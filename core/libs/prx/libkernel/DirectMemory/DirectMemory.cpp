@@ -416,6 +416,25 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
     }
     if ((flags & GuestMapFixed) != 0) {
         ValidateRange(addr, len, alignment);
+#ifdef _WIN32
+        if ((flags & GuestMapNoOverwrite) != 0) {
+            const auto start = reinterpret_cast<std::uintptr_t>(addr);
+            auto cursor = start;
+            while (cursor - start < len) {
+                MEMORY_BASIC_INFORMATION info{};
+                if (VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &info, sizeof(info)) != sizeof(info))
+                    throw std::system_error(EINVAL, std::generic_category(), "No-overwrite range query failed");
+                if (info.State != MEM_FREE) {
+                    char busy[128];
+                    std::snprintf(busy, sizeof(busy), "No-overwrite range %p+0x%zx is occupied", addr, len);
+                    throw std::system_error(EEXIST, std::generic_category(), busy);
+                }
+                const auto regionEnd = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+                if (regionEnd <= cursor) throw std::system_error(EINVAL, std::generic_category(), "No-overwrite range query failed");
+                cursor = regionEnd;
+            }
+        }
+#endif
 #if defined(__linux__)
         const int placement = (flags & GuestMapNoOverwrite) != 0 ? MAP_FIXED_NOREPLACE : MAP_FIXED;
 #else
