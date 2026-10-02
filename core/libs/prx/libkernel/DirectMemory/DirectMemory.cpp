@@ -424,14 +424,21 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
                 MEMORY_BASIC_INFORMATION info{};
                 if (VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &info, sizeof(info)) != sizeof(info))
                     throw std::system_error(EINVAL, std::generic_category(), "No-overwrite range query failed");
-                if (info.State != MEM_FREE) {
-                    char busy[128];
-                    std::snprintf(busy, sizeof(busy), "No-overwrite range %p+0x%zx is occupied", addr, len);
-                    throw std::system_error(EEXIST, std::generic_category(), busy);
+                if (info.State == MEM_FREE) {
+                    cursor = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+                    continue;
                 }
                 const auto regionEnd = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
                 if (regionEnd <= cursor) throw std::system_error(EINVAL, std::generic_category(), "No-overwrite range query failed");
-                cursor = regionEnd;
+                const auto usedEnd = std::min(regionEnd, start + len);
+                const auto usedBegin = std::max(reinterpret_cast<std::uintptr_t>(info.BaseAddress), start);
+                if (info.State != MEM_RESERVE || !GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<void*>(usedBegin), usedEnd - usedBegin)) {
+                    char busy[160];
+                    std::snprintf(busy, sizeof(busy), "No-overwrite range %p+0x%zx is occupied (state=0x%lx prot=0x%lx)", addr, len,
+                        (unsigned long)info.State, (unsigned long)info.Protect);
+                    throw std::system_error(EEXIST, std::generic_category(), busy);
+                }
+                cursor = usedEnd;
             }
         }
 #endif

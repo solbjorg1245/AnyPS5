@@ -27,6 +27,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 extern "C" {
 void* APS5_VABI mmap_nid_postfix(void*, std::size_t, int, int, int, std::int64_t) noexcept;
@@ -178,6 +181,29 @@ static void CheckFixedVirtualReservation() {
     Require(pooled == requested);
     Require(sceKernelMunmap(pooled, page * 2) == 0);
 }
+
+#ifdef _WIN32
+static void CheckNoOverwriteRejectsHostOccupiedMapping() {
+    constexpr std::size_t page = 0x4000;
+    void* reservation = nullptr;
+    Require(sceKernelReserveVirtualRange(&reservation, page * 4, 0, 0) == 0);
+    Require(sceKernelMunmap(reservation, page * 4) == 0);
+    void* target = static_cast<unsigned char*>(reservation) + page;
+    GuestArena::GuestArenaCommit_nid_postfix(target, page, PAGE_READWRITE, page);
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page, 0, 0, &phys) == 0);
+    void* fixed = target;
+    bool rejected = false;
+    try {
+        rejected = sceKernelMapDirectMemory(&fixed, page, 3, 0x90, phys, 0) != 0;
+    } catch (const std::exception&) {
+        rejected = true;
+    }
+    Require(rejected);
+    GuestArena::GuestArenaReset_nid_postfix(target, page);
+    Require(sceKernelReleaseDirectMemory(phys, page) == 0);
+}
+#endif
 
 static void CheckSharedDirectMemoryLifecycle() {
     constexpr std::size_t page = 0x4000;
@@ -621,6 +647,9 @@ int main() {
     CheckSharedDirectMemoryLifecycle();
     CheckReservedHolesAreUncommitted();
     CheckHeapAfterMappingReuse();
+#ifdef _WIN32
+    CheckNoOverwriteRejectsHostOccupiedMapping();
+#endif
     CheckSharedWriteTracking();
     CheckPlaceholderCollect();
     CheckReadsIntoSharedWriteTracking();
