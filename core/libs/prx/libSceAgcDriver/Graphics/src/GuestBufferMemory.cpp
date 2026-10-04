@@ -469,9 +469,11 @@ AddressBuildTotals& AddressBuilds() {
     return totals;
 }
 
+// Never destroyed: the mirrors hold buffers of their device, and static teardown runs after the
+// Vulkan driver has gone (destroying them at exit faulted inside the driver).
 ImageMirrors& Mirrors() {
-    static ImageMirrors mirrors;
-    return mirrors;
+    static auto* mirrors = new ImageMirrors();
+    return *mirrors;
 }
 
 bool mirrorsEnabled() {
