@@ -387,13 +387,14 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 return it->texture;
             }
         } else if (source == nullptr && it->bytes.size() == guestBytes && it->keys == *keys) {
-            // Unwritten pages need no comparison; partially resident textures compare only committed
-            // pages. The compare goes through the flush hook: it waits for recorded work over the
-            // surface (counted, and named for the [hooksync] line).
+            // Unwritten pages need no comparison, nor do blocks nobody stamped since the snapshot;
+            // partially resident textures compare only committed pages. The compare goes through
+            // the flush hook: it waits for recorded work over the surface (counted, and named for
+            // the [hooksync] line).
             const auto equalsCommitted = [&] {
                 if (Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
-                return GuestMemory::EqualsCommitted(address, it->bytes);
+                return GuestMemory::EqualsCommittedSince(address, it->bytes, it->generation);
             };
             if (*keys != DccKeys::Uncompressed || GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation) || equalsCommitted()) {
                 it->generation = generation;

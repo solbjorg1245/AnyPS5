@@ -2083,7 +2083,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     // Debug aid: APS5_TRACE_FLUSH names what forces pending results to guest memory.
     static const bool trace = std::getenv("APS5_TRACE_FLUSH") != nullptr;
     if (trace) {
-        for (const auto& texture : flush) std::fprintf(stderr, "[flush] image 0x%llx+0x%llx for %s 0x%llx+0x%zx\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), reason, static_cast<unsigned long long>(address), bytes);
+        for (const auto& texture : flush) std::fprintf(stderr, "[flush] image 0x%llx+0x%llx (%ux%u format %u dim %d last array %u tile %d mips %u) for %s 0x%llx+0x%zx\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), texture->descriptor.width, texture->descriptor.height, texture->descriptor.format, static_cast<int>(texture->descriptor.dimension), texture->descriptor.depthOrLastArray, static_cast<int>(texture->descriptor.tileMode), texture->descriptor.mipCount, reason, static_cast<unsigned long long>(address), bytes);
     }
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::exception_ptr failure;

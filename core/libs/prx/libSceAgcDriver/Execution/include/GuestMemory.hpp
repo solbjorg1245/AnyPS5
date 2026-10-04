@@ -31,6 +31,10 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
 // scratch heaps): uncommitted pages read as zeros, are not compared, and are never stored.
 void ReadCommitted(std::uint64_t address, std::span<std::byte> destination);
 bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes);
+// EqualsCommitted for `bytes` read from the range at `generation` (a CollectWrites result): only
+// the write-tracker blocks stamped since are compared, the others still hold what was read. The
+// whole range is compared outside the watched arena or for a generation of 0.
+bool EqualsCommittedSince(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t generation);
 // EqualsCommitted without the flush hook: the caller has decided that the recorded GPU work
 // writing the range need not be waited for (the dispatch-cache validation in Driver.cpp).
 bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes);

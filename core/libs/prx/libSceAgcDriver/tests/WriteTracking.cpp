@@ -15,6 +15,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -117,6 +118,31 @@ void CheckOwnStore() {
     CollectWritesUncached(base, 2 * Block);
     Require(!UnchangedSince(base, 64, beforeCpu), "a CPU write after the driver store is not seen");
 }
+
+void CheckEqualsSince() {
+    void* memory = AllocateWatched(4 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, 4 * Block);
+    std::vector<std::byte> snapshot(4 * Block);
+    std::memcpy(snapshot.data(), memory, snapshot.size());
+    const auto synced = CollectWrites(base, 4 * Block);
+    Require(EqualsCommittedSince(base, snapshot, synced), "unchanged memory differs from its snapshot");
+
+    bytes[2 * Block + 100] = 0x22;
+    CollectWritesUncached(base, 4 * Block);
+    Require(!EqualsCommittedSince(base, snapshot, synced), "a CPU write into a stamped block is not seen");
+    Require(!EqualsCommittedSince(base, snapshot, 0), "a whole compare (generation 0) misses the write");
+
+    bytes[2 * Block + 100] = 0x11;
+    CollectWritesUncached(base, 4 * Block);
+    Require(EqualsCommittedSince(base, snapshot, synced), "a stamped block written back to its old bytes differs");
+
+    const auto partial = std::span<const std::byte>(snapshot).subspan(Block / 2, 2 * Block);
+    Write(base + 3 * Block, std::array<std::byte, 16>{});
+    Require(EqualsCommittedSince(base + Block / 2, partial, synced), "a store outside the compared range is compared");
+    Require(!EqualsCommittedSince(base, snapshot, synced), "a driver store into a stamped block is not seen");
+}
 }
 
 int main() {
@@ -127,6 +153,7 @@ int main() {
         }
         CheckSharedBlock();
         CheckOwnStore();
+        CheckEqualsSince();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;

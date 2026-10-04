@@ -1077,6 +1077,49 @@ bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t gene
     return true;
 }
 
+bool EqualsCommittedSince(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t generation) {
+    if (bytes.empty()) return true;
+    FlushGpuWrites(address, bytes.size());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    bool whole = false;
+    static const bool trace = std::getenv("APS5_TRACE_COMPARE_SINCE") != nullptr;
+    std::size_t changedBlocks = 0, cpuBlocks = 0, writtenBlocks = 0;
+    {
+        auto& tracker = Tracker();
+        const auto lock = lockTracker(tracker);
+        tracker.initialize();
+        whole = !tracker.watched || generation == 0 || bytes.size() > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes.size());
+        if (!whole) {
+            const auto end = address + bytes.size();
+            const auto first = tracker.blockOf(address);
+            const auto last = tracker.blockOf(end - 1);
+            for (auto block = first; block <= last; ++block) {
+                if (tracker.stampOf(block) <= generation) continue;
+                ++changedBlocks;
+                if (tracker.cpuStampOf(block) > generation) ++cpuBlocks;
+                if (tracker.writtenStampOf(block) > generation) ++writtenBlocks;
+                const auto begin = std::max<std::uint64_t>(address, tracker.blockBegin(block));
+                const auto finish = std::min<std::uint64_t>(end, tracker.blockBegin(block) + WriteBlockBytes);
+                if (!runs.empty() && runs.back().second == begin) runs.back().second = finish;
+                else runs.emplace_back(begin, finish);
+            }
+        }
+    }
+    if (whole) return EqualsCommittedUnsynced(address, bytes);
+    bool equal = true;
+    for (const auto& [begin, finish] : runs) {
+        if (!EqualsCommittedUnsynced(begin, bytes.subspan(static_cast<std::size_t>(begin - address), static_cast<std::size_t>(finish - begin)))) {
+            equal = false;
+            break;
+        }
+    }
+    if (trace && bytes.size() >= (16u << 20u)) {
+        static std::atomic<int> reports{0};
+        if (reports.fetch_add(1) < 200) std::fprintf(stderr, "[compare-since] 0x%llx+0x%zx gen %llu: %zu of %zu blocks stamped (cpu %zu, written %zu) -> %s\n", static_cast<unsigned long long>(address), bytes.size(), static_cast<unsigned long long>(generation), changedBlocks, (bytes.size() + WriteBlockBytes - 1) / WriteBlockBytes, cpuBlocks, writtenBlocks, equal ? "equal" : "differs");
+    }
+    return equal;
+}
+
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
