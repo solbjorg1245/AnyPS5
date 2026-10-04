@@ -234,12 +234,43 @@ bool HandleSse4a(EXCEPTION_POINTERS* info) {
     return true;
 }
 
+// INT 0x41 is the console's debugger break: SDK and middleware assertions (Demon's Souls' audio
+// library after printing "Assertion failed") execute it, and without a debugger attached the title
+// runs on. Windows faults on the instruction (an access violation at -1), so it is stepped over,
+// reported once per site.
+bool HandleDebugBreak(EXCEPTION_POINTERS* info) {
+    const auto* record = info->ExceptionRecord;
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION && record->ExceptionCode != EXCEPTION_PRIV_INSTRUCTION) return false;
+    auto* context = info->ContextRecord;
+    std::uint8_t bytes[2];
+    if (ReadCode(context->Rip, bytes, sizeof(bytes)) != sizeof(bytes) || bytes[0] != 0xcd || bytes[1] != 0x41) return false;
+    static std::mutex mutex;
+    static std::uint64_t seen[64];
+    static std::size_t seenCount = 0;
+    bool first = true;
+    {
+        std::lock_guard lock(mutex);
+        for (std::size_t i = 0; i < seenCount; ++i) {
+            if (seen[i] == context->Rip) first = false;
+        }
+        if (first && seenCount < sizeof(seen) / sizeof(seen[0])) seen[seenCount++] = context->Rip;
+    }
+    if (first) {
+        char line[MAX_PATH + 64];
+        DescribeAddress(context->Rip, line, sizeof(line));
+        Report("[libc] debugger break (int 0x41) at %s on thread %lu: no debugger, continuing\n", line, GetCurrentThreadId());
+    }
+    context->Rip += sizeof(bytes);
+    return true;
+}
+
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
     const auto* fault = info->ExceptionRecord;
     if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleSse4a(info)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (HandleDebugBreak(info)) return EXCEPTION_CONTINUE_EXECUTION;
     const auto* record = info->ExceptionRecord;
     if (!IsFatal(record->ExceptionCode)) return EXCEPTION_CONTINUE_SEARCH;
     if (reported.exchange(true)) {
