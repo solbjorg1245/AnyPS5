@@ -374,6 +374,24 @@ void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std:
     require(any, "unmap address is not registered");
 }
 
+bool GuestAllocationsQuery_nid_postfix(std::uintptr_t address, bool findNext, Range* out) {
+    std::lock_guard lock(registry().mutex);
+    const auto& ranges = registry().ranges;
+    auto it = ranges.upper_bound(address);
+    if (it != ranges.begin() && address < std::prev(it)->first + std::prev(it)->second->bytes) --it;
+    else if (!findNext || it == ranges.end()) return false;
+    const auto& piece = *it->second;
+    const auto sameRun = [&](const auto& lower, const auto& upper) {
+        return lower->second->allocationAddress == upper->second->allocationAddress && lower->first + lower->second->bytes == upper->first;
+    };
+    auto first = it;
+    while (first != ranges.begin() && sameRun(std::prev(first), first)) --first;
+    auto last = it;
+    for (auto next = std::next(last); next != ranges.end() && sameRun(last, next); ++next) last = next;
+    *out = Range{first->first, static_cast<std::size_t>(last->first + last->second->bytes - first->first), piece.readable, piece.writable, piece.allocationAddress, piece.allocationBytes, piece.releasable};
+    return true;
+}
+
 Lease GuestAllocationsAcquire_nid_postfix() {
     std::lock_guard lock(registry().mutex);
     Lease result;

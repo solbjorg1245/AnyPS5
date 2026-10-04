@@ -218,37 +218,32 @@ int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInf
  const auto address = reinterpret_cast<uintptr_t>(addr);
  // The mapping that contains the address, or with SCE_KERNEL_VQ_FIND_NEXT (flags bit 0) the first
  // mapping at or above it: titles walk their mappings and check that a mapping covers a whole
- // allocation, so the answer must be the registered allocation, not a page.
+ // allocation, so the answer is the mapped run of the registered allocation, not a page. Reserved
+ // ranges count as mappings (uncommitted ones), as on the PS5.
  constexpr int findNext = 1;
- const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
- const GuestAllocations::Range* best = nullptr;
- for (const auto& range : lease) {
-  const auto begin = range->allocationAddress;
-  const auto end = begin + range->allocationBytes;
-  if (address >= begin && address < end) { best = range.get(); break; }
-  if ((flags & findNext) != 0 && begin > address && (best == nullptr || begin < best->allocationAddress)) best = range.get();
- }
- if (best != nullptr) {
-  info->start = best->allocationAddress;
-  info->end = best->allocationAddress + best->allocationBytes;
-  info->protection = (best->readable ? 1 : 0) | (best->writable ? 2 : 0) | (!best->releasable ? 4 : 0);
+ GuestAllocations::Range found{};
+ if (GuestAllocations::GuestAllocationsQuery_nid_postfix(address, (flags & findNext) != 0, &found)) {
+  info->start = found.address;
+  info->end = found.address + found.bytes;
+  info->protection = (found.readable ? 1 : 0) | (found.writable ? 2 : 0) | (!found.releasable ? 4 : 0);
+  const auto at = std::max<uintptr_t>(address, info->start);
   int recorded = 0;
-  if (GuestProtection(std::max<uintptr_t>(address, info->start), &recorded)) info->protection = recorded;
-  std::uintptr_t directStart = 0;
-  std::uintptr_t directEnd = 0;
+  if (GuestProtection(at, &recorded)) info->protection = recorded;
+  // An allocation can mix direct mappings, reserved holes and other memory; the answer is the
+  // piece around the address, and a reserved hole has no physical pages behind it.
   std::uint64_t physicalOffset = 0;
   int memoryType = 0;
-  const bool direct = QueryDirectMapping(std::max<uintptr_t>(address, info->start), &directStart, &directEnd, &physicalOffset, &memoryType);
+  const auto backing = QueryGuestBacking(at, &info->start, &info->end, &physicalOffset, &memoryType);
+  const bool direct = backing == GuestBacking::Direct;
+  const bool reserved = backing == GuestBacking::Reserved;
   info->is_direct = direct ? 1u : 0u;
-  info->is_flexible = !direct && best->releasable ? 1u : 0u;
-  if (direct) {
-   info->start = std::max(info->start, directStart);
-   info->end = std::min(info->end, directEnd);
-   info->memory_type = memoryType;
-  }
-  info->is_committed = 1;
-  ApplyRangeName(std::max<uintptr_t>(address, info->start), info);
-  if (direct) info->offset = physicalOffset + info->start - directStart;
+  info->is_flexible = backing == GuestBacking::Other && found.releasable ? 1u : 0u;
+  info->is_committed = reserved ? 0u : 1u;
+  if (reserved) info->protection = 0;
+  if (direct) info->memory_type = memoryType;
+  const auto backingStart = info->start;
+  ApplyRangeName(at, info);
+  if (direct) info->offset = physicalOffset + info->start - backingStart;
   return 0;
  }
  // Memory the registry does not know (the title's own heap blocks, stacks): the host's committed

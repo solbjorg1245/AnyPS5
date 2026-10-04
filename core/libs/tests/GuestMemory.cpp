@@ -246,6 +246,38 @@ static void CheckSharedDirectMemoryLifecycle() {
     Require(sceKernelReleaseDirectMemory(phys, page * 3) == 0);
 }
 
+// Demon's Souls unmaps a partly mapped reservation by querying each piece and giving the physical
+// pages of the committed ones back to its allocator, so a hole must not look committed.
+static void CheckReservedHolesAreUncommitted() {
+    constexpr std::size_t page = 0x4000;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page, 0, 0, &phys) == 0);
+    void* reserved = nullptr;
+    Require(sceKernelReserveVirtualRange(&reserved, page * 4, 0, 0) == 0);
+    const auto base = reinterpret_cast<std::uintptr_t>(reserved);
+    void* mapped = reinterpret_cast<void*>(base + page);
+    Require(sceKernelMapDirectMemory(&mapped, page, 3, 0x10, phys, 0) == 0);
+    VirtualQueryInfo info{};
+    Require(sceKernelVirtualQuery(reserved, 0, &info, sizeof(info)) == 0);
+    Require(!info.is_committed && !info.is_direct && info.protection == 0);
+    Require(info.start == base && info.end == base + page);
+    Require(sceKernelVirtualQuery(mapped, 0, &info, sizeof(info)) == 0);
+    Require(info.is_committed && info.is_direct && info.offset == static_cast<std::uint64_t>(phys));
+    Require(info.start == base + page && info.end == base + page * 2);
+    Require(sceKernelVirtualQuery(reinterpret_cast<void*>(base + page * 3), 0, &info, sizeof(info)) == 0);
+    Require(!info.is_committed && info.start == base + page * 2 && info.end == base + page * 4);
+    void* flexible = reinterpret_cast<void*>(base + page * 2);
+    Require(sceKernelMapFlexibleMemory(&flexible, page, 3, 0x10) == 0);
+    Require(sceKernelVirtualQuery(flexible, 0, &info, sizeof(info)) == 0);
+    Require(info.is_committed && !info.is_direct && info.start == base + page * 2 && info.end == base + page * 3);
+    Require(sceKernelMunmap(reserved, page * 4) == 0);
+    Require(sceKernelReserveVirtualRange(&reserved, page * 4, 0, 0) == 0);
+    Require(sceKernelVirtualQuery(reserved, 0, &info, sizeof(info)) == 0);
+    Require(!info.is_committed && info.end == reinterpret_cast<std::uintptr_t>(reserved) + page * 4);
+    Require(sceKernelMunmap(reserved, page * 4) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, page) == 0);
+}
+
 static void CheckHeapAfterMappingReuse() {
     constexpr std::size_t bytes = 0x30000;
     auto* pointer = static_cast<unsigned char*>(GuestHeap::GuestHeapAllocate_nid_postfix(bytes));
@@ -561,6 +593,7 @@ int main() {
     CheckDirectMemoryFollowsPhysicalPages();
     CheckFixedVirtualReservation();
     CheckSharedDirectMemoryLifecycle();
+    CheckReservedHolesAreUncommitted();
     CheckHeapAfterMappingReuse();
     CheckSharedWriteTracking();
     CheckReadsIntoSharedWriteTracking();

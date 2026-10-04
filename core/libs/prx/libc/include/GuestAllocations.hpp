@@ -35,6 +35,10 @@ void GuestAllocationsRemove_nid_postfix(void* mutation, const void* pointer);
 void GuestAllocationsProtect_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, bool readable, bool writable, const std::function<void()>& apply);
 void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, const std::function<void(const void*, std::size_t, const void*, bool)>& apply);
 Lease GuestAllocationsAcquire_nid_postfix();
+// The registered piece that contains address (with findNext: else the first one above it), widened
+// over the adjoining pieces of the same allocation. Unlike a lease it includes inaccessible pieces,
+// such as reserved ranges with nothing mapped into them.
+bool GuestAllocationsQuery_nid_postfix(std::uintptr_t address, bool findNext, Range* out);
 // Changes whenever a mutation ends, so callers can cache facts about guest mappings between changes.
 std::uint64_t GuestAllocationsGeneration_nid_postfix();
 // Precise invalidation for such caches: the callback runs, after the generation changed, for every

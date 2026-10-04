@@ -285,7 +285,26 @@ struct DirectMapping {
 
 std::map<std::uintptr_t, DirectMapping> g_directMappings;
 
+// Reserved address ranges with nothing mapped into them yet (start -> end). sceKernelVirtualQuery
+// reports them as uncommitted: Demon's Souls walks a range it unmaps and gives the physical pages
+// of every committed piece back to its own page allocator.
+std::map<std::uintptr_t, std::uintptr_t> g_reservations;
+
+void EraseReservations(std::uintptr_t start, std::uintptr_t end) {
+    auto it = g_reservations.lower_bound(start);
+    if (it != g_reservations.begin() && std::prev(it)->second > start) --it;
+    while (it != g_reservations.end() && it->first < end) {
+        const auto base = it->first;
+        const auto rangeEnd = it->second;
+        it = g_reservations.erase(it);
+        if (base < start) g_reservations.emplace(base, start);
+        if (rangeEnd > end) it = g_reservations.emplace(end, rangeEnd).first;
+    }
+}
+
+// Whatever a range held stops being a plain reservation as well when it is mapped or unmapped.
 void EraseMappings(std::uintptr_t start, std::uintptr_t end) {
+    EraseReservations(start, end);
     auto it = g_directMappings.lower_bound(start);
     if (it != g_directMappings.begin() && std::prev(it)->second.end > start) --it;
     while (it != g_directMappings.end() && it->first < end) {
@@ -620,6 +639,7 @@ int DoReserveVirtual(void** addr, size_t len, int flags, size_t alignment) {
         Unmap(mapped, len);
         throw;
     }
+    MarkReserved(mapped, len, true);
     *addr = mapped;
     Trace("reserve %p+0x%zx flags=0x%x align=0x%zx", mapped, len, flags, alignment);
     return 0;
@@ -656,15 +676,38 @@ bool GuestProtection(uintptr_t addr, int* prot) {
     return true;
 }
 
-bool QueryDirectMapping(std::uintptr_t address, std::uintptr_t* start, std::uintptr_t* end, std::uint64_t* offset, int* memoryType) {
+void MarkReserved(const void* addr, size_t len, bool reserved) {
+    const auto start = reinterpret_cast<std::uintptr_t>(addr);
     std::lock_guard lock(g_directLock);
-    const auto next = g_directMappings.upper_bound(address);
-    if (next == g_directMappings.begin()) return false;
-    const auto it = std::prev(next);
-    if (address >= it->second.end) return false;
-    *start = it->first;
-    *end = it->second.end;
-    *offset = it->second.phys;
-    *memoryType = it->second.memoryType;
-    return true;
+    EraseReservations(start, start + len);
+    if (reserved) g_reservations.emplace(start, start + len);
+}
+
+GuestBacking QueryGuestBacking(std::uintptr_t address, std::uintptr_t* start, std::uintptr_t* end, std::uint64_t* offset, int* memoryType) {
+    std::lock_guard lock(g_directLock);
+    const auto nextMapping = g_directMappings.upper_bound(address);
+    if (nextMapping != g_directMappings.begin()) {
+        const auto it = std::prev(nextMapping);
+        if (address < it->second.end) {
+            *start = std::max(*start, it->first);
+            *end = std::min(*end, it->second.end);
+            *offset = it->second.phys + (*start - it->first);
+            *memoryType = it->second.memoryType;
+            return GuestBacking::Direct;
+        }
+        *start = std::max(*start, it->second.end);
+    }
+    if (nextMapping != g_directMappings.end()) *end = std::min(*end, nextMapping->first);
+    const auto nextReservation = g_reservations.upper_bound(address);
+    if (nextReservation != g_reservations.begin()) {
+        const auto it = std::prev(nextReservation);
+        if (address < it->second) {
+            *start = std::max(*start, it->first);
+            *end = std::min(*end, it->second);
+            return GuestBacking::Reserved;
+        }
+        *start = std::max(*start, it->second);
+    }
+    if (nextReservation != g_reservations.end()) *end = std::min(*end, nextReservation->first);
+    return GuestBacking::Other;
 }

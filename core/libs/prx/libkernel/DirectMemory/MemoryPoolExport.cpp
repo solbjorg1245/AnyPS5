@@ -27,6 +27,7 @@ int PoolCommit(void* addr, uint64_t len, int prot) {
     if (!addr || len == 0 || !PageAligned(reinterpret_cast<uintptr_t>(addr)) || !PageAligned(len)) return SCE_KERNEL_ERROR_EINVAL;
     const int ret = DoMprotect(addr, static_cast<size_t>(len), prot);
     if (ret == 0) {
+        MarkReserved(addr, static_cast<size_t>(len), false);
         PoolState& pool = Pool();
         std::lock_guard<std::mutex> lock(pool.mutex);
         pool.committedBytes += static_cast<size_t>(len);
@@ -38,6 +39,7 @@ int PoolDecommit(void* addr, uint64_t len) {
     if (!addr || len == 0 || !PageAligned(reinterpret_cast<uintptr_t>(addr)) || !PageAligned(len)) return SCE_KERNEL_ERROR_EINVAL;
     const int ret = DoMprotect(addr, static_cast<size_t>(len), 0);
     if (ret == 0) {
+        MarkReserved(addr, static_cast<size_t>(len), true);
         PoolState& pool = Pool();
         std::lock_guard<std::mutex> lock(pool.mutex);
         pool.committedBytes -= static_cast<size_t>(len) < pool.committedBytes ? static_cast<size_t>(len) : pool.committedBytes;
