@@ -187,6 +187,12 @@ public:
     bool PresentClear(std::uint32_t width, std::uint32_t height, bool opaque);
     void PresentPixels(std::uint32_t width, std::uint32_t height, std::span<const std::byte> pixels);
     bool PresentDisplayBuffer(const DisplayBuffer& buffer);
+    // Debug aid: APS5_CAPTURE_DIR=<directory>. When <directory>/capture exists at a present (under
+    // the mutex, before the display buffer is presented), the file is removed, the device drained
+    // (WaitIdle) and every live storage image (render targets included) and depth surface saved as
+    // <directory>/p<present>_*.raw (StorageTexture::DumpLive, DumpDepthSurfaces): the state each
+    // target was left in by the frame.
+    void CaptureTargets();
     double FinishPresent();
     void QueuePresent();
     // At the flip packet (under the mutex): the recorder's submissions so far and, under

@@ -1,8 +1,12 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <functional>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -45,6 +49,26 @@ void Driver::reportSkip(const char* kind, const std::string& what) {
         }
     } else if (traceSkips) {
         line += prefix + " again: " + what.substr(0, 100) + "\n";
+    }
+    // Debug aid: APS5_SKIP_COUNTS=1 prints how many draws and dispatches each reason skipped, every
+    // 10 s (the reason up to its packet and target suffix, at most 140 characters).
+    static const bool countSkips = std::getenv("APS5_SKIP_COUNTS") != nullptr;
+    if (countSkips) {
+        static std::map<std::string, std::uint64_t> counts;
+        static auto lastReport = std::chrono::steady_clock::now();
+        auto key = prefix + ": " + what.substr(0, std::min(what.find(" ["), what.find('\n')));
+        if (key.size() > 140) key.resize(140);
+        ++counts[key];
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastReport >= std::chrono::seconds(10)) {
+            lastReport = now;
+            std::vector<std::pair<std::uint64_t, std::string>> sorted;
+            for (const auto& [reason, count] : counts) sorted.emplace_back(count, reason);
+            std::sort(sorted.rbegin(), sorted.rend());
+            line += "[gpu] skips over 10 s:\n";
+            for (const auto& [count, reason] : sorted) line += "  " + std::to_string(count) + " x " + reason + "\n";
+            counts.clear();
+        }
     }
     if (!line.empty()) std::fwrite(line.data(), 1, line.size(), stderr);
 }

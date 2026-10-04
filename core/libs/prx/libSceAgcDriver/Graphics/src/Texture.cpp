@@ -1925,6 +1925,47 @@ std::vector<VkBufferImageCopy> StorageTexture::CopyRegions(const std::vector<boo
     return regions;
 }
 
+std::size_t StorageTexture::DumpLive(const Context& context, const std::string& prefix) {
+    constexpr std::uint32_t MaxLayers = 8;
+    std::vector<std::shared_ptr<StorageTexture>> textures;
+    {
+        auto& live = Live();
+        std::lock_guard lock(live.mutex);
+        for (auto* texture : live.textures) {
+            if (auto owner = texture->weak_from_this().lock()) textures.push_back(std::move(owner));
+        }
+    }
+    std::size_t written = 0;
+    for (const auto& texture : textures) {
+        if (texture->image == VK_NULL_HANDLE || texture->mips.empty()) continue;
+        const auto& descriptor = texture->descriptor;
+        const auto& mip = texture->mips[0];
+        const auto layers = std::min(texture->arrayLayers, MaxLayers);
+        Buffer buffer(context, static_cast<std::size_t>(texture->sliceLinearBytes * layers), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        std::vector<VkBufferImageCopy> regions;
+        for (const auto& region : texture->CopyRegions()) {
+            if (region.imageSubresource.mipLevel == 0 && region.bufferOffset < texture->sliceLinearBytes * layers) regions.push_back(region);
+        }
+        CommandBatch batch(context);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(batch.Handle(), texture->image, VK_IMAGE_LAYOUT_GENERAL, buffer.Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+        const std::uint32_t header[3] = {mip.pitchBytes / BytesPerElement(descriptor.format) * BlockWidth(descriptor.format), mip.height, static_cast<std::uint32_t>(texture->storageFormat)};
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            char name[96];
+            std::snprintf(name, sizeof(name), "%llx_%ux%u_l%u.raw", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, layer);
+            if (std::FILE* file = std::fopen((prefix + name).c_str(), "wb")) {
+                std::fwrite(header, sizeof(header), 1, file);
+                std::fwrite(buffer.Bytes().data() + layer * texture->sliceLinearBytes + mip.linearOffset, 1, static_cast<std::size_t>(mip.linearSize), file);
+                std::fclose(file);
+                ++written;
+            }
+        }
+    }
+    return written;
+}
+
 bool StorageTexture::overlaps(std::uint64_t address, std::size_t bytes) const {
     return address < descriptor.baseAddress + guestBytes && descriptor.baseAddress < address + bytes;
 }

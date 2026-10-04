@@ -164,6 +164,50 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     return found == list.rend() ? nullptr : (*found)->Sampled(words, resource, components);
 }
 
+std::size_t DumpDepthSurfaces(const Context& context, const std::string& prefix) {
+    std::lock_guard lock(surfacesMutex());
+    std::size_t written = 0;
+    for (const auto& surface : surfaces()) {
+        if (surface->context.device != context.device) continue;
+        const auto& target = surface->target;
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const bool stencil = target.stencilAddress != 0;
+        const std::uint64_t texels = static_cast<std::uint64_t>(target.extent.width) * target.extent.height;
+        const std::uint64_t depthBytes = texels * (d16 ? 2u : 4u);
+        std::vector<VkBufferImageCopy> regions;
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        region.imageExtent = {target.extent.width, target.extent.height, 1};
+        if (target.address != 0) regions.push_back(region);
+        if (stencil) {
+            region.bufferOffset = depthBytes;
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+            regions.push_back(region);
+        }
+        if (regions.empty()) continue;
+        Buffer buffer(context, static_cast<std::size_t>(depthBytes + (stencil ? texels : 0u)), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        CommandBatch batch(context);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(batch.Handle(), surface->image, VK_IMAGE_LAYOUT_GENERAL, buffer.Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+        const auto save = [&](const char* plane, std::uint64_t address, VkFormat format, std::uint64_t offset, std::uint64_t bytes) {
+            char name[96];
+            std::snprintf(name, sizeof(name), "%s_%llx_%ux%u.raw", plane, static_cast<unsigned long long>(address), target.extent.width, target.extent.height);
+            std::FILE* file = std::fopen((prefix + name).c_str(), "wb");
+            if (file == nullptr) return;
+            const std::uint32_t header[3] = {target.extent.width, target.extent.height, static_cast<std::uint32_t>(format)};
+            std::fwrite(header, sizeof(header), 1, file);
+            std::fwrite(buffer.Bytes().data() + offset, 1, static_cast<std::size_t>(bytes), file);
+            std::fclose(file);
+            ++written;
+        };
+        if (target.address != 0) save("depth", target.address, d16 ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT, 0, depthBytes);
+        if (stencil) save("stencil", target.stencilAddress, VK_FORMAT_S8_UINT, depthBytes, texels);
+    }
+    return written;
+}
+
 bool DepthSurfaceAt(std::uint64_t address) {
     std::lock_guard lock(surfacesMutex());
     return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->target.address == address || surface->target.stencilAddress == address; });

@@ -25,6 +25,7 @@
 #include <chrono>
 #include <charconv>
 #include <condition_variable>
+#include <filesystem>
 #include <fstream>
 #include <cstdlib>
 #include <mutex>
@@ -1786,6 +1787,21 @@ FrameDumps& Dumps() {
     return dumps;
 }
 
+}
+
+void VulkanDevice::CaptureTargets() {
+    static const char* directory = std::getenv("APS5_CAPTURE_DIR");
+    if (directory == nullptr) return;
+    static std::uint64_t presents = 0;
+    ++presents;
+    std::error_code error;
+    if (!std::filesystem::remove(std::filesystem::path(directory) / "capture", error)) return;
+    const auto started = std::chrono::steady_clock::now();
+    WaitIdle();
+    const auto prefix = (std::filesystem::path(directory) / ("p" + std::to_string(presents) + "_")).string();
+    const auto images = Graphics::StorageTexture::DumpLive(graphicsContext(), prefix);
+    const auto depths = Graphics::DumpDepthSurfaces(graphicsContext(), prefix);
+    std::fprintf(stderr, "[capture] present %llu: %zu storage image files and %zu depth surface files saved under %s in %.0f ms\n", static_cast<unsigned long long>(presents), images, depths, directory, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
 }
 
 bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {

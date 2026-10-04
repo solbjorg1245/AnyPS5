@@ -14,6 +14,7 @@
 #include <map>
 #include <memory>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -249,6 +250,11 @@ public:
     // may carry DCC metadata, and this surface must be host-imported (the write-back is GPU-direct).
     // False, naming why, when the copy must be a transfer.
     bool CopyFrom(StorageTexture& source, const char*& refusal);
+    // Debug aid (APS5_CAPTURE_DIR, see VulkanDevice::CaptureTargets): saves mip 0 of the first
+    // layers of every live image as <prefix><address>_<width>x<height>_l<layer>.raw (u32 row pitch
+    // in texels, u32 height, u32 VkFormat, then the rows). The GPU must be idle. Returns the number of
+    // files written.
+    static std::size_t DumpLive(const Context& context, const std::string& prefix);
     VkImage Image() const { return image; }
     const GuestTextureResource& Descriptor() const { return descriptor; }
     std::uint32_t ImageLayers() const { return geometry.imageLayers; }

@@ -89,6 +89,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                     presenting->WaitIdle();
                     timing.Mark("device_idle_wait");
                 }
+                presenting->CaptureTargets();
                 submitted = presenting->PresentDisplayBuffer(*buffer);
                 timing.Mark("present_display_buffer");
             } else {

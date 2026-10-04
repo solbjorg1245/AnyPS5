@@ -557,6 +557,7 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_CODE_HASH_KEY",
     "APS5_NO_FAILURE_MEMO",
     "APS5_NO_RESULT_MEMO",
+    "APS5_SHADER_CACHE_VERSION",
 };
 
 const std::vector<std::byte>& switchKey() {
@@ -762,8 +763,19 @@ DiskStore& store() {
 
 }
 
+// Development aid: APS5_SHADER_CACHE_VERSION=<hex> keys the cache with that version instead of the
+// hash of the recompiler and driver sources, so a rebuild whose changes cannot affect shader
+// translation (driver state, memory or presentation work) keeps the shaders compiled so far. Entries
+// go stale silently when the translation did change: never set it across recompiler changes.
 std::uint64_t SourceVersion() {
-    return Generated::SourceVersion;
+    static const std::uint64_t version = [] {
+        const char* value = std::getenv("APS5_SHADER_CACHE_VERSION");
+        if (value == nullptr) return Generated::SourceVersion;
+        const auto pinned = std::strtoull(value, nullptr, 16);
+        std::fprintf(stderr, "[shader-disk-cache] source version pinned to %016llx by APS5_SHADER_CACHE_VERSION (sources hash to %016llx)\n", static_cast<unsigned long long>(pinned), static_cast<unsigned long long>(Generated::SourceVersion));
+        return pinned;
+    }();
+    return version;
 }
 
 void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, const ResourceSpecialization& specialization, std::vector<std::byte>& key) {
