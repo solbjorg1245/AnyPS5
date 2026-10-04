@@ -86,6 +86,13 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
         } else {
             append(0xc8, 2, Stage::Vertex, 0x8b, 0x8c, Role::Main);
         }
+        // A depth-only draw binds no pixel shader (drawPrecheck lets it through only without color
+        // writes): the pipeline has no fragment stage, so its pixel stage state is never read.
+        if (!queue.shader.contains(0x008)) {
+            Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, 0x008);
+            require(!graphics.hasColorTarget, "a draw writing color binds no pixel shader");
+            return product;
+        }
         append(0x008, 1, Stage::Fragment, 0x00b, 0x00c, Role::Fragment);
         programs.back().firstUserSgpr = 0;
         product->pixel = Graphics::DecodePixelStageInfo(queue.context, Graphics::ExportMappings(graphics));

@@ -27,14 +27,17 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
     traceIndirect = traceIndirectEnabled;
     if (traceIndirect && drawParameters.indirect) std::fprintf(stderr, "[draw] indirect packet %s args 0x%llx count %u reached\n", Pm4::Name(packet[0]).c_str(), static_cast<unsigned long long>(drawParameters.indirect->arguments), drawParameters.indirect->count);
     {
-        const auto targetMask = queue.context.find(0x8e);
-        const auto shaderMask = queue.context.find(0x8f);
-        const bool colorWrites = targetMask != queue.context.end() && shaderMask != queue.context.end() && (targetMask->second & shaderMask->second) != 0;
+        const bool colorWrites = Graphics::WritesColor(queue.context);
+        const auto word = [&](std::uint32_t offset) { const auto it = queue.context.find(offset); return it == queue.context.end() ? 0u : it->second; };
+        // A RESUMMARIZE or DECOMPRESS pass (DB_RENDER_CONTROL bits 4 and 12, without clears or
+        // copies) only rebuilds the HTILE metadata of a depth surface. Depth surfaces are
+        // uncompressed host images here, so it changes nothing.
+        if ((word(0x000) & 0x1010u) != 0 && (word(0x000) & 0xfu) == 0 && !colorWrites) return DrawVerdict::Nothing;
+        // Without a pixel shader a draw only tests and writes depth/stencil (shadow maps, depth
+        // prepasses): it runs with no fragment stage (decodeDraw), or does nothing when neither
+        // test is on or no depth/stencil plane is bound.
         if (!colorWrites && !queue.shader.contains(0x8)) {
-            const auto word = [&](std::uint32_t offset) { const auto it = queue.context.find(offset); return it == queue.context.end() ? 0u : it->second; };
             if ((word(0x200) & 3u) == 0 || ((word(0x010) & 3u) == 0 && (word(0x011) & 1u) == 0)) return DrawVerdict::Nothing;
-            rejected = "AGC graphics: depth/stencil-only draws without a pixel shader are not implemented";
-            return DrawVerdict::Rejected;
         }
     }
     if (drawParameters.indexed) {

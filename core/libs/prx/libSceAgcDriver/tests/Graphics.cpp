@@ -129,9 +129,17 @@ void stateTests() {
     queue.context[0x8e] = 0xff;
     queue.context[0x8f] = 0xff;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "color export format 0");
-    queue = makeState();
-    queue.context[0x200] = 2;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "depth");
+    // Without a depth or stencil plane every fragment passes the enabled tests and nothing is
+    // written, as on the hardware.
+    for (const auto control : {0x2u, 0x007007b6u, 0x007007c3u}) {
+        queue = makeState();
+        queue.context[0x200] = control;
+        queue.context[0x1b3] = 2;
+        queue.context[0x1b4] = 2;
+        state = AgcDriver::Graphics::DecodeState(queue);
+        Require(!state.depth && !state.depthTest && !state.depthWrite && !state.stencilTest, "a depth/stencil test without a plane was not dropped");
+        Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "precheck rejected a depth/stencil test without a plane");
+    }
     queue = makeState();
     queue.context[0x200] = 0x007007b4;
     queue.context[0x1b3] = 2;
@@ -139,8 +147,8 @@ void stateTests() {
     (void)AgcDriver::Graphics::DecodeState(queue);
     Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "a depth write without the depth test was rejected");
     queue = makeState();
-    queue.context[0x200] = 0x007007b6;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "depth");
+    queue.context[0x200] = 0x0000000a;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "depth bounds");
     queue = makeState();
     queue.context[0x10f] = 0x7fc00000;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "non-finite");
@@ -387,8 +395,17 @@ void DisabledColorTests() {
     queue.context[0x8e] = 3;
     const auto partial = AgcDriver::Graphics::DecodeState(queue);
     Require(partial.hasColorTarget && partial.blend.colorWriteMask == 3, "partial color write mask changed");
+    Require(AgcDriver::Graphics::WritesColor(queue.context), "a written slot did not count as a color write");
     queue.context.erase(0x31c);
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "missing register");
+    // A slot whose CB_COLOR_INFO format is COLOR_INVALID is not written, whatever the masks say.
+    queue = makeState();
+    queue.context[0x31c] = 0;
+    queue.context[0x1b3] = 2;
+    queue.context[0x1b4] = 2;
+    const auto unbound = AgcDriver::Graphics::DecodeState(queue);
+    Require(!unbound.hasColorTarget && unbound.colors.empty(), "a COLOR_INVALID slot became an attachment");
+    Require(!AgcDriver::Graphics::WritesColor(queue.context) && AgcDriver::Graphics::DrawRejection(queue, false).empty(), "a COLOR_INVALID slot counted as a color write");
 }
 
 void DepthStencilTests() {
@@ -444,6 +461,19 @@ void DepthStencilTests() {
     queue.context[0x10b] = 0;
     queue.context[0x000] = 1;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "DB_RENDER_CONTROL");
+    // A test whose own plane is missing passes: stencil without a stencil plane, depth without a
+    // depth plane.
+    queue.context[0x000] = 0;
+    queue.context[0x011] = 0x20000180;
+    queue.context[0x200] = 0x00700777;
+    state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.depth && state.depth->stencilAddress == 0 && state.depthTest && state.depthWrite && !state.stencilTest, "a stencil test without a stencil plane was not dropped");
+    queue.context[0x010] = 0x22900980;
+    queue.context[0x011] = 0x20000181;
+    queue.context[0x10b] = 0x00050050;
+    queue.context[0x10c] = 0x01ffff01;
+    state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.depth && state.depth->address == 0 && state.depth->stencilAddress == 0x20000 && !state.depthTest && !state.depthWrite && state.stencilTest, "a depth test without a depth plane was not dropped");
     queue = makeState();
     queue.context[0x31b] = 1u << 26u;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "mip exceeds");

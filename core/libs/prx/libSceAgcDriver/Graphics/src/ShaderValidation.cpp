@@ -496,7 +496,10 @@ std::set<std::uint32_t> ValidateShaders(std::span<const CompiledShader> shaders,
     Require(state.stages.path == ShaderPath::Vertex || tessellation || mesh, "unsupported graphics shader path");
     Require(state.stages.mesh.has_value() == mesh && state.stages.tessellation.has_value() == tessellation, "graphics stage configuration disagrees with its path");
     Require(!state.rectList || (state.stages.path == ShaderPath::Vertex && state.topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST && state.cullMode == VK_CULL_MODE_NONE), "invalid rect-list pipeline state");
-    Require(shaders.size() == (tessellation || state.rectList ? 4u : 2u), "incorrect graphics stage count");
+    // A depth-only draw (no pixel shader, no color target) ends at its last geometry stage.
+    const bool depthOnly = !shaders.empty() && shaders.back().stage != Stage::Fragment;
+    Require(!depthOnly || (!state.hasColorTarget && !state.rectList), "only a draw without color targets may lack a pixel shader");
+    Require(shaders.size() + (depthOnly ? 1u : 0u) == (tessellation || state.rectList ? 4u : 2u), "incorrect graphics stage count");
     const std::array<Stage, 4> tessStages{Stage::Local, Stage::TessellationControl, Stage::TessellationEvaluation, Stage::Fragment};
     static_cast<void>(AssemblePushConstants(shaders));
     Module previous;
@@ -516,8 +519,9 @@ std::set<std::uint32_t> ValidateShaders(std::span<const CompiledShader> shaders,
     }
     // One float4 color per MRT attachment. A pixel shader may also export no color at all when it
     // writes storage images or buffers instead; its attachments are then left untouched.
-    const auto attachments = std::max<std::size_t>(state.colors.size(), 1u);
     std::set<std::uint32_t> locations;
+    if (depthOnly) return locations;
+    const auto attachments = std::max<std::size_t>(state.colors.size(), 1u);
     for (const auto& [location, signature] : previous.outputs) {
         if (location >= attachments) continue;
         Require(signature == "vertex:f32x4", "fragment shader must export float4 colors to its attachments");

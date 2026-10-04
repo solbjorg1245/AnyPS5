@@ -90,6 +90,9 @@ ShaderStages DecodeShaderStages(const QueueState& queue);
 State DecodeState(const QueueState& queue);
 std::array<std::uint8_t, 8> ExportMappings(const State& state);
 ColorTarget DecodeColorBuffer(const Registers& context, std::uint32_t slot);
+// Whether a draw writes any color channel: CB_TARGET_MASK & CB_SHADER_MASK over the slots with a
+// bound format, as DecodeState counts them (false while either mask is unset).
+bool WritesColor(const Registers& context);
 
 struct ColorMetadataPass {
     enum class Mode { EliminateFastClear, DccDecompress };
