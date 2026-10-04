@@ -486,6 +486,35 @@ void ValidateOutput(void** addr) {
     }
 }
 
+// Releases one piece of a guest allocation that Mutation::Unmap took out of the registry.
+void ReleasePiece(const void* piece, size_t pieceBytes, const void* allocation, bool last) {
+    auto* pieceAddress = const_cast<void*>(piece);
+    std::lock_guard lock(g_directLock);
+    EraseMappings(reinterpret_cast<std::uintptr_t>(piece), reinterpret_cast<std::uintptr_t>(piece) + pieceBytes);
+#if defined(__linux__)
+    Unmap(pieceAddress, pieceBytes);
+#else
+    if (KernelArena::Get().Contains(pieceAddress, pieceBytes)) munmap(pieceAddress, pieceBytes);
+    else if (last) munmap_release(const_cast<void*>(allocation));
+    else munmap(pieceAddress, pieceBytes);
+#endif
+}
+
+// A fixed mapping replaces whatever the range held, as MAP_FIXED does on FreeBSD (Demon's Souls
+// maps over its own live allocations when it loads a level). MAP_NO_OVERWRITE keeps the refusal.
+void ClearFixedRange(GuestAllocations::Mutation& mutation, void* addr, size_t len, int flags) {
+    constexpr int GuestMapNoOverwrite = 0x80;
+    try {
+        mutation.RequireAvailable(addr, len);
+        return;
+    } catch (const std::runtime_error&) {
+        if ((flags & GuestMapNoOverwrite) != 0) throw;
+    }
+    Trace("replace fixed %p+0x%zx", addr, len);
+    mutation.Unmap(addr, len, ReleasePiece);
+    RecordProtection(addr, len, -1);
+}
+
 }
 
 int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
@@ -499,7 +528,7 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
         RecordProtection(*addr, len, prot);
         return 0;
     }
-    if (*addr != nullptr && (flags & GuestMapFixedFlag) != 0) mutation.RequireAvailable(*addr, len);
+    if (*addr != nullptr && (flags & GuestMapFixedFlag) != 0) ClearFixedRange(mutation, *addr, len, flags);
     std::lock_guard lock(g_directLock);
     ValidatePhysicalRange(static_cast<std::uint64_t>(physStart), len);
     void* mapped = MapAligned(*addr, len, PROT_NONE, flags, alignment);
@@ -525,7 +554,7 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags) {
         RecordProtection(*addr, len, prot);
         return 0;
     }
-    if (*addr != nullptr && (flags & GuestMapFixedFlag) != 0) mutation.RequireAvailable(*addr, len);
+    if (*addr != nullptr && (flags & GuestMapFixedFlag) != 0) ClearFixedRange(mutation, *addr, len, flags);
     void* mapped = MapAligned(*addr, len, LinuxProtFromSce(prot), flags, PS5_PAGE_SIZE);
     try {
         mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0);
@@ -572,18 +601,7 @@ int DoMunmap(void* addr, size_t len) {
     Trace("unmap %p+0x%zx", addr, len);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0 || !addr) return SCE_KERNEL_ERROR_EINVAL;
     GuestAllocations::Mutation mutation;
-    mutation.Unmap(addr, len, [&](const void* piece, std::size_t pieceBytes, const void* allocation, bool last) {
-        auto* pieceAddress = const_cast<void*>(piece);
-        std::lock_guard lock(g_directLock);
-        EraseMappings(reinterpret_cast<std::uintptr_t>(piece), reinterpret_cast<std::uintptr_t>(piece) + pieceBytes);
-#if defined(__linux__)
-        Unmap(pieceAddress, pieceBytes);
-#else
-        if (KernelArena::Get().Contains(pieceAddress, pieceBytes)) munmap(pieceAddress, pieceBytes);
-        else if (last) munmap_release(const_cast<void*>(allocation));
-        else munmap(pieceAddress, pieceBytes);
-#endif
-    });
+    mutation.Unmap(addr, len, ReleasePiece);
     RecordProtection(addr, len, -1);
     return 0;
 }
@@ -593,7 +611,7 @@ int DoReserveVirtual(void** addr, size_t len, int flags, size_t alignment) {
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     GuestAllocations::Mutation mutation;
     const bool fixed = *addr != nullptr && (flags & GuestMapFixedFlag) != 0;
-    if (fixed) mutation.RequireAvailable(*addr, len);
+    if (fixed) ClearFixedRange(mutation, *addr, len, flags);
     constexpr int GuestMapNoCoalesce = 0x400000;
     void* mapped = MapAligned(fixed ? *addr : nullptr, len, PROT_NONE, fixed ? GuestMapFixedFlag | (flags & GuestMapNoCoalesce) : 0, alignment);
     try {

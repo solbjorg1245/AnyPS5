@@ -343,8 +343,21 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         for (std::uint32_t key = 0; key < entries; key++) keys[key] = key;
     }
     counters.outOfRange.fetch_add(outOfRange, std::memory_order_relaxed);
+    // A table that selects nothing (or nothing usable) binds null images and an empty mapping:
+    // every key then misses the mapping and samples zeros, as an unbound descriptor does on the
+    // GPU. Demon's Souls dispatches such tables for materials that have no textures yet.
+    const auto bindNullTable = [&] {
+        ResourceMaterializer::CountBindlessRejection(BindlessRejection::NoEntry);
+        DescriptorValue null;
+        null.dwordCount = 8u;
+        null.dwords.fill(0u);
+        resolution.mapping.clear();
+        resolution.slots.assign(slots, null);
+        resolved = null;
+    };
     if (keys.empty()) {
-        rejectTable(BindlessRejection::NoEntry, "bindless image table selects no entry");
+        bindNullTable();
+        return;
     }
 
     const std::uint64_t heapBase = heap.Base48();
@@ -386,7 +399,8 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         valid[i] = 1u;
     }
     if (!shape.has_value()) {
-        rejectTable(BindlessRejection::NoEntry, "bindless image table has no valid entry");
+        bindNullTable();
+        return;
     }
     const auto pad = candidates[static_cast<std::size_t>(std::find(valid.begin(), valid.end(), std::uint8_t{1}) - valid.begin())];
     resolution.mapping.clear();

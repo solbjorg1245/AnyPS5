@@ -16,6 +16,9 @@
 namespace AgcDriver {
 namespace {
 
+// Windows and Linux both keep the lowest 64 KiB of the address space unmapped.
+constexpr std::uint64_t NullPageBytes = 0x10000;
+
 struct CaptureProfile {
     std::atomic<std::uint64_t> captures{0};
     std::atomic<std::uint64_t> reads{0};
@@ -132,6 +135,16 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
             }
         }
         if (next != self.initial.end() && next->first - address < sizeof(*value)) throw std::runtime_error("AGC driver: shader memory read overlaps a snapshot boundary");
+    }
+    // The capture follows every scalar load the shader could make, including ones through a null
+    // table pointer on paths the shader does not take at run time (Demon's Souls reads [null+0x60]
+    // in a compute shader that runs fine on hardware). The null page is never mapped, so such a
+    // load reads zero instead of failing the dispatch.
+    if (address < NullPageBytes) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) std::fprintf(stderr, "[capture] scalar load from the null page at 0x%llx reads zero\n", static_cast<unsigned long long>(address));
+        *value = 0;
+        return true;
     }
     auto& page = self.page(address & ~static_cast<std::uint64_t>(PageBytes - 1));
     const auto index = static_cast<std::size_t>((address % PageBytes) / sizeof(*value));
