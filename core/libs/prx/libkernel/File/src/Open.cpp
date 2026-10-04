@@ -5,6 +5,7 @@
 #include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
+#include "prx/libkernel/File/include/ReadTrace.hpp"
 #include "SceTypes.hpp"
 
 #include <cerrno>
@@ -109,6 +110,7 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
     if (fd < 0) {
         return SceErrorFromErrno(errno);
     }
+    if (File::ReadTraceEnabled()) File::TraceOpen(fd, native.string());
     return fd;
 }
 
@@ -128,6 +130,7 @@ std::int64_t APS5_VABI sceKernelRead(int d, void* buf, std::size_t nbytes) {
     }
     const GuestArena::HostWrite destination(buf, nbytes);
     if (!destination.Open()) errno = EFAULT;
+    if (File::ReadTraceEnabled()) File::TraceReadInto("read", File::TracedPath(d).c_str(), -1, buf, nbytes, __builtin_return_address(0));
     auto n = destination.Open() ? NativeRead(d, buf, nbytes) : -1;
     if (n < 0) {
         throw std::runtime_error(std::string(__func__) + ": read failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));

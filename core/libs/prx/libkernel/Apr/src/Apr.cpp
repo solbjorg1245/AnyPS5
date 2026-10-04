@@ -4,6 +4,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/Apr/include/AprCommandBuffer.hpp"
+#include "prx/libkernel/File/include/ReadTrace.hpp"
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
@@ -146,6 +147,7 @@ void _readFile(const Apr::ReadFileCommand& command) {
     std::ifstream stream(file.path, std::ios::binary);
     if (!stream) throw std::runtime_error("APR: cannot open " + file.path.string());
     stream.seekg(static_cast<std::streamoff>(command.offset));
+    if (File::ReadTraceEnabled()) File::TraceReadInto("apr", file.path.string().c_str(), static_cast<std::int64_t>(command.offset), reinterpret_cast<void*>(command.destination), command.size);
     const GuestArena::HostWrite destination(reinterpret_cast<void*>(command.destination), command.size);
     if (!destination.Open()) throw std::runtime_error("APR: the read destination of " + file.path.string() + " is not writable guest memory");
     stream.read(reinterpret_cast<char*>(command.destination), static_cast<std::streamsize>(command.size));

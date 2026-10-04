@@ -1,4 +1,5 @@
 #include <cstdint>
+#include "prx/libkernel/File/include/ReadTrace.hpp"
 #include <cstddef>
 #include <limits>
 #include "SceTypes.hpp"
@@ -262,6 +263,7 @@ int64_t APS5_VABI pread_nid_postfix(int d, void* buf, size_t nbytes, int64_t off
     }
     const GuestArena::HostWrite destination(buf, nbytes);
     if (!destination.Open()) errno = EFAULT;
+    if (File::ReadTraceEnabled()) File::TraceReadInto("pread", File::TracedPath(d).c_str(), offset, buf, nbytes, __builtin_return_address(0));
     auto n = destination.Open() ? NativePread(d, buf, nbytes, offset) : -1;
     if (n < 0) {
         throw std::runtime_error(std::string(__func__) + ": pread failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));

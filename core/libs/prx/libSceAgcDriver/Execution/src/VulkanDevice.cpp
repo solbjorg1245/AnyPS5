@@ -2439,6 +2439,24 @@ void WatchMemory(std::uint64_t programAddress) {
         contents.insert(contents.end(), bytes, bytes + ranges[i].bytes);
     }
     if (history.empty() || history.back().second != contents) {
+        if (!history.empty()) {
+            const auto& previous = history.back().second;
+            std::size_t changed = 0;
+            std::string where;
+            for (std::size_t offset = 0; offset + 8 <= contents.size() && offset + 8 <= previous.size(); offset += 8) {
+                if (std::memcmp(contents.data() + offset, previous.data() + offset, 8) == 0) continue;
+                if (++changed > 6) continue;
+                std::uint64_t now = 0;
+                std::memcpy(&now, contents.data() + offset, 8);
+                char text[48];
+                std::snprintf(text, sizeof(text), " +0x%zx=%016llx", offset, static_cast<unsigned long long>(now));
+                where += text;
+            }
+            // Bit 63 marks the snapshot taken before a dispatch: a change found there was made after
+            // the previous dispatch finished, by the CPU or by work other than a dispatch.
+            const bool before = (programAddress >> 63u) != 0;
+            std::fprintf(stderr, "[watch] %s dispatch 0x%llx: %zu qwords changed:%s\n", before ? "before" : "after", static_cast<unsigned long long>(programAddress & ~(1ull << 63u)), changed, where.c_str());
+        }
         history.emplace_back(programAddress, std::move(contents));
         if (history.size() > 64) history.pop_front();
     }
@@ -2873,10 +2891,12 @@ std::shared_ptr<RecipeHit> VulkanDevice::PrepareRecipe(const std::shared_ptr<con
 }
 
 void VulkanDevice::Dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipe) {
+    WatchMemory(programAddress | (1ull << 63u));
     static_cast<void>(dispatch(shader, x, y, z, 0, snapshots, programAddress, std::move(prepared), recipe));
 }
 
 VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompiler::RecompileResult& shader, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipe) {
+    WatchMemory(programAddress | (1ull << 63u));
     return dispatch(shader, 0, 0, 0, arguments, snapshots, programAddress, std::move(prepared), recipe);
 }
 
@@ -3349,6 +3369,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
 
 RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, const std::shared_ptr<RecipeHit>& hit, IndirectOutcome& outcome, const std::shared_ptr<PreparedDispatch>& verify, bool refreshByWords) {
     PerformanceTimer timing("Vulkan.DispatchRecipe");
+    WatchMemory(programAddress | (1ull << 63u));
     outcome = {0, 0};
     char groupsText[40];
     if (arguments != 0) std::snprintf(groupsText, sizeof(groupsText), "indirect");

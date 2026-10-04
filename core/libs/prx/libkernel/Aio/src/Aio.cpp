@@ -10,6 +10,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
+#include "prx/libkernel/File/include/ReadTrace.hpp"
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -50,6 +51,7 @@ void SetState(std::int32_t id, std::int32_t state) {
 }
 
 std::int64_t NativePread(std::int32_t fd, void* buf, std::size_t nbyte, std::int64_t offset) {
+    if (File::ReadTraceEnabled()) File::TraceReadInto("aio", File::TracedPath(fd).c_str(), offset, buf, nbyte);
     const GuestArena::HostWrite destination(buf, nbyte);
     if (!destination.Open()) {
         errno = EFAULT;

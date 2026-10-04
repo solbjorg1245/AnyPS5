@@ -108,6 +108,17 @@ void _releaseFlexible(uintptr_t start, size_t len) {
 
 }
 
+
+namespace {
+
+// APS5_TRACE_MEMORY also names the guest code behind each direct mapping.
+void TraceMapCaller(const char* api, const void* caller, void* const* addr, size_t len, int64_t phys) {
+ static const bool enabled = std::getenv("APS5_TRACE_MEMORY") != nullptr;
+ if (enabled) std::fprintf(stderr, "[memory] %s caller %p addr %p len 0x%zx phys 0x%llx\n", api, caller, addr ? *addr : nullptr, len, static_cast<unsigned long long>(phys));
+}
+
+}
+
 extern "C" {
 
 int APS5_VABI sceKernelAllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, size_t alignment, int memory_type, int64_t* phys_addr_out) {
@@ -149,11 +160,13 @@ size_t APS5_VABI sceKernelGetDirectMemorySize(void) {
 
 int APS5_VABI sceKernelMapDirectMemory(void** addr, size_t len, int prot, int flags, int64_t direct_memory_start, size_t alignment) {
  (void)alignment;
+ TraceMapCaller("MapDirectMemory", __builtin_return_address(0), addr, len, direct_memory_start);
  return DoMapDirect(addr, len, prot, flags, direct_memory_start, alignment);
 }
 
 int APS5_VABI sceKernelMapDirectMemory2(void** addr, size_t len, int type, int prot, int flags, int64_t direct_memory_start, size_t alignment) {
  (void)type;
+ TraceMapCaller("MapDirectMemory2", __builtin_return_address(0), addr, len, direct_memory_start);
  return DoMapDirect(addr, len, prot, flags, direct_memory_start, alignment);
 }
 
@@ -382,6 +395,7 @@ int APS5_VABI sceKernelBatchMap2(KernelBatchMapEntry* entries, int num_entries, 
   auto& entry = entries[processed];
   switch (entry.operation) {
   case OpMapDirect:
+   TraceMapCaller("BatchMap", __builtin_return_address(0), &entry.start, entry.length, static_cast<int64_t>(entry.offset));
    result = DoMapDirect(&entry.start, entry.length, static_cast<uint8_t>(entry.protection), flags, static_cast<int64_t>(entry.offset), 0);
    break;
   case OpUnmap:

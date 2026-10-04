@@ -194,11 +194,14 @@ void Driver::execute(const Submission& submission) {
             CaptureTrace::Log("flip frame=%llu submission=%llu offset=%zu batch=%llu unsignaled=%llu", static_cast<unsigned long long>(frameSerial), static_cast<unsigned long long>(submission.serial), cursor, static_cast<unsigned long long>(batchesAtFlip), static_cast<unsigned long long>(unsignaledAtFlip));
             submission.flips.at(cursor)->GpuReady(frame);
         } else if (opcode == 0x15) {
-            timed(&WorkerProfile::dispatchMs, [&] { dispatch(queue, packet, submission); });
+            // A dispatch the driver cannot run is skipped and reported, as a draw is, instead of
+            // ending the process: Demon's Souls issues compute work whose resource tables are not
+            // filled yet (a null SRT, a null texture), which the GPU tolerates.
+            timed(&WorkerProfile::dispatchMs, [&] { tolerate("dispatch", [&] { dispatch(queue, packet, submission); }); });
             Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(false);
         } else if (opcode == 0x16) {
-            timed(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission); });
+            timed(&WorkerProfile::dispatchMs, [&] { tolerate("dispatch", [&] { dispatchIndirect(queue, packet, submission); }); });
             Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(true);
         } else if (opcode == 0x3c || opcode == 0x93) {

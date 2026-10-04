@@ -1128,6 +1128,19 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std:
 }
 
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
+    // Debug aid: APS5_TRACE_GPU_WRITES=<hex address>:<hex bytes> names every GPU write reported in
+    // that range and the driver code that reported it. GPU stores into imported memory bypass CPU
+    // watchpoints, so this is how GPU work that lands in live CPU data is found.
+    static const std::pair<std::uint64_t, std::uint64_t> traced = [] {
+        const char* text = std::getenv("APS5_TRACE_GPU_WRITES");
+        if (text == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0, 0};
+        char* end = nullptr;
+        const auto begin = std::strtoull(text, &end, 16);
+        return std::pair<std::uint64_t, std::uint64_t>{begin, begin + (*end == ':' ? std::strtoull(end + 1, nullptr, 16) : 1ull)};
+    }();
+    if (traced.first != traced.second && address < traced.second && address + bytes > traced.first) {
+        std::fprintf(stderr, "[gpu-writes] 0x%llx+0x%zx reported from +0x%llx\n", static_cast<unsigned long long>(address), bytes, ModuleOffset(__builtin_return_address(0)));
+    }
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
