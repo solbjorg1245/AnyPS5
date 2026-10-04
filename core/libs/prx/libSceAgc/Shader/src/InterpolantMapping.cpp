@@ -11,6 +11,7 @@
 extern "C" {
 
 APS5_EXPORT("HV4j+E0MBHE", sceAgcCreateInterpolantMapping);
+APS5_EXPORT("dbOlWdppb4o", sceAgcCreateInterpolantMapping);
 int APS5_VABI sceAgcCreateInterpolantMapping(ShaderRegister* regs, const Shader* gs, const Shader* ps) {
     constexpr auto fn = __func__;
     if (regs == nullptr) {
@@ -52,6 +53,13 @@ int APS5_VABI sceAgcCreateInterpolantMapping(ShaderRegister* regs, const Shader*
 
     FillIdentityInterpolants(regs, ps->num_input_semantics);
     return 0;
+}
+
+// Rebuilds the SPI_PS_INPUT_CNTL words of an existing mapping for a new shader pair. The mapping
+// is a pure function of the two shaders, so recomputing it yields the updated registers.
+APS5_EXPORT("vieBRwlh1Lw", sceAgcUpdateInterpolantMapping);
+int APS5_VABI sceAgcUpdateInterpolantMapping(ShaderRegister* regs, const Shader* gs, const Shader* ps) {
+    return sceAgcCreateInterpolantMapping(regs, gs, ps);
 }
 
 }

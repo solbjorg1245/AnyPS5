@@ -321,4 +321,15 @@ int APS5_VABI sceKernelIsTrinityMode(void) {
     return 0;
 }
 
+// Reports a standard retail console: mode 2, submode 0.
+int APS5_VABI sceKernelGetOperationMode(int* mode, int* subMode) {
+    if (mode != nullptr) {
+        *mode = 2;
+    }
+    if (subMode != nullptr) {
+        *subMode = 0;
+    }
+    return 0;
+}
+
 }

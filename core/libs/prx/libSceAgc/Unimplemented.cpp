@@ -150,4 +150,12 @@ int APS5_VABI sceAgcUnknown_y5K5tPktiL8() {
  return 0;
 }
 
+
+// Imported by Demon's Souls (PPSA01341) through an unreferenced wrapper; name unknown.
+APS5_EXPORT("v3G+IipShZs", sceAgcUnknown_v3GIipShZs);
+int APS5_VABI sceAgcUnknown_v3GIipShZs() {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
 }

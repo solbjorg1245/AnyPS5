@@ -109,4 +109,12 @@ int APS5_VABI sceAgcDriverUnknown_chJWZcNSzjk() {
  return 0;
 }
 
+
+// Imported by Demon's Souls (PPSA01341) through an unreferenced wrapper; name unknown.
+APS5_EXPORT("JQc0956gCf0", sceAgcDriverUnknown_JQc0956gCf0);
+int APS5_VABI sceAgcDriverUnknown_JQc0956gCf0() {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
 }
