@@ -82,9 +82,21 @@ int main() {
     result.dir_names_num = static_cast<std::uint32_t>(names.size());
     result.infos = infos.data();
     Check(sceSaveDataDirNameSearch(&cond, &result) == 0 && result.set_num == 1, "search finds the save");
-    std::uint64_t sizes[2] = {};
-    std::memcpy(sizes, &infos[0], sizeof(sizes));
-    Check(sizes[0] == 96 && sizes[1] == 94, "search info carries blocks and free blocks");
+    Check(infos[0].blocks == 96 && infos[0].free_blocks == 94, "search info carries blocks and free blocks");
+    // A second save lands 32 bytes after the first name and 48 bytes after the first info, as titles
+    // index the arrays.
+    SaveDataMountResult second{};
+    Check(Mount(Name("GAME1"), MountCreate | MountRdwr, 48, second) == 0, "create a second save");
+    Check(sceSaveDataUmount2(0, &second.mount_point) == 0, "unmount the second save");
+    Check(sizeof(SceSaveDataDirName) == 32 && sizeof(SaveDataSearchInfo) == 48, "search result element sizes");
+    Check(sceSaveDataDirNameSearch(&cond, &result) == 0 && result.set_num == 2, "search finds both saves");
+    const bool firstIsGame0 = std::strcmp(names[0].data, "GAME0") == 0;
+    Check(std::strcmp(names[firstIsGame0 ? 1 : 0].data, "GAME1") == 0, "the second name is where a title reads it");
+    Check(infos[firstIsGame0 ? 1 : 0].blocks == 48, "the second info is where a title reads it");
+    SaveDataDelete delSecond{};
+    const auto gameOne = Name("GAME1");
+    delSecond.dir_name = &gameOne;
+    Check(sceSaveDataDelete(&delSecond) == 0, "delete the second save");
 
     // A save made before sizes were recorded takes the size the title mounts it with.
     std::filesystem::create_directories(std::filesystem::path("_sd") / "OLD0");

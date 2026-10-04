@@ -1337,8 +1337,13 @@ struct SaveDataMountInfo {
 };
 
 struct SceSaveDataTitleId { char data[10]; char pad[2]; };
-struct SceSaveDataDirName { char data[33]; char pad[3]; };
-struct SaveDataSearchInfo { std::uint8_t opaque[128]; };
+// Search results are arrays of these: Demon's Souls walks dir names 32 bytes and infos 48 bytes apart.
+struct SceSaveDataDirName { char data[32]; };
+struct SaveDataSearchInfo {
+    std::uint64_t blocks;
+    std::uint64_t free_blocks;
+    std::uint8_t reserved[32];
+};
 struct SaveDataMemoryData { void* buf; std::size_t buf_size; std::size_t offset; };
 
 struct SaveDataMount3 {

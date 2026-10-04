@@ -318,11 +318,8 @@ static int dirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameS
                 result->params[set] = load_param(entry.path().string());
             }
             if (result->infos != nullptr) {
-                // SaveDataSearchInfo starts with the blocks and free blocks of the save.
-                std::uint64_t sizes[2] = {};
-                describe_blocks(entry.path().string(), &sizes[0], &sizes[1]);
-                std::memset(&result->infos[set], 0, sizeof(result->infos[set]));
-                std::memcpy(&result->infos[set], sizes, sizeof(sizes));
+                result->infos[set] = SaveDataSearchInfo{};
+                describe_blocks(entry.path().string(), &result->infos[set].blocks, &result->infos[set].free_blocks);
             }
             set++;
         }
