@@ -29,10 +29,13 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
     {
         const bool colorWrites = Graphics::WritesColor(queue.context);
         const auto word = [&](std::uint32_t offset) { const auto it = queue.context.find(offset); return it == queue.context.end() ? 0u : it->second; };
-        // A RESUMMARIZE or DECOMPRESS pass (DB_RENDER_CONTROL bits 4 and 12, without clears or
-        // copies) only rebuilds the HTILE metadata of a depth surface. Depth surfaces are
-        // uncompressed host images here, so it changes nothing.
-        if ((word(0x000) & 0x1010u) != 0 && (word(0x000) & 0xfu) == 0 && !colorWrites) return DrawVerdict::Nothing;
+        // A RESUMMARIZE or DECOMPRESS pass (DB_RENDER_CONTROL bits 4 and 12), or an in-place
+        // decompress (the compress-disable bits 5 and 6 with neither test on), without clears,
+        // copies or color writes only rebuilds or expands the HTILE metadata of a depth surface.
+        // Depth surfaces are uncompressed host images here, so it changes nothing.
+        const auto renderControl = word(0x000);
+        const bool metadataPass = (renderControl & 0x1010u) != 0 || ((renderControl & 0x60u) != 0 && (word(0x200) & 3u) == 0);
+        if (metadataPass && (renderControl & 0xfu) == 0 && !colorWrites) return DrawVerdict::Nothing;
         // Without a pixel shader a draw only tests and writes depth/stencil (shadow maps, depth
         // prepasses): it runs with no fragment stage (decodeDraw), or does nothing when neither
         // test is on or no depth/stencil plane is bound.

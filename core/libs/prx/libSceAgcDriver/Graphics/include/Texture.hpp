@@ -58,7 +58,9 @@ public:
     // compute pass writing it and the next pass sampling it share one image and copy nothing.
     // CanCopyFrom says whether the two descriptors address the same surface compatibly.
     Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components);
-    Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components);
+    // A view of layers [baseLayer, baseLayer + layerCount) of a depth surface's image (DepthSurface),
+    // as a 2D array (with a 2D first-layer view) when `array` is set.
+    Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, std::uint32_t baseLayer = 0, std::uint32_t layerCount = 1, bool array = false);
     static bool CanCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
     ~Texture();
     Texture(const Texture&) = delete;

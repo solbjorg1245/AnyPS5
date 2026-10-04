@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <bitset>
 #include <cmath>
@@ -131,8 +132,11 @@ VkStencilOpState stencilFace(std::uint32_t compare, std::uint32_t ops, std::uint
 
 void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result) {
     zero(cx, 0x000, 0x00001f9fu, "depth/stencil clear, copy, resummarize or decompress draws (DB_RENDER_CONTROL)");
+    // DB_DEPTH_VIEW: SLICE_START (bits 0-10, high bits 11-12) is the array slice the draw renders
+    // into; SLICE_MAX (bits 13-23, 30-31) only bounds layered rendering, whose layer exports are
+    // ignored, so such draws land in SLICE_START. MIPID (bits 26-29) is unsupported.
     const auto view = read(cx, 0x002);
-    zero(cx, 0x002, ~0x03000000u, "depth array slices or mips (DB_DEPTH_VIEW)");
+    zero(cx, 0x002, 0x3c000000u, "depth mips (DB_DEPTH_VIEW MIPID)");
     zero(cx, 0x010, 0x000f100cu, "multisampled, partially resident or mipmapped depth (DB_Z_INFO)");
     zero(cx, 0x011, 0x00001000u, "partially resident stencil (DB_STENCIL_INFO)");
     const auto zFormat = read(cx, 0x010) & 3u;
@@ -154,6 +158,7 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     depth.format = zFormat == 1 ? (stencil ? VK_FORMAT_D16_UNORM_S8_UINT : VK_FORMAT_D16_UNORM) : (stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT);
     depth.clearDepth = readFloat(cx, 0x00b);
     depth.clearStencil = static_cast<std::uint8_t>(read(cx, 0x00a) & 0xffu);
+    depth.slice = (view & 0x7ffu) | (((view >> 11u) & 3u) << 11u);
     result.depth = depth;
     result.depthTest = zFormat != 0 && (depthControl & 2u) != 0;
     result.depthWrite = result.depthTest && (depthControl & 4u) != 0 && !depthReadOnly;
@@ -164,6 +169,35 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
         result.stencilFront = stencilFace((depthControl >> 8u) & 7u, ops, read(cx, 0x10c), stencilReadOnly);
         result.stencilBack = (depthControl & 0x80u) != 0 ? stencilFace((depthControl >> 20u) & 7u, ops >> 12u, read(cx, 0x10d), stencilReadOnly) : result.stencilFront;
     }
+}
+
+// PA_SU_SC_MODE_CNTL POLY_OFFSET_FRONT/BACK_ENABLE: the polygon offset of the faces the draw
+// rasterizes, as one Vulkan depth bias. With PA_SU_POLY_OFFSET_DB_FMT_CNTL naming the depth format's
+// own units (-23 bits and float for D32, -16 bits for D16) the offset and clamp registers are
+// Vulkan's constant factor and clamp and the scale is 16x the slope factor, as radv programs them.
+// Shadow passes use it. Two-sided shadow casters give back faces a smaller slope factor than front
+// faces; Vulkan has one bias for both, so they take the front faces' (the faces nearest the light,
+// which decide the shadow map wherever a caster is closed).
+void decodeDepthBias(const Registers& cx, std::uint32_t raster, State& result) {
+    if (!result.depth || !result.depthTest) return;
+    const bool front = (result.cullMode & VK_CULL_MODE_FRONT_BIT) == 0;
+    const bool back = (result.cullMode & VK_CULL_MODE_BACK_BIT) == 0;
+    const bool frontBias = front && (raster & 0x800u) != 0;
+    const bool backBias = back && (raster & 0x1000u) != 0;
+    if (!frontBias && !backBias) return;
+    const bool d16 = result.depth->format == VK_FORMAT_D16_UNORM || result.depth->format == VK_FORMAT_D16_UNORM_S8_UINT;
+    Require((read(cx, 0x2de) & 0x1ffu) == (d16 ? 0x0f0u : 0x1e9u), "depth bias in units other than the depth format's (PA_SU_POLY_OFFSET_DB_FMT_CNTL) is unsupported");
+    const auto scale = readFloat(cx, frontBias ? 0x2e0 : 0x2e2);
+    const auto offset = readFloat(cx, frontBias ? 0x2e1 : 0x2e3);
+    if (front && back && (frontBias != backBias || readFloat(cx, 0x2e2) != scale || readFloat(cx, 0x2e3) != offset)) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) std::fprintf(stderr, "[gpu] two-sided draws with different front and back depth bias take the front faces' (PA_SU_SC_MODE_CNTL=0x%08x)\n", raster);
+    }
+    const auto clamp = find(cx, 0x2df);
+    result.depthBias = true;
+    result.depthBiasConstant = offset;
+    result.depthBiasSlope = scale / 16.0f;
+    result.depthBiasClamp = clamp == cx.end() ? 0.0f : std::bit_cast<float>(clamp->second);
 }
 
 // CB_TARGET_MASK & CB_SHADER_MASK without the slots whose CB_COLOR_INFO format is COLOR_INVALID:
@@ -430,11 +464,13 @@ State DecodeState(const QueueState& queue) {
     result.negativeOneToOne = (read(cx, 0x204) & 0x80000u) == 0;
     const auto raster = read(cx, 0x205);
     // Bits 5-10 give the front/back polygon type (2 = filled triangles), which POLY_MODE (bit 3) turns on
-    // explicitly; KEEP_TOGETHER_ENABLE (bit 24) only affects primitive distribution across the chip.
-    const auto rasterMode = raster & ~0x7u & ~(1u << 24u);
-    Require(rasterMode == 0 || rasterMode == 0x240u || rasterMode == 0x248u, "polygon mode, depth bias, provoking vertex or nonstandard rasterization is unsupported");
+    // explicitly; KEEP_TOGETHER_ENABLE (bit 24) only affects primitive distribution across the chip;
+    // POLY_OFFSET_FRONT/BACK_ENABLE (bits 11, 12) are the depth bias (decodeDepthBias).
+    const auto rasterMode = raster & ~0x7u & ~(1u << 24u) & ~0x1800u;
+    Require(rasterMode == 0 || rasterMode == 0x240u || rasterMode == 0x248u, "polygon mode, provoking vertex or nonstandard rasterization is unsupported");
     result.cullMode = ((raster & 1u) != 0 ? VK_CULL_MODE_FRONT_BIT : 0u) | ((raster & 2u) != 0 ? VK_CULL_MODE_BACK_BIT : 0u);
     if (result.rectList) result.cullMode = VK_CULL_MODE_NONE;
+    decodeDepthBias(cx, raster, result);
     result.frontFace = (raster & 4u) != 0 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
     APS5_LOG_OUT_DEBUG("Raster=0x%x cullMode=0x%x frontFace=%u negativeOneToOne=%u", raster, static_cast<unsigned>(result.cullMode), static_cast<unsigned>(result.frontFace), result.negativeOneToOne ? 1u : 0u);
     const auto shaderMask = read(cx, 0x8f);
@@ -572,8 +608,13 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     // ROUND_MODE (bit 18) only affects unorm rounding. With DCC_ENABLE (bit 28) the target is written
     if ((info & ~(0x00039f7cu | 0x00040000u | 0x10000000u)) != 0) throw std::runtime_error("AGC graphics: color compression, DCC, endian conversion, nonstandard rounding or color optimization is unsupported (CB_COLOR_INFO 0x" + [&] { char text[16]; std::snprintf(text, sizeof(text), "%08x", info); return std::string(text); }() + ")");
     Require((info & 0x8000u) != 0 || number == 7 || number == 4 || number == 5, "unclamped normalized color is unsupported");
+    // CB_COLOR_VIEW SLICE_START (bits 0-12) renders into one slice of an array surface. Its slices are
+    // whole 2D surfaces one after the other, so the draw targets the 2D surface of that slice
+    // (Demon's Souls writes four slices of one R32 array through four MRT slots). SLICE_MAX (bits
+    // 13-25) above SLICE_START would be layered rendering, which is unsupported.
     const auto view = read(cx, 0x31b + stride);
-    Require((view & ~0x3c000000u) == 0, "color array views are unsupported");
+    const auto slice = view & 0x1fffu;
+    Require(((view >> 13u) & 0x1fffu) == slice, "layered color rendering over several array slices is unsupported");
     const auto viewMip = (view >> 26u) & 0xfu;
     zero(cx, 0x31d + stride, ~0u, "color samples, fragments or destination alpha override");
     const auto attrib2 = read(cx, 0x3b0 + slot);
@@ -598,7 +639,8 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
     const auto high = read(cx, 0x390 + slot);
     Require((high & ~0xffu) == 0, "invalid color address extension");
-    color.surfaceAddress = (static_cast<std::uint64_t>(high) << 40u) | (static_cast<std::uint64_t>(read(cx, 0x318 + stride)) << 8u);
+    Require(slice == 0 || maxMip == 0, "slices of mipmapped color arrays are unsupported");
+    color.surfaceAddress = ((static_cast<std::uint64_t>(high) << 40u) | (static_cast<std::uint64_t>(read(cx, 0x318 + stride)) << 8u)) + static_cast<std::uint64_t>(slice) * colorLayout.Bytes();
     color.address = color.surfaceAddress + mipOffset;
     color.bytes = colorLayout.Bytes();
     GuestMemory::CheckRange(reinterpret_cast<const void*>(color.address), color.bytes, colorLayout.Alignment(), true);
@@ -609,6 +651,7 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
         color.clearWords[word] = clear == cx.end() ? 0u : clear->second;
     }
     if ((info & 0x10000000u) != 0) {
+        Require(slice == 0, "DCC keys of color array slices are unsupported");
         if (maxMip == 0) {
             const auto dccHigh = find(cx, 0x3a8 + slot);
             color.dccAddress = ((dccHigh == cx.end() ? 0ull : static_cast<std::uint64_t>(dccHigh->second & 0xffu)) << 40u) | (static_cast<std::uint64_t>(read(cx, 0x325 + stride)) << 8u);

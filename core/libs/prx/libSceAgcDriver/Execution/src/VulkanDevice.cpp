@@ -833,6 +833,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     // PA_CL_CLIP_CNTL near/far clip disable maps to depth clamping.
     enabled.depthClamp = available.depthClamp;
     state->depthClamp = enabled.depthClamp == VK_TRUE;
+    // PA_SU_POLY_OFFSET_CLAMP (shadow-map polygon offset).
+    enabled.depthBiasClamp = available.depthBiasClamp;
     enabled.occlusionQueryPrecise = available.occlusionQueryPrecise;
     state->occlusionQueryPrecise = enabled.occlusionQueryPrecise == VK_TRUE;
     // Recompiled storage-image access declares no format (the guest descriptor decides it).

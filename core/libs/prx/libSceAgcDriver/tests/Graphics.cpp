@@ -474,11 +474,39 @@ void DepthStencilTests() {
     queue.context[0x10c] = 0x01ffff01;
     state = AgcDriver::Graphics::DecodeState(queue);
     Require(state.depth && state.depth->address == 0 && state.depth->stencilAddress == 0x20000 && !state.depthTest && !state.depthWrite && state.stencilTest, "a depth test without a depth plane was not dropped");
+    // The polygon offset of the rasterized faces is the Vulkan depth bias (a shadow pass: back faces
+    // culled, D32 units), and DB_DEPTH_VIEW SLICE_START the slice drawn into.
+    queue.context[0x010] = 0x22900983;
+    queue.context[0x200] = 0x00000066;
+    queue.context[0x205] = 0x01001a4a;
+    queue.context[0x2de] = 0x1e9;
+    queue.context[0x2e0] = std::bit_cast<std::uint32_t>(-120.0f);
+    queue.context[0x2e1] = std::bit_cast<std::uint32_t>(-1.1f);
+    queue.context[0x2e2] = std::bit_cast<std::uint32_t>(-17.6f);
+    queue.context[0x2e3] = std::bit_cast<std::uint32_t>(-1.1f);
+    queue.context[0x002] = 0x00016003;
+    log.clear();
+    AgcDriver::Graphics::RegisterReadLog() = &log;
+    state = AgcDriver::Graphics::DecodeState(queue);
+    AgcDriver::Graphics::RegisterReadLog() = nullptr;
+    for (const auto read : log) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks a depth bias register the decoder reads: " + std::to_string(read.offset));
+    Require(state.depthBias && state.depthBiasConstant == -1.1f && state.depthBiasSlope == -7.5f && state.depthBiasClamp == 0.0f && state.cullMode == VK_CULL_MODE_BACK_BIT, "front-face depth bias decode changed");
+    Require(state.depth->slice == 3, "DB_DEPTH_VIEW SLICE_START was not decoded");
+    queue.context[0x205] = 0x00001a48;
+    state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.depthBias && state.depthBiasSlope == -7.5f && state.cullMode == VK_CULL_MODE_NONE, "a two-sided draw did not take the front faces' depth bias");
+    queue.context[0x205] = 0x00000a4a;
+    queue.context[0x2de] = 0xf0;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "PA_SU_POLY_OFFSET_DB_FMT_CNTL");
+    queue.context[0x205] = 0x240;
+    queue.context[0x002] = 1u << 26u;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "DB_DEPTH_VIEW MIPID");
+    queue.context[0x002] = 0;
     queue = makeState();
     queue.context[0x31b] = 1u << 26u;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "mip exceeds");
     queue.context[0x31b] = 1u << 13u;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "array views");
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "layered color rendering");
 }
 
 alignas(256) std::array<std::uint8_t, 4> dccKeys{};

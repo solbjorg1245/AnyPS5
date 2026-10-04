@@ -153,6 +153,10 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         raster.cullMode = state.cullMode;
         raster.frontFace = state.frontFace;
         raster.lineWidth = 1;
+        raster.depthBiasEnable = state.depth && state.depthBias ? VK_TRUE : VK_FALSE;
+        raster.depthBiasConstantFactor = state.depthBiasConstant;
+        raster.depthBiasSlopeFactor = state.depthBiasSlope;
+        raster.depthBiasClamp = state.depthBiasClamp;
         VkPipelineMultisampleStateCreateInfo samples{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         samples.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
         VkPipelineDepthStencilStateCreateInfo depthStencil{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -350,6 +354,12 @@ std::vector<std::byte> pipelineKey(const Context& context, const State& state, c
         append(key, state.stencilTest);
         append(key, state.stencilFront);
         append(key, state.stencilBack);
+        append(key, state.depthBias);
+        if (state.depthBias) {
+            append(key, state.depthBiasConstant);
+            append(key, state.depthBiasSlope);
+            append(key, state.depthBiasClamp);
+        }
     }
     append(key, state.stages.mesh.has_value());
     if (state.stages.mesh) {
