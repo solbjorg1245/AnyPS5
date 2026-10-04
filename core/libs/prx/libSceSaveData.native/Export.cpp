@@ -153,6 +153,48 @@ bool store_param(const std::string& real_path, const SaveDataParam& param) {
     return write_file_replace(param_path(real_path), bytes);
 }
 
+// The size a save directory was created with, in blocks, kept next to it like its param
+// (<dir>.blocks). Titles budget their saves with what sceSaveDataGetMountInfo reports: Demon's
+// Souls adds blocks << 16 of every mounted save to its quota and refuses to save once the sum
+// passes 1 GiB, which the maximum (32768 blocks) did on its own.
+std::string blocks_path(const std::string& real_path) {
+    return real_path + ".blocks";
+}
+
+bool load_blocks(const std::string& real_path, std::uint64_t* blocks) {
+    std::vector<char> bytes;
+    if (!std::filesystem::exists(blocks_path(real_path)) || !read_file_all(blocks_path(real_path), bytes) || bytes.size() != sizeof(*blocks)) {
+        return false;
+    }
+    std::memcpy(blocks, bytes.data(), sizeof(*blocks));
+    return *blocks != 0 && *blocks <= SAVE_DATA_BLOCKS_MAX;
+}
+
+bool store_blocks(const std::string& real_path, std::uint64_t blocks) {
+    std::vector<char> bytes(sizeof(blocks));
+    std::memcpy(bytes.data(), &blocks, sizeof(blocks));
+    return write_file_replace(blocks_path(real_path), bytes);
+}
+
+std::uint64_t used_blocks(const std::string& real_path) {
+    std::uint64_t bytes = 0;
+    std::error_code ec;
+    for (std::filesystem::recursive_directory_iterator it(real_path, ec), end; !ec && it != end; it.increment(ec)) {
+        if (it->is_regular_file(ec)) bytes += it->file_size(ec);
+    }
+    return (bytes + SAVE_DATA_BLOCK_SIZE - 1) / SAVE_DATA_BLOCK_SIZE;
+}
+
+// A directory without a record (made before records were kept) counts the blocks its files use,
+// at least the minimum a title may create.
+void describe_blocks(const std::string& real_path, std::uint64_t* blocks, std::uint64_t* free_blocks) {
+    const auto used = used_blocks(real_path);
+    if (!load_blocks(real_path, blocks)) {
+        *blocks = std::clamp(used, SAVE_DATA_BLOCKS_MIN, SAVE_DATA_BLOCKS_MAX);
+    }
+    *free_blocks = *blocks > used ? *blocks - used : 0;
+}
+
 struct ParamField {
     std::size_t offset;
     std::size_t size;
@@ -233,6 +275,7 @@ static int deleteSave(const SaveDataDelete* del) {
     }
     std::error_code ec;
     std::filesystem::remove(param_path(path), ec);
+    std::filesystem::remove(blocks_path(path), ec);
     return SAVE_DATA_OK;
 }
 
@@ -274,6 +317,13 @@ static int dirNameSearch(const SaveDataDirNameSearchCond* cond, SaveDataDirNameS
             if (result->params != nullptr) {
                 result->params[set] = load_param(entry.path().string());
             }
+            if (result->infos != nullptr) {
+                // SaveDataSearchInfo starts with the blocks and free blocks of the save.
+                std::uint64_t sizes[2] = {};
+                describe_blocks(entry.path().string(), &sizes[0], &sizes[1]);
+                std::memset(&result->infos[set], 0, sizeof(result->infos[set]));
+                std::memcpy(&result->infos[set], sizes, sizeof(sizes));
+            }
             set++;
         }
     }
@@ -306,12 +356,16 @@ static int getMountInfo(const SaveDataMountPoint* mount_point, SaveDataMountInfo
     if (mount_point == nullptr || info == nullptr) {
         throw std::runtime_error("sceSaveDataGetMountInfo: null argument");
     }
-    if (find_slot_by_mount_point(mount_point->data) == -1) {
+    const int slot = find_slot_by_mount_point(mount_point->data);
+    if (slot == -1) {
         return SAVE_DATA_ERROR_NOT_MOUNTED;
     }
     std::memset(info, 0, sizeof(*info));
-    info->blocks = SAVE_DATA_BLOCKS_MAX;
-    info->free_blocks = SAVE_DATA_BLOCKS_MAX;
+    std::uint64_t blocks = 0;
+    std::uint64_t free_blocks = 0;
+    describe_blocks(g_slots[static_cast<std::size_t>(slot)].real_path, &blocks, &free_blocks);
+    info->blocks = blocks;
+    info->free_blocks = free_blocks;
     return SAVE_DATA_OK;
 }
 
@@ -454,6 +508,13 @@ static int mount3(const SaveDataMount3* mount, SaveDataMountResult* mount_result
     }
     if (create || create2) {
         std::filesystem::create_directories(real_path);
+    }
+    // A save keeps the size it was created with; one made before sizes were recorded takes the size
+    // the title asks for when it mounts it.
+    const bool created = (create || create2) && !exists;
+    std::uint64_t recorded = 0;
+    if (mount->blocks != 0 && mount->blocks <= SAVE_DATA_BLOCKS_MAX && (created || !load_blocks(real_path, &recorded))) {
+        store_blocks(real_path, mount->blocks);
     }
     // The title gets a short mount point (16 bytes on the PS5) and opens files under it; the
     // path resolver maps it to the save directory, whose name may be far longer.
