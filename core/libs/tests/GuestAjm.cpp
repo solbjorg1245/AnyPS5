@@ -15,6 +15,7 @@ int APS5_VABI sceAjmInstanceCreate(std::uint32_t, std::uint32_t, std::uint64_t, 
 int APS5_VABI sceAjmInstanceDestroy(std::uint32_t, std::uint32_t);
 int APS5_VABI sceAjmBatchInitialize(void*, std::size_t, AjmBatchInfo*);
 int APS5_VABI sceAjmBatchJobDecode(AjmBatchInfo*, std::uint32_t, const void*, std::size_t, void*, std::size_t, void*);
+int APS5_VABI sceAjmBatchJobInitialize(AjmBatchInfo*, std::uint32_t, const void*, std::size_t, void*);
 int APS5_VABI sceAjmBatchStart(std::uint32_t, const AjmBatchInfo*, int, AjmBatchError*, std::uint32_t*);
 int APS5_VABI sceAjmBatchWait(std::uint32_t, std::uint32_t, std::uint32_t, AjmBatchError*);
 }
@@ -84,6 +85,87 @@ void TestMp3(std::uint32_t context) {
 
 }
 
+void TestUnsupportedAt9(std::uint32_t context) {
+    constexpr std::uint32_t channels = 16;
+    constexpr std::size_t superframe = 384 * channels;
+    std::uint32_t instance = 0;
+    Require(sceAjmInstanceCreate(context, 1, channels, &instance) == 0);
+    std::vector<std::uint8_t> batch(0x100);
+    const std::uint8_t config[8] = {0x31, 0x73, 0xC1, 0x7E, 0, 0, 0, 0};
+    std::uint32_t id = 0;
+    AjmBatchError error{};
+    {
+        AjmBatchInfo info{};
+        std::int32_t result[2] = {-1, -1};
+        Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+        Require(sceAjmBatchJobInitialize(&info, instance, config, sizeof(config), result) == 0);
+        Require(sceAjmBatchStart(context, &info, 0, &error, &id) == 0 && sceAjmBatchWait(context, id, 0, &error) == 0);
+        Require(result[0] == 0);
+    }
+    std::vector<std::uint8_t> input(superframe * 2 + 100, 0x5A);
+    std::vector<std::int16_t> pcm(1024 * channels, 0x1234);
+    AjmBatchInfo info{};
+    DecodeSideband sideband{};
+    Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+    Require(sceAjmBatchJobDecode(&info, instance, input.data(), input.size(), pcm.data(), pcm.size() * sizeof(std::int16_t), &sideband) == 0);
+    Require(sceAjmBatchStart(context, &info, 0, &error, &id) == 0 && sceAjmBatchWait(context, id, 0, &error) == 0);
+    Require(sideband.result == 0 && sideband.inputConsumed == static_cast<std::int32_t>(superframe));
+    Require(sideband.outputWritten == static_cast<std::int32_t>(pcm.size() * sizeof(std::int16_t)) && sideband.totalDecodedSamples == 1024);
+    for (const std::int16_t sample : pcm) Require(sample == 0);
+    Require(sceAjmInstanceDestroy(context, instance) == 0);
+}
+
+void TestAmbisonicAt9(std::uint32_t context) {
+    // Silent mono frames as stored in the 16-channel ambisonic streams: frame by frame, channel by channel,
+    // each channel's last frame followed by its padding up to 384 bytes.
+    const std::vector<std::uint8_t> frames[4] = {
+        {0x30, 0xE0, 0x1E, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x19, 0xCE, 0x73, 0x9C, 0xE7, 0x3D, 0xEF, 0x7B, 0xDE, 0xF7, 0xA4, 0xDB, 0x49, 0xB6, 0x93, 0x6D, 0x3C, 0x78, 0xF1, 0xE3, 0xC7, 0x51, 0xD4, 0x75, 0x1D, 0x47, 0x50},
+        {0xAC, 0xDC, 0x1E, 0x80, 0x00, 0x00, 0x0C, 0xE7, 0x39, 0xCE, 0x73, 0x9E, 0xF7, 0xBD, 0xEF, 0x7B, 0xD2, 0x6D, 0xA4, 0xDB, 0x49, 0xB6, 0x9E, 0x3C, 0x78, 0xF1, 0xE3, 0xA8, 0xEA, 0x3A, 0x8E, 0xA0},
+        {0xA4, 0xD4, 0x1E, 0x80, 0x00, 0x00, 0x33, 0x9C, 0xE7, 0x39, 0xCE, 0x7B, 0xDE, 0xF7, 0xBD, 0xEF, 0x49, 0xB6, 0x93, 0x6D, 0x26, 0xDA, 0x78, 0xF1, 0xE3, 0xC7, 0x8E, 0xA3, 0xA8},
+        {0xA0, 0xD0, 0x1E, 0x80, 0x00, 0x00, 0x67, 0x39, 0xCE, 0x73, 0x9C, 0xF7, 0xBD, 0xEF, 0x7B, 0xDE, 0x93, 0x6D, 0x26, 0xDA, 0x4D, 0xB4, 0xF1, 0xE3, 0xC7, 0x8F, 0x1D, 0x40},
+    };
+    constexpr std::size_t superframe = 384 * 16;
+    std::vector<std::uint8_t> input;
+    for (const auto& frame : frames) {
+        for (int channel = 0; channel < 16; ++channel) {
+            input.insert(input.end(), frame.begin(), frame.end());
+            if (&frame == &frames[3]) input.insert(input.end(), 384 - (37 + 32 + 29 + 28), 0x01);
+        }
+    }
+    Require(input.size() == superframe);
+
+    std::uint32_t instance = 0;
+    Require(sceAjmInstanceCreate(context, 1, 16, &instance) == 0);
+    std::vector<std::uint8_t> batch(0x100);
+    const std::uint8_t config[8] = {0x30, 0x73, 0xC1, 0x7E, 0, 0, 0, 0};
+    std::uint32_t id = 0;
+    AjmBatchError error{};
+    AjmBatchInfo info{};
+    std::int32_t initResult[2] = {-1, -1};
+    Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+    Require(sceAjmBatchJobInitialize(&info, instance, config, sizeof(config), initResult) == 0);
+    Require(sceAjmBatchStart(context, &info, 0, &error, &id) == 0 && sceAjmBatchWait(context, id, 0, &error) == 0 && initResult[0] == 0);
+
+    const auto decode = [&](const std::vector<std::uint8_t>& bytes, std::vector<std::int16_t>& pcm) {
+        DecodeSideband sideband{};
+        AjmBatchInfo run{};
+        Require(sceAjmBatchInitialize(batch.data(), batch.size(), &run) == 0);
+        Require(sceAjmBatchJobDecode(&run, instance, bytes.data(), bytes.size(), pcm.data(), pcm.size() * sizeof(std::int16_t), &sideband) == 0);
+        Require(sceAjmBatchStart(context, &run, 0, &error, &id) == 0 && sceAjmBatchWait(context, id, 0, &error) == 0);
+        return sideband;
+    };
+    std::vector<std::int16_t> pcm(1024 * 16, 0x1234);
+    auto sideband = decode(input, pcm);
+    Require(sideband.result == 0 && sideband.inputConsumed == static_cast<std::int32_t>(superframe));
+    Require(sideband.outputWritten == static_cast<std::int32_t>(pcm.size() * sizeof(std::int16_t)) && sideband.totalDecodedSamples == 1024);
+    for (const std::int16_t sample : pcm) Require(sample == 0);
+
+    std::vector<std::uint8_t> garbage(superframe, 0xFF);
+    sideband = decode(garbage, pcm);
+    Require((sideband.result & 2) != 0);
+    Require(sceAjmInstanceDestroy(context, instance) == 0);
+}
+
 int main() {
     constexpr int invalidParameter = static_cast<int>(0x80930005);
     std::uint32_t context = 0;
@@ -99,5 +181,7 @@ int main() {
     Require(sceAjmDecAt9ParseConfigData(badHeader, &info) == invalidParameter);
     Require(sceAjmDecAt9ParseConfigData(nullptr, &info) == invalidParameter);
     TestMp3(context);
+    TestUnsupportedAt9(context);
+    TestAmbisonicAt9(context);
     Require(sceAjmFinalize(context) == 0);
 }

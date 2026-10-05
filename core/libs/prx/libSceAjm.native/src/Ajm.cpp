@@ -97,6 +97,11 @@ struct Instance {
     std::uint64_t totalDecodedSamples = 0;
     SidebandGaplessDecode gapless{};
     bool flagsReported = false;
+    bool silent = false;
+    std::uint32_t silentChannels = 0;
+    std::uint32_t silentRate = 48000;
+    std::uint32_t silentSuperframeBytes = 0;
+    std::vector<void*> substreams;
     AVCodecContext* mp3 = nullptr;
     std::uint32_t mp3Channels = 0;
     std::uint32_t mp3SampleRate = 0;
@@ -104,6 +109,7 @@ struct Instance {
 
     ~Instance() {
         if (decoder) Atrac9ReleaseHandle(decoder);
+        for (void* handle : substreams) Atrac9ReleaseHandle(handle);
         if (mp3) avcodec_free_context(&mp3);
     }
 };
@@ -212,6 +218,103 @@ bool ResetDecoder(Instance& instance) {
     return Atrac9InitDecoder(instance.decoder, config) == 0;
 }
 
+// PS5 third-order ambisonic streams (the cutscene *_3oa.at9 files) carry a 16-channel config that
+// starts with 0x30 instead of 0xFE: every one of the files has 30 73 c1 7e. Their 6144-byte superframe
+// holds sixteen mono ATRAC9 streams of 384 bytes each (the config of the stand-alone mono files is
+// fe 70 0b f0). The four frames of each superframe are stored frame by frame, the sixteen channels'
+// frames back to back in channel order; the bytes a channel did not use in its 384 follow its fourth
+// frame as padding. The channels are decoded by one mono decoder each and written interleaved.
+constexpr std::uint8_t AMBISONIC_CONFIG[ATRAC9_CONFIG_DATA_SIZE] = {0x30, 0x73, 0xC1, 0x7E};
+constexpr std::uint32_t AMBISONIC_CHANNELS = 16;
+constexpr std::uint32_t SUBSTREAM_FRAMES = 4;
+constexpr std::uint32_t SUBSTREAM_FRAME_SAMPLES = 256;
+constexpr std::uint32_t SUBSTREAM_BYTES = 384;
+
+bool ResetSubstreams(Instance& instance) {
+    for (void* handle : instance.substreams) Atrac9ReleaseHandle(handle);
+    instance.substreams.clear();
+    instance.superframeRemaining = 0;
+    instance.frameInSuperframe = 0;
+    unsigned char mono[ATRAC9_CONFIG_DATA_SIZE] = {0xFE, static_cast<unsigned char>(instance.info.configData[1] & 0xF0u), 0x0B, 0xF0};
+    for (std::uint32_t channel = 0; channel < instance.silentChannels; ++channel) {
+        void* handle = Atrac9GetHandle();
+        instance.substreams.push_back(handle);
+        if (Atrac9InitDecoder(handle, mono) != 0) return false;
+    }
+    return true;
+}
+
+// Decodes one 6144-byte superframe into frameSamples * channels interleaved samples of the instance's
+// PCM encoding. Returns the first decoder error, or 0.
+int DecodeSubstreams(Instance& instance, const std::uint8_t* input, std::uint8_t* pcm, std::uint32_t encoding, std::size_t sampleBytes) {
+    const std::size_t channels = instance.substreams.size();
+    std::size_t offset = 0;
+    std::size_t used[AMBISONIC_CHANNELS] = {};
+    for (std::uint32_t frame = 0; frame < SUBSTREAM_FRAMES; ++frame) {
+        for (std::size_t channel = 0; channel < channels; ++channel) {
+            std::uint8_t samples[SUBSTREAM_FRAME_SAMPLES * sizeof(float)];
+            int frameBytes = 0;
+            int status;
+            switch (encoding) {
+            case 0: status = Atrac9Decode(instance.substreams[channel], input + offset, reinterpret_cast<short*>(samples), &frameBytes, 0); break;
+            case 1: status = Atrac9DecodeS32(instance.substreams[channel], input + offset, reinterpret_cast<int*>(samples), &frameBytes, 0); break;
+            default: status = Atrac9DecodeF32(instance.substreams[channel], input + offset, reinterpret_cast<float*>(samples), &frameBytes, 0); break;
+            }
+            if (status != 0 || frameBytes <= 0 || offset + static_cast<std::size_t>(frameBytes) > SUBSTREAM_BYTES * channels) return status != 0 ? status : -1;
+            for (std::size_t i = 0; i < SUBSTREAM_FRAME_SAMPLES; ++i) {
+                std::memcpy(pcm + ((frame * SUBSTREAM_FRAME_SAMPLES + i) * channels + channel) * sampleBytes, samples + i * sampleBytes, sampleBytes);
+            }
+            offset += static_cast<std::size_t>(frameBytes);
+            used[channel] += static_cast<std::size_t>(frameBytes);
+            if (frame == SUBSTREAM_FRAMES - 1) {
+                if (used[channel] > SUBSTREAM_BYTES) return -1;
+                offset += SUBSTREAM_BYTES - used[channel];
+            }
+        }
+    }
+    return 0;
+}
+
+// PS5 title streams can carry configurations LibAtrac9 cannot decode, for example the 16-channel
+// third-order ambisonic files whose config does not start with 0xFE. Such an instance is kept in a
+// silent mode: runs succeed, consume one superframe and produce silence. The superframe is 1024
+// samples and 384 bytes per channel, which matches the block align of those files (16 channels, 6144).
+constexpr std::uint32_t SILENT_SUPERFRAME_SAMPLES = 1024;
+constexpr std::uint32_t SILENT_BYTES_PER_CHANNEL = 384;
+constexpr std::uint32_t AT9_SAMPLE_RATES[16] = {11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 44100, 48000, 64000, 88200, 96000, 128000, 176400, 192000};
+
+void EnterSilentMode(Instance& instance, const std::uint8_t* parameters, std::uint64_t size) {
+    std::uint8_t config[ATRAC9_CONFIG_DATA_SIZE] = {};
+    std::memcpy(config, parameters, std::min<std::uint64_t>(size, sizeof(config)));
+    const std::uint32_t flagChannels = static_cast<std::uint32_t>(instance.flags & 0x7fu);
+    instance.silent = true;
+    instance.silentChannels = flagChannels >= 1 && flagChannels <= 16 ? flagChannels : 16;
+    instance.silentRate = size >= 2 ? AT9_SAMPLE_RATES[config[1] >> 4] : 48000;
+    instance.silentSuperframeBytes = SILENT_BYTES_PER_CHANNEL * instance.silentChannels;
+    instance.info = {};
+    instance.info.channels = static_cast<int>(instance.silentChannels);
+    instance.info.samplingRate = static_cast<int>(instance.silentRate);
+    instance.info.frameSamples = static_cast<int>(SILENT_SUPERFRAME_SAMPLES);
+    instance.info.framesInSuperframe = 1;
+    instance.info.superframeSize = static_cast<int>(instance.silentSuperframeBytes);
+    instance.initialized = true;
+    instance.totalDecodedSamples = 0;
+    instance.gapless = {};
+    instance.superframeRemaining = 0;
+    instance.frameInSuperframe = 0;
+    static std::mutex noticeLock;
+    static std::vector<std::uint32_t> noticed;
+    const std::uint32_t key = std::uint32_t{config[0]} | std::uint32_t{config[1]} << 8 | std::uint32_t{config[2]} << 16 | std::uint32_t{config[3]} << 24;
+    bool first;
+    {
+        std::lock_guard lock(noticeLock);
+        first = std::find(noticed.begin(), noticed.end(), key) == noticed.end();
+        if (first) noticed.push_back(key);
+    }
+    if (first) std::fprintf(stderr, "[ajm] unsupported ATRAC9 config %02x %02x %02x %02x (%u ch): decoding as silence\n", config[0], config[1], config[2], config[3], instance.silentChannels);
+    AJM_TRACE("[ajm] silent ATRAC9: %u channels, %u Hz, superframe %u bytes\n", instance.silentChannels, instance.silentRate, instance.silentSuperframeBytes);
+}
+
 std::int32_t InitializeInstance(Instance& instance, const std::uint8_t* parameters, std::uint64_t size) {
     if (instance.codec != CODEC_AT9) {
         instance.initialized = true;
@@ -219,9 +322,34 @@ std::int32_t InitializeInstance(Instance& instance, const std::uint8_t* paramete
     }
     if (size < ATRAC9_CONFIG_DATA_SIZE) return AJM_RESULT_INVALID_PARAMETER;
     std::memcpy(instance.info.configData, parameters, ATRAC9_CONFIG_DATA_SIZE);
+    instance.silent = false;
+    for (void* handle : instance.substreams) Atrac9ReleaseHandle(handle);
+    instance.substreams.clear();
+    if (size >= ATRAC9_CONFIG_DATA_SIZE && std::memcmp(parameters, AMBISONIC_CONFIG, sizeof(AMBISONIC_CONFIG)) == 0) {
+        instance.silent = true;
+        instance.silentChannels = AMBISONIC_CHANNELS;
+        instance.silentRate = AT9_SAMPLE_RATES[parameters[1] >> 4];
+        instance.silentSuperframeBytes = SUBSTREAM_BYTES * AMBISONIC_CHANNELS;
+        instance.info = {};
+        std::memcpy(instance.info.configData, parameters, ATRAC9_CONFIG_DATA_SIZE);
+        instance.info.channels = static_cast<int>(AMBISONIC_CHANNELS);
+        instance.info.samplingRate = static_cast<int>(instance.silentRate);
+        instance.info.frameSamples = static_cast<int>(SUBSTREAM_FRAMES * SUBSTREAM_FRAME_SAMPLES);
+        instance.info.framesInSuperframe = 1;
+        instance.info.superframeSize = static_cast<int>(instance.silentSuperframeBytes);
+        if (ResetSubstreams(instance)) {
+            instance.initialized = true;
+            instance.totalDecodedSamples = 0;
+            instance.gapless = {};
+            AJM_TRACE("[ajm] ambisonic ATRAC9: %u mono substreams, %u Hz, superframe %u bytes\n", AMBISONIC_CHANNELS, instance.silentRate, instance.silentSuperframeBytes);
+            return 0;
+        }
+        for (void* handle : instance.substreams) Atrac9ReleaseHandle(handle);
+        instance.substreams.clear();
+    }
     if (!ResetDecoder(instance)) {
-        instance.initialized = false;
-        return AJM_RESULT_INVALID_PARAMETER;
+        EnterSilentMode(instance, parameters, size);
+        return 0;
     }
     Atrac9GetCodecInfo(instance.decoder, &instance.info);
     instance.initialized = true;
@@ -345,6 +473,7 @@ void RunAt9(Instance& instance, const JobHeader& job, const AjmBuffer* inputs, c
     static const bool traceFlags = std::getenv("APS5_TRACE_AJM") != nullptr;
     if (traceFlags && instance.totalDecodedSamples == 0 && consumedFirstRun(instance)) std::fprintf(stderr, "[ajm] instance %u flags 0x%llx (encoding %u)\n", job.instance, static_cast<unsigned long long>(instance.flags), encoding);
 
+    const bool silent = instance.silent;
     std::int32_t result = 0;
     int decodeStatus = 0;
     std::size_t consumed = 0;
@@ -374,7 +503,11 @@ void RunAt9(Instance& instance, const JobHeader& job, const AjmBuffer* inputs, c
             instance.frameInSuperframe = 0;
         }
         int used = 0;
-        switch (encoding) {
+        if (silent) {
+            used = static_cast<int>(superframeSize);
+            std::fill(pcm.begin(), pcm.end(), std::uint8_t{0});
+            if (!instance.substreams.empty()) decodeStatus = DecodeSubstreams(instance, input.data() + consumed, pcm.data(), encoding, sampleBytes);
+        } else switch (encoding) {
         case 0: decodeStatus = Atrac9Decode(instance.decoder, input.data() + consumed, reinterpret_cast<short*>(pcm.data()), &used, 0); break;
         case 1: decodeStatus = Atrac9DecodeS32(instance.decoder, input.data() + consumed, reinterpret_cast<int*>(pcm.data()), &used, 0); break;
         default: decodeStatus = Atrac9DecodeF32(instance.decoder, input.data() + consumed, reinterpret_cast<float*>(pcm.data()), &used, 0); break;
@@ -382,7 +515,11 @@ void RunAt9(Instance& instance, const JobHeader& job, const AjmBuffer* inputs, c
         if (decodeStatus != 0 || used <= 0 || static_cast<std::uint32_t>(used) > instance.superframeRemaining) {
             result |= AJM_RESULT_INVALID_DATA;
             // The decoder tracks its position in the superframe; a fresh one starts the next superframe.
-            ResetDecoder(instance);
+            if (silent) {
+                if (!instance.substreams.empty()) ResetSubstreams(instance);
+            } else {
+                ResetDecoder(instance);
+            }
             break;
         }
         consumed += static_cast<std::size_t>(used);
@@ -545,7 +682,11 @@ void Execute(const JobHeader& job, const AjmBuffer* inputs, const AjmBuffer* out
         AJM_TRACE("[ajm] instance %u clear context (sideband %llu bytes)\n", job.instance, static_cast<unsigned long long>(job.sidebandSize));
         instance->totalDecodedSamples = 0;
         instance->gapless.skippedSamples = 0;
-        if (instance->decoder && instance->initialized) ResetDecoder(*instance);
+        if (instance->silent) {
+            if (!instance->substreams.empty()) ResetSubstreams(*instance);
+        } else if (instance->decoder && instance->initialized) {
+            ResetDecoder(*instance);
+        }
         if (instance->mp3) avcodec_flush_buffers(instance->mp3);
         WriteResult(job.sideband, job.sidebandSize, 0);
         break;
