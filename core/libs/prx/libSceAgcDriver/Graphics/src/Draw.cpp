@@ -254,6 +254,10 @@ struct DrawProfile {
     // Which key words the misses differ in is the cache's own "[rescache] miss churn" line
     // (ResourceCache::noteMiss compares each miss with the last key of the same variants).
     std::uint64_t cacheHits = 0;
+    // Of the hits, those whose read-only buffers moved (rebased), and templates passed over
+    // because a moved range was not readable on the CPU (counted as misses too).
+    std::uint64_t cacheRebased = 0;
+    std::uint64_t cacheRebaseRefused = 0;
     std::uint64_t cacheMisses = 0;
     std::uint64_t cacheInvalidated = 0;
     std::uint64_t uncacheable = 0;
@@ -372,7 +376,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     std::fprintf(stderr, "%s\n", line);
-    std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
+    std::fprintf(stderr, "[rescache] draws: %llu hits (%llu rebased), %llu misses (%llu rebase refused), %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheRebased), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheRebaseRefused), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     profile.totalsUs.fill(0);
     profile.maxUs.fill(0);
     profile.maxDrawUs = profile.hookWaitUs = profile.maxHookWaitUs = profile.ownSyncUs = 0;
@@ -388,7 +392,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.lookupUs = 0;
     profile.kindUs.fill(0);
     profile.kindCounts.fill(0);
-    profile.cacheHits = profile.cacheMisses = profile.cacheInvalidated = profile.uncacheable = 0;
+    profile.cacheHits = profile.cacheRebased = profile.cacheRebaseRefused = profile.cacheMisses = profile.cacheInvalidated = profile.uncacheable = 0;
     profile.validateHits = profile.validateMisses = 0;
     profile.recipeHits = 0;
     profile.recipeMisses.fill(0);
@@ -538,6 +542,11 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
 // draw), so a target or index ring that moves per frame does not miss on every draw. That guards a
 // workload with such rings; in the profiled menu stage every draw was DRAW_INDEX_AUTO (index range
 // 0) onto one fixed target, so its misses come from the stages' descriptor words themselves.
+bool RebasedTemplates() {
+    static const bool enabled = std::getenv("APS5_NO_REBASED_TEMPLATES") == nullptr;
+    return enabled;
+}
+
 ResourceCache::Key DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges) {
     ResourceCache::Key key{0xffffffffu};
     const auto append64 = [&](std::uint64_t value) {
@@ -546,8 +555,11 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
     };
     append64(reinterpret_cast<std::uint64_t>(context.device));
     key.push_back(static_cast<std::uint32_t>(shaders.size()));
+    // Read-only guest buffer bases stay out of the key (rebased templates, see
+    // ShaderResources::RebaseEligible); APS5_NO_REBASED_TEMPLATES=1 keys them as before.
+    static const bool rebase = RebasedTemplates();
     for (const auto& shader : shaders) {
-        const auto part = ShaderResources::ContentKey(shader);
+        const auto part = ShaderResources::ContentKey(shader, true, rebase);
         key.push_back(static_cast<std::uint32_t>(part.size()));
         key.insert(key.end(), part.begin(), part.end());
     }
@@ -882,7 +894,7 @@ struct ResolvedResources {
     const ShaderResources::BuildTiming* built = nullptr;
 };
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer) {
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, const Recorder* recorder, DrawOutcome& outcome, DrawTimer& timer) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
@@ -900,11 +912,16 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     if (resolved.cacheable) {
         resolved.contentKey = DrawResourceKey(context, shaders, state.color, draw.indexAddress, indexBytes, !trimKey);
         if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
-            if (cached->Revalidate(shaders)) {
+            bool rebased = false;
+            if (recorder != nullptr && !cached->RebaseEligible(shaders, *recorder, rebased)) {
+                // Still valid for draws at its own addresses: the fresh build below replaces it.
+                countCache(&DrawProfile::cacheRebaseRefused);
+            } else if (cached->Revalidate(shaders)) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
                 resolved.resources = std::move(cached);
                 outcome.kind = KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
+                if (rebased) countCache(&DrawProfile::cacheRebased);
             } else {
                 SharedResourceCache().Remove(resolved.contentKey);
                 countCache(&DrawProfile::cacheInvalidated);
@@ -1254,7 +1271,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
-    const auto drawBindings = resources.PrepareDrawBindings(*recorder);
+    const auto drawBindings = resources.PrepareDrawBindings(*recorder, shaders);
     const bool capture = CaptureInputsEnabled();
     const bool continued = !capture && !readsTarget && !gpuIndirect && recorder->ContinuesRenderPass(passKey);
     outcome.passContinued = continued;
@@ -1482,7 +1499,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const bool recordDraws = RecordDraws();
     auto* recorder = Recorder::Active();
     const bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr; });
-    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
+    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, recorder, outcome, timer);
     auto& resources = resolved.resources;
     const auto& contentKey = resolved.contentKey;
     const bool cacheable = resolved.cacheable;
@@ -1924,7 +1941,8 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     if (resources == nullptr) return miss(DrawRecipeMiss::TemplateGone);
     Require(resources->Reusable(), "draw recipe over a non-reusable template");
     const auto proofStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const bool proved = resources->ProveCurrent(shaders, &result.proof);
+    bool rebased = false;
+    const bool proved = resources->RebaseEligible(shaders, *recorder, rebased) && resources->ProveCurrent(shaders, &result.proof);
     if (profile) result.proofUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - proofStart).count();
     if (!proved) {
         SharedResourceCache().Remove(recipe.key, resources.get());

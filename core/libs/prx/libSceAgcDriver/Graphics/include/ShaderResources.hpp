@@ -115,7 +115,18 @@ public:
         std::vector<Snapshot> snapshots;
         ~DrawBindings();
     };
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder) const;
+    // With `shaders` (the draw's own stages, which may be a rebased hit, see RebaseEligible), each
+    // read-only guest buffer is snapshot from the address the draw's descriptor names, which can
+    // differ from the one the object was built for.
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const CompiledShader> shaders = {}) const;
+    // Rebased draw templates (ContentKey with `rebaseReadOnly`): a draw key leaves the base address
+    // of read-only guest buffers out, since ring-allocated constants move every frame; a hit then
+    // snapshots each moved buffer from the draw's address into its own descriptor set copy
+    // (PrepareDrawBindings). Whether this object can serve `shaders` that way: every moved
+    // element is a read-only buffer the object snapshots, and its new range is readable on the
+    // CPU now (accessible, no pending GPU write or storage result, no queued store, not written by
+    // this object). `rebased` says whether any element moved.
+    bool RebaseEligible(std::span<const CompiledShader> shaders, const Recorder& recorder, bool& rebased) const;
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
     // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs
@@ -156,7 +167,9 @@ public:
     // Without `dataWords` the ShaderData and FlattenedSrt descriptor words stay out of the key
     // (their count and size remain): a compute template then serves dispatches whose constants
     // differ, and the hit refreshes its data buffers with the dispatch's words (RefreshData).
-    static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true);
+    // With `rebaseReadOnly` the base address of read-only guest buffer elements stays out (only
+    // whether it is null remains): see RebaseEligible.
+    static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool rebaseReadOnly = false);
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers
     // (vkCmdUpdateBuffer, a transfer write the caller's pre-dispatch barrier makes visible; a
     // buffer already holding the words is left alone). Returns whether anything was recorded. With
@@ -245,6 +258,11 @@ private:
         std::int32_t pushByte = -1;
         std::int64_t dataAllocation = -1;
         std::uint32_t dataByte = 0;
+        // Guest buffers: where the descriptor came from (stage index in build order, binding index
+        // in its program, element), so a rebased hit reads the draw's own words (RebaseEligible).
+        std::int32_t sourceShader = -1;
+        std::uint32_t sourceBinding = 0;
+        std::uint32_t sourceElement = 0;
     };
     struct DataPatch {
         std::size_t allocation;

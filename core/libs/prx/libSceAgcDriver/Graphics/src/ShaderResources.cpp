@@ -960,6 +960,9 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                         const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
                         const bool atomic = element < binding.bufferAtomic.size() && binding.bufferAtomic[element];
                         const auto index = addGuestBuffer(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4), target, indexAddress, indexBytes, written, atomic);
+                        allocations[index].sourceShader = static_cast<std::int32_t>(&shader - shaders.data());
+                        allocations[index].sourceBinding = static_cast<std::uint32_t>(&binding - shader.program->bindings.data());
+                        allocations[index].sourceElement = element;
                         const auto& push = shader.program->pushConstants;
                         if (!push.empty()) {
                             const auto position = shader.program->memoryOffsetDword * 4u + element;
@@ -978,6 +981,8 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                     Require(binding.count == 1, "shader data and flattened SRT descriptors must not be arrays");
                     Require(!binding.guestDescriptor.empty(), "empty shader data descriptor");
                     item.allocations.push_back(addDataBuffer(binding.guestDescriptor));
+                    allocations[item.allocations.back()].sourceShader = static_cast<std::int32_t>(&shader - shaders.data());
+                    allocations[item.allocations.back()].sourceBinding = static_cast<std::uint32_t>(&binding - shader.program->bindings.data());
                     if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData) shaderData = static_cast<std::int64_t>(item.allocations.back());
                 }
                 bindings.push_back(std::move(item));
@@ -1205,7 +1210,7 @@ void ShaderResources::reportDescriptorCaches() const {
     std::fprintf(stderr, "[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools, samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
 }
 
-std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords) {
+std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool rebaseReadOnly) {
     Require(shader.program != nullptr, "missing compiled shader");
     const auto& program = *shader.program;
     std::vector<std::uint32_t> key;
@@ -1228,7 +1233,25 @@ std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& sha
     };
     for (const auto& binding : program.bindings) {
         key.insert(key.end(), {static_cast<std::uint32_t>(binding.kind), static_cast<std::uint32_t>(binding.role), binding.descriptorSet, binding.binding, binding.count, binding.readOnly ? 1u : 0u, binding.imageShape.has_value() ? static_cast<std::uint32_t>(*binding.imageShape) + 1u : 0u, static_cast<std::uint32_t>(binding.guestDescriptor.size())});
-        if (dataWords || !DataRole(binding.role)) key.insert(key.end(), binding.guestDescriptor.begin(), binding.guestDescriptor.end());
+        if (rebaseReadOnly && binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
+            const auto start = key.size();
+            key.insert(key.end(), binding.guestDescriptor.begin(), binding.guestDescriptor.end());
+            for (std::size_t offset = 0; offset + 4 <= binding.guestDescriptor.size(); offset += 4) {
+                const auto element = offset / 4;
+                const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+                if (written) continue;
+                auto* words = key.data() + start + offset;
+                const bool null = words[0] == 0 && (words[1] & 0xffffu) == 0;
+                words[0] = null ? 0u : 1u;
+                words[1] &= ~0xffffu;
+                // The size too: the draw's descriptor copy takes the snapshot's own range.
+                words[2] = words[2] == 0 ? 0u : 1u;
+            }
+        } else if ((dataWords && !rebaseReadOnly) || !DataRole(binding.role)) {
+            // Rebased draw keys leave the data words out as well: a hit binds a data buffer copy
+            // holding the draw's own words (PrepareDrawBindings).
+            key.insert(key.end(), binding.guestDescriptor.begin(), binding.guestDescriptor.end());
+        }
         packBits(binding.imageWritten);
         packBits(binding.samplerDepthCompare);
         packBits(binding.imageDepthCompare);
@@ -2671,18 +2694,109 @@ ShaderResources::DrawBindings::~DrawBindings() {
     if (cache != nullptr && allocation.set != VK_NULL_HANDLE) cache->Free(allocation);
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder) const {
+namespace {
+
+// The descriptor words of a built object's binding as the draw's own stages give them (its source,
+// see ShaderResources::Allocation); empty when the stages do not name it.
+std::span<const std::uint32_t> SourceWords(std::span<const CompiledShader> shaders, std::int32_t shader, std::uint32_t binding) {
+    if (shader < 0 || static_cast<std::size_t>(shader) >= shaders.size() || shaders[static_cast<std::size_t>(shader)].program == nullptr) return {};
+    const auto& bindings = shaders[static_cast<std::size_t>(shader)].program->bindings;
+    if (binding >= bindings.size()) return {};
+    return bindings[binding].guestDescriptor;
+}
+
+// The range a draw's own descriptor gives a guest buffer element, or `fallback` (the built one).
+std::pair<std::uint64_t, std::uint64_t> SourceRange(std::span<const CompiledShader> shaders, std::int32_t shader, std::uint32_t binding, std::uint32_t element, std::pair<std::uint64_t, std::uint64_t> fallback) {
+    const auto words = SourceWords(shaders, shader, binding);
+    const auto offset = static_cast<std::size_t>(element) * 4;
+    if (offset + 4 > words.size()) return fallback;
+    const ShaderRecompiler::ShaderBufferResource descriptor{{words[offset], words[offset + 1], words[offset + 2], words[offset + 3]}};
+    if (descriptor.GetSize() == 0 || descriptor.Base48() == 0) return {0, 0};
+    return {descriptor.Base48(), descriptor.GetSize()};
+}
+
+// Whether a data allocation's words differ from the draw's own (rebased hits). An allocation the
+// stages do not name compares equal; one without recorded words differs as `unknown`.
+bool DataMoved(std::span<const CompiledShader> shaders, std::int32_t shader, std::uint32_t binding, const std::vector<std::uint32_t>& built, bool& unknown) {
+    unknown = false;
+    const auto words = SourceWords(shaders, shader, binding);
+    if (words.empty()) return false;
+    if (built.empty()) {
+        unknown = true;
+        return true;
+    }
+    return words.size() != built.size() || !std::equal(words.begin(), words.end(), built.begin());
+}
+
+}
+
+bool ShaderResources::RebaseEligible(std::span<const CompiledShader> shaders, const Recorder& recorder, bool& rebased) const {
+    rebased = false;
+    if (_set == VK_NULL_HANDLE || usesBda) return true;
+    const auto reads = guestMemory.InPlaceReads();
+    for (const auto& item : allocations) {
+        if (!item.guest) {
+            if (item.buffer == nullptr || !DataRole(item.role)) continue;
+            bool unknown = false;
+            if (!DataMoved(shaders, item.sourceShader, item.sourceBinding, item.dataWords, unknown)) continue;
+            rebased = true;
+            if (unknown || SourceWords(shaders, item.sourceShader, item.sourceBinding).size() * sizeof(std::uint32_t) != item.size) return false;
+            continue;
+        }
+        const auto [address, size] = SourceRange(shaders, item.sourceShader, item.sourceBinding, item.sourceElement, {item.address, item.size});
+        if (address == item.address && size == item.size) continue;
+        rebased = true;
+        // Only an element PrepareDrawBindings would snapshot at its built address can move.
+        if (item.written || address == 0 || item.address == 0 || address < item.adjustment) return false;
+        if (size + item.adjustment > context.limits.maxStorageBufferRange) return false;
+        if (guestMemory.WritesOverlap(item.address, item.size)) return false;
+        const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
+        if (!direct) return false;
+        const auto begin = address - item.adjustment;
+        const auto bytes = static_cast<std::size_t>(size) + item.adjustment;
+        if (guestMemory.WritesOverlap(begin, bytes)) return false;
+        if (Recorder::SnapshotWriteOverlaps(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes)) return false;
+        if (recorder.QueuedStoreOverlaps(begin, bytes) || recorder.QueuedKeyStoreOverlaps(begin, bytes)) return false;
+        if (PendingStorageOverlaps(begin, bytes, nullptr)) return false;
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return false;
+    }
+    return true;
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const CompiledShader> shaders) const {
     if (_set == VK_NULL_HANDLE || usesBda) return {};
     const auto reads = guestMemory.InPlaceReads();
     auto result = std::make_shared<DrawBindings>();
     std::vector<std::size_t> selected;
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
+        if (!item.guest && item.buffer != nullptr && DataRole(item.role)) {
+            // A rebased hit's data buffer: a copy holding the draw's own words, patched like the
+            // built one (the guest buffer adjustments are the same: they are part of the key).
+            bool unknown = false;
+            if (!DataMoved(shaders, item.sourceShader, item.sourceBinding, item.dataWords, unknown)) continue;
+            Require(!unknown, "a rebased data buffer without recorded words");
+            const auto words = SourceWords(shaders, item.sourceShader, item.sourceBinding);
+            Require(words.size() * sizeof(std::uint32_t) == item.size, "a rebased data buffer changed size");
+            auto buffer = std::make_shared<Buffer>(context, item.size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            auto* bytes = buffer->Bytes().data();
+            std::memcpy(bytes, words.data(), item.size);
+            for (const auto& patch : dataPatches) {
+                if (patch.allocation == index && patch.byte < item.size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
+            }
+            selected.push_back(index);
+            result->snapshots.push_back({0, std::move(buffer)});
+            continue;
+        }
         if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
+        // A rebased hit (RebaseEligible proved the moved range) snapshots the draw's own range.
+        const auto [address, size] = SourceRange(shaders, item.sourceShader, item.sourceBinding, item.sourceElement, {item.address, item.size});
+        const bool moved = address != item.address || size != item.size;
         const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
-        if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
-        const auto begin = item.address - item.adjustment;
-        const auto bytes = item.size + item.adjustment;
+        if (!moved && (!direct || recorder.PendingWriteOverlaps(item.address, item.size))) continue;
+        Require(!moved || direct, "a rebased guest buffer is not one the template snapshots");
+        const auto begin = address - item.adjustment;
+        const auto bytes = static_cast<std::size_t>(size) + item.adjustment;
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         const auto generation = GuestMemory::CollectWrites(begin, bytes);
         auto buffer = recorder.ReusableDrawSnapshot(begin, bytes);
