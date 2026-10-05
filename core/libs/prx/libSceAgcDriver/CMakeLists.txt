@@ -52,6 +52,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/DeviceAccess.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Diagnostics.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/FrameTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DataHitVerification.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/Dispatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchCache.cpp

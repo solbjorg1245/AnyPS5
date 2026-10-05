@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/FrameTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentationScaler.hpp"
@@ -1791,11 +1792,19 @@ FrameDumps& Dumps() {
 
 }
 
+void VulkanDevice::CaptureImages(const std::string& prefix, std::span<const std::uint64_t> addresses) {
+    WaitIdle();
+    const auto images = Graphics::StorageTexture::DumpLive(graphicsContext(), prefix, addresses);
+    const auto depths = Graphics::DumpDepthSurfaces(graphicsContext(), prefix, addresses);
+    std::fprintf(stderr, "[capture] %s: %zu storage image files and %zu depth surface files\n", prefix.c_str(), images, depths);
+}
+
 void VulkanDevice::CaptureTargets() {
     static const char* directory = std::getenv("APS5_CAPTURE_DIR");
     if (directory == nullptr) return;
     static std::uint64_t presents = 0;
     ++presents;
+    FrameTrace::AtPresent(directory, presents);
     std::error_code error;
     if (!std::filesystem::remove(std::filesystem::path(directory) / "capture", error)) return;
     const auto started = std::chrono::steady_clock::now();

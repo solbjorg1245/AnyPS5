@@ -213,6 +213,7 @@ private:
     static void timed(double WorkerProfile::*bucket, TWork&& work);
     template <typename TWork>
     void tolerate(const char* kind, TWork&& work);
+    void traceDispatch(const QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t queueId);
     void execute(const Submission& submission);
     void markCompleted(std::uint64_t serial);
     static const std::atomic<std::uint64_t>*& workerQueued();

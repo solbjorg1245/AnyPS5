@@ -191,8 +191,12 @@ public:
     // the mutex, before the display buffer is presented), the file is removed, the device drained
     // (WaitIdle) and every live storage image (render targets included) and depth surface saved as
     // <directory>/p<present>_*.raw (StorageTexture::DumpLive, DumpDepthSurfaces): the state each
-    // target was left in by the frame.
+    // target was left in by the frame. A <directory>/trace file starts a frame trace instead (see
+    // FrameTrace.hpp), which saves chosen commands' targets through CaptureImages.
     void CaptureTargets();
+    // Drains the device (the caller holds GuestMemory::GpuMutex) and saves the live images and depth
+    // surfaces at `addresses` (every one when empty) under `prefix`.
+    void CaptureImages(const std::string& prefix, std::span<const std::uint64_t> addresses);
     double FinishPresent();
     void QueuePresent();
     // At the flip packet (under the mutex): the recorder's submissions so far and, under

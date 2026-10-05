@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/FrameTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -8,10 +9,67 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <shared_mutex>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// The FrameTrace line of a draw: packet, verdict, programs, the written color targets and the depth
+// target (`targets` receives their addresses for a dump).
+std::string describeDraw(const QueueState& queue, std::uint32_t header, std::uint32_t queueId, const char* verdict, const std::string& reason, std::vector<std::uint64_t>& targets) {
+    const auto reg = [](const auto& bank, std::uint32_t offset) {
+        const auto it = bank.find(offset);
+        return it == bank.end() ? 0u : it->second;
+    };
+    const auto program = [&](std::uint32_t low) { return (static_cast<std::uint64_t>(reg(queue.shader, low + 1) & 0xffu) << 40u) | (static_cast<std::uint64_t>(reg(queue.shader, low)) << 8u); };
+    char text[1024];
+    int length = std::snprintf(text, sizeof(text), "draw q%x %s %s vs=0x%llx ps=0x%llx", queueId, Pm4::Name(header).c_str(), verdict, static_cast<unsigned long long>(program(0xc8)), static_cast<unsigned long long>(program(0x008)));
+    const auto mask = reg(queue.context, 0x8e) & reg(queue.context, 0x8f);
+    for (std::uint32_t slot = 0; slot < 8 && length < static_cast<int>(sizeof(text)) - 96; ++slot) {
+        const auto info = reg(queue.context, 0x31c + slot * 0xfu);
+        if (((mask >> (4u * slot)) & 0xfu) == 0 || ((info >> 2u) & 0x1fu) == 0) continue;
+        const auto address = (static_cast<std::uint64_t>(reg(queue.context, 0x390 + slot) & 0xffu) << 40u) | (static_cast<std::uint64_t>(reg(queue.context, 0x318 + slot * 0xfu)) << 8u);
+        targets.push_back(address);
+        length += std::snprintf(text + length, sizeof(text) - length, " rt%u=0x%llx/%08x/v%x/%x", slot, static_cast<unsigned long long>(address), info, reg(queue.context, 0x31b + slot * 0xfu), (mask >> (4u * slot)) & 0xfu);
+    }
+    const auto zInfo = reg(queue.context, 0x010);
+    const auto stencilInfo = reg(queue.context, 0x011);
+    if ((zInfo & 3u) != 0 || (stencilInfo & 1u) != 0) {
+        const auto zAddress = (static_cast<std::uint64_t>(reg(queue.context, 0x01a) & 0xffu) << 40u) | (static_cast<std::uint64_t>(reg(queue.context, 0x012)) << 8u);
+        const auto stencilAddress = (static_cast<std::uint64_t>(reg(queue.context, 0x01b) & 0xffu) << 40u) | (static_cast<std::uint64_t>(reg(queue.context, 0x013)) << 8u);
+        if ((zInfo & 3u) != 0) targets.push_back(zAddress);
+        if ((stencilInfo & 1u) != 0) targets.push_back(stencilAddress);
+        const auto htile = (static_cast<std::uint64_t>(reg(queue.context, 0x01e) & 0xffu) << 40u) | (static_cast<std::uint64_t>(reg(queue.context, 0x005)) << 8u);
+        float clearDepth = 0;
+        const auto clearWord = reg(queue.context, 0x00b);
+        std::memcpy(&clearDepth, &clearWord, sizeof(clearDepth));
+        length += std::snprintf(text + length, sizeof(text) - length, " z=0x%llx/%08x s=0x%llx/%08x view=%x htile=0x%llx clear=%g/%u", static_cast<unsigned long long>(zAddress), zInfo, static_cast<unsigned long long>(stencilAddress), stencilInfo, reg(queue.context, 0x002), static_cast<unsigned long long>(htile), clearDepth, reg(queue.context, 0x00a) & 0xffu);
+    }
+    if (length < static_cast<int>(sizeof(text)) - 64) length += std::snprintf(text + length, sizeof(text) - length, " dc=%08x rc=%x sc=%x", reg(queue.context, 0x200), reg(queue.context, 0x000), reg(queue.context, 0x203));
+    std::string line(text);
+    if (!reason.empty()) line += " | " + reason.substr(0, 160);
+    return line;
+}
+
+// The FrameTrace line of a dispatch: packet, compute program and grid (an indirect grid is read by the
+// GPU, the packet words are its arguments' address).
+std::string describeDispatch(const QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t queueId) {
+    const auto reg = [&](std::uint32_t offset) {
+        const auto it = queue.shader.find(offset);
+        return it == queue.shader.end() ? 0u : it->second;
+    };
+    const auto program = (static_cast<std::uint64_t>(reg(0x20d) & 0xffu) << 40u) | (static_cast<std::uint64_t>(reg(0x20c)) << 8u);
+    char text[384];
+    int length = std::snprintf(text, sizeof(text), "dispatch q%x %s cs=0x%llx args=%x,%x,%x ud=", queueId, Pm4::Name(packet[0]).c_str(), static_cast<unsigned long long>(program), packet.size() > 1 ? packet[1] : 0u, packet.size() > 2 ? packet[2] : 0u, packet.size() > 3 ? packet[3] : 0u);
+    // COMPUTE_USER_DATA_0..15
+    for (std::uint32_t index = 0; index < 16 && length < static_cast<int>(sizeof(text)) - 10; ++index) length += std::snprintf(text + length, sizeof(text) - length, "%s%x", index == 0 ? "" : ",", reg(0x240 + index));
+    return text;
+}
+
+}
 
 template <typename TWork>
 void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
@@ -25,6 +83,16 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
         profile.reported = end;
         std::fprintf(stderr, "[gpu] worker at %.0f s: dispatch %.1f s, draw %.1f s, wait %.1f s\n", std::chrono::duration<double>(end - profile.start).count(), profile.dispatchMs / 1000, profile.drawMs / 1000, profile.waitMs / 1000);
     }
+}
+
+// Logs a dispatch of a traced frame (FrameTrace); a dump after it saves every live image.
+void Driver::traceDispatch(const QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t queueId) {
+    if (!FrameTrace::Active()) return;
+    const auto entry = FrameTrace::Record(describeDispatch(queue, packet, queueId));
+    if (!entry.dump) return;
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    if (const auto localDevice = device.Load()) localDevice->CaptureImages(entry.prefix, {});
 }
 
 template <typename TWork>
@@ -168,6 +236,13 @@ void Driver::execute(const Submission& submission) {
         } progress{*this, !waitPacket};
         if (!waitPacket) ++packetsInFlight;
         recent.Record(cursor);
+        // DMA_DATA and WRITE_DATA store to memory outside draws and dispatches (depth/HTILE clears).
+        if (FrameTrace::Active() && (opcode == 0x50 || opcode == 0x37)) {
+            char text[160];
+            int length = std::snprintf(text, sizeof(text), "packet q%x %s", submission.queue, Pm4::Name(header).c_str());
+            for (std::size_t word = 1; word < packet.size() && word < 8 && length < static_cast<int>(sizeof(text)) - 10; ++word) length += std::snprintf(text + length, sizeof(text) - length, " %08x", packet[word]);
+            FrameTrace::Record(text);
+        }
         if (header == RenderingWaitPacketHeader) {
             timed(&WorkerProfile::waitMs, [&] { submission.renderingWaits.at(cursor)->Wait(); });
         } else if (header == FlipPacketHeader) {
@@ -198,10 +273,12 @@ void Driver::execute(const Submission& submission) {
             // ending the process: Demon's Souls issues compute work whose resource tables are not
             // filled yet (a null SRT, a null texture), which the GPU tolerates.
             timed(&WorkerProfile::dispatchMs, [&] { tolerate("dispatch", [&] { dispatch(queue, packet, submission); }); });
+            traceDispatch(queue, packet, submission.queue);
             Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(false);
         } else if (opcode == 0x16) {
             timed(&WorkerProfile::dispatchMs, [&] { tolerate("dispatch", [&] { dispatchIndirect(queue, packet, submission); }); });
+            traceDispatch(queue, packet, submission.queue);
             Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(true);
         } else if (opcode == 0x3c || opcode == 0x93) {
@@ -253,23 +330,39 @@ void Driver::execute(const Submission& submission) {
                     }
                     reportSkip("draw", what + suffix);
                 };
+                const char* traceVerdict = "drawn";
+                std::string traceReason;
                 try {
                     std::string rejected;
                     const auto verdict = draw(queue, packet, submission, rejected);
                     drawn = verdict == DrawVerdict::Drawn;
                     CaptureTrace::Log("draw submission=%llu queue=%x offset=%zu target=%llx mask=%x verdict=%d reason=%.256s", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), static_cast<int>(verdict), rejected.c_str());
                     if (verdict == DrawVerdict::Rejected) {
+                        traceVerdict = "rejected";
+                        traceReason = rejected;
                         skipped(rejected);
                         countSkip(Graphics::DrawSkip::Prechecked);
                     } else if (verdict == DrawVerdict::Nothing) {
+                        traceVerdict = "nothing";
                         countSkip(Graphics::DrawSkip::Nothing);
                     } else if (traceDraws) {
                         std::fprintf(stderr, "[draw] target 0x%llx mask 0x%x ok\n",static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e));
                     }
                 } catch (const std::exception& error) {
                     CaptureTrace::Log("draw-error submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, error.what());
+                    traceVerdict = "failed";
+                    traceReason = error.what();
                     skipped(error.what());
                     countSkip(Graphics::DrawSkip::Thrown);
+                }
+                if (FrameTrace::Active()) {
+                    std::vector<std::uint64_t> targets;
+                    const auto entry = FrameTrace::Record(describeDraw(queue, header, submission.queue, traceVerdict, traceReason, targets));
+                    if (entry.dump) {
+                        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+                        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                        if (const auto localDevice = device.Load()) localDevice->CaptureImages(entry.prefix, entry.all ? std::span<const std::uint64_t>() : std::span<const std::uint64_t>(targets));
+                    }
                 }
             }); });
             finishDrawPacket(drawn);
