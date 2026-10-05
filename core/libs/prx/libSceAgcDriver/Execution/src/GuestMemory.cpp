@@ -943,6 +943,27 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 #endif
 }
 
+// Debug aid: APS5_TRACE_COLLECT_FAIL=1 names the first ranges whose collect fails (each failure sends
+// a proof to its full walk and a refresh to the byte compare), with the first page that is not plain
+// committed memory.
+void traceCollectFail(std::uint64_t address, std::size_t bytes, const char* why) {
+    static const bool trace = std::getenv("APS5_TRACE_COLLECT_FAIL") != nullptr;
+    static std::atomic<std::uint32_t> printed{0};
+    if (!trace || printed.fetch_add(1, std::memory_order_relaxed) >= 400) return;
+#ifdef _WIN32
+    for (std::uint64_t cursor = address; cursor < address + bytes;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0) break;
+        if (info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS || (info.Protect & PAGE_GUARD) != 0) {
+            std::fprintf(stderr, "[collect-fail] 0x%llx+0x%zx (%s): page 0x%llx state 0x%lx type 0x%lx protect 0x%lx region 0x%llx+0x%llx\n", static_cast<unsigned long long>(address), bytes, why, static_cast<unsigned long long>(cursor), info.State, info.Type, info.Protect, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info.BaseAddress)), static_cast<unsigned long long>(info.RegionSize));
+            return;
+        }
+        cursor = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+    }
+#endif
+    std::fprintf(stderr, "[collect-fail] 0x%llx+0x%zx (%s): every page committed\n", static_cast<unsigned long long>(address), bytes, why);
+}
+
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
@@ -969,7 +990,10 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     }
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
+    if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) {
+        if (tracker.watched && bytes != 0) traceCollectFail(address, bytes, "not covered");
+        return 0;
+    }
     auto cursor = first;
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
@@ -980,7 +1004,10 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
     const TimedAccess timed(CounterCollect, bytes);
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
+    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) {
+        traceCollectFail(address, bytes, "walk");
+        return 0;
+    }
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);

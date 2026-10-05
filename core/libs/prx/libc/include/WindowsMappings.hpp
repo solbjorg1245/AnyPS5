@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdint>
 #include <mutex>
 #include <map>
@@ -46,6 +47,7 @@ public:
                 reset(cursor, size);
                 const DWORD flags = MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | (watched ? MEM_WRITE_WATCH : 0);
                 if (!allocate(GetCurrentProcess(), reinterpret_cast<void*>(cursor), size, flags, protection, nullptr, 0)) fail("replace guest placeholder with private memory");
+                rememberRange(freshRanges, cursor, cursor + size);
                 cursor += size;
             } else {
                 if (memory.State != MEM_COMMIT) throw std::runtime_error("guest memory is not committed");
@@ -230,15 +232,38 @@ public:
                 cursor = stop;
             } else {
                 const auto memory = query(cursor);
-                if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
                 const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+                // A placeholder holds no memory, so nothing stores there: unwritten (a later commit over it
+                // is reported through freshRanges, a shared mapping through its unseen views).
+                // APS5_STRICT_COLLECT=1 fails such ranges as before (they go to the byte compare).
+                static const bool strict = std::getenv("APS5_STRICT_COLLECT") != nullptr;
+                if (memory.State == MEM_RESERVE && !strict) {
+                    cursor = stop;
+                    continue;
+                }
+                if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
+                auto watchStop = stop;
+                if (const auto next = freshRanges.lower_bound(cursor); next != freshRanges.end()) watchStop = std::min(watchStop, std::max(cursor, next->first));
+                if (const auto fresh = rangeAt(freshRanges, cursor); fresh != freshRanges.end()) {
+                    // Every page of the fresh part is reported written, once.
+                    const auto freshStop = std::min(stop, fresh->second);
+                    auto at = cursor & ~static_cast<std::uintptr_t>(4095);
+                    for (; at < freshStop && *count < capacity; at += 4096) pages[(*count)++] = reinterpret_cast<void*>(at);
+                    if (clear) {
+                        ResetWriteWatch(reinterpret_cast<void*>(cursor), at - cursor);
+                        forgetRange(freshRanges, cursor, at);
+                    }
+                    if (*count == capacity) return true;
+                    cursor = freshStop;
+                    continue;
+                }
                 ULONG_PTR available = capacity - *count;
                 if (available == 0) return true;
                 DWORD granularity = 0;
-                if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(cursor), stop - cursor, pages + *count, &available, &granularity) != 0) fail("collect private guest writes");
+                if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(cursor), watchStop - cursor, pages + *count, &available, &granularity) != 0) fail("collect private guest writes");
                 *count += available;
                 if (*count == capacity) return true;
-                cursor = stop;
+                cursor = watchStop;
             }
         }
         return true;
@@ -266,27 +291,43 @@ private:
         std::uint64_t offset;
         std::uint32_t hostWrites;
     };
-    void forgetClean(std::uintptr_t start, std::uintptr_t end) {
-        auto it = cleanRanges.lower_bound(start);
-        if (it != cleanRanges.begin() && std::prev(it)->second > start) --it;
-        while (it != cleanRanges.end() && it->first < end) {
+    static void forgetRange(std::map<std::uintptr_t, std::uintptr_t>& ranges, std::uintptr_t start, std::uintptr_t end) {
+        auto it = ranges.lower_bound(start);
+        if (it != ranges.begin() && std::prev(it)->second > start) --it;
+        while (it != ranges.end() && it->first < end) {
             const auto first = it->first;
             const auto last = it->second;
-            it = cleanRanges.erase(it);
-            if (first < start) cleanRanges.emplace(first, start);
-            if (last > end) it = cleanRanges.emplace(end, last).first;
+            it = ranges.erase(it);
+            if (first < start) ranges.emplace(first, start);
+            if (last > end) it = ranges.emplace(end, last).first;
         }
     }
 
-    void rememberClean(std::uintptr_t start, std::uintptr_t end) {
-        auto it = cleanRanges.lower_bound(start);
-        if (it != cleanRanges.begin() && std::prev(it)->second >= start) --it;
-        while (it != cleanRanges.end() && it->first <= end) {
+    static void rememberRange(std::map<std::uintptr_t, std::uintptr_t>& ranges, std::uintptr_t start, std::uintptr_t end) {
+        auto it = ranges.lower_bound(start);
+        if (it != ranges.begin() && std::prev(it)->second >= start) --it;
+        while (it != ranges.end() && it->first <= end) {
             start = std::min(start, it->first);
             end = std::max(end, it->second);
-            it = cleanRanges.erase(it);
+            it = ranges.erase(it);
         }
-        cleanRanges.emplace(start, end);
+        ranges.emplace(start, end);
+    }
+
+    // The range of `ranges` holding `cursor`, or end().
+    static std::map<std::uintptr_t, std::uintptr_t>::const_iterator rangeAt(const std::map<std::uintptr_t, std::uintptr_t>& ranges, std::uintptr_t cursor) {
+        const auto next = ranges.upper_bound(cursor);
+        if (next == ranges.begin()) return ranges.end();
+        const auto found = std::prev(next);
+        return cursor < found->second ? found : ranges.end();
+    }
+
+    void forgetClean(std::uintptr_t start, std::uintptr_t end) {
+        forgetRange(cleanRanges, start, end);
+    }
+
+    void rememberClean(std::uintptr_t start, std::uintptr_t end) {
+        rememberRange(cleanRanges, start, end);
     }
 
     void invalidate(SharedPage& page) {
@@ -342,6 +383,7 @@ private:
     void reset(std::uintptr_t address, std::size_t bytes) {
         const auto end = address + bytes;
         forgetClean(address, end);
+        forgetRange(freshRanges, address, end);
         for (auto cursor = address; cursor < end;) {
             const auto memory = query(cursor);
             if (memory.State == MEM_RESERVE) {
@@ -379,6 +421,10 @@ private:
     }
 
     std::map<std::uintptr_t, std::uintptr_t> cleanRanges;
+    // Private memory committed over a placeholder since the last collect: Collect reports a placeholder
+    // as unwritten (nothing can store there), so the commit that makes it memory (zeros, unseen by the
+    // write watch) is reported as a write once.
+    std::map<std::uintptr_t, std::uintptr_t> freshRanges;
     std::map<std::uintptr_t, View> views;
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::mutex mutex;

@@ -344,6 +344,32 @@ static void CheckSharedWriteTracking() {
 #endif
 }
 
+static void CheckPlaceholderCollect() {
+#ifdef _WIN32
+    if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) return;
+    constexpr std::size_t granule = 0x10000;
+    constexpr std::size_t bytes = granule * 2;
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, granule);
+    Require(block != nullptr);
+    const auto collect = [&](bool clear) {
+        std::array<void*, 64> pages{};
+        std::size_t count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(reinterpret_cast<std::uintptr_t>(block), bytes, pages.data(), &count, clear));
+        return count;
+    };
+    Require(collect(true) == 0);
+    GuestArena::GuestArenaCommit_nid_postfix(block, granule, 0x04 /* PAGE_READWRITE */, granule);
+    Require(collect(false) == 16);
+    Require(collect(true) == 16);
+    Require(collect(true) == 0);
+    static_cast<volatile unsigned char*>(block)[0x5000] = 7;
+    Require(collect(true) == 1);
+    Require(collect(true) == 0);
+    GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+#endif
+}
+
 static void CheckReadsIntoSharedWriteTracking() {
 #ifdef _WIN32
     constexpr std::size_t page = 0x4000;
@@ -596,6 +622,7 @@ int main() {
     CheckReservedHolesAreUncommitted();
     CheckHeapAfterMappingReuse();
     CheckSharedWriteTracking();
+    CheckPlaceholderCollect();
     CheckReadsIntoSharedWriteTracking();
 #if defined(__linux__)
     CheckWriteWatch();
