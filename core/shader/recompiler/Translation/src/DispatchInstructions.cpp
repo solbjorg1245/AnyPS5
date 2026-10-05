@@ -73,7 +73,7 @@ void TranslationContext::TranslateInstruction(const RdnaInstruction& decoded) {
     }
     if (const DebugProbe probe = DebugProbeConfig(); probe.enabled && instruction.programCounter == probe.programCounter) {
         RdnaOperand source{};
-        source.kind = RdnaOperandKind::VectorRegister;
+        source.kind = probe.scalar ? RdnaOperandKind::ScalarRegister : RdnaOperandKind::VectorRegister;
         source.reg = probe.vgpr;
         RdnaOperand target{};
         target.kind = RdnaOperandKind::VectorRegister;
@@ -118,7 +118,8 @@ DebugProbe parseProbe(const char* text) {
     char* end = nullptr;
     result.programCounter = static_cast<std::uint32_t>(std::strtoul(text, &end, 16));
     if (end == nullptr || *end != ':') return result;
-    result.vgpr = static_cast<std::uint32_t>(std::strtoul(end + 1, &end, 10));
+    result.scalar = end[1] == 's';
+    result.vgpr = static_cast<std::uint32_t>(std::strtoul(end + (result.scalar ? 2 : 1), &end, 10));
     if (end != nullptr && *end == ':') result.shift = static_cast<std::uint32_t>(std::strtoul(end + 1, nullptr, 10));
     result.enabled = result.vgpr < 255u;
     return result;
@@ -151,7 +152,7 @@ DebugProbe currentProbe() {
 
 std::uint64_t DebugProbeKey() {
     const auto probe = DebugProbeConfig();
-    return probe.enabled ? (static_cast<std::uint64_t>(probe.programCounter) << 32u) | (static_cast<std::uint64_t>(probe.vgpr) << 8u) | probe.shift | 0x80000000ull : 0u;
+    return probe.enabled ? (static_cast<std::uint64_t>(probe.programCounter) << 32u) | (static_cast<std::uint64_t>(probe.scalar) << 30u) | (static_cast<std::uint64_t>(probe.vgpr) << 8u) | probe.shift | 0x80000000ull : 0u;
 }
 
 DebugProbe DebugProbeConfig() {

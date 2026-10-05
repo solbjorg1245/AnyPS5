@@ -268,14 +268,17 @@ private:
     std::uint32_t currentVectorLimit = 1;
 };
 
-// Debug aid: APS5_PROBE=<pc hex>:<vgpr>[:<shift>] copies VGPR <vgpr> into v255 right after the
-// instruction at <pc> is translated, and every image store then writes (v255 >> shift) instead of its
-// data, so a dumped output image is a per-lane trace of that register.
+// Debug aid: APS5_PROBE=<pc hex>:<vgpr>[:<shift>] copies VGPR <vgpr> (or SGPR <n> with "s<n>") into
+// v255 right after the instruction at <pc> is translated, and every image store then writes
+// (v255 >> shift) instead of its data, so a dumped output image is a per-lane trace of that register.
+// Shift 32 stores it converted from an unsigned integer to float, shift 33 its four bytes as the
+// four channels (exact in any float format).
 struct DebugProbe {
     bool enabled = false;
     std::uint32_t programCounter = 0;
     std::uint32_t vgpr = 0;
     std::uint32_t shift = 0;
+    bool scalar = false;
 };
 [[nodiscard]] DebugProbe DebugProbeConfig();
 

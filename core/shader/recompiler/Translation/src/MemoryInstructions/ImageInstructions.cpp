@@ -126,11 +126,18 @@ bool TranslationContext::imageStore(const RdnaInstruction& inst) {
         RdnaOperand probeReg{};
         probeReg.kind = RdnaOperandKind::VectorRegister;
         probeReg.reg = 255u;
-        // Shift 32 stores the register converted from an unsigned integer to float (indices, counts).
+        // Shift 32 stores the register converted from an unsigned integer to float (indices, counts),
+        // shift 33 its bytes as four floats.
         IrValue& raw = readRawU32(probeReg).Value();
-        IrValue& probed = probe.shift == 32u ? ir.BitCastU32(ir.Emit(IrOpcode::ConvertF32U32, IrType::F32, {&raw})) : ir.ShiftRightLogical(raw, ir.Constant(probe.shift));
-        IrValue& zero = ir.Constant(0u);
-        data = &ir.Emit(IrOpcode::CompositeConstructU32x4, IrOpcodeType(IrOpcode::CompositeConstructU32x4), {&probed, &zero, &zero, &zero});
+        const auto asFloat = [&](IrValue& value) -> IrValue& { return ir.BitCastU32(ir.Emit(IrOpcode::ConvertF32U32, IrType::F32, {&value})); };
+        if (probe.shift == 33u) {
+            const auto byte = [&](std::uint32_t index) -> IrValue& { return asFloat(ir.BitwiseAnd(ir.ShiftRightLogical(raw, ir.Constant(index * 8u)), ir.Constant(0xffu))); };
+            data = &ir.Emit(IrOpcode::CompositeConstructU32x4, IrOpcodeType(IrOpcode::CompositeConstructU32x4), {&byte(0), &byte(1), &byte(2), &byte(3)});
+        } else {
+            IrValue& probed = probe.shift == 32u ? asFloat(raw) : ir.ShiftRightLogical(raw, ir.Constant(probe.shift));
+            IrValue& zero = ir.Constant(0u);
+            data = &ir.Emit(IrOpcode::CompositeConstructU32x4, IrOpcodeType(IrOpcode::CompositeConstructU32x4), {&probed, &zero, &zero, &zero});
+        }
     }
     IrValue& exec = ir.GetExec();
     (void)ir.Emit(IrOpcode::ImageWrite, IrOpcodeType(IrOpcode::ImageWrite), {resource, address, data, &exec}, addMemoryInfo(memory, inst.programCounter));

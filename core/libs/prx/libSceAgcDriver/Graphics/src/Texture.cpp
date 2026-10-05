@@ -1952,7 +1952,8 @@ std::size_t StorageTexture::DumpLive(const Context& context, const std::string& 
         if (texture->image == VK_NULL_HANDLE || texture->mips.empty()) continue;
         const auto& descriptor = texture->descriptor;
         const auto& mip = texture->mips[0];
-        const auto layers = std::min(texture->arrayLayers, MaxLayers);
+        // Small images keep every layer (3D light grids); large ones their first MaxLayers.
+        const auto layers = texture->sliceLinearBytes * texture->arrayLayers <= (64ull << 20u) ? texture->arrayLayers : std::min(texture->arrayLayers, MaxLayers);
         Buffer buffer(context, static_cast<std::size_t>(texture->sliceLinearBytes * layers), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         std::vector<VkBufferImageCopy> regions;
         for (const auto& region : texture->CopyRegions()) {
