@@ -7,6 +7,8 @@
 #include <string>
 #include <cmath>
 #include <cstdlib>
+#include <initializer_list>
+#include <vector>
 #include <SpirvBackend/SpirvEmitterHelpers.hpp>
 #include <SpirvBackend/SpirvEmitterInstructions.hpp>
 
@@ -99,6 +101,58 @@ std::uint32_t NormalizeFormatComponent(SpirvEmitterState& state, const SpirvBuff
         return EmitUFloatToF32Bits(state, raw, bits);
     default:
         FailEmit("buffer format component type is not supported");
+    }
+}
+
+std::uint32_t EncodeFormatComponent(SpirvEmitterState& state, const SpirvBufferFormatInfo& info, std::uint32_t component, std::uint32_t data) {
+    const auto bits = info.componentBits[component];
+    const auto glsl = [&](GLSLstd450 operation, std::initializer_list<std::uint32_t> operands) {
+        const auto result = state.module.AllocateId();
+        std::vector<std::uint32_t> words{spv::OpExtInst, TypeF32(state), result, GlslStd450(state), static_cast<std::uint32_t>(operation)};
+        words.insert(words.end(), operands.begin(), operands.end());
+        state.module.AddFunction(words);
+        return result;
+    };
+    const auto convert = [&](spv::Op operation, std::uint32_t type, std::uint32_t value) {
+        const auto result = state.module.AllocateId();
+        state.module.AddFunction(operation, type, result, value);
+        return result;
+    };
+    const auto scaled = [&](float low, float high, float scale) {
+        const auto clamped = glsl(GLSLstd450FClamp, {EmitBitcastU32ToF32(state, data), ConstantF32Value(state, low), ConstantF32Value(state, high)});
+        const auto product = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFMul, TypeF32(state), product, clamped, ConstantF32Value(state, scale));
+        return glsl(GLSLstd450RoundEven, {product});
+    };
+    switch (info.type) {
+    case SpirvFormatComponentType::Uint:
+    case SpirvFormatComponentType::Sint:
+        return data;
+    case SpirvFormatComponentType::Uscaled:
+        return convert(spv::OpConvertFToU, TypeU32(state), EmitBitcastU32ToF32(state, data));
+    case SpirvFormatComponentType::Sscaled:
+        return convert(spv::OpBitcast, TypeU32(state), convert(spv::OpConvertFToS, TypeI32(state), EmitBitcastU32ToF32(state, data)));
+    case SpirvFormatComponentType::Unorm:
+        return convert(spv::OpConvertFToU, TypeU32(state), scaled(0.0f, 1.0f, static_cast<float>((1u << bits) - 1u)));
+    case SpirvFormatComponentType::Snorm:
+        return convert(spv::OpBitcast, TypeU32(state), convert(spv::OpConvertFToS, TypeI32(state), scaled(-1.0f, 1.0f, static_cast<float>((1u << (bits - 1u)) - 1u))));
+    case SpirvFormatComponentType::Float: {
+        if (bits == 32u) {
+            return data;
+        }
+        const auto half = EmitF32ToF16BitsRte(state, EmitBitcastU32ToF32(state, data));
+        if (bits == 16u) {
+            return half;
+        }
+        // 11- and 10-bit floats have no sign (negative values store 0) and keep the half's exponent
+        // with its 6 or 5 leading mantissa bits.
+        const auto negative = Binary(state, spv::OpINotEqual, TypeBool(state), Binary(state, spv::OpBitwiseAnd, TypeU32(state), half, ConstantU32(state, 0x8000u)), ConstantU32(state, 0u));
+        const auto magnitude = Binary(state, spv::OpBitwiseAnd, TypeU32(state), half, ConstantU32(state, 0x7fffu));
+        const auto truncated = Binary(state, spv::OpShiftRightLogical, TypeU32(state), magnitude, ConstantU32(state, bits == 11u ? 4u : 5u));
+        return Select(state, TypeU32(state), negative, ConstantU32(state, 0u), truncated);
+    }
+    default:
+        FailEmit("buffer format component type is not supported for stores");
     }
 }
 

@@ -26,6 +26,7 @@ struct State {
     // MaxMatchDumps a frame), so passes are found although async queues reorder the indices.
     std::vector<std::pair<std::string, bool>> matches;
     std::uint32_t matchDumps = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> buffers;
 };
 
 constexpr std::uint32_t MaxMatchDumps = 64;
@@ -57,9 +58,17 @@ void AtPresent(const std::string& directory, std::uint64_t present) {
     trace.dumps.clear();
     trace.matches.clear();
     trace.matchDumps = 0;
+    trace.buffers.clear();
     if (std::FILE* list = std::fopen((root / "after.txt").string().c_str(), "r")) {
         char line[128];
         while (std::fgets(line, sizeof(line), list) != nullptr) {
+            if (std::strncmp(line, "buffer ", 7) == 0) {
+                char* end = nullptr;
+                const auto address = std::strtoull(line + 7, &end, 16);
+                const auto bytes = end != nullptr ? std::strtoull(end, nullptr, 16) : 0ull;
+                if (address != 0 && bytes != 0) trace.buffers.emplace_back(address, bytes);
+                continue;
+            }
             if (std::strncmp(line, "match ", 6) == 0) {
                 std::string text(line + 6);
                 while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) text.pop_back();
@@ -92,6 +101,12 @@ std::string& threadWrites() {
 
 void NoteWrites(const std::string& text) {
     threadWrites() += text;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> DumpBuffers() {
+    auto& trace = Trace();
+    std::lock_guard lock(trace.mutex);
+    return trace.buffers;
 }
 
 std::string TakeWrites() {

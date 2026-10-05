@@ -1866,7 +1866,18 @@ void VulkanDevice::CaptureImages(const std::string& prefix, std::span<const std:
     WaitIdle();
     const auto images = Graphics::StorageTexture::DumpLive(graphicsContext(), prefix, addresses);
     const auto depths = Graphics::DumpDepthSurfaces(graphicsContext(), prefix, addresses);
-    std::fprintf(stderr, "[capture] %s: %zu storage image files and %zu depth surface files\n", prefix.c_str(), images, depths);
+    std::size_t buffers = 0;
+    for (const auto& [address, bytes] : FrameTrace::DumpBuffers()) {
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes))) continue;
+        char name[64];
+        std::snprintf(name, sizeof(name), "buffer_%llx.bin", static_cast<unsigned long long>(address));
+        if (std::FILE* file = std::fopen((prefix + name).c_str(), "wb")) {
+            std::fwrite(reinterpret_cast<const void*>(address), 1, static_cast<std::size_t>(bytes), file);
+            std::fclose(file);
+            ++buffers;
+        }
+    }
+    std::fprintf(stderr, "[capture] %s: %zu storage image files, %zu depth surface files and %zu buffers\n", prefix.c_str(), images, depths, buffers);
 }
 
 void VulkanDevice::CaptureTargets() {

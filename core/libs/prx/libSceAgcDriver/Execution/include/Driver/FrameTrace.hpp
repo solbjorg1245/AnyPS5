@@ -3,6 +3,8 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace AgcDriver::FrameTrace {
 
@@ -30,6 +32,9 @@ Entry Record(const std::string& line);
 // while a trace runs; the dispatch's trace line takes them (TakeWrites).
 void NoteWrites(const std::string& text);
 std::string TakeWrites();
+// "buffer <address hex> <bytes hex>" lines of after.txt: guest memory ranges saved with every dump
+// as <prefix>buffer_<address>.bin (after the drain, so GPU writes to host imports have landed).
+std::vector<std::pair<std::uint64_t, std::uint64_t>> DumpBuffers();
 
 }
 

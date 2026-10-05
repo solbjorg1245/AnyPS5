@@ -442,10 +442,19 @@ void FormattedStorePrepared(SpirvValueEmitContext& ctx, const IrValue& inst, con
     }
     const auto bits = info.componentBits[component];
     const auto componentMem = RebaseFormattedComponent(mem, info, component);
-    if (bits == 8u || bits == 16u) {
-        StoreSubwordPrepared(ctx, inst, componentMem, resource, bits, data);
+    const auto encoded = EncodeFormatComponent(ctx.state, info, component, data);
+    if (info.packedBitfield) {
+        // The component's bits replace their field of the packed dword.
+        auto& state = ctx.state;
+        const auto mask = ((bits == 32u ? 0u : (1u << bits)) - 1u) << info.componentBitOffset[component];
+        const auto old = LoadWordPrepared(ctx, inst, componentMem, resource);
+        const auto field = Binary(state, spv::OpBitwiseAnd, TypeU32(state), Binary(state, spv::OpShiftLeftLogical, TypeU32(state), encoded, ConstantU32(state, info.componentBitOffset[component])), ConstantU32(state, mask));
+        const auto kept = Binary(state, spv::OpBitwiseAnd, TypeU32(state), old, ConstantU32(state, ~mask));
+        StoreWordPrepared(ctx, inst, componentMem, resource, Binary(state, spv::OpBitwiseOr, TypeU32(state), kept, field));
+    } else if (bits == 8u || bits == 16u) {
+        StoreSubwordPrepared(ctx, inst, componentMem, resource, bits, encoded);
     } else {
-        StoreWordPrepared(ctx, inst, componentMem, resource, data);
+        StoreWordPrepared(ctx, inst, componentMem, resource, encoded);
     }
 }
 
@@ -593,10 +602,31 @@ void StoreWideBuffer(SpirvValueEmitContext& ctx, const IrValue& inst, const Memo
         if (info.type != SpirvFormatComponentType::Unknown) {
             const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info, components, FormattedAccess::Store);
             EmitIfCondition(state, plan.inBounds, [&]() {
+                if (info.packedBitfield) {
+                    // Every stored component goes into one dword (fields the store leaves out keep
+                    // their bits).
+                    const auto stored = std::min(components, info.componentCount);
+                    std::uint32_t keepMask = 0xffffffffu;
+                    for (std::uint32_t component = 0; component < stored; component++) {
+                        const auto bits = info.componentBits[component];
+                        keepMask &= ~(((bits == 32u ? 0u : (1u << bits)) - 1u) << info.componentBitOffset[component]);
+                    }
+                    auto word = keepMask == 0u ? ConstantU32(state, 0u) : Binary(state, spv::OpBitwiseAnd, TypeU32(state), LoadWordInBounds(ctx, plan.resource, plan.indices.at(0)), ConstantU32(state, keepMask));
+                    for (std::uint32_t component = 0; component < stored; component++) {
+                        const auto data = state.module.AllocateId();
+                        state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), data, composite, component);
+                        const auto bits = info.componentBits[component];
+                        const auto mask = ((bits == 32u ? 0u : (1u << bits)) - 1u) << info.componentBitOffset[component];
+                        const auto field = Binary(state, spv::OpBitwiseAnd, TypeU32(state), Binary(state, spv::OpShiftLeftLogical, TypeU32(state), EncodeFormatComponent(state, info, component, data), ConstantU32(state, info.componentBitOffset[component])), ConstantU32(state, mask));
+                        word = Binary(state, spv::OpBitwiseOr, TypeU32(state), word, field);
+                    }
+                    StoreWordInBounds(ctx, plan.resource, plan.indices.at(0), word);
+                    return;
+                }
                 for (std::uint32_t component = 0; component < components; component++) {
                     const auto data = state.module.AllocateId();
                     state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), data, composite, component);
-                    StoreFormattedInBounds(ctx, mem, plan, component, data);
+                    StoreFormattedInBounds(ctx, mem, plan, component, component < info.componentCount ? EncodeFormatComponent(state, info, component, data) : data);
                 }
             });
             return;

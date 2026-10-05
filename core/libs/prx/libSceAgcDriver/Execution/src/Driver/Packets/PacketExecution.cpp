@@ -88,11 +88,26 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
 // Logs a dispatch of a traced frame (FrameTrace); a dump after it saves every live image.
 void Driver::traceDispatch(const QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t queueId) {
     if (!FrameTrace::Active()) return;
-    const auto entry = FrameTrace::Record(describeDispatch(queue, packet, queueId) + FrameTrace::TakeWrites());
+    const auto line = describeDispatch(queue, packet, queueId) + FrameTrace::TakeWrites();
+    const auto entry = FrameTrace::Record(line);
     if (!entry.dump) return;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     if (const auto localDevice = device.Load()) localDevice->CaptureImages(entry.prefix, {});
+    // The buffer ranges the dispatch writes (its " wb=<address>+<bytes>" entries), as stored in guest
+    // memory once the device is idle.
+    for (auto at = line.find(" wb=0x"); at != std::string::npos; at = line.find(" wb=0x", at + 1)) {
+        char* end = nullptr;
+        const auto address = std::strtoull(line.c_str() + at + 6, &end, 16);
+        const auto bytes = end != nullptr && end[0] == '+' ? std::strtoull(end + 1, nullptr, 16) : 0ull;
+        if (address == 0 || bytes == 0 || bytes > (64ull << 20u) || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes))) continue;
+        char name[64];
+        std::snprintf(name, sizeof(name), "wb_%llx.bin", static_cast<unsigned long long>(address));
+        if (std::FILE* file = std::fopen((entry.prefix + name).c_str(), "wb")) {
+            std::fwrite(reinterpret_cast<const void*>(address), 1, static_cast<std::size_t>(bytes), file);
+            std::fclose(file);
+        }
+    }
 }
 
 template <typename TWork>
