@@ -226,6 +226,13 @@ public:
     // Results pending in images lying wholly inside the range are dead (a fill overwrites every
     // byte of them): they are dropped instead of stored. Returns how many images were.
     static std::size_t DiscardPendingInside(std::uint64_t address, std::size_t bytes);
+    // A uniform fill of DCC keys at `address` re-initialises the surfaces those keys belong to: the
+    // title reuses their memory (transient allocations alias: Demon's Souls' 3840x2160 UI layer
+    // shares memory and DCC keys with the 2560x1440 scene color). Results other images still have
+    // pending in the units of that memory, or in units whose own keys the fill overwrote, are dead:
+    // storing them later would put the other image's bytes and "uncompressed" keys over the cleared
+    // surface. Returns how many images lost results.
+    static std::size_t DiscardPendingUnderKeysFill(std::uint64_t address, std::size_t bytes);
     // A fill of the whole surface (`layer` WholeImage) or of one array layer with the 16-byte
     // `pattern`, done as a GPU clear of the image instead of a store into guest memory: the
     // pattern must be one texel of the storage format repeated, exactly representable as a clear

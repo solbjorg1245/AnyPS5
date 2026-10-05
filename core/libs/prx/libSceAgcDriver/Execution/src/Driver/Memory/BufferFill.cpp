@@ -143,6 +143,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         if (traceKeys && coverage.cover == Graphics::StorageTexture::FillCover::Keys) std::fprintf(stderr, "[dcc-keys] title fills keys 0x%llx+0x%zx with %08x %08x %08x %08x (queue 0x%x)\n", static_cast<unsigned long long>(base), bytes, pattern[0], pattern[1], pattern[2], pattern[3], queueId);
         const bool uniformKeysFill = coverage.cover == Graphics::StorageTexture::FillCover::Keys && std::all_of(pattern.begin(), pattern.end(), [&](std::uint32_t word) { return word == (pattern[0] & 0xffu) * 0x01010101u; });
         if (uniformKeysFill) {
+            Graphics::StorageTexture::DiscardPendingUnderKeysFill(base, bytes);
             Graphics::StorageTexture::NoteKeysFill(base, bytes, static_cast<std::uint8_t>(pattern[0]));
             Graphics::StorageTexture::ClearByKeysFill(base, bytes, static_cast<std::uint8_t>(pattern[0]));
         }

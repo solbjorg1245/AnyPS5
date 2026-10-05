@@ -2436,6 +2436,67 @@ bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {
     return identities;
 }
 
+std::size_t StorageTexture::DiscardPendingUnderKeysFill(std::uint64_t address, std::size_t bytes) {
+    constexpr std::uint64_t keyBytes = 256;
+    const auto end = address + bytes;
+    // The surfaces whose keys these are (as NoteKeysFill finds them): their memory is reused.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reused;
+    {
+        auto& live = Live();
+        std::lock_guard lock(live.mutex);
+        for (const auto* texture : live.textures) {
+            if (texture->released || texture->descriptor.dccAddress != address || texture->guestBytes / keyBytes == 0 || bytes < texture->guestBytes / keyBytes) continue;
+            reused.emplace_back(texture->descriptor.baseAddress, texture->descriptor.baseAddress + texture->guestBytes);
+        }
+    }
+    if (reused.empty()) return 0;
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    std::size_t discarded = 0;
+    for (auto it = pending.textures.begin(); it != pending.textures.end();) {
+        auto* texture = *it;
+        const bool owner = texture->descriptor.dccAddress == address;
+        if (owner || texture == refreshing || !texture->blockUnits) {
+            ++it;
+            continue;
+        }
+        // The texel range whose keys the fill overwrote, if this image has keys there.
+        std::uint64_t keyedBegin = 0, keyedEnd = 0;
+        if (const auto dcc = texture->descriptor.dccAddress; dcc != 0) {
+            const auto first = std::max(dcc, address);
+            const auto last = std::min(dcc + texture->guestBytes / keyBytes, end);
+            if (first < last) {
+                keyedBegin = texture->descriptor.baseAddress + (first - dcc) * keyBytes;
+                keyedEnd = texture->descriptor.baseAddress + (last - dcc) * keyBytes;
+            }
+        }
+        bool dropped = false;
+        for (std::uint32_t unit = 0; unit < texture->trackedLayers; ++unit) {
+            if (!texture->layerPending[unit]) continue;
+            const auto unitBegin = texture->layerBegin(unit);
+            const auto unitEnd = unitBegin + texture->layerBytes(unit);
+            bool dead = unitBegin < keyedEnd && keyedBegin < unitEnd;
+            for (const auto& [begin, stop] : reused) dead = dead || (unitBegin < stop && begin < unitEnd);
+            if (!dead) continue;
+            texture->layerPending[unit] = false;
+            unitsDropped.fetch_add(1, std::memory_order_relaxed);
+            dropped = true;
+        }
+        if (dropped) {
+            texture->originalValid = false;
+            ++discarded;
+        }
+        if (dropped && !texture->anyLayerPending()) {
+            texture->dirty = false;
+            it = pending.textures.erase(it);
+            continue;
+        }
+        ++it;
+    }
+    if (discarded != 0) BumpPendingSerial();
+    return discarded;
+}
+
 std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::size_t bytes) {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
