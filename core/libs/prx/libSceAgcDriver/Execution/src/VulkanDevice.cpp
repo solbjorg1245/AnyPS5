@@ -1876,6 +1876,21 @@ void VulkanDevice::CaptureTargets() {
     ++presents;
     FrameTrace::AtPresent(directory, presents);
     std::error_code error;
+    // <directory>/clear.txt (hex addresses, one per line): those images are zeroed once (the file is
+    // removed), to tell a pass that creates bad values each frame from one that keeps old ones.
+    if (const auto clearList = std::filesystem::path(directory) / "clear.txt"; std::filesystem::exists(clearList, error)) {
+        std::vector<std::uint64_t> addresses;
+        if (std::FILE* list = std::fopen(clearList.string().c_str(), "r")) {
+            char line[64];
+            while (std::fgets(line, sizeof(line), list) != nullptr) {
+                if (const auto address = std::strtoull(line, nullptr, 16); address != 0) addresses.push_back(address);
+            }
+            std::fclose(list);
+        }
+        std::filesystem::remove(clearList, error);
+        WaitIdle();
+        for (const auto address : addresses) std::fprintf(stderr, "[capture] present %llu: zeroed %zu image(s) at 0x%llx\n", static_cast<unsigned long long>(presents), Graphics::StorageTexture::DebugClear(graphicsContext(), address), static_cast<unsigned long long>(address));
+    }
     if (!std::filesystem::remove(std::filesystem::path(directory) / "capture", error)) return;
     const auto started = std::chrono::steady_clock::now();
     WaitIdle();

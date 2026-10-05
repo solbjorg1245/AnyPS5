@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <map>
 #include <mutex>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -80,6 +81,21 @@ void AtPresent(const std::string& directory, std::uint64_t present) {
 
 bool Active() {
     return Trace().active.load(std::memory_order_relaxed);
+}
+
+namespace {
+std::string& threadWrites() {
+    static thread_local std::string writes;
+    return writes;
+}
+}
+
+void NoteWrites(const std::string& text) {
+    threadWrites() += text;
+}
+
+std::string TakeWrites() {
+    return std::exchange(threadWrites(), {});
 }
 
 Entry Record(const std::string& line) {

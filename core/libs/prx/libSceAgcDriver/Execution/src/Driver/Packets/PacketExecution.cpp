@@ -88,7 +88,7 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
 // Logs a dispatch of a traced frame (FrameTrace); a dump after it saves every live image.
 void Driver::traceDispatch(const QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t queueId) {
     if (!FrameTrace::Active()) return;
-    const auto entry = FrameTrace::Record(describeDispatch(queue, packet, queueId));
+    const auto entry = FrameTrace::Record(describeDispatch(queue, packet, queueId) + FrameTrace::TakeWrites());
     if (!entry.dump) return;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -357,7 +357,7 @@ void Driver::execute(const Submission& submission) {
                 }
                 if (FrameTrace::Active()) {
                     std::vector<std::uint64_t> targets;
-                    const auto entry = FrameTrace::Record(describeDraw(queue, header, submission.queue, traceVerdict, traceReason, targets));
+                    const auto entry = FrameTrace::Record(describeDraw(queue, header, submission.queue, traceVerdict, traceReason, targets) + FrameTrace::TakeWrites());
                     if (entry.dump) {
                         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
                         std::lock_guard gpuLock(GuestMemory::GpuMutex());

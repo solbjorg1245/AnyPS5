@@ -257,6 +257,10 @@ public:
     // <prefix><address>_<width>x<height>_a<layers>_l<layer>.raw (u32 row pitch in texels, u32 height,
     // u32 VkFormat, then the rows). The GPU must be idle. Returns the number of files written.
     static std::size_t DumpLive(const Context& context, const std::string& prefix, std::span<const std::uint64_t> addresses = {});
+    // Debug aid (APS5_CAPTURE_DIR, see VulkanDevice::CaptureTargets): sets every live image at
+    // `address` to zero on the device (all mips and layers). The GPU must be idle. Returns the number
+    // of images cleared.
+    static std::size_t DebugClear(const Context& context, std::uint64_t address);
     VkImage Image() const { return image; }
     const GuestTextureResource& Descriptor() const { return descriptor; }
     std::uint32_t ImageLayers() const { return geometry.imageLayers; }

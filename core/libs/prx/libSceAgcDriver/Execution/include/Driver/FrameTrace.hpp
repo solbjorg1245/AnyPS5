@@ -26,6 +26,10 @@ struct Entry {
 };
 // Logs one command of a traced frame (nothing when no trace runs).
 Entry Record(const std::string& line);
+// The memory a recorded use writes (storage images, buffer ranges), noted by the thread recording it
+// while a trace runs; the dispatch's trace line takes them (TakeWrites).
+void NoteWrites(const std::string& text);
+std::string TakeWrites();
 
 }
 

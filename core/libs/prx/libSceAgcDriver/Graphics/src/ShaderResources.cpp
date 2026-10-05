@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/FrameTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <algorithm>
@@ -2688,6 +2689,21 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
     recorder.NotePendingWrites(guestMemory.Writes());
     guestMemory.MarkDirectWrites();
+    if (AgcDriver::FrameTrace::Active()) {
+        std::string text;
+        char item[96];
+        for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+            if (!storageWritten[index] || storageTextures[index] == nullptr) continue;
+            const auto& written = storageTextures[index]->Descriptor();
+            std::snprintf(item, sizeof(item), " w=0x%llx/%ux%u/f%u", static_cast<unsigned long long>(written.baseAddress), written.width, written.height, written.format);
+            text += item;
+        }
+        for (const auto& [begin, end] : guestMemory.Writes()) {
+            std::snprintf(item, sizeof(item), " wb=0x%llx+0x%llx", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
+            text += item;
+        }
+        AgcDriver::FrameTrace::NoteWrites(text);
+    }
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();
     // Recorded uses only (dispatches and recorded draws): a synchronous draw writes back in

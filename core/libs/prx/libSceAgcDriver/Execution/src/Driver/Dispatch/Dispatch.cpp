@@ -82,15 +82,17 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (text == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0, 0};
         char* end = nullptr;
         const auto probeAddress = std::strtoull(text, &end, 16);
-        const auto index = end != nullptr && *end == ':' ? std::strtoull(end + 1, nullptr, 10) : 0ull;
+        // "<address>:*" probes every dispatch of the shader.
+        const auto index = end != nullptr && *end == ':' ? (end[1] == '*' ? ~0ull : std::strtoull(end + 1, nullptr, 10)) : 0ull;
         return std::pair<std::uint64_t, std::uint64_t>{probeAddress, index};
     }();
     bool probeThis = false;
 
     if (probeDispatch.first != 0 && (address & 0xfffffffffull) == (probeDispatch.first & 0xfffffffffull)) {
         static std::atomic<std::uint64_t> dispatchesSeen{0};
-        probeThis = dispatchesSeen.fetch_add(1) == probeDispatch.second;
-        if (probeThis) std::fprintf(stderr, "[gpu] probing dispatch %llu of 0x%llx\n", static_cast<unsigned long long>(probeDispatch.second), static_cast<unsigned long long>(address));
+        const auto seen = dispatchesSeen.fetch_add(1);
+        probeThis = probeDispatch.second == ~0ull || seen == probeDispatch.second;
+        if (probeThis && (probeDispatch.second != ~0ull || seen == 0)) std::fprintf(stderr, "[gpu] probing dispatch %llu of 0x%llx\n", static_cast<unsigned long long>(probeDispatch.second), static_cast<unsigned long long>(address));
     }
 
     if (FailureMemo() && snapshot.handles->poisoned.load(std::memory_order_relaxed) != 0) {
