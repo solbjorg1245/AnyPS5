@@ -62,8 +62,8 @@ std::string vteMessage(std::uint32_t viewportControl) {
 // not routed: color targets are single-layer, so layered draws land in layer 0.
 constexpr std::uint32_t LayerExports = (1u << 18u) | (1u << 19u) | (1u << 21u) | (1u << 24u);
 // EXEC_ON_HIER_FAIL / EXEC_ON_NOOP / EXEC_IF_OVERLAPPED (bits 9, 10, 17) only force the pixel shader
-// to run, which it always does here.
-constexpr std::uint32_t ShaderControlMask = ~(0x00009870u | 0x00020600u);
+// to run, which it always does here. STENCIL_TEST_VAL_EXPORT_ENABLE (bit 1) is checked by DecodeState.
+constexpr std::uint32_t ShaderControlMask = ~(0x00009870u | 0x00020600u | 0x2u);
 constexpr std::uint32_t AlphaToCoverageMask = ~0x0001ff00u;
 constexpr std::uint32_t ScanModeMask = ~2u;
 constexpr std::uint32_t ScanControlMask = ~0x06003fffu;
@@ -130,6 +130,20 @@ VkStencilOpState stencilFace(std::uint32_t compare, std::uint32_t ops, std::uint
     return face;
 }
 
+// Whether DB_STENCILREFMASK STENCILTESTVAL takes part in the stencil work: a compare function other
+// than NEVER or ALWAYS, or a REPLACE_TEST op (3), on the front face or an enabled back face.
+bool stencilTestValueUsed(const Registers& cx, std::uint32_t depthControl) {
+    const auto ops = read(cx, 0x10b);
+    const auto face = [](std::uint32_t compare, std::uint32_t faceOps) {
+        if (compare != 0 && compare != 7) return true;
+        for (std::uint32_t shift = 0; shift < 12; shift += 4) {
+            if (((faceOps >> shift) & 0xfu) == 3u) return true;
+        }
+        return false;
+    };
+    return face((depthControl >> 8u) & 7u, ops) || ((depthControl & 0x80u) != 0 && face((depthControl >> 20u) & 7u, ops >> 12u));
+}
+
 void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result) {
     zero(cx, 0x000, 0x00001f9fu, "depth/stencil clear, copy, resummarize or decompress draws (DB_RENDER_CONTROL)");
     // DB_DEPTH_VIEW: SLICE_START (bits 0-10, high bits 11-12) is the array slice the draw renders
@@ -159,6 +173,7 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     depth.clearDepth = readFloat(cx, 0x00b);
     depth.clearStencil = static_cast<std::uint8_t>(read(cx, 0x00a) & 0xffu);
     depth.slice = (view & 0x7ffu) | (((view >> 11u) & 3u) << 11u);
+    if ((read(cx, 0x010) & 0x20000000u) != 0 && find(cx, 0x005) != cx.end()) depth.htileAddress = base(0x005, 0x01e);
     result.depth = depth;
     result.depthTest = zFormat != 0 && (depthControl & 2u) != 0;
     result.depthWrite = result.depthTest && (depthControl & 4u) != 0 && !depthReadOnly;
@@ -440,12 +455,15 @@ State DecodeState(const QueueState& queue) {
         }
     }
     zero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports");
-    {
-        const auto depthControl = read(cx, 0x200);
-        if ((depthControl & 3u) != 0 && depthSurfaceBound(cx)) decodeDepth(cx, depthControl, result);
-        Require((depthControl & 0xc0000008u) == 0, "depth bounds or depth-conditional color writes are unsupported");
-    }
+    const auto depthControl = read(cx, 0x200);
+    if ((depthControl & 3u) != 0 && depthSurfaceBound(cx)) decodeDepth(cx, depthControl, result);
+    Require((depthControl & 0xc0000008u) == 0, "depth bounds or depth-conditional color writes are unsupported");
     zero(cx, 0x203, ShaderControlMask, "depth export, shader coverage or ordered fragment execution");
+    // STENCIL_TEST_VAL_EXPORT_ENABLE (DB_SHADER_CONTROL bit 1): the pixel shader's MRTZ stencil
+    // replaces STENCILTESTVAL, which only matters where the stencil test compares against it or an op
+    // writes it. Elsewhere the export changes nothing and is dropped (Demon's Souls' alpha-tested
+    // depth passes export it with an always-pass, keep-everything stencil state).
+    if ((read(cx, 0x203) & 2u) != 0) Require(!result.stencilTest || !stencilTestValueUsed(cx, depthControl), "stencil test value export from the pixel shader is unsupported");
     zero(cx, 0x2dc, AlphaToCoverageMask, "alpha-to-coverage");
     zero(cx, 0x2f8, ~0u, "multisampling or coverage conversion");
     zero(cx, 0x292, ScanModeMask, "scan conversion mode");
@@ -495,7 +513,9 @@ State DecodeState(const QueueState& queue) {
 
     // CB_COLOR_CONTROL mode 0 disables color writes, which only matters when a target is written.
     if (const auto colorControl = read(cx, 0x202); !colorControlSupported(colorControl, result.hasColorTarget)) throw std::runtime_error(colorControlMessage(colorControl));
-    zero(cx, 0x1c4, ~0u, "depth or sample-mask export");
+    // SPI_SHADER_Z_FORMAT only says how the pixel shader packs its MRTZ export, which the DB reads
+    // for the depth, stencil or sample-mask exports DB_SHADER_CONTROL enables: depth and mask exports
+    // are rejected above and the stencil export is dropped, so the format changes nothing.
     const auto exportFormat = read(cx, 0x1c5);
     APS5_LOG_OUT_DEBUG("Export format=%u", exportFormat);
     // SPI_SHADER_POS_FORMAT: POS0 must be a 4-component position; later vectors carry the misc/clip
@@ -621,6 +641,9 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     const auto maxMip = attrib2 >> 28u;
     Require(viewMip <= maxMip, "color view mip exceeds the surface");
     const auto attrib3 = read(cx, 0x3b8 + slot);
+    // RESOURCE_TYPE (bits 24-25): the slices of a 3D target are interleaved in its 3D tiles, not laid
+    // one after the other, so only 2D (array) targets take a slice view.
+    Require(slice == 0 || ((attrib3 >> 24u) & 3u) == 1u, "slices of 3D color targets are unsupported");
     color.tileMode = DecodeColorTileMode(attrib3);
     color.extent = {((attrib2 >> 14u) & 0x3fffu) + 1u, (attrib2 & 0x3fffu) + 1u};
     color.elementBytes = decoded.elementBytes;
@@ -747,7 +770,6 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
     if (auto reason = nonzero(cx, 0x204, ClipControlMask, "unsupported PA_CL_CLIP_CNTL flags"); !reason.empty()) return reason;
     std::uint32_t targetMask = 0, shaderMask = 0;
     if (value(cx, 0x8e, targetMask) && value(cx, 0x8f, shaderMask) && value(cx, 0x202, word) && !colorControlSupported(word, writtenColorMask(cx, targetMask, shaderMask) != 0)) return colorControlMessage(word);
-    if (auto reason = nonzero(cx, 0x1c4, ~0u, "depth or sample-mask export"); !reason.empty()) return reason;
     // The pixel stage decode (ShaderInputState.cpp) reads these after DecodeState and the program
     // prepare; a bank without them fails there with this message. A draw without a pixel shader
     // (depth only, decodeDraw) has no pixel stage.

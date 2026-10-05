@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -35,6 +36,7 @@ public:
             prepare(commands.handle, 0);
             RecordMemoryBarrier(context, commands.handle, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
             commands.Finish(2);
+            std::fprintf(stderr, "[gpu] depth surface 0x%llx (stencil 0x%llx, %ux%u, vk format %d) created\n", static_cast<unsigned long long>(target.address), static_cast<unsigned long long>(target.stencilAddress), target.extent.width, target.extent.height, static_cast<int>(target.format));
         } catch (...) {
             release();
             throw;
@@ -87,6 +89,88 @@ public:
         textures.emplace(key, texture);
         return texture;
     }
+
+    // Takes over depth a compute pass left in a storage image of this memory (Demon's Souls downsamples
+    // its depth with compute into the half-size target it then depth-tests against): the image's
+    // first slice becomes slice 0, through a device buffer, behind the work recorded so far. Only
+    // results still pending on the GPU are found; depth already stored to guest memory is not read
+    // (reported when `written` says a write was noted).
+    void TakeWrittenDepth(bool written) {
+        overwritten = false;
+        if (target.address == 0) return;
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const std::uint32_t texelBytes = d16 ? 2u : 4u;
+        const auto bytes = static_cast<std::uint64_t>(target.extent.width) * target.extent.height * texelBytes;
+        const auto source = StorageTexture::FindPending(target.address, bytes);
+        if (source == nullptr || source->Descriptor().width != target.extent.width || source->Descriptor().height != target.extent.height || BytesPerElement(source->Descriptor().format) != texelBytes) {
+            static std::atomic<int> reports{0};
+            if (written && reports.fetch_add(1) < 4) std::fprintf(stderr, "[gpu] depth surface 0x%llx: guest memory written by a compute pass is not taken over (%s)\n", static_cast<unsigned long long>(target.address), source == nullptr ? "results no longer pending" : "another texel layout");
+            return;
+        }
+        auto buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        Commands commands(context);
+        RecordMemoryBarrier(context, commands.handle, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {target.extent.width, target.extent.height, 1};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands.handle, source->Image(), VK_IMAGE_LAYOUT_GENERAL, buffer->Handle(), 1, &region);
+        RecordMemoryBarrier(context, commands.handle, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands.handle, buffer->Handle(), image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        RecordMemoryBarrier(context, commands.handle, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+        if (commands.recorder != nullptr) commands.recorder->Keep(buffer);
+        commands.Finish(3);
+    }
+
+    // A storage image wrote this surface's memory (NoteDepthSurfaceWrite): that image, not this one,
+    // holds the newest depth until the next use as an attachment takes it over (TakeWrittenDepth).
+    bool overwritten = false;
+
+    // The HTILE bytes of one slice: 4 bytes per 8x8 tile in 32 KiB blocks of 1024x512 pixels (the
+    // toolkit fills 288 KiB for a 2560x1440 surface and 64 KiB per 1024x1024 shadow slice).
+    std::uint64_t HtileSliceBytes() const {
+        return static_cast<std::uint64_t>((target.extent.width + 1023u) / 1024u) * ((target.extent.height + 511u) / 512u) * 0x8000u;
+    }
+
+    // Marks the slices whose HTILE overlaps [begin, end) as cleared (NoteDepthMetadataClear).
+    void NoteMetadataWrite(std::uint64_t begin, std::uint64_t end) {
+        if (htileAddress == 0) return;
+        const auto sliceBytes = HtileSliceBytes();
+        // A single-slice surface owns its whole (possibly further padded) block; array slices follow
+        // one another.
+        const auto htileEnd = htileAddress + sliceBytes * std::max(layers, 1u);
+        if (end <= htileAddress || begin >= htileEnd) return;
+        const auto first = static_cast<std::uint32_t>((std::max(begin, htileAddress) - htileAddress) / sliceBytes);
+        const auto last = static_cast<std::uint32_t>((std::min(end, htileEnd) - 1u - htileAddress) / sliceBytes);
+        for (std::uint32_t slice = first; slice <= last; ++slice) clearedSlices.insert(slice);
+    }
+
+    // Clears the slices whose HTILE a shader zeroed to the clear values, behind the work recorded so
+    // far (before the draw or sampling about to use the surface).
+    void ApplyMetadataClears(float depth, std::uint8_t stencil) {
+        if (clearedSlices.empty()) return;
+        Commands commands(context);
+        RecordMemoryBarrier(context, commands.handle, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkClearDepthStencilValue clear{depth, stencil};
+        std::vector<VkImageSubresourceRange> ranges;
+        for (const auto slice : clearedSlices) {
+            if (slice >= layers) break;
+            if (!ranges.empty() && ranges.back().baseArrayLayer + ranges.back().layerCount == slice) ++ranges.back().layerCount;
+            else ranges.push_back({aspects(), 0, 1, slice, 1});
+        }
+        if (!ranges.empty()) context.Function<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage")(commands.handle, image, VK_IMAGE_LAYOUT_GENERAL, &clear, static_cast<std::uint32_t>(ranges.size()), ranges.data());
+        RecordMemoryBarrier(context, commands.handle, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+        commands.Finish(2);
+        static std::atomic<int> reports{0};
+        if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[gpu] depth surface 0x%llx (%ux%u): HTILE 0x%llx written by a shader, %zu slice(s) from %u cleared to depth %g stencil %u\n", static_cast<unsigned long long>(target.address != 0 ? target.address : target.stencilAddress), target.extent.width, target.extent.height, static_cast<unsigned long long>(htileAddress), clearedSlices.size(), *clearedSlices.begin(), depth, stencil);
+        clearedSlices.clear();
+    }
+
+    // The HTILE base the last draw named, and the clear values it held (for sampling).
+    std::uint64_t htileAddress = 0;
+    float clearDepth = 0;
+    std::uint8_t clearStencil = 0;
+    std::set<std::uint32_t> clearedSlices;
 
     // Whether a resource of this extent at `address` is a plane of this surface. The memory of a depth
     // surface is often handed to other resources later in the frame (transient allocations: the
@@ -247,10 +331,35 @@ std::vector<std::unique_ptr<DepthSurface>>& surfaces() {
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) {
     std::lock_guard lock(surfacesMutex());
     for (const auto& surface : surfaces()) {
-        if (surface->context.device == context.device && sameSurface(surface->target, target)) return surface->LayerView(target.slice);
+        if (surface->context.device != context.device || !sameSurface(surface->target, target)) continue;
+        if (surface->overwritten) surface->TakeWrittenDepth(true);
+        surface->htileAddress = target.htileAddress;
+        surface->clearDepth = target.clearDepth;
+        surface->clearStencil = target.clearStencil;
+        const auto view = surface->LayerView(target.slice);
+        surface->ApplyMetadataClears(target.clearDepth, target.clearStencil);
+        return view;
     }
     surfaces().push_back(std::make_unique<DepthSurface>(context, target));
-    return surfaces().back()->LayerView(target.slice);
+    auto& surface = *surfaces().back();
+    // A compute pass may have written the memory before any draw used it as depth.
+    surface.TakeWrittenDepth(false);
+    surface.htileAddress = target.htileAddress;
+    surface.clearDepth = target.clearDepth;
+    surface.clearStencil = target.clearStencil;
+    return surface.LayerView(target.slice);
+}
+
+void NoteDepthMetadataClear(std::uint64_t begin, std::uint64_t end) {
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) surface->NoteMetadataWrite(begin, end);
+}
+
+void NoteDepthSurfaceWrite(std::uint64_t address, std::uint32_t width, std::uint32_t height) {
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        if (surface->Covers(address, width, height)) surface->overwritten = true;
+    }
 }
 
 void ClearDepthSurfaces(VkDevice device) {
@@ -264,15 +373,21 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) {
         return surface->context.device == context.device && surface->Covers(resource.baseAddress, resource.width, resource.height);
     });
-    return found == list.rend() ? nullptr : (*found)->Sampled(words, resource, components);
+    // Memory a compute pass wrote since the last depth draw is sampled from its storage image.
+    if (found == list.rend() || (*found)->overwritten) return nullptr;
+    auto texture = (*found)->Sampled(words, resource, components);
+    (*found)->ApplyMetadataClears((*found)->clearDepth, (*found)->clearStencil);
+    return texture;
 }
 
-std::size_t DumpDepthSurfaces(const Context& context, const std::string& prefix) {
+std::size_t DumpDepthSurfaces(const Context& context, const std::string& prefix, std::span<const std::uint64_t> addresses) {
     std::lock_guard lock(surfacesMutex());
     std::size_t written = 0;
     for (const auto& surface : surfaces()) {
         if (surface->context.device != context.device) continue;
         const auto& target = surface->target;
+        const auto listed = [&](std::uint64_t address) { return address != 0 && std::find(addresses.begin(), addresses.end(), address) != addresses.end(); };
+        if (!addresses.empty() && !listed(target.address) && !listed(target.stencilAddress)) continue;
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const bool stencil = target.stencilAddress != 0;
         const std::uint64_t texels = static_cast<std::uint64_t>(target.extent.width) * target.extent.height;
@@ -320,7 +435,7 @@ std::size_t DumpDepthSurfaces(const Context& context, const std::string& prefix)
 
 bool DepthSurfaceAt(std::uint64_t address, std::uint32_t width, std::uint32_t height) {
     std::lock_guard lock(surfacesMutex());
-    return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->Covers(address, width, height); });
+    return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->Covers(address, width, height) && !surface->overwritten; });
 }
 
 }

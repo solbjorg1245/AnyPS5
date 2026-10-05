@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -1935,13 +1936,14 @@ std::vector<VkBufferImageCopy> StorageTexture::CopyRegions(const std::vector<boo
     return regions;
 }
 
-std::size_t StorageTexture::DumpLive(const Context& context, const std::string& prefix) {
+std::size_t StorageTexture::DumpLive(const Context& context, const std::string& prefix, std::span<const std::uint64_t> addresses) {
     constexpr std::uint32_t MaxLayers = 8;
     std::vector<std::shared_ptr<StorageTexture>> textures;
     {
         auto& live = Live();
         std::lock_guard lock(live.mutex);
         for (auto* texture : live.textures) {
+            if (!addresses.empty() && std::find(addresses.begin(), addresses.end(), texture->descriptor.baseAddress) == addresses.end()) continue;
             if (auto owner = texture->weak_from_this().lock()) textures.push_back(std::move(owner));
         }
     }
@@ -1964,7 +1966,7 @@ std::size_t StorageTexture::DumpLive(const Context& context, const std::string& 
         const std::uint32_t header[3] = {mip.pitchBytes / BytesPerElement(descriptor.format) * BlockWidth(descriptor.format), mip.height, static_cast<std::uint32_t>(texture->storageFormat)};
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
             char name[96];
-            std::snprintf(name, sizeof(name), "%llx_%ux%u_l%u.raw", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, layer);
+            std::snprintf(name, sizeof(name), "%llx_%ux%u_a%u_l%u.raw", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, texture->arrayLayers, layer);
             if (std::FILE* file = std::fopen((prefix + name).c_str(), "wb")) {
                 std::fwrite(header, sizeof(header), 1, file);
                 std::fwrite(buffer.Bytes().data() + layer * texture->sliceLinearBytes + mip.linearOffset, 1, static_cast<std::size_t>(mip.linearSize), file);
@@ -1981,6 +1983,9 @@ bool StorageTexture::overlaps(std::uint64_t address, std::size_t bytes) const {
 }
 
 void StorageTexture::MarkDirty() {
+    // A depth surface of this memory and extent now holds older depth than this image (the build
+    // notes the write too, but a cached build does not run again).
+    NoteDepthSurfaceWrite(descriptor.baseAddress, descriptor.width, descriptor.height);
     markLayersPending(0, trackedLayers);
 }
 

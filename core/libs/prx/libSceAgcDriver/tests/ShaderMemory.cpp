@@ -1064,8 +1064,10 @@ int main() {
         expectFailure([&] { static_cast<void>(PrepareResourceProgram(request)); }, "shader user data exceeds the scalar register bank", "user data overran scalar register bank");
         request.context.userDataBaseRegister = 8;
         request.context.memory = {};
+        // A null nested pointer reads zeros, as the null page does on the console (Demon's Souls walks
+        // SRTs whose optional tables are null; see ShaderMemory's null-page reads).
         AgcDriver::ShaderMemory invalid({});
-        expectFailure([&] { invalid.Capture(request); }, "null or misaligned address", "null nested pointer was accepted");
+        static_cast<void>(invalid.Capture(request));
         std::cout << "Shader memory capture, strict validation and deterministic replay passed\n";
         return 0;
     } catch (const std::exception& error) {

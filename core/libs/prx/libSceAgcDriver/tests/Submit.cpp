@@ -295,20 +295,18 @@ void testLabelHeldAtSubmission() {
     AgcDriverWaitIdle_nid_postfix();
 }
 
-void testWorkerFailure() {
+// A dispatch the driver cannot run (here: no compute program registers) is reported and skipped,
+// as the GPU runs past compute work whose tables are not filled yet (Demon's Souls issues some):
+// the queue goes idle and later submissions are accepted.
+void testSkippedDispatch() {
     std::array<std::uint32_t, 5> words{0xc0031500, 1, 1, 1, 0x41};
     Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
     check(sceAgcDriverSubmitAcb(0x21, &packet) == 0, "dispatch was not accepted");
-    std::array<std::string, 4> messages;
     std::vector<std::thread> waiters;
-    for (auto& message : messages) {
-        waiters.emplace_back([&message] { message = expectFailure([] { AgcDriverWaitIdle_nid_postfix(); }); });
-    }
+    for (std::size_t waiter = 0; waiter < 4; ++waiter) waiters.emplace_back([] { AgcDriverWaitIdle_nid_postfix(); });
     for (auto& waiter : waiters) waiter.join();
-    for (const auto& message : messages) check(message.find("required shader register") != std::string::npos, "worker failure was lost");
-    check(expectFailure([&] { sceAgcDriverSubmitDcb(&packet); }) == messages[0], "subsequent DCB lost worker failure");
-    check(expectFailure([&] { sceAgcDriverAgrSubmitDcb(&packet); }) == messages[0], "subsequent AGR lost worker failure");
-    check(expectFailure([&] { sceAgcDriverSubmitAcb(0x20, &packet); }) == messages[0], "subsequent ACB lost worker failure");
+    check(sceAgcDriverSubmitAcb(0x20, &packet) == 0, "a submission after a skipped dispatch was refused");
+    AgcDriverWaitIdle_nid_postfix();
 }
 
 }
@@ -324,8 +322,8 @@ int main() {
         testEndOfPipeLabelsWithoutWork();
         testLabelHeldAtSubmission();
         testWideLabelStoredSinceSubmission();
-        testWorkerFailure();
-        check(expectFailure([] { LibcRunShutdown_nid_postfix(); }).find("required shader register") != std::string::npos, "shutdown lost worker failure");
+        testSkippedDispatch();
+        LibcRunShutdown_nid_postfix();
         std::puts("AGC driver submit tests passed");
         return 0;
     } catch (const std::exception& error) {

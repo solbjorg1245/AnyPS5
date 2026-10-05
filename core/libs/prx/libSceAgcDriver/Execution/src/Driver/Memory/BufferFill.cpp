@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include <algorithm>
 #include <bit>
 #include <cstdlib>
 #include <cstring>
@@ -130,6 +132,9 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         recordLabelsForPacket(localDevice.get(), queueId);
         phase(FillLabels);
         GuestMemory::CheckRange(reinterpret_cast<const void*>(base), bytes, 16, true);
+        // HTILE words with ZMASK 0 (bits 0-3) mark their tiles cleared: a fill of a depth surface's
+        // HTILE with them is the toolkit's depth/stencil clear.
+        if (std::all_of(pattern.begin(), pattern.end(), [](std::uint32_t word) { return (word & 0xfu) == 0; })) Graphics::NoteDepthMetadataClear(base, base + bytes);
         phase(FillCheck);
         const auto coverage = Graphics::StorageTexture::ClassifyFill(base, bytes);
         phase(FillClassify);
