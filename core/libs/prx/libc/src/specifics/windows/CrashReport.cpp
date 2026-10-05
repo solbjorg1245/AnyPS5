@@ -394,7 +394,27 @@ struct ExitReporter {
     }
 } g_exitReporter;
 
+// The host's stdout/stderr are unbuffered, and MinGW's printf family writes an unbuffered stream one
+// character at a time: every log line cost ~100 WriteFile calls under the stream lock, about half of
+// the draw thread's time with APS5_PROFILE_DRAW, and the game's own logging contended for the same
+// lock. Both streams get a buffer, flushed every second (a hang still shows its last lines) and by
+// the crash reports above. APS5_UNBUFFERED_LOGS=1 keeps them unbuffered.
+void BufferLogStreams() {
+    if (IsEnvironmentSet("APS5_UNBUFFERED_LOGS")) return;
+    std::setvbuf(stdout, nullptr, _IOFBF, 1 << 16);
+    std::setvbuf(stderr, nullptr, _IOFBF, 1 << 16);
+    CreateThread(nullptr, 0, [](void*) -> DWORD {
+        SetThreadDescription(GetCurrentThread(), L"log flusher");
+        for (;;) {
+            Sleep(1000);
+            std::fflush(stdout);
+            std::fflush(stderr);
+        }
+    }, nullptr, 0, nullptr);
+}
+
 const bool g_crashReportInstalled = [] {
+    BufferLogStreams();
     g_sse4aEmulation = !IsEnvironmentSet("APS5_NO_SSE4A_EMULATION");
     g_sse4aTrace = IsEnvironmentSet("APS5_TRACE_SSE4A");
     AddVectoredExceptionHandler(1, ReportCrash);
