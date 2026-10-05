@@ -33,6 +33,8 @@ public:
         appendMesh(key, request);
         append(key, request.target);
         append(key, DebugProbeActive());
+        // The probed instruction and register, so a moved probe compiles again.
+        if (DebugProbeActive()) append(key, DebugProbeKey());
         append(key, RayTracingStrict());
         append(key, RayTracingMiss());
     }

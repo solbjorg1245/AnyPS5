@@ -126,7 +126,9 @@ bool TranslationContext::imageStore(const RdnaInstruction& inst) {
         RdnaOperand probeReg{};
         probeReg.kind = RdnaOperandKind::VectorRegister;
         probeReg.reg = 255u;
-        IrValue& probed = ir.ShiftRightLogical(readRawU32(probeReg).Value(), ir.Constant(probe.shift));
+        // Shift 32 stores the register converted from an unsigned integer to float (indices, counts).
+        IrValue& raw = readRawU32(probeReg).Value();
+        IrValue& probed = probe.shift == 32u ? ir.BitCastU32(ir.Emit(IrOpcode::ConvertF32U32, IrType::F32, {&raw})) : ir.ShiftRightLogical(raw, ir.Constant(probe.shift));
         IrValue& zero = ir.Constant(0u);
         data = &ir.Emit(IrOpcode::CompositeConstructU32x4, IrOpcodeType(IrOpcode::CompositeConstructU32x4), {&probed, &zero, &zero, &zero});
     }

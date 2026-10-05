@@ -1,6 +1,9 @@
 #include "Translation/DispatchInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
 #include "Recompiler.hpp"
+#include <mutex>
+#include <cstdio>
+#include <chrono>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +26,13 @@ void TranslationContext::TranslateInstruction(const RdnaInstruction& decoded) {
     }
     if (instruction.op == RdnaOpcode::Unsupported) {
         throw std::runtime_error(instruction.unsupportedReason.empty() ? "unsupported decoded instruction at pc " + std::to_string(instruction.programCounter) : std::string(instruction.unsupportedReason));
+    }
+    // The probe register starts at -12345.0, so lanes that never reach the probed instruction show.
+    if (const DebugProbe probe = DebugProbeConfig(); probe.enabled && instruction.programCounter == 0u) {
+        RdnaOperand target{};
+        target.kind = RdnaOperandKind::VectorRegister;
+        target.reg = 255u;
+        writeOperand(target, &ir.Constant(0xc640e400u));
     }
     bool translated = false;
     switch (instruction.family) {
@@ -100,21 +110,53 @@ bool RayTracingMiss() {
     return miss;
 }
 
+namespace {
+
+DebugProbe parseProbe(const char* text) {
+    DebugProbe result;
+    if (text == nullptr) return result;
+    char* end = nullptr;
+    result.programCounter = static_cast<std::uint32_t>(std::strtoul(text, &end, 16));
+    if (end == nullptr || *end != ':') return result;
+    result.vgpr = static_cast<std::uint32_t>(std::strtoul(end + 1, &end, 10));
+    if (end != nullptr && *end == ':') result.shift = static_cast<std::uint32_t>(std::strtoul(end + 1, nullptr, 10));
+    result.enabled = result.vgpr < 255u;
+    return result;
+}
+
+// APS5_PROBE, or the first line of the file APS5_PROBE_FILE names (read again at most once a second),
+// so a probe moves to another instruction without restarting the title.
+DebugProbe currentProbe() {
+    static const DebugProbe fromEnvironment = parseProbe(std::getenv("APS5_PROBE"));
+    static const char* file = std::getenv("APS5_PROBE_FILE");
+    if (file == nullptr) return fromEnvironment;
+    static std::mutex mutex;
+    static DebugProbe fromFile;
+    static std::chrono::steady_clock::time_point readAt{};
+    std::lock_guard lock(mutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - readAt >= std::chrono::seconds(1)) {
+        readAt = now;
+        fromFile = {};
+        if (std::FILE* input = std::fopen(file, "r")) {
+            char line[64] = {};
+            if (std::fgets(line, sizeof(line), input) != nullptr) fromFile = parseProbe(line);
+            std::fclose(input);
+        }
+    }
+    return fromFile;
+}
+
+}
+
+std::uint64_t DebugProbeKey() {
+    const auto probe = DebugProbeConfig();
+    return probe.enabled ? (static_cast<std::uint64_t>(probe.programCounter) << 32u) | (static_cast<std::uint64_t>(probe.vgpr) << 8u) | probe.shift | 0x80000000ull : 0u;
+}
+
 DebugProbe DebugProbeConfig() {
-    static const DebugProbe parsed = [] {
-        DebugProbe result;
-        const char* text = std::getenv("APS5_PROBE");
-        if (text == nullptr) return result;
-        char* end = nullptr;
-        result.programCounter = static_cast<std::uint32_t>(std::strtoul(text, &end, 16));
-        if (end == nullptr || *end != ':') return result;
-        result.vgpr = static_cast<std::uint32_t>(std::strtoul(end + 1, &end, 10));
-        if (end != nullptr && *end == ':') result.shift = static_cast<std::uint32_t>(std::strtoul(end + 1, nullptr, 10));
-        result.enabled = result.vgpr < 255u;
-        return result;
-    }();
-    DebugProbe probe = parsed;
-    probe.enabled = parsed.enabled && DebugProbeActive();
+    DebugProbe probe = currentProbe();
+    probe.enabled = probe.enabled && DebugProbeActive();
     return probe;
 }
 

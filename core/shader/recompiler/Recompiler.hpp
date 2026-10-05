@@ -417,6 +417,8 @@ struct ResourceCapture;
 // cache keys on it.
 void SetDebugProbeActive(bool active);
 [[nodiscard]] bool DebugProbeActive();
+// The probed instruction, register and shift packed for the cache key (0 without a probe).
+[[nodiscard]] std::uint64_t DebugProbeKey();
 [[nodiscard]] bool RayTracingStrict();
 [[nodiscard]] bool RayTracingMiss();
 

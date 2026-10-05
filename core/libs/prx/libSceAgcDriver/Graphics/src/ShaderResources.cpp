@@ -2702,7 +2702,8 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
             std::snprintf(item, sizeof(item), " wb=0x%llx+0x%llx", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
             text += item;
         }
-        AgcDriver::FrameTrace::NoteWrites(text);
+        // The bound resources (textures with their surfaces, storage images, buffers).
+        AgcDriver::FrameTrace::NoteWrites(text + " |" + Describe());
     }
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();
