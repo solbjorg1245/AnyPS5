@@ -11,7 +11,9 @@ namespace AgcDriver::FrameTrace {
 // file is removed): every command is logged to <dir>/p<present>_trace.txt with its index in the
 // frame, and after each index listed in <dir>/after.txt (one per line; "all" after the index saves
 // every live image instead of the command's own targets) the targets are saved as
-// <dir>/p<present>_c<index>_*.raw. Indices count commands of every queue in execution order.
+// <dir>/p<present>_c<index>_*.raw. Indices count commands of every queue in execution order, which
+// async compute queues reorder from frame to frame: a "match <text>" line (optionally ending in
+// "all") instead dumps after every command whose trace line contains the text.
 void AtPresent(const std::string& directory, std::uint64_t present);
 bool Active();
 

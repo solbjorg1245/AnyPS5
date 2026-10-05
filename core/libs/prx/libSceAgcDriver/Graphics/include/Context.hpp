@@ -29,7 +29,12 @@ inline void Require(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error("AGC graphics: " + reason);
 }
 
+// Called when a call reports VK_ERROR_DEVICE_LOST, before the error is thrown: VulkanDevice installs
+// one that prints the VK_EXT_device_fault report (faulting addresses, vendor codes) once.
+inline void (*DeviceLostHook)() = nullptr;
+
 inline void Check(VkResult result, const char* operation) {
+    if (result == VK_ERROR_DEVICE_LOST && DeviceLostHook != nullptr) DeviceLostHook();
     if (result != VK_SUCCESS) throw std::runtime_error(std::string("AGC graphics: ") + operation + ": Vulkan result " + std::to_string(result));
 }
 

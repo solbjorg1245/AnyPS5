@@ -6,6 +6,8 @@
 #include <filesystem>
 #include <map>
 #include <mutex>
+#include <string>
+#include <vector>
 
 namespace AgcDriver::FrameTrace {
 namespace {
@@ -19,7 +21,13 @@ struct State {
     std::uint64_t next = 0;
     // Command index -> whether every live image is saved after it.
     std::map<std::uint64_t, bool> dumps;
+    // "match <text>" lines: commands whose line contains the text are dumped too (at most
+    // MaxMatchDumps a frame), so passes are found although async queues reorder the indices.
+    std::vector<std::pair<std::string, bool>> matches;
+    std::uint32_t matchDumps = 0;
 };
+
+constexpr std::uint32_t MaxMatchDumps = 64;
 
 // Never destroyed: worker threads may record while the process exits.
 State& Trace() {
@@ -46,9 +54,19 @@ void AtPresent(const std::string& directory, std::uint64_t present) {
     trace.present = present;
     trace.next = 0;
     trace.dumps.clear();
+    trace.matches.clear();
+    trace.matchDumps = 0;
     if (std::FILE* list = std::fopen((root / "after.txt").string().c_str(), "r")) {
         char line[128];
         while (std::fgets(line, sizeof(line), list) != nullptr) {
+            if (std::strncmp(line, "match ", 6) == 0) {
+                std::string text(line + 6);
+                while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) text.pop_back();
+                const bool all = text.size() > 4 && text.compare(text.size() - 4, 4, " all") == 0;
+                if (all) text.resize(text.size() - 4);
+                if (!text.empty()) trace.matches.emplace_back(text, all);
+                continue;
+            }
             char* end = nullptr;
             const auto index = std::strtoull(line, &end, 10);
             if (end == line) continue;
@@ -74,6 +92,14 @@ Entry Record(const std::string& line) {
     if (const auto found = trace.dumps.find(entry.index); found != trace.dumps.end()) {
         entry.dump = true;
         entry.all = found->second;
+    }
+    for (const auto& [text, all] : trace.matches) {
+        if (trace.matchDumps >= MaxMatchDumps || line.find(text) == std::string::npos) continue;
+        ++trace.matchDumps;
+        entry.dump = true;
+        entry.all = entry.all || all;
+    }
+    if (entry.dump) {
         entry.prefix = (std::filesystem::path(trace.directory) / ("p" + std::to_string(trace.present) + "_c" + std::to_string(entry.index) + "_")).string();
     }
     return entry;

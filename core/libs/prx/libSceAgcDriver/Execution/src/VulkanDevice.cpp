@@ -39,6 +39,7 @@
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <iterator>
 #include <list>
 #include <stdexcept>
 #include <string>
@@ -50,7 +51,59 @@
 namespace AgcDriver {
 namespace {
 
+// The device whose loss DeviceLostHook reports (one Vulkan device at a time).
+struct DeviceFaultReport {
+    VkDevice device = VK_NULL_HANDLE;
+    PFN_vkGetDeviceFaultInfoEXT getFaultInfo = nullptr;
+    std::atomic<bool> reported{false};
+};
+
+DeviceFaultReport& FaultReport() {
+    static auto* report = new DeviceFaultReport();
+    return *report;
+}
+
+// Prints VK_EXT_device_fault's description of the loss once: the faulting GPU virtual addresses
+// (page faults from a bad buffer device address or descriptor), instruction pointers and vendor
+// fault codes. NVIDIA reports a page fault's address; a timeout (TDR) reports no address.
+void ReportDeviceFault() {
+    auto& report = FaultReport();
+    if (report.getFaultInfo == nullptr || report.reported.exchange(true)) return;
+    VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    if (report.getFaultInfo(report.device, &counts, nullptr) != VK_SUCCESS && counts.addressInfoCount == 0 && counts.vendorInfoCount == 0) {
+        std::fprintf(stderr, "[gpu] device lost: VK_EXT_device_fault has no report\n");
+        return;
+    }
+    std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+    std::vector<VkDeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
+    counts.vendorBinarySize = 0;
+    VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+    info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
+    info.pVendorInfos = vendors.empty() ? nullptr : vendors.data();
+    const auto result = report.getFaultInfo(report.device, &counts, &info);
+    std::fprintf(stderr, "[gpu] device lost (fault info result %d): %s; %u address(es), %u vendor record(s)\n", static_cast<int>(result), info.description, counts.addressInfoCount, counts.vendorInfoCount);
+    static constexpr const char* types[] = {"none", "read invalid", "write invalid", "execute invalid", "instruction pointer unknown", "instruction pointer invalid", "instruction pointer fault"};
+    for (std::uint32_t index = 0; index < counts.addressInfoCount && index < addresses.size(); ++index) {
+        const auto& address = addresses[index];
+        const auto type = static_cast<std::size_t>(address.addressType);
+        std::fprintf(stderr, "[gpu]   address 0x%llx (precision 0x%llx): %s\n", static_cast<unsigned long long>(address.reportedAddress), static_cast<unsigned long long>(address.addressPrecision), type < std::size(types) ? types[type] : "?");
+    }
+    for (std::uint32_t index = 0; index < counts.vendorInfoCount && index < vendors.size(); ++index) {
+        const auto& vendor = vendors[index];
+        std::fprintf(stderr, "[gpu]   vendor: %s (code 0x%llx, data 0x%llx)\n", vendor.description, static_cast<unsigned long long>(vendor.vendorFaultCode), static_cast<unsigned long long>(vendor.vendorFaultData));
+    }
+}
+
+void InstallDeviceFaultReport(VkDevice device, PFN_vkGetDeviceFaultInfoEXT getFaultInfo, bool) {
+    auto& report = FaultReport();
+    report.device = device;
+    report.getFaultInfo = getFaultInfo;
+    report.reported = false;
+    Graphics::DeviceLostHook = getFaultInfo != nullptr ? &ReportDeviceFault : nullptr;
+}
+
 void check(VkResult result, const char* operation) {
+    if (result == VK_ERROR_DEVICE_LOST && Graphics::DeviceLostHook != nullptr) Graphics::DeviceLostHook();
     if (result != VK_SUCCESS) {
         throw std::runtime_error(std::string(operation) + ": Vulkan result " + std::to_string(result));
     }
@@ -789,6 +842,18 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     }
     maintenance8Features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
     maintenance8Features.maintenance8 = VK_TRUE;
+    // VK_EXT_device_fault: a lost device reports what faulted (DeviceLostHook prints it).
+    VkPhysicalDeviceFaultFeaturesEXT faultFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    bool deviceFault = false;
+    if (hasExtension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &faultFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+        deviceFault = faultFeatures.deviceFault == VK_TRUE;
+        if (deviceFault) deviceExtensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    }
+    const bool faultBinary = faultFeatures.deviceFaultVendorBinary == VK_TRUE;
+    faultFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    faultFeatures.deviceFault = VK_TRUE;
     VkPhysicalDeviceDepthClipControlFeaturesEXT depthClipFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
     if (hasExtension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME)) {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &depthClipFeatures};
@@ -894,6 +959,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         maintenance8Features.pNext = const_cast<void*>(deviceInfo.pNext);
         deviceInfo.pNext = &maintenance8Features;
     }
+    if (deviceFault) {
+        faultFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
+        deviceInfo.pNext = &faultFeatures;
+    }
     byteFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
     if (state->fragmentShaderBarycentric) {
         barycentricFeatures.pNext = byteFeatures.pNext;
@@ -935,6 +1004,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     bdaFeatures.pNext = &byteFeatures;
     deviceInfo.pNext = &bdaFeatures;
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
+    if (deviceFault) InstallDeviceFaultReport(state->device, state->DeviceFunction<PFN_vkGetDeviceFaultInfoEXT>("vkGetDeviceFaultInfoEXT"), faultBinary);
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family);
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
