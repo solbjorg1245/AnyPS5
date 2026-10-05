@@ -549,11 +549,57 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
 
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView");
         createFirstLayerView(descriptor, viewInfo);
+        imageDescriptor = descriptor;
+        imageFormat = vkFormat;
+        imageAspect = aspect;
+        imageDepthCompare = depthCompare;
         if (profile) {
             auto& totals = Profile();
             totals.view += timer.lap();
             if (++totals.count % 200 == 0) std::fprintf(stderr, "[texture] %llu textures (%llu copied from storage images, %llu uploads recorded, images %llu suballocated / %llu dedicated): allocate+image %.0f ms, guest read %.0f ms, detile+copy %.0f ms, view+buffer release %.0f ms\n", static_cast<unsigned long long>(totals.count), static_cast<unsigned long long>(totals.fromStorage), static_cast<unsigned long long>(totals.recordedUploads), static_cast<unsigned long long>(ImageMemoryPool::PooledImages()), static_cast<unsigned long long>(ImageMemoryPool::DedicatedImages()), totals.allocate, totals.read, totals.gpu, totals.view);
         }
+    } catch (...) {
+        release();
+        throw;
+    }
+}
+
+bool Texture::SharesImageWith(const GuestTextureResource& descriptor, bool depthCompare) const {
+    if (!imageDescriptor.has_value() || owned == nullptr || depthCompare != imageDepthCompare) return false;
+    const auto& mine = *imageDescriptor;
+    // The image is the whole surface (every mip and slice): the same surface in the same format gives
+    // the same image, whatever range and swizzle the view takes. The format must resolve the same
+    // way, so it is compared exactly.
+    return descriptor.baseAddress == mine.baseAddress && descriptor.width == mine.width && descriptor.height == mine.height && descriptor.depthOrLastArray == mine.depthOrLastArray && descriptor.mipCount == mine.mipCount && descriptor.format == mine.format && descriptor.dimension == mine.dimension && descriptor.tileMode == mine.tileMode && descriptor.dccAddress == mine.dccAddress && DescribeSurface(descriptor).imageLayers == DescribeSurface(mine).imageLayers;
+}
+
+Texture::Texture(const Context& context, const std::shared_ptr<const Texture>& shared, const GuestTextureResource& descriptor, VkComponentMapping components) : context(context) {
+    Require(shared != nullptr && shared->SharesImageWith(descriptor, shared->imageDepthCompare), "texture view does not share the image's surface");
+    try {
+        // The image, its memory and its recorded upload stay alive with `owned` (the upload batch
+        // holds it too); this texture only adds a view.
+        owned = shared->owned;
+        image = shared->image;
+        imageDescriptor = shared->imageDescriptor;
+        imageFormat = shared->imageFormat;
+        imageAspect = shared->imageAspect;
+        imageDepthCompare = shared->imageDepthCompare;
+        const auto geometry = DescribeSurface(descriptor);
+        const auto viewLevelCount = std::min(descriptor.lastLevel, descriptor.mipCount - 1u) - descriptor.baseLevel + 1u;
+        const auto viewLayerCount = geometry.imageLayers - descriptor.baseArray;
+        if (descriptor.dimension == TextureDimension::kCube) {
+            Require(viewLayerCount % 6u == 0, "guest cube texture view does not contain a multiple of 6 array slices");
+        }
+        VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        viewInfo.image = image;
+        viewInfo.viewType = ViewTypeFor(descriptor.dimension, viewLayerCount);
+        viewInfo.format = imageFormat;
+        viewInfo.components = imageDepthCompare ? VkComponentMapping{} : components;
+        viewInfo.subresourceRange = {imageAspect, descriptor.baseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
+        VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
+        ChainMinLod(context, descriptor, viewInfo, minLod);
+        Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView shared");
+        createFirstLayerView(descriptor, viewInfo);
     } catch (...) {
         release();
         throw;

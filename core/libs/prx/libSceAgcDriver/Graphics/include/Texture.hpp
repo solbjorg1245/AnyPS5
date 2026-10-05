@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -66,6 +67,11 @@ public:
     // A view of layers [baseLayer, baseLayer + layerCount) of a depth surface's image (DepthSurface),
     // as a 2D array (with a 2D first-layer view) when `array` is set.
     Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, std::uint32_t baseLayer = 0, std::uint32_t layerCount = 1, bool array = false);
+    // Another view of `shared`'s snapshot image: a descriptor of the same surface that differs only in
+    // what the view selects (base/last mip, base slice, swizzle, minimum LOD) shares the image and its
+    // upload instead of snapshotting the surface again. SharesImageWith says whether it may.
+    Texture(const Context& context, const std::shared_ptr<const Texture>& shared, const GuestTextureResource& descriptor, VkComponentMapping components);
+    bool SharesImageWith(const GuestTextureResource& descriptor, bool depthCompare) const;
     static bool CanCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
     ~Texture();
     Texture(const Texture&) = delete;
@@ -99,6 +105,11 @@ private:
     VkImageView firstLayerView = VK_NULL_HANDLE;
     VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkDeviceSize allocationBytes = 0;
+    // The snapshot image's surface and how it was made, for views sharing it (empty: none).
+    std::optional<GuestTextureResource> imageDescriptor;
+    VkFormat imageFormat = VK_FORMAT_UNDEFINED;
+    VkImageAspectFlags imageAspect = 0;
+    bool imageDepthCompare = false;
     std::shared_ptr<ResidentColor> source;
     std::shared_ptr<StorageTexture> storageSource;
     std::unique_ptr<CommandBatch> upload;
