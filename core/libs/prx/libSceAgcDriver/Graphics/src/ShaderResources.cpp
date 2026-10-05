@@ -512,11 +512,13 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
     // The budget counts guest bytes of the cached surfaces (each also holds a GPU image and, for a
-    // snapshot, a CPU copy). APS5_TEXTURE_CACHE_MIB sets it.
+    // snapshot, a CPU copy). APS5_TEXTURE_CACHE_MIB sets it. Default 6 GiB: a Boletaria frame samples
+    // more than 2 GiB, and at 2 GiB the LRU cycled (~3900 evictions and ~15 GiB re-uploaded per 10 s,
+    // half the draw thread's time); 6 GiB of entries took ~10 GiB of video memory in total.
     static const std::uint64_t budget = [] {
         const char* value = std::getenv("APS5_TEXTURE_CACHE_MIB");
         const auto mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
-        return (mib != 0 ? mib : 2048ull) << 20u;
+        return (mib != 0 ? mib : 6144ull) << 20u;
     }();
     while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) {
         const auto victim = std::prev(cache.entries.end());
