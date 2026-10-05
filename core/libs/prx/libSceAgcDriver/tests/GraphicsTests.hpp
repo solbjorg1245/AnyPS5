@@ -31,6 +31,7 @@ struct TextureDetilerTestAccess {
 
 void RunTextureFormatTests();
 void RunTextureTilingTests();
+void RunImageMemoryPoolTests();
 void RunGuestTextureResourceTests();
 void RunGuestSamplerResourceTests();
 void RunTextureDetilerTests(const AgcDriver::Graphics::Context& context, const TextureDetilerTestAccess& access);

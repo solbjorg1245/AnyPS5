@@ -224,6 +224,133 @@ void ChainMinLod(const Context& context, const GuestTextureResource& descriptor,
 
 }
 
+namespace {
+
+std::atomic<std::uint64_t> pooledImageCount{0};
+std::atomic<std::uint64_t> dedicatedImageCount{0};
+
+}
+
+bool ImageMemoryPool::Enabled() {
+    static const bool enabled = std::getenv("APS5_NO_TEXTURE_SUBALLOC") == nullptr;
+    return enabled;
+}
+
+std::uint64_t ImageMemoryPool::PooledImages() { return pooledImageCount.load(); }
+std::uint64_t ImageMemoryPool::DedicatedImages() { return dedicatedImageCount.load(); }
+
+ImageMemoryPool::ImageMemoryPool(const Context& context) : device(context.device), context(context) {}
+
+ImageMemoryPool::~ImageMemoryPool() {
+    for (const auto& block : blocks) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(device, block->memory, nullptr);
+}
+
+ImageMemoryPool::Allocation ImageMemoryPool::AllocateAndBind(VkImage image, VkMemoryPropertyFlags properties) {
+    VkMemoryRequirements requirements{};
+    bool dedicated = false;
+    bool requiresDedicated = false;
+    // vkGetImageMemoryRequirements2 is core 1.1; a device without it (tests) just gets no hint.
+    if (const auto query = reinterpret_cast<PFN_vkGetImageMemoryRequirements2>(context.deviceProc != nullptr ? context.deviceProc(device, "vkGetImageMemoryRequirements2") : nullptr)) {
+        VkMemoryDedicatedRequirements dedicatedRequirements{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
+        VkMemoryRequirements2 requirements2{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+        requirements2.pNext = &dedicatedRequirements;
+        VkImageMemoryRequirementsInfo2 info{VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2};
+        info.image = image;
+        query(device, &info, &requirements2);
+        requirements = requirements2.memoryRequirements;
+        dedicated = dedicatedRequirements.prefersDedicatedAllocation != VK_FALSE || dedicatedRequirements.requiresDedicatedAllocation != VK_FALSE;
+        requiresDedicated = dedicatedRequirements.requiresDedicatedAllocation != VK_FALSE;
+    } else {
+        context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(device, image, &requirements);
+    }
+    const auto type = context.MemoryType(requirements.memoryTypeBits, properties);
+    const auto bind = context.Function<PFN_vkBindImageMemory>("vkBindImageMemory");
+    (void)requiresDedicated;
+    if (Enabled() && !dedicated && requirements.size <= maxPooledBytes) {
+        std::lock_guard lock(mutex);
+        auto place = [&](Block& block) -> std::optional<Allocation> {
+            const auto offset = block.ranges.Allocate(requirements.size, requirements.alignment);
+            if (!offset) return std::nullopt;
+            if (bind(device, image, block.memory, *offset) != VK_SUCCESS) {
+                block.ranges.Free(*offset, requirements.size);
+                return std::nullopt;
+            }
+            return Allocation{block.memory, *offset, requirements.size, true};
+        };
+        for (const auto& block : blocks) {
+            if (block->type != type) continue;
+            if (auto result = place(*block)) {
+                ++pooledImageCount;
+                return *result;
+            }
+        }
+        VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocate.allocationSize = blockBytes;
+        allocate.memoryTypeIndex = type;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        // A failed block (video memory exhausted) falls through to the dedicated path below.
+        if (context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(device, &allocate, nullptr, &memory) == VK_SUCCESS) {
+            blocks.push_back(std::make_unique<Block>(Block{memory, type, RangeAllocator(blockBytes)}));
+            if (auto result = place(*blocks.back())) {
+                ++pooledImageCount;
+                return *result;
+            }
+        }
+    }
+    VkMemoryDedicatedAllocateInfo dedicatedInfo{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+    dedicatedInfo.image = image;
+    VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocate.pNext = dedicated ? &dedicatedInfo : nullptr;
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = type;
+    Allocation result{VK_NULL_HANDLE, 0, requirements.size, false};
+    Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(device, &allocate, nullptr, &result.memory), "vkAllocateMemory texture");
+    if (const auto status = bind(device, image, result.memory, 0); status != VK_SUCCESS) {
+        context.Function<PFN_vkFreeMemory>("vkFreeMemory")(device, result.memory, nullptr);
+        Check(status, "vkBindImageMemory");
+    }
+    ++dedicatedImageCount;
+    return result;
+}
+
+void ImageMemoryPool::Release(const Allocation& allocation) noexcept {
+    if (allocation.memory == VK_NULL_HANDLE) return;
+    if (!allocation.pooled) {
+        context.Function<PFN_vkFreeMemory>("vkFreeMemory")(device, allocation.memory, nullptr);
+        return;
+    }
+    VkDeviceMemory empty = VK_NULL_HANDLE;
+    {
+        std::lock_guard lock(mutex);
+        for (auto it = blocks.begin(); it != blocks.end(); ++it) {
+            auto& block = **it;
+            if (block.memory != allocation.memory) continue;
+            block.ranges.Free(allocation.offset, allocation.size);
+            if (block.ranges.Empty()) {
+                // Keep one empty block per memory type for reuse; return the rest to the driver.
+                const auto spare = std::count_if(blocks.begin(), blocks.end(), [&](const auto& other) { return other.get() != &block && other->type == block.type && other->ranges.Empty(); });
+                if (spare > 0) {
+                    empty = block.memory;
+                    blocks.erase(it);
+                }
+            }
+            break;
+        }
+    }
+    if (empty != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(device, empty, nullptr);
+}
+
+std::shared_ptr<ImageMemoryPool> GetImageMemoryPool(const Context& context) {
+    static std::mutex registryMutex;
+    static std::map<VkDevice, std::weak_ptr<ImageMemoryPool>> registry;
+    std::lock_guard lock(registryMutex);
+    auto& slot = registry[context.device];
+    if (auto pool = slot.lock()) return pool;
+    auto pool = std::make_shared<ImageMemoryPool>(context);
+    slot = pool;
+    return pool;
+}
+
 Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare) : context(context) {
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -268,14 +395,9 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &imageInfo, nullptr, &image), "vkCreateImage");
         owned = std::make_shared<OwnedImage>(context, image, VK_NULL_HANDLE);
 
-        VkMemoryRequirements requirements{};
-        context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image, &requirements);
-        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocation.allocationSize = requirements.size;
-        allocationBytes = requirements.size;
-        allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory texture");
-        Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory");
+        owned->pool = GetImageMemoryPool(context);
+        owned->allocation = owned->pool->AllocateAndBind(image, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        allocationBytes = owned->allocation.size;
 
         {
             // Debug aid: APS5_DUMP_TEXTURE=<hex addresses, comma separated> saves the detiled first mip
@@ -430,7 +552,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         if (profile) {
             auto& totals = Profile();
             totals.view += timer.lap();
-            if (++totals.count % 200 == 0) std::fprintf(stderr, "[texture] %llu textures (%llu copied from storage images, %llu uploads recorded): allocate+image %.0f ms, guest read %.0f ms, detile+copy %.0f ms, view+buffer release %.0f ms\n", static_cast<unsigned long long>(totals.count), static_cast<unsigned long long>(totals.fromStorage), static_cast<unsigned long long>(totals.recordedUploads), totals.allocate, totals.read, totals.gpu, totals.view);
+            if (++totals.count % 200 == 0) std::fprintf(stderr, "[texture] %llu textures (%llu copied from storage images, %llu uploads recorded, images %llu suballocated / %llu dedicated): allocate+image %.0f ms, guest read %.0f ms, detile+copy %.0f ms, view+buffer release %.0f ms\n", static_cast<unsigned long long>(totals.count), static_cast<unsigned long long>(totals.fromStorage), static_cast<unsigned long long>(totals.recordedUploads), static_cast<unsigned long long>(ImageMemoryPool::PooledImages()), static_cast<unsigned long long>(ImageMemoryPool::DedicatedImages()), totals.allocate, totals.read, totals.gpu, totals.view);
         }
     } catch (...) {
         release();

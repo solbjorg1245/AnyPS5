@@ -1800,6 +1800,7 @@ int main() {
         RunLiveStackAccessTests();
         RunTextureFormatTests();
         RunTextureTilingTests();
+        RunImageMemoryPoolTests();
         RunGuestTextureResourceTests();
         RunGuestSamplerResourceTests();
         mock = MockVulkan{};

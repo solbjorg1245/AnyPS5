@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ImageMemoryPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -43,11 +44,15 @@ struct OwnedImage {
     OwnedImage& operator=(const OwnedImage&) = delete;
     ~OwnedImage() {
         if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
-        if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+        if (pool) pool->Release(allocation);
+        else if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
     }
     Context context;
     VkImage image;
     VkDeviceMemory memory;
+    // Set when the memory is a range of a shared block (ImageMemoryPool); `memory` is then unused.
+    std::shared_ptr<ImageMemoryPool> pool;
+    ImageMemoryPool::Allocation allocation;
 };
 
 class Texture {
