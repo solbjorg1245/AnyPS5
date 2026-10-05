@@ -3,9 +3,12 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include <cstdint>
+#include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <tuple>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -42,8 +45,8 @@ struct BufferAllocation {
 //
 // Device-local allocations (the detiler's scratch buffers and the staging shadows of written guest
 // buffers, see GuestBufferMemory) are retained in a third tier with a budget of their own, video
-// memory instead of pinned host memory: APS5_STAGING_POOL_MIB (default 512); 0 keeps them in the
-// two host tiers as before.
+// memory instead of pinned host memory: APS5_STAGING_POOL_MIB (default 2048: 512 evicted ~4000 per
+// 10 s of gameplay); 0 keeps them in the two host tiers as before.
 class BufferPool {
 public:
     explicit BufferPool(const Context& context);
@@ -60,10 +63,15 @@ private:
         BufferAllocation allocation;
         std::uint64_t lastUse;
     };
+    // Retained slots are grouped by what a Take must match (capacity, usage, memory properties),
+    // each group oldest first: a Take is a map lookup instead of a scan of every slot (with
+    // thousands retained the scan cost more than the allocation it saved).
+    using SlotKey = std::tuple<std::size_t, VkBufferUsageFlags, VkMemoryPropertyFlags>;
     // One retention tier: its slots, their bytes, the byte budget they are evicted under and its
     // counters (APS5_PROFILE_DRAW, reported every 10 s from Take).
     struct Tier {
-        std::vector<Slot> free;
+        std::map<SlotKey, std::deque<Slot>> free;
+        std::size_t slots = 0;
         VkDeviceSize retainedBytes = 0;
         VkDeviceSize budget = 0;
         std::uint64_t hits = 0;
@@ -93,12 +101,14 @@ private:
     Tier deviceTier;
     std::uint64_t clock = 0;
     static constexpr VkDeviceSize budget = 512ull * 1024 * 1024;
-    // The small tier's own budget (512 slots of at most half a MiB each): pinned host memory the
+    // The small tier's own budget (slots of at most half a MiB each): pinned host memory the
     // large tier's budget does not count.
-    static constexpr VkDeviceSize smallBudget = 64ull * 1024 * 1024;
+    static constexpr VkDeviceSize smallBudget = 256ull * 1024 * 1024;
     // Requests of this size and more keep their exact size and go to the large tier.
     static constexpr std::size_t classLimit = std::size_t{1} << 20u;
-    static constexpr std::size_t defaultSlots = 512;
+    // 512 slots evicted ~8000 small allocations per 10 s of gameplay (each a kernel allocation to
+    // make again); the small tier's byte budget is what bounds it now.
+    static constexpr std::size_t defaultSlots = 8192;
 };
 
 std::shared_ptr<BufferPool> GetBufferPool(const Context& context);

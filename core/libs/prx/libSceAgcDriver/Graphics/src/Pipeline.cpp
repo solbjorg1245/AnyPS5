@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -230,6 +231,13 @@ VkPipelineLayout Pipeline::Layout() const {
     return layout;
 }
 
+namespace {
+
+// Framebuffers made by AcquireFramebuffer since the last [pipecache] report.
+std::atomic<std::uint64_t> framebuffersMade{0};
+
+}
+
 std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent) {
     Require(targets.size() == attachments && owners.size() == colorAttachments, "render targets do not match the pipeline's attachments");
     const bool resident = std::all_of(owners.begin(), owners.end(), [](const auto& owner) { return owner != nullptr; });
@@ -251,9 +259,12 @@ std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImag
         }
     }
     auto framebuffer = std::make_shared<Framebuffer>(context, renderPass, targets, extent);
+    framebuffersMade.fetch_add(1, std::memory_order_relaxed);
     if (!resident) return framebuffer;
-    // Beyond the bound the least recently used unreferenced entry goes.
-    constexpr std::size_t bound = 8;
+    // Beyond the bound the least recently used unreferenced entry goes. One shadow pipeline draws into
+    // every slice of a cascade array and of the 80-slice atlas, each slice its own view: a bound of
+    // 8 cycled them and made a framebuffer per draw.
+    constexpr std::size_t bound = 128;
     while (framebuffers.size() >= bound) {
         const auto victim = std::find_if(framebuffers.begin(), framebuffers.end(), [](const CachedFramebuffer& entry) { return entry.framebuffer.use_count() == 1; });
         if (victim == framebuffers.end()) break;
@@ -444,7 +455,7 @@ void reportPipelines(PipelineStore& store) {
     if (now - store.lastReport < std::chrono::seconds(10)) return;
     store.lastReport = now;
     const auto lookups = store.hits + store.misses + store.uncached;
-    std::fprintf(stderr, "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size());
+    std::fprintf(stderr, "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached; %llu framebuffers made\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size(), static_cast<unsigned long long>(framebuffersMade.exchange(0, std::memory_order_relaxed)));
     store.hits = store.misses = store.uncached = store.evicted = 0;
 }
 
@@ -488,7 +499,13 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     auto pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     store.entries.push_back({context.device, context.bufferPool, hash, key, pipeline});
     store.index[hash] = std::prev(store.entries.end());
-    constexpr std::size_t bound = 256;
+    // A gameplay frame uses more than a thousand pipelines: at the old bound of 256 every frame
+    // evicted and recreated ~1300 of them (~1 ms each). APS5_PIPELINE_CACHE_ENTRIES sets the bound.
+    static const std::size_t bound = [] {
+        const char* text = std::getenv("APS5_PIPELINE_CACHE_ENTRIES");
+        const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+        return parsed != 0 ? static_cast<std::size_t>(parsed) : std::size_t{8192};
+    }();
     while (store.entries.size() > bound) {
         // Only an entry no recorded draw still holds may go (Kept keeps its shared_ptr until the fence).
         const auto victim = std::find_if(store.entries.begin(), store.entries.end(), [](const PipelineStore::Entry& entry) { return entry.pipeline.use_count() == 1; });
