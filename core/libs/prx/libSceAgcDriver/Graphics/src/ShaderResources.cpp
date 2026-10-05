@@ -106,7 +106,11 @@ struct TextureCache {
     // Per surface address, the newest entry whose snapshot image other keys of the surface may view.
     std::unordered_map<std::uint64_t, std::list<CachedTexture>::iterator> surfaces;
     std::uint64_t bytes = 0;
+    // Of `bytes`, the entries of LargeTextureBytes and more (APS5_TEXTURE_LARGE_MIB bounds them).
+    std::uint64_t largeBytes = 0;
 };
+
+constexpr std::uint64_t LargeTextureBytes = 64ull << 20u;
 
 TextureCache& Textures() {
     static TextureCache cache;
@@ -131,6 +135,7 @@ std::list<CachedTexture>::iterator findTexture(TextureCache& cache, const Textur
 
 void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
     cache.bytes -= it->accounted;
+    if (it->accounted >= LargeTextureBytes) cache.largeBytes -= it->accounted;
     cache.index.erase(it->key);
     if (const auto surface = cache.surfaces.find(it->address); surface != cache.surfaces.end() && surface->second == it) cache.surfaces.erase(surface);
     cache.entries.erase(it);
@@ -520,6 +525,24 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         eraseTexture(cache, victim);
         counters.budgetEvictions.fetch_add(1, std::memory_order_relaxed);
     }
+    // Debug aid (bisecting budget-dependent bugs by surface size): APS5_TEXTURE_LARGE_MIB=<n> keeps
+    // the entries of 64 MiB and more within n MiB of their own, least recently used first.
+    static const std::uint64_t largeBudget = [] {
+        const char* value = std::getenv("APS5_TEXTURE_LARGE_MIB");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) << 20u : 0ull;
+    }();
+    if (largeBudget != 0 && entry.accounted >= LargeTextureBytes) {
+        while (cache.largeBytes != 0 && cache.largeBytes + entry.accounted > largeBudget) {
+            auto victim = std::prev(cache.entries.end());
+            while (victim->accounted < LargeTextureBytes && victim != cache.entries.begin()) --victim;
+            if (victim->accounted < LargeTextureBytes) break;
+            counters.evictedBytes.fetch_add(victim->accounted, std::memory_order_relaxed);
+            counters.largeEvictions.fetch_add(1, std::memory_order_relaxed);
+            eraseTexture(cache, victim);
+            counters.budgetEvictions.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (entry.accounted >= LargeTextureBytes) cache.largeBytes += entry.accounted;
     cache.bytes += entry.accounted;
     counters.cachedBytes.store(cache.bytes, std::memory_order_relaxed);
     auto texture = entry.texture;
@@ -2547,6 +2570,14 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     // between the stages marks them uncompressed).
     const auto address = record.resource.baseAddress;
     const auto bytes = static_cast<std::size_t>(record.guestBytes);
+    // A depth surface drawn over the memory serves the lookup ahead of the cache (cachedTexture's
+    // DepthSurfaceTexture): its results stay in the depth image, so guest memory never changes and
+    // an entry made before the surface existed (the 80-slice shadow atlas snapshotted while the area
+    // loaded) would pass every check below. Served from it, the scene sampled stale shadows - dark
+    // walls and foliage once the texture budget was large enough to keep that entry (6 GiB).
+    // APS5_FAST_TEXTURE_IGNORES_DEPTH=1 skips the check as before.
+    static const bool ignoreDepth = std::getenv("APS5_FAST_TEXTURE_IGNORES_DEPTH") != nullptr;
+    if (!ignoreDepth && DepthSurfaceAt(address, record.resource.width, record.resource.height)) return nullptr;
     if (GuestMemory::CollectWrites(address, bytes) == 0) return nullptr;
     if (PendingStorageOverlaps(address, bytes, record.source.get())) return nullptr;
     auto keys = record.keys;
