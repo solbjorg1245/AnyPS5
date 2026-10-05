@@ -316,6 +316,27 @@ void EraseMappings(std::uintptr_t start, std::uintptr_t end) {
     }
 }
 
+void ErasePhysMappings(std::uint64_t first, std::uint64_t last) {
+    for (auto it = g_directMappings.begin(); it != g_directMappings.end();) {
+        const auto base = it->first;
+        const auto mapping = it->second;
+        const auto mappingLast = mapping.phys + (mapping.end - base);
+        if (mapping.phys >= last || mappingLast <= first) {
+            ++it;
+            continue;
+        }
+        it = g_directMappings.erase(it);
+        if (mapping.phys < first) {
+            const auto keep = first - mapping.phys;
+            g_directMappings.emplace(base, DirectMapping{base + keep, mapping.phys, mapping.memoryType, mapping.backing});
+        }
+        if (mappingLast > last) {
+            const auto skip = last - mapping.phys;
+            it = g_directMappings.emplace(base + skip, DirectMapping{mapping.end, last, mapping.memoryType, mapping.backing}).first;
+        }
+    }
+}
+
 
 void ValidatePhysicalRange(std::uint64_t phys, std::size_t len) {
     for (std::size_t offset = 0; offset < len; offset += PS5_PAGE_SIZE) {
@@ -689,6 +710,7 @@ void ForgetDirectMemory(int64_t start, size_t len) {
     std::lock_guard lock(g_directLock);
     ValidatePhysicalRange(first, len);
     g_physPages.erase(g_physPages.lower_bound(first), g_physPages.lower_bound(first + len));
+    ErasePhysMappings(first, first + len);
     Trace("release physical 0x%llx+0x%zx", static_cast<unsigned long long>(first), len);
 }
 

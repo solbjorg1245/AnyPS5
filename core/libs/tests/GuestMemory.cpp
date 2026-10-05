@@ -166,6 +166,29 @@ static void CheckDirectMemoryFollowsPhysicalPages() {
     Require(sceKernelReleaseDirectMemory(again, page * 2) == 0);
 }
 
+static void CheckReleaseDirectMemoryClearsMappings() {
+    constexpr std::size_t page = 0x4000;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * 2, 0, 0, &phys) == 0);
+    void* mapped = nullptr;
+    Require(sceKernelMapDirectMemory(&mapped, page * 2, 3, 0, phys, 0) == 0);
+    VirtualQueryInfo before{};
+    Require(sceKernelVirtualQuery(mapped, 0, &before, sizeof(before)) == 0);
+    Require(before.is_direct && before.offset == static_cast<std::uint64_t>(phys));
+    Require(sceKernelReleaseDirectMemory(phys + page, page) == 0);
+    VirtualQueryInfo split{};
+    Require(sceKernelVirtualQuery(mapped, 0, &split, sizeof(split)) == 0);
+    Require(split.is_direct && split.offset == static_cast<std::uint64_t>(phys));
+    VirtualQueryInfo dropped{};
+    Require(sceKernelVirtualQuery(static_cast<unsigned char*>(mapped) + page, 0, &dropped, sizeof(dropped)) == 0);
+    Require(!dropped.is_direct && dropped.offset == 0);
+    Require(sceKernelReleaseDirectMemory(phys, page) == 0);
+    VirtualQueryInfo cleared{};
+    Require(sceKernelVirtualQuery(mapped, 0, &cleared, sizeof(cleared)) == 0);
+    Require(!cleared.is_direct && cleared.offset == 0);
+    Require(sceKernelMunmap(mapped, page * 2) == 0);
+}
+
 static void CheckFixedVirtualReservation() {
     constexpr std::size_t page = 0x4000;
     void* probe = nullptr;
@@ -643,6 +666,7 @@ int main() {
     CheckNamedAndHintedMappings();
     CheckInternalNamedFlexibleMapping();
     CheckDirectMemoryFollowsPhysicalPages();
+    CheckReleaseDirectMemoryClearsMappings();
     CheckFixedVirtualReservation();
     CheckSharedDirectMemoryLifecycle();
     CheckReservedHolesAreUncommitted();
