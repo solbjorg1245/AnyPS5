@@ -271,6 +271,42 @@ private:
         return memory.kind == ResourceKind::ScalarBuffer && memory.dataBits == 32u && memory.dataDwords == 1u ? &memory : nullptr;
     }
 
+    // An s_load of one dword through a raw 64-bit address (LoadAddressU32 of a GetAddressResource,
+    // see TranslationContext::sLoad): its memory record.
+    const MemoryInfo* AddressReadMemory(IrValue& read, std::uint32_t& index) const {
+        if (read.Opcode() != IrOpcode::LoadAddressU32 || read.ArgumentCount() != 4u) {
+            return nullptr;
+        }
+        std::uint32_t extra = 1u;
+        if (!immediateU32(read.Argument(2), extra) || extra != 0u) {
+            return nullptr;
+        }
+        index = read.Flags<MemoryFlags>().index;
+        if (index >= m_program.Resources().memoryInfo.size()) {
+            return nullptr;
+        }
+        const auto& memory = m_program.Resources().memoryInfo[index];
+        return memory.kind == ResourceKind::ScalarAddress && memory.dataBits == 32u && memory.dataDwords == 1u ? &memory : nullptr;
+    }
+
+    // How many values a table key can take when nothing else bounds the table (0: unknown): a bit
+    // index (the light and decal loops walk a wave-uniform mask with s_ff1) or a masked value.
+    static std::uint32_t KeyRange(IrValue* key) {
+        key = key->Resolve();
+        switch (key->Opcode()) {
+            case IrOpcode::FindILsb32:
+            case IrOpcode::FindUMsb32: return 32u;
+            case IrOpcode::BitwiseAnd32: {
+                std::uint32_t mask = 0;
+                if (!immediateU32(key->Argument(0), mask) && !immediateU32(key->Argument(1), mask)) {
+                    return 0u;
+                }
+                return mask < 0x10000u ? mask + 1u : 0u;
+            }
+            default: return 0u;
+        }
+    }
+
     bool MemoryIndexBelongsTo(std::uint32_t index, const IrValue& owner) const {
         for (const auto& block : m_program.Blocks()) {
             for (const IrValue* inst : block->Instructions()) {
@@ -287,10 +323,10 @@ private:
     }
 
     bool MakeRuntimeBufferSource(const IrValue& handle, std::uint32_t& source, DescriptorSource& descriptor) {
-        if (handle.Opcode() != IrOpcode::GetBufferResource) {
+        if (handle.Opcode() != IrOpcode::GetBufferResource && handle.Opcode() != IrOpcode::GetAddressResource) {
             return false;
         }
-        MakeSource(handle, 4u, false, false, descriptor);
+        MakeSource(handle, handle.Opcode() == IrOpcode::GetAddressResource ? 2u : 4u, false, false, descriptor);
         std::uint32_t badDword = 0;
         if (!ValidateSource(descriptor, badDword)) {
             return false;
@@ -369,7 +405,10 @@ private:
 
     // A T# whose eight dwords are scalar reads of one V# (the table) at `entryOffset + key * 32`
     // with a wave-uniform runtime key: a bindless image table. The key stays an ordinary value
-    // (the SPIR-V selects the bound slot from it); the eight reads become planning-only.
+    // (the SPIR-V selects the bound slot from it); the eight reads become planning-only. The reads
+    // may also be s_loads through a raw 64-bit address (Demon's Souls' light and decal passes walk
+    // a T# table behind an SRT pointer with s_ff1 over a wave-OR'ed mask): such a table has no
+    // size, so the key's range must bound it (KeyRange).
     bool TryMakeTableImage(IrValue& handle, IndirectImagePlan& plan) {
         if (handle.Opcode() != IrOpcode::GetImageResource || handle.ArgumentCount() != 8u) {
             return false;
@@ -379,10 +418,11 @@ private:
         IrValue* heapHandle = nullptr;
         IrValue* heapOffset = nullptr;
         std::uint32_t immediateOffset = 0;
+        const bool addressTable = handle.Argument(0)->Resolve()->Opcode() == IrOpcode::LoadAddressU32;
         for (std::uint32_t dword = 0; dword < heapReads.size(); dword++) {
             heapReads[dword] = handle.Argument(dword)->Resolve();
             std::uint32_t memoryIndex = 0;
-            const MemoryInfo* memory = ScalarReadMemory(*heapReads[dword], memoryIndex);
+            const MemoryInfo* memory = addressTable ? AddressReadMemory(*heapReads[dword], memoryIndex) : ScalarReadMemory(*heapReads[dword], memoryIndex);
             if (memory == nullptr || !MemoryIndexBelongsTo(memoryIndex, *heapReads[dword])) {
                 return false;
             }
@@ -419,19 +459,33 @@ private:
             }
         }
 
+        DescriptorSource::IndirectImage table;
+        if (addressTable) {
+            if (heapHandle->Opcode() != IrOpcode::GetAddressResource || heapHandle->ArgumentCount() != 2u) {
+                return false;
+            }
+            table.heapAddress = true;
+            table.entryLimit = KeyRange(key);
+            if (table.entryLimit == 0u) {
+                return false;
+            }
+        }
         DescriptorSource heapSource;
         std::uint32_t heapSourceIndex = 0;
         if (!MakeRuntimeBufferSource(*heapHandle, heapSourceIndex, heapSource)) {
             return false;
         }
+        // The address's two dwords stand for the V#'s four in the image source and the roots.
+        for (std::uint32_t dword = heapSource.dwordCount; dword < 4u; dword++) {
+            heapSource.dwords[dword] = &m_builder.Constant(0u);
+        }
 
-        DescriptorSource::IndirectImage table;
         table.heapSource = heapSourceIndex;
         table.materialSource = heapSourceIndex;
         table.entryOffset = entryOffset;
         DescriptorSource materialSource = heapSource;
         std::uint32_t materialMemoryIndex = 0;
-        const MemoryInfo* materialMemory = ScalarReadMemory(*key, materialMemoryIndex);
+        const MemoryInfo* materialMemory = addressTable ? nullptr : ScalarReadMemory(*key, materialMemoryIndex);
         if (materialMemory != nullptr && MemoryIndexBelongsTo(materialMemoryIndex, *key)) {
             IrValue* selector = nullptr;
             std::uint32_t selectorStride = 0;

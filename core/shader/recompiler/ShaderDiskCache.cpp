@@ -558,6 +558,7 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_FAILURE_MEMO",
     "APS5_NO_RESULT_MEMO",
     "APS5_SHADER_CACHE_VERSION",
+    "APS5_TRACE_BINDLESS",
 };
 
 const std::vector<std::byte>& switchKey() {

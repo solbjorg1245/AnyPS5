@@ -293,8 +293,11 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     const auto slots = ResourceMaterializer::BindlessSlots();
     DescriptorValue heapValue;
     walker.EvaluateDescriptorSource(plan, table.heapSource, runtime, heapValue);
-    const ShaderBufferResource heap = decodeBufferDescriptor(heapValue);
-    const std::uint64_t heapSize = heap.GetSize();
+    // A table behind a raw address has no size: the key's range bounds it, and a null address
+    // (no table bound) reads nothing.
+    const ShaderBufferResource heap = table.heapAddress ? ShaderBufferResource{} : decodeBufferDescriptor(heapValue);
+    const std::uint64_t addressBase = table.heapAddress ? ((static_cast<std::uint64_t>(heapValue.dwords[1]) << 32u) | heapValue.dwords[0]) & 0xffffffffffffull : 0u;
+    const std::uint64_t heapSize = table.heapAddress ? (addressBase != 0u ? table.entryOffset + static_cast<std::uint64_t>(table.entryLimit) * TableEntryBytes : 0u) : heap.GetSize();
     const auto entries = heapSize > table.entryOffset ? static_cast<std::uint32_t>(std::min<std::uint64_t>((heapSize - table.entryOffset) / TableEntryBytes, std::numeric_limits<std::uint32_t>::max())) : 0u;
     const auto readWord = [&](std::uint64_t address, std::uint32_t& word) {
         if (!runtime.readMemory(runtime.userContext, address, &word)) {
@@ -360,7 +363,7 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         return;
     }
 
-    const std::uint64_t heapBase = heap.Base48();
+    const std::uint64_t heapBase = table.heapAddress ? addressBase : heap.Base48();
     std::vector<DescriptorValue> candidates(keys.size());
     std::vector<std::uint8_t> valid(keys.size(), 0u);
     std::optional<DecodedImage> shape;
