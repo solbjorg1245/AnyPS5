@@ -226,7 +226,12 @@ public:
 #ifdef _WIN32
         const auto size = static_cast<std::uint64_t>(bytes);
         section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, static_cast<DWORD>(size >> 32), static_cast<DWORD>(size), nullptr);
-        if (!section) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "create direct memory backing");
+        if (!section) {
+            const auto error = static_cast<int>(GetLastError());
+            char message[96];
+            std::snprintf(message, sizeof(message), "create direct memory backing of 0x%llx bytes (%llu MiB)", static_cast<unsigned long long>(size), static_cast<unsigned long long>((size + 0xFFFFF) >> 20));
+            throw std::system_error(error, std::system_category(), message);
+        }
 #else
         file = memfd_create("direct memory", MFD_CLOEXEC);
         if (file < 0) throw std::system_error(errno, std::generic_category(), "create direct memory backing");
