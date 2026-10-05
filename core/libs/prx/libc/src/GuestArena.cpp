@@ -193,6 +193,14 @@ bool GuestArenaCollectWrites_nid_postfix(std::uintptr_t address, std::size_t byt
     return WindowsMappings::Get().Collect(address, bytes, pages, count, clear);
 }
 
+void GuestArenaDescribePage_nid_postfix(std::uintptr_t address, char* text, std::size_t size) {
+    WindowsMappings::Get().Describe(address, text, size);
+}
+
+std::uint64_t GuestArenaMappingSerial_nid_postfix() {
+    return WindowsMappings::Get().MappingSerial();
+}
+
 bool GuestArenaHostRegionOverlaps_nid_postfix(std::uintptr_t address, std::size_t bytes) {
     return Arena::Get().OverlapsHostRegion(address, bytes);
 }

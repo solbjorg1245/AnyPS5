@@ -162,6 +162,9 @@ struct TextureCounters {
     // Entries dropped to stay inside the byte budget, and entries a lookup replaced because the surface
     // changed (memory, keys, source): which of the two makes the snapshots.
     std::atomic<std::uint64_t> budgetEvictions{0};
+    // Their accounted bytes, and how many of them were 64 MiB or more.
+    std::atomic<std::uint64_t> evictedBytes{0};
+    std::atomic<std::uint64_t> largeEvictions{0};
     std::atomic<std::uint64_t> replaced{0};
     std::atomic<std::uint64_t> cachedBytes{0};
     std::atomic<std::uint64_t> sameSurface{0};
@@ -182,7 +185,7 @@ void reportTextureCounters() {
     auto last = counters.lastReport.load();
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-    std::fprintf(stderr, "[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; cache %llu MiB, %llu budget evictions, %llu replaced, %llu made beside another key of the surface, %llu views of a shared image\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.cachedBytes) >> 20u, count(counters.budgetEvictions), count(counters.replaced), count(counters.sameSurface), count(counters.sharedImages));
+    std::fprintf(stderr, "[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; cache %llu MiB, %llu budget evictions (%llu MiB, %llu of 64 MiB or more), %llu replaced, %llu made beside another key of the surface, %llu views of a shared image\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.cachedBytes) >> 20u, count(counters.budgetEvictions), count(counters.evictedBytes) >> 20u, count(counters.largeEvictions), count(counters.replaced), count(counters.sameSurface), count(counters.sharedImages));
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -418,7 +421,25 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
                     if (!GuestMemory::EqualsCommitted(address, *it->bytes)) {
                         static std::atomic<std::uint32_t> stale{0};
-                        if (stale.fetch_add(1, std::memory_order_relaxed) < 300) std::fprintf(stderr, "[texture-stale] 0x%llx+0x%zx %ux%u format %u tile %d mips %u: snapshot differs from guest memory although unstamped since generation %llu\n", static_cast<unsigned long long>(address), it->bytes->size(), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), resource.mipCount, static_cast<unsigned long long>(it->generation));
+                        if (stale.fetch_add(1, std::memory_order_relaxed) < 300) {
+                            // Where it differs: the first differing byte, how many 4 KiB pages
+                            // differ, and the first page's mapping and tracker stamps.
+                            std::vector<std::byte> current(it->bytes->size());
+                            GuestMemory::ReadCommitted(address, current);
+                            std::size_t first = current.size();
+                            std::size_t pages = 0;
+                            for (std::size_t page = 0; page < current.size(); page += 4096) {
+                                const auto length = std::min<std::size_t>(4096, current.size() - page);
+                                if (std::memcmp(current.data() + page, it->bytes->data() + page, length) == 0) continue;
+                                ++pages;
+                                if (first == current.size()) {
+                                    first = page;
+                                    while (first < page + length && current[first] == (*it->bytes)[first]) ++first;
+                                }
+                            }
+                            const bool unchanged = GuestMemory::UnchangedSince(address, it->bytes->size(), it->generation);
+                            std::fprintf(stderr, "[texture-stale] 0x%llx+0x%zx %ux%u format %u tile %d mips %u: snapshot differs from guest memory although unstamped since generation %llu (now %llu, unchanged %d); first difference +0x%zx, %zu pages differ; %s\n", static_cast<unsigned long long>(address), it->bytes->size(), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), resource.mipCount, static_cast<unsigned long long>(it->generation), static_cast<unsigned long long>(generation), unchanged ? 1 : 0, first, pages, first < current.size() ? GuestMemory::DescribePage(address + first).c_str() : "no difference on re-read");
+                        }
                     }
                 }
                 it->generation = generation;
@@ -493,7 +514,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         return (mib != 0 ? mib : 2048ull) << 20u;
     }();
     while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) {
-        eraseTexture(cache, std::prev(cache.entries.end()));
+        const auto victim = std::prev(cache.entries.end());
+        counters.evictedBytes.fetch_add(victim->accounted, std::memory_order_relaxed);
+        if (victim->accounted >= (64ull << 20u)) counters.largeEvictions.fetch_add(1, std::memory_order_relaxed);
+        eraseTexture(cache, victim);
         counters.budgetEvictions.fetch_add(1, std::memory_order_relaxed);
     }
     cache.bytes += entry.accounted;

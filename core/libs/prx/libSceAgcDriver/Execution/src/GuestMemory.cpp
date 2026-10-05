@@ -66,6 +66,19 @@ std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
+// What a collect memo entry is valid under: the unwatch serial plus, on Windows, the arena's mapping
+// serial. A page mapped (or committed over a placeholder) after a walk holds bytes no write made,
+// reported by the next walk only: a memo hit in the same epoch hid it, and a texture snapshot read
+// before the map stayed "unchanged" for the rest of the epoch (stale inputs of the shadow atlas and
+// partly mapped surfaces while an area loads). APS5_MAPPING_BLIND_MEMO=1 ignores mappings as before.
+std::uint64_t memoSerial(std::memory_order order) {
+    auto serial = unwatchSerial.load(order);
+#ifdef _WIN32
+    static const bool blind = std::getenv("APS5_MAPPING_BLIND_MEMO") != nullptr;
+    if (!blind) serial += GuestArena::GuestArenaMappingSerial_nid_postfix() << 32u;
+#endif
+    return serial;
+}
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
 // tracker mutex acquisitions that had to wait (APS5_PROFILE_DRAW; see lockTracker).
 std::atomic<std::uint64_t> collectDirty{0};
@@ -973,7 +986,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     // One epoch for the lookup and the entry made after the walk: an unbumped thread's fresh epoch
     // must not differ between them.
     const auto epoch = currentCollectEpoch();
-    const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
+    const auto unwatched = memoSerial(std::memory_order_acquire);
     const bool useMemo = memoized && collectMemoEnabled() && bytes != 0;
     if (useMemo && !sharedCollectMemo()) {
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
@@ -997,7 +1010,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     auto cursor = first;
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
-            if (entry.epoch == epoch && entry.unwatched == unwatchSerial.load(std::memory_order_relaxed) && entry.begin <= cursor && stop <= entry.end) {
+            if (entry.epoch == epoch && entry.unwatched == memoSerial(std::memory_order_relaxed) && entry.begin <= cursor && stop <= entry.end) {
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.generation;
             }
@@ -1010,7 +1023,8 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     }
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
-        const auto serial = unwatchSerial.load(std::memory_order_relaxed);
+        // The serial read before the walk: a mapping made during it leaves the entry unusable.
+        const auto serial = unwatched;
         if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial};
         else threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
     }
@@ -1301,6 +1315,21 @@ bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
         if (k < cpu.size()) cpu[k] = generation == 0 || tracker.cpuStampOf(block) > generation ? 1 : 0;
     }
     return true;
+}
+
+std::string DescribePage(std::uint64_t address) {
+    char text[512];
+    MEMORY_BASIC_INFORMATION info{};
+    const bool queried = VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == sizeof(info);
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    const bool covered = tracker.watched && tracker.covers(address, 1);
+    const auto block = covered ? tracker.blockOf(address) : 0;
+    char mapping[192] = "";
+    GuestArena::GuestArenaDescribePage_nid_postfix(static_cast<std::uintptr_t>(address), mapping, sizeof(mapping));
+    std::snprintf(text, sizeof(text), "page 0x%llx: %s type 0x%lx state 0x%lx protect 0x%lx allocation 0x%llx region 0x%llx+0x%llx; watched %d stamp %u written %u cpu %u; %s", static_cast<unsigned long long>(address), queried ? "queried" : "no query", queried ? info.Type : 0ul, queried ? info.State : 0ul, queried ? info.Protect : 0ul, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info.AllocationBase)), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info.BaseAddress)), static_cast<unsigned long long>(info.RegionSize), covered ? 1 : 0, covered ? tracker.stampOf(block) : 0u, covered ? tracker.writtenStampOf(block) : 0u, covered ? tracker.cpuStampOf(block) : 0u, mapping);
+    return text;
 }
 
 namespace {

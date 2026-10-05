@@ -7,6 +7,7 @@
 #include <functional>
 #include <mutex>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -118,6 +119,8 @@ constexpr std::uint8_t BlockUnchanged = 0;
 constexpr std::uint8_t BlockWritten = 1;
 constexpr std::uint8_t BlockMaybeWritten = 2;
 bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu = {});
+// Debug aid: the page's mapping (VirtualQuery) and its tracker block's stamps, as one line.
+std::string DescribePage(std::uint64_t address);
 
 // Serializes device work: draws, dispatches, presentation and the deferred write-backs below. The
 // mutex is recursive; it is wrapped so every acquisition (std::lock_guard at any site) measures how

@@ -24,6 +24,10 @@ void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t byt
 bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address);
 bool GuestArenaProtection_nid_postfix(std::uintptr_t address, std::uint32_t* protection);
 bool GuestArenaCollectWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear);
+// Debug aid: the page's shared-view and clean/fresh range state (WindowsMappings::Describe).
+void GuestArenaDescribePage_nid_postfix(std::uintptr_t address, char* text, std::size_t size);
+// Bumped by every commit over a placeholder, shared map and release of guest memory.
+std::uint64_t GuestArenaMappingSerial_nid_postfix();
 bool GuestArenaHostRegionOverlaps_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_t protection, std::size_t granule);
 void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes);

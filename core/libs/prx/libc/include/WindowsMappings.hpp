@@ -4,6 +4,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstddef>
 #include <cstdlib>
@@ -29,6 +30,12 @@ public:
         return allocate(GetCurrentProcess(), address, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
     }
 
+    // Bumped by every change that puts bytes no write made at a guest address (a commit over a
+    // placeholder, a shared map, a release): GuestMemory's collect memo is valid under one value.
+    std::uint64_t MappingSerial() const {
+        return mappingSerial.load(std::memory_order_acquire);
+    }
+
     void Commit(void* address, std::size_t bytes, DWORD protection, std::size_t granule, bool watched) {
         std::lock_guard lock(mutex);
         const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
@@ -48,6 +55,7 @@ public:
                 const DWORD flags = MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | (watched ? MEM_WRITE_WATCH : 0);
                 if (!allocate(GetCurrentProcess(), reinterpret_cast<void*>(cursor), size, flags, protection, nullptr, 0)) fail("replace guest placeholder with private memory");
                 rememberRange(freshRanges, cursor, cursor + size);
+                mappingSerial.fetch_add(1, std::memory_order_release);
                 cursor += size;
             } else {
                 if (memory.State != MEM_COMMIT) throw std::runtime_error("guest memory is not committed");
@@ -67,6 +75,7 @@ public:
     void Reset(void* address, std::size_t bytes) {
         std::lock_guard lock(mutex);
         reset(reinterpret_cast<std::uintptr_t>(address), bytes);
+        mappingSerial.fetch_add(1, std::memory_order_release);
     }
 
     void Map(void* address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection) {
@@ -93,6 +102,7 @@ public:
             views.emplace(base, View{shared, protection, 0, false, owned, offset + done, 0});
             invalidate(*shared);
         }
+        mappingSerial.fetch_add(1, std::memory_order_release);
     }
 
     void SetProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
@@ -179,6 +189,21 @@ public:
         GetSystemInfo(&system);
         const auto base = reinterpret_cast<std::uintptr_t>(alias) & ~(static_cast<std::uintptr_t>(system.dwAllocationGranularity) - 1);
         if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(base), 0)) fail("unmap shared guest alias");
+    }
+
+    // Debug aid: the write-tracking state of the page holding `address`, as one line.
+    void Describe(std::uintptr_t address, char* text, std::size_t size) {
+        std::lock_guard lock(mutex);
+        const auto base = address & ~(pageBytes - 1);
+        const bool clean = rangeAt(cleanRanges, address) != cleanRanges.end();
+        const bool fresh = rangeAt(freshRanges, address) != freshRanges.end();
+        const auto found = views.find(base);
+        if (found == views.end()) {
+            std::snprintf(text, size, "no view (clean %d fresh %d)", clean ? 1 : 0, fresh ? 1 : 0);
+            return;
+        }
+        const auto& view = found->second;
+        std::snprintf(text, size, "view protection 0x%lx seen %llu generation %llu armed %d host writes %u aliases %zu section offset 0x%llx (clean %d fresh %d)", view.protection, static_cast<unsigned long long>(view.seen), static_cast<unsigned long long>(view.page->generation), view.armed ? 1 : 0, view.hostWrites, view.page->aliases.size(), static_cast<unsigned long long>(view.offset), clean ? 1 : 0, fresh ? 1 : 0);
     }
 
     bool Protection(std::uintptr_t address, std::uint32_t* protection) {
@@ -428,6 +453,7 @@ private:
     std::map<std::uintptr_t, View> views;
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::mutex mutex;
+    std::atomic<std::uint64_t> mappingSerial{0};
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;
     UnmapFunction unmap = nullptr;

@@ -39,6 +39,10 @@ namespace {
 // APS5_PROFILE_DRAW: accumulate texture setup phases and report every 200 textures.
 struct TextureProfile {
     double allocate = 0, read = 0, gpu = 0, view = 0;
+    // Of `allocate`: image creation and binding, and the staging copy of the snapshot; with the
+    // snapshot bytes uploaded.
+    double imageCreate = 0, stagingCopy = 0;
+    std::uint64_t uploadBytes = 0;
     std::uint64_t count = 0;
     std::uint64_t fromStorage = 0;
     double storageCreate = 0, storageWriteBack = 0, storageAlloc = 0, storageHostCopy = 0, storageGpu = 0, storageStore = 0;
@@ -398,6 +402,11 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         owned->pool = GetImageMemoryPool(context);
         owned->allocation = owned->pool->AllocateAndBind(image, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         allocationBytes = owned->allocation.size;
+        if (profile) {
+            const auto lap = timer.lap();
+            Profile().allocate += lap;
+            Profile().imageCreate += lap;
+        }
 
         {
             // Debug aid: APS5_DUMP_TEXTURE=<hex addresses, comma separated> saves the detiled first mip
@@ -415,6 +424,12 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             }
             auto staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             std::memcpy(staging->Bytes().data(), snapshot.data(), snapshot.size());
+            if (profile) {
+                const auto lap = timer.lap();
+                Profile().allocate += lap;
+                Profile().stagingCopy += lap;
+                Profile().uploadBytes += snapshot.size();
+            }
             auto tiled = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             if (profile) Profile().allocate += timer.lap();
@@ -556,7 +571,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         if (profile) {
             auto& totals = Profile();
             totals.view += timer.lap();
-            if (++totals.count % 200 == 0) std::fprintf(stderr, "[texture] %llu textures (%llu copied from storage images, %llu uploads recorded, images %llu suballocated / %llu dedicated): allocate+image %.0f ms, guest read %.0f ms, detile+copy %.0f ms, view+buffer release %.0f ms\n", static_cast<unsigned long long>(totals.count), static_cast<unsigned long long>(totals.fromStorage), static_cast<unsigned long long>(totals.recordedUploads), static_cast<unsigned long long>(ImageMemoryPool::PooledImages()), static_cast<unsigned long long>(ImageMemoryPool::DedicatedImages()), totals.allocate, totals.read, totals.gpu, totals.view);
+            if (++totals.count % 200 == 0) std::fprintf(stderr, "[texture] %llu textures (%llu copied from storage images, %llu uploads recorded, images %llu suballocated / %llu dedicated): allocate+image %.0f ms (image %.0f, staging copy %.0f of %.0f MiB), guest read %.0f ms, detile+copy %.0f ms, view+buffer release %.0f ms\n", static_cast<unsigned long long>(totals.count), static_cast<unsigned long long>(totals.fromStorage), static_cast<unsigned long long>(totals.recordedUploads), static_cast<unsigned long long>(ImageMemoryPool::PooledImages()), static_cast<unsigned long long>(ImageMemoryPool::DedicatedImages()), totals.allocate, totals.imageCreate, totals.stagingCopy, totals.uploadBytes / 1048576.0, totals.read, totals.gpu, totals.view);
         }
     } catch (...) {
         release();
