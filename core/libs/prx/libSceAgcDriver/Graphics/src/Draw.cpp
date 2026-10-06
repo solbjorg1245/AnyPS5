@@ -203,6 +203,9 @@ struct DrawOutcome {
     std::uint64_t inputCopies = 0;
     std::uint64_t inputCopyBytes = 0;
     std::uint64_t indicesScanned = 0;
+    // Index and vertex inputs the GPU reads in place from their host imports (no copy), and their bytes.
+    std::uint64_t inPlaceInputs = 0;
+    std::uint64_t inPlaceInputBytes = 0;
 };
 
 // The resources of a draw: a recipe hit (reserved for the draw recipe step), a resource-cache
@@ -277,10 +280,13 @@ struct DrawProfile {
     std::array<std::uint64_t, IndirectPathCount> indirect{};
     std::uint64_t indirectRewritten = 0;
     double indirectReadUs = 0;
-    // Fresh draw input copies (DrawOutcome::inputCopies), their bytes and the indices scanned.
+    // Fresh draw input copies (DrawOutcome::inputCopies), their bytes, the indices scanned, and the
+    // inputs read in place with their bytes.
     std::uint64_t inputCopies = 0;
     std::uint64_t inputCopyBytes = 0;
     std::uint64_t indicesScanned = 0;
+    std::uint64_t inPlaceInputs = 0;
+    std::uint64_t inPlaceInputBytes = 0;
     // Draw packets that drew nothing, by DrawSkip, and their time.
     std::array<std::uint64_t, static_cast<std::size_t>(DrawSkip::Count)> skips{};
     std::array<double, static_cast<std::size_t>(DrawSkip::Count)> skipUs{};
@@ -334,6 +340,8 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.inputCopies += outcome.inputCopies;
     profile.inputCopyBytes += outcome.inputCopyBytes;
     profile.indicesScanned += outcome.indicesScanned;
+    profile.inPlaceInputs += outcome.inPlaceInputs;
+    profile.inPlaceInputBytes += outcome.inPlaceInputBytes;
     profile.lookupUs += outcome.lookupUs;
     if (outcome.kind < KindCount) {
         ++profile.kindCounts[outcome.kind];
@@ -356,7 +364,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         if (profile.totalsUs[i] <= 0) continue;
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s=%.1fms", DrawPhaseNames[i], profile.totalsUs[i] / 1000.0);
         if (i == PhaseResources && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (bindings %.1f, upload %.1f, descriptors %.1f, other %.1f of which %.1f in %llu address-based builds)", profile.bindingsUs / 1000.0, profile.uploadUs / 1000.0, profile.descriptorsUs / 1000.0, profile.otherUs / 1000.0, profile.addressOtherUs / 1000.0, static_cast<unsigned long long>(profile.addressBuilds));
-        if (i == PhaseVertex && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (fresh input copies %llu = %.1f MiB, indices scanned %llu)", static_cast<unsigned long long>(profile.inputCopies), static_cast<double>(profile.inputCopyBytes) / 1048576.0, static_cast<unsigned long long>(profile.indicesScanned));
+        if (i == PhaseVertex && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (fresh input copies %llu = %.1f MiB, in place %llu = %.1f MiB, indices scanned %llu)", static_cast<unsigned long long>(profile.inputCopies), static_cast<double>(profile.inputCopyBytes) / 1048576.0, static_cast<unsigned long long>(profile.inPlaceInputs), static_cast<double>(profile.inPlaceInputBytes) / 1048576.0, static_cast<unsigned long long>(profile.indicesScanned));
         if (i == PhaseReadTarget && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs);
     }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; per kind (avg us, count):");
@@ -412,7 +420,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.indirect.fill(0);
     profile.indirectRewritten = 0;
     profile.indirectReadUs = 0;
-    profile.inputCopies = profile.inputCopyBytes = profile.indicesScanned = 0;
+    profile.inputCopies = profile.inputCopyBytes = profile.indicesScanned = profile.inPlaceInputs = profile.inPlaceInputBytes = 0;
     profile.skips.fill(0);
     profile.skipUs.fill(0);
 }
@@ -699,11 +707,29 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
 
 }
 
-DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use) {
+bool InPlaceInputs() {
+    static const bool inPlace = std::getenv("APS5_NO_INPLACE_INPUTS") == nullptr;
+    return inPlace;
+}
+
+DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, bool inPlace) {
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
     DrawInputCopy copy;
     if (recorder != nullptr && bytes != 0) {
         GuestMemory::FlushGpuWrites(address, bytes);
+        // In place: the GPU reads the host import when the batch runs, as it reads a GPU-side
+        // indirect draw's records (recordIndirectArguments): no snapshot, no copy, nothing kept.
+        // The hook above landed the pending image results and ordered the recorded writes, the
+        // pass's opening barrier covers them on the GPU (VERTEX_INPUT after every write), and the
+        // range is noted as a pending read of the batch so no CPU copy lands on it early. Copying
+        // an indirect draw's whole descriptor ranges (~100 MiB of indices) was 4-5 GiB per 10 s.
+        if (inPlace && InPlaceInputs()) {
+            if (const auto* import = HostImportFor(context, address, bytes); import != nullptr) {
+                copy.import = import;
+                copy.importOffset = address - import->base;
+                return copy;
+            }
+        }
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = GuestMemory::CollectWrites(address, bytes);
         if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived);
@@ -732,11 +758,18 @@ struct DrawInputs {
     bool nothing = false;
     std::uint64_t indexBytes = 0;
     std::shared_ptr<Buffer> indices;
+    // The index buffer binding: the copy's buffer (`indices`, kept with the draw) or the host
+    // import read in place at `indexOffset`; a vertex buffer read in place has a null entry in
+    // `vertexBuffers` and its import's handle and offset below.
+    VkBuffer indexHandle = VK_NULL_HANDLE;
+    VkDeviceSize indexOffset = 0;
     std::uint32_t maxIndex = 0;
     VertexInputLayout vertexInput;
     std::vector<std::shared_ptr<Buffer>> vertexBuffers;
     std::vector<VkBuffer> vertexHandles;
     std::vector<VkDeviceSize> vertexOffsets;
+    // The guest ranges the GPU reads in place, noted on the batch (Recorder::NotePendingReads).
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> inPlaceRanges;
     std::set<std::uint32_t> fragmentOutputs;
     VkPipelineStageFlags shaderStages = 0;
     std::uint32_t meshGroups = 0;
@@ -808,20 +841,27 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     inputs.maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
     if (draw.indexed) {
         const auto use = draw.indexSize == 2 ? Recorder::SnapshotUse::Index16 : Recorder::SnapshotUse::Index32;
-        auto copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
         // An indirect draw's index range is the whole index buffer (often ~100 MiB) and only the
         // device limit needs its highest index: with no limit below the 32-bit range the scan is
         // skipped and the snapshot is kept as unscanned (UnscannedIndices), which a later direct
-        // draw over the same range scans instead.
+        // draw over the same range scans instead. Such an unscanned range is read in place from
+        // its host import instead of copied (a direct draw keeps its scanned snapshot).
         constexpr std::uint32_t UnscannedIndices = std::numeric_limits<std::uint32_t>::max();
         static const bool scanIndirectIndices = std::getenv("APS5_SCAN_INDIRECT_INDICES") != nullptr;
         const bool scan = args == nullptr || scanIndirectIndices || context.limits.maxDrawIndexedIndexValue < UnscannedIndices;
+        auto copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use, !scan);
         std::uint32_t highest = copy.derived;
-        if (!copy.reused) {
+        if (copy.import != nullptr) {
+            ++outcome.inPlaceInputs;
+            outcome.inPlaceInputBytes += indexBytes;
+            inputs.inPlaceRanges.emplace_back(draw.indexAddress, draw.indexAddress + indexBytes);
+            inputs.indexHandle = copy.import->buffer;
+            inputs.indexOffset = copy.importOffset;
+        } else if (!copy.reused) {
             ++outcome.inputCopies;
             outcome.inputCopyBytes += indexBytes;
         }
-        if (!copy.reused || (scan && highest == UnscannedIndices)) {
+        if (copy.import == nullptr && (!copy.reused || (scan && highest == UnscannedIndices))) {
             highest = UnscannedIndices;
             if (scan) {
                 highest = 0;
@@ -840,7 +880,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (!scan) highest = 0;
         Require(highest <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
         inputs.maxIndex = highest;
-        inputs.indices = std::move(copy.buffer);
+        if (copy.import == nullptr) {
+            inputs.indexHandle = copy.buffer->Handle();
+            inputs.indices = std::move(copy.buffer);
+        }
     }
     APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
     const auto& attributes = shaders.front().program->vertexAttributes;
@@ -864,20 +907,37 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         fetches.push_back({address, address + bytes, (fields[1] >> 16u) & 0x3fffu, attribute.fetchIndex, DecodeVertexFormat(attribute).alignment});
     }
     const auto plan = PlanVertexCopies(fetches);
+    // Per planned copy: the buffer bound (a copy, or the host import read in place) and the offset
+    // of the copy's first byte in it.
+    std::vector<VkBuffer> copyHandles;
+    std::vector<VkDeviceSize> copyBases;
+    copyHandles.reserve(plan.copies.size());
+    copyBases.reserve(plan.copies.size());
     for (const auto& [begin, end] : plan.copies) {
         const auto bytes = static_cast<std::size_t>(end - begin);
         GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
-        auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
+        auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex, true);
+        if (copy.import != nullptr) {
+            ++outcome.inPlaceInputs;
+            outcome.inPlaceInputBytes += bytes;
+            inputs.inPlaceRanges.emplace_back(begin, end);
+            copyHandles.push_back(copy.import->buffer);
+            copyBases.push_back(copy.importOffset);
+            inputs.vertexBuffers.push_back(nullptr);
+            continue;
+        }
         if (!copy.reused) {
             ++outcome.inputCopies;
             outcome.inputCopyBytes += bytes;
         }
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
+        copyHandles.push_back(copy.buffer->Handle());
+        copyBases.push_back(0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
     for (std::size_t i = 0; i < attributes.size(); ++i) {
-        inputs.vertexHandles.push_back(inputs.vertexBuffers[plan.copyOf[i]]->Handle());
-        inputs.vertexOffsets[i] = plan.offsets[i];
+        inputs.vertexHandles.push_back(copyHandles[plan.copyOf[i]]);
+        inputs.vertexOffsets[i] = copyBases[plan.copyOf[i]] + plan.offsets[i];
     }
     timer.phase(PhaseVertex);
     return inputs;
@@ -996,7 +1056,7 @@ void recordDrawCommands(const Context& context, VkCommandBuffer commands, const 
         return;
     }
     if (!inputs.vertexHandles.empty()) context.Resolved(&DeviceFunctions::cmdBindVertexBuffers, "vkCmdBindVertexBuffers")(commands, 0, static_cast<std::uint32_t>(inputs.vertexHandles.size()), inputs.vertexHandles.data(), inputs.vertexOffsets.data());
-    if (draw.indexed) context.Resolved(&DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, inputs.indices->Handle(), 0, draw.indexSize == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+    if (draw.indexed) context.Resolved(&DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, inputs.indexHandle, inputs.indexOffset, draw.indexSize == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     if (args == nullptr) {
         if (draw.indexed) context.Resolved(&DeviceFunctions::cmdDrawIndexed, "vkCmdDrawIndexed")(commands, draw.indexCount, draw.instanceCount, 0, static_cast<std::int32_t>(draw.firstVertex), draw.firstInstance);
         else context.Resolved(&DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, draw.indexCount, draw.instanceCount, draw.firstVertex, draw.firstInstance);
@@ -1382,6 +1442,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
+    // Inputs read in place from their imports when the batch runs (CopyDrawInput).
+    if (!inputs.inPlaceRanges.empty()) recorder->NotePendingReads(inputs.inPlaceRanges, Recorder::ReadKind::DrawInput);
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);

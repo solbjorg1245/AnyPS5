@@ -18,14 +18,21 @@ namespace AgcDriver::Graphics {
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
 
+struct HostImport;
+
 struct DrawInputCopy {
     std::shared_ptr<Buffer> buffer;
     bool reused = false;
     std::uint32_t derived = 0;
     std::uint64_t generation = 0;
     std::uint64_t registryGeneration = 0;
+    // In place: the host import the GPU reads the range from when the batch runs (no copy), at
+    // `importOffset` in its buffer; `buffer` is then null.
+    const HostImport* import = nullptr;
+    VkDeviceSize importOffset = 0;
 };
-DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use);
+// `inPlace`: bind the host import instead of copying when one covers the range (APS5_NO_INPLACE_INPUTS=1: never).
+DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, bool inPlace = false);
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived);
 
 std::array<std::uint32_t, 4> MeshIndexBufferDescriptor(const Pm4::DrawParameters& draw, std::uint64_t unreadAddress);

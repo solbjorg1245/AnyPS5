@@ -170,7 +170,7 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
 void Driver::traceCopyRefused(const VulkanDevice::CopyOutcome& outcome, std::uint64_t source, std::uint64_t destination, std::size_t bytes, const std::shared_ptr<VulkanDevice>& localDevice) {
     using Outcome = VulkanDevice::CopyOutcome;
     static constexpr const char* rules[Outcome::Refusals] = {"none", "size", "pending image", "source pending", "source unsettled", "destination pending", "destination unsettled", "label", "reader", "shadowed"};
-    static constexpr const char* readers[] = {"dispatch element", "gpu copy", "address-based", "indirect", "storage upload", "copy source"};
+    static constexpr const char* readers[] = {"dispatch element", "gpu copy", "address-based", "indirect", "storage upload", "copy source", "draw input"};
     if (outcome.reason == Outcome::SourcePending || outcome.reason == Outcome::SourceUnsettled) {
         traceCopyPending(rules[outcome.reason], source, bytes, source, destination, bytes, localDevice);
         return;
