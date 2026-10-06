@@ -10,6 +10,10 @@
 
 namespace ShaderRecompiler {
 
+namespace Detail {
+struct WalkProgram;
+}
+
 using SrtMemoryReader = bool (*)(void* userData, std::uint64_t address, std::uint32_t* value);
 
 // The guest addresses a walk dereferenced (Detail::Evaluator::EvaluateRawRead): the leaf read of
@@ -30,6 +34,12 @@ struct SrtRuntime {
     void* userContext = nullptr;
     SrtMemoryReader readSpecializationMemory = nullptr;
     SrtReadTrace* readTrace = nullptr;
+    // The express walk (Detail::WalkProgram, compiled once per plan by the recompiler's source
+    // cache) and the reader it dereferences memory with: a reader that returns false declines the
+    // read (the driver's: recorded GPU work writes the page, or it is not mapped whole), and the
+    // capture falls back to the interpreter over readMemory. Either null: the interpreter only.
+    const Detail::WalkProgram* walk = nullptr;
+    SrtMemoryReader expressRead = nullptr;
 };
 
 enum class RuntimeValueType {

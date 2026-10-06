@@ -87,12 +87,19 @@ private:
     };
 
     static bool read(void* context, std::uint64_t address, std::uint32_t* value);
+    // The express walk's reader (SrtRuntime::expressRead): a page not fetched yet is copied whole
+    // when nothing recorded writes it and it is mapped whole, otherwise the read is declined and
+    // the capture falls back to `read`; the words read are recorded in the pages like `read`'s.
+    static bool expressRead(void* context, std::uint64_t address, std::uint32_t* value);
     Page& page(std::uint64_t base);
 
     // Regions given at construction (the registered shader's code and header), referenced as given:
     // the caller keeps them alive for as long as the capture is used.
     std::map<std::uint64_t, std::span<const std::byte>> initial;
     std::map<std::uint64_t, Page> pages;
+    // The page the express reader served last (map nodes are stable), reset per capture.
+    Page* expressPage = nullptr;
+    std::uint64_t expressBase = 0;
     PendingWriteQuery pendingWrite = nullptr;
     PendingWriteObserver observe = nullptr;
     HookWaitCounter hookWaits = nullptr;

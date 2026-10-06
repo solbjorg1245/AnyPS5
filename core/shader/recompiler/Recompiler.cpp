@@ -184,6 +184,10 @@ struct ResultMemoEntry {
     std::shared_ptr<const RecompileResult> result;
 };
 
+namespace Detail {
+std::shared_ptr<const WalkProgram> CompileWalkProgram(const IrResourcePlan& plan);
+}
+
 struct SourceEntry {
     std::mutex mutex;
     // The code the entry was built for: the key carries only a hash of it, so a candidate entry is
@@ -191,6 +195,11 @@ struct SourceEntry {
     // points into a registration the driver may replace while the entry lives on.
     std::vector<std::uint32_t> code;
     std::shared_ptr<const IrResourcePlan> plan;
+    // The plan's express walk (Detail::WalkProgram), compiled on the first capture (under mutex;
+    // walkReady publishes it for the lock-free reads after); null when the plan has none.
+    std::shared_ptr<const Detail::WalkProgram> walk;
+    std::atomic<const Detail::WalkProgram*> walkReady{nullptr};
+    bool walkTried = false;
     // A plan build that threw (an unsupported resource chain or control flow) is remembered and
     // rethrown: the front end ran every pass before failing, ~13 ms per dispatch of a shader the
     // title issues every frame (0x1048947300 at the intro video). APS5_NO_FAILURE_MEMO=1 rebuilds.
@@ -607,15 +616,32 @@ std::shared_ptr<const IrResourcePlan> GetResourcePlan(const RecompileRequest& re
 
 namespace {
 
+// The source's express walk, compiled on first use (APS5_NO_EXPRESS=1: none, the interpreter
+// walks every capture).
+const Detail::WalkProgram* walkFor(SourceEntry& source) {
+    static const bool enabled = std::getenv("APS5_NO_EXPRESS") == nullptr;
+    if (!enabled) return nullptr;
+    if (const auto* ready = source.walkReady.load(std::memory_order_acquire); ready != nullptr) return ready;
+    std::lock_guard lock(source.mutex);
+    if (!source.walkTried) {
+        source.walkTried = true;
+        if (source.plan != nullptr) source.walk = Detail::CompileWalkProgram(*source.plan);
+        if (source.walk != nullptr) source.walkReady.store(source.walk.get(), std::memory_order_release);
+    }
+    return source.walk.get();
+}
+
 // The capture's materialization; with pure flat slots in the plan the walk's read addresses are
 // traced into the capture (ResourceCapture::readTrace).
 void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime) {
     const auto& plan = *capture.plan;
+    SrtRuntime express = runtime;
+    express.walk = capture.source != nullptr ? walkFor(*capture.source) : nullptr;
     if (std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; })) {
-        ResourceMaterializer{}.Materialize(plan, runtime, capture.snapshot, capture.specialization);
+        ResourceMaterializer{}.Materialize(plan, express, capture.snapshot, capture.specialization);
         return;
     }
-    SrtRuntime traced = runtime;
+    SrtRuntime traced = express;
     traced.readTrace = &capture.readTrace;
     ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot, capture.specialization);
     auto& other = capture.readTrace.otherReads;

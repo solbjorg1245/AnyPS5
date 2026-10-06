@@ -3,6 +3,7 @@
 #include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/SrtWalker/WalkProgram.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -53,6 +54,14 @@ struct CaptureProfile {
     // The driver's per-shader source handle memo: captures served from it, and resolves it made.
     std::atomic<std::uint64_t> handleHits{0};
     std::atomic<std::uint64_t> handleMisses{0};
+    // The express walk's outcome per capture (ShaderRecompiler::Detail::WalkOutcome) and why the
+    // express reader declined: the page is written by recorded GPU work, not mapped whole, a word
+    // of a page fetched word by word, or an address the interpreter path rejects.
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ShaderRecompiler::Detail::WalkOutcome::Count)> expressOutcomes{};
+    std::atomic<std::uint64_t> expressPending{0};
+    std::atomic<std::uint64_t> expressUnmapped{0};
+    std::atomic<std::uint64_t> expressWordwise{0};
+    std::atomic<std::uint64_t> expressBoundary{0};
 };
 
 constexpr std::uint64_t WordWaitNanoseconds = 50000;
@@ -227,6 +236,81 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     return true;
 }
 
+bool ShaderMemory::expressRead(void* context, std::uint64_t address, std::uint32_t* value) {
+    auto& self = *static_cast<ShaderMemory*>(context);
+    auto& totals = CaptureTotals();
+    if (address % sizeof(*value) != 0 || address > std::numeric_limits<std::uint64_t>::max() - sizeof(*value)) {
+        ++totals.expressBoundary;
+        return false;
+    }
+    ++totals.reads;
+    if (!self.initial.empty()) {
+        const auto next = self.initial.upper_bound(address);
+        if (next != self.initial.begin()) {
+            const auto previous = std::prev(next);
+            const auto offset = address - previous->first;
+            if (offset < previous->second.size()) {
+                if (previous->second.size() - offset < sizeof(*value)) {
+                    ++totals.expressBoundary;
+                    return false;
+                }
+                std::memcpy(value, previous->second.data() + offset, sizeof(*value));
+                return true;
+            }
+        }
+        if (next != self.initial.end() && next->first - address < sizeof(*value)) {
+            ++totals.expressBoundary;
+            return false;
+        }
+    }
+    if (address < NullPageBytes) {
+        *value = 0;
+        return true;
+    }
+    const auto base = address & ~static_cast<std::uint64_t>(PageBytes - 1);
+    Page* page = self.expressPage;
+    if (page == nullptr || self.expressBase != base) {
+        const auto found = self.pages.find(base);
+        if (found != self.pages.end()) {
+            page = &found->second;
+        } else {
+            if (WordwisePages() && self.pendingWrite != nullptr && self.pendingWrite(base, PageBytes, {}) != PendingWrite::None) {
+                ++totals.expressPending;
+                return false;
+            }
+            // What page() does through GuestMemory::Read, without its per-call timing and caller
+            // attribution: the flush hook for the page, then a copy checked against the page
+            // states (no VirtualQuery). A page not mapped whole stays in the map unfetched, as
+            // page() leaves it, for the interpreter's word reads.
+            const auto started = CaptureProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            GuestMemory::FlushGpuWrites(base, PageBytes);
+            auto& fresh = self.pages[base];
+            ++totals.pages;
+            const bool whole = GuestMemory::CopyMapped(base, std::as_writable_bytes(std::span(fresh.words))) == GuestMemory::Compare::Equal;
+            if (CaptureProfiled()) totals.pageReadNanoseconds += NanosecondsSince(started);
+            if (!whole) {
+                ++totals.expressUnmapped;
+                return false;
+            }
+            fresh.valid.set();
+            page = &fresh;
+        }
+        self.expressPage = page;
+        self.expressBase = base;
+    }
+    const auto index = static_cast<std::size_t>((address % PageBytes) / sizeof(*value));
+    if (!page->valid.test(index)) {
+        ++totals.expressWordwise;
+        return false;
+    }
+    page->read.set(index);
+    page->recent.set(index);
+    *value = page->words[index];
+    auto& recent = ThreadRecentReads();
+    recent.entries[recent.next++ % RecentReads::Count] = {address, *value};
+    return true;
+}
+
 std::uint64_t ShaderMemory::LocateRecentWords(std::span<const std::uint32_t> words, std::string* chain) {
     if (words.empty()) return 0;
     const auto& recent = ThreadRecentReads();
@@ -290,7 +374,11 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
     runtime.userContext = this;
     runtime.readMemory = &read;
     runtime.readSpecializationMemory = &read;
+    runtime.expressRead = &expressRead;
+    expressPage = nullptr;
+    ShaderRecompiler::Detail::NoteWalkOutcome(ShaderRecompiler::Detail::WalkOutcome::NoProgram);
     auto capture = handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
+    totals.expressOutcomes[static_cast<std::size_t>(ShaderRecompiler::Detail::LastWalkOutcome())].fetch_add(1, std::memory_order_relaxed);
     if (profile) {
         totals.captureNanoseconds += NanosecondsSince(started);
         totals.resolveNanoseconds += capture->sourceNanoseconds;
@@ -305,8 +393,9 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
             const auto wordNs = totals.wordReadNanoseconds.load();
             const auto specializationNs = ShaderRecompiler::ResourceMaterializer::SpecializationNanoseconds();
             const auto hookNs = totals.hookWaitNanoseconds.load();
-            const auto walkNs = captureNs > resolveNs + pageNs + wordNs + specializationNs ? captureNs - resolveNs - pageNs - wordNs - specializationNs : 0;
-            std::fprintf(stderr, "[capture] %llu captures: %llu word reads, %llu pages fetched (%llu read word by word over pending GPU writes: %llu words waited %.2f s, %llu read raw on evidence, %llu verified with %llu mismatches, %llu served from known values, %llu hook reads not observed: no GPU wait), capture (plan lookup + materialize) %.1f s, %llu KiB registered code this capture; sub-phases (s, us per capture): source resolve %.2f/%.1f, walk %.2f/%.1f, specialization (every materialize) %.2f/%.1f, page reads %.2f/%.1f, word reads %.2f/%.1f, hook GPU waits inside %.2f/%.1f; source handle memo %llu hits, %llu resolves\n", static_cast<unsigned long long>(totals.captures.load()), static_cast<unsigned long long>(totals.reads.load()), static_cast<unsigned long long>(totals.pages.load()), static_cast<unsigned long long>(totals.pagesWordwise.load()), static_cast<unsigned long long>(totals.wordWaits.load()), totals.wordWaitNanoseconds.load() / 1e9, static_cast<unsigned long long>(totals.wordsRaw.load()), static_cast<unsigned long long>(totals.wordsVerified.load()), static_cast<unsigned long long>(totals.wordMismatches.load()), static_cast<unsigned long long>(totals.wordsKnown.load()), static_cast<unsigned long long>(totals.observationsSkipped.load()), captureNs / 1e9, static_cast<unsigned long long>(initialBytes / 1024), resolveNs / 1e9, resolveNs / captures / 1e3, walkNs / 1e9, walkNs / captures / 1e3, specializationNs / 1e9, specializationNs / captures / 1e3, pageNs / 1e9, pageNs / captures / 1e3, wordNs / 1e9, wordNs / captures / 1e3, hookNs / 1e9, hookNs / captures / 1e3, static_cast<unsigned long long>(totals.handleHits.load()), static_cast<unsigned long long>(totals.handleMisses.load()));
+            const auto expressNs = ShaderRecompiler::Detail::ExpressWalkNanoseconds();
+            const auto walkNs = captureNs > resolveNs + pageNs + wordNs + specializationNs + expressNs ? captureNs - resolveNs - pageNs - wordNs - specializationNs - expressNs : 0;
+            std::fprintf(stderr, "[capture] %llu captures: %llu word reads, %llu pages fetched (%llu read word by word over pending GPU writes: %llu words waited %.2f s, %llu read raw on evidence, %llu verified with %llu mismatches, %llu served from known values, %llu hook reads not observed: no GPU wait), capture (plan lookup + materialize) %.1f s, %llu KiB registered code this capture; sub-phases (s, us per capture): source resolve %.2f/%.1f, walk %.2f/%.1f, specialization (every materialize) %.2f/%.1f, page reads %.2f/%.1f, word reads %.2f/%.1f, hook GPU waits inside %.2f/%.1f; source handle memo %llu hits, %llu resolves; express walk (program + its reads) %.2f/%.1f: %llu ran, %llu no program, %llu unsupported root, %llu op failed, %llu declined (page pending %llu, unmapped %llu, word of a word-wise page %llu, boundary %llu)\n", static_cast<unsigned long long>(totals.captures.load()), static_cast<unsigned long long>(totals.reads.load()), static_cast<unsigned long long>(totals.pages.load()), static_cast<unsigned long long>(totals.pagesWordwise.load()), static_cast<unsigned long long>(totals.wordWaits.load()), totals.wordWaitNanoseconds.load() / 1e9, static_cast<unsigned long long>(totals.wordsRaw.load()), static_cast<unsigned long long>(totals.wordsVerified.load()), static_cast<unsigned long long>(totals.wordMismatches.load()), static_cast<unsigned long long>(totals.wordsKnown.load()), static_cast<unsigned long long>(totals.observationsSkipped.load()), captureNs / 1e9, static_cast<unsigned long long>(initialBytes / 1024), resolveNs / 1e9, resolveNs / captures / 1e3, walkNs / 1e9, walkNs / captures / 1e3, specializationNs / 1e9, specializationNs / captures / 1e3, pageNs / 1e9, pageNs / captures / 1e3, wordNs / 1e9, wordNs / captures / 1e3, hookNs / 1e9, hookNs / captures / 1e3, static_cast<unsigned long long>(totals.handleHits.load()), static_cast<unsigned long long>(totals.handleMisses.load()), expressNs / 1e9, expressNs / captures / 1e3, static_cast<unsigned long long>(totals.expressOutcomes[0].load()), static_cast<unsigned long long>(totals.expressOutcomes[1].load()), static_cast<unsigned long long>(totals.expressOutcomes[2].load()), static_cast<unsigned long long>(totals.expressOutcomes[3].load()), static_cast<unsigned long long>(totals.expressOutcomes[4].load()), static_cast<unsigned long long>(totals.expressPending.load()), static_cast<unsigned long long>(totals.expressUnmapped.load()), static_cast<unsigned long long>(totals.expressWordwise.load()), static_cast<unsigned long long>(totals.expressBoundary.load()));
         }
     }
     return capture;

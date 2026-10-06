@@ -1,7 +1,9 @@
 #include "Optimization/SrtWalker/SrtDescriptorEvaluation.hpp"
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
+#include "Optimization/SrtWalker/WalkProgram.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
@@ -44,7 +46,8 @@ const DescriptorSource* Source(const IrResourcePlan& program, std::uint32_t sour
 
 }
 
-bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const std::uint32_t> sources, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, bool evaluateFlat, std::span<const std::uint8_t> cleanFlatSlots, std::vector<std::uint8_t>& activeSources) {
+// The interpreter: Evaluator over the IR graph, reading through runtime.readMemory.
+static bool evaluateInterpreted(const IrResourcePlan& program, std::span<const std::uint32_t> sources, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, bool evaluateFlat, std::span<const std::uint8_t> cleanFlatSlots, std::vector<std::uint8_t>& activeSources) {
     failureReason().clear();
     static const bool debug = std::getenv("APS5_SRT_DEBUG") != nullptr;
     if (debug) {
@@ -143,6 +146,59 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
     if (evaluateFlat) {
         flat = std::move(flattened);
     }
+    return true;
+}
+
+// The express walk first, for the standard materialization call (every materialization source,
+// the flat slots, the plan's own clean slots, one reader for both evaluators): a run that
+// completes is the interpreter's result. APS5_VERIFY_EXPRESS=1 runs the interpreter as well and
+// aborts on a difference; the recompiler's source cache compiles no program under
+// APS5_NO_EXPRESS=1, so the interpreter alone runs.
+bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const std::uint32_t> sources, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, bool evaluateFlat, std::span<const std::uint8_t> cleanFlatSlots, std::vector<std::uint8_t>& activeSources) {
+    const bool standard = runtime.walk != nullptr && runtime.expressRead != nullptr && evaluateFlat && runtime.readMemory == runtime.readSpecializationMemory && sources.data() == program.materializationSources.data() && sources.size() == program.materializationSources.size() && cleanFlatSlots.data() == program.cleanFlatSlots.data() && cleanFlatSlots.size() == program.cleanFlatSlots.size();
+    if (!standard) {
+        NoteWalkOutcome(WalkOutcome::NoProgram);
+        return evaluateInterpreted(program, sources, runtime, results, flat, evaluateFlat, cleanFlatSlots, activeSources);
+    }
+    static const bool verify = std::getenv("APS5_VERIFY_EXPRESS") != nullptr;
+    std::vector<DescriptorValue> expressResults;
+    std::vector<std::uint32_t> expressFlat;
+    std::vector<std::uint8_t> expressActive;
+    SrtRuntime express = runtime;
+    // Under verification the interpreter's walk alone traces the reads.
+    if (verify) express.readTrace = nullptr;
+    if (ExecuteWalkProgram(*runtime.walk, program, express, expressResults, expressFlat, expressActive) != WalkOutcome::Ran) {
+        return evaluateInterpreted(program, sources, runtime, results, flat, evaluateFlat, cleanFlatSlots, activeSources);
+    }
+    if (!verify) {
+        results = std::move(expressResults);
+        flat = std::move(expressFlat);
+        activeSources = std::move(expressActive);
+        return true;
+    }
+    if (!evaluateInterpreted(program, sources, runtime, results, flat, evaluateFlat, cleanFlatSlots, activeSources)) {
+        std::fprintf(stderr, "[express] verify: shader 0x%llx: the interpreter failed (%s) where the express walk ran\n", static_cast<unsigned long long>(runtime.shaderBase), failureReason().c_str());
+        std::abort();
+    }
+    static std::atomic<std::uint64_t> verified{0};
+    const auto count = verified.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto differ = [&](const char* what, std::size_t index, std::uint32_t expected, std::uint32_t got) {
+        std::fprintf(stderr, "[express] verify: shader 0x%llx: %s %zu differs: interpreter %08x, express %08x (after %llu verified)\n", static_cast<unsigned long long>(runtime.shaderBase), what, index, expected, got, static_cast<unsigned long long>(count - 1));
+        std::abort();
+    };
+    if (results.size() != expressResults.size()) differ("source count", results.size(), 0, static_cast<std::uint32_t>(expressResults.size()));
+    for (std::size_t i = 0; i < results.size(); ++i) {
+        if (results[i].dwordCount != expressResults[i].dwordCount) differ("source dword count", i, results[i].dwordCount, expressResults[i].dwordCount);
+        for (std::uint32_t dword = 0; dword < results[i].dwordCount; ++dword) {
+            if (results[i].dwords[dword] != expressResults[i].dwords[dword]) differ("source dword", i * 8 + dword, results[i].dwords[dword], expressResults[i].dwords[dword]);
+        }
+    }
+    if (flat.size() != expressFlat.size()) differ("flat slot count", flat.size(), 0, static_cast<std::uint32_t>(expressFlat.size()));
+    for (std::size_t i = 0; i < flat.size(); ++i) {
+        if (flat[i] != expressFlat[i]) differ("flat slot", i, flat[i], expressFlat[i]);
+    }
+    if (activeSources != expressActive) differ("active sources", activeSources.size(), 0, static_cast<std::uint32_t>(expressActive.size()));
+    if (count % 10000 == 0) std::fprintf(stderr, "[express] verify: %llu captures agreed with the interpreter\n", static_cast<unsigned long long>(count));
     return true;
 }
 
