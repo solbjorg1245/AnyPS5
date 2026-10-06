@@ -308,6 +308,15 @@ static void ReportRefused(const char* call, const Fiber* self, const Fiber* targ
     NoteEvent(target, 'X');
 }
 
+// A run or switch to an object that is no fiber (finalized, never initialized, or overwritten):
+// refused like ReportRefused's calls, with the object's first words.
+static void ReportNotFiber(const char* call, const FiberObject* object) {
+    static std::atomic<int> reports{0};
+    if (reports.fetch_add(1, std::memory_order_relaxed) >= 32) return;
+    const auto* words = reinterpret_cast<const std::uint64_t*>(object);
+    std::fprintf(stderr, "[fiber] %s refused on t%u: %p is no fiber (words %016llx %016llx, current '%s')\n", call, HostThreadId(), static_cast<const void*>(object), object != nullptr ? static_cast<unsigned long long>(words[0]) : 0ull, object != nullptr ? static_cast<unsigned long long>(words[1]) : 0ull, ThreadState().current != nullptr ? ThreadState().current->name : "-");
+}
+
 static void CompletePendingSuspend() {
     auto& thread = ThreadState();
     if (thread.pendingSuspend) {
@@ -583,7 +592,10 @@ int32_t APS5_VABI sceFiberFinalize(FiberObject* object) {
 
 int32_t APS5_VABI sceFiberRun_nid_postfix(FiberObject* object, uint64_t arg_on_run, uint64_t* arg_on_return) {
     auto* fiber = AsFiber(object);
-    if (!fiber) return object ? SCE_FIBER_ERROR_INVALID : SCE_FIBER_ERROR_NULL;
+    if (!fiber) {
+        ReportNotFiber("sceFiberRun", object);
+        return object ? SCE_FIBER_ERROR_INVALID : SCE_FIBER_ERROR_NULL;
+    }
     if (ThreadState().current) {
         ReportRefused("sceFiberRun", ThreadState().current, fiber, SCE_FIBER_ERROR_PERMISSION);
         return SCE_FIBER_ERROR_PERMISSION;
@@ -604,7 +616,10 @@ int32_t APS5_VABI sceFiberRun_nid_postfix(FiberObject* object, uint64_t arg_on_r
 
 int32_t APS5_VABI sceFiberSwitch(FiberObject* object, uint64_t arg_on_run, uint64_t* arg_on_run_out) {
     auto* target = AsFiber(object);
-    if (!target) return object ? SCE_FIBER_ERROR_INVALID : SCE_FIBER_ERROR_NULL;
+    if (!target) {
+        ReportNotFiber("sceFiberSwitch", object);
+        return object ? SCE_FIBER_ERROR_INVALID : SCE_FIBER_ERROR_NULL;
+    }
     auto* self = ThreadState().current;
     if (!self) {
         ReportRefused("sceFiberSwitch", nullptr, target, SCE_FIBER_ERROR_PERMISSION);

@@ -79,7 +79,7 @@ static_assert(sizeof(IrDescriptorBinding) == 32, "IrDescriptorBinding changed: u
 static_assert(sizeof(BindingAllocationResult) == 120, "BindingAllocationResult changed: update the allocation encoder");
 static_assert(sizeof(ResourceSpecialization) == 72, "ResourceSpecialization changed: update BuildKey");
 static_assert(sizeof(ResourceSpecialization::Buffer) == 16, "ResourceSpecialization::Buffer changed: update BuildKey");
-static_assert(sizeof(ResourceSpecialization::Image) == 36, "ResourceSpecialization::Image changed: update BuildKey");
+static_assert(sizeof(ResourceSpecialization::Image) == 40, "ResourceSpecialization::Image changed: update BuildKey");
 static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildKey");
 #endif
 
@@ -392,6 +392,7 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(image.mipMode);
         out.Value(image.mipCount);
         out.Value(image.conversionFormat);
+        out.Value(image.float16Store);
         out.Value(image.shaderSwizzle);
         out.Value(image.read);
         out.Value(image.written);
@@ -479,6 +480,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(image.mipMode);
         in.Value(image.mipCount);
         in.Value(image.conversionFormat);
+        in.Value(image.float16Store);
         in.Value(image.shaderSwizzle);
         in.Value(image.read);
         in.Value(image.written);
@@ -805,6 +807,7 @@ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, c
         out.Value(image.dimension);
         out.Value(image.mipCount);
         out.Value(image.conversionFormat);
+        out.Value(image.float16Store);
         out.Value(image.shaderSwizzle);
         out.Value(image.indirectRoot);
         out.Value(image.indirectMappingOffset);

@@ -523,6 +523,30 @@ std::uint32_t PackImageTexel(SpirvValueEmitContext& ctx, const ImageEmitAccess& 
     return result;
 }
 
+// A store to a 16-bit float storage format (ImageResource::float16Store) saturates finite values at
+// +-65504, the format's largest finite value; NaN and infinity pass unchanged. Vulkan's conversion
+// rounds them to infinity, which seeded the froxel fog volume of Boletaria (a bright fire overflowed
+// R to +inf in the lit volume, the temporal blend turned it into NaN in G/B, and the history,
+// validated through alpha only, spread it over the screen: magenta or green frames after minutes of
+// play, t138-t188). The PS5 shows none of it, so its store conversion is taken to saturate; with the
+// clamp a 7-minute walk left the lit volumes clean (t194). APS5_NO_F16_STORE_CLAMP=1 disables it.
+std::uint32_t SaturateFloat16Texel(SpirvEmitterState& state, std::uint32_t texel) {
+    const auto f32 = TypeF32(state);
+    const auto boolean = TypeBool(state);
+    std::array<std::uint32_t, 4> parts{};
+    for (std::uint32_t component = 0; component < parts.size(); ++component) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, f32, value, texel, component);
+        const auto special = Binary(state, spv::OpLogicalOr, boolean, Unary(state, spv::OpIsNan, boolean, value), Unary(state, spv::OpIsInf, boolean, value));
+        const auto clamped = state.module.AllocateId();
+        state.module.AddFunction(spv::OpExtInst, f32, clamped, GlslStd450(state), GLSLstd450FClamp, value, ConstantF32(state, 0xc77fe000u), ConstantF32(state, 0x477fe000u));
+        parts[component] = Select(state, f32, special, value, clamped);
+    }
+    const auto result = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, ImageVectorType(state, IrTextureNumericClass::Float, 4), result, parts[0], parts[1], parts[2], parts[3]);
+    return result;
+}
+
 std::uint32_t StoreTexel(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, std::uint32_t data, bool integer) {
     auto& state = ctx.state;
     const auto& mem = access.mem;
@@ -634,7 +658,9 @@ void EmitWriteOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
     EmitIfCondition(state, ctx.Arg(access.inst, 3), [&]() {
         const auto mipLod = access.image.mipMode == ImageMipMode::DynamicStorage ? LodU32(ctx, access) : 0u;
         const auto coord = CoordU32(ctx, access);
-        const auto texel = StoreTexel(ctx, access, ctx.Arg(access.inst, 2), uintImage);
+        auto texel = StoreTexel(ctx, access, ctx.Arg(access.inst, 2), uintImage);
+        static const bool clampF16 = std::getenv("APS5_NO_F16_STORE_CLAMP") == nullptr;
+        if (clampF16 && access.image.float16Store && !uintImage) texel = SaturateFloat16Texel(state, texel);
         EmitStorageImageWrite(state, access.mem.resource, mipLod, coord, texel);
     });
 }

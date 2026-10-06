@@ -52,6 +52,10 @@ struct ImageResource {
     bool r128 = false;
     bool depthBits = false;
     bool depthUnorm16 = false;
+    // A written storage image of a 16-bit float format (from the bound T#): its stores saturate
+    // finite values at the format's largest finite value instead of rounding them to infinity
+    // (SaturateFloat16Texel in SpirvImageEmitter.cpp).
+    bool float16Store = false;
     std::uint32_t indirectRoot = NoIndirectImage;
     std::uint32_t indirectMappingOffset = 0;
     std::uint32_t indirectSearchIterations = 0;

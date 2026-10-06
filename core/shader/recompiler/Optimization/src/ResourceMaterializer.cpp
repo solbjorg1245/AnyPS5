@@ -44,6 +44,7 @@ struct DecodedImage {
     bool fmask = false;
     bool depthBits = false;
     bool depthUnorm16 = false;
+    bool float16Store = false;
 };
 
 ShaderBufferResource decodeBufferDescriptor(const DescriptorValue& value) {
@@ -184,6 +185,7 @@ DecodedImage decodeImageDescriptor(const DescriptorValue& descriptor, const Imag
         decoded.shaderSwizzle = descriptorImageSwizzle(descriptor);
     }
     const bool rawSintStorage = storage && format == IrBufferFormat::Format32SInt && base.written && !base.read && !base.atomic;
+    decoded.float16Store = storage && base.written && (format == IrBufferFormat::Format16Float || format == IrBufferFormat::Format16_16Float || format == IrBufferFormat::Format16_16_16_16Float);
     decoded.numericClass = SampledTextureNumericClass(format);
     if (!storage && !base.depthCompare && IsDepthBitsTexture(descriptor.dwords[1], descriptor.dwords[3])) {
         decoded.depthBits = true;
@@ -573,6 +575,7 @@ void buildResourceSpecialization(const IrResourcePlan& plan, ResourceSnapshot& s
         entry.dimension = decoded.dimension;
         entry.mipCount = decoded.mipCount;
         entry.conversionFormat = decoded.conversionFormat;
+        entry.float16Store = decoded.float16Store;
         entry.shaderSwizzle = decoded.shaderSwizzle;
         entry.indirectRoot = ImageResource::NoIndirectImage;
         entry.indirectMappingOffset = 0u;
@@ -660,6 +663,7 @@ void ResourceMaterializer::Apply(IrProgram& program, const ResourceSpecializatio
         image.dimension = source.dimension;
         image.mipCount = source.mipCount;
         image.conversionFormat = source.conversionFormat;
+        image.float16Store = source.float16Store;
         image.shaderSwizzle = source.shaderSwizzle;
         image.indirectRoot = source.indirectRoot;
         image.indirectMappingOffset = source.indirectMappingOffset;
@@ -932,7 +936,7 @@ bool ResourceSpecialization::Buffer::operator==(const Buffer& other) const {
 }
 
 bool ResourceSpecialization::Image::operator==(const Image& other) const {
-    return numericClass == other.numericClass && dimension == other.dimension && mipCount == other.mipCount && conversionFormat == other.conversionFormat && shaderSwizzle == other.shaderSwizzle && indirectRoot == other.indirectRoot && indirectMappingOffset == other.indirectMappingOffset && indirectSearchIterations == other.indirectSearchIterations && cube == other.cube && fmask == other.fmask && depthBits == other.depthBits && depthUnorm16 == other.depthUnorm16;
+    return numericClass == other.numericClass && dimension == other.dimension && mipCount == other.mipCount && conversionFormat == other.conversionFormat && float16Store == other.float16Store && shaderSwizzle == other.shaderSwizzle && indirectRoot == other.indirectRoot && indirectMappingOffset == other.indirectMappingOffset && indirectSearchIterations == other.indirectSearchIterations && cube == other.cube && fmask == other.fmask && depthBits == other.depthBits && depthUnorm16 == other.depthUnorm16;
 }
 
 bool ResourceSpecialization::operator==(const ResourceSpecialization& other) const {
