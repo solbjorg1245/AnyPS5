@@ -20,7 +20,19 @@ std::string DescribeDeviceAddress(VkDeviceAddress address);
 // the 'read invalid' device losses inside destroyed imports, t167-t177).
 bool CheckStaleImports();
 void NoteImportHandle(VkBuffer buffer, std::uint64_t guestBase, bool live);
-bool ReportDestroyedImport(VkBuffer buffer, const char* where, std::uint64_t detail);
+bool ReportDestroyedImport(VkBuffer buffer, const char* where, std::uint64_t detail, std::uint64_t* guestBase = nullptr);
+
+// Debug aid APS5_GPU_CHECKPOINTS=1 (VK_NV_device_diagnostic_checkpoints): every recorded draw and
+// dispatch is preceded by a checkpoint whose marker indexes a ring of descriptions (kind, guest
+// program addresses, render target or dispatch size); a lost device prints the last checkpoint
+// each pipeline stage reached, naming the work that faulted. SetCheckpointWork gives the calling
+// thread's next draw its programs (the driver sets them per draw packet).
+bool CheckpointsRequested();
+void InstallCheckpoints(PFN_vkCmdSetCheckpointNV set, PFN_vkGetQueueCheckpointDataNV get, VkQueue queue);
+void SetCheckpointWork(std::uint64_t first, std::uint64_t second);
+void RecordCheckpoint(VkCommandBuffer commands, char kind, std::uint64_t first, std::uint64_t second, std::uint64_t detail);
+void RecordDrawCheckpoint(VkCommandBuffer commands, std::uint64_t detail);
+void ReportCheckpoints();
 
 class Buffer {
 public:

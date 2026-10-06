@@ -3004,7 +3004,17 @@ void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoi
     if (_set == VK_NULL_HANDLE) return;
     if (CheckStaleImports()) {
         for (const auto buffer : boundBuffers) {
-            if (ReportDestroyedImport(buffer, "a descriptor set bound now", reinterpret_cast<std::uint64_t>(_set))) break;
+            std::uint64_t base = 0;
+            if (!ReportDestroyedImport(buffer, "a descriptor set bound now", reinterpret_cast<std::uint64_t>(_set), &base)) continue;
+            static std::atomic<int> details{0};
+            if (details.fetch_add(1) < 6) {
+                std::fprintf(stderr, "[stale-import]   object %p: reusable %d, %zu direct regions, %zu bound buffers, %zu allocations, lease %d%s", static_cast<const void*>(this), reusable ? 1 : 0, directRegions.size(), boundBuffers.size(), allocations.size(), HoldsLease() ? 1 : 0, "\n");
+                for (const auto& region : directRegions) {
+                    const auto current = HostImportSerial(context, region.begin, static_cast<std::size_t>(region.end - region.begin), false);
+                    std::fprintf(stderr, "[stale-import]     direct 0x%llx+0x%llx serial %llu, now %llu%s%s", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end - region.begin), static_cast<unsigned long long>(region.serial), static_cast<unsigned long long>(current), region.begin >= base && region.begin < base + 0x40000000ull ? " (in or after the destroyed import's base)" : "", "\n");
+                }
+            }
+            break;
         }
     }
     context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);

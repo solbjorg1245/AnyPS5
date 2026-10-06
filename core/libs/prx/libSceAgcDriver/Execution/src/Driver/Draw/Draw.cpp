@@ -164,6 +164,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::vector<bool> recompiled(programs.size(), false);
     bool drawHit = false;
     bool verifyHit = false;
+    if (Graphics::CheckpointsRequested() && !programs.empty()) Graphics::SetCheckpointWork(programs.front().binary.codeAddress, programs.back().binary.codeAddress);
     lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, hits, drawHit, verifyHit, phaseTiming, phaseMs);
 
     if (registerKey) {

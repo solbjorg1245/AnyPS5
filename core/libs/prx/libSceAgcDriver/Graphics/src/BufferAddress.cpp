@@ -1,10 +1,16 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <map>
 #include <mutex>
+#include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#endif
 
 namespace AgcDriver::Graphics {
 
@@ -91,6 +97,98 @@ ImportHandles& Handles() {
 
 }
 
+namespace {
+
+struct CheckpointEntry {
+    std::atomic<std::uint64_t> serial{0};
+    char kind = 0;
+    std::uint64_t first = 0;
+    std::uint64_t second = 0;
+    std::uint64_t detail = 0;
+};
+
+struct Checkpoints {
+    static constexpr std::size_t Size = std::size_t{1} << 16;
+    PFN_vkCmdSetCheckpointNV set = nullptr;
+    PFN_vkGetQueueCheckpointDataNV get = nullptr;
+    VkQueue queue = VK_NULL_HANDLE;
+    std::atomic<std::uint64_t> next{0};
+    std::vector<CheckpointEntry> ring = std::vector<CheckpointEntry>(Size);
+};
+
+Checkpoints& Marks() {
+    static auto* marks = new Checkpoints();
+    return *marks;
+}
+
+thread_local std::uint64_t checkpointFirst = 0;
+thread_local std::uint64_t checkpointSecond = 0;
+
+}
+
+bool CheckpointsRequested() {
+    static const bool requested = std::getenv("APS5_GPU_CHECKPOINTS") != nullptr;
+    return requested;
+}
+
+void InstallCheckpoints(PFN_vkCmdSetCheckpointNV set, PFN_vkGetQueueCheckpointDataNV get, VkQueue queue) {
+    auto& marks = Marks();
+    marks.set = set;
+    marks.get = get;
+    marks.queue = queue;
+    std::fprintf(stderr, "[checkpoints] %s%s", set != nullptr && get != nullptr ? "recording a checkpoint before every draw and dispatch" : "unavailable", "\n");
+}
+
+void SetCheckpointWork(std::uint64_t first, std::uint64_t second) {
+    checkpointFirst = first;
+    checkpointSecond = second;
+}
+
+void RecordCheckpoint(VkCommandBuffer commands, char kind, std::uint64_t first, std::uint64_t second, std::uint64_t detail) {
+    auto& marks = Marks();
+    if (marks.set == nullptr) return;
+    const auto serial = marks.next.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto& entry = marks.ring[serial % Checkpoints::Size];
+    entry.kind = kind;
+    entry.first = first;
+    entry.second = second;
+    entry.detail = detail;
+    entry.serial.store(serial, std::memory_order_release);
+    marks.set(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(serial)));
+}
+
+void RecordDrawCheckpoint(VkCommandBuffer commands, std::uint64_t detail) {
+    if (Marks().set == nullptr) return;
+    RecordCheckpoint(commands, 'D', checkpointFirst, checkpointSecond, detail);
+}
+
+void ReportCheckpoints() {
+    auto& marks = Marks();
+    if (marks.get == nullptr || marks.queue == VK_NULL_HANDLE) return;
+    std::uint32_t count = 0;
+    marks.get(marks.queue, &count, nullptr);
+    std::vector<VkCheckpointDataNV> data(count, VkCheckpointDataNV{VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
+    if (count != 0) marks.get(marks.queue, &count, data.data());
+    std::fprintf(stderr, "[checkpoints] %u stage checkpoint(s), %llu recorded in all%s", count, static_cast<unsigned long long>(marks.next.load()), "\n");
+    const auto describe = [&](std::uint64_t serial, const char* prefix) {
+        const auto& entry = marks.ring[serial % Checkpoints::Size];
+        if (serial == 0 || entry.serial.load(std::memory_order_acquire) != serial) {
+            std::fprintf(stderr, "[checkpoints] %s #%llu (overwritten)%s", prefix, static_cast<unsigned long long>(serial), "\n");
+            return;
+        }
+        std::fprintf(stderr, "[checkpoints] %s #%llu %s programs 0x%llx / 0x%llx, %s 0x%llx%s", prefix, static_cast<unsigned long long>(serial), entry.kind == 'D' ? "draw" : "dispatch", static_cast<unsigned long long>(entry.first), static_cast<unsigned long long>(entry.second), entry.kind == 'D' ? "color target" : "groups", static_cast<unsigned long long>(entry.detail), "\n");
+    };
+    for (const auto& checkpoint : data) {
+        const auto serial = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(checkpoint.pCheckpointMarker));
+        std::fprintf(stderr, "[checkpoints] stage 0x%x reached:%s", static_cast<unsigned>(checkpoint.stage), "\n");
+        for (std::uint64_t back = 3; back > 0; --back) {
+            if (serial > back) describe(serial - back, "  before");
+        }
+        describe(serial, "  last  ");
+        describe(serial + 1, "  next  ");
+    }
+}
+
 bool CheckStaleImports() {
     static const bool check = std::getenv("APS5_CHECK_STALE_IMPORTS") != nullptr;
     return check;
@@ -105,15 +203,44 @@ void NoteImportHandle(VkBuffer buffer, std::uint64_t guestBase, bool live) {
     else handles.destroyed[buffer] = {guestBase, now};
 }
 
-bool ReportDestroyedImport(VkBuffer buffer, const char* where, std::uint64_t detail) {
+namespace {
+
+// The stack slots that point into the driver's code, as offsets (addr2line -f -C -e
+// libSceAgcDriver.prx with the image base added), from the caller outwards.
+void reportDriverStack() {
+#ifdef _WIN32
+    HMODULE driver = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(&reportDriverStack), &driver)) return;
+    MODULEINFO info{};
+    if (!GetModuleInformation(GetCurrentProcess(), driver, &info, sizeof(info))) return;
+    const auto base = reinterpret_cast<std::uintptr_t>(info.lpBaseOfDll);
+    const auto end = base + info.SizeOfImage;
+    std::fprintf(stderr, "[stale-import]   driver addresses on the stack (image base 0x%llx):", static_cast<unsigned long long>(base));
+    const auto* slot = static_cast<const std::uintptr_t*>(__builtin_frame_address(0));
+    int printed = 0;
+    for (int i = 0; i < 4096 && printed < 32; ++i) {
+        const auto value = slot[i];
+        if (value <= base || value >= end) continue;
+        std::fprintf(stderr, " 0x%llx", static_cast<unsigned long long>(value - base));
+        ++printed;
+    }
+    std::fprintf(stderr, "\n");
+#endif
+}
+
+}
+
+bool ReportDestroyedImport(VkBuffer buffer, const char* where, std::uint64_t detail, std::uint64_t* guestBase) {
     if (!CheckStaleImports() || buffer == VK_NULL_HANDLE) return false;
     auto& handles = Handles();
     std::lock_guard lock(handles.mutex);
     const auto found = handles.destroyed.find(buffer);
     if (found == handles.destroyed.end()) return false;
+    if (guestBase != nullptr) *guestBase = found->second.guestBase;
     static int reports = 0;
     if (reports++ < 16) {
         std::fprintf(stderr, "[stale-import] %s (0x%llx) uses the buffer of import guest 0x%llx destroyed %.3f s ago%s", where, static_cast<unsigned long long>(detail), static_cast<unsigned long long>(found->second.guestBase), SecondsNow() - found->second.destroyed, "\n");
+        if (reports <= 6) reportDriverStack();
         std::fflush(stderr);
     }
     return true;
