@@ -934,6 +934,17 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         state->capabilities.push_back(spv::CapabilityStorageImageArrayNonUniformIndexing);
         state->spirvExtensions.push_back("SPV_EXT_descriptor_indexing");
     }
+    // gl_BaseInstance (Vulkan 1.1 core): an indirect draw's start-instance SGPR reads it, so such
+    // draws stay on the GPU (see the translator's instance base SGPR).
+    VkPhysicalDeviceShaderDrawParametersFeatures drawParametersFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES};
+    {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &drawParametersFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+    }
+    const bool drawParameters = drawParametersFeatures.shaderDrawParameters == VK_TRUE && std::getenv("APS5_NO_DRAW_PARAMETERS") == nullptr;
+    drawParametersFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES};
+    drawParametersFeatures.shaderDrawParameters = VK_TRUE;
+    if (drawParameters) state->capabilities.push_back(spv::CapabilityDrawParameters);
     state->samplerAnisotropy = true;
     state->textureCompressionBC = true;
     deviceInfo.pEnabledFeatures = &enabled;
@@ -980,6 +991,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     if (state->descriptorIndexing) {
         descriptorIndexingFeatures.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &descriptorIndexingFeatures;
+    }
+    if (drawParameters) {
+        drawParametersFeatures.pNext = byteFeatures.pNext;
+        byteFeatures.pNext = &drawParametersFeatures;
     }
     // Timeline semaphores let a queue worker wait for recorded batches without holding the GPU mutex
     // (see Recorder::WaitSerial). The instance is 1.1, so the KHR extension is used even on 1.2+

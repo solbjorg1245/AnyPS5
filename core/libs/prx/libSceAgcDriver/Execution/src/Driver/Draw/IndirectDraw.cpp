@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <cstdlib>
+#include <mutex>
+#include <unordered_set>
 
 namespace AgcDriver::DriverDetail {
 
@@ -44,6 +46,23 @@ std::optional<Graphics::IndirectDrawPath> Driver::classifyIndirectDraw(const Sha
         const auto stride = (attribute.resource.fields[1] >> 16u) & 0x3fffu;
         const auto extent = stride == 0 ? static_cast<std::uint64_t>(attribute.resource.fields[2]) : static_cast<std::uint64_t>(attribute.resource.fields[2]) * stride;
         if (extent > vertexCap) fail(Path::VertexRange);
+    }
+    // APS5_DUMP_INDIRECT_SHADERS=<dir>: the front stage's code of each program whose indirect draws
+    // stay on the CPU path, once per code address (vs_<address>.bin, for llvm-mc).
+    static const char* dumpDirectory = std::getenv("APS5_DUMP_INDIRECT_SHADERS");
+    if (dumpDirectory && indirectCpu) {
+        static std::mutex dumpMutex;
+        static std::unordered_set<std::uint64_t> dumped;
+        const std::lock_guard lock(dumpMutex);
+        if (dumped.insert(frontProgram.binary.codeAddress).second) {
+            char path[512];
+            std::snprintf(path, sizeof(path), "%s/vs_%llx.bin", dumpDirectory, static_cast<unsigned long long>(frontProgram.binary.codeAddress));
+            if (auto* file = std::fopen(path, "wb")) {
+                std::fwrite(frontProgram.binary.code.data(), sizeof(std::uint32_t), frontProgram.binary.code.size(), file);
+                std::fclose(file);
+            }
+            std::fprintf(stderr, "[draw] indirect cpu-path shader 0x%llx (%zu words, %s) user sgpr base %u\n", static_cast<unsigned long long>(frontProgram.binary.codeAddress), frontProgram.binary.code.size(), Graphics::IndirectDrawPathName(*indirectCpu), frontProgram.firstUserSgpr);
+        }
     }
     if (traceIndirect) {
         const auto location = [](std::uint32_t value, std::int32_t sgpr) { char text[24]; if (value == 0x280u) std::snprintf(text, sizeof(text), "none"); else std::snprintf(text, sizeof(text), "0x%x(s%d)", value, sgpr); return std::string(text); };

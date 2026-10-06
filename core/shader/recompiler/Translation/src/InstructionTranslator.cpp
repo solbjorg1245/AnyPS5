@@ -352,7 +352,13 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         }
     } else if (options.stage == ShaderStageKind::Vertex) {
         entryIr.SetVectorReg(static_cast<VectorReg>(5), builtin(StageInputKind::VertexIndex));
-        entryIr.SetVectorReg(static_cast<VectorReg>(8), builtin(StageInputKind::InstanceIndex));
+        if (options.instanceBaseSgpr >= 0) {
+            IrValue& base = builtin(StageInputKind::BaseInstance);
+            entryIr.SetScalarReg(static_cast<ScalarReg>(options.instanceBaseSgpr), base);
+            entryIr.SetVectorReg(static_cast<VectorReg>(8), entryIr.ISub(builtin(StageInputKind::InstanceIndex), base));
+        } else {
+            entryIr.SetVectorReg(static_cast<VectorReg>(8), builtin(StageInputKind::InstanceIndex));
+        }
     }
 }
 
@@ -392,6 +398,8 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
         program.Info().instanceOffsetShared = options.embeddedFetch->instanceOffsetShared;
         program.Info().vertexOffsetConflict = options.embeddedFetch->vertexOffsetConflict;
         program.Info().instanceOffsetConflict = options.embeddedFetch->instanceOffsetConflict;
+    } else if (options.instanceBaseSgpr >= 0) {
+        program.Info().instanceOffsetSgpr = options.instanceBaseSgpr;
     }
     program.Metadata().cfgFailureKind = cfg.failureKind;
     program.Metadata().failureReason = cfg.unsupportedReason;

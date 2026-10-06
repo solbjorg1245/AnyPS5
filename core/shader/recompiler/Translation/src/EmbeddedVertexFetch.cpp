@@ -432,4 +432,55 @@ EmbeddedFetchPlan EmbeddedVertexFetchAnalyzer::Analyze(const RdnaProgram& progra
     return plan;
 }
 
+std::int32_t FindInstanceBaseSgpr(const RdnaProgram& program, std::uint32_t userDataBaseRegister, std::uint32_t userDataCount) {
+    if (userDataBaseRegister != 8u) return -1;
+    for (const auto& inst : program.instructions) {
+        switch (inst.op) {
+        case RdnaOpcode::SMovrelsB32:
+        case RdnaOpcode::SMovrelsB64:
+        case RdnaOpcode::SMovreldB32:
+        case RdnaOpcode::SMovreldB64:
+        case RdnaOpcode::SMovrelsd2B32:
+            return -1;
+        default:
+            break;
+        }
+    }
+    const auto instanceAdd = [](const RdnaInstruction& inst, std::uint32_t sgpr) {
+        return inst.op == RdnaOpcode::VAddNcU32 && isVectorOperand(inst.destination) && inst.source0.kind == RdnaOperandKind::ScalarRegister && scalarSlot(inst.source0) == sgpr && (inst.source0.sdwaSel == 6u || inst.source0.sdwaSel == 4u) &&
+            isVectorOperand(inst.source1) && inst.source1.reg == kInstanceIndexVgpr && inst.source1.sdwaSel == 6u && (inst.source2.kind == RdnaOperandKind::Unknown || inst.source2.kind == RdnaOperandKind::None);
+    };
+    // Reads of the entry value only: in the straight-line prefix, scanning stops at the first write
+    // of the SGPR (later reads see the written value) or at s_endpgm (data may follow the code).
+    const auto reads = [](const RdnaInstruction& inst, std::uint32_t sgpr) {
+        const std::array<const RdnaOperand*, 4> sources{&inst.source0, &inst.source1, &inst.source2, &inst.source3};
+        for (std::uint32_t i = 0u; i < sources.size(); i++) {
+            if (!isScalarOperand(*sources[i])) continue;
+            const auto first = scalarSlot(*sources[i]);
+            // s_load_* addresses through a 64-bit pair, not the four words of a buffer V#.
+            const bool pairBase = i == 0u && inst.op >= RdnaOpcode::SLoadDword && inst.op <= RdnaOpcode::SLoadDwordx16;
+            if (sgpr >= first && sgpr < first + (pairBase ? 2u : scalarOperandWidth(inst, i))) return true;
+        }
+        return false;
+    };
+    std::int32_t found = -1;
+    for (std::uint32_t sgpr = userDataBaseRegister; sgpr < userDataBaseRegister + userDataCount; sgpr++) {
+        bool added = false;
+        bool other = false;
+        bool branched = false;
+        for (const auto& inst : program.instructions) {
+            if (reads(inst, sgpr)) {
+                if (instanceAdd(inst, sgpr)) added = true;
+                else { other = true; break; }
+            }
+            if (!branched && (inst.op == RdnaOpcode::SEndpgm || (touchesSgpr(inst, sgpr) && !reads(inst, sgpr)))) break;
+            if (IsDirectBranchOpcode(inst.op) || inst.op == RdnaOpcode::SSetpcB64) branched = true;
+        }
+        if (!added || other) continue;
+        if (found >= 0) return -1;
+        found = static_cast<std::int32_t>(sgpr);
+    }
+    return found;
+}
+
 }

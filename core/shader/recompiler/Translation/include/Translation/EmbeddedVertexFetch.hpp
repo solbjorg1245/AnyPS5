@@ -26,6 +26,11 @@ struct EmbeddedFetchPlan {
     bool instanceOffsetConflict = false;
 };
 
+// The user SGPR a vertex shader adds to its instance ID VGPR (v8) and reads nowhere else
+// (`v_add_nc_u32 vN, sK, v8`, sK whole or its low word through SDWA): the start instance an indirect
+// draw writes. -1 when no single SGPR qualifies or the program indexes SGPRs relatively.
+[[nodiscard]] std::int32_t FindInstanceBaseSgpr(const RdnaProgram& program, std::uint32_t userDataBaseRegister, std::uint32_t userDataCount);
+
 class EmbeddedVertexFetchAnalyzer {
 public:
     [[nodiscard]] EmbeddedFetchPlan Analyze(const RdnaProgram& program, std::uint32_t attributeTableRegister, std::uint32_t bufferTableRegister, std::uint32_t userDataBaseRegister, std::uint32_t userDataCount, std::uint32_t waveSize) const;

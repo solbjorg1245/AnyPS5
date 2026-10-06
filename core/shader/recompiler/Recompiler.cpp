@@ -120,6 +120,13 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
         embeddedFetch = embeddedFetchAnalyzer.Analyze(decoded, inputInfo.vertex->fetchAttribReg, inputInfo.vertex->fetchBufferReg, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size()), request.context.waveSize);
     }
     translateOptions.embeddedFetch = embeddedFetch.loads.empty() ? nullptr : &embeddedFetch;
+    // APS5_NO_INSTANCE_BASE_SGPR=1: the start-instance SGPR stays plain user data (indirect draws of
+    // such shaders then patch it per record on the CPU).
+    static const bool instanceBase = std::getenv("APS5_NO_INSTANCE_BASE_SGPR") == nullptr;
+    const auto& capabilities = request.target.supportedCapabilities;
+    if (instanceBase && stageKind == ShaderStageKind::Vertex && translateOptions.embeddedFetch == nullptr && std::find(capabilities.begin(), capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityDrawParameters)) != capabilities.end()) {
+        translateOptions.instanceBaseSgpr = FindInstanceBaseSgpr(decoded, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size()));
+    }
 
     auto program = translator.Translate(decoded, cfg, translateOptions);
     // Debug aid: APS5_DUMP_IR=<hex code address> (or "all") prints the program after each front-end pass.

@@ -33,6 +33,9 @@ struct TranslateOptions {
     bool fragmentShaderBarycentricEnabled = false;
     ShaderStageInputInfo inputInfo;
     const EmbeddedFetchPlan* embeddedFetch = nullptr;
+    // A vertex stage's start-instance SGPR (FindInstanceBaseSgpr), read as gl_BaseInstance with v8
+    // as InstanceIndex - BaseInstance; the driver passes its value as the draw's first instance.
+    std::int32_t instanceBaseSgpr = -1;
 };
 
 class InstructionTranslator {
