@@ -14,6 +14,14 @@ void NoteDeviceAddress(VkDeviceAddress address, std::uint64_t bytes, const char*
 void ForgetDeviceAddress(VkDeviceAddress address);
 std::string DescribeDeviceAddress(VkDeviceAddress address);
 
+// Debug aid APS5_CHECK_STALE_IMPORTS=1: the VkBuffer handles of destroyed host imports are kept
+// (until a new import gets the same handle), and work about to bind one reports it
+// (ReportDestroyedImport: a descriptor or address that outlived its import reads freed memory,
+// the 'read invalid' device losses inside destroyed imports, t167-t177).
+bool CheckStaleImports();
+void NoteImportHandle(VkBuffer buffer, std::uint64_t guestBase, bool live);
+bool ReportDestroyedImport(VkBuffer buffer, const char* where, std::uint64_t detail);
+
 class Buffer {
 public:
     Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);

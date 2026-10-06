@@ -1228,6 +1228,10 @@ void ShaderResources::buildComplete() {
                 writes.push_back(write);
             }
             context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+            if (CheckStaleImports()) {
+                boundBuffers.clear();
+                for (const auto& info : buffers) boundBuffers.push_back(info.buffer);
+            }
         }
         for (const auto& allocation : allocations) {
             if (allocation.adjustment == 0) continue;
@@ -2998,6 +3002,11 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
     if (_set == VK_NULL_HANDLE) return;
+    if (CheckStaleImports()) {
+        for (const auto buffer : boundBuffers) {
+            if (ReportDestroyedImport(buffer, "a descriptor set bound now", reinterpret_cast<std::uint64_t>(_set))) break;
+        }
+    }
     context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);
 }
 

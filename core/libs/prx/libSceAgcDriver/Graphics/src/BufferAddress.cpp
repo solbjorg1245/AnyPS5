@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -69,6 +70,53 @@ void ForgetDeviceAddress(VkDeviceAddress address) {
     registry.retired.push_back(found->second);
     registry.live.erase(found);
     if (registry.retired.size() > AddressRegistry::RetiredKept) registry.retired.pop_front();
+}
+
+namespace {
+
+struct DestroyedImport {
+    std::uint64_t guestBase = 0;
+    double destroyed = 0;
+};
+
+struct ImportHandles {
+    std::mutex mutex;
+    std::map<VkBuffer, DestroyedImport> destroyed;
+};
+
+ImportHandles& Handles() {
+    static auto* handles = new ImportHandles();
+    return *handles;
+}
+
+}
+
+bool CheckStaleImports() {
+    static const bool check = std::getenv("APS5_CHECK_STALE_IMPORTS") != nullptr;
+    return check;
+}
+
+void NoteImportHandle(VkBuffer buffer, std::uint64_t guestBase, bool live) {
+    if (!CheckStaleImports() || buffer == VK_NULL_HANDLE) return;
+    auto& handles = Handles();
+    const auto now = SecondsNow();
+    std::lock_guard lock(handles.mutex);
+    if (live) handles.destroyed.erase(buffer);
+    else handles.destroyed[buffer] = {guestBase, now};
+}
+
+bool ReportDestroyedImport(VkBuffer buffer, const char* where, std::uint64_t detail) {
+    if (!CheckStaleImports() || buffer == VK_NULL_HANDLE) return false;
+    auto& handles = Handles();
+    std::lock_guard lock(handles.mutex);
+    const auto found = handles.destroyed.find(buffer);
+    if (found == handles.destroyed.end()) return false;
+    static int reports = 0;
+    if (reports++ < 16) {
+        std::fprintf(stderr, "[stale-import] %s (0x%llx) uses the buffer of import guest 0x%llx destroyed %.3f s ago%s", where, static_cast<unsigned long long>(detail), static_cast<unsigned long long>(found->second.guestBase), SecondsNow() - found->second.destroyed, "\n");
+        std::fflush(stderr);
+    }
+    return true;
 }
 
 std::string DescribeDeviceAddress(VkDeviceAddress address) {

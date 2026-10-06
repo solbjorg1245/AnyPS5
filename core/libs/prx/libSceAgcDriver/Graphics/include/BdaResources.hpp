@@ -7,6 +7,12 @@ namespace AgcDriver::Graphics {
 
 bool LoopGuardTripped();
 
+// Debug aid APS5_CHECK_STALE_IMPORTS=1: every page table made is kept weakly with its ranges, and an
+// import destroyed while a live table still maps its device address is reported with the table's
+// age and owners and the destroying driver frames (a shader reading through that table would read
+// freed memory: the 'read invalid' device losses inside destroyed imports, t167-t177).
+void CheckDestroyedImport(VkDeviceAddress address, std::uint64_t bytes, std::uint64_t guestBase);
+
 class BdaResources {
 public:
     explicit BdaResources(const Context& context);

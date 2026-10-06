@@ -406,6 +406,8 @@ private:
     // Whether the layout is this object's own (no cache) and destroyed with it.
     bool ownsLayout = false;
     VkDescriptorSet _set = VK_NULL_HANDLE;
+    // APS5_CHECK_STALE_IMPORTS: the buffer handles written into _set, checked at each Bind.
+    std::vector<VkBuffer> boundBuffers;
     // Dedicated pool of this object's set (no cache, or a set too large for a cache pool).
     VkDescriptorPool pool = VK_NULL_HANDLE;
     // The cache pool the set was allocated from, freed back to it on release.

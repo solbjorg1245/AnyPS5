@@ -135,6 +135,8 @@ HostImports& Imports() {
 }
 
 void destroyImport(const Context& context, const HostImport& entry) {
+    CheckDestroyedImport(entry.address, entry.bytes, entry.base);
+    NoteImportHandle(entry.buffer, entry.base, false);
     ForgetDeviceAddress(entry.address);
     context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, entry.buffer, nullptr);
     context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr);
@@ -205,6 +207,7 @@ const char* createImport(const Context& context, HostImport& entry, VkResult& fa
     entry.address = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &addressInfo);
     if (entry.address == 0) return failed("vkGetBufferDeviceAddressKHR", VK_ERROR_UNKNOWN);
     NoteDeviceAddress(entry.address, bytes, "import", entry.base);
+    NoteImportHandle(entry.buffer, entry.base, true);
     return nullptr;
 }
 

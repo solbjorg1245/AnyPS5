@@ -5,11 +5,17 @@
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <list>
 #include <mutex>
 #include <sstream>
+#include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#endif
 
 namespace AgcDriver::Graphics {
 
@@ -118,6 +124,82 @@ std::uint64_t hashRanges(const std::vector<ShaderRecompiler::BdaAbi::Range>& ran
     return hash;
 }
 
+bool checkTables() {
+    static const bool check = std::getenv("APS5_CHECK_STALE_IMPORTS") != nullptr;
+    return check;
+}
+
+struct LiveTable {
+    std::weak_ptr<Buffer> buffer;
+    std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
+    std::chrono::steady_clock::time_point made;
+};
+
+struct LiveTables {
+    std::mutex mutex;
+    std::list<LiveTable> tables;
+};
+
+LiveTables& Live() {
+    static auto* live = new LiveTables();
+    return *live;
+}
+
+void noteLiveTable(const std::shared_ptr<Buffer>& table, const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges) {
+    if (!checkTables()) return;
+    auto& live = Live();
+    std::lock_guard lock(live.mutex);
+    live.tables.push_back({table, ranges, std::chrono::steady_clock::now()});
+}
+
+// The stack slots that point into the driver's code, as offsets (addr2line -f -C -e
+// libSceAgcDriver.prx with the image base added), from the caller outwards.
+void reportDriverFrames() {
+#ifdef _WIN32
+    HMODULE driver = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(&reportDriverFrames), &driver)) return;
+    MODULEINFO info{};
+    if (!GetModuleInformation(GetCurrentProcess(), driver, &info, sizeof(info))) return;
+    const auto base = reinterpret_cast<std::uintptr_t>(info.lpBaseOfDll);
+    const auto end = base + info.SizeOfImage;
+    std::fprintf(stderr, "[bda-check]   driver addresses on the destroying thread's stack:");
+    const auto* slot = static_cast<const std::uintptr_t*>(__builtin_frame_address(0));
+    int printed = 0;
+    for (int i = 0; i < 4096 && printed < 32; ++i) {
+        const auto value = slot[i];
+        if (value <= base || value >= end) continue;
+        std::fprintf(stderr, " 0x%llx", static_cast<unsigned long long>(value - base));
+        ++printed;
+    }
+    std::fprintf(stderr, "%s", "\n");
+#endif
+}
+
+}
+
+void CheckDestroyedImport(VkDeviceAddress address, std::uint64_t bytes, std::uint64_t guestBase) {
+    if (!checkTables() || address == 0) return;
+    static std::atomic<int> reports{0};
+    auto& live = Live();
+    std::lock_guard lock(live.mutex);
+    const auto now = std::chrono::steady_clock::now();
+    for (auto it = live.tables.begin(); it != live.tables.end();) {
+        const auto owners = it->buffer.use_count();
+        if (owners == 0) {
+            it = live.tables.erase(it);
+            continue;
+        }
+        const auto mapped = std::find_if(it->ranges.begin(), it->ranges.end(), [&](const ShaderRecompiler::BdaAbi::Range& range) { return range.deviceAddress < address + bytes && address < range.deviceAddress + (range.end - range.begin); });
+        if (mapped != it->ranges.end() && reports.fetch_add(1) < 12) {
+            std::fprintf(stderr, "[bda-check] import guest 0x%llx+0x%llx (device 0x%llx) destroyed while a live page table (%ld owners, made %.3f s ago, %zu ranges) maps guest 0x%llx+0x%llx to device 0x%llx%s", static_cast<unsigned long long>(guestBase), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(address), owners, std::chrono::duration<double>(now - it->made).count(), it->ranges.size(), static_cast<unsigned long long>(mapped->begin), static_cast<unsigned long long>(mapped->end - mapped->begin), static_cast<unsigned long long>(mapped->deviceAddress), "\n");
+            reportDriverFrames();
+            std::fflush(stderr);
+        }
+        ++it;
+    }
+}
+
+namespace {
 }
 
 BdaResources::BdaResources(const Context& context) {
@@ -196,6 +278,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), 0};
     std::memcpy(table->Bytes().data(), &header, sizeof(header));
     if (!ranges.empty()) std::memcpy(table->Bytes().data() + sizeof(header), ranges.data(), ranges.size() * sizeof(ranges.front()));
+    noteLiveTable(table, ranges);
     if (tableCacheEnabled()) {
         std::lock_guard lock(cache.mutex);
         ++cache.misses;
