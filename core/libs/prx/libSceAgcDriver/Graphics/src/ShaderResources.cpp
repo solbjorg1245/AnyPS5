@@ -314,6 +314,17 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         return keys;
     };
     if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
+    // No surface outgrows the console's 16 GiB: a larger size is a descriptor decoded wrongly (or
+    // garbage), whose CPU snapshot below would fail to allocate. The draw is skipped with the words
+    // that describe it (0x2128000000 bytes recurred in some Boletaria runs).
+    if (guestBytes > (16ull << 30u)) {
+        char text[512];
+        int length = std::snprintf(text, sizeof(text), "AGC graphics: texture 0x%llx describes 0x%llx bytes (%ux%u depth/last array %u base array %u, mips %u base %u last %u, format %u, tile %d, dim %d); words",
+                                   static_cast<unsigned long long>(resource.baseAddress), static_cast<unsigned long long>(guestBytes), resource.width, resource.height, resource.depthOrLastArray, resource.baseArray,
+                                   resource.mipCount, resource.baseLevel, resource.lastLevel, resource.format, static_cast<int>(resource.tileMode), static_cast<int>(resource.dimension));
+        for (std::size_t i = 0; i < words.size() && length > 0 && length < static_cast<int>(sizeof(text)) - 10; ++i) length += std::snprintf(text + length, sizeof(text) - length, " %08x", words[i]);
+        throw std::runtime_error(text);
+    }
     auto& counters = TextureCounts();
     const auto address = resource.baseAddress;
     const auto bytes = static_cast<std::size_t>(guestBytes);
