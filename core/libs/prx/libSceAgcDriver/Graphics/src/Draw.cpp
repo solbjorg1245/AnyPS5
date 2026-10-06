@@ -1003,17 +1003,41 @@ void recordDrawCommands(const Context& context, VkCommandBuffer commands, const 
     }
 }
 
+// A Constant dimension of 0 is not rewritten: the game's records hold 0 there (the base vertex of
+// every Boletaria DRAW_INDEX_INDIRECT record, t108), and the copy + update it costs must be recorded
+// outside the render pass, which ended the pass on every such draw. APS5_CHECK_INDIRECT_ARGS=1 reads
+// the records back (indirectRecordCheck) and a nonzero value there ends the guess for the rest of the
+// run. APS5_NO_ZERO_CONSTANT_GUESS=1 always rewrites.
+std::atomic<bool> zeroConstantRefuted{false};
+
+bool zeroConstantGuessed() {
+    static const bool guess = std::getenv("APS5_NO_ZERO_CONSTANT_GUESS") == nullptr;
+    return guess && !zeroConstantRefuted.load(std::memory_order_relaxed);
+}
+
+// Whether a GPU-side draw's records are copied and rewritten before the draw reads them.
+bool rewritesRecords(const Pm4::DrawParameters::IndirectDraw& args) {
+    using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
+    const bool guessed = zeroConstantGuessed();
+    const auto rewrites = [&](Rule rule, std::uint32_t constant) { return rule == Rule::Constant && (constant != 0 || !guessed); };
+    return rewrites(args.vertexRule, args.vertexConstant) || rewrites(args.instanceRule, args.instanceConstant);
+}
+
 // The GPU-side records of an indirect draw, recorded outside the render pass: the stores that
 // produced them (a dispatch in place, a fill, the host) precede the indirect read, as for
 // DISPATCH_INDIRECT; a Constant dimension is rewritten in a scratch copy (vkCmdDrawIndirect reads
 // the record's dword as the first vertex / instance, and the constant is what the fixed-function
 // fetch must start at). The scratch is kept until the batch completed. Returns whether a copy was
 // rewritten; `argumentBuffer`/`argumentOffset` receive where the draw reads the records.
-bool recordIndirectArguments(const Context& context, VkCommandBuffer commands, Recorder* recorder, bool recorded, const IndirectRecord& indirect, std::unique_ptr<DeviceBuffer>& scratch, VkBuffer& argumentBuffer, VkDeviceSize& argumentOffset, const std::function<void(std::uint32_t)>& countBarrier) {
+// `inPass`: the draw continues an open pass, whose opening barrier made earlier writes visible to
+// the indirect read; only records that need no rewrite get there (rewritesRecords).
+bool recordIndirectArguments(const Context& context, VkCommandBuffer commands, Recorder* recorder, bool recorded, const IndirectRecord& indirect, std::unique_ptr<DeviceBuffer>& scratch, VkBuffer& argumentBuffer, VkDeviceSize& argumentOffset, const std::function<void(std::uint32_t)>& countBarrier, bool inPass = false) {
     using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
     const auto* args = indirect.args;
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
-    countBarrier(1);
+    if (!inPass) {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        countBarrier(1);
+    }
     if (recorded) {
         // Read in place from the import when the batch runs (a synchronous draw waits for its own).
         recorder->NotePendingRead(args->arguments, static_cast<std::size_t>(args->RangeBytes()), Recorder::ReadKind::Indirect);
@@ -1021,8 +1045,9 @@ bool recordIndirectArguments(const Context& context, VkCommandBuffer commands, R
     }
     argumentBuffer = indirect.argumentImport->buffer;
     argumentOffset = args->arguments - indirect.argumentImport->base;
-    const bool rewritten = args->vertexRule == Rule::Constant || args->instanceRule == Rule::Constant;
+    const bool rewritten = rewritesRecords(*args);
     if (!rewritten) return false;
+    Require(!inPass, "rewritten indirect records inside a render pass");
     const auto bytes = static_cast<std::size_t>(args->RangeBytes());
     scratch = std::make_unique<DeviceBuffer>(context, bytes, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     CopyBuffer(context, commands, argumentBuffer, argumentOffset, scratch->Handle(), 0, bytes);
@@ -1046,7 +1071,8 @@ bool recordIndirectArguments(const Context& context, VkCommandBuffer commands, R
 // records whose Constant dimension holds a value the hardware would have ignored. Empty otherwise.
 std::function<void()> indirectRecordCheck(const IndirectRecord* indirect) {
     static const bool checkArguments = std::getenv("APS5_CHECK_INDIRECT_ARGS") != nullptr;
-    if (indirect == nullptr || indirect->args == nullptr || indirect->path != IndirectDrawPath::Gpu || !checkArguments) return {};
+    if (indirect == nullptr || indirect->args == nullptr || indirect->path != IndirectDrawPath::Gpu) return {};
+    if (!checkArguments) return {};
     return [args = *indirect->args] {
         using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
         static std::atomic<std::uint64_t> printed{0};
@@ -1058,7 +1084,10 @@ std::function<void()> indirectRecordCheck(const IndirectRecord* indirect) {
                 const bool ignoredVertex = args.vertexRule == Rule::Constant && (args.recordBytes == 20 ? arguments.vertexOffset : arguments.firstVertexOrIndex) != 0;
                 const bool ignoredInstance = args.instanceRule == Rule::Constant && arguments.firstInstance != 0;
                 ++checked;
-                if (ignoredVertex || ignoredInstance) ++ignoredValues;
+                if (ignoredVertex || ignoredInstance) {
+                    ++ignoredValues;
+                    if (!zeroConstantRefuted.exchange(true)) std::fprintf(stderr, "[draw] indirect records hold values in a Constant dimension: rewriting records from now on\n");
+                }
                 if (printed.fetch_add(1) < 16) std::fprintf(stderr, "[draw] indirect record 0x%llx: count %u instances %u first %u vertexOffset %u startInstance %u (vertex %s, instance %s)\n", static_cast<unsigned long long>(args.arguments + static_cast<std::uint64_t>(record) * args.stride), arguments.count, arguments.instances, arguments.firstVertexOrIndex, arguments.vertexOffset, arguments.firstInstance, args.vertexRule == Rule::Constant ? "const: record value ignored" : "in-place", args.instanceRule == Rule::Constant ? "const: record value ignored" : "in-place");
             }
         } catch (const std::exception& error) {
@@ -1273,7 +1302,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, shaders);
     const bool capture = CaptureInputsEnabled();
-    const bool continued = !capture && !readsTarget && !gpuIndirect && recorder->ContinuesRenderPass(passKey);
+    // A GPU-side draw whose records need no rewrite reads them in place, covered by the pass's
+    // opening barrier, so it continues the pass like any other draw.
+    const bool rewrites = gpuIndirect && rewritesRecords(*args);
+    const bool continued = !capture && !readsTarget && !rewrites && recorder->ContinuesRenderPass(passKey);
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
     const auto commands = continued ? recorder->CommandsInRenderPass() : recorder->Commands();
@@ -1296,10 +1328,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     VkDeviceSize argumentOffset = 0;
     bool rewritten = false;
     if (continued) {
+        if (gpuIndirect) rewritten = recordIndirectArguments(context, commands, recorder, true, *record.indirect, scratch, argumentBuffer, argumentOffset, countBarrier, true);
         record.pipeline->Continue(commands, state.viewport, state.scissor);
     } else {
-        const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
-        context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages, 0, 1, &before, 0, nullptr, 0, nullptr);
+        const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT};
+        context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | inputs.shaderStages, 0, 1, &before, 0, nullptr, 0, nullptr);
         countBarrier(1);
         APS5_LOG_CHARS_OUT_DEBUG("Upload barrier recorded");
         if (gpuIndirect) rewritten = recordIndirectArguments(context, commands, recorder, true, *record.indirect, scratch, argumentBuffer, argumentOffset, countBarrier);
