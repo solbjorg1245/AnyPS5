@@ -143,6 +143,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     std::shared_ptr<DispatchEntry> missedEntry;
     bool missedDiffering = false;
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
+    std::shared_ptr<DispatchVariant> relocated;
 
     static const bool traceCache = std::getenv("APS5_TRACE_DISPATCH_CACHE") != nullptr;
     if (traceCache) {
@@ -178,7 +179,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
     if (!stampValidate()) mix(reinterpret_cast<std::uintptr_t>(it->second.get()));
     phaseTiming.Phase(PhaseKey);
-    lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
+    lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering, relocated);
+    if (relocated != nullptr) attachVariant = relocated;
     if (cached) {
         captureMs += phaseTiming.Elapsed();
     } else {
@@ -231,6 +233,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         insertDispatch(address, key, noDispatchCache, profile, it->second, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
     }
     if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, localDevice->Serial(), request, memory, address, *keepVariant, liveWords, *compiledResult);
+    if (verifyDataHits() && relocated != nullptr) verifyDataHit(snapshot, codeOffset, localDevice->Serial(), request, memory, address, *relocated, relocated->words, *compiledResult);
 
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
         dispatch(queue, packet, submission, indirectArguments);

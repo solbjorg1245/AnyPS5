@@ -97,6 +97,8 @@ void Driver::reportDispatchCache(EntryCounters& counters) {
         dataRanks += text;
     }
     std::fprintf(stderr, "[dispatch-cache] data hits (10 s): %llu (%llu words refreshed; by rank 1..k %s; %llu data variants missed on pending runs), verified %llu; inserts with data positions %llu of %llu (%.1f positions each), leaves skipped: unmapped %llu, mismatched %llu, aliased %llu\n", count(counters.dataHits), count(counters.dataWordsRefreshed), dataRanks.c_str(), count(dataPendingMisses.exchange(0, std::memory_order_relaxed)), count(counters.dataVerified), count(counters.dataInserts), count(counters.inserts), counters.dataInserts != 0 ? static_cast<double>(counters.dataPositionsInserted) / static_cast<double>(counters.dataInserts) : 0.0, count(counters.dataLeavesUnmapped), count(counters.dataLeavesMismatched), count(counters.dataLeavesAliased));
+    const auto& verdicts = counters.relocationVerdicts;
+    std::fprintf(stderr, "[dispatch-cache] relocated hits (10 s): %llu; rules learned %llu, refused: shape %llu, data positions %llu, deltas %llu, nothing moved %llu, other words %llu, no pointer %llu, compiled %llu, descriptors %llu; relocations differing %llu, unordered %llu\n", count(counters.relocatedHits), count(verdicts[0]), count(verdicts[1]), count(verdicts[2]), count(verdicts[3]), count(verdicts[4]), count(verdicts[5]), count(verdicts[6]), count(verdicts[7]), count(verdicts[8]), count(counters.relocatedDiffering), count(counters.relocatedUnordered));
     counters = EntryCounters{};
 }
 

@@ -38,6 +38,14 @@ struct DispatchVariant {
     std::vector<std::uint32_t> dataSlots;
     std::uint32_t flatBinding = NoFlatBinding;
 
+    // Relocation rule (DispatchRelocation.cpp): the low-word positions of the 64-bit pointers
+    // through which the walk reached `movedRuns` (run indices). A later dispatch whose pointers all
+    // moved by one delta is validated against these runs shifted by it instead of captured again.
+    std::vector<std::uint32_t> pointerPositions;
+    std::vector<std::uint32_t> movedRuns;
+    // (binding, word) of the compiled descriptors' addresses inside the moved runs, shifted with them.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> shiftSlots;
+
     std::uint32_t pushOffset = 0;
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
 
@@ -69,6 +77,8 @@ struct EntryCounters {
 
     std::uint64_t dataHits = 0, dataWordsRefreshed = 0, dataVerified = 0, dataInserts = 0, dataPositionsInserted = 0, dataLeavesUnmapped = 0, dataLeavesMismatched = 0, dataLeavesAliased = 0;
     std::array<std::uint64_t, MaxDispatchVariants> dataHitsByRank{};
+    std::array<std::uint64_t, 9> relocationVerdicts{};
+    std::uint64_t relocatedHits = 0, relocatedDiffering = 0, relocatedUnordered = 0;
     std::set<std::size_t> differingPositions;
     std::size_t differingFirstPosition = std::numeric_limits<std::size_t>::max(), differingLastPosition = 0;
     std::map<std::uint64_t, std::uint64_t> differingByProgram;
@@ -79,6 +89,9 @@ struct DataMask {
     std::span<const std::uint32_t> positions;
     std::vector<std::pair<std::uint32_t, std::uint32_t>>* live;
 };
+
+// Why learnRelocation took or refused a relocation rule (counted per verdict).
+enum class RelocationVerdict { Learned, Shape, DataPositions, Deltas, NothingMoved, OtherWords, NoPointer, Compiled, Descriptors, Count };
 
 enum class EntryOutcome { Equal, EqualData, Differing, Inaccessible, QueuedLabel, FlushingImage, PublishMoved, PendingMoved, ForgetMoved };
 

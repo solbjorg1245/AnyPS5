@@ -34,6 +34,8 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                 break;
             }
         }
+        auto relocation = RelocationVerdict::Count;
+        if (relocatedHits() && !stampValidate() && missedEntry != nullptr && missedDiffering && !missedEntry->variants.empty() && !fresh->dataPositions.empty()) relocation = learnRelocation(*missedEntry->variants.front(), *fresh);
         bool stable = true;
         if (stampValidate()) {
 
@@ -65,6 +67,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
         if (profile && missedEntry != nullptr && missedDiffering) classifyDiffering(address, key, *missedEntry->variants.front(), *fresh, capture.get(), entryCounters);
         if (stable) {
             ++entryCounters.inserts;
+            if (relocation != RelocationVerdict::Count) ++entryCounters.relocationVerdicts[static_cast<std::size_t>(relocation)];
             entryCounters.runsInserted += fresh->runs.size();
             if (!fresh->dataPositions.empty()) {
                 ++entryCounters.dataInserts;

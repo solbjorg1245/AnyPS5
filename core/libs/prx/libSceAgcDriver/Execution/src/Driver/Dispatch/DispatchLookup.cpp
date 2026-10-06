@@ -4,7 +4,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering) {
+void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering, std::shared_ptr<DispatchVariant>& relocated) {
     if (!noDispatchCache) {
 
         static const bool validateUnlocked = std::getenv("APS5_NO_UNLOCKED_VALIDATE") == nullptr;
@@ -30,6 +30,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
             std::vector<ShaderRecompiler::MemoryRegion> regions;
 
             std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
+            std::uint64_t relocatedUnordered = 0, relocatedDiffering = 0;
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             if (!stampValidate()) {
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DispatchCache);
@@ -56,6 +57,33 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                     }
                 }
                 current = variant != nullptr;
+
+                if (!current && relocatedHits()) {
+                    for (const auto& stored : variants) {
+                        if (stored->pointerPositions.empty()) continue;
+                        auto candidate = relocateVariant(*stored, relocatedUnordered);
+                        if (candidate == nullptr) break;
+                        regions.clear();
+                        appendEntryRegions(*candidate, regions);
+                        const auto result = validateVariant(address, submission.queue, *candidate, regions, imagesFlushed, runsSynced, sampling, &liveData);
+                        if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) {
+                            if (result == EntryOutcome::Differing) traceFailedRelocation(address, *candidate);
+                            ++relocatedDiffering;
+                            break;
+                        }
+                        for (const auto& [position, value] : liveData) candidate->words[position] = value;
+                        if (!liveData.empty()) {
+                            auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*candidate->compiled);
+                            auto& descriptor = patched->bindings[candidate->flatBinding].guestDescriptor;
+                            for (std::size_t k = 0; k < candidate->dataPositions.size(); ++k) {
+                                if (candidate->dataSlots[k] < descriptor.size()) descriptor[candidate->dataSlots[k]] = candidate->words[candidate->dataPositions[k]];
+                            }
+                            candidate->compiled = std::move(patched);
+                        }
+                        relocated = std::move(candidate);
+                        break;
+                    }
+                }
             } else {
                 variant = variants.front();
                 compared = 1;
@@ -103,6 +131,8 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
             counters.retriesEqual += retriesEqual;
             counters.retriesMoved += retriesMoved;
             counters.variantsCompared += compared;
+            counters.relocatedUnordered += relocatedUnordered;
+            counters.relocatedDiffering += relocatedDiffering;
             switch (outcome) {
                 case EntryOutcome::Equal: ++counters.equal; break;
                 case EntryOutcome::EqualData: ++counters.equal; break;
@@ -165,6 +195,36 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                         again->second->touched = dispatchCacheHits;
                         ++counters.touches;
                     }
+                }
+            } else if (relocated != nullptr) {
+                ++counters.relocatedHits;
+                ++dispatchCacheHits;
+                compiledResult = relocated->compiled;
+                regions.clear();
+                appendEntryRegions(*relocated, regions);
+                captured.reserve(memory.size() + regions.size());
+                captured.assign(memory.begin(), memory.end());
+                captured.insert(captured.end(), regions.begin(), regions.end());
+                cached = true;
+                if (untouched) {
+                    // The relocated variant goes first, as a fresh capture's would.
+                    auto replacement = std::make_shared<DispatchEntry>();
+                    replacement->variants.reserve(dispatchVariants());
+                    accountVariant(*relocated, true);
+                    replacement->variants.push_back(relocated);
+                    for (const auto& kept : variants) {
+                        if (replacement->variants.size() < dispatchVariants()) {
+                            replacement->variants.push_back(kept);
+                        } else {
+                            accountVariant(*kept, false);
+                            ++counters.variantsEvicted;
+                        }
+                    }
+                    ++counters.variantsInserted;
+                    replacement->touched = dispatchCacheHits;
+                    replacement->order = entry->order;
+                    dispatchOrder.splice(dispatchOrder.begin(), dispatchOrder, replacement->order);
+                    again->second = std::move(replacement);
                 }
             } else {
                 if (traceCache) std::fprintf(stderr, "[dispatch-cache] 0x%llx captured memory changed\n", static_cast<unsigned long long>(address));
