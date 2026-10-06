@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
+#include <array>
 #include <bit>
 #include <cstring>
 #include <limits>
@@ -44,20 +45,38 @@ ColorTargetLayout::ColorTargetLayout(std::uint32_t width, std::uint32_t height, 
             blockHeight = 1u << (log2Elements / 2u);
             pitch = (width + blockWidth - 1u) / blockWidth * blockWidth;
             paddedHeight = (height + blockHeight - 1u) / blockHeight * blockHeight;
-            const auto* equation = FindTextureSwizzleEquation(27u, bytesPerElement);
-            require(equation != nullptr, "AGC graphics: no SW_64KB_R_X equation for the color element size");
-            xOffsets.resize(blockWidth);
-            yOffsets.resize(blockHeight);
-            for (std::uint32_t x = 0; x < blockWidth; ++x) {
-                std::uint32_t offset = 0;
-                for (std::uint32_t bit = 0; bit < 16u; ++bit) offset |= parity(x & equation->bits[bit] & 0xfffu) << bit;
-                xOffsets[x] = offset;
-            }
-            for (std::uint32_t y = 0; y < blockHeight; ++y) {
-                std::uint32_t offset = 0;
-                for (std::uint32_t bit = 0; bit < 16u; ++bit) offset |= parity((y << 12u) & equation->bits[bit] & 0xfff000u) << bit;
-                yOffsets[y] = offset;
-            }
+            // The tables depend on the element size alone: built once per size (a layout is made
+            // for every color target of every draw, and building them was 5% of the draw thread).
+            struct Tables {
+                std::vector<std::uint32_t> x;
+                std::vector<std::uint32_t> y;
+            };
+            static const std::array<Tables, 5> tables = [] {
+                std::array<Tables, 5> built;
+                for (std::uint32_t log2Bytes = 0; log2Bytes < built.size(); ++log2Bytes) {
+                    const auto elementBytes = 1u << log2Bytes;
+                    const auto* equation = FindTextureSwizzleEquation(27u, elementBytes);
+                    if (equation == nullptr) continue;
+                    const auto elements = 16u - log2Bytes;
+                    built[log2Bytes].x.resize(std::size_t{1} << ((elements + 1u) / 2u));
+                    built[log2Bytes].y.resize(std::size_t{1} << (elements / 2u));
+                    for (std::uint32_t x = 0; x < built[log2Bytes].x.size(); ++x) {
+                        std::uint32_t offset = 0;
+                        for (std::uint32_t bit = 0; bit < 16u; ++bit) offset |= parity(x & equation->bits[bit] & 0xfffu) << bit;
+                        built[log2Bytes].x[x] = offset;
+                    }
+                    for (std::uint32_t y = 0; y < built[log2Bytes].y.size(); ++y) {
+                        std::uint32_t offset = 0;
+                        for (std::uint32_t bit = 0; bit < 16u; ++bit) offset |= parity((y << 12u) & equation->bits[bit] & 0xfff000u) << bit;
+                        built[log2Bytes].y[y] = offset;
+                    }
+                }
+                return built;
+            }();
+            const auto& table = tables[static_cast<std::size_t>(std::countr_zero(bytesPerElement))];
+            require(!table.x.empty(), "AGC graphics: no SW_64KB_R_X equation for the color element size");
+            xOffsets = table.x;
+            yOffsets = table.y;
             break;
         }
         default: throw std::runtime_error("AGC graphics: unsupported color tile mode");

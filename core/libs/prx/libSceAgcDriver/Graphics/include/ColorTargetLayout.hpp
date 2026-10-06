@@ -36,9 +36,10 @@ private:
     std::uint32_t elementBytes;
     std::uint32_t blockWidth = 1;
     std::uint32_t blockHeight = 1;
-    // The XOR swizzle is linear over GF(2), so a block offset is xOffsets[x] ^ yOffsets[y].
-    std::vector<std::uint32_t> xOffsets;
-    std::vector<std::uint32_t> yOffsets;
+    // The XOR swizzle is linear over GF(2), so a block offset is xOffsets[x] ^ yOffsets[y]. Views
+    // of tables shared by every layout of the element size.
+    std::span<const std::uint32_t> xOffsets;
+    std::span<const std::uint32_t> yOffsets;
 };
 
 }
