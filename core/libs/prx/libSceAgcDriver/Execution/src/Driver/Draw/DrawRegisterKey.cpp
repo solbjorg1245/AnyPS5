@@ -1,9 +1,71 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <string>
+#include <unordered_set>
 
 namespace AgcDriver::DriverDetail {
 
+namespace {
+
+// Debug aid: APS5_TRACE_DRAW_KEY_CHURN=1 reports, every 10 s, how often the draw key repeats with
+// each DrawKeyRegisters range left out (and with only that range), to find the registers that make
+// keys churn ([draw-key-churn]).
+void probeKeyChurn(const QueueState& queue) {
+    static const bool enabled = std::getenv("APS5_TRACE_DRAW_KEY_CHURN") != nullptr;
+    if (!enabled) return;
+    constexpr std::size_t Ranges = Graphics::DrawKeyRegisters.size();
+    static std::mutex mutex;
+    static std::array<std::unordered_set<std::uint64_t>, Ranges + 1> seen;
+    static std::array<std::uint64_t, Ranges + 1> repeats{};
+    static std::uint64_t total = 0;
+    static auto lastReport = std::chrono::steady_clock::now();
+    std::array<std::uint64_t, Ranges> rangeHash{};
+    for (std::size_t r = 0; r < Ranges; ++r) {
+        const auto& range = Graphics::DrawKeyRegisters[r];
+        const auto& bank = range.bank == Graphics::RegisterBank::Context ? queue.context : range.bank == Graphics::RegisterBank::Shader ? queue.shader : queue.userConfig;
+        std::uint64_t hash = 0xcbf29ce484222325ull;
+        const auto end = range.first + range.count;
+        for (auto it = bank.lower_bound(range.first); it != bank.end() && it->first < end; ++it) {
+            hash = (hash ^ it->first) * 0x100000001b3ull;
+            hash = (hash ^ it->second) * 0x100000001b3ull;
+        }
+        rangeHash[r] = hash;
+    }
+    std::lock_guard lock(mutex);
+    ++total;
+    for (std::size_t leftOut = 0; leftOut <= Ranges; ++leftOut) {
+        std::uint64_t key = 0xcbf29ce484222325ull;
+        for (std::size_t r = 0; r < Ranges; ++r) {
+            if (r != leftOut) key = (key ^ rangeHash[r]) * 0x100000001b3ull;
+        }
+        if (seen[leftOut].size() > (1u << 20u)) seen[leftOut].clear();
+        if (!seen[leftOut].insert(key).second) ++repeats[leftOut];
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    lastReport = now;
+    std::string text;
+    char item[96];
+    for (std::size_t r = 0; r < Ranges; ++r) {
+        if (repeats[r] <= repeats[Ranges] + total / 50) continue;
+        const auto& range = Graphics::DrawKeyRegisters[r];
+        std::snprintf(item, sizeof(item), " %s 0x%x+%u: %llu", Graphics::RegisterBankName(range.bank), range.first, range.count, static_cast<unsigned long long>(repeats[r]));
+        text += item;
+    }
+    std::fprintf(stderr, "[draw-key-churn] %llu keys (10 s), %llu repeat whole; repeats with one range left out (only ranges adding > 2%%):%s\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(repeats[Ranges]), text.c_str());
+    repeats.fill(0);
+    total = 0;
+}
+
+}
+
 std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial) {
+    probeKeyChurn(queue);
     std::uint64_t key = 0xcbf29ce484222325ull;
     const auto mix = [&](std::uint64_t value) {
         key ^= value;

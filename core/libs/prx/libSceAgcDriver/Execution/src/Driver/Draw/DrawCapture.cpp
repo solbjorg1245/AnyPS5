@@ -3,7 +3,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include <chrono>
 #include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 #include <cstring>
 
 namespace AgcDriver::DriverDetail {
@@ -20,6 +23,35 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
         {0, 0, pushOffset, (graphics.stages.mesh ? ShaderRecompiler::MeshDrawPushOffsetBytes : Graphics::PipelinePushConstantBytes) - pushOffset},
         ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, graphics.stages.mesh, graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}}
     };
+    if (profile) {
+        // APS5_PROFILE_DRAW: how many stage captures repeat a (program, user data) pair seen before,
+        // the bound on what a capture memo keyed by them could serve ([capture-repeat], every 10 s).
+        static std::mutex repeatMutex;
+        static std::unordered_map<std::uint64_t, std::uint64_t> seen;
+        static std::uint64_t repeats = 0, total = 0, frameRepeats = 0;
+        static auto lastReport = std::chrono::steady_clock::now();
+        std::uint64_t hash = 14695981039346656037ull;
+        const auto mix = [&](std::uint64_t value) { hash = (hash ^ value) * 1099511628211ull; };
+        mix(program.binary.codeAddress);
+        for (const auto word : program.userData) mix(word);
+        std::lock_guard lock(repeatMutex);
+        ++total;
+        const auto now = std::chrono::steady_clock::now();
+        const auto stamp = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
+        if (const auto it = seen.find(hash); it != seen.end()) {
+            ++repeats;
+            if (stamp - it->second < 2000) ++frameRepeats;
+            it->second = stamp;
+        } else {
+            if (seen.size() > (1u << 20u)) seen.clear();
+            seen.emplace(hash, stamp);
+        }
+        if (now - lastReport > std::chrono::seconds(10)) {
+            lastReport = now;
+            std::fprintf(stderr, "[capture-repeat] %llu stage captures (10 s): %llu repeat a (program, user data) pair seen before, %llu of them within 2 s; %zu pairs known\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(repeats), static_cast<unsigned long long>(frameRepeats), seen.size());
+            repeats = total = frameRepeats = 0;
+        }
+    }
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
     const auto handle = SourceHandleFor(*program.snapshot, program.codeOffset, localDevice->Serial(), request, false);
     auto& stageCapture = stageCaptures[i];
