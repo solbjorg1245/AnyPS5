@@ -101,6 +101,28 @@ RdnaImageDimension descriptorDimension(const DescriptorValue& descriptor, RdnaIm
     }
 }
 
+// A sampled or stored surface lies in mapped memory: above the null pages (never mapped on Windows
+// or Linux) and below the end of the 47-bit user address space (guest and host addresses coincide).
+// The capture walk follows every scalar load the shader could make, also on paths it does not take
+// at run time, and there it can read material data that is no descriptor (Demon's Souls: floats
+// giving base address 0x9a42b3333300, or 0xb400). Such a descriptor binds a null image instead of
+// failing the whole draw (bindless table entries: see imageAddressBelowUserLimit).
+constexpr std::uint64_t MinImageAddress = 0x10000ull;
+constexpr std::uint64_t MaxImageAddress = 0x800000000000ull;
+
+bool plausibleImageAddress(const DescriptorValue& descriptor) {
+    const auto baseAddress = ((static_cast<std::uint64_t>(descriptor.dwords[1] & 0xffu) << 32u) | descriptor.dwords[0]) << 8u;
+    return baseAddress >= MinImageAddress && baseAddress < MaxImageAddress;
+}
+
+// Bindless table entries are only checked against the upper end: a table entry whose base lies in
+// the null pages stays usable (rejecting those changed what Boletaria's tables sample: a light
+// effect turned into a white blob and a lighting dispatch lost its input).
+bool imageAddressBelowUserLimit(const DescriptorValue& descriptor) {
+    const auto baseAddress = ((static_cast<std::uint64_t>(descriptor.dwords[1] & 0xffu) << 32u) | descriptor.dwords[0]) << 8u;
+    return baseAddress < MaxImageAddress;
+}
+
 bool validImageDescriptor(const DescriptorValue& descriptor, bool r128) {
     const auto type = rawImageType(descriptor);
     const auto format = rawImageFormat(descriptor);
@@ -378,7 +400,7 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
             readWord(address + dword * sizeof(std::uint32_t), candidate.dwords[dword]);
         }
         DecodedImage decoded;
-        bool usable = !nullImageDescriptor(candidate) && validImageDescriptor(candidate, image.r128);
+        bool usable = !nullImageDescriptor(candidate) && validImageDescriptor(candidate, image.r128) && imageAddressBelowUserLimit(candidate);
         if (usable) {
             try {
                 decoded = decodeImageDescriptor(candidate, image);
@@ -493,7 +515,12 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         if (descriptor.dwordCount != 8u) {
             throw std::runtime_error("image descriptor has an invalid width");
         }
-        if (!validImageDescriptor(descriptor, image.r128) && !nullImageDescriptor(descriptor)) {
+        if ((!validImageDescriptor(descriptor, image.r128) || !plausibleImageAddress(descriptor)) && !nullImageDescriptor(descriptor)) {
+            static std::atomic<int> reports{0};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 32) {
+                const auto& w = descriptor.dwords;
+                std::fprintf(stderr, "[capture] shader 0x%llx image %u: descriptor %08x %08x %08x %08x %08x %08x %08x %08x is no image, bound as null\n", static_cast<unsigned long long>(runtime.shaderBase), i, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            }
             descriptor.dwords.fill(0u);
         }
         snapshot.images[i] = descriptor;

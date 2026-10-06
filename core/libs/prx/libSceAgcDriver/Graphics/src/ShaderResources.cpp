@@ -290,6 +290,26 @@ std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, con
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
+// A null T# (base address 0: the game's own, or one the recompiler rejected as no descriptor, see
+// validImageDescriptor) reads zeros on hardware and drops stores. It binds a zeroed 1x1 linear
+// RGBA8 surface of the binding's shape in driver memory: one for sampled reads and one for storage,
+// so stores never reach what sampled reads see.
+bool NullTextureWords(std::span<const std::uint32_t> words) {
+    return words.size() >= 2 && words[0] == 0 && (words[1] & 0xffu) == 0;
+}
+
+std::array<std::uint32_t, 8> NullTextureDescriptor(std::optional<ShaderRecompiler::DescriptorImageShape> shape, bool storage) {
+    alignas(256) static std::array<std::byte, 256> sampledZeros{};
+    alignas(256) static std::array<std::byte, 256> storageZeros{};
+    const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(storage ? storageZeros.data() : sampledZeros.data()));
+    std::uint32_t type = 9;  // 2D
+    if (shape == ShaderRecompiler::DescriptorImageShape::Image1D) type = 8;
+    else if (shape == ShaderRecompiler::DescriptorImageShape::Image2DArray) type = 13;
+    else if (shape == ShaderRecompiler::DescriptorImageShape::Image3D) type = 10;
+    constexpr auto rgba8 = static_cast<std::uint32_t>(ShaderRecompiler::IrBufferFormat::Format8_8_8_8UNorm);
+    return {static_cast<std::uint32_t>(base >> 8u), static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (rgba8 << 20u), 0u, 0xfacu | (type << 28u), 0u, 0u, 0u, 0u};
+}
+
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false) {
     CaptureTrace::Log("sampled-lookup address=%llx width=%u height=%u dcc=%llx", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(resource.dccAddress));
     if (auto depth = DepthSurfaceTexture(context, words, resource, components)) return depth;
@@ -325,7 +345,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                                    resource.mipCount, resource.baseLevel, resource.lastLevel, resource.format, static_cast<int>(resource.tileMode), static_cast<int>(resource.dimension));
         for (std::size_t i = 0; i < words.size() && length > 0 && length < static_cast<int>(sizeof(text)) - 10; ++i) length += std::snprintf(text + length, sizeof(text) - length, " %08x", words[i]);
         // Where this thread's capture read the words, and what that memory holds now.
-        const auto source = ShaderMemory::LocateRecentWords(words);
+        std::string chain;
+        const auto source = ShaderMemory::LocateRecentWords(words, &chain);
         if (length > 0 && length < static_cast<int>(sizeof(text)) - 40) {
             if (source == 0) length += std::snprintf(text + length, sizeof(text) - length, "; not among this thread's recent capture reads");
             else {
@@ -338,6 +359,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 }
             }
         }
+        if (!chain.empty()) std::fprintf(stderr, "[gpu] capture reads before texture 0x%llx's descriptor at 0x%llx:%s\n", static_cast<unsigned long long>(resource.baseAddress), static_cast<unsigned long long>(source), chain.c_str());
         throw std::runtime_error(text);
     }
     auto& counters = TextureCounts();
@@ -2648,7 +2670,12 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
     if (binding.kind == ShaderRecompiler::DescriptorKind::SampledImage) {
         const auto elementWords = binding.guestDescriptor.size() / binding.count;
         for (std::uint32_t element = 0; element < binding.count; ++element) {
-            const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
+            auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
+            std::array<std::uint32_t, 8> nullWords{};
+            if (NullTextureWords(words)) {
+                nullWords = NullTextureDescriptor(binding.imageShape, false);
+                words = nullWords;
+            }
             const auto* record = nextRecord();
             const auto resource = record != nullptr && record->decoded ? record->resource : DecodeTextureResource(words);
             const bool firstLayer = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
@@ -2674,7 +2701,12 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
     // storage writes).
     std::uint32_t mipOffset = 0;
     for (std::uint32_t element = 0; element < binding.count; ++element) {
-        const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
+        auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
+        std::array<std::uint32_t, 8> nullWords{};
+        if (NullTextureWords(words)) {
+            nullWords = NullTextureDescriptor(binding.imageShape, true);
+            words = nullWords;
+        }
         const bool sameAsPrevious = SameAsPreviousStorageElement(binding, element);
         if (sameAsPrevious) ++mipOffset;
         else mipOffset = 0;

@@ -401,6 +401,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/ShaderInputState.cpp
         ${agcTextureDetileShaderHeader}
         Execution/src/GuestMemory.cpp
+        Execution/src/ShaderMemory.cpp
         Execution/src/Pm4.cpp
         Execution/src/Driver/FrameTrace.cpp
 )

@@ -227,7 +227,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     return true;
 }
 
-std::uint64_t ShaderMemory::LocateRecentWords(std::span<const std::uint32_t> words) {
+std::uint64_t ShaderMemory::LocateRecentWords(std::span<const std::uint32_t> words, std::string* chain) {
     if (words.empty()) return 0;
     const auto& recent = ThreadRecentReads();
     std::map<std::uint64_t, std::uint32_t> seen;
@@ -245,7 +245,23 @@ std::uint64_t ShaderMemory::LocateRecentWords(std::span<const std::uint32_t> wor
             const auto found = seen.find(address + word * sizeof(std::uint32_t));
             all = found != seen.end() && found->second == words[word];
         }
-        if (all) return address;
+        if (!all) continue;
+        // The first read of the descriptor's run, then the reads before it.
+        auto first = i;
+        while (first > 0) {
+            const auto previous = recent.entries[(recent.next - count + first - 1) % RecentReads::Count].first;
+            if (previous < address || previous >= address + words.size() * sizeof(std::uint32_t)) break;
+            --first;
+        }
+        if (chain != nullptr) {
+            char text[48];
+            for (std::size_t j = first > 24 ? first - 24 : 0; j < first; ++j) {
+                const auto& [before, value] = recent.entries[(recent.next - count + j) % RecentReads::Count];
+                std::snprintf(text, sizeof(text), " %llx=%08x", static_cast<unsigned long long>(before), value);
+                *chain += text;
+            }
+        }
+        return address;
     }
     return 0;
 }
