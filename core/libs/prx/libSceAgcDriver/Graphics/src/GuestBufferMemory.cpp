@@ -406,6 +406,16 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     for (auto it = state.failed.begin(); it != state.failed.end();) it = leasedRangeAt(lease, *it) != nullptr ? std::next(it) : state.failed.erase(it);
 }
 
+// Whether `entry` holds all of [begin, end). UploadPrepare merges overlapping regions and keeps the
+// first part's import: a buffer descriptor larger than its registered allocation (a V# whose size
+// runs into the next allocations) extends a lease region served by a small import, and that import
+// must not then serve the merged range, whose BDA table entry and descriptor would run past the
+// import's end into other imports' memory (garbage reads) or unmapped addresses (the device losses
+// in the froxel lighting shader, t167-t185).
+bool importCovers(const HostImport& entry, std::uint64_t begin, std::uint64_t end) {
+    return begin >= entry.base && end <= entry.base + entry.bytes;
+}
+
 const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end) {
     auto found = state.imports.upper_bound(begin);
     if (found == state.imports.begin()) return nullptr;
@@ -1989,8 +1999,9 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
         const bool stale = importsStale(context, state);
         for (auto& region : regions) {
             if (region.mirror != nullptr) continue;
-            // An import found when the lease was acquired is reused while none was dropped since.
-            const HostImport* entry = region.direct != nullptr && state.epoch == importsEpoch ? region.direct : nullptr;
+            // An import found when the lease was acquired is reused while none was dropped since,
+            // and only while it still holds the region (see importCovers).
+            const HostImport* entry = region.direct != nullptr && state.epoch == importsEpoch && importCovers(*region.direct, region.begin, region.end) ? region.direct : nullptr;
             region.direct = nullptr;
             if (stale) {
                 region.pending = true;
@@ -2134,7 +2145,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             }
             // An import taken by UploadPrepare (or at the lease) is still the registry's unless one
             // was dropped since.
-            const HostImport* entry = region.direct != nullptr && state.epoch == importsEpoch ? region.direct : nullptr;
+            const HostImport* entry = region.direct != nullptr && state.epoch == importsEpoch && importCovers(*region.direct, region.begin, region.end) ? region.direct : nullptr;
             region.direct = nullptr;
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
             if (entry == nullptr) {
@@ -2570,6 +2581,17 @@ VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std:
 
 ShaderRecompiler::BdaAbi::Range GuestBufferMemory::addressRange(const Region& region) {
     Require(region.buffer != nullptr || region.direct != nullptr || region.mirror != nullptr, "incomplete guest GPU upload");
+    // APS5_CHECK_STALE_IMPORTS: the import (or mirror) must cover the whole region it serves.
+    if (CheckStaleImports()) {
+        const auto base = region.direct != nullptr ? region.direct->base : region.mirror != nullptr ? region.mirror->base : region.begin;
+        const auto bytes = region.direct != nullptr ? region.direct->bytes : region.mirror != nullptr ? region.mirror->bytes : region.end - region.begin;
+        static std::atomic<int> reports{0};
+        if ((region.begin < base || region.end > base + bytes) && reports.fetch_add(1) < 8) {
+            std::fprintf(stderr, "[bda-check] region 0x%llx+0x%llx is served by %s 0x%llx+0x%llx that does not cover it%s", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end - region.begin), region.direct != nullptr ? "import" : "mirror", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), "\n");
+            ReportDriverStack("[bda-check]");
+            std::fflush(stderr);
+        }
+    }
     const auto address = region.direct != nullptr ? region.direct->address + (region.begin - region.direct->base) : region.mirror != nullptr ? region.mirror->buffer->DeviceAddress() + (region.begin - region.mirror->base) : region.buffer->DeviceAddress();
     Require(region.end - region.begin <= std::numeric_limits<std::uint64_t>::max() - address, "GPU address range overflow");
     const auto permissions = ShaderRecompiler::BdaAbi::Read | (region.direct != nullptr && region.writable ? ShaderRecompiler::BdaAbi::Write : 0u);
