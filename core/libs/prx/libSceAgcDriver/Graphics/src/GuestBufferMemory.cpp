@@ -1647,6 +1647,11 @@ struct CopyStats {
     std::atomic<std::uint64_t> stagedOutBytes{0};
     std::atomic<std::uint64_t> stagedLost{0};
     std::atomic<std::uint64_t> stagingRefused{0};
+    // Staging chain: copy-ins served by the previous use's shadow, their bytes, and those that
+    // needed no copy (the same shadow).
+    std::atomic<std::uint64_t> chained{0};
+    std::atomic<std::uint64_t> chainedBytes{0};
+    std::atomic<std::uint64_t> chainedInPlace{0};
     std::atomic<std::int64_t> lastStagingReport{0};
 };
 
@@ -1670,15 +1675,93 @@ std::shared_ptr<Buffer> stagingBuffer(const Context& context, std::size_t bytes,
 }
 
 // APS5_TRACE_STAGING=1: every distinct staged range once, with its size and whether an atomic
-// element lies in it, to see which elements the staging window admits at a stage.
-void traceStaged(std::uint64_t begin, std::uint64_t end, bool atomic) {
+// element lies in it, to see which elements the staging window admits at a stage; and per range
+// the uses and bytes copied in, whose top ranges the [buffers] staging report lists every 10 s.
+bool traceStagingEnabled() {
     static const bool trace = std::getenv("APS5_TRACE_STAGING") != nullptr;
-    if (!trace) return;
+    return trace;
+}
+
+std::mutex& stagedTraceMutex() {
     static std::mutex mutex;
-    static std::set<std::pair<std::uint64_t, std::uint64_t>> seen;
-    std::lock_guard lock(mutex);
-    if (!seen.insert({begin, end}).second) return;
+    return mutex;
+}
+
+std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t>& stagedUses() {
+    static std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t> uses;
+    return uses;
+}
+
+void traceStaged(std::uint64_t begin, std::uint64_t end, bool atomic) {
+    if (!traceStagingEnabled()) return;
+    std::lock_guard lock(stagedTraceMutex());
+    const auto [entry, fresh] = stagedUses().try_emplace({begin, end}, 0);
+    ++entry->second;
+    if (!fresh) return;
     std::fprintf(stderr, "[staging] 0x%llx+0x%llx (%.1f KiB)%s\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), (end - begin) / 1024.0, atomic ? " atomic" : "");
+}
+
+// How many staged regions repeat a range the previous staging build on the same recorder staged
+// (with nothing staged between): the copy-back and copy-in such a pair could share one shadow.
+struct StagedRepeats {
+    const void* recorder = nullptr;
+    std::set<std::pair<std::uint64_t, std::uint64_t>> previous;
+    std::uint64_t builds = 0;
+    std::uint64_t regions = 0;
+    std::uint64_t repeated = 0;
+    std::uint64_t repeatedBytes = 0;
+};
+
+StagedRepeats& stagedRepeats() {
+    static StagedRepeats repeats;
+    return repeats;
+}
+
+template <typename Regions>
+void noteStagedBuild(const void* recorder, const Regions& copies) {
+    std::set<std::pair<std::uint64_t, std::uint64_t>> current;
+    for (const auto* region : copies) {
+        if (region->deviceLocal) current.insert({region->begin, region->end});
+    }
+    std::lock_guard lock(stagedTraceMutex());
+    auto& repeats = stagedRepeats();
+    ++repeats.builds;
+    for (const auto& range : current) {
+        ++repeats.regions;
+        if (repeats.recorder != recorder || !repeats.previous.contains(range)) continue;
+        ++repeats.repeated;
+        repeats.repeatedBytes += range.second - range.first;
+    }
+    repeats.recorder = recorder;
+    repeats.previous = std::move(current);
+}
+
+// The ranges with the most bytes staged in since the last report, then the counts restart.
+void reportStagedTop() {
+    if (!traceStagingEnabled()) return;
+    {
+        std::lock_guard lock(stagedTraceMutex());
+        auto& repeats = stagedRepeats();
+        std::fprintf(stderr, "[buffers] staging builds (10 s): %llu with %llu staged regions; %llu regions (%.0f MiB) repeat a range of the previous staging build\n", static_cast<unsigned long long>(repeats.builds), static_cast<unsigned long long>(repeats.regions), static_cast<unsigned long long>(repeats.repeated), repeats.repeatedBytes / 1048576.0);
+        repeats.builds = repeats.regions = repeats.repeated = repeats.repeatedBytes = 0;
+    }
+    std::vector<std::pair<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>>> top;
+    {
+        std::lock_guard lock(stagedTraceMutex());
+        for (auto& [range, uses] : stagedUses()) {
+            if (uses != 0) top.push_back({uses * (range.second - range.first), range});
+        }
+        for (auto& entry : stagedUses()) entry.second = 0;
+    }
+    std::sort(top.begin(), top.end(), std::greater<>());
+    std::string line = "[buffers] staged ranges by bytes copied in (10 s):";
+    char item[96];
+    for (std::size_t i = 0; i < top.size() && i < 12; ++i) {
+        const auto& [bytes, range] = top[i];
+        std::snprintf(item, sizeof(item), " 0x%llx+0x%llx x%llu %.0f MiB", static_cast<unsigned long long>(range.first), static_cast<unsigned long long>(range.second - range.first), static_cast<unsigned long long>(bytes / (range.second - range.first)), bytes / 1048576.0);
+        line += item;
+    }
+    std::fprintf(stderr, "%s (%zu ranges)\n", line.c_str(), top.size());
 }
 
 void reportStaging() {
@@ -1695,6 +1778,81 @@ void reportStaging() {
     lastStaged = staged;
     lastIn = in;
     lastOut = out;
+    const auto chained = stats.chained.load(), chainedBytes = stats.chainedBytes.load(), chainedInPlace = stats.chainedInPlace.load();
+    static std::uint64_t lastChained = 0, lastChainedBytes = 0, lastChainedInPlace = 0;
+    std::fprintf(stderr, "[buffers] staging chain (10 s): %llu copy-ins from the previous staging shadow (%.0f MiB off PCIe), %llu of them in the same shadow (no copy)\n", static_cast<unsigned long long>(chained - lastChained), (chainedBytes - lastChainedBytes) / 1048576.0, static_cast<unsigned long long>(chainedInPlace - lastChainedInPlace));
+    lastChained = chained;
+    lastChainedBytes = chainedBytes;
+    lastChainedInPlace = chainedInPlace;
+    reportStagedTop();
+}
+
+// Staging chain. A staged region is copied in from its host import over PCIe before every use
+// and its written sub-ranges copied back after it; in Boletaria ~90% of the staged regions (about
+// 9 GiB per 10 s each way) repeat a range the previous staging build on the same queue staged
+// (the per-object compute passes run back to back over the same 0.5-1.5 MiB buffers). After a
+// use's copy-back the device-local shadow holds the range's bytes as the import will hold them
+// once the batch ran: the written sub-ranges were copied back from it, the rest was copied in
+// and left alone. So the next copy-in of exactly that range on the same recorder takes the
+// shadow as its source (a device-local copy), or none at all when it is the same shadow, as long
+// as nothing else wrote the range since: no CPU store (collected) and no driver write
+// (MarkWritten) stamped it after the copy-back was marked. Queue order keeps the copy after the
+// shadow's last writer (the copy-in barrier covers shader and transfer writes). A shadow about to
+// be refilled or written leaves the registry first, and a range written by two regions of one
+// build is not registered (which region's bytes the import ends with is the copy-backs' order).
+// APS5_NO_STAGING_CHAIN=1 copies every region from its import as before.
+struct StagedShadow {
+    const Recorder* recorder = nullptr;
+    std::shared_ptr<Buffer> buffer;
+    std::uint64_t generation = 0;
+};
+
+struct StagedShadows {
+    std::mutex mutex;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, StagedShadow> entries;
+};
+
+StagedShadows& stagedShadows() {
+    static auto* shadows = new StagedShadows();
+    return *shadows;
+}
+
+bool stagingChainEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_STAGING_CHAIN") != nullptr;
+    return !disabled;
+}
+
+// The registered shadow `region` (about to be copied into `target`) can be copied from, or null;
+// the caller collected the range's writes first.
+// Either way the range's entry and every entry held by `target` leave the registry: the copy-in
+// and the work after it change `target`, and the use registers again after its copy-back.
+std::shared_ptr<Buffer> takeStagedShadow(const Recorder* recorder, std::uint64_t begin, std::uint64_t end, const Buffer* target) {
+    auto& shadows = stagedShadows();
+    std::shared_ptr<Buffer> source;
+    std::uint64_t generation = 0;
+    {
+        std::lock_guard lock(shadows.mutex);
+        const auto found = shadows.entries.find({begin, end});
+        if (found != shadows.entries.end() && found->second.recorder == recorder) {
+            source = found->second.buffer;
+            generation = found->second.generation;
+        }
+        if (found != shadows.entries.end()) shadows.entries.erase(found);
+        for (auto it = shadows.entries.begin(); it != shadows.entries.end();) {
+            if (it->second.buffer.get() == target) it = shadows.entries.erase(it);
+            else ++it;
+        }
+    }
+    if (source == nullptr) return nullptr;
+    return GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(end - begin), generation) ? source : nullptr;
+}
+
+void registerStagedShadow(const Recorder* recorder, std::uint64_t begin, std::uint64_t end, std::shared_ptr<Buffer> buffer, std::uint64_t generation) {
+    auto& shadows = stagedShadows();
+    std::lock_guard lock(shadows.mutex);
+    // A few hundred ranges in practice; a runaway set starts over.
+    if (shadows.entries.size() >= 4096) shadows.entries.clear();
+    shadows.entries[{begin, end}] = StagedShadow{recorder, std::move(buffer), generation};
 }
 
 }
@@ -2173,7 +2331,26 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 expected.assign(snapshotBytes.begin(), snapshotBytes.end());
             }
         }
-        CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
+        // Staging chain: the previous use's shadow of this exact range instead of the import.
+        bool sameShadow = false;
+        if (region->deviceLocal && stagingChainEnabled()) {
+            GuestMemory::CollectWrites(region->begin, static_cast<std::size_t>(bytes));
+            region->chainGeneration = GuestMemory::TrackerGeneration();
+            if (auto shadow = takeStagedShadow(recorder, region->begin, region->end, region->buffer.get())) {
+                sameShadow = shadow == region->buffer;
+                if (!sameShadow) {
+                    copySource = shadow->Handle();
+                    copyOffset = 0;
+                    recorder->Keep(shadow);
+                }
+                if (profile) {
+                    Copies().chained.fetch_add(1, std::memory_order_relaxed);
+                    Copies().chainedBytes.fetch_add(bytes, std::memory_order_relaxed);
+                    if (sameShadow) Copies().chainedInPlace.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        if (!sameShadow) CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -2209,6 +2386,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
         }
     }
+    if (stagedAny && traceStagingEnabled()) noteStagedBuild(recorder, copies);
     if (stagedAny) reportStaging();
     // The copied bytes are visible to the shaders bound to the buffers, which may also store into
     // them. Every stage: dispatches and draws share this path, and draws run mesh, task and
@@ -2342,11 +2520,36 @@ bool GuestBufferMemory::HasCopiedWrites() const {
 }
 
 void GuestBufferMemory::MarkDirectWrites() const {
+    // Staging chain: a staged region's shadow may stand for its range only when nothing but this
+    // use wrote the range since its copy-in (checked before this use's own marks below): a CPU
+    // store during the use landed in the import, not in the shadow, and the copy-back only covers
+    // the written sub-ranges.
+    std::vector<const Region*> chainable;
+    if (stagingChainEnabled()) {
+        for (const auto& region : regions) {
+            if (!region.gpuCopy || !region.deviceLocal || !region.copiedBack || region.buffer == nullptr || region.chainGeneration == 0) continue;
+            const auto bytes = static_cast<std::size_t>(region.end - region.begin);
+            GuestMemory::CollectWrites(region.begin, bytes);
+            if (GuestMemory::UnchangedSince(region.begin, bytes, region.chainGeneration)) chainable.push_back(&region);
+        }
+    }
     for (const auto& [begin, end] : writes) {
         const auto* found = owner(begin);
         if (found == nullptr) continue;
         const auto& region = *found;
         if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+    }
+    // Staging chain: each staged region whose copy-back was recorded now holds its range as the
+    // import will (after the marks above, so only later writers stamp past the generation).
+    if (chainable.empty()) return;
+    const auto* recorder = Recorder::Active();
+    std::uint64_t generation = 0;
+    for (const auto* candidate : chainable) {
+        const auto& region = *candidate;
+        const bool overlapped = std::any_of(regions.begin(), regions.end(), [&](const Region& other) { return &other != &region && other.begin < region.end && region.begin < other.end && WritesOverlap(std::max(other.begin, region.begin), static_cast<std::size_t>(std::min(other.end, region.end) - std::max(other.begin, region.begin))); });
+        if (overlapped) continue;
+        if (generation == 0) generation = GuestMemory::TrackerGeneration();
+        registerStagedShadow(recorder, region.begin, region.end, region.buffer, generation);
     }
 }
 

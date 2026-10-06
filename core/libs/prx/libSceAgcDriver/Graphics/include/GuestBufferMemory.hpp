@@ -281,6 +281,10 @@ private:
         VkBuffer copySource = VK_NULL_HANDLE;
         std::uint64_t copySourceBase = 0;
         bool copiedBack = false;
+        // Staging chain: the tracker generation at this use's copy-in (after collecting the
+        // range), against which MarkDirectWrites proves nothing else wrote the range during the
+        // use before it registers the shadow.
+        std::uint64_t chainGeneration = 0;
         // An element the shader updates atomically lies inside (AddWritable's `atomic`).
         bool atomic = false;
         // The gpuCopy buffer is a device-local staging shadow (see stagingEligible): no host
