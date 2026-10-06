@@ -1284,8 +1284,8 @@ VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
 }
 
 bool Recorder::DeferCopyBacks() {
-    static const bool disabled = std::getenv("APS5_NO_DEFERRED_COPY_BACK") != nullptr;
-    return !disabled;
+    static const bool enabled = std::getenv("APS5_DEFER_COPY_BACK") != nullptr;
+    return enabled;
 }
 
 void Recorder::DeferCopies(std::vector<DeferredCopy> copies) {

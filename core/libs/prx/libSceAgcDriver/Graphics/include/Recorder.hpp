@@ -92,7 +92,10 @@ public:
     // these copies over (TakeDeferredCopies) and copies the union back after its own work: the
     // ~970 back-to-back uses per frame of one 285 KiB buffer then cost one copy-back, not 970
     // (with two full barriers each). Never across batches: Submit records what is left.
-    // APS5_NO_DEFERRED_COPY_BACK=1 records every copy-back at once, as before.
+    // Opt-in (APS5_DEFER_COPY_BACK=1) while a device loss seen with it on remains unexplained
+    // (t175: 5 of 7 runs lost the device ~2 min into gameplay with it, none of 3 without); the
+    // default records every copy-back at once, as before. It saves GPU time only (t166: staging
+    // class time 1400 -> 870 ms per 10 s), and the frame is CPU-bound.
     struct DeferredCopy {
         std::shared_ptr<void> keep;
         const void* sourceKey = nullptr;
