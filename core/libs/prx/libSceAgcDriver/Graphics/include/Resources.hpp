@@ -13,12 +13,16 @@ namespace AgcDriver::Graphics {
 void NoteDeviceAddress(VkDeviceAddress address, std::uint64_t bytes, const char* kind, std::uint64_t guestBase = 0);
 void ForgetDeviceAddress(VkDeviceAddress address);
 std::string DescribeDeviceAddress(VkDeviceAddress address);
+// Whether [address, address + bytes) lies inside one live registered buffer.
+bool DeviceAddressLive(VkDeviceAddress address, std::uint64_t bytes);
 
 // Debug aid APS5_CHECK_STALE_IMPORTS=1: the VkBuffer handles of destroyed host imports are kept
 // (until a new import gets the same handle), and work about to bind one reports it
 // (ReportDestroyedImport: a descriptor or address that outlived its import reads freed memory,
 // the 'read invalid' device losses inside destroyed imports, t167-t177).
 bool CheckStaleImports();
+// Prints the stack slots that point into the driver's code (offsets from its image base).
+void ReportDriverStack(const char* tag);
 void NoteImportHandle(VkBuffer buffer, std::uint64_t guestBase, bool live);
 bool ReportDestroyedImport(VkBuffer buffer, const char* where, std::uint64_t detail, std::uint64_t* guestBase = nullptr);
 

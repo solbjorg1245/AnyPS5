@@ -203,19 +203,17 @@ void NoteImportHandle(VkBuffer buffer, std::uint64_t guestBase, bool live) {
     else handles.destroyed[buffer] = {guestBase, now};
 }
 
-namespace {
-
-// The stack slots that point into the driver's code, as offsets (addr2line -f -C -e
-// libSceAgcDriver.prx with the image base added), from the caller outwards.
-void reportDriverStack() {
+// The stack slots that point into the driver's code, as offsets (llvm-symbolizer --relative-address
+// on libSceAgcDriver.prx, tools/prxstack.py), from the caller outwards.
+void ReportDriverStack(const char* tag) {
 #ifdef _WIN32
     HMODULE driver = nullptr;
-    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(&reportDriverStack), &driver)) return;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(&ReportDriverStack), &driver)) return;
     MODULEINFO info{};
     if (!GetModuleInformation(GetCurrentProcess(), driver, &info, sizeof(info))) return;
     const auto base = reinterpret_cast<std::uintptr_t>(info.lpBaseOfDll);
     const auto end = base + info.SizeOfImage;
-    std::fprintf(stderr, "[stale-import]   driver addresses on the stack (image base 0x%llx):", static_cast<unsigned long long>(base));
+    std::fprintf(stderr, "%s   driver addresses on the stack (image base 0x%llx):", tag, static_cast<unsigned long long>(base));
     const auto* slot = static_cast<const std::uintptr_t*>(__builtin_frame_address(0));
     int printed = 0;
     for (int i = 0; i < 4096 && printed < 32; ++i) {
@@ -228,8 +226,6 @@ void reportDriverStack() {
 #endif
 }
 
-}
-
 bool ReportDestroyedImport(VkBuffer buffer, const char* where, std::uint64_t detail, std::uint64_t* guestBase) {
     if (!CheckStaleImports() || buffer == VK_NULL_HANDLE) return false;
     auto& handles = Handles();
@@ -240,10 +236,19 @@ bool ReportDestroyedImport(VkBuffer buffer, const char* where, std::uint64_t det
     static int reports = 0;
     if (reports++ < 16) {
         std::fprintf(stderr, "[stale-import] %s (0x%llx) uses the buffer of import guest 0x%llx destroyed %.3f s ago%s", where, static_cast<unsigned long long>(detail), static_cast<unsigned long long>(found->second.guestBase), SecondsNow() - found->second.destroyed, "\n");
-        if (reports <= 6) reportDriverStack();
+        if (reports <= 6) ReportDriverStack("[stale-import]");
         std::fflush(stderr);
     }
     return true;
+}
+
+bool DeviceAddressLive(VkDeviceAddress address, std::uint64_t bytes) {
+    auto& registry = Registry();
+    std::lock_guard lock(registry.mutex);
+    auto above = registry.live.upper_bound(address);
+    if (above == registry.live.begin()) return false;
+    const auto& entry = std::prev(above)->second;
+    return address >= entry.address && address + bytes <= entry.address + entry.bytes;
 }
 
 std::string DescribeDeviceAddress(VkDeviceAddress address) {

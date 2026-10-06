@@ -215,6 +215,19 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     if (!cached.has_value()) built = memory.AddressRanges();
     const auto& ranges = cached.has_value() ? *cached->ranges : built;
     const auto serial = cached.has_value() ? cached->serial : 0;
+    // APS5_CHECK_STALE_IMPORTS: every mapped device range must be a live buffer's.
+    if (checkTables()) {
+        static std::atomic<int> reports{0};
+        for (const auto& range : ranges) {
+            if (range.end <= range.begin || DeviceAddressLive(range.deviceAddress, range.end - range.begin)) continue;
+            if (reports.fetch_add(1) < 16) {
+                std::fprintf(stderr, "[bda-check] page table (%s, space serial %llu, %zu ranges) maps guest 0x%llx+0x%llx to device 0x%llx, which is no live buffer:%s%s", cached.has_value() ? "the cached space's" : "built", static_cast<unsigned long long>(serial), ranges.size(), static_cast<unsigned long long>(range.begin), static_cast<unsigned long long>(range.end - range.begin), static_cast<unsigned long long>(range.deviceAddress), DescribeDeviceAddress(range.deviceAddress).c_str(), "\n");
+                reportDriverFrames();
+                std::fflush(stderr);
+            }
+            break;
+        }
+    }
     Require(ranges.size() <= std::numeric_limits<std::uint32_t>::max(), "BDA table range count overflow");
     Require(ranges.size() <= (std::numeric_limits<std::size_t>::max() - sizeof(ShaderRecompiler::BdaAbi::Header)) / sizeof(ShaderRecompiler::BdaAbi::Range), "BDA table size overflow");
     tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + ranges.size() * sizeof(ShaderRecompiler::BdaAbi::Range);
