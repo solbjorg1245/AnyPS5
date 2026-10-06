@@ -86,7 +86,7 @@ void ReportDeviceFault() {
     for (std::uint32_t index = 0; index < counts.addressInfoCount && index < addresses.size(); ++index) {
         const auto& address = addresses[index];
         const auto type = static_cast<std::size_t>(address.addressType);
-        std::fprintf(stderr, "[gpu]   address 0x%llx (precision 0x%llx): %s\n", static_cast<unsigned long long>(address.reportedAddress), static_cast<unsigned long long>(address.addressPrecision), type < std::size(types) ? types[type] : "?");
+        std::fprintf(stderr, "[gpu]   address 0x%llx (precision 0x%llx): %s%s\n", static_cast<unsigned long long>(address.reportedAddress), static_cast<unsigned long long>(address.addressPrecision), type < std::size(types) ? types[type] : "?", Graphics::DescribeDeviceAddress(address.reportedAddress).c_str());
     }
     for (std::uint32_t index = 0; index < counts.vendorInfoCount && index < vendors.size(); ++index) {
         const auto& vendor = vendors[index];

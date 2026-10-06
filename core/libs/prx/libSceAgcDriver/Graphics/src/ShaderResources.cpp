@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/FrameTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -318,11 +319,25 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // garbage), whose CPU snapshot below would fail to allocate. The draw is skipped with the words
     // that describe it (0x2128000000 bytes recurred in some Boletaria runs).
     if (guestBytes > (16ull << 30u)) {
-        char text[512];
+        char text[768];
         int length = std::snprintf(text, sizeof(text), "AGC graphics: texture 0x%llx describes 0x%llx bytes (%ux%u depth/last array %u base array %u, mips %u base %u last %u, format %u, tile %d, dim %d); words",
                                    static_cast<unsigned long long>(resource.baseAddress), static_cast<unsigned long long>(guestBytes), resource.width, resource.height, resource.depthOrLastArray, resource.baseArray,
                                    resource.mipCount, resource.baseLevel, resource.lastLevel, resource.format, static_cast<int>(resource.tileMode), static_cast<int>(resource.dimension));
         for (std::size_t i = 0; i < words.size() && length > 0 && length < static_cast<int>(sizeof(text)) - 10; ++i) length += std::snprintf(text + length, sizeof(text) - length, " %08x", words[i]);
+        // Where this thread's capture read the words, and what that memory holds now.
+        const auto source = ShaderMemory::LocateRecentWords(words);
+        if (length > 0 && length < static_cast<int>(sizeof(text)) - 40) {
+            if (source == 0) length += std::snprintf(text + length, sizeof(text) - length, "; not among this thread's recent capture reads");
+            else {
+                length += std::snprintf(text + length, sizeof(text) - length, "; read at 0x%llx, now", static_cast<unsigned long long>(source));
+                std::array<std::uint32_t, 8> now{};
+                const auto bytes = std::min(words.size(), now.size()) * sizeof(std::uint32_t);
+                if (GuestMemory::Accessible(reinterpret_cast<const void*>(source), bytes)) {
+                    std::memcpy(now.data(), reinterpret_cast<const void*>(source), bytes);
+                    for (std::size_t i = 0; i < bytes / sizeof(std::uint32_t) && length > 0 && length < static_cast<int>(sizeof(text)) - 10; ++i) length += std::snprintf(text + length, sizeof(text) - length, " %08x", now[i]);
+                }
+            }
+        }
         throw std::runtime_error(text);
     }
     auto& counters = TextureCounts();

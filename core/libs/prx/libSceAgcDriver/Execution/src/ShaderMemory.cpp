@@ -78,6 +78,18 @@ CaptureProfile& CaptureTotals() {
 
 std::atomic<ShaderMemory::WaitedMsProvider> waitedMsProvider{nullptr};
 
+// The calling thread's last capture reads, for ShaderMemory::LocateRecentWords.
+struct RecentReads {
+    static constexpr std::size_t Count = 4096;
+    std::array<std::pair<std::uint64_t, std::uint32_t>, Count> entries{};
+    std::size_t next = 0;
+};
+
+RecentReads& ThreadRecentReads() {
+    thread_local RecentReads reads;
+    return reads;
+}
+
 double WaitedMs() {
     const auto provider = waitedMsProvider.load(std::memory_order_acquire);
     return provider != nullptr ? provider() : 0.0;
@@ -210,7 +222,32 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     page.read.set(index);
     page.recent.set(index);
     *value = page.words[index];
+    auto& recent = ThreadRecentReads();
+    recent.entries[recent.next++ % RecentReads::Count] = {address, *value};
     return true;
+}
+
+std::uint64_t ShaderMemory::LocateRecentWords(std::span<const std::uint32_t> words) {
+    if (words.empty()) return 0;
+    const auto& recent = ThreadRecentReads();
+    std::map<std::uint64_t, std::uint32_t> seen;
+    const auto count = std::min(recent.next, RecentReads::Count);
+    // Oldest first, so a later read of an address wins.
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto& [address, value] = recent.entries[(recent.next - count + i) % RecentReads::Count];
+        seen[address] = value;
+    }
+    for (std::size_t i = count; i-- > 0;) {
+        const auto& [address, value] = recent.entries[(recent.next - count + i) % RecentReads::Count];
+        if (value != words[0]) continue;
+        bool all = true;
+        for (std::size_t word = 1; word < words.size() && all; ++word) {
+            const auto found = seen.find(address + word * sizeof(std::uint32_t));
+            all = found != seen.end() && found->second == words[word];
+        }
+        if (all) return address;
+    }
+    return 0;
 }
 
 ShaderMemory::KnownValueCounts ShaderMemory::KnownValues() {

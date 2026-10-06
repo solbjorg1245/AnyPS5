@@ -68,6 +68,9 @@ public:
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> TakeRecentRegions();
     // The driver's source handle memo outcomes, for the [capture] line (APS5_PROFILE_DRAW).
     static void CountHandleMemo(bool hit);
+    // The guest address the calling thread's recent capture reads (the last 4096 dwords) found
+    // `words` at, consecutively (0: not among them), for reports on a descriptor decoded as garbage.
+    static std::uint64_t LocateRecentWords(std::span<const std::uint32_t> words);
 
 private:
     static constexpr std::size_t PageBytes = 4096;

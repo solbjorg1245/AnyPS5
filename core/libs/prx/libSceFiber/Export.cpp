@@ -120,7 +120,8 @@ static std::map<const Fiber*, ParkedStack>& Parked() {
 // The last events of each fiber (APS5_FIBER_CHECK), printed with a parked-stack or wiped-context
 // report: what ran on the stack, on which host thread, from which stack pointer, and where it
 // parked. Kinds: N initialize, R run from a thread, I switched in, O switched out, T returned to
-// its thread, P parked (saved stack published), U resumed (unparked), F finalized.
+// its thread, P parked (saved stack published), U resumed (unparked), S started from its entry
+// (resumed while Idle: a fresh initial frame at the context's top), F finalized.
 struct FiberEvent {
     std::uint64_t ms = 0;
     std::uint32_t thread = 0;
@@ -172,6 +173,26 @@ static void DumpEvents(const Fiber* fiber) {
     }
 }
 
+// Every other fiber's events of the last `window` ms in time order: who ran where around a change.
+// Caller holds ParkedMutex.
+static void DumpRecentEvents(const Fiber* except, std::uint64_t window) {
+    const auto now = NowMs();
+    std::vector<std::pair<const FiberEvent*, const Fiber*>> recent;
+    for (const auto& [fiber, events] : Events()) {
+        if (fiber == except) continue;
+        const auto count = std::min(events.next, events.ring.size());
+        for (std::size_t i = events.next - count; i < events.next; ++i) {
+            const auto& event = events.ring[i % events.ring.size()];
+            if (event.ms + window >= now) recent.emplace_back(&event, fiber);
+        }
+    }
+    std::stable_sort(recent.begin(), recent.end(), [](const auto& a, const auto& b) { return a.first->ms < b.first->ms; });
+    std::fprintf(stderr, "[fiber-check]   other fibers' events of the last %llu ms (%zu):\n", static_cast<unsigned long long>(window), recent.size());
+    for (const auto& [event, fiber] : recent) {
+        std::fprintf(stderr, "[fiber-check]     %llu t%u %c %p saved=%p sp=%p context=%p+0x%llx\n", static_cast<unsigned long long>(event->ms), event->thread, event->kind, static_cast<const void*>(fiber), event->saved, event->sp, static_cast<const void*>(fiber->context), static_cast<unsigned long long>(fiber->contextSize));
+    }
+}
+
 // Compares a parked stack with its copy; reports the first change of each parking. Caller holds
 // ParkedMutex.
 static void CompareParked(const Fiber* fiber, ParkedStack& parked, const char* when) {
@@ -199,6 +220,7 @@ static void CompareParked(const Fiber* fiber, ParkedStack& parked, const char* w
     if (VirtualQuery(parked.begin, &info, sizeof(info)) != 0) std::fprintf(stderr, "[fiber-check]   page: base=%p allocation=%p size=0x%llx state=0x%lx protect=0x%lx type=0x%lx\n", info.BaseAddress, info.AllocationBase, static_cast<unsigned long long>(info.RegionSize), info.State, info.Protect, info.Type);
 #endif
     DumpEvents(fiber);
+    DumpRecentEvents(fiber, 100);
     std::fflush(stderr);
 }
 
@@ -470,7 +492,10 @@ static bool AcquireForResume(Fiber* target) {
         if (state != FiberState::Idle && state != FiberState::Suspended) return false;
         if (target->state.compare_exchange_weak(state, FiberState::Running, std::memory_order_acq_rel)) {
             if (state == FiberState::Suspended) UnparkFiber(target);
-            if (state == FiberState::Idle) PrepareInitialStack(target);
+            if (state == FiberState::Idle) {
+                PrepareInitialStack(target);
+                NoteEvent(target, 'S');
+            }
             return true;
         }
     }
@@ -490,6 +515,7 @@ static void Resume(Fiber* target, void** save, std::uint64_t argOnRun) {
         if (CheckFibers()) {
             std::lock_guard lock(ParkedMutex());
             DumpEvents(target);
+            DumpRecentEvents(target, 100);
         }
         std::fflush(stderr);
         std::abort();

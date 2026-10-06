@@ -3,8 +3,16 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include <span>
+#include <string>
 
 namespace AgcDriver::Graphics {
+
+// Device address ranges of live buffers and of the last few thousand destroyed ones, for the
+// device-lost report: DescribeDeviceAddress names the buffers a faulting GPU address lies in (or
+// lies nearest to), with their kind, guest base and age.
+void NoteDeviceAddress(VkDeviceAddress address, std::uint64_t bytes, const char* kind, std::uint64_t guestBase = 0);
+void ForgetDeviceAddress(VkDeviceAddress address);
+std::string DescribeDeviceAddress(VkDeviceAddress address);
 
 class Buffer {
 public:
