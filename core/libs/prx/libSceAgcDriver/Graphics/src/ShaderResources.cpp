@@ -290,6 +290,24 @@ std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, con
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
+void ReportUndecodedTexture(std::span<const std::uint32_t> words, const char* reason) {
+    static std::mutex mutex;
+    static std::set<std::vector<std::uint32_t>> seen;
+    {
+        std::lock_guard lock(mutex);
+        if (seen.size() >= 64 || !seen.emplace(words.begin(), words.end()).second) return;
+    }
+    std::string chain;
+    const auto source = ShaderMemory::LocateRecentWords(words, &chain);
+    std::string text;
+    char word[16];
+    for (const auto value : words) {
+        std::snprintf(word, sizeof(word), " %08x", value);
+        text += word;
+    }
+    std::fprintf(stderr, "[gpu] undecodable T#%s read at 0x%llx (%s); reads before:%s\n", text.c_str(), static_cast<unsigned long long>(source), reason, chain.c_str());
+}
+
 // A null T# (base address 0: the game's own, or one the recompiler rejected as no descriptor, see
 // validImageDescriptor) reads zeros on hardware and drops stores. It binds a zeroed 1x1 linear
 // RGBA8 surface of the binding's shape in driver memory: one for sampled reads and one for storage,
@@ -2677,7 +2695,17 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
                 words = nullWords;
             }
             const auto* record = nextRecord();
-            const auto resource = record != nullptr && record->decoded ? record->resource : DecodeTextureResource(words);
+            // A descriptor the driver cannot decode is reported once per word set with where the
+            // capture read it (the walk can read data that is no T#, see validImageDescriptor).
+            const auto decode = [&] {
+                try {
+                    return DecodeTextureResource(words);
+                } catch (const std::exception& error) {
+                    ReportUndecodedTexture(words, error.what());
+                    throw;
+                }
+            };
+            const auto resource = record != nullptr && record->decoded ? record->resource : decode();
             const bool firstLayer = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
             if (!firstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension)) throw std::runtime_error("AGC graphics: guest texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
             const VkComponentMapping components{ComponentSwizzleFor(resource.dstSelX), ComponentSwizzleFor(resource.dstSelY), ComponentSwizzleFor(resource.dstSelZ), ComponentSwizzleFor(resource.dstSelW)};

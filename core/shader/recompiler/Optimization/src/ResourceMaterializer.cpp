@@ -396,7 +396,7 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         auto& candidate = candidates[i];
         candidate.dwordCount = 8u;
         const std::uint64_t address = heapBase + table.entryOffset + static_cast<std::uint64_t>(keys[i]) * TableEntryBytes;
-        for (std::uint32_t dword = 0; dword < 8u; dword++) {
+        for (std::uint32_t dword = 0; dword < (image.r128 ? 4u : 8u); dword++) {
             readWord(address + dword * sizeof(std::uint32_t), candidate.dwords[dword]);
         }
         DecodedImage decoded;
@@ -515,6 +515,10 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         if (descriptor.dwordCount != 8u) {
             throw std::runtime_error("image descriptor has an invalid width");
         }
+        // A 128-bit T# (MIMG R128) is four dwords; the hardware takes the rest as zero, while the
+        // walk's last four come from whatever follows it (Demon's Souls: a pointer or floats, read
+        // as an array pitch or corner sampling).
+        if (image.r128) std::fill(descriptor.dwords.begin() + 4, descriptor.dwords.end(), 0u);
         if ((!validImageDescriptor(descriptor, image.r128) || !plausibleImageAddress(descriptor)) && !nullImageDescriptor(descriptor)) {
             static std::atomic<int> reports{0};
             if (reports.fetch_add(1, std::memory_order_relaxed) < 32) {
