@@ -121,7 +121,8 @@ static std::map<const Fiber*, ParkedStack>& Parked() {
 // report: what ran on the stack, on which host thread, from which stack pointer, and where it
 // parked. Kinds: N initialize, R run from a thread, I switched in, O switched out, T returned to
 // its thread, P parked (saved stack published), U resumed (unparked), S started from its entry
-// (resumed while Idle: a fresh initial frame at the context's top), F finalized.
+// (resumed while Idle: a fresh initial frame at the context's top), F finalized, X a run or switch
+// to it refused (ReportRefused).
 struct FiberEvent {
     std::uint64_t ms = 0;
     std::uint32_t thread = 0;
@@ -293,6 +294,18 @@ static void ReportContextReuse(Fiber* fiber, const char* name, std::uint8_t* con
         ++it;
     }
     contexts[begin] = fiber;
+}
+
+// A refused run or switch: the title's wrappers ignore the result and carry on as if the switch had
+// happened, so the calling fiber keeps running while the title's scheduler takes it for parked (a
+// later resume then runs a second execution over its stack: the 'wiped context' aborts). Reported
+// with the states, rate-limited.
+static void ReportRefused(const char* call, const Fiber* self, const Fiber* target, int32_t result) {
+    static std::atomic<int> reports{0};
+    if (reports.fetch_add(1, std::memory_order_relaxed) >= 64) return;
+    const auto state = [](const Fiber* fiber) { return fiber != nullptr && fiber->magic == FIBER_MAGIC ? static_cast<unsigned>(fiber->state.load(std::memory_order_acquire)) : 0u; };
+    std::fprintf(stderr, "[fiber] %s refused (0x%08x) on t%u: self '%s' (state %u), target '%s' (state %u)\n", call, static_cast<unsigned>(result), HostThreadId(), self != nullptr ? self->name : "-", state(self), target != nullptr ? target->name : "-", state(target));
+    NoteEvent(target, 'X');
 }
 
 static void CompletePendingSuspend() {
@@ -571,8 +584,14 @@ int32_t APS5_VABI sceFiberFinalize(FiberObject* object) {
 int32_t APS5_VABI sceFiberRun_nid_postfix(FiberObject* object, uint64_t arg_on_run, uint64_t* arg_on_return) {
     auto* fiber = AsFiber(object);
     if (!fiber) return object ? SCE_FIBER_ERROR_INVALID : SCE_FIBER_ERROR_NULL;
-    if (ThreadState().current) return SCE_FIBER_ERROR_PERMISSION;
-    if (!AcquireForResume(fiber)) return SCE_FIBER_ERROR_STATE;
+    if (ThreadState().current) {
+        ReportRefused("sceFiberRun", ThreadState().current, fiber, SCE_FIBER_ERROR_PERMISSION);
+        return SCE_FIBER_ERROR_PERMISSION;
+    }
+    if (!AcquireForResume(fiber)) {
+        ReportRefused("sceFiberRun", nullptr, fiber, SCE_FIBER_ERROR_STATE);
+        return SCE_FIBER_ERROR_STATE;
+    }
     ThreadState().threadFramePointer = reinterpret_cast<std::uint64_t>(static_cast<void**>(__builtin_frame_address(0))[0]);
     ThreadState().threadBounds = CurrentBounds();
     NoteEvent(fiber, 'R');
@@ -587,8 +606,14 @@ int32_t APS5_VABI sceFiberSwitch(FiberObject* object, uint64_t arg_on_run, uint6
     auto* target = AsFiber(object);
     if (!target) return object ? SCE_FIBER_ERROR_INVALID : SCE_FIBER_ERROR_NULL;
     auto* self = ThreadState().current;
-    if (!self) return SCE_FIBER_ERROR_PERMISSION;
-    if (target == self || !AcquireForResume(target)) return SCE_FIBER_ERROR_STATE;
+    if (!self) {
+        ReportRefused("sceFiberSwitch", nullptr, target, SCE_FIBER_ERROR_PERMISSION);
+        return SCE_FIBER_ERROR_PERMISSION;
+    }
+    if (target == self || !AcquireForResume(target)) {
+        ReportRefused("sceFiberSwitch", self, target, SCE_FIBER_ERROR_STATE);
+        return SCE_FIBER_ERROR_STATE;
+    }
     if (TraceFibers()) {
         auto** frame = static_cast<void**>(__builtin_frame_address(0));
         void* chain[6] = {};
@@ -611,7 +636,10 @@ int32_t APS5_VABI sceFiberSwitch(FiberObject* object, uint64_t arg_on_run, uint6
 
 int32_t APS5_VABI sceFiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_on_run) {
     auto* self = ThreadState().current;
-    if (!self) return SCE_FIBER_ERROR_PERMISSION;
+    if (!self) {
+        ReportRefused("sceFiberReturnToThread", nullptr, nullptr, SCE_FIBER_ERROR_PERMISSION);
+        return SCE_FIBER_ERROR_PERMISSION;
+    }
     if (TraceFibers()) std::fprintf(stderr, "[fiber] return %s from %p\n", self->name, __builtin_return_address(0));
     NoteEvent(self, 'T');
     self->state.store(FiberState::Suspending, std::memory_order_relaxed);
