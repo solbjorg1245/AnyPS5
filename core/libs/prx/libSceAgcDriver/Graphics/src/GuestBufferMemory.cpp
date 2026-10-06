@@ -2308,6 +2308,8 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     // backs another build claimed over these ranges are recorded first: the copy-ins may read the
     // imports. A range a queued label or key store overlaps decides below, after those stores.
     const bool deferring = Recorder::DeferCopyBacks();
+    // Claims an earlier use left behind (it failed before its copy-backs) are not this build's.
+    if (deferring) recorder->ReleaseClaims();
     std::vector<std::shared_ptr<Buffer>> chainShadows(copies.size());
     std::vector<std::uint8_t> chainDecided(copies.size(), 0);
     for (std::size_t index = 0; index < copies.size(); ++index) {
@@ -2322,7 +2324,8 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         GuestMemory::CollectWrites(region->begin, static_cast<std::size_t>(bytes));
         region->chainGeneration = GuestMemory::TrackerGeneration();
         chainShadows[index] = takeStagedShadow(recorder, region->begin, region->end, region->buffer.get());
-        if (deferring && chainShadows[index] != nullptr) {
+        static const bool noClaims = std::getenv("APS5_NO_COPY_BACK_CLAIMS") != nullptr;
+        if (deferring && !noClaims && chainShadows[index] != nullptr) {
             recorder->ClaimDeferredCopies(chainShadows[index].get());
             region->claimedShadow = chainShadows[index].get();
         }

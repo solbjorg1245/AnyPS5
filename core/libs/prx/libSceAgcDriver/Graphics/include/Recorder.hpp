@@ -114,6 +114,12 @@ public:
     void ClaimDeferredCopies(const void* sourceKey);
     std::vector<DeferredCopy> TakeClaimedCopies(const void* sourceKey);
     void FlushClaimedOverlapping(std::uint64_t address, std::size_t bytes);
+    // Claims the claiming use did not take (its copy-back skipped the region, it wrote nothing
+    // back, or it failed before MarkGpuWrites) go back to the unclaimed copies, which the next
+    // command records: held longer, every command after the use would read the imports without
+    // the earlier use's results until Submit (t167-t170: device lost). Called after each use's
+    // copy-backs and before a build claims.
+    void ReleaseClaims();
     bool Idle() const { return open == nullptr && inFlight.empty(); }
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;

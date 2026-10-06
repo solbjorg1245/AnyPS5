@@ -1315,6 +1315,12 @@ std::vector<Recorder::DeferredCopy> Recorder::TakeClaimedCopies(const void* sour
     return taken;
 }
 
+void Recorder::ReleaseClaims() {
+    if (claimedCopies.empty()) return;
+    deferredCopies.insert(deferredCopies.end(), std::make_move_iterator(claimedCopies.begin()), std::make_move_iterator(claimedCopies.end()));
+    claimedCopies.clear();
+}
+
 void Recorder::FlushClaimedOverlapping(std::uint64_t address, std::size_t bytes) {
     const auto end = address + bytes;
     const auto overlapping = [&](const DeferredCopy& copy) { return copy.address < end && address < copy.address + copy.bytes; };

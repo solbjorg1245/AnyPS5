@@ -3022,7 +3022,10 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
     recorder.NotePendingReads(guestMemory.InPlaceReads(), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
-    if (SkipWriteBack()) return;
+    if (SkipWriteBack()) {
+        recorder.ReleaseClaims();
+        return;
+    }
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (storageWritten[index]) storageTextures[index]->MarkDirty();
     }
@@ -3030,6 +3033,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // recorded here after the work: those regions then need no CPU write-back (HasCopiedWrites),
     // and the note and mark below cover them like direct writes.
     guestMemory.RecordCopyBacks(recorder);
+    recorder.ReleaseClaims();
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
     recorder.NotePendingWrites(guestMemory.Writes());
