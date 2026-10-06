@@ -3,6 +3,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "Optimization/ResourceProgram.hpp"
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
@@ -63,6 +65,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
     }();
 
     stageCapture.regions = shaderMemory.TakeRecentRegions();
+    stageCapture.capture = capture;
     recompiled[i] = true;
     memory = shaderMemory.Regions();
 
@@ -112,7 +115,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
     return stageCapture.compiled;
 }
 
-void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming) {
+void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const DrawStageHits& hits, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming) {
     if (useDrawEntries && !drawHit && !(drawParameters.indirect && indirectCpu)) {
         phaseTiming.Phase(DrawRowVectors);
         std::uint64_t unstable = 0, mismatches = 0;
@@ -136,7 +139,49 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                 variant->words.resize(offset + count);
                 std::memcpy(variant->words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
             }
-            if (verifyHit && matched[i] != nullptr && (matched[i]->runs != variant->runs || matched[i]->words != variant->words)) {
+            // Data positions (DrawStageHits): the pure flat-SRT leaves among the words. The vertex
+            // input decode's reads count as other reads: a hit reuses the stage info they shaped.
+            if (dataHits() && !stampValidate() && stageCapture.capture != nullptr && !stageCapture.capture->readTrace.leaves.empty()) {
+                const auto& bindings = variant->compiled->bindings;
+                for (std::size_t b = 0; b < bindings.size(); ++b) {
+                    if (bindings[b].role != ShaderRecompiler::DescriptorRole::FlattenedSrt) continue;
+                    const auto& trace = stageCapture.capture->readTrace;
+                    std::vector<std::uint64_t> otherReads(trace.otherReads.begin(), trace.otherReads.end());
+                    for (const auto& read : decodeReads[i]) {
+                        for (auto address = read.address & ~std::uint64_t{3}; address < read.address + read.bytes.size(); address += sizeof(std::uint32_t)) otherReads.push_back(address);
+                    }
+                    if (!decodeReads[i].empty()) std::sort(otherReads.begin(), otherReads.end());
+                    variant->flatBinding = static_cast<std::uint32_t>(b);
+                    static_cast<void>(DataWordPositions(variant->runs, trace.leaves, otherReads, variant->words, bindings[b].guestDescriptor, variant->dataPositions, variant->dataSlots));
+                    if (!variant->dataPositions.empty()) {
+                        std::lock_guard cacheLock(drawCacheMutex);
+                        ++drawEntryCounters.dataInserts;
+                        drawEntryCounters.dataPositionsInserted += variant->dataPositions.size();
+                    }
+                    break;
+                }
+            }
+            // A data hit's stage holds the live words and a patched result: both must be what the
+            // capture made (APS5_VERIFY_DATA_HITS).
+            const bool dataStage = verifyHit && hits.data && matched[i] != nullptr && i < hits.liveWords.size() && !hits.liveWords[i].empty();
+            if (dataStage) {
+                const auto& patched = *hits.results[i];
+                const auto& captured = *stageCapture.compiled;
+                bool same = matched[i]->runs == variant->runs && hits.liveWords[i] == variant->words && captured.variantId == patched.variantId && captured.pushConstants == patched.pushConstants && captured.bindings.size() == patched.bindings.size();
+                for (std::size_t b = 0; same && b < captured.bindings.size(); ++b) {
+                    const auto& left = captured.bindings[b];
+                    const auto& right = patched.bindings[b];
+                    same = left.kind == right.kind && left.role == right.role && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor;
+                }
+                if (!same) {
+                    std::fprintf(stderr, "[draw-cache] APS5_VERIFY_DATA_HITS: stage %zu (program 0x%llx) of a data hit disagrees with its capture\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress));
+                    std::fflush(stderr);
+                    std::abort();
+                }
+                std::lock_guard cacheLock(drawCacheMutex);
+                ++drawEntryCounters.dataVerified;
+            }
+            if (verifyHit && !dataStage && matched[i] != nullptr && (matched[i]->runs != variant->runs || matched[i]->words != variant->words)) {
                 ++mismatches;
                 static std::atomic<std::uint64_t> reports{0};
                 if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: stage %zu (program 0x%llx) of a hit captured differently: %zu runs / %zu words matched, %zu / %zu fresh\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), matched[i]->runs.size(), matched[i]->words.size(), variant->runs.size(), variant->words.size());

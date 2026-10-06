@@ -4,7 +4,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs) {
+void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, DrawStageHits& hits, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs) {
     using Role = ShaderRecompiler::ProgramRole;
     if (useDrawEntries) {
         if (!registerKey) {
@@ -74,6 +74,9 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             std::optional<DrawMiss> miss;
             std::vector<std::size_t> ranks(programs.size(), 0);
+            // Per stage, the live words of the leaves a data hit refreshed (validateVariant).
+            std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> liveData(programs.size());
+            const bool dataAllowed = dataHits() && !verifyDrawEntries();
             std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0;
             if (entry->stages.size() != programs.size()) miss = DrawMiss::Stages;
 
@@ -95,11 +98,13 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         regions.clear();
                         appendEntryRegions(*variant, regions);
                         ++compared;
-                        auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
-                        if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
+                        auto* live = dataAllowed ? &liveData[i] : nullptr;
+                        auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
+                        if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
                         if (!anyLayout) outcome = result;
                         anyLayout = true;
-                        if (result != EntryOutcome::Equal) continue;
+                        if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) continue;
+                        if (result != EntryOutcome::EqualData) liveData[i].clear();
                         matched[i] = variant;
                         ranks[i] = rank;
                         ++stageEqual;
@@ -113,6 +118,33 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 }
             }
             drawHit = !miss;
+            // The hit's stage results; a data hit's stages carry the live words and a patched copy.
+            std::uint64_t dataStages = 0, dataWords = 0;
+            if (drawHit) {
+                hits.liveWords.assign(programs.size(), {});
+                hits.results.assign(programs.size(), nullptr);
+                hits.data = false;
+                for (std::size_t i = 0; i < programs.size(); ++i) {
+                    if (matched[i] == nullptr) continue;
+                    const auto& variant = *matched[i];
+                    hits.results[i] = variant.compiled;
+                    if (liveData[i].empty() || variant.flatBinding >= variant.compiled->bindings.size()) continue;
+                    auto& words = hits.liveWords[i];
+                    words = variant.words;
+                    for (const auto& [position, value] : liveData[i]) words[position] = value;
+                    matchedRegions[i].clear();
+                    appendEntryRegions(variant, matchedRegions[i], &words);
+                    auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
+                    auto& descriptor = patched->bindings[variant.flatBinding].guestDescriptor;
+                    for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
+                        if (variant.dataSlots[k] < descriptor.size()) descriptor[variant.dataSlots[k]] = words[variant.dataPositions[k]];
+                    }
+                    hits.results[i] = std::move(patched);
+                    hits.data = true;
+                    ++dataStages;
+                    dataWords += liveData[i].size();
+                }
+            }
             std::lock_guard cacheLock(drawCacheMutex);
             auto& counters = drawEntryCounters;
             counters.stageValidations += stageValidations;
@@ -150,6 +182,16 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         drawOrder.splice(drawOrder.begin(), drawOrder, again->second->order);
                         again->second->touched = drawCacheHits;
                         ++counters.touches;
+                    }
+                }
+                if (hits.data) {
+                    ++counters.dataHits;
+                    counters.dataStages += dataStages;
+                    counters.dataWordsRefreshed += dataWords;
+                    if (verifyDataHits()) {
+                        // Captured again like a verified hit (cacheDrawStages compares the results).
+                        verifyHit = true;
+                        drawHit = false;
                     }
                 }
                 if (verifyDrawEntries()) {

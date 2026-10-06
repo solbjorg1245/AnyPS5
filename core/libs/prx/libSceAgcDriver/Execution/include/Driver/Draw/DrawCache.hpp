@@ -60,16 +60,34 @@ struct DrawEntryCounters {
 
     std::uint64_t registerKeyLookups = 0, registerKeyHits = 0, decodeSkipped = 0, decodePartial = 0, facadeMismatches = 0, verifyDecodes = 0, verifyDecodeMismatches = 0;
     double keyUs = 0;
+    // Data hits (DrawStageHits): hits with at least one stage's flat-SRT data words refreshed.
+    std::uint64_t dataHits = 0, dataStages = 0, dataWordsRefreshed = 0, dataInserts = 0, dataPositionsInserted = 0, dataVerified = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
 enum class DrawVerdict { Drawn, Nothing, Rejected };
+
+// A draw hit's stage results. A stage variant whose stored words differ from guest memory only at
+// pure flat-SRT leaves (DataWordPositions, as the dispatch cache's data hits) still matches: its
+// regions then carry the live words (`liveWords`, which they point into) and its result is a copy
+// with the flattened SRT patched (`results`; the variant's own result for an equal stage). Each
+// moving per-object constant (a world matrix in the flattened SRT) otherwise made the vertex stage
+// miss, and the miss captured and recompiled every stage of the draw again (~47k of ~118k draws
+// per 10 s in Boletaria). APS5_NO_DATA_HITS=1 disables them with the dispatch ones;
+// APS5_VERIFY_DATA_HITS=1 captures such draws again and aborts when the patched result differs.
+struct DrawStageHits {
+    std::vector<std::vector<std::uint32_t>> liveWords;
+    std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> results;
+    bool data = false;
+};
 
 struct StageCapture {
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
     std::vector<ShaderRecompiler::MemoryRegion> regions;
     std::uint64_t forgetSerial = 0;
     std::uint32_t pushOffset = 0;
+    // The capture's read trace, for the inserted variant's data positions.
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
 };
 
 }
