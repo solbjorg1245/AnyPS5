@@ -4,6 +4,10 @@
 #include "prx/libc/include/General.hpp"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <map>
+#include <mutex>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -88,9 +92,95 @@ static bool TraceFibers() {
     return enabled;
 }
 
+// Debug aid APS5_FIBER_CHECK=1: the live part of every suspended fiber's stack (saved stack pointer
+// to the context's end) is copied when it parks, and a watcher thread compares it every 2 ms until
+// the fiber resumes; any change is a store by someone else into a parked stack, reported with the
+// differing words (old -> new) when it happens rather than at the resume that finds a wiped frame.
+struct ParkedStack {
+    const void* begin = nullptr;
+    std::vector<std::uint64_t> words;
+    bool reported = false;
+};
+
+static bool CheckFibers() {
+    static const bool enabled = std::getenv("APS5_FIBER_CHECK") != nullptr;
+    return enabled;
+}
+
+static std::mutex& ParkedMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+static std::map<const Fiber*, ParkedStack>& Parked() {
+    static std::map<const Fiber*, ParkedStack> parked;
+    return parked;
+}
+
+// Compares a parked stack with its copy; reports the first change of each parking. Caller holds
+// ParkedMutex.
+static void CompareParked(const Fiber* fiber, ParkedStack& parked, const char* when) {
+    if (parked.reported) return;
+    const auto* live = static_cast<const std::uint64_t*>(parked.begin);
+    if (std::memcmp(live, parked.words.data(), parked.words.size() * sizeof(std::uint64_t)) == 0) return;
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i < parked.words.size(); ++i) differing += live[i] != parked.words[i];
+    // A few words are the waits the fiber parked on (counters and flags on its stack that other
+    // threads update); those are taken into the copy. A wipe changes many.
+    if (differing < 8) {
+        std::memcpy(parked.words.data(), live, parked.words.size() * sizeof(std::uint64_t));
+        return;
+    }
+    parked.reported = true;
+    std::fprintf(stderr, "[fiber-check] parked stack of '%s' changed (%s, %llu ms): %zu of %zu words differ in %p+0x%zx\n", fiber->name, when, static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()), differing, parked.words.size(), parked.begin, parked.words.size() * sizeof(std::uint64_t));
+    std::size_t shown = 0;
+    for (std::size_t i = 0; i < parked.words.size() && shown < 24; ++i) {
+        if (live[i] == parked.words[i]) continue;
+        ++shown;
+        std::fprintf(stderr, "[fiber-check]   %p: %016llx -> %016llx\n", static_cast<const void*>(live + i), static_cast<unsigned long long>(parked.words[i]), static_cast<unsigned long long>(live[i]));
+    }
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(parked.begin, &info, sizeof(info)) != 0) std::fprintf(stderr, "[fiber-check]   page: base=%p allocation=%p size=0x%llx state=0x%lx protect=0x%lx type=0x%lx\n", info.BaseAddress, info.AllocationBase, static_cast<unsigned long long>(info.RegionSize), info.State, info.Protect, info.Type);
+#endif
+    std::fflush(stderr);
+}
+
+static void ParkFiber(const Fiber* fiber) {
+    if (!CheckFibers()) return;
+    static std::once_flag watcher;
+    std::call_once(watcher, [] {
+        std::thread([] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                std::lock_guard lock(ParkedMutex());
+                for (auto& [fiber, parked] : Parked()) CompareParked(fiber, parked, "while parked");
+            }
+        }).detach();
+    });
+    const auto begin = reinterpret_cast<std::uintptr_t>(fiber->savedStack);
+    const auto end = reinterpret_cast<std::uintptr_t>(fiber->context + fiber->contextSize) & ~static_cast<std::uintptr_t>(7);
+    if (end <= begin) return;
+    ParkedStack parked;
+    parked.begin = fiber->savedStack;
+    parked.words.assign(reinterpret_cast<const std::uint64_t*>(begin), reinterpret_cast<const std::uint64_t*>(end));
+    std::lock_guard lock(ParkedMutex());
+    Parked()[fiber] = std::move(parked);
+}
+
+static void UnparkFiber(const Fiber* fiber) {
+    if (!CheckFibers()) return;
+    std::lock_guard lock(ParkedMutex());
+    const auto found = Parked().find(fiber);
+    if (found == Parked().end()) return;
+    CompareParked(fiber, found->second, "at resume");
+    Parked().erase(found);
+}
+
 static void CompletePendingSuspend() {
     auto& thread = ThreadState();
     if (thread.pendingSuspend) {
+        ParkFiber(thread.pendingSuspend);
         thread.pendingSuspend->state.store(FiberState::Suspended, std::memory_order_release);
         thread.pendingSuspend = nullptr;
     }
@@ -283,6 +373,7 @@ static bool AcquireForResume(Fiber* target) {
         }
         if (state != FiberState::Idle && state != FiberState::Suspended) return false;
         if (target->state.compare_exchange_weak(state, FiberState::Running, std::memory_order_acq_rel)) {
+            if (state == FiberState::Suspended) UnparkFiber(target);
             if (state == FiberState::Idle) PrepareInitialStack(target);
             return true;
         }
@@ -294,6 +385,10 @@ static void Resume(Fiber* target, void** save, std::uint64_t argOnRun) {
     if (frame->returnAddress == 0) {
         std::fprintf(stderr, "[fiber] resuming '%s' with a wiped context: saved=%p context=%p size=0x%llx\n", target->name, target->savedStack,
                      static_cast<void*>(target->context), static_cast<unsigned long long>(target->contextSize));
+#ifdef _WIN32
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(target->savedStack, &info, sizeof(info)) != 0) std::fprintf(stderr, "[fiber]   page: base=%p allocation=%p size=0x%llx state=0x%lx protect=0x%lx type=0x%lx\n", info.BaseAddress, info.AllocationBase, static_cast<unsigned long long>(info.RegionSize), info.State, info.Protect, info.Type);
+#endif
         const auto* words = static_cast<const std::uint64_t*>(target->savedStack);
         for (int i = 0; i < 40; i += 4) std::fprintf(stderr, "[fiber]   +0x%03x %016llx %016llx %016llx %016llx\n", i * 8, static_cast<unsigned long long>(words[i]), static_cast<unsigned long long>(words[i + 1]), static_cast<unsigned long long>(words[i + 2]), static_cast<unsigned long long>(words[i + 3]));
         std::fflush(stderr);
@@ -339,6 +434,7 @@ int32_t APS5_VABI sceFiberFinalize(FiberObject* object) {
     if (!fiber) return object ? SCE_FIBER_ERROR_INVALID : SCE_FIBER_ERROR_NULL;
     const auto state = fiber->state.load(std::memory_order_acquire);
     if (state == FiberState::Running || state == FiberState::Suspending) return SCE_FIBER_ERROR_STATE;
+    if (state == FiberState::Suspended) UnparkFiber(fiber);
     fiber->magic = 0;
     return SCE_OK;
 }
