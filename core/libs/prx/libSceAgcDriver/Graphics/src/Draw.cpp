@@ -198,6 +198,11 @@ struct DrawOutcome {
     // in ownSyncUs: those wait by design and would otherwise count as nested hook waits.
     double hookWaitUs = 0;
     double ownSyncUs = 0;
+    // Index and vertex inputs copied afresh from guest memory (CopyDrawInput found no reusable
+    // snapshot), their bytes, and the indices scanned for the highest one.
+    std::uint64_t inputCopies = 0;
+    std::uint64_t inputCopyBytes = 0;
+    std::uint64_t indicesScanned = 0;
 };
 
 // The resources of a draw: a recipe hit (reserved for the draw recipe step), a resource-cache
@@ -272,6 +277,10 @@ struct DrawProfile {
     std::array<std::uint64_t, IndirectPathCount> indirect{};
     std::uint64_t indirectRewritten = 0;
     double indirectReadUs = 0;
+    // Fresh draw input copies (DrawOutcome::inputCopies), their bytes and the indices scanned.
+    std::uint64_t inputCopies = 0;
+    std::uint64_t inputCopyBytes = 0;
+    std::uint64_t indicesScanned = 0;
     // Draw packets that drew nothing, by DrawSkip, and their time.
     std::array<std::uint64_t, static_cast<std::size_t>(DrawSkip::Count)> skips{};
     std::array<double, static_cast<std::size_t>(DrawSkip::Count)> skipUs{};
@@ -322,6 +331,9 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.fullScissorLookups += outcome.fullScissorLookups;
     profile.partialLookups += outcome.partialLookups;
     profile.pagesWalked += outcome.pagesWalked;
+    profile.inputCopies += outcome.inputCopies;
+    profile.inputCopyBytes += outcome.inputCopyBytes;
+    profile.indicesScanned += outcome.indicesScanned;
     profile.lookupUs += outcome.lookupUs;
     if (outcome.kind < KindCount) {
         ++profile.kindCounts[outcome.kind];
@@ -344,6 +356,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         if (profile.totalsUs[i] <= 0) continue;
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s=%.1fms", DrawPhaseNames[i], profile.totalsUs[i] / 1000.0);
         if (i == PhaseResources && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (bindings %.1f, upload %.1f, descriptors %.1f, other %.1f of which %.1f in %llu address-based builds)", profile.bindingsUs / 1000.0, profile.uploadUs / 1000.0, profile.descriptorsUs / 1000.0, profile.otherUs / 1000.0, profile.addressOtherUs / 1000.0, static_cast<unsigned long long>(profile.addressBuilds));
+        if (i == PhaseVertex && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (fresh input copies %llu = %.1f MiB, indices scanned %llu)", static_cast<unsigned long long>(profile.inputCopies), static_cast<double>(profile.inputCopyBytes) / 1048576.0, static_cast<unsigned long long>(profile.indicesScanned));
         if (i == PhaseReadTarget && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs);
     }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; per kind (avg us, count):");
@@ -399,6 +412,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.indirect.fill(0);
     profile.indirectRewritten = 0;
     profile.indirectReadUs = 0;
+    profile.inputCopies = profile.inputCopyBytes = profile.indicesScanned = 0;
     profile.skips.fill(0);
     profile.skipUs.fill(0);
 }
@@ -795,23 +809,35 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     if (draw.indexed) {
         const auto use = draw.indexSize == 2 ? Recorder::SnapshotUse::Index16 : Recorder::SnapshotUse::Index32;
         auto copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
+        // An indirect draw's index range is the whole index buffer (often ~100 MiB) and only the
+        // device limit needs its highest index: with no limit below the 32-bit range the scan is
+        // skipped and the snapshot is kept as unscanned (UnscannedIndices), which a later direct
+        // draw over the same range scans instead.
+        constexpr std::uint32_t UnscannedIndices = std::numeric_limits<std::uint32_t>::max();
+        static const bool scanIndirectIndices = std::getenv("APS5_SCAN_INDIRECT_INDICES") != nullptr;
+        const bool scan = args == nullptr || scanIndirectIndices || context.limits.maxDrawIndexedIndexValue < UnscannedIndices;
         std::uint32_t highest = copy.derived;
         if (!copy.reused) {
-            highest = 0;
-            const auto bytes = copy.buffer->Bytes();
-            for (std::size_t offset = 0; offset < indexBytes; offset += draw.indexSize) {
-                std::uint32_t index = 0;
-                if (draw.indexSize == 2) {
-                    std::uint16_t value = 0;
-                    std::memcpy(&value, bytes.data() + offset, sizeof(value));
-                    index = value;
-                } else {
-                    std::memcpy(&index, bytes.data() + offset, sizeof(index));
-                }
-                highest = std::max(highest, index);
-            }
-            KeepDrawInput(context.recorder, draw.indexAddress, copy, use, highest);
+            ++outcome.inputCopies;
+            outcome.inputCopyBytes += indexBytes;
         }
+        if (!copy.reused || (scan && highest == UnscannedIndices)) {
+            highest = UnscannedIndices;
+            if (scan) {
+                highest = 0;
+                const auto bytes = copy.buffer->Bytes();
+                if (draw.indexSize == 2) {
+                    const auto* values = reinterpret_cast<const std::uint16_t*>(bytes.data());
+                    for (std::size_t i = 0, count = static_cast<std::size_t>(indexBytes) / 2; i < count; ++i) highest = std::max<std::uint32_t>(highest, values[i]);
+                } else {
+                    const auto* values = reinterpret_cast<const std::uint32_t*>(bytes.data());
+                    for (std::size_t i = 0, count = static_cast<std::size_t>(indexBytes) / 4; i < count; ++i) highest = std::max(highest, values[i]);
+                }
+                outcome.indicesScanned += indexBytes / draw.indexSize;
+            }
+            if (!copy.reused) KeepDrawInput(context.recorder, draw.indexAddress, copy, use, highest);
+        }
+        if (!scan) highest = 0;
         Require(highest <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
         inputs.maxIndex = highest;
         inputs.indices = std::move(copy.buffer);
@@ -842,6 +868,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto bytes = static_cast<std::size_t>(end - begin);
         GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
+        if (!copy.reused) {
+            ++outcome.inputCopies;
+            outcome.inputCopyBytes += bytes;
+        }
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
