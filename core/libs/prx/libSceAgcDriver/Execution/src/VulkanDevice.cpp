@@ -563,8 +563,11 @@ struct VulkanDevice::State {
             }
             // Every ShaderResources (kept by the recorder or the resource cache) is gone now, so the
             // sets and samplers they borrowed can go.
+            copiedWriters->clear();
             resourceCache.Clear();
             Graphics::ClearCachedTextures(device);
+            Graphics::ClearImageMirrors(device);
+            patternBuffers.clear();
             descriptorCache.reset();
             emptyBuffer.reset();
             samplerCache.reset();

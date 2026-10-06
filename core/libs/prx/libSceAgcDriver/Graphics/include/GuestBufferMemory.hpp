@@ -156,6 +156,7 @@ struct MirrorStats {
     std::uint64_t heapRefills = 0;
 };
 MirrorStats MirrorCounters();
+void ClearImageMirrors(VkDevice device);
 
 struct AddressCopy {
     std::uint64_t begin;
