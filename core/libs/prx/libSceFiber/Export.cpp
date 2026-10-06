@@ -117,6 +117,61 @@ static std::map<const Fiber*, ParkedStack>& Parked() {
     return parked;
 }
 
+// The last events of each fiber (APS5_FIBER_CHECK), printed with a parked-stack or wiped-context
+// report: what ran on the stack, on which host thread, from which stack pointer, and where it
+// parked. Kinds: N initialize, R run from a thread, I switched in, O switched out, T returned to
+// its thread, P parked (saved stack published), U resumed (unparked), F finalized.
+struct FiberEvent {
+    std::uint64_t ms = 0;
+    std::uint32_t thread = 0;
+    char kind = 0;
+    const void* saved = nullptr;
+    const void* sp = nullptr;
+};
+
+struct FiberEvents {
+    std::array<FiberEvent, 48> ring{};
+    std::size_t next = 0;
+};
+
+static std::map<const Fiber*, FiberEvents>& Events() {
+    static std::map<const Fiber*, FiberEvents> events;
+    return events;
+}
+
+static std::uint32_t HostThreadId() {
+#ifdef _WIN32
+    return GetCurrentThreadId();
+#else
+    return 0;
+#endif
+}
+
+static std::uint64_t NowMs() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+static void NoteEvent(const Fiber* fiber, char kind) {
+    if (!CheckFibers() || fiber == nullptr) return;
+    const FiberEvent event{NowMs(), HostThreadId(), kind, fiber->savedStack, __builtin_frame_address(0)};
+    std::lock_guard lock(ParkedMutex());
+    auto& events = Events()[fiber];
+    events.ring[events.next++ % events.ring.size()] = event;
+}
+
+// Caller holds ParkedMutex.
+static void DumpEvents(const Fiber* fiber) {
+    const auto found = Events().find(fiber);
+    if (found == Events().end()) return;
+    const auto& events = found->second;
+    const auto count = std::min(events.next, events.ring.size());
+    std::fprintf(stderr, "[fiber-check]   last %zu events of '%s' (ms, host thread, kind, saved stack, sp):\n", count, fiber->name);
+    for (std::size_t i = events.next - count; i < events.next; ++i) {
+        const auto& event = events.ring[i % events.ring.size()];
+        std::fprintf(stderr, "[fiber-check]     %llu t%u %c saved=%p sp=%p\n", static_cast<unsigned long long>(event.ms), event.thread, event.kind, event.saved, event.sp);
+    }
+}
+
 // Compares a parked stack with its copy; reports the first change of each parking. Caller holds
 // ParkedMutex.
 static void CompareParked(const Fiber* fiber, ParkedStack& parked, const char* when) {
@@ -143,11 +198,13 @@ static void CompareParked(const Fiber* fiber, ParkedStack& parked, const char* w
     MEMORY_BASIC_INFORMATION info{};
     if (VirtualQuery(parked.begin, &info, sizeof(info)) != 0) std::fprintf(stderr, "[fiber-check]   page: base=%p allocation=%p size=0x%llx state=0x%lx protect=0x%lx type=0x%lx\n", info.BaseAddress, info.AllocationBase, static_cast<unsigned long long>(info.RegionSize), info.State, info.Protect, info.Type);
 #endif
+    DumpEvents(fiber);
     std::fflush(stderr);
 }
 
 static void ParkFiber(const Fiber* fiber) {
     if (!CheckFibers()) return;
+    NoteEvent(fiber, 'P');
     static std::once_flag watcher;
     std::call_once(watcher, [] {
         std::thread([] {
@@ -170,11 +227,50 @@ static void ParkFiber(const Fiber* fiber) {
 
 static void UnparkFiber(const Fiber* fiber) {
     if (!CheckFibers()) return;
+    NoteEvent(fiber, 'U');
     std::lock_guard lock(ParkedMutex());
     const auto found = Parked().find(fiber);
     if (found == Parked().end()) return;
     CompareParked(fiber, found->second, "at resume");
     Parked().erase(found);
+}
+
+// A fiber initialized over a context that a live fiber (suspended or running) still uses, or a
+// suspended fiber initialized anew, runs two stacks in one: the parked fiber's frames are
+// overwritten by the new one's (the 'wiped context' abort). Reported once per pair; the contexts
+// of every initialized fiber are kept by address for the check.
+static void ReportContextReuse(Fiber* fiber, const char* name, std::uint8_t* context, std::uint64_t size) {
+    static std::mutex mutex;
+    static std::map<std::uintptr_t, Fiber*> contexts;
+    static int reports = 0;
+    std::lock_guard lock(mutex);
+    const auto describe = [](const Fiber* other) {
+        return other->magic == FIBER_MAGIC ? static_cast<unsigned>(other->state.load(std::memory_order_acquire)) : 0u;
+    };
+    if (fiber->magic == FIBER_MAGIC && describe(fiber) != static_cast<unsigned>(FiberState::Idle) && reports < 16) {
+        ++reports;
+        std::fprintf(stderr, "[fiber] '%s' (%p) initialized as '%s' while in state %u\n", fiber->name, static_cast<void*>(fiber), name, describe(fiber));
+    }
+    const auto begin = reinterpret_cast<std::uintptr_t>(context);
+    const auto end = begin + size;
+    for (auto it = contexts.begin(); it != contexts.end();) {
+        auto* other = it->second;
+        const auto otherBegin = it->first;
+        const bool current = other->magic == FIBER_MAGIC && reinterpret_cast<std::uintptr_t>(other->context) == otherBegin;
+        if (!current) {
+            it = contexts.erase(it);
+            continue;
+        }
+        const auto otherEnd = otherBegin + other->contextSize;
+        const auto state = describe(other);
+        if (other != fiber && otherBegin < end && begin < otherEnd && state != static_cast<unsigned>(FiberState::Idle) && reports < 16) {
+            ++reports;
+            std::fprintf(stderr, "[fiber] '%s' (%p) initialized over %p+0x%llx, which live fiber '%s' (%p, state %u) uses at %p+0x%llx\n", name, static_cast<void*>(fiber), context, static_cast<unsigned long long>(size), other->name, static_cast<void*>(other), state, other->context, static_cast<unsigned long long>(other->contextSize));
+            std::fflush(stderr);
+        }
+        ++it;
+    }
+    contexts[begin] = fiber;
 }
 
 static void CompletePendingSuspend() {
@@ -391,6 +487,10 @@ static void Resume(Fiber* target, void** save, std::uint64_t argOnRun) {
 #endif
         const auto* words = static_cast<const std::uint64_t*>(target->savedStack);
         for (int i = 0; i < 40; i += 4) std::fprintf(stderr, "[fiber]   +0x%03x %016llx %016llx %016llx %016llx\n", i * 8, static_cast<unsigned long long>(words[i]), static_cast<unsigned long long>(words[i + 1]), static_cast<unsigned long long>(words[i + 2]), static_cast<unsigned long long>(words[i + 3]));
+        if (CheckFibers()) {
+            std::lock_guard lock(ParkedMutex());
+            DumpEvents(target);
+        }
         std::fflush(stderr);
         std::abort();
     }
@@ -412,6 +512,7 @@ int32_t APS5_VABI _sceFiberInitializeImpl_nid_postfix(FiberObject* object, const
     if (addr_context == nullptr) return SCE_FIBER_ERROR_INVALID;
     if (size_context < FIBER_MIN_CONTEXT_SIZE) return SCE_FIBER_ERROR_RANGE;
     auto* fiber = reinterpret_cast<Fiber*>(object);
+    ReportContextReuse(fiber, name, static_cast<std::uint8_t*>(addr_context), size_context);
     std::memset(object, 0, FIBER_OBJECT_SIZE);
     fiber->magic = FIBER_MAGIC;
     fiber->state.store(FiberState::Idle, std::memory_order_relaxed);
@@ -425,6 +526,7 @@ int32_t APS5_VABI _sceFiberInitializeImpl_nid_postfix(FiberObject* object, const
         auto* words = static_cast<std::uint64_t*>(addr_context);
         std::fill(words, words + size_context / sizeof(std::uint64_t), FIBER_CONTEXT_FILL);
     }
+    NoteEvent(fiber, 'N');
     if (TraceFibers()) std::fprintf(stderr, "[fiber] init %s object=%p context=%p+0x%llx entry=%p\n", fiber->name, static_cast<void*>(object), addr_context, static_cast<unsigned long long>(size_context), reinterpret_cast<void*>(entry));
     return SCE_OK;
 }
@@ -435,6 +537,7 @@ int32_t APS5_VABI sceFiberFinalize(FiberObject* object) {
     const auto state = fiber->state.load(std::memory_order_acquire);
     if (state == FiberState::Running || state == FiberState::Suspending) return SCE_FIBER_ERROR_STATE;
     if (state == FiberState::Suspended) UnparkFiber(fiber);
+    NoteEvent(fiber, 'F');
     fiber->magic = 0;
     return SCE_OK;
 }
@@ -446,6 +549,7 @@ int32_t APS5_VABI sceFiberRun_nid_postfix(FiberObject* object, uint64_t arg_on_r
     if (!AcquireForResume(fiber)) return SCE_FIBER_ERROR_STATE;
     ThreadState().threadFramePointer = reinterpret_cast<std::uint64_t>(static_cast<void**>(__builtin_frame_address(0))[0]);
     ThreadState().threadBounds = CurrentBounds();
+    NoteEvent(fiber, 'R');
     Resume(fiber, &ThreadState().threadStack, arg_on_run);
     CompletePendingSuspend();
     SetBounds(ThreadState().threadBounds);
@@ -469,6 +573,8 @@ int32_t APS5_VABI sceFiberSwitch(FiberObject* object, uint64_t arg_on_run, uint6
         }
         std::fprintf(stderr, "[fiber] switch %s -> %s from %p %p %p %p %p %p\n", self->name, target->name, chain[0], chain[1], chain[2], chain[3], chain[4], chain[5]);
     }
+    NoteEvent(self, 'O');
+    NoteEvent(target, 'I');
     self->state.store(FiberState::Suspending, std::memory_order_relaxed);
     ThreadState().pendingSuspend = self;
     Resume(target, &self->savedStack, arg_on_run);
@@ -481,6 +587,7 @@ int32_t APS5_VABI sceFiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_o
     auto* self = ThreadState().current;
     if (!self) return SCE_FIBER_ERROR_PERMISSION;
     if (TraceFibers()) std::fprintf(stderr, "[fiber] return %s from %p\n", self->name, __builtin_return_address(0));
+    NoteEvent(self, 'T');
     self->state.store(FiberState::Suspending, std::memory_order_relaxed);
     ThreadState().pendingSuspend = self;
     ThreadState().current = nullptr;

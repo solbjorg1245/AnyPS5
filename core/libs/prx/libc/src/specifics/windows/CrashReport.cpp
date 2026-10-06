@@ -264,6 +264,61 @@ bool HandleDebugBreak(EXCEPTION_POINTERS* info) {
     return true;
 }
 
+// A C++ exception no frame catches (0x20474343, GCC's SEH code) ends the process through the
+// unhandled-exception filter, which ReportCrash never sees as fatal (every throw raises that
+// code first-chance). The search phase found no handler, so nothing has unwound yet: the stack
+// above the raise still holds the thrower's frames.
+constexpr DWORD GccCxxException = 0x20474343;
+
+void ReportCxxException(EXCEPTION_POINTERS* info, const char* what) {
+    const auto* context = info->ContextRecord;
+    char line[MAX_PATH + 64];
+    char threadName[128] = "";
+    PWSTR description = nullptr;
+    if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &description)) && description) {
+        WideCharToMultiByte(CP_UTF8, 0, description, -1, threadName, sizeof(threadName), nullptr, nullptr);
+        LocalFree(description);
+    }
+    Report("\n%s C++ exception on thread %lu '%s'\n  unwound frames:\n", what, GetCurrentThreadId(), threadName);
+    {
+        // The exact chain through the modules' unwind tables (every x64 PE function that is not a
+        // leaf has one); a frame without one is taken as a leaf (return address at rsp).
+        CONTEXT walk = *context;
+        for (int depth = 0; depth < 40 && walk.Rip != 0; ++depth) {
+            DescribeAddress(walk.Rip, line, sizeof(line));
+            Report("    #%d %s\n", depth, line);
+            DWORD64 imageBase = 0;
+            auto* function = RtlLookupFunctionEntry(walk.Rip, &imageBase, nullptr);
+            if (function == nullptr) {
+                if (!IsReadable(walk.Rsp)) break;
+                walk.Rip = *reinterpret_cast<const DWORD64*>(walk.Rsp);
+                walk.Rsp += 8;
+                continue;
+            }
+            void* handlerData = nullptr;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, walk.Rip, function, &walk, &handlerData, &establisher, nullptr);
+        }
+    }
+    Report("  stack return address candidates:\n");
+    int printed = 0;
+    for (std::uint64_t slot = context->Rsp; printed < 40 && slot < context->Rsp + 0x4000; slot += 8) {
+        if (!IsReadable(slot)) break;
+        const auto value = *reinterpret_cast<const std::uint64_t*>(slot);
+        if (!IsExecutable(value)) continue;
+        DescribeAddress(value, line, sizeof(line));
+        Report("    [rsp+0x%llx] %s\n", static_cast<unsigned long long>(slot - context->Rsp), line);
+        ++printed;
+    }
+    std::fflush(stdout);
+    std::fflush(stderr);
+}
+
+LONG WINAPI ReportUncaught(EXCEPTION_POINTERS* info) {
+    if (info->ExceptionRecord->ExceptionCode == GccCxxException) ReportCxxException(info, "FATAL: uncaught");
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
     const auto* fault = info->ExceptionRecord;
@@ -272,6 +327,10 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     if (HandleSse4a(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleDebugBreak(info)) return EXCEPTION_CONTINUE_EXECUTION;
     const auto* record = info->ExceptionRecord;
+    // APS5_TRACE_THROWS=1: every C++ throw (first chance) with its thread and stack, flushed at once,
+    // so the one no frame catches is the last one logged before the process ends.
+    static const bool traceThrows = GetEnvironmentVariableA("APS5_TRACE_THROWS", nullptr, 0) != 0;
+    if (traceThrows && record->ExceptionCode == GccCxxException) ReportCxxException(info, "[throw]");
     if (!IsFatal(record->ExceptionCode)) return EXCEPTION_CONTINUE_SEARCH;
     if (reported.exchange(true)) {
         // Another thread is already reporting; let it finish before this fault ends the process.
@@ -418,6 +477,7 @@ const bool g_crashReportInstalled = [] {
     g_sse4aEmulation = !IsEnvironmentSet("APS5_NO_SSE4A_EMULATION");
     g_sse4aTrace = IsEnvironmentSet("APS5_TRACE_SSE4A");
     AddVectoredExceptionHandler(1, ReportCrash);
+    SetUnhandledExceptionFilter(ReportUncaught);
     std::signal(SIGABRT, AbortSignalHandler);
     _set_invalid_parameter_handler(InvalidParameterHandler);
     InstallWatch();
