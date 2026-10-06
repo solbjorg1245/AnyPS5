@@ -1,5 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -12,6 +16,33 @@ void Driver::classifyDiffering(std::uint64_t program, std::uint64_t key, const D
     while (ring.size() > 3) ring.pop_back();
     if (priorValueSets.size() > dispatchCacheEntries()) priorValueSets.clear();
     if (old.runs != fresh.runs || old.words.size() != fresh.words.size()) {
+        // Debug aid APS5_TRACE_RUNS_CHANGED=1 or =<program hex> (with APS5_PROFILE_DRAW): the first such misses show
+        // the read ranges of the stored variant and of the fresh capture (what the walk read
+        // elsewhere), with the words of short ranges.
+        static const char* traceRuns = std::getenv("APS5_TRACE_RUNS_CHANGED");
+        static const std::uint64_t traceProgram = traceRuns != nullptr ? std::strtoull(traceRuns, nullptr, 16) : 0;
+        static std::atomic<int> traced{0};
+        if (traceRuns != nullptr && (traceProgram <= 1 || traceProgram == program) && traced.fetch_add(1, std::memory_order_relaxed) < 12) {
+            const auto print = [](const char* which, const DispatchVariant& variant) {
+                std::string text;
+                char item[64];
+                std::size_t offset = 0;
+                for (const auto& [begin, end] : variant.runs) {
+                    const auto count = static_cast<std::size_t>((end - begin) / sizeof(std::uint32_t));
+                    std::snprintf(item, sizeof(item), " %llx+%llx", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
+                    text += item;
+                    for (std::size_t i = 0; count <= 4 && i < count && offset + i < variant.words.size(); ++i) {
+                        std::snprintf(item, sizeof(item), "%c%08x", i == 0 ? '=' : ',', variant.words[offset + i]);
+                        text += item;
+                    }
+                    offset += count;
+                }
+                std::fprintf(stderr, "[runs-changed]   %s %zu runs:%s\n", which, variant.runs.size(), text.c_str());
+            };
+            std::fprintf(stderr, "[runs-changed] program 0x%llx key 0x%llx:\n", static_cast<unsigned long long>(program), static_cast<unsigned long long>(key));
+            print("stored", old);
+            print("fresh ", fresh);
+        }
         ++counters.differingRunsChanged;
         ++counters.differingWalk;
         return;
