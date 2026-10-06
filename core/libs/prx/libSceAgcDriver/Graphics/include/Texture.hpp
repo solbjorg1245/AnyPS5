@@ -431,6 +431,9 @@ private:
     mutable std::uint32_t nextForeignKeyProof = 0;
     // Write generation `original` is known current at (the oldest of layerGeneration).
     std::uint64_t generation = 0;
+    // The render pass left open when Refresh last completed (Recorder::OpenRenderPassSerial): while
+    // it is still the open one, Refresh has nothing to do.
+    std::uint64_t refreshPassSerial = 0;
     std::uint32_t trackedLayers = 1;
     std::uint64_t trackedLayerBytes = 0;
     std::vector<std::uint64_t> layerGeneration;
@@ -491,7 +494,7 @@ private:
 // element (a fast miss is followed by a full lookup); the refresh, upload, DCC scan and pending
 // flush rows lie inside the storage and sampled rows.
 struct LookupOutcomes {
-    enum Kind : std::size_t { SampledFast, SampledFastMiss, SampledHitView, SampledHitClearedView, SampledHitSnapshot, SampledMadeView, SampledMadeSnapshot, StorageHit, StorageMade, RefreshUnchanged, RefreshCompared, UploadDirect, UploadCpu, UploadClear, DccScan, PendingFlush, Count };
+    enum Kind : std::size_t { SampledFast, SampledFastMiss, SampledHitView, SampledHitClearedView, SampledHitSnapshot, SampledMadeView, SampledMadeSnapshot, StorageHit, StorageMade, RefreshUnchanged, RefreshCompared, RefreshMemo, UploadDirect, UploadCpu, UploadClear, DccScan, PendingFlush, Count };
     static const char* Name(Kind kind);
     static bool Profiled();
     // Charges the time since `start` to `kind` on this thread and returns now.

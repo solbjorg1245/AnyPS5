@@ -1188,7 +1188,7 @@ VkImageView StorageTexture::FirstLayerView(std::uint32_t mip) {
 }
 
 const char* LookupOutcomes::Name(Kind kind) {
-    static constexpr const char* names[Count] = {"sampled fast hit", "sampled fast miss", "sampled hit view", "sampled hit cleared view", "sampled hit snapshot", "sampled made view", "sampled made snapshot", "storage hit", "storage made", "refresh unchanged", "refresh compared", "upload direct", "upload cpu", "upload clear", "dcc scan", "pending flush"};
+    static constexpr const char* names[Count] = {"sampled fast hit", "sampled fast miss", "sampled hit view", "sampled hit cleared view", "sampled hit snapshot", "sampled made view", "sampled made snapshot", "storage hit", "storage made", "refresh unchanged", "refresh compared", "refresh memo", "upload direct", "upload cpu", "upload clear", "dcc scan", "pending flush"};
     return kind < Count ? names[kind] : "?";
 }
 
@@ -1220,6 +1220,18 @@ bool StorageTexture::Refresh() {
     // This image's own pending results stay on the GPU, where the next dispatch wants them (the
     // flush below and the compare through the hook skip it).
     refreshing = this;
+    // Refresh memo: while the render pass that was open when this image was last refreshed is
+    // still the open one, only draws of that pass were recorded since (anything else ends it), so
+    // no GPU command touched the memory, and a CPU store into an attachment being rendered is a
+    // race the pass itself already ignores: the image is as current as it was then (the resident
+    // target of every draw continuing a pass was refreshed per draw: 20M pages walked per 10 s).
+    // Debug aid: APS5_NO_REFRESH_MEMO=1 refreshes every time, as before.
+    static const bool memo = std::getenv("APS5_NO_REFRESH_MEMO") == nullptr;
+    const auto passSerial = memo ? Recorder::ActiveOpenRenderPassSerial() : 0;
+    if (passSerial != 0 && passSerial == refreshPassSerial) {
+        if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshMemo, start);
+        return true;
+    }
     NoteProved();
     // Results of other images pending in this memory must reach it first, except an alias's: its
     // units are taken on the device below (borrowUnits), so it stays pending. The keys read for
@@ -1354,6 +1366,7 @@ bool StorageTexture::Refresh() {
         ++Profile().storageReused;
         layerGeneration.assign(trackedLayers, current);
         refreshGeneration();
+        refreshPassSerial = passSerial;
         if (profile) LookupOutcomes::Add(stamped ? LookupOutcomes::RefreshUnchanged : LookupOutcomes::RefreshCompared, start);
         return true;
     }
@@ -1452,6 +1465,7 @@ bool StorageTexture::Refresh() {
     } else {
         uploadedKeys = keys;
     }
+    refreshPassSerial = passSerial;
     return false;
 }
 

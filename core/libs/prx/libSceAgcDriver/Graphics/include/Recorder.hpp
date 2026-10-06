@@ -67,6 +67,11 @@ public:
     // `timing`): Commands(), RecordStore and Submit end it; CommandsInRenderPass hands a
     // continuing draw the command buffer without ending it.
     bool ContinuesRenderPass(std::uint64_t key) const;
+    // The serial of the render pass currently left open (0: none). While it stays the same, only
+    // draws of that pass were recorded (anything else ends it): StorageTexture::Refresh's memo.
+    std::uint64_t OpenRenderPassSerial() const { return open != nullptr && open->renderPass.open ? open->renderPass.serial : 0; }
+    // The active recorder's, for a caller holding the GPU mutex (0 otherwise, or without a recorder).
+    static std::uint64_t ActiveOpenRenderPassSerial();
     VkCommandBuffer CommandsInRenderPass();
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool continuable);
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
@@ -617,6 +622,8 @@ private:
             bool continuable = false;
             std::uint64_t key = 0;
             std::uint32_t timing = NoTiming;
+            // Counts the passes this recorder left open (OpenRenderPassSerial).
+            std::uint64_t serial = 0;
         } renderPass;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
         bool hostReadOwed = false;
@@ -685,6 +692,7 @@ private:
     void recordKeyStores(bool forWriter);
     // Records the deferred copy-backs (DeferCopies) with their barrier pair; `claimed` too.
     void flushDeferredCopies(bool claimed = false);
+    std::uint64_t passSerials = 0;
     std::vector<DeferredCopy> deferredCopies;
     std::vector<DeferredCopy> claimedCopies;
 

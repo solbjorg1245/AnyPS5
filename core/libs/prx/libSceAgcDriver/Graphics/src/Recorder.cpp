@@ -1377,10 +1377,19 @@ VkCommandBuffer Recorder::CommandsInRenderPass() {
 void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool continuable) {
     Require(open != nullptr, "no batch is open for the render pass");
     auto& pass = open->renderPass;
-    if (!pass.open) pass.timing = timing;
+    if (!pass.open) {
+        pass.timing = timing;
+        pass.serial = ++passSerials;
+    }
     pass.open = true;
     pass.key = key;
     pass.continuable = continuable;
+}
+
+std::uint64_t Recorder::ActiveOpenRenderPassSerial() {
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) return 0;
+    auto* recorder = Active();
+    return recorder != nullptr ? recorder->OpenRenderPassSerial() : 0;
 }
 
 void Recorder::endOpenRenderPass() {
