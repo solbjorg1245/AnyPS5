@@ -506,6 +506,11 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     mixDescriptors(snapshot.images);
     mixDescriptors(snapshot.samplers);
     mixWords(snapshot.flattenedSrt);
+    mix(snapshot.deferredFlat.size());
+    for (const auto& [slot, address] : snapshot.deferredFlat) {
+        mix(slot);
+        mix(address);
+    }
     mixWords(snapshot.userData);
     mix(static_cast<std::uint64_t>(snapshot.uniformFill.kind));
     mix(snapshot.uniformFill.resource);
@@ -645,6 +650,16 @@ void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime) {
     SrtRuntime traced = express;
     traced.readTrace = &capture.readTrace;
     ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot, capture.specialization);
+    // Deferred flat slots: the leaf addresses the driver claimed, as (slot, address) through the
+    // trace's leaves (a slot reads one address; an address may serve several slots).
+    if (runtime.deferredReads != nullptr && !runtime.deferredReads->empty()) {
+        auto& deferred = capture.snapshot.deferredFlat;
+        for (const auto& [slot, address] : capture.readTrace.leaves) {
+            if (std::find(runtime.deferredReads->begin(), runtime.deferredReads->end(), address) == runtime.deferredReads->end()) continue;
+            if (std::find(deferred.begin(), deferred.end(), std::pair{slot, address}) == deferred.end()) deferred.emplace_back(slot, address);
+        }
+        std::sort(deferred.begin(), deferred.end());
+    }
     auto& other = capture.readTrace.otherReads;
     std::sort(other.begin(), other.end());
     other.erase(std::unique(other.begin(), other.end()), other.end());

@@ -260,6 +260,7 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
                 fail("DescriptorBindingBuilder::Populate flattened SRT snapshot is empty");
             }
             physical.guestDescriptor = snapshot.flattenedSrt;
+            physical.deferredWords = snapshot.deferredFlat;
             break;
         case DescriptorRole::ShaderData:
             if (layout.UsesPushData()) {

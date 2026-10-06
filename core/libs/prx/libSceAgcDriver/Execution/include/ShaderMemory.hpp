@@ -34,8 +34,11 @@ public:
     // KnownValue: recorded work writes it with bytes the driver already knows (a copy HLE's
     // destination, Driver.cpp's known-value ring entries), copied into `known` when the caller
     // passes a span of exactly `bytes` (empty: the answer alone); VerifyKnownValue serves them and
-    // reads through the hook too, counting a difference.
-    enum class PendingWrite : std::uint8_t { None, Sync, Raw, VerifyRaw, KnownValue, VerifyKnownValue };
+    // reads through the hook too, counting a difference. RawExpected: recorded work writes it but
+    // every observation left it unchanged; `known` receives the value the evidence saw last, the
+    // bytes are read raw while they still hold it, and another value is read through the hook
+    // (waiting for the writer) and reported to the observer as changed, which ends the evidence.
+    enum class PendingWrite : std::uint8_t { None, Sync, Raw, VerifyRaw, KnownValue, VerifyKnownValue, RawExpected };
     using PendingWriteQuery = PendingWrite (*)(std::uint64_t address, std::size_t bytes, std::span<std::byte> known);
     // Words served from known values by every capture, and the verified ones and their mismatches
     // (APS5_VERIFY_KNOWN_VALUES=1), for Driver.cpp's [copy] line.
@@ -44,8 +47,8 @@ public:
     };
     static KnownValueCounts KnownValues();
     // Told, for a dword read that went through the hook, whether the bytes read before the hook's
-    // wait were still there after it (the driver's evidence for later raw reads).
-    using PendingWriteObserver = void (*)(std::uint64_t address, bool unchanged);
+    // wait were still there after it (the driver's evidence for later raw reads), and the value read.
+    using PendingWriteObserver = void (*)(std::uint64_t address, bool unchanged, std::uint32_t value);
     // The calling thread's count of hook syncs that waited for unfinished GPU work: a read is only
     // observed when the count moved across it (against finished work both reads see the GPU's
     // bytes, and "unchanged" would be no evidence). Null observes every read that went through
@@ -55,6 +58,17 @@ public:
     // by the driver: the [capture] line charges the waits made inside a capture to it.
     using WaitedMsProvider = double (*)();
     static void SetWaitedMsProvider(WaitedMsProvider provider);
+    // The driver's description of the GPU work that last wrote a range (Driver::describeWriters),
+    // set once; the [capture-stalls] line names the writers of the words captures waited for.
+    using WriterDescriber = std::string (*)(std::uint64_t address, std::size_t bytes);
+    static void SetWriterDescriber(WriterDescriber describer);
+    // Whether recorded GPU work that writes the range has not run yet (its batch is open or in
+    // flight with the fence unsignaled): a read through the hook would wait. Set once by the
+    // driver; deferPureLeaf defers only such words (a finished writer's word is read cheaply).
+    using PendingUnsignaledQuery = bool (*)(std::uint64_t address, std::size_t bytes);
+    static void SetPendingUnsignaledQuery(PendingUnsignaledQuery query);
+    // Deferred flat slots (see deferPureLeaf in ShaderMemory.cpp): on unless APS5_NO_DEFERRED_FLAT=1.
+    static bool DeferredFlatEnabled();
     explicit ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> initial, PendingWriteQuery pendingWrite = nullptr, PendingWriteObserver observe = nullptr, HookWaitCounter hookWaits = nullptr);
     // Returns what the capture resolved (plan, snapshot, specialization) for
     // ShaderRecompiler::Recompile(request, capture), which then skips its own materialization. One
@@ -91,6 +105,9 @@ private:
     // when nothing recorded writes it and it is mapped whole, otherwise the read is declined and
     // the capture falls back to `read`; the words read are recorded in the pages like `read`'s.
     static bool expressRead(void* context, std::uint64_t address, std::uint32_t* value);
+    // SrtRuntime::deferPureLeaf: claims a pure flat slot's word on a page recorded GPU work writes
+    // (placeholder 0, the address kept in `deferred` for the recompiler) instead of waiting for it.
+    static bool deferPureLeaf(void* context, std::uint64_t address, std::uint32_t* value);
     Page& page(std::uint64_t base);
 
     // Regions given at construction (the registered shader's code and header), referenced as given:
@@ -103,6 +120,9 @@ private:
     PendingWriteQuery pendingWrite = nullptr;
     PendingWriteObserver observe = nullptr;
     HookWaitCounter hookWaits = nullptr;
+    // The current capture's deferred flat words (deferPureLeaf), handed to the recompiler through
+    // SrtRuntime::deferredReads.
+    std::vector<std::uint64_t> deferred;
 };
 
 // The positions, among a dispatch-cache variant's stored words, of the pure flat-SRT leaves a

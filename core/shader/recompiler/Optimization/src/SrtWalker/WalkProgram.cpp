@@ -329,6 +329,11 @@ struct Execution {
             else trace->otherReads.push_back(address);
         }
         std::uint32_t word = 0;
+        // A pure slot's leaf the driver defers to the GPU (SrtRuntime::deferPureLeaf) is not read.
+        if (leafSlot != WalkNoOp && runtime.deferPureLeaf != nullptr && runtime.deferPureLeaf(runtime.userContext, address, &word)) {
+            result = word;
+            return Step::Ok;
+        }
         if (!runtime.expressRead(runtime.userContext, address, &word)) return Step::Bailed;
         result = word;
         return Step::Ok;

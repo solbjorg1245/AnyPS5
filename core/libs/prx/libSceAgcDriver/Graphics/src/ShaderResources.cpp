@@ -2933,7 +2933,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 if (patch.allocation == index && patch.byte < item.size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
             }
             selected.push_back(index);
-            result->snapshots.push_back({0, std::move(buffer)});
+            result->snapshots.push_back({0, std::move(buffer), index});
             continue;
         }
         if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
@@ -2954,7 +2954,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
         }
         selected.push_back(index);
-        result->snapshots.push_back({begin, std::move(buffer)});
+        result->snapshots.push_back({begin, std::move(buffer), index});
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (selected.empty()) return {};
@@ -2999,6 +2999,30 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     update(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     recorder.Keep(result);
     return result;
+}
+
+VkBuffer ShaderResources::DataBufferFor(std::uint32_t vulkanBinding, const DrawBindings* drawBindings, std::size_t* allocation, std::byte** hostBytes) const {
+    *hostBytes = nullptr;
+    for (const auto& binding : bindings) {
+        if (binding.layout.binding != vulkanBinding || binding.allocations.size() != 1) continue;
+        const auto index = binding.allocations.front();
+        *allocation = index;
+        if (drawBindings != nullptr) {
+            for (const auto& snapshot : drawBindings->snapshots) {
+                if (snapshot.allocation != index) continue;
+                *hostBytes = snapshot.buffer->Bytes().data();
+                return snapshot.buffer->Handle();
+            }
+        }
+        const auto& item = allocations[index];
+        if (item.buffer == nullptr || item.guest || !DataRole(item.role)) return VK_NULL_HANDLE;
+        return item.buffer->Handle();
+    }
+    return VK_NULL_HANDLE;
+}
+
+ShaderResources::DeferredMemo& ShaderResources::DeferredMemoFor(std::size_t allocation) const {
+    return allocations[allocation].deferred;
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {

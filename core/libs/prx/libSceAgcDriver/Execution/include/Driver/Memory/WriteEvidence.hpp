@@ -33,6 +33,11 @@ struct DwordEvidence {
     std::uint64_t program = 0;
     std::uint64_t begin = 0;
     std::uint64_t end = 0;
+    // The word's value at the last observation (ShaderMemory::PendingWrite::RawExpected: a raw
+    // read that finds another value re-reads through the hook and ends the streak). After the
+    // writer fields: observeDword resets an entry with DwordEvidence{0, 0, program, begin, end}.
+    std::uint32_t lastValue = 0;
+    bool valueKnown = false;
 };
 
 class SampledReadScope {

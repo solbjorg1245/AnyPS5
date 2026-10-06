@@ -49,6 +49,15 @@ void Driver::stop() {
 
 Driver::Driver() {
     ShaderMemory::SetWaitedMsProvider(&Graphics::Recorder::ThreadWaitedMs);
+    ShaderMemory::SetWriterDescriber([](std::uint64_t address, std::size_t bytes) { return Driver::Get().describeWriters(address, address + bytes); });
+    ShaderMemory::SetPendingUnsignaledQuery([](std::uint64_t address, std::size_t bytes) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        auto* recorder = Graphics::Recorder::Active();
+        if (recorder == nullptr) return false;
+        const auto info = recorder->DescribePendingWrite(address, bytes);
+        return info.has_value() && !info->signaled;
+    });
     try {
         LibcRegisterShutdown_nid_postfix([] { Driver::Get().Shutdown(); });
     } catch (...) {

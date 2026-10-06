@@ -110,6 +110,8 @@ public:
         struct Snapshot {
             std::uint64_t address;
             std::shared_ptr<Buffer> buffer;
+            // The allocation the snapshot stands in for (DataBufferFor).
+            std::size_t allocation = 0;
         };
         DescriptorCache* cache = nullptr;
         DescriptorCache::SetAllocation allocation;
@@ -120,6 +122,23 @@ public:
     // read-only guest buffer is snapshot from the address the draw's descriptor names, which can
     // differ from the one the object was built for.
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const CompiledShader> shaders = {}) const;
+    // The data buffer a draw binds at Vulkan binding `vulkanBinding` (a ShaderData/FlattenedSrt
+    // role): the snapshot PrepareDrawBindings made for it (`hostBytes` then points at its mapped
+    // bytes, which only this draw uses), else the object's own (`hostBytes` null); VK_NULL_HANDLE
+    // when the binding holds no data buffer. `allocation` receives the buffer's allocation index.
+    VkBuffer DataBufferFor(std::uint32_t vulkanBinding, const DrawBindings* drawBindings, std::size_t* allocation, std::byte** hostBytes) const;
+    // Deferred flat slots (Draw.cpp recordDeferredFlat): `key` identifies the (slot, address) list
+    // the memo describes; `known` says `values` are the words the buffer holds at those slots (a
+    // GPU copy made while the source was pending leaves them unknown, with the write-watch
+    // `generation` collected at the copy: the buffer holds the source's current words while the
+    // range is unchanged since).
+    struct DeferredMemo {
+        std::uint64_t key = 0;
+        std::uint64_t generation = 0;
+        bool known = false;
+        std::vector<std::uint32_t> values;
+    };
+    DeferredMemo& DeferredMemoFor(std::size_t allocation) const;
     // Rebased draw templates (ContentKey with `rebaseReadOnly`): a draw key leaves the base address
     // of read-only guest buffers out, since ring-allocated constants move every frame; a hit then
     // snapshots each moved buffer from the draw's address into its own descriptor set copy
@@ -264,6 +283,8 @@ private:
         std::int32_t sourceShader = -1;
         std::uint32_t sourceBinding = 0;
         std::uint32_t sourceElement = 0;
+        // Data buffers: what the buffer holds at a binding's deferred flat slots (DeferredMemoFor).
+        mutable DeferredMemo deferred;
     };
     struct DataPatch {
         std::size_t allocation;

@@ -316,6 +316,10 @@ struct DescriptorBinding {
     // skip the write-back and the pending-write note for the element; an element beyond the vector
     // (a producer that does not fill it) must be treated as written.
     std::vector<bool> bufferWritten;
+    // FlattenedSrt: words the capture left to the GPU (ResourceSnapshot::deferredFlat): (word
+    // index, guest address). The driver copies each from guest memory into the data buffer on the
+    // GPU before the work runs; guestDescriptor holds a placeholder there.
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> deferredWords;
 };
 
 struct VertexAttribute {

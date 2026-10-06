@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace ShaderRecompiler {
@@ -40,6 +41,9 @@ struct ResourceSnapshot {
     std::vector<std::uint32_t> flattenedSrt;
     std::vector<std::uint32_t> userData;
     UniformFill uniformFill;
+    // Flat slots whose words the GPU fetches (SrtRuntime::deferPureLeaf): (flat offset, guest
+    // address), sorted; the word in flattenedSrt is a placeholder.
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> deferredFlat;
 };
 
 struct UniformFillPlan {

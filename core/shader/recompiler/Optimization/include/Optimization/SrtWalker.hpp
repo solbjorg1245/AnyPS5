@@ -40,6 +40,14 @@ struct SrtRuntime {
     // capture falls back to the interpreter over readMemory. Either null: the interpreter only.
     const Detail::WalkProgram* walk = nullptr;
     SrtMemoryReader expressRead = nullptr;
+    // Deferred flat slots: before either walk reads the leaf of a pure flat slot
+    // (IrResourcePlan::pureFlatSlots, a word no CPU evaluation consumes) it offers the read to
+    // deferPureLeaf; a driver claims it (true, `value` = a placeholder) when recorded GPU work
+    // still writes the word, so the CPU does not wait for the GPU. The claimed addresses go to
+    // deferredReads; the recompiler lists them per slot in ResourceSnapshot::deferredFlat and the
+    // driver copies each word on the GPU into the data buffer of every draw using the result.
+    SrtMemoryReader deferPureLeaf = nullptr;
+    std::vector<std::uint64_t>* deferredReads = nullptr;
 };
 
 enum class RuntimeValueType {

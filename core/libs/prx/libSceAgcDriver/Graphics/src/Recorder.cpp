@@ -1463,6 +1463,37 @@ void Recorder::recordKeyStores(bool forWriter) {
     if (forWriter) keyStoreRunsForWriter.fetch_add(1, std::memory_order_relaxed);
 }
 
+void Recorder::RecordCopies(std::span<const DeferredCopy> copies, CommandClass which) {
+    if (copies.empty()) return;
+    // Outside any render pass, in the open batch.
+    const auto commands = Commands();
+    const auto timing = beginTiming(ClassKey(which));
+    // Behind every earlier recorded write of the sources (a shader's stores through a V# bound in
+    // place, a transfer, a label), and visible to the work after.
+    recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    const auto copy = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
+    // One vkCmdCopyBuffer per (source, destination) pair with all its regions.
+    struct Group {
+        VkBuffer source;
+        VkBuffer destination;
+        std::vector<VkBufferCopy> regions;
+    };
+    std::vector<Group> groups;
+    std::uint64_t bytes = 0;
+    for (const auto& item : copies) {
+        auto group = std::find_if(groups.begin(), groups.end(), [&](const Group& candidate) { return candidate.source == item.source && candidate.destination == item.destination; });
+        if (group == groups.end()) group = groups.insert(groups.end(), Group{item.source, item.destination, {}});
+        group->regions.push_back({item.sourceOffset, item.destinationOffset, item.bytes});
+        bytes += item.bytes;
+    }
+    for (const auto& group : groups) copy(commands, group.source, group.destination, static_cast<std::uint32_t>(group.regions.size()), group.regions.data());
+    constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, copiedAccess);
+    CountBarriers(which, 2);
+    EndGpuTiming(timing, bytes);
+    open->coveredAccess = copiedAccess;
+}
+
 void Recorder::ensureOpen() {
     GuestMemory::AssertGpuLockHeld("Recorder::Commands");
     if (open == nullptr) {
@@ -1675,7 +1706,7 @@ namespace {
 
 constexpr std::uint32_t MaxTimedRanges = 512;
 constexpr std::size_t CommandClasses = static_cast<std::size_t>(Recorder::CommandClass::Count);
-constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh"};
+constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh", "deferred-flat"};
 // [barriers] counters by class (relaxed: only reported) and the [gputime] totals, which the
 // presenter's thread adds to without the GPU mutex (AddGpuTiming).
 std::atomic<std::uint64_t> classBarriers[CommandClasses]{};

@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -169,6 +170,12 @@ struct DrawOutcome {
     // A recorded draw began a render pass of its own, or continued the previous draw's.
     bool passBegun = false;
     bool passContinued = false;
+    // Deferred flat slots (recordDeferredFlat): words copied on the GPU and the copy regions, words
+    // filled on the CPU, bindings whose buffer already held the words.
+    std::uint64_t deferredFlatWords = 0;
+    std::uint64_t deferredFlatCopies = 0;
+    std::uint64_t deferredFlatCpu = 0;
+    std::uint64_t deferredFlatUnchanged = 0;
     SyncReason reason = SyncNone;
     // Shader validation memo (see CachedFragmentOutputs).
     bool validateMemoized = false;
@@ -222,6 +229,10 @@ struct DrawProfile {
     std::uint64_t partialLookups = 0;
     std::uint64_t pagesWalked = 0;
     double lookupUs = 0;
+    std::uint64_t deferredFlatWords = 0;
+    std::uint64_t deferredFlatCopies = 0;
+    std::uint64_t deferredFlatCpu = 0;
+    std::uint64_t deferredFlatUnchanged = 0;
     std::array<double, PhaseCount> totalsUs{};
     // The longest single draw's time per phase, and the longest draw: the [lock] line's 'draw'
     // hold max (tens of ms against an average well under a millisecond) needs a phase name.
@@ -330,6 +341,10 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     if (outcome.completion) ++profile.completion;
     if (outcome.passBegun) ++profile.passesBegun;
     if (outcome.passContinued) ++profile.passesContinued;
+    profile.deferredFlatWords += outcome.deferredFlatWords;
+    profile.deferredFlatCopies += outcome.deferredFlatCopies;
+    profile.deferredFlatCpu += outcome.deferredFlatCpu;
+    profile.deferredFlatUnchanged += outcome.deferredFlatUnchanged;
     ++profile.reasons[outcome.reason];
     (outcome.recorded ? (outcome.waited ? profile.waitedUs : profile.recordedUs) : profile.synchronousUs) += drawUs;
     profile.targetLookups += outcome.targetLookups;
@@ -355,7 +370,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     const auto synchronous = profile.draws - profile.recorded - profile.waited;
     const auto average = [](double total, std::uint64_t count) { return count != 0 ? total / static_cast<double>(count) : 0.0; };
     char line[2048];
-    int n = std::snprintf(line, sizeof(line), "[draws] %llu draws over 10 s (%llu recorded avg %.0f us, of them %llu with completion; %llu recorded then waited avg %.0f us; %llu synchronous avg %.0f us; render passes %llu begun, %llu draws continued one; waited or synchronous because:", static_cast<unsigned long long>(profile.draws), static_cast<unsigned long long>(profile.recorded), average(profile.recordedUs, profile.recorded), static_cast<unsigned long long>(profile.completion), static_cast<unsigned long long>(profile.waited), average(profile.waitedUs, profile.waited), static_cast<unsigned long long>(synchronous), average(profile.synchronousUs, synchronous), static_cast<unsigned long long>(profile.passesBegun), static_cast<unsigned long long>(profile.passesContinued));
+    int n = std::snprintf(line, sizeof(line), "[draws] %llu draws over 10 s (%llu recorded avg %.0f us, of them %llu with completion; %llu recorded then waited avg %.0f us; %llu synchronous avg %.0f us; render passes %llu begun, %llu draws continued one, deferred flat words: %llu copied on the GPU in %llu copies, %llu filled on the CPU, %llu bindings unchanged; waited or synchronous because:", static_cast<unsigned long long>(profile.draws), static_cast<unsigned long long>(profile.recorded), average(profile.recordedUs, profile.recorded), static_cast<unsigned long long>(profile.completion), static_cast<unsigned long long>(profile.waited), average(profile.waitedUs, profile.waited), static_cast<unsigned long long>(synchronous), average(profile.synchronousUs, synchronous), static_cast<unsigned long long>(profile.passesBegun), static_cast<unsigned long long>(profile.passesContinued), static_cast<unsigned long long>(profile.deferredFlatWords), static_cast<unsigned long long>(profile.deferredFlatCopies), static_cast<unsigned long long>(profile.deferredFlatCpu), static_cast<unsigned long long>(profile.deferredFlatUnchanged));
     const auto room = [&] { return n > 0 && static_cast<std::size_t>(n) < sizeof(line); };
     for (std::size_t i = SyncNone + 1; i < SyncCount && room(); ++i) {
         if (profile.reasons[i] != 0) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", SyncReasonNames[i], static_cast<unsigned long long>(profile.reasons[i]));
@@ -406,6 +421,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.addressBuilds = 0;
     profile.draws = profile.recorded = profile.waited = profile.completion = 0;
     profile.passesBegun = profile.passesContinued = 0;
+    profile.deferredFlatWords = profile.deferredFlatCopies = profile.deferredFlatCpu = profile.deferredFlatUnchanged = 0;
     profile.reasons.fill(0);
     profile.recordedUs = profile.waitedUs = profile.synchronousUs = 0;
     profile.targetLookups = profile.slowLookups = 0;
@@ -976,6 +992,158 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
     return resident;
 }
 
+namespace {
+
+// Identifies a binding's deferred (slot, address) list for the data buffer memo.
+std::uint64_t DeferredKey(const std::vector<std::pair<std::uint32_t, std::uint64_t>>& words) {
+    std::uint64_t hash = 14695981039346656037ull;
+    for (const auto& [slot, address] : words) {
+        hash = (hash ^ slot) * 1099511628211ull;
+        hash = (hash ^ address) * 1099511628211ull;
+    }
+    return hash;
+}
+
+}
+
+// Deferred flat slots (ResourceSnapshot::deferredFlat, ShaderMemory::deferPureLeaf): the pure flat
+// SRT words a stage's capture left to the GPU must be in the stage's data buffer (the template's
+// own, or this draw's snapshot of it) when the draw runs. While recorded GPU work still writes
+// them (the upload kernel ran just before this draw) they are copied on the GPU from their host
+// imports, behind that work (Recorder::RecordCopies ends an open pass, so the draw begins one).
+// Otherwise the words are read raw now (nothing recorded writes them; a CPU store into a range
+// noted as an in-place read waits for the batch): a fresh snapshot buffer is filled on the CPU, and
+// the template's own buffer is left alone when it is known to hold these words already (the memo:
+// the values the last fill left, or the write-watch generation of the last GPU copy, which read the
+// same words when nothing stamped the range since), else copied into on the GPU. The upload kernel
+// rewrites the whole block before most draws, so the memo compares values, not stamps. Returns
+// whether anything was recorded. A word outside the host imports is read on the CPU through the
+// flush hook and written with vkCmdUpdateBuffer.
+bool recordDeferredFlat(const Context& context, Recorder& recorder, const ShaderResources& resources, const ShaderResources::DrawBindings* drawBindings, std::span<const CompiledShader> shaders, DrawOutcome& outcome) {
+    std::vector<Recorder::DeferredCopy> copies;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    std::vector<std::pair<VkBuffer, std::pair<VkDeviceSize, std::uint32_t>>> fallbacks;
+    std::vector<std::uint32_t> current;
+    struct Region {
+        std::size_t first;
+        std::size_t last;
+    };
+    std::vector<Region> regions;
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) continue;
+        for (const auto& binding : shader.program->bindings) {
+            if (binding.role != ShaderRecompiler::DescriptorRole::FlattenedSrt || binding.deferredWords.empty()) continue;
+            const auto& words = binding.deferredWords;
+            std::size_t allocation = 0;
+            std::byte* hostBytes = nullptr;
+            const VkBuffer destination = resources.DataBufferFor(binding.binding, drawBindings, &allocation, &hostBytes);
+            Require(destination != VK_NULL_HANDLE, "deferred flat slots without a data buffer");
+            std::uint64_t spanBegin = std::numeric_limits<std::uint64_t>::max(), spanEnd = 0;
+            for (const auto& [slot, address] : words) {
+                Require(slot < binding.guestDescriptor.size(), "deferred flat slot outside the data words");
+                spanBegin = std::min(spanBegin, address);
+                spanEnd = std::max(spanEnd, address + sizeof(std::uint32_t));
+            }
+            const auto spanBytes = static_cast<std::size_t>(spanEnd - spanBegin);
+            // Regions of consecutive slots at consecutive addresses (the pairs are sorted by slot).
+            regions.clear();
+            for (std::size_t first = 0; first < words.size();) {
+                std::size_t last = first + 1;
+                while (last < words.size() && words[last].first == words[last - 1].first + 1 && words[last].second == words[last - 1].second + sizeof(std::uint32_t)) ++last;
+                regions.push_back({first, last});
+                first = last;
+            }
+            // Pending here means the writer's batch has not run yet (open, or in flight with its
+            // fence unsignaled): a finished batch nobody reaped leaves the words readable now.
+            const auto pendingInfo = recorder.DescribePendingWrite(spanBegin, spanBytes);
+            const bool pending = pendingInfo.has_value() && !pendingInfo->signaled;
+            if (!pending) {
+                current.resize(words.size());
+                bool mapped = true;
+                for (const auto& region : regions) {
+                    if (!mapped) break;
+                    mapped = GuestMemory::CopyMapped(words[region.first].second, std::as_writable_bytes(std::span(current).subspan(region.first, region.last - region.first))) == GuestMemory::Compare::Equal;
+                }
+                if (mapped) {
+                    if (hostBytes != nullptr) {
+                        for (std::size_t i = 0; i < words.size(); ++i) std::memcpy(hostBytes + static_cast<std::size_t>(words[i].first) * sizeof(std::uint32_t), &current[i], sizeof(std::uint32_t));
+                        outcome.deferredFlatCpu += words.size();
+                        continue;
+                    }
+                    auto& memo = resources.DeferredMemoFor(allocation);
+                    const auto key = DeferredKey(words);
+                    if (memo.key == key) {
+                        if (memo.known && memo.values == current) {
+                            ++outcome.deferredFlatUnchanged;
+                            continue;
+                        }
+                        if (!memo.known && memo.generation != 0 && GuestMemory::UnchangedSince(spanBegin, spanBytes, memo.generation)) {
+                            // The last GPU copy read these very words.
+                            memo.values = current;
+                            memo.known = true;
+                            ++outcome.deferredFlatUnchanged;
+                            continue;
+                        }
+                    }
+                    // The buffer holds other words: the copy below reads exactly `current` (no GPU
+                    // write is pending; a CPU store waits for the batch).
+                    memo.key = key;
+                    memo.values = current;
+                    memo.known = true;
+                    memo.generation = GuestMemory::CollectWrites(spanBegin, spanBytes);
+                } else if (hostBytes == nullptr) {
+                    auto& memo = resources.DeferredMemoFor(allocation);
+                    memo.known = false;
+                    memo.values.clear();
+                    memo.key = DeferredKey(words);
+                    memo.generation = 0;
+                }
+            } else if (hostBytes == nullptr) {
+                // The GPU copy reads whatever the pending work leaves: unknown until read later.
+                auto& memo = resources.DeferredMemoFor(allocation);
+                memo.known = false;
+                memo.values.clear();
+                memo.key = DeferredKey(words);
+                memo.generation = GuestMemory::CollectWrites(spanBegin, spanBytes);
+            }
+            for (const auto& region : regions) {
+                const auto [slot, address] = words[region.first];
+                const auto bytes = static_cast<std::uint64_t>(region.last - region.first) * sizeof(std::uint32_t);
+                outcome.deferredFlatWords += region.last - region.first;
+                const auto* import = HostImportFor(context, address, static_cast<std::size_t>(bytes));
+                if (import == nullptr) {
+                    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Capture);
+                    for (std::size_t i = region.first; i < region.last; ++i) {
+                        std::uint32_t word = 0;
+                        GuestMemory::Read(words[i].second, std::as_writable_bytes(std::span(&word, 1)), alignof(std::uint32_t));
+                        fallbacks.push_back({destination, {static_cast<VkDeviceSize>(words[i].first) * sizeof(std::uint32_t), word}});
+                    }
+                    continue;
+                }
+                Recorder::DeferredCopy item;
+                item.source = import->buffer;
+                item.destination = destination;
+                item.sourceOffset = address - import->base;
+                item.destinationOffset = static_cast<VkDeviceSize>(slot) * sizeof(std::uint32_t);
+                item.bytes = bytes;
+                copies.push_back(item);
+                reads.emplace_back(address, address + bytes);
+            }
+        }
+    }
+    if (copies.empty() && fallbacks.empty()) return false;
+    recorder.RecordCopies(copies, Recorder::CommandClass::DeferredFlat);
+    if (!fallbacks.empty()) {
+        const auto commands = recorder.Commands();
+        const auto update = context.Resolved(&DeviceFunctions::cmdUpdateBuffer, "vkCmdUpdateBuffer");
+        for (const auto& [buffer, patch] : fallbacks) update(commands, buffer, patch.first, sizeof(std::uint32_t), &patch.second);
+        recorder.MarkCovered(0);
+    }
+    if (!reads.empty()) recorder.NotePendingReads(reads, Recorder::ReadKind::DrawInput);
+    outcome.deferredFlatCopies += copies.size() + fallbacks.size();
+    return true;
+}
+
 // A draw's resources (resolveDrawResources): the resource-cache template a recordable draw's
 // stages repeat, or a fresh build.
 struct ResolvedResources {
@@ -1393,11 +1561,14 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, shaders);
+    // Deferred flat slots: the words a stage's capture left to the GPU are copied into the data
+    // buffer now, behind the work that writes them (recordDeferredFlat ends an open pass).
+    const bool deferredFlat = recordDeferredFlat(context, *recorder, resources, drawBindings.get(), shaders, outcome);
     const bool capture = CaptureInputsEnabled();
     // A GPU-side draw whose records need no rewrite reads them in place, covered by the pass's
     // opening barrier, so it continues the pass like any other draw.
     const bool rewrites = gpuIndirect && rewritesRecords(*args);
-    const bool continued = !capture && !readsTarget && !rewrites && recorder->ContinuesRenderPass(passKey);
+    const bool continued = !capture && !readsTarget && !rewrites && !deferredFlat && recorder->ContinuesRenderPass(passKey);
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
     const auto commands = continued ? recorder->CommandsInRenderPass() : recorder->Commands();

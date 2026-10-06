@@ -152,11 +152,18 @@ bool Evaluator::EvaluateRawRead(IrValue& inst, std::uint64_t& result) {
             return false;
         }
     }
+    bool pureLeaf = false;
     if (auto* trace = _runtime.readTrace; trace != nullptr) {
-        if (&inst == trace->leaf) trace->leaves.emplace_back(trace->leafSlot, address);
+        pureLeaf = &inst == trace->leaf;
+        if (pureLeaf) trace->leaves.emplace_back(trace->leafSlot, address);
         else trace->otherReads.push_back(address);
     }
     std::uint32_t word = 0;
+    // A pure slot's leaf the driver defers to the GPU (SrtRuntime::deferPureLeaf) is not read.
+    if (pureLeaf && _runtime.deferPureLeaf != nullptr && _runtime.deferPureLeaf(_runtime.userContext, address, &word)) {
+        result = word;
+        return true;
+    }
     if (_runtime.readMemory != nullptr) {
         if (!_runtime.readMemory(_runtime.userContext, address, &word)) {
             return false;

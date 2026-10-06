@@ -103,7 +103,7 @@ bool Driver::traceCapSync() {
     return trace;
 }
 
-void Driver::observeDword(std::uint64_t address, bool unchanged) {
+void Driver::observeDword(std::uint64_t address, bool unchanged, std::uint32_t value) {
     if (!writeEvidenceEnabled()) return;
     (unchanged ? observedUnchanged : observedChanged).fetch_add(1, std::memory_order_relaxed);
     std::lock_guard lock(writtenBuffersMutex);
@@ -120,18 +120,22 @@ void Driver::observeDword(std::uint64_t address, bool unchanged) {
     } else if (evidence.streak < (1u << 30u)) {
         ++evidence.streak;
     }
+    evidence.lastValue = value;
+    evidence.valueKnown = true;
 }
 
 void Driver::observeRange(std::uint64_t address, std::span<const std::byte> before) {
     if (before.empty() || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), before.size())) return;
     const auto* now = reinterpret_cast<const std::byte*>(address);
     for (std::size_t offset = 0; offset + 4 <= before.size(); offset += 4) {
-        observeDword(address + offset, std::memcmp(before.data() + offset, now + offset, 4) == 0);
+        std::uint32_t value = 0;
+        std::memcpy(&value, now + offset, sizeof(value));
+        observeDword(address + offset, std::memcmp(before.data() + offset, now + offset, 4) == 0, value);
     }
 }
 
-void Driver::observePendingWrite(std::uint64_t address, bool unchanged) {
-    Get().observeDword(address, unchanged);
+void Driver::observePendingWrite(std::uint64_t address, bool unchanged, std::uint32_t value) {
+    Get().observeDword(address, unchanged, value);
 }
 
 bool Driver::knownValueCurrent(const WrittenBuffer& writer) {
@@ -178,6 +182,10 @@ ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, s
         }
         return knownValueVerify() ? Policy::VerifyKnownValue : Policy::KnownValue;
     }
+    // A single dword with its last observed value known is read raw against that value
+    // (RawExpected: a different value ends the evidence and waits), which replaces the sampled
+    // verification for it; a longer range keeps the sample.
+    bool expected = false;
     {
         std::lock_guard lock(writtenBuffersMutex);
         for (std::uint64_t dword = first; dword < limit; dword += 4) {
@@ -190,8 +198,13 @@ ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, s
                 reason = &ValidateCounters::syncedWriterChanged;
                 return Policy::Sync;
             }
+            if (bytes == sizeof(std::uint32_t) && known.size() == bytes && found->second.valueKnown && !validateSkipVerify()) {
+                std::memcpy(known.data(), &found->second.lastValue, sizeof(std::uint32_t));
+                expected = true;
+            }
         }
     }
+    if (expected) return Policy::RawExpected;
     if (sampledRead()) {
         reason = &ValidateCounters::syncedSample;
         return Policy::Sync;
