@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libc/include/HostMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -114,7 +115,7 @@ bool addressSpaceCacheEnabled() {
 // Imports persist across draws, keyed by allocation base, and are dropped when their allocation leaves
 // the registered set; a dropped import is destroyed once the recorded work that may read it completed.
 struct HostImports {
-    std::mutex mutex;
+    HostMutex mutex;
     VkDevice device = VK_NULL_HANDLE;
     PFN_vkDestroyBuffer destroyBuffer = nullptr;
     PFN_vkFreeMemory freeMemory = nullptr;
@@ -435,7 +436,7 @@ bool importsStale(const Context& context, const HostImports& state) {
 // GuestMemory::GpuMutex only (every completion and every stage B holds it). APS5_NO_LEASE_MIRROR=1
 // restores copies.
 struct ImageMirrors {
-    std::mutex mutex;
+    HostMutex mutex;
     VkDevice device = VK_NULL_HANDLE;
     std::map<std::uint64_t, std::shared_ptr<ImageMirror>> entries;
     std::set<std::uint64_t> failed;
@@ -473,7 +474,7 @@ AddressBuildTiming& ThreadAddressTiming() {
 }
 
 struct AddressBuildTotals {
-    std::mutex mutex;
+    HostMutex mutex;
     std::uint64_t builds = 0;
     AddressBuildTiming sums;
     double snapshotsUs = 0;
@@ -853,7 +854,7 @@ void reportMirrors() {
 // waiter yields instead when its own thread holds the device lock (a driver thread mutating the
 // registry mid-packet, as the plain spin did) and reports whether it finished any work.
 struct LeaseState {
-    std::mutex mutex;
+    HostMutex mutex;
     LeaseStats stats;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
     // Under GuestMemory::GpuMutex: the recorder whose batches hold leases (serials restart with a
@@ -1704,8 +1705,8 @@ bool traceStagingEnabled() {
     return trace;
 }
 
-std::mutex& stagedTraceMutex() {
-    static std::mutex mutex;
+HostMutex& stagedTraceMutex() {
+    static HostMutex mutex;
     return mutex;
 }
 
@@ -1834,7 +1835,7 @@ struct StagedShadow {
 };
 
 struct StagedShadows {
-    std::mutex mutex;
+    HostMutex mutex;
     std::map<std::pair<std::uint64_t, std::uint64_t>, StagedShadow> entries;
 };
 
@@ -2243,7 +2244,7 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     if (profile) {
         // Why the region is copied rather than bound in place, totalled every 1000 uploads (under a
         // mutex: prepare stages of several builds copy at once).
-        static std::mutex reasonsMutex;
+        static HostMutex reasonsMutex;
         static std::uint64_t uploads = 0, noImport = 0, noImportBytes = 0, misaligned = 0, misalignedBytes = 0, snapshotOnly = 0, snapshotBytes = 0;
         static std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> outside;
         bool inImport = false;

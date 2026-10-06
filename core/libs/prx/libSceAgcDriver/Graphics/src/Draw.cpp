@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libc/include/HostMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
@@ -214,7 +215,7 @@ enum DrawKind : std::size_t { KindRecipeHit, KindTemplateHit, KindBuild, KindBda
 constexpr std::array<const char*, KindCount> DrawKindNames{"recipe hit", "template hit", "build", "BDA"};
 
 struct DrawProfile {
-    std::mutex mutex;
+    HostMutex mutex;
     std::array<double, KindCount> kindUs{};
     std::array<std::uint64_t, KindCount> kindCounts{};
     std::uint64_t fullScissorLookups = 0;
@@ -508,8 +509,8 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
     return keyed;
 }
 
-std::mutex& validationMutex() {
-    static std::mutex mutex;
+HostMutex& validationMutex() {
+    static HostMutex mutex;
     return mutex;
 }
 
@@ -955,7 +956,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         resident = lookup();
         if (resident != nullptr) materializeRegisterClear(context, color, *resident);
     } catch (const std::exception& error) {
-        static std::mutex reportMutex;
+        static HostMutex reportMutex;
         static std::set<std::uint64_t> reported;
         std::lock_guard lock(reportMutex);
         if (reported.insert(color.address).second) std::fprintf(stderr, "[gpu] color target 0x%llx stays non-resident: %s\n", static_cast<unsigned long long>(color.address), error.what());
@@ -1553,7 +1554,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         std::unique_ptr<Buffer> dump;
     };
     const int dumpLimit = DumpTargetLimit();
-    static std::mutex dumpMutex;
+    static HostMutex dumpMutex;
     static std::map<std::uint64_t, int> dumped;
     std::vector<TargetBinding> targets(state.colors.size());
     std::vector<VkImageView> targetViews;

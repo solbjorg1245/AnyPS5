@@ -1,4 +1,5 @@
 #include "Recompiler.hpp"
+#include "prx/libc/include/HostMutex.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -189,7 +190,7 @@ std::shared_ptr<const WalkProgram> CompileWalkProgram(const IrResourcePlan& plan
 }
 
 struct SourceEntry {
-    std::mutex mutex;
+    HostMutex mutex;
     // The code the entry was built for: the key carries only a hash of it, so a candidate entry is
     // accepted only when its code matches word for word. Owned here because the request's span
     // points into a registration the driver may replace while the entry lives on.
@@ -236,7 +237,7 @@ struct SourceKeyHash {
 };
 
 std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request) {
-    static std::shared_mutex mutex;
+    static HostSharedMutex mutex;
     // Entries whose code hashes alike share a bucket; the code comparison picks the right one.
     static std::unordered_map<std::vector<std::uint64_t>, std::vector<std::shared_ptr<SourceEntry>>, SourceKeyHash> sources;
     struct SourceKeyStorage {};

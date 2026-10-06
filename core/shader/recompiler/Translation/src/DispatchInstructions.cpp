@@ -1,4 +1,5 @@
 #include "Translation/DispatchInstructions.hpp"
+#include "prx/libc/include/HostMutex.hpp"
 #include "Translation/TranslationContext.hpp"
 #include "Recompiler.hpp"
 #include <mutex>
@@ -131,7 +132,7 @@ DebugProbe currentProbe() {
     static const DebugProbe fromEnvironment = parseProbe(std::getenv("APS5_PROBE"));
     static const char* file = std::getenv("APS5_PROBE_FILE");
     if (file == nullptr) return fromEnvironment;
-    static std::mutex mutex;
+    static HostMutex mutex;
     static DebugProbe fromFile;
     static std::chrono::steady_clock::time_point readAt{};
     std::lock_guard lock(mutex);

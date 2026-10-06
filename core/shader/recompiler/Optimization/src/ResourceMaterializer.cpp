@@ -1,4 +1,5 @@
 #include "Optimization/ResourceMaterializer.hpp"
+#include "prx/libc/include/HostMutex.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
@@ -295,7 +296,7 @@ struct TableTrace {
 };
 
 void traceTable(const IrResourcePlan& plan, const ImageResource& image, const DescriptorSource::IndirectImage& table, std::uint64_t heapBase, std::uint64_t materialBase, const TableTrace& trace) {
-    static std::mutex mutex;
+    static HostMutex mutex;
     static std::map<std::pair<std::uint64_t, std::uint32_t>, TableTrace> seen;
     std::lock_guard lock(mutex);
     auto& last = seen[{plan.shaderHash, image.firstUsePc}];

@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRIVER_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
+#include "prx/libc/include/HostMutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketHistory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
@@ -244,7 +245,7 @@ private:
     std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>> dispatchCache;
 
     std::list<std::uint64_t> dispatchOrder;
-    std::mutex dispatchCacheMutex;
+    HostMutex dispatchCacheMutex;
     std::uint64_t dispatchCacheHits = 0;
     std::uint64_t dispatchCacheEvictions = 0;
 
@@ -260,23 +261,23 @@ private:
 
     std::unordered_map<std::uint64_t, std::shared_ptr<DrawEntry>> drawCache;
     std::list<std::uint64_t> drawOrder;
-    std::mutex drawCacheMutex;
+    HostMutex drawCacheMutex;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
 
     DrawEntryCounters drawEntryCounters;
 
-    std::mutex driverPhasesMutex;
+    HostMutex driverPhasesMutex;
     std::array<DriverPhaseTotals, DispatchClassCount> driverPhaseTotals{};
     std::chrono::steady_clock::time_point driverPhasesReport = std::chrono::steady_clock::now();
 
-    std::mutex drawPhasesMutex;
+    HostMutex drawPhasesMutex;
     DrawPhaseTotals drawPhaseTotals;
 
     std::map<std::uint32_t, QueueState> queues;
     std::map<std::uint32_t, std::shared_ptr<IVideoOutput>> outputs;
     DevicePointer device;
 
-    std::mutex labelStoresMutex;
+    HostMutex labelStoresMutex;
     std::unordered_map<std::uint64_t, std::array<LabelStore, LabelStoreHistory>> labelStores;
 
     std::vector<std::shared_ptr<VulkanDevice>> replacedDevices;
@@ -297,7 +298,7 @@ private:
     std::atomic<std::uint64_t> evidenceReads{0};
     std::atomic<std::uint64_t> evidenceValidations{0};
 
-    std::mutex writtenBuffersMutex;
+    HostMutex writtenBuffersMutex;
     std::deque<WrittenBuffer> writtenBuffers;
     std::uint64_t writtenBufferSerial = 0;
     std::unordered_map<std::uint64_t, DwordEvidence> dwordEvidence;
@@ -307,7 +308,7 @@ private:
     std::atomic<std::uint64_t> observationsNoWait{0};
     std::atomic<std::uint64_t> observationsNotReached{0};
 
-    std::mutex validateMutex;
+    HostMutex validateMutex;
     ValidateCounters validateCounters;
 
 };

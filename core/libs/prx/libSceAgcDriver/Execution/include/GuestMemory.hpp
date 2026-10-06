@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 
 #include <atomic>
+#include "prx/libc/include/HostMutex.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -143,7 +144,7 @@ public:
 
 private:
     void acquired();
-    std::recursive_mutex mutex;
+    HostRecursiveMutex mutex;
     // The holder's thread token and recursion depth, written by the holder only; another thread
     // reads the owner just to see that it is not itself.
     std::atomic<const void*> owner{nullptr};

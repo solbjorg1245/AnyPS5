@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libc/include/HostMutex.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -40,7 +41,7 @@ struct AddressEntry {
 
 struct AddressRegistry {
     static constexpr std::size_t RetiredKept = 4096;
-    std::mutex mutex;
+    HostMutex mutex;
     std::map<VkDeviceAddress, AddressEntry> live;
     std::deque<AddressEntry> retired;
 };
@@ -86,7 +87,7 @@ struct DestroyedImport {
 };
 
 struct ImportHandles {
-    std::mutex mutex;
+    HostMutex mutex;
     std::map<VkBuffer, DestroyedImport> destroyed;
 };
 

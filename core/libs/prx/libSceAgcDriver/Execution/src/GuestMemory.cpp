@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/HostMutex.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -141,13 +142,13 @@ struct MemoryCounters {
 };
 
 struct MemoryProfile {
-    std::mutex threadsMutex;
+    HostMutex threadsMutex;
     std::vector<const MemoryCounters*> threads;
     MemoryCounters retired;
     MemoryCounters shared;
     std::atomic<std::int64_t> lastReport{0};
     // Sampled callers of Read and Write (module offsets), to name what touches guest memory most.
-    std::mutex callersMutex;
+    HostMutex callersMutex;
     std::array<std::pair<unsigned long long, std::uint64_t>, 16> callers{};
     std::array<std::pair<unsigned long long, std::uint64_t>, 16> writeCallers{};
 };
@@ -410,10 +411,16 @@ struct PageSpan {
 
 struct PageStates {
     std::once_flag once;
+    // Set after the once-call returned: the fast path of every page query skips the
+    // std::call_once (libwinpthread) that each access made before.
+    std::atomic<bool> ready{false};
     PageSpan arena;
     PageSpan image;
 
-    void initialize();
+    void initialize() {
+        if (!ready.load(std::memory_order_acquire)) initializeSlow();
+    }
+    void initializeSlow();
 
     PageSpan* spanOf(std::uintptr_t address) {
         if (arena.covers(address)) return &arena;
@@ -456,7 +463,7 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
     forgetSerial.fetch_add(1, std::memory_order_release);
 }
 
-void PageStates::initialize() {
+void PageStates::initializeSlow() {
     std::call_once(once, [&] {
         GuestArena::GuestArenaRange_nid_postfix(&arena.base, &arena.size);
         const bool arenaCached = arena.allocate();
@@ -480,6 +487,7 @@ void PageStates::initialize() {
 #endif
         if (arenaCached || imageCached) GuestAllocations::GuestAllocationsSetInvalidator_nid_postfix(&ForgetPages);
     });
+    ready.store(true, std::memory_order_release);
 }
 
 struct PageRun {
@@ -682,7 +690,7 @@ constexpr std::size_t WriteBlockBytes = 65536;
 enum class StampKind : std::uint8_t { Cpu, Driver, ImportWindow };
 
 struct WriteTracker {
-    std::mutex mutex;
+    HostMutex mutex;
     bool initialized = false;
     bool watched = false;
 #ifdef _WIN32
@@ -737,6 +745,7 @@ struct WriteTracker {
         if (!watched) return;
         blocks.assign(size / WriteBlockBytes + 1, 0);
         cpuBlocks.assign(size / WriteBlockBytes + 1, 0);
+        driverPieces.assign(size / WriteBlockBytes + 1, DriverPieces{});
         writtenBlocks.assign(size / WriteBlockBytes + 1, 0);
         pages.resize(1u << 16);
 #else
@@ -778,22 +787,29 @@ struct WriteTracker {
         std::uint32_t whole = 0;
         std::uint32_t dropped = 0;
         std::uint32_t next = 0;
+        // Whether any driver store was noted for the block (an unordered_map held only noted
+        // blocks before; the flat table, one entry per block like the stamps, costs no lookup
+        // or allocation per block marked).
+        bool noted = false;
         std::array<DriverPiece, 4> pieces{};
     };
-    std::unordered_map<std::uint64_t, DriverPieces> driverPieces;
+    std::vector<DriverPieces> driverPieces;
 
     void noteDriverStore(std::uint64_t block, std::uint64_t address, std::uint64_t end, std::uint32_t stampGeneration) {
         const auto begin = blockBegin(block);
         const auto from = static_cast<std::uint32_t>(std::max(address, begin) - begin);
         const auto to = static_cast<std::uint32_t>(std::min<std::uint64_t>(end, begin + WriteBlockBytes) - begin);
         if (from == 0 && to == WriteBlockBytes) {
-            if (const auto found = driverPieces.find(block); found != driverPieces.end()) {
-                found->second = DriverPieces{};
-                found->second.whole = stampGeneration;
+            auto& whole = driverPieces[block];
+            if (whole.noted) {
+                whole = DriverPieces{};
+                whole.noted = true;
+                whole.whole = stampGeneration;
             }
             return;
         }
         auto& entry = driverPieces[block];
+        entry.noted = true;
         auto& slot = entry.pieces[entry.next++ % entry.pieces.size()];
         entry.dropped = std::max(entry.dropped, slot.generation);
         slot = {stampGeneration, from, to};
@@ -850,7 +866,7 @@ WriteTracker& Tracker() {
 
 // Takes the tracker mutex; under APS5_PROFILE_DRAW an acquisition that found it held is counted
 // ('tracker waits N / M' in [guestmem]), which says whether walking outside the lock would pay.
-std::unique_lock<std::mutex> lockTracker(WriteTracker& tracker) {
+std::unique_lock<HostMutex> lockTracker(WriteTracker& tracker) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return std::unique_lock(tracker.mutex);
     std::unique_lock lock(tracker.mutex, std::try_to_lock);
@@ -1250,9 +1266,8 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
     for (auto block = first; block <= last; ++block) {
         if (tracker.writtenStampOf(block) <= generation) continue;
         if (tracker.cpuStampOf(block) > generation) return true;
-        const auto found = tracker.driverPieces.find(block);
-        if (found == tracker.driverPieces.end()) return true;
-        const auto& entry = found->second;
+        const auto& entry = tracker.driverPieces[block];
+        if (!entry.noted) return true;
         if (entry.whole > generation || entry.dropped > generation) return true;
         const auto begin = tracker.blockBegin(block);
         const auto from = std::max(address, begin) - begin;

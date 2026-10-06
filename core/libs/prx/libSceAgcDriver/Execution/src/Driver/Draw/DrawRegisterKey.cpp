@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libc/include/HostMutex.hpp"
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -19,7 +20,7 @@ void probeKeyChurn(const QueueState& queue) {
     static const bool enabled = std::getenv("APS5_TRACE_DRAW_KEY_CHURN") != nullptr;
     if (!enabled) return;
     constexpr std::size_t Ranges = Graphics::DrawKeyRegisters.size();
-    static std::mutex mutex;
+    static HostMutex mutex;
     static std::array<std::unordered_set<std::uint64_t>, Ranges + 1> seen;
     static std::array<std::uint64_t, Ranges + 1> repeats{};
     static std::uint64_t total = 0;

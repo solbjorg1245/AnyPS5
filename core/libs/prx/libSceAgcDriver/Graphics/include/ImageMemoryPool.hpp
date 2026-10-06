@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_IMAGEMEMORYPOOL_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libc/include/HostMutex.hpp"
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -111,7 +112,7 @@ private:
     };
     VkDevice device;
     const Context context;
-    std::mutex mutex;
+    HostMutex mutex;
     std::vector<std::unique_ptr<Block>> blocks;
 };
 

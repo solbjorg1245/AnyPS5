@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_SAMPLER_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libc/include/HostMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestSamplerResource.hpp"
 #include <array>
 #include <cstdint>
@@ -48,7 +49,7 @@ private:
         std::shared_ptr<Sampler> sampler;
         std::uint64_t lastUse;
     };
-    std::mutex mutex;
+    HostMutex mutex;
     std::map<std::array<std::uint32_t, 5>, Entry> entries;
     std::uint64_t clock = 0;
     std::size_t capacity;

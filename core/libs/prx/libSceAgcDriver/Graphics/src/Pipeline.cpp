@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libc/include/HostMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <algorithm>
 #include <array>
@@ -415,7 +416,7 @@ struct PipelineStore {
         std::vector<std::byte> key;
         std::shared_ptr<Pipeline> pipeline;
     };
-    std::mutex mutex;
+    HostMutex mutex;
     // Least recently used first.
     std::list<Entry> entries;
     std::unordered_map<std::uint64_t, std::list<Entry>::iterator> index;

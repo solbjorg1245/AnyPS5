@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libc/include/HostMutex.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/FrameTrace.hpp"
@@ -275,7 +276,7 @@ struct VulkanDevice::State {
     // Compute pipeline objects by variant (and push-constant use), under their own mutex: the
     // dispatch's find-or-insert and the verify switch's lookups touch the map, recipes hold weak
     // references to its objects.
-    std::mutex computePipelinesMutex;
+    HostMutex computePipelinesMutex;
     std::map<std::uint64_t, std::shared_ptr<ComputePipelineObjects>> computePipelines;
     std::unique_ptr<Graphics::GpuColorTransfer> colorTransfer;
     std::shared_ptr<Graphics::BufferPool> bufferPool;
@@ -337,7 +338,7 @@ struct VulkanDevice::State {
         std::uint64_t throughSerial;
     };
     std::deque<RetiredRange> retiredRanges;
-    std::mutex presentMutex;
+    HostMutex presentMutex;
     // The presentation present() submitted and QueuePresent has not handed to the swapchain.
     bool queuePending = false;
     std::uint32_t queueIndex = 0;
@@ -2556,7 +2557,7 @@ void WatchMemory(std::uint64_t programAddress) {
         return parsed;
     }();
     if (ranges.empty()) return;
-    static std::mutex mutex;
+    static HostMutex mutex;
     static std::deque<std::pair<std::uint64_t, std::vector<std::uint8_t>>> history;
     static bool written = false;
     std::lock_guard lock(mutex);

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libc/include/HostMutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <atomic>
@@ -47,7 +48,7 @@ struct TableEntry {
 };
 
 struct TableCache {
-    std::mutex mutex;
+    HostMutex mutex;
     VkDevice device = VK_NULL_HANDLE;
     std::list<TableEntry> entries;
     std::uint64_t hits = 0;
@@ -136,7 +137,7 @@ struct LiveTable {
 };
 
 struct LiveTables {
-    std::mutex mutex;
+    HostMutex mutex;
     std::list<LiveTable> tables;
 };
 

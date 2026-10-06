@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libc/include/HostMutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -133,7 +134,7 @@ struct GpuKeyStore {
 };
 
 struct KeyStoreMemo {
-    std::mutex mutex;
+    HostMutex mutex;
     std::vector<GpuKeyStore> entries;
     const Recorder* recorder = nullptr;
 };
@@ -425,7 +426,7 @@ DccKeys textureClearKeys(const GuestTextureResource& resource, std::uint64_t gue
     if (keys == DccKeys::Uncompressed) return keys;
     std::byte probe[16]{};
     if (!IsDccClear(keys) || !FillDccClear(ResolveTextureFormat(resource.format), keys, resource.dccAlphaOnMsb, std::span(probe, std::min<std::size_t>(sizeof(probe), BytesPerElement(resource.format))))) {
-        static std::mutex reportedMutex;
+        static HostMutex reportedMutex;
         static std::set<std::pair<std::uint64_t, int>> reported;
         std::lock_guard lock(reportedMutex);
         if (reported.size() < 32 && reported.insert({resource.baseAddress, static_cast<int>(keys)}).second) std::fprintf(stderr, "[gpu] texture 0x%llx (format %u) has %s DCC keys at 0x%llx; its texels are read as stored\n", static_cast<unsigned long long>(resource.baseAddress), resource.format, DccKeysName(keys), static_cast<unsigned long long>(resource.dccAddress));

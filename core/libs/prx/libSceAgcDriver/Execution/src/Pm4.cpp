@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libc/include/HostMutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
 #include <algorithm>
@@ -102,7 +103,7 @@ constexpr std::uint32_t DmaSelectGds = 1;
 constexpr std::size_t GdsBytes = 0x10000;
 
 struct GdsStorage {
-    std::mutex mutex;
+    HostMutex mutex;
     std::array<std::byte, GdsBytes> bytes{};
 };
 
