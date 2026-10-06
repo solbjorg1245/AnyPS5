@@ -285,6 +285,9 @@ private:
         // range), against which MarkDirectWrites proves nothing else wrote the range during the
         // use before it registers the shadow.
         std::uint64_t chainGeneration = 0;
+        // Deferred copy-backs: the shadow whose deferred copy-backs this use claimed (it took that
+        // shadow through the staging chain); its copy-back takes them over (RecordCopyBacks).
+        const void* claimedShadow = nullptr;
         // An element the shader updates atomically lies inside (AddWritable's `atomic`).
         bool atomic = false;
         // The gpuCopy buffer is a device-local staging shadow (see stagingEligible): no host
@@ -336,6 +339,7 @@ private:
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
     void recordGpuCopies(std::span<Region* const> copies, bool addressable);
+    void allocateRegionBuffer(Region& region, bool addressable);
     void takeHeapReferences();
     Context context;
     bool stagingAllowed = false;

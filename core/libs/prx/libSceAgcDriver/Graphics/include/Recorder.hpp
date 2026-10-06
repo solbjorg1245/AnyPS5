@@ -83,6 +83,37 @@ public:
     void FlushKeyStores();
     void FlushKeyStoresOverlapping(std::uint64_t address, std::size_t bytes) { if (HasQueuedKeyStores() && QueuedKeyStoreOverlaps(address, bytes)) FlushKeyStores(); }
     bool Recording() const { return open != nullptr; }
+    bool RenderPassOpen() const { return open != nullptr && open->renderPass.open; }
+    // Deferred copy-backs of staged buffers (GuestBufferMemory::RecordCopyBacks): a dispatch's
+    // written sub-ranges go from its device-local shadow back into the host import, but the copies
+    // are recorded only before the next other command (Commands()), store or key-store run, or at
+    // Submit, so a label never lands before them and everything recorded later reads the import
+    // after them. When the next staging build takes the same shadow (the staging chain), it takes
+    // these copies over (TakeDeferredCopies) and copies the union back after its own work: the
+    // ~970 back-to-back uses per frame of one 285 KiB buffer then cost one copy-back, not 970
+    // (with two full barriers each). Never across batches: Submit records what is left.
+    // APS5_NO_DEFERRED_COPY_BACK=1 records every copy-back at once, as before.
+    struct DeferredCopy {
+        std::shared_ptr<void> keep;
+        const void* sourceKey = nullptr;
+        VkBuffer source = VK_NULL_HANDLE;
+        VkBuffer destination = VK_NULL_HANDLE;
+        VkDeviceSize sourceOffset = 0;
+        VkDeviceSize destinationOffset = 0;
+        VkDeviceSize bytes = 0;
+        // The guest range the copy stores.
+        std::uint64_t address = 0;
+    };
+    static bool DeferCopyBacks();
+    void DeferCopies(std::vector<DeferredCopy> copies);
+    // A staging build that takes the shadow `sourceKey` (staging chain) claims its deferred copies:
+    // Commands() leaves claimed copies alone while the build records its work (a store run, a key
+    // store run and Submit still record them, as does a later build staging an overlapping range:
+    // FlushClaimedOverlapping), and the build's own copy-back takes them (TakeClaimedCopies) to
+    // copy the union of both uses' written ranges back from its buffer.
+    void ClaimDeferredCopies(const void* sourceKey);
+    std::vector<DeferredCopy> TakeClaimedCopies(const void* sourceKey);
+    void FlushClaimedOverlapping(std::uint64_t address, std::size_t bytes);
     bool Idle() const { return open == nullptr && inFlight.empty(); }
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
@@ -637,6 +668,10 @@ private:
     // Records the queued key stores as one run (`forWriter`: before a command writing, reading or
     // labelling over one, not at Submit).
     void recordKeyStores(bool forWriter);
+    // Records the deferred copy-backs (DeferCopies) with their barrier pair; `claimed` too.
+    void flushDeferredCopies(bool claimed = false);
+    std::vector<DeferredCopy> deferredCopies;
+    std::vector<DeferredCopy> claimedCopies;
 
     // The unlocked wait of SyncThrough(waitUnlocked): the target batch (submitting the open one when
     // it is the target), the timeline wait with the mutex released, then the completions up to it.

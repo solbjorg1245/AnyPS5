@@ -1272,6 +1272,7 @@ std::uint64_t Recorder::ReapsWithWork() {
 
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
     ensureOpen();
+    flushDeferredCopies();
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
     // for a caller whose ranges overlap a queued store: FlushStores).
@@ -1280,6 +1281,77 @@ VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
     if (coveredAccess != nullptr) *coveredAccess = open->coveredAccess;
     open->coveredAccess = 0;
     return open->commands;
+}
+
+bool Recorder::DeferCopyBacks() {
+    static const bool disabled = std::getenv("APS5_NO_DEFERRED_COPY_BACK") != nullptr;
+    return !disabled;
+}
+
+void Recorder::DeferCopies(std::vector<DeferredCopy> copies) {
+    if (copies.empty()) return;
+    ensureOpen();
+    deferredCopies.insert(deferredCopies.end(), std::make_move_iterator(copies.begin()), std::make_move_iterator(copies.end()));
+}
+
+namespace {
+// Moves the copies of `from` whose source is `sourceKey` to the end of `to`.
+void moveCopies(std::vector<Recorder::DeferredCopy>& from, std::vector<Recorder::DeferredCopy>& to, const std::function<bool(const Recorder::DeferredCopy&)>& selected) {
+    const auto kept = std::stable_partition(from.begin(), from.end(), [&](const Recorder::DeferredCopy& copy) { return !selected(copy); });
+    to.insert(to.end(), std::make_move_iterator(kept), std::make_move_iterator(from.end()));
+    from.erase(kept, from.end());
+}
+}
+
+void Recorder::ClaimDeferredCopies(const void* sourceKey) {
+    if (sourceKey == nullptr) return;
+    moveCopies(deferredCopies, claimedCopies, [&](const DeferredCopy& copy) { return copy.sourceKey == sourceKey; });
+}
+
+std::vector<Recorder::DeferredCopy> Recorder::TakeClaimedCopies(const void* sourceKey) {
+    std::vector<DeferredCopy> taken;
+    if (sourceKey == nullptr) return taken;
+    moveCopies(claimedCopies, taken, [&](const DeferredCopy& copy) { return copy.sourceKey == sourceKey; });
+    return taken;
+}
+
+void Recorder::FlushClaimedOverlapping(std::uint64_t address, std::size_t bytes) {
+    const auto end = address + bytes;
+    const auto overlapping = [&](const DeferredCopy& copy) { return copy.address < end && address < copy.address + copy.bytes; };
+    if (std::none_of(claimedCopies.begin(), claimedCopies.end(), overlapping)) return;
+    // Back to the unclaimed list (their order among themselves kept), recorded now.
+    moveCopies(claimedCopies, deferredCopies, overlapping);
+    flushDeferredCopies();
+}
+
+void Recorder::flushDeferredCopies(bool claimed) {
+    if (open == nullptr || (deferredCopies.empty() && (!claimed || claimedCopies.empty()))) return;
+    auto copies = std::move(deferredCopies);
+    deferredCopies.clear();
+    if (claimed) {
+        copies.insert(copies.end(), std::make_move_iterator(claimedCopies.begin()), std::make_move_iterator(claimedCopies.end()));
+        claimedCopies.clear();
+    }
+    if (copies.empty()) return;
+    if (open->renderPass.open) endOpenRenderPass();
+    const auto commands = open->commands;
+    const auto timing = beginTiming(ClassKey(CommandClass::StagingOut));
+    // The shaders' stores into the shadows (whichever stage made them) precede the copies.
+    recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    CountBarriers(CommandClass::StagingOut);
+    std::uint64_t bytes = 0;
+    for (const auto& copy : copies) {
+        const VkBufferCopy region{copy.sourceOffset, copy.destinationOffset, copy.bytes};
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, copy.source, copy.destination, 1, &region);
+        bytes += copy.bytes;
+    }
+    // As a GPU label store or fill: visible to everything recorded after (shaders, transfers, an
+    // indirect dispatch's arguments) and to the host once the batch completed.
+    constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+    recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, copiedAccess);
+    CountBarriers(CommandClass::StagingOut);
+    open->coveredAccess = copiedAccess;
+    EndGpuTiming(timing, bytes);
 }
 
 void Recorder::MarkCovered(VkAccessFlags access) {
@@ -1445,8 +1517,9 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
         run.queued.push_back({buffer, offset, std::vector<std::byte>(bytes.begin(), bytes.end()), address});
         return;
     }
-    // A label says the work before it is done: the queued key stores (results of that work) land
-    // ahead of every store of the run.
+    // A label says the work before it is done: the queued key stores and the deferred copy-backs
+    // (results of that work) land ahead of every store of the run.
+    flushDeferredCopies(true);
     if (!open->keyStores.empty()) recordKeyStores(true);
     if (open->renderPass.open) endOpenRenderPass();
     open->coveredAccess = 0;
@@ -1516,6 +1589,7 @@ bool Recorder::closeStoreRun(bool atSubmit) {
         auto stores = std::move(run.queued);
         run.queued.clear();
         if (stores.empty()) return false;
+        flushDeferredCopies(true);
         // A label says the work before it is done: the queued key stores (results of that work)
         // land ahead of every store of the run, and the pass a draw left open ends.
         if (!open->keyStores.empty()) recordKeyStores(true);
@@ -2459,6 +2533,7 @@ void Recorder::Submit() {
     if (activeRecorder == this) workSinceSubmit.store(0, std::memory_order_relaxed);
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    flushDeferredCopies(true);
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     if (open->samples != VK_NULL_HANDLE) context.Function<PFN_vkCmdEndQuery>("vkCmdEndQuery")(open->commands, open->samples, 0);
