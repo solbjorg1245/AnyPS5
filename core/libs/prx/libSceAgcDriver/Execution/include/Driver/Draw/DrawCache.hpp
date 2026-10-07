@@ -143,6 +143,13 @@ struct DrawEntryCounters {
     // The relocation path's time (APS5_PROFILE_DRAW): the candidate search under the cache mutex,
     // the choice (the quick shifted checks), the decode copies with the live words, the rekeys.
     double relocationFindUs = 0, relocationChooseUs = 0, relocationDecodeUs = 0, relocationRekeyUs = 0;
+    // Absent keys seen before (Driver::noteAbsentDrawKeyLocked): evicted from the cache, by the
+    // cache size that would have kept them (2x, 4x, 8x, 16x, 32x the entries, beyond: the entries
+    // plus the evictions since the key's eviction), and never seen (new, or evicted beyond the
+    // remembered window), of which those whose base key (the key without the pointer words) has
+    // an entry: the same pipeline state and shaders at a new SRT pointer.
+    std::array<std::uint64_t, 6> absentEvicted{};
+    std::uint64_t absentNew = 0, absentNewBaseKnown = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 

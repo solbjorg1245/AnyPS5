@@ -45,6 +45,51 @@ std::size_t Driver::drawCacheEntries() {
     return entries;
 }
 
+std::size_t Driver::drawEvictedKeyBound() {
+    static const std::size_t bound = [] {
+        const char* text = std::getenv("APS5_DRAW_EVICTED_KEYS");
+        if (text != nullptr) return static_cast<std::size_t>(std::strtoull(text, nullptr, 10));
+        return std::getenv("APS5_PROFILE_DRAW") != nullptr ? std::size_t{262144} : std::size_t{0};
+    }();
+    return bound;
+}
+
+// An evicted key is remembered with the eviction count (a key evicted again refreshes it); the
+// evictions older than the window expire from the order's front, and a key expires with its
+// last eviction.
+void Driver::noteDrawEvictionLocked(std::uint64_t key) {
+    const auto bound = drawEvictedKeyBound();
+    if (bound == 0) return;
+    const auto index = drawCacheEvictions;
+    drawEvictedKeys.insert_or_assign(key, index);
+    drawEvictedOrder.emplace_back(index, key);
+    while (!drawEvictedOrder.empty() && index - drawEvictedOrder.front().first >= bound) {
+        const auto [expired, expiredKey] = drawEvictedOrder.front();
+        drawEvictedOrder.pop_front();
+        const auto found = drawEvictedKeys.find(expiredKey);
+        if (found != drawEvictedKeys.end() && found->second == expired) drawEvictedKeys.erase(found);
+    }
+}
+
+// An absent key that was evicted would have hit with a cache of the entries plus the evictions
+// since (every eviction at capacity is one new entry): bucket it by that size as a multiple of
+// the cache's entries.
+void Driver::noteAbsentDrawKeyLocked(std::uint64_t key, std::uint64_t base) {
+    if (drawEvictedKeyBound() == 0) return;
+    auto& counters = drawEntryCounters;
+    const auto found = drawEvictedKeys.find(key);
+    if (found == drawEvictedKeys.end()) {
+        ++counters.absentNew;
+        if (base != 0 && drawBaseIndex.contains(base)) ++counters.absentNewBaseKnown;
+        return;
+    }
+    const auto entries = drawCacheEntries();
+    const auto needed = entries + (drawCacheEvictions - found->second);
+    std::size_t bucket = 0;
+    for (std::size_t size = entries * 2; bucket + 1 < counters.absentEvicted.size() && needed > size; size *= 2) ++bucket;
+    ++counters.absentEvicted[bucket];
+}
+
 void Driver::accountDrawVariant(const DispatchVariant& variant, bool added) {
     if (added) {
         ++drawCacheVariants;
@@ -148,8 +193,9 @@ void Driver::insertDrawEntry(const DrawKey& key, std::vector<std::shared_ptr<Dis
         }
         unindexDrawKeyLocked(last->second->baseKey, last->first);
         drawOrder.erase(last->second->order);
-        drawCache.erase(last);
         ++drawCacheEvictions;
+        noteDrawEvictionLocked(last->first);
+        drawCache.erase(last);
     }
 }
 

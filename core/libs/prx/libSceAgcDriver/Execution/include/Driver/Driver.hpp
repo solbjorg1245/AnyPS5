@@ -113,6 +113,9 @@ private:
     static bool registerKeyEnabled();
     static bool verifyDrawRecipe();
     static std::size_t drawCacheEntries();
+    static std::size_t drawEvictedKeyBound();
+    void noteDrawEvictionLocked(std::uint64_t key);
+    void noteAbsentDrawKeyLocked(std::uint64_t key, std::uint64_t base);
     void accountDrawVariant(const DispatchVariant& variant, bool added);
     void insertDrawEntry(const DrawKey& key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, const DrawRelocation* relocation, const std::vector<std::shared_ptr<DispatchVariant>>* matched);
     std::shared_ptr<const DrawRecipe> findDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages);
@@ -280,6 +283,13 @@ private:
     std::unordered_map<std::uint64_t, std::vector<std::uint64_t>> drawBaseIndex;
     HostMutex drawCacheMutex;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
+    // Keys evicted from the draw cache with the eviction count at the time, those of the last
+    // drawEvictedKeyBound() evictions (APS5_DRAW_EVICTED_KEYS; on under APS5_PROFILE_DRAW): an
+    // absent key found here was evicted, and the evictions since say how many more entries would
+    // have kept it (DrawEntryCounters::absentEvicted). The order holds (eviction count, key) per
+    // eviction, so an expiry pops its front. Under drawCacheMutex.
+    std::unordered_map<std::uint64_t, std::uint64_t> drawEvictedKeys;
+    std::deque<std::pair<std::uint64_t, std::uint64_t>> drawEvictedOrder;
 
     DrawEntryCounters drawEntryCounters;
 
