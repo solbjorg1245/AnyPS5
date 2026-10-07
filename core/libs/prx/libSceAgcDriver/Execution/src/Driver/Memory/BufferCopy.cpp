@@ -15,13 +15,21 @@ bool Driver::matchesCopyKernel(std::span<const std::uint32_t> code, const std::v
     if (!enabled || userData.size() != 12 || compute.numThreads[0] != 64 || compute.numThreads[1] != 1 || compute.numThreads[2] != 1 || !compute.groupIdEnable[0]) return false;
     static constexpr std::size_t copyKernelWords = 38;
     static constexpr std::uint64_t copyKernelHash = 0x6ec00fe8aa95f99aull;
+    // The tiled copy kernel (Demon's Souls' per-frame SRT upload, program 0x248881200, 38 words
+    // too): dest[i] = src[i mod period] for i < count, count and period read from the record (+0
+    // and +4), so a plain copy whenever period >= count, which copyBuffer requires of every match
+    // below. The draws' captures waited for this dispatch (the hook waits of PROGRESS session 31);
+    // matched, its destination is stored on the CPU or recorded as a transfer whose bytes the
+    // evidence ring knows (noteCopyWriter). APS5_NO_COPY_HLE_TILED=1 runs it as a dispatch again.
+    static constexpr std::uint64_t tiledCopyKernelHash = 0xc771c42e4d069d62ull;
+    static const bool tiled = std::getenv("APS5_NO_COPY_HLE_TILED") == nullptr;
     if (code.size() < copyKernelWords || code[0] != 0xbfa00002u || code[copyKernelWords - 1] != 0xbf810000u) return false;
     std::uint64_t hash = 0xcbf29ce484222325ull;
     for (const auto word : code.first(copyKernelWords)) {
         hash ^= word;
         hash *= 0x100000001b3ull;
     }
-    if (hash != copyKernelHash) return false;
+    if (hash != copyKernelHash && !(tiled && hash == tiledCopyKernelHash)) return false;
     const auto stride = [&](std::size_t word) { return (userData[word] >> 16u) & 0x3fffu; };
     const auto swizzled = [&](std::size_t word) { return ((userData[word] >> 31u) & 1u) != 0; };
     return userData[3] == 0x00014004u && userData[7] == 0x00014004u && userData[11] == 0x0004dfacu && stride(1) == 4 && stride(5) == 4 && stride(9) == 16 && !swizzled(1) && !swizzled(5) && !swizzled(9) && userData[10] >= 1;
