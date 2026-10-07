@@ -207,6 +207,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     hits.liveWords.clear();
     hits.results.clear();
     hits.data = false;
+    hits.partial = false;
 
     auto& fresh = scratch->fresh;
     fresh.assign(programs.size(), nullptr);
@@ -221,7 +222,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (registerKey) {
 
         for (std::size_t i = 0; i < programs.size(); ++i) {
-            if (matched[i] != nullptr && drawHit && !verifyDrawRecipe()) {
+            if (matched[i] != nullptr && (drawHit || hits.partial) && !verifyDrawRecipe()) {
                 if (matched[i]->vertexInfo != nullptr) vertexInfos[i] = *matched[i]->vertexInfo;
                 continue;
             }
@@ -257,13 +258,13 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (roles[i] == Role::GeometryBack) continue;
         const auto& program = programs[i];
         pushOffsets[i] = pushCursorBytes;
-        if (drawHit) {
+        if (matched[i] != nullptr && (drawHit || hits.partial)) {
 
             programResults[i] = hits.results[i].get();
             memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
         } else {
             resultIndex[i] = results.size();
-            results.push_back(compileDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs));
+            results.push_back(compileDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit || hits.partial, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs));
             programResults[i] = results.back().get();
         }
         const auto& result = *programResults[i];
@@ -338,10 +339,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (drawParameters.indirect && indirectCpu) {
 
         const auto indirect = *drawParameters.indirect;
-        if (drawHit) {
+        if (drawHit || hits.partial) {
 
             for (std::size_t i = 0; i < programs.size(); ++i) {
-                if (programResults[i] == nullptr) continue;
+                if (programResults[i] == nullptr || (hits.partial && matched[i] == nullptr)) continue;
                 require(matched[i] != nullptr && hits.results[i].get() == programResults[i], "a draw hit's stage result is not its variant's");
                 resultIndex[i] = results.size();
                 results.push_back(hits.results[i]);
@@ -390,7 +391,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 const auto pushBytes = result->pushConstants.size();
                 const auto* previous = result.get();
                 decodeVertexInfo(programIndex);
-                result = compileDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs);
+                result = compileDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit || hits.partial, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs);
                 require(result->pushConstants.size() == pushBytes, "patched program changed its push constant layout");
                 for (auto& stage : stages) {
                     if (stage.program == previous) stage.program = result.get();
@@ -417,9 +418,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     auto& recipeStages = scratch->recipeStages;
     recipeStages.clear();
     // A recipe replays the resources recorded with its variants' words: not for refreshed data.
-    if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes() && !(drawHit && hits.data)) {
+    if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes() && !hits.data) {
         recipeStages.reserve(programs.size());
-        for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
+        for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(matched[i] != nullptr && (drawHit || hits.partial) ? matched[i] : fresh[i]);
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();
     }
     std::shared_ptr<const DrawRecipe> recipe;

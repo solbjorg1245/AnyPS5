@@ -21,6 +21,11 @@ bool patchedResultReuse() {
     return reuse;
 }
 
+bool partialDrawHits() {
+    static const bool partial = std::getenv("APS5_NO_PARTIAL_DRAW_HITS") == nullptr;
+    return partial;
+}
+
 bool traceDrawMisses() {
     static const bool trace = std::getenv("APS5_TRACE_DRAW_MISSES") != nullptr;
     return trace;
@@ -253,9 +258,15 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 }
             }
             drawHit = !miss;
-            // The hit's stage results; a data hit's stages carry the live words and a patched copy.
+            // A miss keeps the stages validated before the differing one (matched) as a hit would,
+            // so only the differing and later stages are captured again (Driver::draw binds a kept
+            // stage's result like a hit's); off under the verify modes, which re-capture to compare.
+            std::size_t stagesKept = 0;
+            for (const auto& variant : matched) stagesKept += variant != nullptr ? 1 : 0;
+            hits.partial = !drawHit && stagesKept != 0 && partialDrawHits() && !verifyDrawEntries() && !verifyDataHits();
+            // The kept stages' results; a data hit's stages carry the live words and a patched copy.
             std::uint64_t dataStages = 0, dataWords = 0;
-            if (drawHit) {
+            if (drawHit || hits.partial) {
                 const auto patchStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 hits.liveWords.assign(programs.size(), {});
                 hits.results.assign(programs.size(), nullptr);
@@ -305,6 +316,10 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             counters.patchUs += patchUs;
             counters.patchedMade += patchedMade;
             counters.patchedReused += patchedReused;
+            if (hits.partial) {
+                ++counters.partialHits;
+                counters.partialStagesKept += stagesKept;
+            }
             if (drawHit) {
                 ++counters.hits;
                 if (registerKey) ++counters.registerKeyHits;

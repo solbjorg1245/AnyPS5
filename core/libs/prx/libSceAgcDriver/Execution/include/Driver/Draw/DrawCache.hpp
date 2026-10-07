@@ -64,6 +64,7 @@ struct DrawEntryCounters {
     // hit's patched results, and the patched copies made or reused.
     double compareUs = 0, patchUs = 0;
     std::uint64_t compareCalls = 0, patchedMade = 0, patchedReused = 0;
+    std::uint64_t partialHits = 0, partialStagesKept = 0;
     // Data hits (DrawStageHits): hits with at least one stage's flat-SRT data words refreshed.
     std::uint64_t dataHits = 0, dataStages = 0, dataWordsRefreshed = 0, dataInserts = 0, dataPositionsInserted = 0, dataVerified = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
@@ -83,6 +84,10 @@ struct DrawStageHits {
     std::vector<std::vector<std::uint32_t>> liveWords;
     std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> results;
     bool data = false;
+    // A miss that keeps its matched stages (results and liveWords set for them, as on a hit): only
+    // the stages without a match are captured again. APS5_NO_PARTIAL_DRAW_HITS=1 captures every
+    // stage of a miss.
+    bool partial = false;
 };
 
 struct StageCapture {
