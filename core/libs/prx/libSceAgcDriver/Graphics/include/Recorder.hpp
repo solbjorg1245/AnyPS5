@@ -178,6 +178,13 @@ public:
     static bool ReadTracking();
     void NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind);
     void NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind);
+    // Notes an immutable, sorted, merged list of in-place reads by reference: the open batch keeps
+    // one reference per list, so a list every address-based dispatch of the batch notes (its shared
+    // address space's ranges, thousands of them; t290: 44M ranges noted per 10 s) is referenced
+    // once and never copied. Tested by PendingReadOverlaps like the noted ranges. Null or empty
+    // notes nothing. APS5_NO_READ_SETS=1 copies the ranges as NotePendingReads does.
+    void NotePendingReadSet(std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> ranges, ReadKind kind);
+    static bool ReadSets();
     // Whether an unexecuted batch (open, or in flight with its fence unsignaled) reads the range in
     // place. A hit in an in-flight batch whose fence signaled meanwhile is a miss (one status
     // query per hit). `ignoreSignaled` false: every in-flight batch counts, whatever its fence.
@@ -198,6 +205,9 @@ public:
     struct ReadStatistics {
         std::uint64_t noted, queries, staleIgnored;
         std::array<std::uint64_t, static_cast<std::size_t>(ReadKind::Count)> hits;
+        // Read sets (NotePendingReadSet): lists referenced, notes of a list the batch already held,
+        // and the ranges those repeat notes would have copied.
+        std::uint64_t setsNoted, setNotesSkipped, setRangesSkipped;
     };
     static ReadStatistics ReadCounts();
     // Whether the OPEN (unsubmitted) batch writes the range: a wait on such a range must submit it.
@@ -573,6 +583,8 @@ private:
             ReadKind kind;
         };
         std::vector<Read> reads;
+        // Read lists noted by reference (NotePendingReadSet), each with its reader kind.
+        std::vector<std::pair<std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>>, ReadKind>> readSets;
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
         bool submitted = false;
@@ -733,9 +745,16 @@ private:
     static bool overlaps(const Batch& batch, std::uint64_t address, std::uint64_t end);
     // The first noted read of `batch` overlapping [address, end), or null.
     static const Batch::Read* readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end);
+    // The reader kind of the first noted read list of `batch` overlapping [address, end), if any.
+    static std::optional<ReadKind> readSetOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end);
     bool signaled(const Batch& batch) const;
     // Rebuilds the lock-free snapshot of pending writes from open, inFlight and finishing.
     void publishPendingWrites() const;
+    // Publishes the snapshot with [address, end) added: a copy of the current snapshot with the
+    // range merged in (O(N) over the merged ranges: no gathering of every batch's writes and no
+    // sort), which keeps the snapshot a superset of the pending union as the full rebuild does; a
+    // missing snapshot rebuilds in full. APS5_NO_INCREMENTAL_SNAPSHOT=1 rebuilds in full per note.
+    void publishPendingWriteAdded(std::uint64_t address, std::uint64_t end) const;
     // Appends one range to the open batch; returns whether the snapshot must be rebuilt for it.
     // `ownLabel`: the range is a label's own store (NoteLabel, AfterCompletions), which does not
     // overwrite the table entries it covers; any other range flags them (table mutex, briefly).

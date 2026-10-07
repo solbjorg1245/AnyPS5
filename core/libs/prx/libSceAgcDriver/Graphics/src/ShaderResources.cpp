@@ -3559,13 +3559,32 @@ void ShaderResources::WriteBack() {
 }
 
 void ShaderResources::MarkGpuWrites(Recorder& recorder) {
+    // APS5_PROFILE_DRAW: the parts' times accumulate in `timing` (marks...Ms), which the dispatch
+    // reads before and after the call for its "record: marks: ..." rows.
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto lap = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto part = [&](double& total) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        total += std::chrono::duration<double, std::milli>(now - lap).count();
+        lap = now;
+    };
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
     {
         ScratchLease<InPlaceReadsScratch> scratch;
-        recorder.NotePendingReads(guestMemory.InPlaceReads(scratch->reads), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
+        const auto kind = guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement;
+        if (Recorder::ReadSets()) {
+            // The build's own regions as ranges, the shared address space's list by reference.
+            auto set = guestMemory.InPlaceReadSet(scratch->reads);
+            recorder.NotePendingReads(scratch->reads, kind);
+            recorder.NotePendingReadSet(std::move(set), kind);
+        } else {
+            recorder.NotePendingReads(guestMemory.InPlaceReads(scratch->reads), kind);
+        }
     }
+    part(timing.marksReadsMs);
     if (SkipWriteBack()) {
         recorder.ReleaseClaims();
         return;
@@ -3578,10 +3597,13 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // and the note and mark below cover them like direct writes.
     guestMemory.RecordCopyBacks(recorder);
     recorder.ReleaseClaims();
+    part(timing.marksCopyBacksMs);
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
     recorder.NotePendingWrites(guestMemory.Writes(), Recorder::WriteKind::ShaderWrite);
+    part(timing.marksWritesMs);
     guestMemory.MarkDirectWrites();
+    part(timing.marksDirectMs);
     if (AgcDriver::FrameTrace::Active()) {
         std::string text;
         char item[96];

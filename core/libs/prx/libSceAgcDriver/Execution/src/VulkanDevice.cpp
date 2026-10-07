@@ -2451,8 +2451,8 @@ ResourceCache::Key DispatchContentKey(const Graphics::CompiledShader& shader, Vk
 
 // The phases of VulkanDevice::dispatch (APS5_PROFILE_DRAW), followed by one row per image lookup
 // outcome (Graphics::LookupOutcomes) on the [indirect] line.
-enum DispatchPhase : std::size_t { PhaseReap, PhaseResources, PhaseResourcesInsert, PhaseResourcesComplete, PhaseResourcesImages, PhaseResourcesUpload, PhaseResourcesDescriptors, PhaseResourcesOther, PhaseResourcesALocked, PhaseResourcesAddress, PhaseResourcesAUnlocked, PhaseResourcesRevalidate, PhaseResourcesFullBuild, PhaseResourcesHookWaits, PhaseProof, PhasePipeline, PhaseDecide, PhaseArgumentRead, PhaseRecordCommands, PhaseRecordKeeps, PhaseRecordDataRefresh, PhaseRecordBind, PhaseRecordMarks, PhaseRecordCompletion, PhaseRecord, PhaseSync, DispatchPhaseCount };
-constexpr std::array<const char*, DispatchPhaseCount> DispatchPhaseNames{"reap", "resources", "resources: cache insert", "resources: complete (wall)", "resources: B images", "resources: B upload", "resources: B descriptors", "resources: B bda+other", "resources: A locked (bda)", "resources: address bindings (bda)", "resources A (unlocked)", "resources: revalidate", "resources: full build (locked)", "resources: hook waits", "proof", "pipeline", "decide", "argument read", "record: commands", "record: keeps", "record: data refresh", "record: bind+dispatch", "record: marks", "record: completion", "record", "sync"};
+enum DispatchPhase : std::size_t { PhaseReap, PhaseResources, PhaseResourcesInsert, PhaseResourcesComplete, PhaseResourcesImages, PhaseResourcesUpload, PhaseResourcesDescriptors, PhaseResourcesOther, PhaseResourcesALocked, PhaseResourcesAddress, PhaseResourcesAUnlocked, PhaseResourcesRevalidate, PhaseResourcesFullBuild, PhaseResourcesHookWaits, PhaseProof, PhasePipeline, PhaseDecide, PhaseArgumentRead, PhaseRecordCommands, PhaseRecordKeeps, PhaseRecordDataRefresh, PhaseRecordBind, PhaseRecordMarks, PhaseRecordMarksReads, PhaseRecordMarksCopyBacks, PhaseRecordMarksWrites, PhaseRecordMarksDirect, PhaseRecordCompletion, PhaseRecord, PhaseSync, DispatchPhaseCount };
+constexpr std::array<const char*, DispatchPhaseCount> DispatchPhaseNames{"reap", "resources", "resources: cache insert", "resources: complete (wall)", "resources: B images", "resources: B upload", "resources: B descriptors", "resources: B bda+other", "resources: A locked (bda)", "resources: address bindings (bda)", "resources A (unlocked)", "resources: revalidate", "resources: full build (locked)", "resources: hook waits", "proof", "pipeline", "decide", "argument read", "record: commands", "record: keeps", "record: data refresh", "record: bind+dispatch", "record: marks", "record: marks: reads", "record: marks: copy-backs", "record: marks: writes", "record: marks: direct", "record: completion", "record", "sync"};
 constexpr std::size_t DispatchRows = static_cast<std::size_t>(DispatchPhaseCount) + static_cast<std::size_t>(Graphics::LookupOutcomes::Count);
 
 const char* DispatchRowName(std::size_t row) {
@@ -3212,7 +3212,16 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     recorder.EndGpuTiming(trailingTiming);
     recorder.MarkCovered(dispatchedAccess);
     recordStep(PhaseRecordBind);
+    // The marks' parts (ShaderResources::MarkGpuWrites' timing) as rows splitting "record: marks".
+    const auto marksBefore = timer.profile ? resources.Timing() : Graphics::ShaderResources::BuildTiming{};
     resources.MarkGpuWrites(recorder);
+    if (timer.profile) {
+        const auto& after = resources.Timing();
+        timer.add(PhaseRecordMarksReads, after.marksReadsMs - marksBefore.marksReadsMs);
+        timer.add(PhaseRecordMarksCopyBacks, after.marksCopyBacksMs - marksBefore.marksCopyBacksMs);
+        timer.add(PhaseRecordMarksWrites, after.marksWritesMs - marksBefore.marksWritesMs);
+        timer.add(PhaseRecordMarksDirect, after.marksDirectMs - marksBefore.marksDirectMs);
+    }
     recordStep(PhaseRecordMarks);
     // Only copied written buffers (and BDA fault checks) need work once the GPU is done; without them
     // the batch can signal its labels from the GPU.

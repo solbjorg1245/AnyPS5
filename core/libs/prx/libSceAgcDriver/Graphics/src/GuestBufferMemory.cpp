@@ -79,6 +79,11 @@ struct GuestBufferMemory::AddressSpace {
     std::uint64_t serial = 0;
     GuestAllocations::Lease lease;
     std::vector<Region> base;
+    // The ranges of `base` served in place by imports (InPlaceReads' filter), sorted and merged:
+    // noted by reference on every batch an address-based dispatch of the space records into
+    // (Recorder::NotePendingReadSet), instead of copied per dispatch (t290: 7.1k address-based
+    // dispatches per 10 s copied 44M ranges into their batches).
+    std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> directRanges;
     std::vector<CopiedRange> copied;
     // The BDA table entries of `base`, in its order.
     std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
@@ -1353,6 +1358,20 @@ void GuestBufferMemory::AcquireRegistered() {
                         built->copied.push_back({region.begin, region.end, region.writable});
                         extras.push_back(std::move(region));
                     }
+                }
+                {
+                    auto direct = std::make_shared<std::vector<std::pair<std::uint64_t, std::uint64_t>>>();
+                    for (const auto& region : built->base) {
+                        if (region.direct != nullptr) direct->emplace_back(region.begin, region.end);
+                    }
+                    std::sort(direct->begin(), direct->end());
+                    std::size_t out = 0;
+                    for (const auto& range : *direct) {
+                        if (out != 0 && range.first <= (*direct)[out - 1].second) (*direct)[out - 1].second = std::max((*direct)[out - 1].second, range.second);
+                        else (*direct)[out++] = range;
+                    }
+                    direct->resize(out);
+                    built->directRanges = std::move(direct);
                 }
                 regions = std::move(extras);
                 lease.clear();
@@ -2854,6 +2873,21 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
     InPlaceReads(result);
     return result;
+}
+
+std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferMemory::InPlaceReadSet(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const {
+    out.clear();
+    if (!uploaded || committed) return nullptr;
+    // A space without its list (none is built without one; kept for safety) lists its base here.
+    if (space != nullptr && space->directRanges == nullptr) {
+        for (const auto& region : space->base) {
+            if (region.direct != nullptr) out.emplace_back(region.begin, region.end);
+        }
+    }
+    for (const auto& region : regions) {
+        if (region.direct != nullptr) out.emplace_back(region.begin, region.end);
+    }
+    return space != nullptr ? space->directRanges : nullptr;
 }
 
 void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {

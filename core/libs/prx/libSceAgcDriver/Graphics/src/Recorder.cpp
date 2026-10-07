@@ -516,6 +516,7 @@ std::atomic<std::uint64_t> queuedLabelsNoted{0}, queuedLabelsOverRecorded{0}, qu
 constexpr std::size_t ReadKinds = static_cast<std::size_t>(Recorder::ReadKind::Count);
 std::atomic<std::uint64_t> readsNoted{0}, readQueries{0}, readStaleIgnored{0};
 std::atomic<std::uint64_t> readHits[ReadKinds]{};
+std::atomic<std::uint64_t> readSetsNoted{0}, readSetNotesSkipped{0}, readSetRangesSkipped{0};
 
 bool ReadTrackingEnabled() {
     // APS5_COPY_READ_TRACKING=0: no in-place reads are noted; the copy HLE's CPU path then requires
@@ -568,7 +569,7 @@ bool QueuedLabelOverlaps(std::uint64_t address, std::size_t bytes) {
 std::atomic<std::uint64_t> hookCalls{0}, hookLocks{0}, targetedSyncs{0}, batchesLeftInFlight{0};
 // Snapshot maintenance (under the GpuMutex): notes whose range the snapshot already covered (no
 // rebuild), rebuilds, and the time the rebuilds took (APS5_PROFILE_DRAW), so their cost is visible.
-std::uint64_t snapshotCovered = 0, snapshotRebuilds = 0;
+std::uint64_t snapshotCovered = 0, snapshotRebuilds = 0, snapshotIncremental = 0;
 double snapshotRebuildMs = 0;
 
 using WriteRanges = Recorder::WriteRanges;
@@ -605,6 +606,13 @@ bool SnapshotCovers(std::uint64_t address, std::uint64_t end) {
     if (snapshot == nullptr || snapshot->empty()) return false;
     const auto it = std::partition_point(snapshot->begin(), snapshot->end(), [&](const auto& range) { return range.second <= address; });
     return it != snapshot->end() && it->first <= address && end <= it->second;
+}
+
+// Whether a note adds its range to the published snapshot in place of a full rebuild
+// (Recorder::publishPendingWriteAdded).
+bool IncrementalSnapshot() {
+    static const bool enabled = std::getenv("APS5_NO_INCREMENTAL_SNAPSHOT") == nullptr;
+    return enabled;
 }
 
 // Attribution of the pending-write syncs the hook makes (the [hooksync] line every 10 s, under
@@ -2221,7 +2229,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     if (bytes == 0) return;
     if (&batch == open.get()) {
         if (!noteWrite(address, bytes, ownLabel, kind)) return;
-        publishPendingWrites();
+        publishPendingWriteAdded(address, address + bytes);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         return;
     }
@@ -2234,7 +2242,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     batch.writeTags.push_back(Batch::WriteTag{packet.queue, packet.opcode, ownLabel && kind == WriteKind::Unknown ? WriteKind::CompletionLabel : kind});
     if (!ownLabel) markOverwritten(address, address + bytes);
     if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
-    if (!SnapshotCovers(address, address + bytes)) publishPendingWrites();
+    if (!SnapshotCovers(address, address + bytes)) publishPendingWriteAdded(address, address + bytes);
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
@@ -2247,7 +2255,7 @@ void Recorder::markOverwritten(std::uint64_t address, std::uint64_t end) {
 
 void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes, WriteKind kind) {
     if (!noteWrite(address, bytes, false, kind)) return;
-    publishPendingWrites();
+    publishPendingWriteAdded(address, address + bytes);
     // The note precedes this thread's vkQueueSubmit and the label another queue polls for; the
     // fence makes that order hold without relying on x86 store ordering.
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -2256,10 +2264,13 @@ void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes, WriteK
 void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, WriteKind kind) {
     bool publish = false;
     for (const auto& [begin, end] : ranges) {
-        if (end > begin && noteWrite(begin, static_cast<std::size_t>(end - begin), false, kind)) publish = true;
+        if (end <= begin || !noteWrite(begin, static_cast<std::size_t>(end - begin), false, kind)) continue;
+        publish = true;
+        // Each uncovered range joins the snapshot at once, so the next range's covers check sees it.
+        if (IncrementalSnapshot()) publishPendingWriteAdded(begin, end);
     }
     if (!publish) return;
-    publishPendingWrites();
+    if (!IncrementalSnapshot()) publishPendingWrites();
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
@@ -2282,6 +2293,34 @@ void Recorder::publishPendingWrites() const {
     pendingWrites.store(std::move(merged), std::memory_order_release);
     publishGeneration.fetch_add(1, std::memory_order_release);
     ++snapshotRebuilds;
+    if (DrawProfiled()) snapshotRebuildMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+}
+
+void Recorder::publishPendingWriteAdded(std::uint64_t address, std::uint64_t end) const {
+    if (activeRecorder != this) return;
+    const std::shared_ptr<const WriteRanges> current = IncrementalSnapshot() ? pendingWrites.load(std::memory_order_acquire) : nullptr;
+    if (current == nullptr) {
+        publishPendingWrites();
+        return;
+    }
+    const auto started = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto merged = std::make_shared<WriteRanges>();
+    merged->reserve(current->size() + 1);
+    // The ranges ending before the new one keep their place; the new range absorbs every range it
+    // touches (adjacent ones too, as the full rebuild merges them); the rest follows unchanged.
+    auto it = current->begin();
+    for (; it != current->end() && it->second < address; ++it) merged->push_back(*it);
+    std::pair<std::uint64_t, std::uint64_t> added{address, end};
+    for (; it != current->end() && it->first <= added.second; ++it) {
+        added.first = std::min(added.first, it->first);
+        added.second = std::max(added.second, it->second);
+    }
+    merged->push_back(added);
+    merged->insert(merged->end(), it, current->end());
+    pendingWrites.store(std::move(merged), std::memory_order_release);
+    publishGeneration.fetch_add(1, std::memory_order_release);
+    ++snapshotRebuilds;
+    ++snapshotIncremental;
     if (DrawProfiled()) snapshotRebuildMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
 }
 
@@ -2340,6 +2379,11 @@ std::uint64_t Recorder::NewestWriteNote(std::uint64_t address, std::size_t bytes
     return newest;
 }
 
+bool Recorder::ReadSets() {
+    static const bool enabled = std::getenv("APS5_NO_READ_SETS") == nullptr;
+    return enabled;
+}
+
 bool Recorder::ReadTracking() {
     return ReadTrackingEnabled();
 }
@@ -2362,6 +2406,33 @@ void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::ui
     readsNoted.fetch_add(ranges.size(), std::memory_order_relaxed);
 }
 
+void Recorder::NotePendingReadSet(std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> ranges, ReadKind kind) {
+    if (ranges == nullptr || ranges->empty() || !ReadTrackingEnabled()) return;
+    if (!ReadSets()) {
+        NotePendingReads(*ranges, kind);
+        return;
+    }
+    ensureOpen();
+    for (const auto& entry : open->readSets) {
+        if (entry.first != ranges) continue;
+        readSetNotesSkipped.fetch_add(1, std::memory_order_relaxed);
+        readSetRangesSkipped.fetch_add(ranges->size(), std::memory_order_relaxed);
+        return;
+    }
+    CaptureTrace::Log("buffer-read-set batch=%llu ranges=%zu kind=%d", static_cast<unsigned long long>(submissions + 1), ranges->size(), static_cast<int>(kind));
+    open->readSets.emplace_back(std::move(ranges), kind);
+    readSetsNoted.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::optional<Recorder::ReadKind> Recorder::readSetOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end) {
+    for (const auto& [set, kind] : batch.readSets) {
+        // Sorted and merged: the first range ending past the address decides.
+        const auto it = std::partition_point(set->begin(), set->end(), [&](const auto& range) { return range.second <= address; });
+        if (it != set->end() && it->first < end) return kind;
+    }
+    return std::nullopt;
+}
+
 const Recorder::Batch::Read* Recorder::readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end) {
     for (const auto& read : batch.reads) {
         if (address < read.end && read.begin < end) return &read;
@@ -2373,21 +2444,26 @@ bool Recorder::PendingReadOverlaps(std::uint64_t address, std::size_t bytes, boo
     if (bytes == 0) return false;
     readQueries.fetch_add(1, std::memory_order_relaxed);
     const auto end = address + bytes;
+    // A batch's noted ranges first, then its read lists (NotePendingReadSet).
+    const auto hit = [&](const Batch& batch) -> std::optional<ReadKind> {
+        if (const auto* read = readOverlap(batch, address, end)) return read->kind;
+        return readSetOverlap(batch, address, end);
+    };
     if (open != nullptr) {
-        if (const auto* read = readOverlap(*open, address, end)) {
-            readHits[static_cast<std::size_t>(read->kind)].fetch_add(1, std::memory_order_relaxed);
+        if (const auto kind = hit(*open)) {
+            readHits[static_cast<std::size_t>(*kind)].fetch_add(1, std::memory_order_relaxed);
             return true;
         }
     }
     // Newest first: the batch most likely still running decides without a status query per batch.
     for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
-        const auto* read = readOverlap(**it, address, end);
-        if (read == nullptr) continue;
+        const auto kind = hit(**it);
+        if (!kind) continue;
         if (ignoreSignaled && signaled(**it)) {
             readStaleIgnored.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
-        readHits[static_cast<std::size_t>(read->kind)].fetch_add(1, std::memory_order_relaxed);
+        readHits[static_cast<std::size_t>(*kind)].fetch_add(1, std::memory_order_relaxed);
         return true;
     }
     return false;
@@ -2396,18 +2472,25 @@ bool Recorder::PendingReadOverlaps(std::uint64_t address, std::size_t bytes, boo
 std::optional<Recorder::PendingReadInfo> Recorder::DescribePendingRead(std::uint64_t address, std::size_t bytes) const {
     if (bytes == 0) return std::nullopt;
     const auto end = address + bytes;
+    const auto hit = [&](const Batch& batch) -> std::optional<ReadKind> {
+        if (const auto* read = readOverlap(batch, address, end)) return read->kind;
+        return readSetOverlap(batch, address, end);
+    };
     if (open != nullptr) {
-        if (const auto* read = readOverlap(*open, address, end)) return PendingReadInfo{submissions + 1, open->queue, read->kind, true, false};
+        if (const auto kind = hit(*open)) return PendingReadInfo{submissions + 1, open->queue, *kind, true, false};
     }
     for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
-        if (const auto* read = readOverlap(**it, address, end)) return PendingReadInfo{(*it)->serial, (*it)->queue, read->kind, false, signaled(**it)};
+        if (const auto kind = hit(**it)) return PendingReadInfo{(*it)->serial, (*it)->queue, *kind, false, signaled(**it)};
     }
     return std::nullopt;
 }
 
 Recorder::ReadStatistics Recorder::ReadCounts() {
-    ReadStatistics counts{readsNoted.load(std::memory_order_relaxed), readQueries.load(std::memory_order_relaxed), readStaleIgnored.load(std::memory_order_relaxed), {}};
+    ReadStatistics counts{readsNoted.load(std::memory_order_relaxed), readQueries.load(std::memory_order_relaxed), readStaleIgnored.load(std::memory_order_relaxed), {}, 0, 0, 0};
     for (std::size_t kind = 0; kind < ReadKinds; ++kind) counts.hits[kind] = readHits[kind].load(std::memory_order_relaxed);
+    counts.setsNoted = readSetsNoted.load(std::memory_order_relaxed);
+    counts.setNotesSkipped = readSetNotesSkipped.load(std::memory_order_relaxed);
+    counts.setRangesSkipped = readSetRangesSkipped.load(std::memory_order_relaxed);
     return counts;
 }
 
@@ -2698,6 +2781,9 @@ void Recorder::Submit() {
         // A CPU write into a noted read after this collect (and so possibly before the GPU read
         // it) fails UnchangedSince at the presenter's check (VulkanDevice RetirePresents).
         for (const auto& read : open->reads) open->readGeneration = std::max(open->readGeneration, GuestMemory::CollectWrites(read.begin, read.end - read.begin));
+        for (const auto& set : open->readSets) {
+            for (const auto& [begin, finish] : *set.first) open->readGeneration = std::max(open->readGeneration, GuestMemory::CollectWrites(begin, finish - begin));
+        }
     }
     auto batch = std::move(open);
     Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
@@ -3151,11 +3237,11 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
                 if (now - lastReport > std::chrono::seconds(10)) {
                     lastReport = now;
                     const auto& h = holdCounters;
-                    std::fprintf(stderr, "[recorder] %llu syncs waited %.1f s for the GPU in total (sources, count/wait: idle %llu/%.1fs, pending write %llu/%.1fs, recorded store %llu/%.1fs, address-based %llu/%.1fs, other %llu/%.1fs); hook %llu calls, %llu locked; %llu targeted syncs left %llu batches in flight; snapshot %llu rebuilds %.0f ms, %llu notes covered; %llu unlocked timeline waits %.1f s; %llu submissions, %zu label entries, %llu completion labels pending; fence waits by thread (count/wait):%s; top sync sites (source@caller syncs/batches/wait):%s; under holds (cumulative): %llu completions ran %.0f ms (kept objects released %.0f ms), pending-write syncs from completions: %llu skipped, %llu waited %.0f ms; %llu reaps (%llu with work) retired %llu batches in %.0f ms; hook waits unlocked %llu / %.0f ms GPU (pending write %llu / %.0f ms, recorded store %llu / %.0f ms) + %.0f ms relock (%llu found the recorder torn down), locked %llu; deferred releases: on the release thread %llu batches (%llu objects) in %.0f ms, inline %llu batches (%llu objects) in %.0f ms (%llu batches over the queue bound of %zu), queue max %llu batches, %llu pending\n",static_cast<unsigned long long>(waits), waitedMs / 1000, static_cast<unsigned long long>(syncCounts[0]), syncWaitedMs[0] / 1000, static_cast<unsigned long long>(syncCounts[1]), syncWaitedMs[1] / 1000, static_cast<unsigned long long>(syncCounts[2]), syncWaitedMs[2] / 1000, static_cast<unsigned long long>(syncCounts[3]), syncWaitedMs[3] / 1000, static_cast<unsigned long long>(syncCounts[4]), syncWaitedMs[4] / 1000, static_cast<unsigned long long>(hookCalls.load()), static_cast<unsigned long long>(hookLocks.load()), static_cast<unsigned long long>(targetedSyncs.load()), static_cast<unsigned long long>(batchesLeftInFlight.load()), static_cast<unsigned long long>(snapshotRebuilds), snapshotRebuildMs, static_cast<unsigned long long>(snapshotCovered), static_cast<unsigned long long>(unlockedWaits.load()), unlockedWaitedUs.load() / 1e6, static_cast<unsigned long long>(recorder.submissions), recorder.PendingLabels(), static_cast<unsigned long long>(completionLabels.load()), ThreadSyncReport().c_str(), SyncSiteReport().c_str(), static_cast<unsigned long long>(h.completions), h.completionMs, h.keptReleaseMs, static_cast<unsigned long long>(h.completionSyncsSkipped), static_cast<unsigned long long>(h.completionSyncsWaited), h.completionSyncWaitMs, static_cast<unsigned long long>(h.reaps), static_cast<unsigned long long>(h.reapsWithWork), static_cast<unsigned long long>(h.reapBatches), h.reapMs, static_cast<unsigned long long>(h.hookUnlockedWaits), h.hookUnlockedWaitMs, static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[1]), h.hookUnlockedWaitMsBySource[1], static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[2]), h.hookUnlockedWaitMsBySource[2], h.hookRelockMs, static_cast<unsigned long long>(h.hookUnlockedTornDown), static_cast<unsigned long long>(h.hookLockedWaits), static_cast<unsigned long long>(threadReleases.load()), static_cast<unsigned long long>(threadObjects.load()), threadReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineReleases.load()), static_cast<unsigned long long>(inlineObjects.load()), inlineReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineOverBound.load()), ReleaseQueueBound(), static_cast<unsigned long long>(releaseQueueMax.load()), static_cast<unsigned long long>(deferredPending.load()));
+                    std::fprintf(stderr, "[recorder] %llu syncs waited %.1f s for the GPU in total (sources, count/wait: idle %llu/%.1fs, pending write %llu/%.1fs, recorded store %llu/%.1fs, address-based %llu/%.1fs, other %llu/%.1fs); hook %llu calls, %llu locked; %llu targeted syncs left %llu batches in flight; snapshot %llu rebuilds (%llu incremental) %.0f ms, %llu notes covered; %llu unlocked timeline waits %.1f s; %llu submissions, %zu label entries, %llu completion labels pending; fence waits by thread (count/wait):%s; top sync sites (source@caller syncs/batches/wait):%s; under holds (cumulative): %llu completions ran %.0f ms (kept objects released %.0f ms), pending-write syncs from completions: %llu skipped, %llu waited %.0f ms; %llu reaps (%llu with work) retired %llu batches in %.0f ms; hook waits unlocked %llu / %.0f ms GPU (pending write %llu / %.0f ms, recorded store %llu / %.0f ms) + %.0f ms relock (%llu found the recorder torn down), locked %llu; deferred releases: on the release thread %llu batches (%llu objects) in %.0f ms, inline %llu batches (%llu objects) in %.0f ms (%llu batches over the queue bound of %zu), queue max %llu batches, %llu pending\n",static_cast<unsigned long long>(waits), waitedMs / 1000, static_cast<unsigned long long>(syncCounts[0]), syncWaitedMs[0] / 1000, static_cast<unsigned long long>(syncCounts[1]), syncWaitedMs[1] / 1000, static_cast<unsigned long long>(syncCounts[2]), syncWaitedMs[2] / 1000, static_cast<unsigned long long>(syncCounts[3]), syncWaitedMs[3] / 1000, static_cast<unsigned long long>(syncCounts[4]), syncWaitedMs[4] / 1000, static_cast<unsigned long long>(hookCalls.load()), static_cast<unsigned long long>(hookLocks.load()), static_cast<unsigned long long>(targetedSyncs.load()), static_cast<unsigned long long>(batchesLeftInFlight.load()), static_cast<unsigned long long>(snapshotRebuilds), static_cast<unsigned long long>(snapshotIncremental), snapshotRebuildMs, static_cast<unsigned long long>(snapshotCovered), static_cast<unsigned long long>(unlockedWaits.load()), unlockedWaitedUs.load() / 1e6, static_cast<unsigned long long>(recorder.submissions), recorder.PendingLabels(), static_cast<unsigned long long>(completionLabels.load()), ThreadSyncReport().c_str(), SyncSiteReport().c_str(), static_cast<unsigned long long>(h.completions), h.completionMs, h.keptReleaseMs, static_cast<unsigned long long>(h.completionSyncsSkipped), static_cast<unsigned long long>(h.completionSyncsWaited), h.completionSyncWaitMs, static_cast<unsigned long long>(h.reaps), static_cast<unsigned long long>(h.reapsWithWork), static_cast<unsigned long long>(h.reapBatches), h.reapMs, static_cast<unsigned long long>(h.hookUnlockedWaits), h.hookUnlockedWaitMs, static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[1]), h.hookUnlockedWaitMsBySource[1], static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[2]), h.hookUnlockedWaitMsBySource[2], h.hookRelockMs, static_cast<unsigned long long>(h.hookUnlockedTornDown), static_cast<unsigned long long>(h.hookLockedWaits), static_cast<unsigned long long>(threadReleases.load()), static_cast<unsigned long long>(threadObjects.load()), threadReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineReleases.load()), static_cast<unsigned long long>(inlineObjects.load()), inlineReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineOverBound.load()), ReleaseQueueBound(), static_cast<unsigned long long>(releaseQueueMax.load()), static_cast<unsigned long long>(deferredPending.load()));
                     std::fprintf(stderr, "[recorder] completion label stores: %llu run, %llu skipped (no CPU write-back overlapped them); %llu counted pending at a write-back; %llu write-backs over a tracked label; %llu write-back completions pending\n", static_cast<unsigned long long>(completionStoresRun.load()), static_cast<unsigned long long>(completionStoresSkipped.load()), static_cast<unsigned long long>(completionLabelsCountedLate.load()), static_cast<unsigned long long>(writeBacksOverLabels.load()), static_cast<unsigned long long>(writeBackCompletions.load()));
                     std::fprintf(stderr, "[recorder] submits %llu, vkQueueSubmit mean %.1f us, max %.1f us\n", static_cast<unsigned long long>(submitCount), submitCount != 0 ? submitUs / static_cast<double>(submitCount) : 0.0, submitMaxUs);
                     const auto reads = Recorder::ReadCounts();
-                    std::fprintf(stderr, "[recorder] in-place reads: %llu noted, %llu queries, hits by reader: dispatch element %llu, gpu copy %llu, address-based %llu, indirect %llu, storage upload %llu, copy source %llu; %llu hits on signaled batches ignored\n", static_cast<unsigned long long>(reads.noted), static_cast<unsigned long long>(reads.queries), static_cast<unsigned long long>(reads.hits[0]), static_cast<unsigned long long>(reads.hits[1]), static_cast<unsigned long long>(reads.hits[2]), static_cast<unsigned long long>(reads.hits[3]), static_cast<unsigned long long>(reads.hits[4]), static_cast<unsigned long long>(reads.hits[5]), static_cast<unsigned long long>(reads.staleIgnored));
+                    std::fprintf(stderr, "[recorder] in-place reads: %llu noted, %llu queries, hits by reader: dispatch element %llu, gpu copy %llu, address-based %llu, indirect %llu, storage upload %llu, copy source %llu; %llu hits on signaled batches ignored; read sets: %llu referenced, %llu repeat notes skipped (%llu ranges)\n", static_cast<unsigned long long>(reads.noted), static_cast<unsigned long long>(reads.queries), static_cast<unsigned long long>(reads.hits[0]), static_cast<unsigned long long>(reads.hits[1]), static_cast<unsigned long long>(reads.hits[2]), static_cast<unsigned long long>(reads.hits[3]), static_cast<unsigned long long>(reads.hits[4]), static_cast<unsigned long long>(reads.hits[5]), static_cast<unsigned long long>(reads.staleIgnored), static_cast<unsigned long long>(reads.setsNoted), static_cast<unsigned long long>(reads.setNotesSkipped), static_cast<unsigned long long>(reads.setRangesSkipped));
                 }
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
@@ -3189,6 +3275,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
         entry.reads.clear();
         if (FlipReadCheck()) {
             for (const auto& read : batch->reads) entry.reads.emplace_back(read.begin, read.end);
+            for (const auto& set : batch->readSets) entry.reads.insert(entry.reads.end(), set.first->begin(), set.first->end());
         }
     }
     // Completions store GPU results to guest memory; a failing one is reported, the rest still run.

@@ -244,6 +244,11 @@ public:
     // The same ranges listed into `out` (cleared first, keeping its capacity), as a span over it:
     // a per-draw query lists them into a thread's scratch instead of a fresh vector.
     std::span<const std::pair<std::uint64_t, std::uint64_t>> InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
+    // The in-place reads split for the recorder's read sets (Recorder::NotePendingReadSet): the
+    // build's own regions listed into `out` as InPlaceReads does, and the shared address space's
+    // ranges (an address-based build: sorted and merged, immutable, the same list for every build
+    // of the space) returned by reference, or null without a space. Nothing once committed.
+    std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> InPlaceReadSet(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
 
 private:
     struct Region {

@@ -262,6 +262,13 @@ public:
         double descriptorsMs = 0;
         double prepareMs = 0;
         double completeMs = 0;
+        // MarkGpuWrites' parts (cumulative over the object's uses; the dispatch diffs them for its
+        // "record: marks: ..." rows): the in-place read notes, the copy-backs with the claims'
+        // release, the pending-write notes (the snapshot publish included), the direct-write marks.
+        double marksReadsMs = 0;
+        double marksCopyBacksMs = 0;
+        double marksWritesMs = 0;
+        double marksDirectMs = 0;
     };
     const BuildTiming& Timing() const { return timing; }
     // The image surfaces (address, bytes) whose stage-B lookup reads guest memory on the CPU and so
