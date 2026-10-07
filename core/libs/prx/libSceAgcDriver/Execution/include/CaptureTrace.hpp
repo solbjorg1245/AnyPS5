@@ -1,5 +1,6 @@
 #pragma once
 
+#include "prx/libc/include/HostThread.hpp"
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -39,7 +40,7 @@ private:
     CaptureTrace() {
         output.exceptions(std::ios::badbit | std::ios::failbit);
         output.open("capture-trace.log", std::ios::binary);
-        worker = std::thread([this] { run(); });
+        worker = HostThread([this] { run(); });
     }
 
     ~CaptureTrace() {
@@ -85,7 +86,7 @@ private:
     std::mutex mutex;
     std::condition_variable changed;
     std::string pending;
-    std::thread worker;
+    HostThread worker;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     unsigned long long sequence = 0;
     bool stopping = false;

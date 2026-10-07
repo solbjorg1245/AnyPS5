@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_PIPELINECACHE_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libc/include/HostThread.hpp"
 #include <condition_variable>
 #include <cstddef>
 #include <filesystem>
@@ -35,7 +36,7 @@ private:
     std::mutex mutex;
     std::condition_variable wake;
     bool stopping = false;
-    std::thread saver;
+    HostThread saver;
 };
 
 }

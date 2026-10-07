@@ -21,6 +21,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
 #ifdef _WIN32
+#include "prx/libc/include/HostThread.hpp"
 #include <windows.h>
 #endif
 #include <atomic>
@@ -139,7 +140,7 @@ public:
         std::lock_guard lock(mutex);
         require(!stopping, "frame dump writer has stopped");
         require(pixels.size() <= maxBytes - queuedBytes, "frame dump queue exceeded 64 MiB");
-        if (!worker.joinable()) worker = std::thread([this] { run(); });
+        if (!worker.joinable()) worker = HostThread([this] { run(); });
         const auto bytes = pixels.size();
         pending.push_back({index, width, height, scale, std::move(pixels)});
         queuedBytes += bytes;
@@ -181,7 +182,7 @@ private:
     std::mutex mutex;
     std::condition_variable changed;
     std::deque<Frame> pending;
-    std::thread worker;
+    HostThread worker;
     std::size_t queuedBytes = 0;
     bool stopping = false;
 };

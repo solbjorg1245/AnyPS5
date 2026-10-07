@@ -11,6 +11,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #ifdef _WIN32
+#include "prx/libc/include/HostThread.hpp"
 #include <windows.h>
 #else
 #include <sys/mman.h>
@@ -630,7 +631,7 @@ private:
     unsigned finished = 0;
     std::atomic<std::size_t> next{0};
     std::atomic<std::uint64_t> copiedBlocks{0};
-    std::vector<std::jthread> threads;
+    std::vector<HostStopThread> threads;
 };
 
 // The device-lock work before [address, address + bytes) of a writable mirror can be compared with

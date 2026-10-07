@@ -30,8 +30,9 @@ void Driver::addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, b
     // draw packet, all of its work counted.
     const auto heap = HostHeap::ThreadCounters();
     const auto packets = static_cast<double>(totals.packets);
-    char heapText[192];
-    std::snprintf(heapText, sizeof(heapText), "; host heap per packet on this thread: %.1f allocations (%.1f from the block cache), %.1f frees", static_cast<double>(heap.allocations - totals.heap.allocations) / packets, static_cast<double>(heap.cacheHits - totals.heap.cacheHits) / packets, static_cast<double>(heap.releases - totals.heap.releases) / packets);
+    const auto arena = HostHeap::Arena();
+    char heapText[256];
+    std::snprintf(heapText, sizeof(heapText), "; host heap per packet on this thread: %.1f allocations (%.1f from the %s), %.1f frees; arena %.1f MiB committed, %.1f MiB on the shared lists", static_cast<double>(heap.allocations - totals.heap.allocations) / packets, static_cast<double>(heap.cacheHits - totals.heap.cacheHits) / packets, HostHeap::ModeName(), static_cast<double>(heap.releases - totals.heap.releases) / packets, static_cast<double>(arena.committedBytes) / 1048576, static_cast<double>(arena.sharedBytes) / 1048576);
     totals.heap = heap;
     std::fprintf(stderr, "[draw] driver phases (10 s, %llu draw packets, %llu drawn, %llu captures), us per packet:%s, total %.1f (%.1f ms; Graphics::Draw %.1f ms, skipped %.1f ms)%s\n", static_cast<unsigned long long>(totals.packets), static_cast<unsigned long long>(totals.drawn), static_cast<unsigned long long>(totals.captures), report.c_str(), total * 1000 / static_cast<double>(totals.packets), total, totals.ms[DrawRowGraphics], totals.ms[DrawRowSkipped], heapText);
     totals.ms = {};

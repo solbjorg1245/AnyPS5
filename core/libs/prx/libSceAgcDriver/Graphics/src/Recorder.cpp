@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4Opcodes.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/HostThread.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -348,7 +349,7 @@ struct ReleaseQueue {
     std::mutex mutex;
     std::condition_variable wake;
     std::vector<DeferredBatch> items;
-    std::thread thread;
+    HostThread thread;
     bool started = false;
     // Set by a joiner under `mutex` until the thread was joined: the thread leaves once the queue
     // is empty, and hand-offs meanwhile destroy inline (nothing may be queued without a taker).
@@ -382,7 +383,7 @@ void ReleaseThreadMain() {
 void JoinReleaseThread() {
     auto& queue = ReleaseThreadQueue();
     std::lock_guard joining(queue.joinMutex);
-    std::thread worker;
+    HostThread worker;
     {
         std::lock_guard lock(queue.mutex);
         if (!queue.started) return;
@@ -420,7 +421,7 @@ void ReleaseDeferredKeeps() {
             // The thread before the items: items queued with no thread to take them would keep
             // `deferredPending` up and ~Recorder waiting forever.
             if (!queue.started) {
-                queue.thread = std::thread(&ReleaseThreadMain);
+                queue.thread = HostThread(&ReleaseThreadMain);
                 queue.started = true;
             }
             // The allocation before any move: a failure here leaves `releasing` intact for the

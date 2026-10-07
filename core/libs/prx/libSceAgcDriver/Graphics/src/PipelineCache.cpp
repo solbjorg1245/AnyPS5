@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "ShaderCacheDirectory.hpp"
+#include "prx/libc/include/HostThread.hpp"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -58,7 +59,7 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
         result = create(context.device, &info, nullptr, &cache);
     }
     Check(result, "vkCreatePipelineCache");
-    if (!path.empty()) saver = std::thread([this] { run(); });
+    if (!path.empty()) saver = HostThread([this] { run(); });
 }
 
 PipelineCache::~PipelineCache() {

@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libc/include/HostThread.hpp"
 #include <bit>
 #include <cstdlib>
 
@@ -179,7 +180,7 @@ void Driver::enqueue(Submission submission) {
     for (const auto dword : submission.labelWrites) ++worker.unfinishedWrites[dword];
     worker.pending.push_back(std::move(submission));
     worker.queued.fetch_add(1, std::memory_order_acq_rel);
-    if (!worker.thread.joinable()) worker.thread = std::thread([this, queue] { run(queue); });
+    if (!worker.thread.joinable()) worker.thread = HostThread([this, queue] { run(queue); });
 }
 
 void Driver::noteHeldAtSubmit(Submission& submission, std::size_t cursor) {

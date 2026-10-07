@@ -8,6 +8,7 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include "prx/libc/include/HostThread.hpp"
 #include <windows.h>
 #endif
 #include "ShaderCacheVersion.hpp"
@@ -592,7 +593,7 @@ public:
         if (root.empty()) return;
         this->root = root;
         directory = root / hex(SourceVersion());
-        std::thread([this] { run(); }).detach();
+        HostThread([this] { run(); }).detach();
     }
 
     [[nodiscard]] bool Enabled() const { return !directory.empty(); }

@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "prx/libc/include/HostThread.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -40,7 +41,7 @@ struct QueueWorker {
 
     std::atomic<std::uint64_t> queued{0};
     std::unordered_map<std::uint64_t, std::uint32_t> unfinishedWrites;
-    std::thread thread;
+    HostThread thread;
 };
 
 }
