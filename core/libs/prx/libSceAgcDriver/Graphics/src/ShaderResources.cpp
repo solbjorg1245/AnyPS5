@@ -1495,8 +1495,32 @@ bool VerifyProofs() {
 // counted every 10 s and the proof fails, so the template is rebuilt. Found because templates
 // that survive across frames (APS5_RESOURCE_CACHE_ENTRIES=4096) doubled the game's visible set
 // (t231) while APS5_NO_FAST_REVALIDATE=1 did not (t235).
+// APS5_VERIFY_FAST_PROOFS=2..6 (diagnostic, session 22): the walk beside the proof keeps the
+// game's visible set right while its verdict never differs in gameplay (t237), so one class of
+// the walk's side effects runs beside every accepted fast proof, without a verdict, to find the
+// one the fast path lacks: 2 = the sampled-texture lookups only, 3 = the storage-image lookups
+// only, 4 = only the pending flush over every snapshot's memory (the sampled lookup's), 5 = only
+// Refresh of every storage image and view source, 6 = no side effect, a spin of
+// APS5_FAST_PROOF_SPIN_US microseconds (default 20) in place of the walk's time.
+unsigned VerifyFastProofsMode() {
+    static const unsigned mode = [] {
+        const char* value = std::getenv("APS5_VERIFY_FAST_PROOFS");
+        if (value == nullptr) return 0u;
+        const auto parsed = std::strtoul(value, nullptr, 10);
+        return parsed >= 2 && parsed <= 6 ? static_cast<unsigned>(parsed) : 1u;
+    }();
+    return mode;
+}
+
 bool VerifyFastProofs() {
-    static const bool enabled = std::getenv("APS5_VERIFY_FAST_PROOFS") != nullptr;
+    return VerifyFastProofsMode() == 1;
+}
+
+// APS5_NO_SERIAL_MEMO=1 (diagnostic, session 22): the fast proof scans the pending registry on
+// every call, as if its serial had moved since the last proof (the epoch gate's memo off, the
+// per-element proofs kept).
+bool SerialMemoEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_SERIAL_MEMO") == nullptr;
     return enabled;
 }
 
@@ -1594,7 +1618,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         return false;
     };
     if (validatedTextures.size() != textures.size()) return fail(FastFail::NoRecord);
-    const bool unchanged = pendingSerialSeen != 0 && pendingSerialSeen == serialBefore;
+    const bool unchanged = SerialMemoEnabled() && pendingSerialSeen != 0 && pendingSerialSeen == serialBefore;
     const bool keyProofs = KeyFastPath();
     thread_local std::vector<GuestMemory::UnchangedQuery> queries;
     thread_local std::vector<StorageTexture::PendingQuery> pending;
@@ -2001,7 +2025,24 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
         for (const auto& image : storageTextures) fastVersions.emplace_back(image.get(), image->Version());
         walkMismatch[0] = 0;
+        // What the walk's lookups did beside the proof (session 22): this thread's lookup outcomes
+        // and the texture-cache counters before and after, summed per template stage (compute /
+        // graphics) and printed with the 10 s line, to name the side effect the fast path lacks.
+        static std::atomic<std::uint64_t> walkKinds[2][LookupOutcomes::Count];
+        static std::atomic<std::uint64_t> walkCacheDeltas[2][4];
+        const std::size_t walkGroup = shaders.front().stage == ShaderRecompiler::ShaderStage::Compute ? 0 : 1;
+        auto& walkOutcomes = ThreadLookupOutcomes();
+        const auto kindsBefore = walkOutcomes.counts;
+        auto& walkCounters = TextureCounts();
+        const std::uint64_t cacheBefore[4] = {walkCounters.replaced.load(std::memory_order_relaxed), walkCounters.storageCreated.load(std::memory_order_relaxed), walkCounters.snapshots.load(std::memory_order_relaxed), walkCounters.fromStorage.load(std::memory_order_relaxed)};
         const bool same = fullWalk();
+        for (std::size_t k = 0; k < LookupOutcomes::Count; ++k) {
+            if (walkOutcomes.counts[k] != kindsBefore[k]) walkKinds[walkGroup][k].fetch_add(walkOutcomes.counts[k] - kindsBefore[k], std::memory_order_relaxed);
+        }
+        const std::uint64_t cacheAfter[4] = {walkCounters.replaced.load(std::memory_order_relaxed), walkCounters.storageCreated.load(std::memory_order_relaxed), walkCounters.snapshots.load(std::memory_order_relaxed), walkCounters.fromStorage.load(std::memory_order_relaxed)};
+        for (std::size_t k = 0; k < 4; ++k) {
+            if (cacheAfter[k] != cacheBefore[k]) walkCacheDeltas[walkGroup][k].fetch_add(cacheAfter[k] - cacheBefore[k], std::memory_order_relaxed);
+        }
         const auto moved = std::find_if(fastVersions.begin(), fastVersions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
         static std::atomic<std::uint64_t> verified{0};
         static std::atomic<std::uint64_t> wrong{0};
@@ -2036,8 +2077,73 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
         const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         auto last = lastReport.load();
-        if (nowMs - last >= 10000 && lastReport.compare_exchange_strong(last, nowMs)) std::fprintf(stderr, "[rescache] fast proofs verified %llu, wrong %llu\n", static_cast<unsigned long long>(verified.load()), static_cast<unsigned long long>(wrong.load()));
+        if (nowMs - last >= 10000 && lastReport.compare_exchange_strong(last, nowMs)) {
+            std::fprintf(stderr, "[rescache] fast proofs verified %llu, wrong %llu\n", static_cast<unsigned long long>(verified.load()), static_cast<unsigned long long>(wrong.load()));
+            std::string kinds;
+            char item[128];
+            for (std::size_t k = 0; k < LookupOutcomes::Count; ++k) {
+                const auto compute = walkKinds[0][k].load(std::memory_order_relaxed);
+                const auto graphics = walkKinds[1][k].load(std::memory_order_relaxed);
+                if (compute == 0 && graphics == 0) continue;
+                std::snprintf(item, sizeof(item), " %s %llu/%llu", LookupOutcomes::Name(static_cast<LookupOutcomes::Kind>(k)), static_cast<unsigned long long>(compute), static_cast<unsigned long long>(graphics));
+                kinds += item;
+            }
+            static const char* const cacheNames[4] = {"replaced", "storage created", "snapshots made", "views made"};
+            for (std::size_t k = 0; k < 4; ++k) {
+                std::snprintf(item, sizeof(item), " | %s %llu/%llu", cacheNames[k], static_cast<unsigned long long>(walkCacheDeltas[0][k].load(std::memory_order_relaxed)), static_cast<unsigned long long>(walkCacheDeltas[1][k].load(std::memory_order_relaxed)));
+                kinds += item;
+            }
+            std::fprintf(stderr, "[rescache] walks beside proofs (compute/graphics, cumulative):%s\n", kinds.c_str());
+        }
         if (stale) return finish(false, false, ProofFailure::Other);
+    } else if (fast && VerifyFastProofsMode() >= 2) {
+        // One class of the walk's side effects beside the accepted proof, no verdict (see
+        // VerifyFastProofsMode).
+        const auto mode = VerifyFastProofsMode();
+        if (mode == 6) {
+            static const long long spinUs = [] { const char* v = std::getenv("APS5_FAST_PROOF_SPIN_US"); return v != nullptr ? std::strtoll(v, nullptr, 10) : 20ll; }();
+            const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(spinUs);
+            while (std::chrono::steady_clock::now() < until) {}
+        } else if (mode == 4) {
+            for (const auto& surface : validatedTextures) {
+                if (surface.valid && surface.source == nullptr) StorageTexture::FlushPending(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes), nullptr, "sampled texture");
+            }
+        } else if (mode == 5) {
+            for (const auto& texture : textures) {
+                if (texture == nullptr) continue;
+                if (const auto& source = texture->SharedStorageSource(); source != nullptr) source->Refresh();
+            }
+            for (const auto& image : storageTextures) {
+                if (image != nullptr) image->Refresh();
+            }
+        } else {
+            lookupLog.clear();
+            std::size_t storageIndex = 0;
+            for (const auto& shader : shaders) {
+                if (shader.program == nullptr) break;
+                for (const auto& binding : shader.program->bindings) {
+                    if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages) continue;
+                    if (binding.kind == ShaderRecompiler::DescriptorKind::SampledImage) {
+                        if (mode != 2) continue;
+                        const auto elementWords = binding.count != 0 ? binding.guestDescriptor.size() / binding.count : 0;
+                        for (std::uint32_t element = 0; element < binding.count; ++element) {
+                            const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
+                            const auto resource = DecodeTextureResource(words);
+                            const VkComponentMapping components{ComponentSwizzleFor(resource.dstSelX), ComponentSwizzleFor(resource.dstSelY), ComponentSwizzleFor(resource.dstSelZ), ComponentSwizzleFor(resource.dstSelW)};
+                            cachedTexture(context, words, resource, components, 0, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element));
+                        }
+                    } else if (binding.kind == ShaderRecompiler::DescriptorKind::StorageImage) {
+                        for (std::uint32_t element = 0; element < binding.count; ++element, ++storageIndex) {
+                            if (mode != 3 || storageIndex >= storageTextures.size()) continue;
+                            if (SameAsPreviousStorageElement(binding, element) && StorageDedupeEnabled()) continue;
+                            const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
+                            cachedStorageTexture(context, words, DecodeTextureResource(words), storageMips[storageIndex]);
+                        }
+                    }
+                }
+            }
+            lookupLog.clear();
+        }
     }
     // (2) The imported buffers the set reads in place: results of storage images pending in them go
     // to guest memory first (as an upload does), then each import must still be the one the set was
