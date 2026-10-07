@@ -2098,6 +2098,102 @@ void ignoredWordBitsTests() {
     }
 }
 
+// The buffer base slots of a variant (BufferBaseWords): a read-only guest-buffer V# whose base
+// (word 0, the low half of word 1) is located once among the words, consecutive in address and
+// read by the walk, yields its base words' slots (word 1 masked to the base bits), whatever the
+// shader made of its other words; a V# the walk did not read, one whose base is split over
+// non-adjacent runs, one with a base word at a data position, a written element's and one located
+// twice yield none.
+void bufferBaseWordsTests() {
+    using AgcDriver::BufferBaseWords;
+    using AgcDriver::PatchMaskAt;
+    using AgcDriver::WordPatchSlot;
+    using AgcDriver::VsharpWord1BaseBits;
+    using Slots = std::vector<WordPatchSlot>;
+    using Reads = std::vector<std::uint64_t>;
+    using Runs = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    const std::vector<std::uint32_t> first{0x4ee7fc40, 0x00040002, 0x10, 0x16204};
+    const std::vector<std::uint32_t> second{0x5ee7fc40, 0x00040002, 0x20, 0x16204};
+    ShaderRecompiler::DescriptorBinding buffers;
+    buffers.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    buffers.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    buffers.count = 2;
+    buffers.guestDescriptor = first;
+    buffers.guestDescriptor.insert(buffers.guestDescriptor.end(), second.begin(), second.end());
+    buffers.bufferWritten = {false, false};
+    // Words: two fillers, the first V# (positions 2-5), two fillers, the second V# (8-11).
+    std::vector<std::uint32_t> words{0xa, 0xb};
+    words.insert(words.end(), first.begin(), first.end());
+    words.insert(words.end(), {0xc, 0xd});
+    words.insert(words.end(), second.begin(), second.end());
+    const Runs runs{{0x1000, 0x1030}};
+    const auto same = [](const Slots& slots, const Slots& expected) {
+        if (slots.size() != expected.size()) return false;
+        for (std::size_t i = 0; i < slots.size(); ++i) {
+            if (slots[i].position != expected[i].position || slots[i].binding != expected[i].binding || slots[i].word != expected[i].word || slots[i].mask != expected[i].mask) return false;
+        }
+        return true;
+    };
+    Slots slots;
+    {
+        const Reads reads{0x1008, 0x1020};
+        const auto counts = BufferBaseWords(runs, words, std::span(&buffers, 1), {}, reads, slots);
+        Require(counts.located == 2 && counts.written + counts.unlocated + counts.unread + counts.ambiguous + counts.data == 0 && same(slots, {{2, 0, 0, 0xffffffffu}, {3, 0, 1, VsharpWord1BaseBits}, {8, 0, 4, 0xffffffffu}, {9, 0, 5, VsharpWord1BaseBits}}), "the V#s among the words were not located");
+        Require(PatchMaskAt(slots, 3) == VsharpWord1BaseBits && PatchMaskAt(slots, 8) == 0xffffffffu && PatchMaskAt(slots, 4) == 0, "the slot mask lookup is wrong");
+    }
+    {
+        // Only a V# the walk read counts; a data position at a base word and a written element skip.
+        const Reads reads{0x1008};
+        auto counts = BufferBaseWords(runs, words, std::span(&buffers, 1), {}, reads, slots);
+        Require(counts.located == 1 && counts.unread == 1 && slots.size() == 2 && slots[0].position == 2, "a V# the walk did not read was located");
+        const std::vector<std::uint32_t> dataPositions{3};
+        counts = BufferBaseWords(runs, words, std::span(&buffers, 1), dataPositions, reads, slots);
+        Require(counts.located == 0 && counts.data == 1 && slots.empty(), "a V# with a base word at a data position was kept");
+        const Reads none;
+        counts = BufferBaseWords(runs, words, std::span(&buffers, 1), {}, none, slots);
+        Require(counts.located == 0 && counts.unread == 2 && slots.empty(), "V#s were located without a read trace");
+        auto written = buffers;
+        written.bufferWritten = {true, false};
+        const Reads both{0x1008, 0x1020};
+        counts = BufferBaseWords(runs, words, std::span(&written, 1), {}, both, slots);
+        Require(counts.located == 1 && counts.written == 1 && slots.size() == 2 && slots[0].position == 8, "a written element's V# was located");
+        written.bufferWritten.clear();
+        Require(BufferBaseWords(runs, words, std::span(&written, 1), {}, both, slots).written == 2, "an element beyond bufferWritten was treated as read-only");
+        // The pair in the flat SRT too: slots into it as well; twice there: the element is skipped.
+        std::array<ShaderRecompiler::DescriptorBinding, 2> withFlat{buffers, buffers};
+        withFlat[1].role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+        withFlat[1].guestDescriptor = {0x1, 0x2, 0x5ee7fc40, 0x00040002, 0x3, 0x4ee7fc40, 0x00040002, 0x4};
+        counts = BufferBaseWords(runs, words, withFlat, {}, both, slots);
+        Require(counts.located == 2 && same(slots, {{2, 0, 0, 0xffffffffu}, {2, 1, 5, 0xffffffffu}, {3, 0, 1, VsharpWord1BaseBits}, {3, 1, 6, VsharpWord1BaseBits}, {8, 0, 4, 0xffffffffu}, {8, 1, 2, 0xffffffffu}, {9, 0, 5, VsharpWord1BaseBits}, {9, 1, 3, VsharpWord1BaseBits}}), "the flat SRT copies of the bases got no slots");
+        withFlat[1].guestDescriptor = {0x4ee7fc40, 0x00040002, 0x5ee7fc40, 0x00040002, 0x3, 0x4ee7fc40, 0x00040002, 0x4};
+        counts = BufferBaseWords(runs, words, withFlat, {}, both, slots);
+        Require(counts.located == 1 && counts.ambiguous == 1 && slots.size() == 4 && slots[0].position == 8, "a base the flat SRT holds twice was kept");
+        // The shader patched the stride (word 1 high half), the record count and word 3: the base
+        // still locates; a base that differs does not.
+        auto patched = buffers;
+        patched.guestDescriptor = {0x4ee7fc40, 0x00080002, 0x40, 0x12345, 0x5ee7fc44, 0x00040002, 0x20, 0x16204};
+        counts = BufferBaseWords(runs, words, std::span(&patched, 1), {}, both, slots);
+        Require(counts.located == 1 && counts.unlocated == 1 && slots.size() == 2 && slots[0].position == 2 && slots[1].mask == VsharpWord1BaseBits, "a V# with shader-patched words 1-3 was not located by its base, or a moved base was");
+    }
+    {
+        // Split over non-adjacent runs: not located; over adjacent runs: located; twice among the
+        // words: ambiguous, skipped.
+        const Runs split{{0x1000, 0x100c}, {0x2000, 0x2024}};
+        const Reads reads{0x1008, 0x2014};
+        const auto counts = BufferBaseWords(split, words, std::span(&buffers, 1), {}, reads, slots);
+        Require(counts.located == 1 && counts.unlocated == 1 && slots.size() == 2 && slots[0].position == 8, "a V# whose base is split over non-adjacent runs was located");
+        const Runs adjacent{{0x1000, 0x100c}, {0x100c, 0x1030}};
+        const Reads both{0x1008, 0x1020};
+        Require(BufferBaseWords(adjacent, words, std::span(&buffers, 1), {}, both, slots).located == 2, "a V# over adjacent runs was not located");
+        auto twice = words;
+        twice.insert(twice.end(), first.begin(), first.end());
+        const Runs longer{{0x1000, 0x1040}};
+        const Reads all{0x1008, 0x1020, 0x1030};
+        const auto ambiguous = BufferBaseWords(longer, twice, std::span(&buffers, 1), {}, all, slots);
+        Require(ambiguous.located == 1 && ambiguous.ambiguous == 1 && slots.size() == 2 && slots[0].position == 8, "a V# located twice was kept");
+    }
+}
+
 // A template's data buffers refreshed by words from a patched compiled result (a data-only hit)
 // and back: DataWordsHash() follows the buffers exactly, so a later recipe hit's hash compare
 // (RecordedDispatch::DataRefresh::Hash) decides correctly in both directions.
@@ -2471,6 +2567,7 @@ int main() {
         importWindowTests(device, recorder);
         dataWordPositionsTests();
         ignoredWordBitsTests();
+        bufferBaseWordsTests();
         dataRefreshTests(device, recorder);
         minLodTests(device, recorder);
         firstLayerViewTests(device, recorder);

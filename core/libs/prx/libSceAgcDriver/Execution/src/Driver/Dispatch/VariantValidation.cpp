@@ -69,9 +69,9 @@ bool Driver::syncPendingRuns(std::uint64_t program, std::uint32_t queue, const S
 
 EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live) {
     if (live != nullptr) live->clear();
-    const bool masked = live != nullptr && !variant.dataPositions.empty();
+    const bool masked = live != nullptr && (!variant.dataPositions.empty() || !variant.baseSlots.empty());
     const bool bitsIgnored = tsharpMask() && !variant.ignoredBits.empty();
-    const DataMask mask{masked ? std::span<const std::uint32_t>(variant.dataPositions) : std::span<const std::uint32_t>{}, live, bitsIgnored ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(variant.ignoredBits) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}};
+    const DataMask mask{masked ? std::span<const std::uint32_t>(variant.dataPositions) : std::span<const std::uint32_t>{}, live, bitsIgnored ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(variant.ignoredBits) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}, masked ? std::span<const WordPatchSlot>(variant.baseSlots) : std::span<const WordPatchSlot>{}};
     PendingView pending;
     pending.Load();
     if (!syncPendingRuns(program, queue, *variant.compiled, regions, runsSynced, pending, sampling)) return EntryOutcome::Differing;

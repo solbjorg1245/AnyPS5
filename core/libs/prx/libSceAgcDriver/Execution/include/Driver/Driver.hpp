@@ -80,6 +80,7 @@ private:
     static bool dataHits();
     static bool verifyDataHits();
     static bool tsharpMask();
+    static bool vsharpBases();
     static bool relocatedHits();
     static RelocationVerdict learnRelocation(const DispatchVariant& old, DispatchVariant& fresh);
     static void traceFailedRelocation(std::uint64_t program, const DispatchVariant& candidate);

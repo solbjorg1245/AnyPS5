@@ -95,7 +95,12 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
                 ignoredBitWords.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
-            if (data->live == nullptr || !std::binary_search(data->positions.begin(), data->positions.end(), position)) return GuestMemory::Compare::Differs;
+            if (data->live == nullptr) return GuestMemory::Compare::Differs;
+            // A data position, or a buffer base word moved within its mask: refreshed on the hit.
+            if (!std::binary_search(data->positions.begin(), data->positions.end(), position)) {
+                const auto mask = PatchMaskAt(data->patches, position);
+                if (mask == 0 || ((stored ^ fresh) & ~mask) != 0) return GuestMemory::Compare::Differs;
+            }
             data->live->emplace_back(position, fresh);
         }
         return GuestMemory::Compare::Equal;

@@ -809,6 +809,79 @@ std::size_t IgnoredWordBits(std::span<const std::pair<std::uint64_t, std::uint64
     return located;
 }
 
+BufferBaseCounts BufferBaseWords(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::uint32_t> words, std::span<const ShaderRecompiler::DescriptorBinding> bindings, std::span<const std::uint32_t> dataPositions, std::span<const std::uint64_t> walkReads, std::vector<WordPatchSlot>& slots) {
+    constexpr std::size_t VsharpWords = 4;
+    constexpr std::size_t BaseWords = 2;
+    BufferBaseCounts counts;
+    slots.clear();
+    std::vector<std::size_t> prefix(runs.size() + 1, 0);
+    for (std::size_t i = 0; i < runs.size(); ++i) prefix[i + 1] = prefix[i] + static_cast<std::size_t>((runs[i].second - runs[i].first) / sizeof(std::uint32_t));
+    const auto addressOf = [&](std::size_t position) {
+        const auto run = static_cast<std::size_t>(std::upper_bound(prefix.begin(), prefix.end(), position) - prefix.begin()) - 1;
+        return runs[run].first + static_cast<std::uint64_t>(position - prefix[run]) * sizeof(std::uint32_t);
+    };
+    const auto dataPosition = [&](std::size_t position) { return std::binary_search(dataPositions.begin(), dataPositions.end(), static_cast<std::uint32_t>(position)); };
+    std::size_t flat = bindings.size();
+    for (std::size_t b = 0; b < bindings.size(); ++b) {
+        if (bindings[b].role == ShaderRecompiler::DescriptorRole::FlattenedSrt) {
+            flat = b;
+            break;
+        }
+    }
+    for (std::size_t b = 0; b < bindings.size(); ++b) {
+        const auto& binding = bindings[b];
+        if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+        const auto& descriptor = binding.guestDescriptor;
+        for (std::size_t element = 0; (element + 1) * VsharpWords <= descriptor.size(); ++element) {
+            const auto* vsharp = descriptor.data() + element * VsharpWords;
+            if (vsharp[0] == 0 && (vsharp[1] & VsharpWord1BaseBits) == 0) continue;
+            // An element beyond bufferWritten is not proved read-only.
+            if (element >= binding.bufferWritten.size() || binding.bufferWritten[element]) {
+                ++counts.written;
+                continue;
+            }
+            std::size_t found = words.size();
+            bool ambiguous = false, unread = false;
+            for (std::size_t position = 0; position + BaseWords <= words.size() && !ambiguous; ++position) {
+                if (words[position] != vsharp[0] || ((words[position + 1] ^ vsharp[1]) & VsharpWord1BaseBits) != 0) continue;
+                const auto address = addressOf(position);
+                if (addressOf(position + BaseWords - 1) != address + (BaseWords - 1) * sizeof(std::uint32_t)) continue;
+                if (!std::binary_search(walkReads.begin(), walkReads.end(), address)) {
+                    unread = true;
+                    continue;
+                }
+                if (found != words.size()) ambiguous = true;
+                found = position;
+            }
+            // The pair's copies among the flat SRT words: patched with it, or ambiguous.
+            std::size_t flatSlot = 0, flatCopies = 0;
+            if (!ambiguous && found != words.size() && flat < bindings.size()) {
+                const auto& flatWords = bindings[flat].guestDescriptor;
+                for (std::size_t s = 0; s + 1 < flatWords.size(); ++s) {
+                    if (flatWords[s] != words[found] || flatWords[s + 1] != words[found + 1]) continue;
+                    flatSlot = s;
+                    ++flatCopies;
+                }
+                if (flatCopies > 1) ambiguous = true;
+            }
+            if (ambiguous) ++counts.ambiguous;
+            else if (found == words.size()) ++(unread ? counts.unread : counts.unlocated);
+            else if (dataPosition(found) || dataPosition(found + 1)) ++counts.data;
+            else {
+                slots.push_back({static_cast<std::uint32_t>(found), static_cast<std::uint32_t>(b), static_cast<std::uint32_t>(element * VsharpWords), 0xffffffffu});
+                slots.push_back({static_cast<std::uint32_t>(found + 1), static_cast<std::uint32_t>(b), static_cast<std::uint32_t>(element * VsharpWords + 1), VsharpWord1BaseBits});
+                if (flatCopies == 1) {
+                    slots.push_back({static_cast<std::uint32_t>(found), static_cast<std::uint32_t>(flat), static_cast<std::uint32_t>(flatSlot), 0xffffffffu});
+                    slots.push_back({static_cast<std::uint32_t>(found + 1), static_cast<std::uint32_t>(flat), static_cast<std::uint32_t>(flatSlot + 1), VsharpWord1BaseBits});
+                }
+                ++counts.located;
+            }
+        }
+    }
+    std::sort(slots.begin(), slots.end(), [](const WordPatchSlot& a, const WordPatchSlot& c) { return a.position != c.position ? a.position < c.position : a.binding != c.binding ? a.binding < c.binding : a.word < c.word; });
+    return counts;
+}
+
 bool WordsEqualIgnoring(std::span<const std::uint32_t> a, std::span<const std::uint32_t> b, std::span<const std::pair<std::uint32_t, std::uint32_t>> ignored) {
     if (a.size() != b.size()) return false;
     for (std::size_t i = 0; i < a.size(); ++i) {

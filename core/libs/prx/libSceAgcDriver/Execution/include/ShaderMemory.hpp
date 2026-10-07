@@ -162,6 +162,45 @@ bool WordsEqualIgnoring(std::span<const std::uint32_t> a, std::span<const std::u
 // sampled-image binding's elements (any other binding: exactly).
 bool SameDescriptorIgnoringTsharpBits(const ShaderRecompiler::DescriptorBinding& binding, std::span<const std::uint32_t> left, std::span<const std::uint32_t> right);
 
+// Buffer base slots of a variant's stored words: for each read-only guest-buffer V# (a 4-word
+// element of a GuestBuffers binding the shader proves it never stores to) whose base is located
+// once among the words (word 0 and the low 16 bits of word 1, two words consecutive in address
+// that the walk read: the first one's address among `walkReads`, sorted; none located when
+// empty), the positions of those two words with the bits the base occupies. The base alone is
+// matched because the shader may patch the other words (stride, record count, format) or build
+// the V# from a 64-bit pointer the walk read, whose position then serves. A stage whose stored
+// words differ from guest memory only there (within the mask) still matches: a hit refreshes the
+// words like data words and writes the masked bits into guestDescriptor[word] of the compiled
+// bindings[binding], so the Graphics side's rebased template reads the moved buffer in place. The
+// title keeps such a V# in a per-frame block of the flat SRT whose base moves 0x40 per frame
+// (~2.3k fragment stage misses per 10 s in Boletaria, [draw-miss] class A). The two words also
+// get slots into the FlattenedSrt binding where its words hold the same pair (the pointer the
+// shader loaded sits in the flat SRT too; APS5_VERIFY_DATA_HITS caught the stale copy, t272). A V#
+// with a base word at a data position, a null one, one located at two positions or whose pair
+// the flat SRT holds twice (which copy moved is unknown) yields none; every other descriptor word
+// still compares exactly. `slots` is sorted by position (two elements holding one base share its
+// positions). Returns how many V#s were located and why the other elements were skipped (a null
+// V# counts nowhere).
+struct WordPatchSlot {
+    std::uint32_t position;
+    std::uint32_t binding;
+    std::uint32_t word;
+    std::uint32_t mask;
+};
+struct BufferBaseCounts {
+    std::uint64_t located = 0;
+    // Not proved read-only; not among the words consecutive in address; among them but not read by
+    // the walk; located at two positions; a base word at a data position.
+    std::uint64_t written = 0, unlocated = 0, unread = 0, ambiguous = 0, data = 0;
+};
+inline constexpr std::uint32_t VsharpWord1BaseBits = 0xffffu;
+BufferBaseCounts BufferBaseWords(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::uint32_t> words, std::span<const ShaderRecompiler::DescriptorBinding> bindings, std::span<const std::uint32_t> dataPositions, std::span<const std::uint64_t> walkReads, std::vector<WordPatchSlot>& slots);
+// The mask of `position` among sorted patch slots, 0 when absent.
+inline std::uint32_t PatchMaskAt(std::span<const WordPatchSlot> slots, std::uint32_t position) {
+    const auto it = std::lower_bound(slots.begin(), slots.end(), position, [](const WordPatchSlot& slot, std::uint32_t value) { return slot.position < value; });
+    return it != slots.end() && it->position == position ? it->mask : 0u;
+}
+
 }
 
 #endif

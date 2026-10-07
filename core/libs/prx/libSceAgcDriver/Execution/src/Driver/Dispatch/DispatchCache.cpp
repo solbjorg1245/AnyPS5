@@ -27,6 +27,13 @@ bool Driver::tsharpMask() {
     return mask;
 }
 
+// Draw-cache variants refresh the base of a read-only guest-buffer V# among their stored words on
+// a hit and patch it into its binding (BufferBaseWords); APS5_NO_VSHARP_BASES=1 compares it exactly.
+bool Driver::vsharpBases() {
+    static const bool bases = std::getenv("APS5_NO_VSHARP_BASES") == nullptr;
+    return bases;
+}
+
 std::size_t Driver::dispatchVariants() {
     static const std::size_t variants = [] {
         if (stampValidate()) return std::size_t{1};

@@ -44,6 +44,11 @@ struct DispatchVariant {
     // misses per 10 s in Boletaria). A hit binds the stored words, so the texture keys stay put.
     // Draw variants only; APS5_NO_TSHARP_MASK=1 compares them exactly.
     std::vector<std::pair<std::uint32_t, std::uint32_t>> ignoredBits;
+    // Buffer base slots (BufferBaseWords): the read-only guest-buffer V#s' base words among the
+    // stored words, refreshed on a hit like the data words and patched into their bindings'
+    // descriptors (the Graphics side rebases the moved buffer in place). Draw variants only;
+    // APS5_NO_VSHARP_BASES=1 leaves them out, so such a V# moving misses the stage.
+    std::vector<WordPatchSlot> baseSlots;
 
     // Relocation rule (DispatchRelocation.cpp): the low-word positions of the 64-bit pointers
     // through which the walk reached `movedRuns` (run indices). A later dispatch whose pointers all
@@ -63,7 +68,8 @@ struct DispatchVariant {
     // Draw data hits (DrawLookup.cpp): the one patched copy of `compiled` the variant's hits bind,
     // reused while no earlier draw still holds it (use_count 1) instead of a deep copy per hit (a
     // DescriptorBinding is seven vectors; ~130k copies per 10 s in Boletaria); only the flat
-    // binding's data slots are rewritten. APS5_NO_PATCHED_RESULT_REUSE=1 copies per hit again.
+    // binding's data slots and the buffer base slots are rewritten. APS5_NO_PATCHED_RESULT_REUSE=1
+    // copies per hit again.
     std::shared_ptr<ShaderRecompiler::RecompileResult> patched;
 };
 
@@ -105,6 +111,9 @@ struct DataMask {
     // (position, mask) sorted by position: a word differing only in the masked bits compares equal
     // (DispatchVariant::ignoredBits).
     std::span<const std::pair<std::uint32_t, std::uint32_t>> ignored;
+    // Sorted patch slots (DispatchVariant::baseSlots): a difference within a slot's mask is a
+    // refreshed word, reported through `live` like one at a data position.
+    std::span<const WordPatchSlot> patches;
 };
 
 // Why learnRelocation took or refused a relocation rule (counted per verdict).

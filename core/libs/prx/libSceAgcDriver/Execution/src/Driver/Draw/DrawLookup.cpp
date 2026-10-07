@@ -46,7 +46,7 @@ void probeDrawMiss(std::uint64_t program, ShaderRecompiler::ProgramRole role, co
         std::size_t groupWords = 0;
     };
     struct Program {
-        std::uint64_t misses = 0, wordsDiffering = 0, atDataPositions = 0, atIgnoredBits = 0, unmapped = 0, equalNow = 0;
+        std::uint64_t misses = 0, wordsDiffering = 0, atDataPositions = 0, atIgnoredBits = 0, atBaseSlots = 0, unmapped = 0, equalNow = 0;
         std::array<std::uint64_t, 3> byCount{};
         ShaderRecompiler::ProgramRole role{};
         std::map<std::pair<std::uint32_t, std::uint32_t>, Position> positions;
@@ -86,6 +86,10 @@ void probeDrawMiss(std::uint64_t program, ShaderRecompiler::ProgramRole role, co
                 ++entry.atIgnoredBits;
                 continue;
             }
+            if (const auto mask = PatchMaskAt(variant.baseSlots, position); mask != 0 && ((stored ^ fresh) & ~mask) == 0) {
+                ++entry.atBaseSlots;
+                continue;
+            }
             ++differing;
             if (entry.positions.size() < 6 || entry.positions.contains({static_cast<std::uint32_t>(r), static_cast<std::uint32_t>(w)})) {
                 auto& slot = entry.positions[{static_cast<std::uint32_t>(r), static_cast<std::uint32_t>(w)}];
@@ -113,7 +117,7 @@ void probeDrawMiss(std::uint64_t program, ShaderRecompiler::ProgramRole role, co
     char item[256];
     for (std::size_t i = 0; i < order.size() && i < 8; ++i) {
         const auto& [code, data] = *order[i];
-        std::snprintf(item, sizeof(item), " [%s 0x%llx: %llu misses, %llu words (1: %llu, 2-4: %llu, 5+: %llu), equal now %llu, at data positions %llu, at ignored bits %llu, unmapped runs %llu, %zu runs/%zu words:", data.role == ShaderRecompiler::ProgramRole::Fragment ? "ps" : data.role == ShaderRecompiler::ProgramRole::Main ? "vs" : "other", static_cast<unsigned long long>(code), static_cast<unsigned long long>(data.misses), static_cast<unsigned long long>(data.wordsDiffering), static_cast<unsigned long long>(data.byCount[0]), static_cast<unsigned long long>(data.byCount[1]), static_cast<unsigned long long>(data.byCount[2]), static_cast<unsigned long long>(data.equalNow), static_cast<unsigned long long>(data.atDataPositions), static_cast<unsigned long long>(data.atIgnoredBits), static_cast<unsigned long long>(data.unmapped), variant.runs.size(), variant.words.size());
+        std::snprintf(item, sizeof(item), " [%s 0x%llx: %llu misses, %llu words (1: %llu, 2-4: %llu, 5+: %llu), equal now %llu, at data positions %llu, at ignored bits %llu, at V# bases %llu, unmapped runs %llu, %zu runs/%zu words:", data.role == ShaderRecompiler::ProgramRole::Fragment ? "ps" : data.role == ShaderRecompiler::ProgramRole::Main ? "vs" : "other", static_cast<unsigned long long>(code), static_cast<unsigned long long>(data.misses), static_cast<unsigned long long>(data.wordsDiffering), static_cast<unsigned long long>(data.byCount[0]), static_cast<unsigned long long>(data.byCount[1]), static_cast<unsigned long long>(data.byCount[2]), static_cast<unsigned long long>(data.equalNow), static_cast<unsigned long long>(data.atDataPositions), static_cast<unsigned long long>(data.atIgnoredBits), static_cast<unsigned long long>(data.atBaseSlots), static_cast<unsigned long long>(data.unmapped), variant.runs.size(), variant.words.size());
         text += item;
         for (const auto& [where, position] : data.positions) {
             std::snprintf(item, sizeof(item), " r%u+%u@0x%llx %llux %08x->%08x grp", where.first, where.second, static_cast<unsigned long long>(position.address), static_cast<unsigned long long>(position.count), position.stored, position.live);
@@ -269,7 +273,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             for (const auto& variant : matched) stagesKept += variant != nullptr ? 1 : 0;
             hits.partial = !drawHit && stagesKept != 0 && partialDrawHits() && !verifyDrawEntries() && !verifyDataHits();
             // The kept stages' results; a data hit's stages carry the live words and a patched copy.
-            std::uint64_t dataStages = 0, dataWords = 0;
+            std::uint64_t dataStages = 0, dataWords = 0, baseStages = 0;
             if (drawHit || hits.partial) {
                 const auto patchStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 hits.liveWords.assign(programs.size(), {});
@@ -279,17 +283,18 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     if (matched[i] == nullptr) continue;
                     auto& variant = *matched[i];
                     hits.results[i] = variant.compiled;
-                    if (liveData[i].empty() || variant.flatBinding >= variant.compiled->bindings.size()) continue;
+                    const bool flat = variant.flatBinding < variant.compiled->bindings.size();
+                    if (liveData[i].empty() || (!flat && variant.baseSlots.empty())) continue;
                     auto& words = hits.liveWords[i];
                     words = variant.words;
                     for (const auto& [position, value] : liveData[i]) words[position] = value;
                     matchedRegions[i].clear();
                     appendEntryRegions(variant, matchedRegions[i], &words);
-                    // The patched copy differs from `compiled` only at the flat binding's data slots,
-                    // rewritten below on every hit, so one copy per variant serves every hit nobody
-                    // else still holds (the previous draw's hits.results and results are cleared
-                    // before this lookup; a holder elsewhere gets its own copy, which the variant then
-                    // keeps instead).
+                    // The patched copy differs from `compiled` only at the flat binding's data slots
+                    // and the buffer base slots, rewritten below on every hit, so one copy per variant
+                    // serves every hit nobody else still holds (the previous draw's hits.results and
+                    // results are cleared before this lookup; a holder elsewhere gets its own copy,
+                    // which the variant then keeps instead).
                     std::shared_ptr<ShaderRecompiler::RecompileResult> patched;
                     if (patchedResultReuse() && variant.patched != nullptr && variant.patched.use_count() == 1) {
                         patched = variant.patched;
@@ -299,10 +304,19 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         if (patchedResultReuse()) variant.patched = patched;
                         ++patchedMade;
                     }
-                    auto& descriptor = patched->bindings[variant.flatBinding].guestDescriptor;
-                    for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
-                        if (variant.dataSlots[k] < descriptor.size()) descriptor[variant.dataSlots[k]] = words[variant.dataPositions[k]];
+                    if (flat) {
+                        auto& descriptor = patched->bindings[variant.flatBinding].guestDescriptor;
+                        for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
+                            if (variant.dataSlots[k] < descriptor.size()) descriptor[variant.dataSlots[k]] = words[variant.dataPositions[k]];
+                        }
                     }
+                    // The buffer base slots: each moved V# base into its binding (BufferBaseWords),
+                    // the base bits only (the shader may have patched the rest of word 1).
+                    for (const auto& slot : variant.baseSlots) {
+                        auto& descriptor = patched->bindings[slot.binding].guestDescriptor;
+                        if (slot.word < descriptor.size()) descriptor[slot.word] = (descriptor[slot.word] & ~slot.mask) | (words[slot.position] & slot.mask);
+                    }
+                    if (!variant.baseSlots.empty() && std::any_of(liveData[i].begin(), liveData[i].end(), [&](const std::pair<std::uint32_t, std::uint32_t>& item) { return PatchMaskAt(variant.baseSlots, item.first) != 0; })) ++baseStages;
                     hits.results[i] = std::move(patched);
                     hits.data = true;
                     ++dataStages;
@@ -361,6 +375,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 if (hits.data) {
                     ++counters.dataHits;
                     counters.dataStages += dataStages;
+                    counters.baseStages += baseStages;
                     counters.dataWordsRefreshed += dataWords;
                     if (verifyDataHits()) {
                         // Captured again like a verified hit (cacheDrawStages compares the results).

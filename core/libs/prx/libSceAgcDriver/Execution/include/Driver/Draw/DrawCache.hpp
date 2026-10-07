@@ -69,6 +69,11 @@ struct DrawEntryCounters {
     std::uint64_t dataHits = 0, dataStages = 0, dataWordsRefreshed = 0, dataInserts = 0, dataPositionsInserted = 0, dataVerified = 0;
     // Variants inserted with don't-care bits (DispatchVariant::ignoredBits) and their positions.
     std::uint64_t ignoredInserts = 0, ignoredPositionsInserted = 0;
+    // Variants inserted with buffer base slots (DispatchVariant::baseSlots), and the data hits'
+    // stages that refreshed a base word.
+    std::uint64_t baseInserts = 0, baseSlotsInserted = 0, baseStages = 0;
+    // Why guest-buffer elements got no base slot at insert (BufferBaseCounts).
+    std::uint64_t baseWritten = 0, baseUnlocated = 0, baseUnread = 0, baseAmbiguous = 0, baseData = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 

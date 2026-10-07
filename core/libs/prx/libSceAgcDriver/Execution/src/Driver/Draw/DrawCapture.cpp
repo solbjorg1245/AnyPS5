@@ -10,6 +10,8 @@
 #include <mutex>
 #include <unordered_map>
 #include <cstring>
+#include <cstdio>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -139,26 +141,57 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                 variant->words.resize(offset + count);
                 std::memcpy(variant->words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
             }
+            // The sorted addresses of every read the walk made besides the pure leaves, plus the
+            // vertex input decode's (otherReads), for the data positions and the buffer base slots.
+            const bool traced = dataHits() && !stampValidate() && stageCapture.capture != nullptr;
+            std::vector<std::uint64_t> otherReads;
+            if (traced) {
+                const auto& trace = stageCapture.capture->readTrace;
+                otherReads.assign(trace.otherReads.begin(), trace.otherReads.end());
+                for (const auto& read : decodeReads[i]) {
+                    for (auto address = read.address & ~std::uint64_t{3}; address < read.address + read.bytes.size(); address += sizeof(std::uint32_t)) otherReads.push_back(address);
+                }
+                if (!decodeReads[i].empty()) std::sort(otherReads.begin(), otherReads.end());
+            }
             // Data positions (DrawStageHits): the pure flat-SRT leaves among the words. The vertex
             // input decode's reads count as other reads: a hit reuses the stage info they shaped.
-            if (dataHits() && !stampValidate() && stageCapture.capture != nullptr && !stageCapture.capture->readTrace.leaves.empty()) {
+            if (traced && !stageCapture.capture->readTrace.leaves.empty()) {
                 const auto& bindings = variant->compiled->bindings;
                 for (std::size_t b = 0; b < bindings.size(); ++b) {
                     if (bindings[b].role != ShaderRecompiler::DescriptorRole::FlattenedSrt) continue;
-                    const auto& trace = stageCapture.capture->readTrace;
-                    std::vector<std::uint64_t> otherReads(trace.otherReads.begin(), trace.otherReads.end());
-                    for (const auto& read : decodeReads[i]) {
-                        for (auto address = read.address & ~std::uint64_t{3}; address < read.address + read.bytes.size(); address += sizeof(std::uint32_t)) otherReads.push_back(address);
-                    }
-                    if (!decodeReads[i].empty()) std::sort(otherReads.begin(), otherReads.end());
                     variant->flatBinding = static_cast<std::uint32_t>(b);
-                    static_cast<void>(DataWordPositions(variant->runs, trace.leaves, otherReads, variant->words, bindings[b].guestDescriptor, variant->dataPositions, variant->dataSlots));
+                    static_cast<void>(DataWordPositions(variant->runs, stageCapture.capture->readTrace.leaves, otherReads, variant->words, bindings[b].guestDescriptor, variant->dataPositions, variant->dataSlots));
                     if (!variant->dataPositions.empty()) {
                         std::lock_guard cacheLock(drawCacheMutex);
                         ++drawEntryCounters.dataInserts;
                         drawEntryCounters.dataPositionsInserted += variant->dataPositions.size();
                     }
                     break;
+                }
+            }
+            // Buffer base slots: the read-only guest-buffer V#s the walk read among the words (a V#
+            // the vertex input decode read shaped the stage info: it compares exactly).
+            if (traced && vsharpBases()) {
+                const auto& trace = stageCapture.capture->readTrace;
+                std::vector<std::uint64_t> walkReads(trace.otherReads.begin(), trace.otherReads.end());
+                if (!decodeReads[i].empty()) {
+                    walkReads.erase(std::remove_if(walkReads.begin(), walkReads.end(), [&](std::uint64_t address) {
+                        return std::any_of(decodeReads[i].begin(), decodeReads[i].end(), [&](const Graphics::DecodeRead& read) { return address >= (read.address & ~std::uint64_t{3}) && address < read.address + read.bytes.size(); });
+                    }), walkReads.end());
+                }
+                const auto counts = BufferBaseWords(variant->runs, variant->words, variant->compiled->bindings, variant->dataPositions, walkReads, variant->baseSlots);
+                if (counts.located + counts.written + counts.unlocated + counts.unread + counts.ambiguous + counts.data != 0) {
+                    std::lock_guard cacheLock(drawCacheMutex);
+                    auto& counters = drawEntryCounters;
+                    if (!variant->baseSlots.empty()) {
+                        ++counters.baseInserts;
+                        counters.baseSlotsInserted += variant->baseSlots.size();
+                    }
+                    counters.baseWritten += counts.written;
+                    counters.baseUnlocated += counts.unlocated;
+                    counters.baseUnread += counts.unread;
+                    counters.baseAmbiguous += counts.ambiguous;
+                    counters.baseData += counts.data;
                 }
             }
             // Don't-care bits: the sampled-image T#s' streaming-feedback fields among the words.
@@ -176,16 +209,110 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             if (dataStage) {
                 const auto& patched = *hits.results[i];
                 const auto& captured = *stageCapture.compiled;
-                bool same = matched[i]->runs == variant->runs && WordsEqualIgnoring(hits.liveWords[i], variant->words, matched[i]->ignoredBits) && captured.variantId == patched.variantId && captured.pushConstants == patched.pushConstants && captured.bindings.size() == patched.bindings.size();
+                // The result is what the draw binds, so a different one aborts; runs or words that
+                // differ with the same result are reported and counted as mismatches. A flat word
+                // either capture left to the GPU (DescriptorBinding::deferredWords: a placeholder
+                // in its descriptor, copied from guest memory per draw) compares as equal: a
+                // variant captured while GPU work still wrote the leaf's page did not read that
+                // word, so a later capture reads one word more (vertex program 0x249376600, 2 runs
+                // / 16 words against 3 / 17, PROGRESS t264) and holds its value instead. So does a
+                // flat copy of a sampled T# word the stage compare accepted through the don't-care
+                // mask (DispatchVariant::ignoredBits): the hit binds the stored word there.
+                const auto deferredAt = [](const ShaderRecompiler::DescriptorBinding& binding, std::size_t word) {
+                    return std::any_of(binding.deferredWords.begin(), binding.deferredWords.end(), [&](const std::pair<std::uint32_t, std::uint64_t>& item) { return item.first == word; });
+                };
+                const auto tsharpCopy = [&](std::uint32_t capturedWord, std::uint32_t patchedWord) {
+                    const auto& stored = matched[i]->words;
+                    for (const auto& [position, mask] : matched[i]->ignoredBits) {
+                        if (position < stored.size() && stored[position] == patchedWord && ((capturedWord ^ patchedWord) & ~mask) == 0) return true;
+                    }
+                    return false;
+                };
+                std::string difference;
+                std::size_t badBinding = captured.bindings.size(), badWord = 0;
+                bool same = captured.variantId == patched.variantId && captured.pushConstants == patched.pushConstants && captured.bindings.size() == patched.bindings.size();
+                if (!same) difference = " variant, push constants or binding count";
                 for (std::size_t b = 0; same && b < captured.bindings.size(); ++b) {
                     const auto& left = captured.bindings[b];
                     const auto& right = patched.bindings[b];
-                    same = left.kind == right.kind && left.role == right.role && left.binding == right.binding && left.count == right.count && SameDescriptorIgnoringTsharpBits(left, left.guestDescriptor, right.guestDescriptor);
+                    same = left.kind == right.kind && left.role == right.role && left.binding == right.binding && left.count == right.count && left.guestDescriptor.size() == right.guestDescriptor.size();
+                    if (same && left.role == ShaderRecompiler::DescriptorRole::FlattenedSrt) {
+                        for (std::size_t w = 0; same && w < left.guestDescriptor.size(); ++w) same = left.guestDescriptor[w] == right.guestDescriptor[w] || deferredAt(left, w) || deferredAt(right, w) || tsharpCopy(left.guestDescriptor[w], right.guestDescriptor[w]);
+                    } else if (same) {
+                        same = SameDescriptorIgnoringTsharpBits(left, left.guestDescriptor, right.guestDescriptor);
+                    }
+                    if (!same) {
+                        std::size_t w = 0;
+                        while (w < left.guestDescriptor.size() && w < right.guestDescriptor.size() && left.guestDescriptor[w] == right.guestDescriptor[w]) ++w;
+                        char text[192];
+                        std::snprintf(text, sizeof(text), " binding %zu (role %d kind %d, %zu / %zu words, %zu / %zu deferred) word %zu: captured %08x, patched %08x", b, static_cast<int>(left.role), static_cast<int>(left.kind), left.guestDescriptor.size(), right.guestDescriptor.size(), left.deferredWords.size(), right.deferredWords.size(), w, w < left.guestDescriptor.size() ? left.guestDescriptor[w] : 0u, w < right.guestDescriptor.size() ? right.guestDescriptor[w] : 0u);
+                        difference = text;
+                        badBinding = b;
+                        badWord = w;
+                    }
+                }
+                // Where a differing flat word comes from, for the report: the stored variant's data
+                // slot for it, the fresh capture's leaf address for it and that address among the
+                // stored runs (position, stored and live words).
+                if (!same && badBinding < captured.bindings.size() && captured.bindings[badBinding].role == ShaderRecompiler::DescriptorRole::FlattenedSrt) {
+                    const auto& stored = *matched[i];
+                    char text[160];
+                    for (std::size_t k = 0; k < stored.dataSlots.size(); ++k) {
+                        if (stored.dataSlots[k] != badWord) continue;
+                        const auto p = stored.dataPositions[k];
+                        std::snprintf(text, sizeof(text), "; stored data slot at position %u (stored %08x, live %08x)", p, p < stored.words.size() ? stored.words[p] : 0u, p < hits.liveWords[i].size() ? hits.liveWords[i][p] : 0u);
+                        difference += text;
+                    }
+                    for (std::size_t k = 0; k < variant->dataSlots.size(); ++k) {
+                        if (variant->dataSlots[k] != badWord) continue;
+                        std::snprintf(text, sizeof(text), "; fresh data slot at position %u", variant->dataPositions[k]);
+                        difference += text;
+                    }
+                    if (stageCapture.capture != nullptr) {
+                        for (const auto& [slot, address] : stageCapture.capture->readTrace.leaves) {
+                            if (slot != badWord) continue;
+                            std::size_t base = 0;
+                            bool located = false;
+                            for (const auto& [begin, end] : stored.runs) {
+                                if (address >= begin && address + sizeof(std::uint32_t) <= end) {
+                                    const auto p = base + static_cast<std::size_t>((address - begin) / sizeof(std::uint32_t));
+                                    std::snprintf(text, sizeof(text), "; fresh leaf @%llx = stored position %zu (stored %08x, live %08x)", static_cast<unsigned long long>(address), p, p < stored.words.size() ? stored.words[p] : 0u, p < hits.liveWords[i].size() ? hits.liveWords[i][p] : 0u);
+                                    difference += text;
+                                    located = true;
+                                }
+                                base += static_cast<std::size_t>((end - begin) / sizeof(std::uint32_t));
+                            }
+                            if (!located) {
+                                std::snprintf(text, sizeof(text), "; fresh leaf @%llx outside the stored runs", static_cast<unsigned long long>(address));
+                                difference += text;
+                            }
+                        }
+                        std::snprintf(text, sizeof(text), "; %zu fresh leaves, %zu other reads", stageCapture.capture->readTrace.leaves.size(), stageCapture.capture->readTrace.otherReads.size());
+                        difference += text;
+                    }
                 }
                 if (!same) {
-                    std::fprintf(stderr, "[draw-cache] APS5_VERIFY_DATA_HITS: stage %zu (program 0x%llx) of a data hit disagrees with its capture\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress));
-                    std::fflush(stderr);
-                    std::abort();
+                    // The words the compare saw against memory now: a word the title wrote between
+                    // the compare and this capture (t270: a flat float of vertex program 0x248a85700
+                    // at the save load) explains the disagreement without a cache fault; reported
+                    // and counted, since the draw's GPU reads see the same write in place.
+                    std::vector<ShaderRecompiler::MemoryRegion> seen;
+                    appendEntryRegions(*matched[i], seen, &hits.liveWords[i]);
+                    bool changed = false;
+                    for (const auto& region : seen) changed = changed || GuestMemory::CompareMapped(region.guestAddress, region.bytes) != GuestMemory::Compare::Equal;
+                    if (!changed) {
+                        std::fprintf(stderr, "[draw-cache] APS5_VERIFY_DATA_HITS: stage %zu (program 0x%llx) of a data hit disagrees with its capture:%s (%zu runs / %zu words matched, %zu / %zu fresh)\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), difference.c_str(), matched[i]->runs.size(), matched[i]->words.size(), variant->runs.size(), variant->words.size());
+                        std::fflush(stderr);
+                        std::abort();
+                    }
+                    ++mismatches;
+                    static std::atomic<std::uint64_t> raceReports{0};
+                    if (raceReports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] APS5_VERIFY_DATA_HITS: stage %zu (program 0x%llx) of a data hit disagrees with its capture:%s, and its memory changed since the compare (a guest write under the draw)\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), difference.c_str());
+                }
+                if (matched[i]->runs != variant->runs || !WordsEqualIgnoring(hits.liveWords[i], variant->words, matched[i]->ignoredBits)) {
+                    ++mismatches;
+                    static std::atomic<std::uint64_t> shapeReports{0};
+                    if (shapeReports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] APS5_VERIFY_DATA_HITS: stage %zu (program 0x%llx) of a data hit captured differently with the same result: %zu runs / %zu words matched, %zu / %zu fresh\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), matched[i]->runs.size(), matched[i]->words.size(), variant->runs.size(), variant->words.size());
                 }
                 std::lock_guard cacheLock(drawCacheMutex);
                 ++drawEntryCounters.dataVerified;
