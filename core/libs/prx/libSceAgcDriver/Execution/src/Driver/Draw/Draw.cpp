@@ -96,7 +96,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     DrawKey drawKey;
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
-    DrawRelocation relocation;
+    auto& relocation = scratch->relocation;
+    relocation.Reset();
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial());
@@ -113,8 +114,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             // A new key under a known base key: its entry, relocated by the pointer pairs' delta
             // (DrawRelocation.cpp), stands in and moves to the new key on a hit or a miss.
             if (drawRelocation()) {
+                const auto findStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 findRelocationCandidates(drawKey, relocation.candidates);
                 if (!relocation.candidates.empty()) ++drawEntryCounters.relocationCandidates;
+                if (profile) drawEntryCounters.relocationFindUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - findStart).count();
             }
         }
     }
@@ -123,11 +126,19 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (!relocation.candidates.empty()) {
         relocating = &relocation;
         relocation.target = drawKey;
-        if (chooseRelocationCandidate(relocation)) {
+        const auto chooseStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const bool chosen = chooseRelocationCandidate(relocation);
+        const auto chooseEnd = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (chosen) {
             entry = relocation.entry;
             // The candidate's decode with the live pointer words: the same registers otherwise.
             relocation.decode = relocatedDecode(*entry->decode, drawKey);
             decode = relocation.decode;
+        }
+        if (profile) {
+            std::lock_guard cacheLock(drawCacheMutex);
+            drawEntryCounters.relocationChooseUs += std::chrono::duration<double, std::micro>(chooseEnd - chooseStart).count();
+            if (chosen) drawEntryCounters.relocationDecodeUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - chooseEnd).count();
         }
     }
 

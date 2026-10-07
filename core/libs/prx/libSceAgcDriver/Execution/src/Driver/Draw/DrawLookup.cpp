@@ -424,7 +424,9 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     }
                 } else if (relocation != nullptr && relocation->entry == entry) {
                     // A hit through the candidate: its entry moves to the new key.
+                    const auto rekeyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                     rekeyDrawEntryLocked(*relocation, matched, ranks);
+                    if (profile) counters.relocationRekeyUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - rekeyStart).count();
                 }
                 if (hits.data) {
                     ++counters.dataHits;

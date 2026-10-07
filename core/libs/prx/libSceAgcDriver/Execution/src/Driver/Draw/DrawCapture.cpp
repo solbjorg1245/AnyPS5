@@ -344,7 +344,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             relocation->entry = nullptr;
             for (const auto& candidate : relocation->candidates) {
                 std::uint64_t learnedHere = 0;
-                for (std::size_t i = 0; i < fresh.size() && i < candidate.deltas.size() && i < candidate.entry->stages.size(); ++i) {
+                for (std::size_t i = 0; i < fresh.size() && i < candidate.programs && i < candidate.entry->stages.size(); ++i) {
                     if (fresh[i] == nullptr || candidate.deltas[i] == 0) continue;
                     for (const auto& old : candidate.entry->stages[i]) {
                         if (old->pushOffset != fresh[i]->pushOffset) continue;
@@ -359,7 +359,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                 learned += learnedHere;
                 relocation->entry = candidate.entry;
                 relocation->key = candidate.key;
-                relocation->deltas = candidate.deltas;
+                relocation->deltas.assign(candidate.deltas.begin(), candidate.deltas.begin() + static_cast<std::ptrdiff_t>(candidate.programs));
                 break;
             }
             // The stages kept through a shifted variant validated under another candidate are

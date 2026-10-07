@@ -73,10 +73,15 @@ struct DrawEntry {
 // candidate entry and its key, the new key and the entry's decode with the live pointer words, per
 // program the delta its pointer pairs moved by (0: its variants compare in place) and the stages
 // lookupDraw matched through a shifted variant (for the rekey and the learn step).
+// Programs per draw the candidates' delta arrays hold (the stages of one draw: at most main,
+// geometry back, local, hull, domain and fragment); an entry with more is not a candidate.
+inline constexpr std::size_t MaxDrawPrograms = 8;
 struct DrawRelocationCandidate {
     std::shared_ptr<DrawEntry> entry;
     std::uint64_t key = 0;
-    std::vector<std::uint64_t> deltas;
+    // Per program of the entry's decode (`programs` of them): the delta its pointer pairs moved by.
+    std::array<std::uint64_t, MaxDrawPrograms> deltas{};
+    std::size_t programs = 0;
 };
 struct DrawRelocation {
     // The fitting entries under the base key, oldest first (the objects drawn with one pipeline
@@ -91,6 +96,17 @@ struct DrawRelocation {
     std::shared_ptr<const DrawDecode> decode;
     std::vector<std::uint64_t> deltas;
     std::vector<bool> relocated;
+    // The next draw's state; the vectors keep their capacity (the struct lives in the DrawScratch:
+    // the candidate list allocated per absent key, ~26k per 10 s in Boletaria, PROGRESS t278).
+    void Reset() {
+        candidates.clear();
+        entry.reset();
+        key = 0;
+        target = DrawKey{};
+        decode.reset();
+        deltas.clear();
+        relocated.clear();
+    }
 };
 
 enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiffering, Layout, Gate, Stages, Count };
@@ -124,6 +140,9 @@ struct DrawEntryCounters {
     // learn step's attempts, successes and verdicts.
     std::uint64_t relocationCandidates = 0, relocationNoCandidate = 0, relocationTried = 0, relocationDeltas = 0, relocationUnchosen = 0, relocationQuickRejected = 0, relocationLearnedFrom = 0, relocatedHits = 0, relocatedPartial = 0, relocatedStages = 0, relocatedInPlace = 0, relocationNoRule = 0, relocationDiffering = 0, relocationUnordered = 0, rekeys = 0, relocationLearnAttempts = 0, relocationLearned = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(RelocationVerdict::Count)> relocationVerdicts{};
+    // The relocation path's time (APS5_PROFILE_DRAW): the candidate search under the cache mutex,
+    // the choice (the quick shifted checks), the decode copies with the live words, the rekeys.
+    double relocationFindUs = 0, relocationChooseUs = 0, relocationDecodeUs = 0, relocationRekeyUs = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 

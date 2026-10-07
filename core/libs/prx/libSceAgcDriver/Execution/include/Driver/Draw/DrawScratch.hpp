@@ -39,6 +39,8 @@ struct DrawScratch {
     std::vector<std::size_t> resultIndex;
     std::vector<Graphics::GuestMemorySnapshot> snapshots;
     std::vector<Pm4::DrawArguments> records;
+    // The draw relocation's candidate list and state (DrawRelocation.cpp), reset per draw.
+    DrawRelocation relocation;
     unsigned depth = 0;
 };
 

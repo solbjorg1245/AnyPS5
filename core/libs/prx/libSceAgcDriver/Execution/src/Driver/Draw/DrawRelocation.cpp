@@ -22,8 +22,12 @@
 // (rekey) with the shifted variants replacing the dead ones. A miss under a candidate captures as
 // usual and teaches the fresh variant the rule against the candidate's (learnRelocation with the
 // delta), so the next frame relocates. The entry's decode gets the live pointer words
-// (relocatedDecode): the same registers otherwise, by the base key. APS5_NO_DRAW_RELOCATION=1
-// disables it; APS5_VERIFY_DATA_HITS=1 captures relocated hits again and compares what they bind.
+// (relocatedDecode): the same registers otherwise, by the base key. Off by default: a hit moves the
+// entry to the new key, and the title's SRT ring revisits its blocks, so the same draw relocated
+// again every frame instead of hitting by its full key (t279 vs t280, PROGRESS session 29: 16.8k
+// relocated hits per 10 s for 1k fewer draw misses, +3.7 us per packet of GPU waits in validate).
+// APS5_DRAW_RELOCATION=1 enables it; APS5_VERIFY_DATA_HITS=1 captures relocated hits again and
+// compares what they bind.
 
 namespace AgcDriver::DriverDetail {
 
@@ -33,7 +37,7 @@ bool Driver::staysOnMove(const DispatchVariant& variant) {
 }
 
 bool Driver::drawRelocation() {
-    static const bool enabled = std::getenv("APS5_NO_DRAW_RELOCATION") == nullptr && dataHits() && !stampValidate();
+    static const bool enabled = std::getenv("APS5_DRAW_RELOCATION") != nullptr && dataHits() && !stampValidate();
     return enabled;
 }
 
@@ -60,7 +64,7 @@ void Driver::findRelocationCandidates(const DrawKey& key, std::vector<DrawReloca
     }
     auto& keys = index->second;
     constexpr auto none = std::numeric_limits<std::size_t>::max();
-    std::vector<std::uint64_t> deltas;
+    std::array<std::uint64_t, MaxDrawPrograms> deltas{};
     for (std::size_t k = 0; k < keys.size();) {
         const auto found = drawCache.find(keys[k]);
         if (found == drawCache.end()) {
@@ -96,7 +100,12 @@ void Driver::findRelocationCandidates(const DrawKey& key, std::vector<DrawReloca
             continue;
         }
         const auto& programs = entry.decode->programs;
-        deltas.assign(programs.size(), 0);
+        if (programs.size() > MaxDrawPrograms) {
+            ++counters.relocationDeltas;
+            ++k;
+            continue;
+        }
+        deltas.fill(0);
         for (std::size_t i = 0; i < programs.size() && fits; ++i) {
             for (std::size_t p = 0; p < pairDeltas.size() && fits; ++p) {
                 if (pairDeltas[p] == 0) continue;
@@ -113,7 +122,7 @@ void Driver::findRelocationCandidates(const DrawKey& key, std::vector<DrawReloca
             ++k;
             continue;
         }
-        candidates.push_back({found->second, keys[k], deltas});
+        candidates.push_back({found->second, keys[k], deltas, programs.size()});
         ++k;
     }
     if (candidates.empty()) ++counters.relocationNoCandidate;
@@ -150,7 +159,7 @@ bool Driver::chooseRelocationCandidate(DrawRelocation& relocation) {
     for (const auto& candidate : relocation.candidates) {
         const auto& entry = *candidate.entry;
         bool usable = true;
-        for (std::size_t i = 0; i < candidate.deltas.size() && usable; ++i) {
+        for (std::size_t i = 0; i < candidate.programs && usable; ++i) {
             if (candidate.deltas[i] == 0 || i >= entry.stages.size()) continue;
             if (entry.decode != nullptr && i < entry.decode->roles.size() && entry.decode->roles[i] == ShaderRecompiler::ProgramRole::GeometryBack) continue;
             bool ruled = false;
@@ -168,8 +177,8 @@ bool Driver::chooseRelocationCandidate(DrawRelocation& relocation) {
         }
         relocation.entry = candidate.entry;
         relocation.key = candidate.key;
-        relocation.deltas = candidate.deltas;
-        relocation.relocated.assign(candidate.deltas.size(), false);
+        relocation.deltas.assign(candidate.deltas.begin(), candidate.deltas.begin() + static_cast<std::ptrdiff_t>(candidate.programs));
+        relocation.relocated.assign(candidate.programs, false);
         break;
     }
     if (rejected != 0 || relocation.entry == nullptr) {
