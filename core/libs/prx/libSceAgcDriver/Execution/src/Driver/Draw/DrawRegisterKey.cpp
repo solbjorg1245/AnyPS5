@@ -5,9 +5,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -43,6 +46,7 @@ void probeKeyChurn(const QueueState& queue) {
     }
     std::lock_guard lock(mutex);
     ++total;
+    bool wholeNew = false;
     for (std::size_t leftOut = 0; leftOut <= Ranges + 2; ++leftOut) {
         std::uint64_t key = 0xcbf29ce484222325ull;
         for (std::size_t r = 0; r < Ranges; ++r) {
@@ -52,7 +56,38 @@ void probeKeyChurn(const QueueState& queue) {
         }
         if (seen[leftOut].size() > (1u << 20u)) seen[leftOut].clear();
         if (!seen[leftOut].insert(key).second) ++repeats[leftOut];
+        else if (leftOut == Ranges) wholeNew = true;
     }
+    // Which user words make a key new: for a new key whose base (every range but the user words)
+    // was seen, the user words that differ from the last ones seen under that base.
+    static std::unordered_map<std::uint64_t, std::vector<std::pair<std::uint32_t, std::uint32_t>>> lastUserWords;
+    static std::map<std::uint32_t, std::uint64_t> differingByOffset;
+    static std::uint64_t newKeys = 0, newWithBaseSeen = 0;
+    std::uint64_t baseKey = 0xcbf29ce484222325ull;
+    for (std::size_t r = 0; r < Ranges; ++r) {
+        if (!userWords(Graphics::DrawKeyRegisters[r])) baseKey = (baseKey ^ rangeHash[r]) * 0x100000001b3ull;
+    }
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> words;
+    for (const auto& range : Graphics::DrawKeyRegisters) {
+        if (!userWords(range)) continue;
+        const auto end = range.first + range.count;
+        for (auto it = queue.shader.lower_bound(range.first); it != queue.shader.end() && it->first < end; ++it) words.emplace_back(it->first, it->second);
+    }
+    if (wholeNew) {
+        ++newKeys;
+        if (const auto last = lastUserWords.find(baseKey); last != lastUserWords.end()) {
+            ++newWithBaseSeen;
+            const auto& old = last->second;
+            std::size_t a = 0, b = 0;
+            while (a < old.size() || b < words.size()) {
+                if (b >= words.size() || (a < old.size() && old[a].first < words[b].first)) { ++differingByOffset[old[a].first]; ++a; }
+                else if (a >= old.size() || words[b].first < old[a].first) { ++differingByOffset[words[b].first]; ++b; }
+                else { if (old[a].second != words[b].second) ++differingByOffset[old[a].first]; ++a; ++b; }
+            }
+        }
+    }
+    if (lastUserWords.size() > (1u << 18u)) lastUserWords.clear();
+    lastUserWords[baseKey] = std::move(words);
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport < std::chrono::seconds(10)) return;
     lastReport = now;
@@ -64,9 +99,19 @@ void probeKeyChurn(const QueueState& queue) {
         std::snprintf(item, sizeof(item), " %s 0x%x+%u: %llu", Graphics::RegisterBankName(range.bank), range.first, range.count, static_cast<unsigned long long>(repeats[r]));
         text += item;
     }
-    std::fprintf(stderr, "[draw-key-churn] %llu keys (10 s), %llu repeat whole; all user-word ranges left out %llu, those + CB_COLOR bases %llu; repeats with one range left out (only ranges adding > 2%%):%s\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(repeats[Ranges]), static_cast<unsigned long long>(repeats[Ranges + 1]), static_cast<unsigned long long>(repeats[Ranges + 2]), text.c_str());
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> offsets;
+    for (const auto& [offset, count] : differingByOffset) offsets.emplace_back(count, offset);
+    std::sort(offsets.rbegin(), offsets.rend());
+    std::string userText;
+    for (std::size_t i = 0; i < offsets.size() && i < 16; ++i) {
+        std::snprintf(item, sizeof(item), " 0x%x: %llu", offsets[i].second, static_cast<unsigned long long>(offsets[i].first));
+        userText += item;
+    }
+    std::fprintf(stderr, "[draw-key-churn] %llu keys (10 s), %llu repeat whole; all user-word ranges left out %llu, those + CB_COLOR bases %llu; repeats with one range left out (only ranges adding > 2%%):%s; new keys %llu, of them %llu with the base (no user words) seen before: differing shader user words by offset (top 16):%s\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(repeats[Ranges]), static_cast<unsigned long long>(repeats[Ranges + 1]), static_cast<unsigned long long>(repeats[Ranges + 2]), text.c_str(), static_cast<unsigned long long>(newKeys), static_cast<unsigned long long>(newWithBaseSeen), userText.c_str());
     repeats.fill(0);
     total = 0;
+    newKeys = newWithBaseSeen = 0;
+    differingByOffset.clear();
 }
 
 }
