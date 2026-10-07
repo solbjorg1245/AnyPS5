@@ -1182,6 +1182,7 @@ void ClearImageMirrors(VkDevice device) {
         state.heapBytes = 0;
         state.device = VK_NULL_HANDLE;
     }
+    Spaces().current.store(nullptr);
 }
 
 ImportProbe ProbeImportWriteProtection(const Context& context) {
