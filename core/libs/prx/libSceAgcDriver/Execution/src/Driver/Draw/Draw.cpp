@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawScratch.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -8,8 +10,36 @@
 
 namespace AgcDriver::DriverDetail {
 
+namespace {
+
+struct DrawScratchTag {};
+
+bool drawScratchEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_DRAW_SCRATCH") == nullptr;
+    return enabled;
+}
+
+}
+
+DrawScratchLease::DrawScratchLease() {
+    if (drawScratchEnabled()) {
+        auto& shared = HostThreadLocal<DrawScratch, DrawScratchTag>();
+        if (shared.depth == 0) scratch = &shared;
+    }
+    if (scratch == nullptr) {
+        owned = std::make_unique<DrawScratch>();
+        scratch = owned.get();
+    }
+    ++scratch->depth;
+}
+
+DrawScratchLease::~DrawScratchLease() {
+    --scratch->depth;
+}
+
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
     PerformanceTimer timing("Driver.Draw");
+    DrawScratchLease scratch;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::array<double, DrawDriverPhaseCount> phaseMs{};
     std::uint64_t captures = 0;
@@ -86,7 +116,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     resolveDrawDecode(queue, submission, decode, registerKey, drawKey, profile);
     const auto& graphics = decode->state;
     const auto& pixel = decode->pixel;
-    std::vector<DrawProgram> programs = decode->programs;
+    auto& programs = scratch->programs;
+    programs = decode->programs;
     const auto setMeshIndexBuffer = [&](const Pm4::DrawParameters& parameters) {
         if (!graphics.stages.mesh) return;
         auto& words = programs.front().userData;
@@ -119,8 +150,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         indirect.startInstanceSgpr = sgprOf(indirect.startInstanceLocation);
         indirect.drawIndexSgpr = sgprOf(indirect.drawIndexLocation);
     }
-    std::vector<ShaderRecompiler::MemoryRegion> memory;
-    std::vector<ShaderRecompiler::LinkedProgram> linked;
+    auto& memory = scratch->memory;
+    memory.clear();
+    memory.reserve(2 * programs.size() + 8);
+    auto& linked = scratch->linked;
+    linked.clear();
+    linked.reserve(programs.size());
     for (std::size_t i = 0; i < programs.size(); ++i) {
         const auto& program = programs[i];
         memory.insert(memory.end(), program.memory.begin(), program.memory.end());
@@ -129,8 +164,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("prepare");
     phaseTiming.Phase(DrawRowProgramPrepare);
 
-    std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>> vertexInfos(programs.size());
-    std::vector<std::vector<Graphics::DecodeRead>> decodeReads(programs.size());
+    auto& vertexInfos = scratch->vertexInfos;
+    vertexInfos.assign(programs.size(), std::nullopt);
+    auto& decodeReads = scratch->decodeReads;
+    decodeReads.resize(programs.size());
+    for (auto& reads : decodeReads) reads.clear();
     const auto decodeVertexInfo = [&](std::size_t i) {
         const auto& program = programs[i];
         if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
@@ -146,22 +184,35 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     // the deep copy each stage of each draw made (bindings with their descriptor words) was a fifth
     // of the draw thread. A slot replaced later (rect list, CPU-indirect patching) re-points the
     // stages that referenced the old object.
-    std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> results;
-    std::vector<Graphics::CompiledShader> stages;
+    auto& results = scratch->results;
+    auto& stages = scratch->stages;
+    results.clear();
+    stages.clear();
     results.reserve(programs.size() + (graphics.rectList ? 2u : 0u));
     stages.reserve(programs.size());
     std::uint32_t pushCursorBytes = 0;
 
-    std::vector<const ShaderRecompiler::RecompileResult*> programResults(programs.size(), nullptr);
+    auto& programResults = scratch->programResults;
+    programResults.assign(programs.size(), nullptr);
 
-    std::vector<StageCapture> stageCaptures(programs.size());
-    std::vector<std::shared_ptr<DispatchVariant>> matched(programs.size());
-    std::vector<std::vector<ShaderRecompiler::MemoryRegion>> matchedRegions(programs.size());
-    DrawStageHits hits;
+    auto& stageCaptures = scratch->stageCaptures;
+    stageCaptures.clear();
+    stageCaptures.resize(programs.size());
+    auto& matched = scratch->matched;
+    matched.assign(programs.size(), nullptr);
+    auto& matchedRegions = scratch->matchedRegions;
+    matchedRegions.resize(programs.size());
+    for (auto& regions : matchedRegions) regions.clear();
+    auto& hits = scratch->hits;
+    hits.liveWords.clear();
+    hits.results.clear();
+    hits.data = false;
 
-    std::vector<std::shared_ptr<DispatchVariant>> fresh(programs.size());
+    auto& fresh = scratch->fresh;
+    fresh.assign(programs.size(), nullptr);
 
-    std::vector<bool> recompiled(programs.size(), false);
+    auto& recompiled = scratch->recompiled;
+    recompiled.assign(programs.size(), false);
     bool drawHit = false;
     bool verifyHit = false;
     if (Graphics::CheckpointsRequested() && !programs.empty()) Graphics::SetCheckpointWork(programs.front().binary.codeAddress, programs.back().binary.codeAddress);
@@ -198,8 +249,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     };
 
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
-    std::vector<std::uint32_t> pushOffsets(programs.size(), 0);
-    std::vector<std::size_t> resultIndex(programs.size(), 0);
+    auto& pushOffsets = scratch->pushOffsets;
+    pushOffsets.assign(programs.size(), 0);
+    auto& resultIndex = scratch->resultIndex;
+    resultIndex.assign(programs.size(), 0);
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (roles[i] == Role::GeometryBack) continue;
         const auto& program = programs[i];
@@ -257,9 +310,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowRectList);
     };
     if (graphics.rectList) buildRectList();
-    std::vector<Graphics::GuestMemorySnapshot> snapshots;
+    auto& snapshots = scratch->snapshots;
     const auto snapshot = [&] {
         snapshots.clear();
+        snapshots.reserve(memory.size());
         for (const auto& region : memory) snapshots.push_back({region.guestAddress, region.bytes});
     };
     snapshot();
@@ -296,7 +350,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
         const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
-        std::vector<Pm4::DrawArguments> records;
+        auto& records = scratch->records;
+        records.clear();
+        records.reserve(count);
         for (std::uint32_t record = 0; record < count; ++record) records.push_back(Pm4::ReadDrawArguments(indirect, record));
         Graphics::CountIndirectDraw(*indirectCpu, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count());
         const auto baseVertexWord = locate(indirect.baseVertexLocation);
@@ -358,7 +414,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return drawn();
     }
 
-    std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
+    auto& recipeStages = scratch->recipeStages;
+    recipeStages.clear();
     // A recipe replays the resources recorded with its variants' words: not for refreshed data.
     if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes() && !(drawHit && hits.data)) {
         recipeStages.reserve(programs.size());

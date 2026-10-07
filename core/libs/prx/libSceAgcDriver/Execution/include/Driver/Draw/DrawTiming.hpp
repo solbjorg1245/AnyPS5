@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAWTIMING_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAWTIMING_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/HostHeap.hpp"
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -15,6 +16,7 @@ inline constexpr const char* DrawDriverPhaseNames[DrawDriverPhaseCount] = {"prol
 struct DrawPhaseTotals {
     std::array<double, DrawDriverPhaseCount> ms{};
     std::uint64_t packets = 0, drawn = 0, captures = 0;
+    HostHeap::Counters heap{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 

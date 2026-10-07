@@ -6,6 +6,8 @@
 #include <malloc.h>
 #include <new>
 
+#include "prx/libSceAgcDriver/Execution/include/HostHeap.hpp"
+
 #include <windows.h>
 #include <psapi.h>
 
@@ -68,6 +70,7 @@ constexpr std::size_t ClassBytesLimit = 256 * 1024;
 struct BlockCache {
     void* heads[MaxShift + 1] = {};
     std::uint32_t counts[MaxShift + 1] = {};
+    AgcDriver::HostHeap::Counters counters;
 };
 
 void releaseCache(void* data) {
@@ -132,15 +135,18 @@ unsigned requestClass(std::size_t bytes) {
 }
 
 void* allocate(std::size_t bytes) {
-    if (bytes != 0 && bytes <= MaxCached) {
+    auto* cache = cacheEnabled() ? threadCache(true) : nullptr;
+    if (cache != nullptr) ++cache->counters.allocations;
+    if (bytes != 0 && bytes <= MaxCached && cache != nullptr) {
         const auto shift = requestClass(bytes);
-        if (auto* cache = threadCache(false); cache != nullptr && cache->heads[shift] != nullptr) {
+        if (cache->heads[shift] != nullptr) {
+            ++cache->counters.cacheHits;
             void* block = cache->heads[shift];
             cache->heads[shift] = *static_cast<void**>(block);
             --cache->counts[shift];
             return block;
         }
-        if (cacheEnabled()) return std::malloc(std::size_t{1} << shift);
+        return std::malloc(std::size_t{1} << shift);
     }
     return std::malloc(bytes != 0 ? bytes : 1);
 }
@@ -148,21 +154,33 @@ void* allocate(std::size_t bytes) {
 void release(void* memory) {
     if (memory == nullptr) return;
     if (cacheEnabled()) {
+        auto* cache = threadCache(true);
+        if (cache != nullptr) ++cache->counters.releases;
         const auto size = _msize(memory);
         if (size >= (std::size_t{1} << MinShift) && size != static_cast<std::size_t>(-1)) {
             // The largest class whose blocks this one can stand in for.
             const auto shift = std::min<unsigned>(static_cast<unsigned>(std::bit_width(size)) - 1u, MaxShift);
             if (size <= 2 * MaxCached) {
-                if (auto* cache = threadCache(true); cache != nullptr && cache->counts[shift] < ClassBytesLimit >> shift) {
+                if (cache != nullptr && cache->counts[shift] < ClassBytesLimit >> shift) {
                     *static_cast<void**>(memory) = cache->heads[shift];
                     cache->heads[shift] = memory;
                     ++cache->counts[shift];
+                    ++cache->counters.cacheStores;
                     return;
                 }
             }
         }
     }
     std::free(memory);
+}
+
+}
+
+namespace AgcDriver::HostHeap {
+
+Counters ThreadCounters() {
+    if (auto* cache = threadCache(false); cache != nullptr) return cache->counters;
+    return {};
 }
 
 }
