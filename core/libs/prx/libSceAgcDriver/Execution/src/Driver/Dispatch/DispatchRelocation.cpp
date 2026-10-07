@@ -386,11 +386,17 @@ std::shared_ptr<DispatchVariant> Driver::shiftVariant(const DispatchVariant& var
 // delta), so the next dispatch of the program relocates. A program dispatched for many objects per
 // frame has as many candidates, and only last frame's block of the same object validates (t296:
 // newest first, 12 hits of 43k shifted validations): the delta of the last same-instance match (the
-// ring's frame stride, per base key) picks the candidate first. APS5_NO_USER_POINTER_RELOCATION=1
-// keys and misses as before; APS5_USER_POINTER_CANDIDATES (default 2) bounds the shifted
-// validations per absent lookup.
+// ring's frame stride, per base key) picks the candidate first, and before it the candidate whose
+// moved block has the live block's content signature (blockSignature, read at the live address
+// through a candidate's rule; t300: 8.1-9.6k of 8.4-9.9k hits per 10 s). Off by default
+// (APS5_USER_POINTER_RELOCATION=1 enables it): the same-binary A/B t300 / t301 made 32-33 presents
+// per 10 s either way; the compute queues' hits rose 4.2-5.1k -> 12.7-13.1k of 18.5k dispatches
+// but their time per dispatch did not fall (145 vs 132-141 us: capture 22 vs 28-32, device call 64
+// vs 55-57, a relocated copy carrying no recipe so the resource build runs in full) and queue 0's
+// GPU-mutex wait rose 938-958 -> 1054-1126 ms. APS5_USER_POINTER_CANDIDATES (default 2) bounds the
+// shifted validations per absent lookup.
 bool Driver::userPointerRelocation() {
-    static const bool enabled = std::getenv("APS5_NO_USER_POINTER_RELOCATION") == nullptr && relocatedHits() && !stampValidate();
+    static const bool enabled = std::getenv("APS5_USER_POINTER_RELOCATION") != nullptr && relocatedHits() && !stampValidate();
     return enabled;
 }
 
@@ -408,29 +414,71 @@ void Driver::collectUserPointerCandidates(std::uint64_t baseKey, std::span<const
     const auto index = dispatchBaseIndex.find(baseKey);
     if (index == dispatchBaseIndex.end()) return;
     const auto pointer = [](std::span<const std::uint32_t> words, std::size_t low) { return static_cast<std::uint64_t>(words[low]) | (static_cast<std::uint64_t>(words[low + 1]) << 32u); };
-    const auto& keys = index->second;
-    for (auto k = keys.rbegin(); k != keys.rend(); ++k) {
-        const auto& [stored, words] = *k;
-        if (words.size() != userData.size() || words.size() < 2) continue;
+    // The delta of the one 64-bit pair the stored user data differ in from the live words.
+    const auto pairDelta = [&](const std::vector<std::uint32_t>& words, std::uint64_t& delta) {
+        if (words.size() != userData.size() || words.size() < 2) return false;
         std::size_t first = std::numeric_limits<std::size_t>::max(), last = 0;
         for (std::size_t i = 0; i < words.size(); ++i) {
             if (words[i] == userData[i]) continue;
             first = std::min(first, i);
             last = i;
         }
-        if (first == std::numeric_limits<std::size_t>::max()) continue;
+        if (first == std::numeric_limits<std::size_t>::max()) return false;
         auto low = first;
         if (low + 1 >= userData.size()) --low;
-        if (last > low + 1) continue;
-        const auto delta = pointer(userData, low) - pointer(words, low);
+        if (last > low + 1) return false;
+        delta = pointer(userData, low) - pointer(words, low);
         // A pointer moved within the ring, not unrelated words.
-        if (delta + (std::uint64_t{1} << 30u) > (std::uint64_t{1} << 31u)) continue;
+        return delta + (std::uint64_t{1} << 30u) <= (std::uint64_t{1} << 31u);
+    };
+    const auto& keys = index->second.keys;
+    for (auto k = keys.rbegin(); k != keys.rend(); ++k) {
+        const auto& [stored, words] = *k;
+        std::uint64_t delta = 0;
+        if (!pairDelta(words, delta)) continue;
         const auto found = dispatchCache.find(stored);
         if (found == dispatchCache.end() || found->second->variants.empty()) continue;
         candidates.push_back({stored, found->second, delta});
     }
-    // The candidate at the base key's stride first; the rest stay for the same-instance search of a miss.
-    if (const auto stride = dispatchBaseStride.find(baseKey); stride != dispatchBaseStride.end()) {
+    // The candidate whose moved block holds the live block's content (its signature read through a
+    // candidate's rule at the live address) first, also from beyond the last 16 keys.
+    bool signed_ = false;
+    const auto& signatures = index->second.signatures;
+    const auto layout = std::find_if(candidates.begin(), candidates.end(), [](const UserPointerCandidate& c) { const auto& v = *c.entry->variants.front(); return v.relocationLearned && !v.movedRuns.empty(); });
+    if (!signatures.empty() && layout != candidates.end()) {
+        const auto& variant = *layout->entry->variants.front();
+        auto live = variant.words;
+        std::size_t offset = 0;
+        bool readable = true;
+        for (std::size_t r = 0, next = 0; r < variant.runs.size() && readable; ++r) {
+            const auto [begin, end] = variant.runs[r];
+            const auto count = static_cast<std::size_t>((end - begin) / sizeof(std::uint32_t));
+            if (next < variant.movedRuns.size() && variant.movedRuns[next] == r) {
+                ++next;
+                const auto address = begin + layout->delta;
+                readable = GuestMemory::Accessible(reinterpret_cast<const void*>(address), end - begin);
+                if (readable) std::memcpy(live.data() + offset, reinterpret_cast<const void*>(address), count * sizeof(std::uint32_t));
+            }
+            offset += count;
+        }
+        const auto signature = readable ? blockSignature(variant, live) : 0;
+        const auto match = signature != 0 ? signatures.find(signature) : signatures.end();
+        std::uint64_t delta = 0;
+        if (match == signatures.end() || !pairDelta(match->second.second, delta)) {
+            ++entryCounters.userPointerSignatureMissing;
+        } else if (const auto found = dispatchCache.find(match->second.first); found != dispatchCache.end() && !found->second->variants.empty()) {
+            const auto at = std::find_if(candidates.begin(), candidates.end(), [&](const UserPointerCandidate& c) { return c.key == match->second.first; });
+            if (at != candidates.end()) std::rotate(candidates.begin(), at, at + 1);
+            else candidates.insert(candidates.begin(), {match->second.first, found->second, delta});
+            candidates.front().bySignature = true;
+            signed_ = true;
+            ++entryCounters.userPointerSignatureFirst;
+        } else {
+            ++entryCounters.userPointerSignatureMissing;
+        }
+    }
+    // Else the candidate at the base key's stride first; the rest stay for the same-instance search of a miss.
+    if (const auto stride = dispatchBaseStride.find(baseKey); !signed_ && stride != dispatchBaseStride.end()) {
         const auto at = std::find_if(candidates.begin(), candidates.end(), [&](const UserPointerCandidate& c) { return c.delta == stride->second; });
         if (at != candidates.end()) {
             std::rotate(candidates.begin(), at, at + 1);
@@ -444,9 +492,41 @@ void Driver::collectUserPointerCandidates(std::uint64_t baseKey, std::span<const
 }
 
 // Under dispatchCacheMutex.
-void Driver::indexDispatchKey(std::uint64_t baseKey, std::uint64_t key, std::span<const std::uint32_t> userData) {
+// A hash of the variant's moved-run words outside its data positions and its rule's pointer pairs
+// (`words` laid out like the variant's), or 0 when it has no moved runs.
+std::uint64_t Driver::blockSignature(const DispatchVariant& variant, std::span<const std::uint32_t> words) {
+    if (variant.movedRuns.empty()) return 0;
+    const auto pairWord = [](const std::vector<std::uint32_t>& lows, std::size_t p) {
+        const auto at = std::upper_bound(lows.begin(), lows.end(), static_cast<std::uint32_t>(p));
+        return at != lows.begin() && *(at - 1) + 1 >= p;
+    };
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    std::size_t offset = 0;
+    for (std::size_t r = 0, next = 0; r < variant.runs.size(); ++r) {
+        const auto count = static_cast<std::size_t>((variant.runs[r].second - variant.runs[r].first) / sizeof(std::uint32_t));
+        if (next < variant.movedRuns.size() && variant.movedRuns[next] == r) {
+            ++next;
+            for (std::size_t p = offset; p < offset + count && p < words.size(); ++p) {
+                if (dataPosition(variant, p) || pairWord(variant.innerPointers, p) || pairWord(variant.pointerPositions, p)) continue;
+                hash ^= (static_cast<std::uint64_t>(p) << 32u) | words[p];
+                hash *= 0x100000001b3ull;
+            }
+        }
+        offset += count;
+    }
+    return hash == 0 ? 1 : hash;
+}
+
+void Driver::indexDispatchKey(std::uint64_t baseKey, std::uint64_t key, std::span<const std::uint32_t> userData, const DispatchVariant* variant) {
     if (dispatchBaseIndex.size() > 65536) dispatchBaseIndex.clear();
-    auto& keys = dispatchBaseIndex[baseKey];
+    auto& index = dispatchBaseIndex[baseKey];
+    if (variant != nullptr && variant->relocationLearned) {
+        if (const auto signature = blockSignature(*variant, variant->words); signature != 0) {
+            if (index.signatures.size() > 1024) index.signatures.clear();
+            index.signatures[signature] = {key, std::vector<std::uint32_t>(userData.begin(), userData.end())};
+        }
+    }
+    auto& keys = index.keys;
     for (auto k = keys.begin(); k != keys.end(); ++k) {
         if (k->first == key) {
             keys.erase(k);
@@ -480,6 +560,7 @@ bool Driver::sameInstance(const DispatchVariant& old, const DispatchVariant& fre
 // Called without dispatchCacheMutex; on a hit `relocated` is the shifted variant, inserted under `key`.
 void Driver::relocateByUserPointer(std::uint64_t address, const Submission& submission, std::uint64_t key, std::uint64_t baseKey, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::vector<UserPointerCandidate>& candidates, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::vector<ShaderRecompiler::MemoryRegion>& captured, bool& cached, std::shared_ptr<DispatchVariant>& relocated) {
     std::uint64_t imagesFlushed = 0, runsSynced = 0, unordered = 0, noRule = 0, validated = 0, differing = 0, hitDelta = 0;
+    bool hitBySignature = false;
     std::vector<ShaderRecompiler::MemoryRegion> regions;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
     {
@@ -517,6 +598,7 @@ void Driver::relocateByUserPointer(std::uint64_t address, const Submission& subm
             }
             relocated = std::move(shifted);
             hitDelta = candidate.delta;
+            hitBySignature = candidate.bySignature;
             break;
         }
     }
@@ -531,6 +613,7 @@ void Driver::relocateByUserPointer(std::uint64_t address, const Submission& subm
     if (relocated == nullptr) return;
     ++counters.userPointerHits;
     if (const auto stride = dispatchBaseStride.find(baseKey); stride != dispatchBaseStride.end() && stride->second == hitDelta) ++counters.userPointerStrideHits;
+    if (hitBySignature) ++counters.userPointerSignatureHits;
     dispatchBaseStride[baseKey] = hitDelta;
     ++dispatchCacheHits;
     compiledResult = relocated->compiled;
@@ -549,7 +632,7 @@ void Driver::relocateByUserPointer(std::uint64_t address, const Submission& subm
     dispatchOrder.push_front(key);
     created->order = dispatchOrder.begin();
     dispatchCache.emplace(key, std::move(created));
-    indexDispatchKey(baseKey, key, userData);
+    indexDispatchKey(baseKey, key, userData, relocated.get());
     if (dispatchCache.size() > dispatchCacheEntries()) {
         eraseDispatchEntry(dispatchCache.find(dispatchOrder.back()));
         ++dispatchCacheEvictions;

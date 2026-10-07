@@ -87,7 +87,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                 ++(same != nullptr ? entryCounters.userPointerSameFound : entryCounters.userPointerSameMissing);
                 if (same != nullptr) dispatchBaseStride[baseKey] = same->delta;
             }
-            if (userPointerRelocation()) indexDispatchKey(baseKey, key, userData);
+            if (userPointerRelocation()) indexDispatchKey(baseKey, key, userData, fresh.get());
             if (relocation != RelocationVerdict::Count) {
                 ++entryCounters.relocationVerdicts[static_cast<std::size_t>(relocation)];
                 if (profile) ++entryCounters.queueKeys[DispatchStatsQueue].verdicts[static_cast<std::size_t>(relocation)];

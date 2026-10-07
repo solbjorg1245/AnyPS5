@@ -115,7 +115,8 @@ private:
     static bool userPointerRelocation();
     static std::size_t userPointerCandidateLimit();
     void collectUserPointerCandidates(std::uint64_t baseKey, std::span<const std::uint32_t> userData, std::vector<UserPointerCandidate>& candidates);
-    void indexDispatchKey(std::uint64_t baseKey, std::uint64_t key, std::span<const std::uint32_t> userData);
+    void indexDispatchKey(std::uint64_t baseKey, std::uint64_t key, std::span<const std::uint32_t> userData, const DispatchVariant* variant);
+    static std::uint64_t blockSignature(const DispatchVariant& variant, std::span<const std::uint32_t> words);
     void relocateByUserPointer(std::uint64_t address, const Submission& submission, std::uint64_t key, std::uint64_t baseKey, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::vector<UserPointerCandidate>& candidates, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::vector<ShaderRecompiler::MemoryRegion>& captured, bool& cached, std::shared_ptr<DispatchVariant>& relocated);
     static bool sameInstance(const DispatchVariant& old, const DispatchVariant& fresh, std::uint64_t delta);
     void dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments = 0);
@@ -296,7 +297,7 @@ private:
     std::unordered_map<std::uint64_t, KeyInputs> lastKeyInputs;
     // Base key (the dispatch key without the user data) -> the keys inserted under it with their
     // user data, oldest first (user-pointer relocation). Under dispatchCacheMutex.
-    std::unordered_map<std::uint64_t, std::deque<std::pair<std::uint64_t, std::vector<std::uint32_t>>>> dispatchBaseIndex;
+    std::unordered_map<std::uint64_t, DispatchBaseIndex> dispatchBaseIndex;
     // Base key -> the user-pointer delta of its last same-instance match (the ring's frame stride):
     // the candidate at that delta is validated first. Under dispatchCacheMutex.
     std::unordered_map<std::uint64_t, std::uint64_t> dispatchBaseStride;

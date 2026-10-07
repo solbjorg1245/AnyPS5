@@ -121,6 +121,15 @@ struct UserPointerCandidate {
     std::uint64_t key;
     std::shared_ptr<DispatchEntry> entry;
     std::uint64_t delta;
+    // Chosen by the live block's content signature (collectUserPointerCandidates).
+    bool bySignature = false;
+};
+
+// The keys inserted under a base key (user-pointer relocation): the last 16 with their user data,
+// oldest first, and by the content signature of their moved block (Driver::blockSignature).
+struct DispatchBaseIndex {
+    std::deque<std::pair<std::uint64_t, std::vector<std::uint32_t>>> keys;
+    std::unordered_map<std::uint64_t, std::pair<std::uint64_t, std::vector<std::uint32_t>>> signatures;
 };
 
 // The queue the current thread's dispatch statistics belong to (set by Driver::dispatch).
@@ -151,7 +160,7 @@ struct EntryCounters {
     // User-pointer relocation (DispatchRelocation.cpp relocateByUserPointer): absent lookups with
     // candidates, candidates without a rule, shifted candidates validated / differing / unordered,
     // hits, copies inserted under the live key; the rules learned against a candidate by verdict.
-    std::uint64_t userPointerLookups = 0, userPointerCandidates = 0, userPointerStrideFirst = 0, userPointerStrideHits = 0, userPointerSameFound = 0, userPointerSameMissing = 0, userPointerNoRule = 0, userPointerValidated = 0, userPointerDiffering = 0, userPointerUnordered = 0, userPointerHits = 0, userPointerCopies = 0;
+    std::uint64_t userPointerLookups = 0, userPointerCandidates = 0, userPointerStrideFirst = 0, userPointerStrideHits = 0, userPointerSignatureFirst = 0, userPointerSignatureMissing = 0, userPointerSignatureHits = 0, userPointerSameFound = 0, userPointerSameMissing = 0, userPointerNoRule = 0, userPointerValidated = 0, userPointerDiffering = 0, userPointerUnordered = 0, userPointerHits = 0, userPointerCopies = 0;
     std::array<std::uint64_t, 9> userPointerVerdicts{};
     std::set<std::size_t> differingPositions;
     std::size_t differingFirstPosition = std::numeric_limits<std::size_t>::max(), differingLastPosition = 0;
