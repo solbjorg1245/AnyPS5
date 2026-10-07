@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstdio>
 #include <map>
@@ -327,13 +328,26 @@ std::vector<std::unique_ptr<DepthSurface>>& surfaces() {
     return *list;
 }
 
+// See DepthSurfaceSerial: bumped under surfacesMutex wherever the list or an `overwritten` flag moves.
+std::atomic<std::uint64_t>& depthSerial() {
+    static std::atomic<std::uint64_t> serial{1};
+    return serial;
+}
+
+void bumpDepthSerial() {
+    depthSerial().fetch_add(1, std::memory_order_release);
+}
+
 }
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) {
     std::lock_guard lock(surfacesMutex());
     for (const auto& surface : surfaces()) {
         if (surface->context.device != context.device || !sameSurface(surface->target, target)) continue;
-        if (surface->overwritten) surface->TakeWrittenDepth(true);
+        if (surface->overwritten) {
+            surface->TakeWrittenDepth(true);
+            bumpDepthSerial();
+        }
         surface->htileAddress = target.htileAddress;
         surface->clearDepth = target.clearDepth;
         surface->clearStencil = target.clearStencil;
@@ -342,6 +356,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
         return view;
     }
     surfaces().push_back(std::make_unique<DepthSurface>(context, target));
+    bumpDepthSerial();
     auto& surface = *surfaces().back();
     // A compute pass may have written the memory before any draw used it as depth.
     surface.TakeWrittenDepth(false);
@@ -359,13 +374,16 @@ void NoteDepthMetadataClear(std::uint64_t begin, std::uint64_t end) {
 void NoteDepthSurfaceWrite(std::uint64_t address, std::uint32_t width, std::uint32_t height) {
     std::lock_guard lock(surfacesMutex());
     for (const auto& surface : surfaces()) {
-        if (surface->Covers(address, width, height)) surface->overwritten = true;
+        if (surface->Covers(address, width, height) && !surface->overwritten) {
+            surface->overwritten = true;
+            bumpDepthSerial();
+        }
     }
 }
 
 void ClearDepthSurfaces(VkDevice device) {
     std::lock_guard lock(surfacesMutex());
-    std::erase_if(surfaces(), [&](const auto& surface) { return surface->context.device == device; });
+    if (std::erase_if(surfaces(), [&](const auto& surface) { return surface->context.device == device; }) != 0) bumpDepthSerial();
 }
 
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
@@ -432,6 +450,10 @@ std::size_t DumpDepthSurfaces(const Context& context, const std::string& prefix,
         }
     }
     return written;
+}
+
+std::uint64_t DepthSurfaceSerial() {
+    return depthSerial().load(std::memory_order_acquire);
 }
 
 bool DepthSurfaceAt(std::uint64_t address, std::uint32_t width, std::uint32_t height) {

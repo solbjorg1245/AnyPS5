@@ -227,7 +227,7 @@ public:
     bool DataWordsDiffer(const CompiledShader& shader) const;
     // Why the fast proof of a Revalidate left the object to the full walk (the [rescache]
     // revalidate line's reasons); Count: it did not.
-    enum class FastFail : std::size_t { NoRecord, Collect, Pending, Evicted, Changed, Keys, ClearedView, StorageKeys, Count };
+    enum class FastFail : std::size_t { NoRecord, Collect, Pending, Evicted, Changed, Keys, ClearedView, StorageKeys, DepthSurface, Count };
     // Why a Pending failure was left to the full walk instead of the own-object refresh (T1, see
     // refreshOwnObjects); Count: it was not.
     enum class OwnRefreshFallback : std::size_t { Disabled, Snapshot, Keys, ForeignView, SurfaceKey, NotImported, Uncached, Rerun, Count };
@@ -455,6 +455,9 @@ private:
     // no image other than the object's own sources has results pending over its surfaces and
     // regions, so those checks are skipped (see fastRevalidate).
     std::uint64_t pendingSerialSeen = 0;
+    // DepthSurfaceSerial() when this object's last fast proof found no depth surface over any sampled
+    // surface (0: never): the scan repeats only once the registry moved (see fastRevalidate).
+    std::uint64_t depthSerialSeen = 0;
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).

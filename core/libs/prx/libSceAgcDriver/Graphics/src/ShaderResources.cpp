@@ -1393,9 +1393,21 @@ namespace {
 // of the reused ones, fast = every image proved current from stamps, full = the lookups were repeated.
 // Why the fast path left an object to the full walk (the "fast-fail by reason" counts).
 using FastFail = ShaderResources::FastFail;
-constexpr std::array<const char*, static_cast<std::size_t>(FastFail::Count)> FastFailNames{"no record", "collect", "pending image", "evicted image", "memory changed", "keys", "cleared view", "storage keys"};
+constexpr std::array<const char*, static_cast<std::size_t>(FastFail::Count)> FastFailNames{"no record", "collect", "pending image", "evicted image", "memory changed", "keys", "cleared view", "storage keys", "depth surface"};
 using OwnRefreshFallback = ShaderResources::OwnRefreshFallback;
 constexpr std::array<const char*, static_cast<std::size_t>(OwnRefreshFallback::Count)> OwnRefreshFallbackNames{"disabled", "snapshot texture", "cleared view", "foreign view", "surface key", "not imported", "uncached", "re-run failed"};
+
+// APS5_TRACE_WALKS=1 (diagnostic, session 23): a fast proof that failed and was left to the full
+// walk prints, for the first 2 cases per variant, fail reason and walk outcome, the reason, the
+// surfaces a Pending failure found pending (their records, the image pending over each right now,
+// the T1 fallback and the re-run's reason), and what the walk returned: the same objects (its new
+// records) or another object (the element, its old record and the object that replaced it), with
+// a 10 s count per template stage, reason and outcome. Diagnosis of the resource-cache bound
+// (PROGRESS sessions 21-23).
+bool TracePendingWalk() {
+    static const bool enabled = std::getenv("APS5_TRACE_WALKS") != nullptr;
+    return enabled;
+}
 
 struct RevalidateProfile {
     std::atomic<std::uint64_t> calls{0};
@@ -1538,6 +1550,13 @@ bool SerialMemoEnabled() {
 // which made the game's GPU occlusion culling conservative and doubled the draws per frame
 // once compute templates survived across frames (APS5_RESOURCE_CACHE_ENTRIES=4096, t231;
 // t235/t237 with the walk did not). APS5_NO_FAST_DEPTH_NOTE=1 skips the note as before.
+// The fast proof fails a sampled surface a depth surface now covers (session 23, see
+// fastRevalidate). APS5_NO_FAST_DEPTH_CHECK=1 restores the proof without it.
+bool FastDepthCheck() {
+    static const bool enabled = std::getenv("APS5_NO_FAST_DEPTH_CHECK") == nullptr;
+    return enabled;
+}
+
 bool FastDepthNote() {
     static const bool enabled = std::getenv("APS5_NO_FAST_DEPTH_NOTE") == nullptr;
     return enabled;
@@ -1670,6 +1689,17 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         return false;
     };
     if (validatedTextures.size() != textures.size()) return fail(FastFail::NoRecord);
+    // A depth surface drawn at a sampled surface since its record was made: the lookup would serve
+    // the surface's depth image in place of the snapshot or view (DepthSurfaceTexture is
+    // cachedTexture's first answer), and nothing below would notice, since depth draws stamp no
+    // guest memory, register no pending image and touch no DCC keys. The record exists only because
+    // the build's lookup found no such surface, so the scan repeats only once the depth registry's
+    // serial moved since the last proof. (Session 23: the half-size depth 0x2ef270000 a Boletaria
+    // compute pass downsamples into its occlusion pyramid was snapshotted as zeros during the load;
+    // with compute templates surviving across frames the proof kept the snapshot and the game drew
+    // twice as much.)
+    const auto depthSerial = DepthSurfaceSerial();
+    const bool depthCheck = FastDepthCheck() && depthSerial != depthSerialSeen;
     const bool unchanged = SerialMemoEnabled() && pendingSerialSeen != 0 && pendingSerialSeen == serialBefore;
     const bool keyProofs = KeyFastPath();
     thread_local std::vector<GuestMemory::UnchangedQuery> queries;
@@ -1692,6 +1722,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (!surface.valid) return fail(FastFail::NoRecord);
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
+        if (depthCheck && DepthSurfaceAt(address, surface.resource.width, surface.resource.height)) return fail(FastFail::DepthSurface);
         surface.collected = GuestMemory::CollectWrites(address, bytes);
         if (surface.collected == 0) return fail(FastFail::Collect);
         const auto* source = surface.source;
@@ -1802,6 +1833,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (surface.source == nullptr) surface.generation = surface.collected;
         surface.keys = scannedKeys[i];
     }
+    depthSerialSeen = depthSerial;
     return true;
 }
 
@@ -1815,6 +1847,7 @@ bool ShaderResources::fastRevalidateEach() {
         surface.collected = GuestMemory::CollectWrites(address, bytes);
         if (surface.collected == 0) return false;
         if (PendingStorageOverlaps(address, bytes, surface.source)) return false;
+        if (FastDepthCheck() && DepthSurfaceAt(address, surface.resource.width, surface.resource.height)) return false;
         if (surface.source != nullptr && surface.resource.dccAddress != 0 && surface.resource.dccAddress != surface.source->Descriptor().dccAddress) return false;
         if (surface.source != nullptr) {
             // The view follows the image: it needs the image current with guest memory, as the
@@ -1953,6 +1986,34 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // by stage, binding by binding, so the walk repeats that order.
     // The first element the full walk would replace (APS5_VERIFY_FAST_PROOFS).
     char walkMismatch[200] = {};
+    // APS5_TRACE_WALKS: the object the walk's lookup returned for that element, and the element.
+    char walkReplacement[360] = {};
+    std::size_t walkMismatchIndex = static_cast<std::size_t>(-1);
+    bool walkMismatchStorage = false;
+    const auto describeReplacement = [&](const Texture* texture, const StorageTexture* image) {
+        const void* object = texture != nullptr ? static_cast<const void*>(texture) : static_cast<const void*>(image);
+        const LookupRecord* record = nullptr;
+        for (auto it = lookupLog.rbegin(); it != lookupLog.rend(); ++it) {
+            if (it->object == object) { record = &*it; break; }
+        }
+        if (texture != nullptr) {
+            if (const auto* source = texture->StorageSource(); source != nullptr) {
+                const auto& own = source->Descriptor();
+                std::snprintf(walkReplacement, sizeof(walkReplacement), " -> texture %p: view of image %p 0x%llx+0x%llx %ux%u f%u dcc 0x%llx gen %llu ver %llu", static_cast<const void*>(texture), static_cast<const void*>(source), static_cast<unsigned long long>(own.baseAddress), static_cast<unsigned long long>(source->GuestBytes()), own.width, own.height, static_cast<unsigned>(own.format), static_cast<unsigned long long>(own.dccAddress), static_cast<unsigned long long>(source->Generation()), static_cast<unsigned long long>(source->Version()));
+            } else {
+                std::snprintf(walkReplacement, sizeof(walkReplacement), " -> texture %p: snapshot", static_cast<const void*>(texture));
+            }
+        } else if (image != nullptr) {
+            const auto& own = image->Descriptor();
+            std::snprintf(walkReplacement, sizeof(walkReplacement), " -> image %p 0x%llx+0x%llx %ux%u f%u dcc 0x%llx gen %llu ver %llu", static_cast<const void*>(image), static_cast<unsigned long long>(own.baseAddress), static_cast<unsigned long long>(image->GuestBytes()), own.width, own.height, static_cast<unsigned>(own.format), static_cast<unsigned long long>(own.dccAddress), static_cast<unsigned long long>(image->Generation()), static_cast<unsigned long long>(image->Version()));
+        } else {
+            std::snprintf(walkReplacement, sizeof(walkReplacement), " -> none");
+        }
+        if (record != nullptr) {
+            const auto used = std::strlen(walkReplacement);
+            std::snprintf(walkReplacement + used, sizeof(walkReplacement) - used, " (record keys %s gen %llu source %p)", DccKeysName(record->keys), static_cast<unsigned long long>(record->generation), static_cast<const void*>(record->source));
+        }
+    };
     // Mode 7 of APS5_VERIFY_FAST_PROOFS walks without moving the records.
     bool recordsAfterWalk = true;
     const auto fullWalk = [&] {
@@ -1969,8 +2030,14 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                         const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
                         const auto resource = DecodeTextureResource(words);
                         const VkComponentMapping components{ComponentSwizzleFor(resource.dstSelX), ComponentSwizzleFor(resource.dstSelY), ComponentSwizzleFor(resource.dstSelZ), ComponentSwizzleFor(resource.dstSelW)};
-                        if (textureIndex >= textures.size() || cachedTexture(context, words, resource, components, 0, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element)) != textures[textureIndex]) {
+                        const auto found = textureIndex < textures.size() ? cachedTexture(context, words, resource, components, 0, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element)) : decltype(textures)::value_type{};
+                        if (textureIndex >= textures.size() || found != textures[textureIndex]) {
                             std::snprintf(walkMismatch, sizeof(walkMismatch), "sampled texture %zu of %zu (binding %u element %u) 0x%llx %ux%u format %u dcc 0x%llx", textureIndex, textures.size(), binding.binding, element, static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned>(resource.format), static_cast<unsigned long long>(resource.dccAddress));
+                            if (TracePendingWalk()) {
+                                walkMismatchIndex = textureIndex;
+                                walkMismatchStorage = false;
+                                describeReplacement(found.get(), nullptr);
+                            }
                             return false;
                         }
                         ++textureIndex;
@@ -1989,6 +2056,11 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                         else expected = cachedStorageTexture(context, words, resource, storageMips[storageIndex]);
                         if (expected != storageTextures[storageIndex]) {
                             std::snprintf(walkMismatch, sizeof(walkMismatch), "storage image %zu of %zu (binding %u element %u) 0x%llx %ux%u format %u dcc 0x%llx%s", storageIndex, storageTextures.size(), binding.binding, element, static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned>(resource.format), static_cast<unsigned long long>(resource.dccAddress), storageIndex < storageWritten.size() && storageWritten[storageIndex] ? " written" : "");
+                            if (TracePendingWalk()) {
+                                walkMismatchIndex = storageIndex;
+                                walkMismatchStorage = true;
+                                describeReplacement(nullptr, expected.get());
+                            }
                             return false;
                         }
                         ++storageIndex;
@@ -2018,8 +2090,17 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // pending over the refreshed surfaces, see fastRevalidate); a fallback, or a second failure,
     // takes the full walk as before.
     bool ownRefreshed = false;
+    auto fallback = OwnRefreshFallback::Count;
+    // APS5_TRACE_PENDING_WALK: the surfaces the first proof found pending and their records, before
+    // T1 and the walk move them.
+    thread_local std::vector<PendingOverlap> tracedOverlaps;
+    thread_local std::vector<ValidatedSurface> tracedRecords;
+    const bool tracePending = TracePendingWalk() && !fast;
+    if (tracePending) {
+        tracedOverlaps = overlapping;
+        tracedRecords = validatedTextures;
+    }
     if (!fast && !overlapping.empty()) {
-        auto fallback = OwnRefreshFallback::Count;
         if (!OwnImageRefreshEnabled()) fallback = OwnRefreshFallback::Disabled;
         else {
             refreshed = overlapping;
@@ -2033,9 +2114,111 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         if (fallback != OwnRefreshFallback::Count) countOwnRefreshFallback(fallback);
     }
     if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
+    // APS5_TRACE_PENDING_WALK (see TracePendingWalk).
+    const auto tracePendingCase = [&](bool walked) {
+        constexpr std::size_t reasons = static_cast<std::size_t>(FastFail::Count) + 1;
+        static std::atomic<std::uint64_t> traced[2][reasons][2];
+        static HostMutex traceMutex;
+        static std::unordered_map<std::uint64_t, unsigned> tracedByVariant[reasons][2];
+        static std::atomic<long long> lastTrace{0};
+        const std::size_t group = shaders.front().stage == ShaderRecompiler::ShaderStage::Compute ? 0 : 1;
+        const std::size_t reasonIndex = std::min<std::size_t>(static_cast<std::size_t>(reason), static_cast<std::size_t>(FastFail::Count));
+        const char* reasonName = reason == FastFail::Count ? "no fast proof" : FastFailNames[static_cast<std::size_t>(reason)];
+        traced[group][reasonIndex][walked ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+        const auto variantId = shaders.front().program != nullptr ? shaders.front().program->variantId : 0;
+        bool print = false;
+        {
+            std::lock_guard traceLock(traceMutex);
+            auto& byVariant = tracedByVariant[reasonIndex][walked ? 1 : 0];
+            auto found = byVariant.find(variantId);
+            if (found == byVariant.end() && byVariant.size() < 64) found = byVariant.emplace(variantId, 0u).first;
+            if (found != byVariant.end() && found->second < 2) {
+                ++found->second;
+                print = true;
+            }
+        }
+        if (print) {
+            std::string text;
+            char item[520];
+            for (const auto& overlap : tracedOverlaps) {
+                const bool still = std::find_if(overlapping.begin(), overlapping.end(), [&](const PendingOverlap& entry) { return entry.element == overlap.element && entry.storage == overlap.storage; }) != overlapping.end();
+                std::uint64_t address = 0;
+                std::uint64_t bytes = 0;
+                const StorageTexture* own = nullptr;
+                if (overlap.storage) {
+                    const auto* image = overlap.element < storageTextures.size() ? storageTextures[overlap.element].get() : nullptr;
+                    if (image == nullptr) continue;
+                    const auto& desc = image->Descriptor();
+                    address = desc.baseAddress;
+                    bytes = image->GuestBytes();
+                    own = image;
+                    std::snprintf(item, sizeof(item), " ; storage %zu%s: image %p 0x%llx+0x%llx %ux%u f%u dcc 0x%llx gen %llu ver %llu", overlap.element, still ? " (still pending after T1)" : "", static_cast<const void*>(image), static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), desc.width, desc.height, static_cast<unsigned>(desc.format), static_cast<unsigned long long>(desc.dccAddress), static_cast<unsigned long long>(image->Generation()), static_cast<unsigned long long>(image->Version()));
+                } else {
+                    if (overlap.element >= tracedRecords.size()) continue;
+                    const auto& record = tracedRecords[overlap.element];
+                    address = record.resource.baseAddress;
+                    bytes = record.bytes;
+                    own = record.source;
+                    char sourceText[160] = "snapshot";
+                    if (record.source != nullptr) {
+                        const auto& desc = record.source->Descriptor();
+                        std::snprintf(sourceText, sizeof(sourceText), "view of image %p 0x%llx %ux%u f%u gen %llu ver %llu", static_cast<const void*>(record.source), static_cast<unsigned long long>(desc.baseAddress), desc.width, desc.height, static_cast<unsigned>(desc.format), static_cast<unsigned long long>(record.source->Generation()), static_cast<unsigned long long>(record.source->Version()));
+                    }
+                    std::snprintf(item, sizeof(item), " ; sampled %zu%s%s%s: 0x%llx+0x%llx %ux%u f%u t%d mips %u dcc 0x%llx keys %s gen %llu collected %llu, %s", overlap.element, overlap.viewUncompressed ? " (view uncompressed)" : "", overlap.sourceEligible ? " (source eligible)" : "", still ? " (still pending after T1)" : "", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), record.resource.width, record.resource.height, static_cast<unsigned>(record.resource.format), static_cast<int>(record.resource.tileMode), record.resource.mipCount, static_cast<unsigned long long>(record.resource.dccAddress), DccKeysName(record.keys), static_cast<unsigned long long>(record.generation), static_cast<unsigned long long>(record.collected), sourceText);
+                    text += item;
+                    if (walked && overlap.element < validatedTextures.size()) {
+                        const auto& now = validatedTextures[overlap.element];
+                        std::snprintf(item, sizeof(item), " | walk record: %s keys %s gen %llu source %p", now.valid ? "valid" : "INVALID", DccKeysName(now.keys), static_cast<unsigned long long>(now.generation), static_cast<const void*>(now.source));
+                    } else {
+                        item[0] = 0;
+                    }
+                }
+                text += item;
+                StorageTexture::PendingQuery query{address, address + bytes, own, nullptr, false};
+                StorageTexture::ScanPending(std::span<StorageTexture::PendingQuery>(&query, 1));
+                if (query.found != nullptr) {
+                    const auto& desc = query.found->Descriptor();
+                    std::snprintf(item, sizeof(item), " | pending now: image %p 0x%llx+0x%llx %ux%u f%u t%d mips %u dcc 0x%llx gen %llu ver %llu%s", static_cast<const void*>(query.found), static_cast<unsigned long long>(desc.baseAddress), static_cast<unsigned long long>(query.found->GuestBytes()), desc.width, desc.height, static_cast<unsigned>(desc.format), static_cast<int>(desc.tileMode), desc.mipCount, static_cast<unsigned long long>(desc.dccAddress), static_cast<unsigned long long>(query.found->Generation()), static_cast<unsigned long long>(query.found->Version()), query.overlaps ? "" : " (found but no overlap)");
+                } else {
+                    std::snprintf(item, sizeof(item), " | pending now: none%s", query.overlaps ? " (a store in progress overlaps)" : "");
+                }
+                text += item;
+            }
+            char oldText[400] = {};
+            if (!walked && !walkMismatchStorage && walkMismatchIndex < tracedRecords.size()) {
+                const auto& record = tracedRecords[walkMismatchIndex];
+                char sourceText[160] = "snapshot";
+                if (record.source != nullptr) {
+                    const auto& desc = record.source->Descriptor();
+                    std::snprintf(sourceText, sizeof(sourceText), "view of image %p 0x%llx %ux%u f%u gen %llu ver %llu", static_cast<const void*>(record.source), static_cast<unsigned long long>(desc.baseAddress), desc.width, desc.height, static_cast<unsigned>(desc.format), static_cast<unsigned long long>(record.source->Generation()), static_cast<unsigned long long>(record.source->Version()));
+                }
+                std::snprintf(oldText, sizeof(oldText), " [old record: %s 0x%llx+0x%llx %ux%u f%u t%d mips %u dcc 0x%llx keys %s gen %llu collected %llu, %s]", record.valid ? "valid" : "INVALID", static_cast<unsigned long long>(record.resource.baseAddress), static_cast<unsigned long long>(record.bytes), record.resource.width, record.resource.height, static_cast<unsigned>(record.resource.format), static_cast<int>(record.resource.tileMode), record.resource.mipCount, static_cast<unsigned long long>(record.resource.dccAddress), DccKeysName(record.keys), static_cast<unsigned long long>(record.generation), static_cast<unsigned long long>(record.collected), sourceText);
+            }
+            std::fprintf(stderr, "[rescache] full walk (%s; stage %u variant 0x%llx, %zu textures %zu storage; %zu pending, %zu after T1; T1 %s): %s%s%s%s%s\n", reasonName, static_cast<unsigned>(shaders.front().stage), static_cast<unsigned long long>(variantId), textures.size(), storageTextures.size(), tracedOverlaps.size(), overlapping.size(), tracedOverlaps.empty() ? "n/a" : fallback == OwnRefreshFallback::Count ? "resolved" : OwnRefreshFallbackNames[static_cast<std::size_t>(fallback)], walked ? "SAME objects" : "REBUILD at ", walked ? "" : walkMismatch, walked ? "" : walkReplacement, oldText, text.c_str());
+        }
+        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = lastTrace.load();
+        if (nowMs - last >= 10000 && lastTrace.compare_exchange_strong(last, nowMs)) {
+            std::string line;
+            char item[96];
+            for (std::size_t g = 0; g < 2; ++g) {
+                line += g == 0 ? " compute:" : " | graphics:";
+                for (std::size_t r = 0; r < reasons; ++r) {
+                    const auto same = traced[g][r][1].load(std::memory_order_relaxed);
+                    const auto rebuild = traced[g][r][0].load(std::memory_order_relaxed);
+                    if (same == 0 && rebuild == 0) continue;
+                    std::snprintf(item, sizeof(item), " %s %llu/%llu", r == static_cast<std::size_t>(FastFail::Count) ? "no fast proof" : FastFailNames[r], static_cast<unsigned long long>(same), static_cast<unsigned long long>(rebuild));
+                    line += item;
+                }
+            }
+            std::fprintf(stderr, "[rescache] full walks by reason (cumulative, same/rebuild):%s\n", line.c_str());
+        }
+    };
     if (!fast) {
         countFullWalk(reason);
-        if (!fullWalk()) {
+        const bool walked = fullWalk();
+        if (tracePending) tracePendingCase(walked);
+        if (!walked) {
             const auto failure = [&] {
                 switch (reason) {
                     case FastFail::Pending: return ProofFailure::Pending;
@@ -2425,16 +2608,16 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     entries.emplace_front(key, std::move(resources));
     index.emplace(key, entries.begin());
     // Entries pin their textures and storage images past the texture caches' budgets, so the bound
-    // stays modest: APS5_RESOURCE_CACHE_ENTRIES (default 1024) covers several frames of distinct
-    // dispatch and draw content. Below the working set it thrashes (Boletaria: 11.3k draw-template
-    // builds per 10 s at 66-78 us, most of them templates evicted under the same key; 4096 entries
-    // leave 3.4k and save 3 us per draw packet), but at 4096 compute templates survive across frames
-    // and the fast proof then serves a stale one (the game draws twice as much): the default stays
-    // 1024 until that is fixed (PROGRESS session 21, APS5_VERIFY_FAST_PROOFS).
+    // stays modest: APS5_RESOURCE_CACHE_ENTRIES (default 4096) covers several frames of distinct
+    // dispatch and draw content. Below the working set it thrashes (Boletaria at 1024: 11.3k
+    // draw-template builds per 10 s at 66-78 us, most of them templates evicted under the same key;
+    // 4096 entries leave 3.4k). Compute templates then survive across frames, which exposed the fast
+    // proof's missing depth-surface check (fixed in session 23, FastFail::DepthSurface; PROGRESS
+    // sessions 21-23): at 4096 the game drew twice as much until then.
     static const std::size_t capacity = [] {
         const char* value = std::getenv("APS5_RESOURCE_CACHE_ENTRIES");
-        const auto parsed = value ? std::strtoull(value, nullptr, 10) : 1024ull;
-        return static_cast<std::size_t>(parsed != 0 ? parsed : 1024ull);
+        const auto parsed = value ? std::strtoull(value, nullptr, 10) : 4096ull;
+        return static_cast<std::size_t>(parsed != 0 ? parsed : 4096ull);
     }();
     while (entries.size() > capacity) {
         if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));

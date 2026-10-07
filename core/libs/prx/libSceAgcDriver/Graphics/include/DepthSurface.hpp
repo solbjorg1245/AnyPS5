@@ -18,6 +18,10 @@ void ClearDepthSurfaces(VkDevice device);
 // Whether a resource of this extent at `address` is a plane of a depth surface whose image holds the
 // newest depth (one of another extent there is another resource sharing the memory).
 bool DepthSurfaceAt(std::uint64_t address, std::uint32_t width, std::uint32_t height);
+// Moves with every change of what DepthSurfaceAt and DepthSurfaceTexture answer: a surface
+// registered or released, or its written depth taken over or noted (session 23). A proof that saw
+// the serial and found no surface over its memory need not look again while it is unchanged.
+std::uint64_t DepthSurfaceSerial();
 // A shader writes the memory of a depth surface of this extent through a storage image: until a draw
 // uses the surface again (which takes the written depth over), the storage image holds the newest
 // depth and samplers read it.
