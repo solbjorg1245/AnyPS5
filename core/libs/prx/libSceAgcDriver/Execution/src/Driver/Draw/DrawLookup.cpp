@@ -1,8 +1,16 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/HostMutex.hpp"
+#include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -11,6 +19,106 @@ namespace {
 bool patchedResultReuse() {
     static const bool reuse = std::getenv("APS5_NO_PATCHED_RESULT_REUSE") == nullptr;
     return reuse;
+}
+
+bool traceDrawMisses() {
+    static const bool trace = std::getenv("APS5_TRACE_DRAW_MISSES") != nullptr;
+    return trace;
+}
+
+// Debug aid: APS5_TRACE_DRAW_MISSES=1 reports every 10 s, for the stage misses that compared a
+// variant and found it Differing, which of its words differ from guest memory now ([draw-miss]):
+// per program the misses, how many words differed, and the first (run, word) positions with the
+// stored and live values, to tell a moved pointer (a relocation candidate) from a per-frame
+// constant the data positions left out. Reads through CopyMapped without a pending-write sync.
+void probeDrawMiss(std::uint64_t program, ShaderRecompiler::ProgramRole role, const DispatchVariant& variant) {
+    struct Position {
+        std::uint64_t count = 0;
+        std::uint32_t stored = 0, live = 0;
+        std::uint64_t address = 0;
+        // The stored words of the run from the 8-word group the position sits in (a T# or V#).
+        std::array<std::uint32_t, 8> group{};
+        std::size_t groupWords = 0;
+    };
+    struct Program {
+        std::uint64_t misses = 0, wordsDiffering = 0, atDataPositions = 0, unmapped = 0, equalNow = 0;
+        std::array<std::uint64_t, 3> byCount{};
+        ShaderRecompiler::ProgramRole role{};
+        std::map<std::pair<std::uint32_t, std::uint32_t>, Position> positions;
+    };
+    static HostMutex mutex;
+    static std::map<std::uint64_t, Program> programs;
+    static std::uint64_t total = 0;
+    static auto lastReport = std::chrono::steady_clock::now();
+    thread_local std::vector<std::byte> live;
+    std::lock_guard lock(mutex);
+    ++total;
+    auto& entry = programs[program];
+    entry.role = role;
+    ++entry.misses;
+    std::size_t base = 0;
+    std::uint64_t differing = 0;
+    for (std::size_t r = 0; r < variant.runs.size(); ++r) {
+        const auto [begin, end] = variant.runs[r];
+        const auto count = static_cast<std::size_t>((end - begin) / sizeof(std::uint32_t));
+        live.resize(count * sizeof(std::uint32_t));
+        if (GuestMemory::CopyMapped(begin, live) != GuestMemory::Compare::Equal) {
+            ++entry.unmapped;
+            base += count;
+            continue;
+        }
+        for (std::size_t w = 0; w < count && base + w < variant.words.size(); ++w) {
+            std::uint32_t fresh = 0;
+            std::memcpy(&fresh, live.data() + w * sizeof(std::uint32_t), sizeof(fresh));
+            const auto stored = variant.words[base + w];
+            if (stored == fresh) continue;
+            const auto position = static_cast<std::uint32_t>(base + w);
+            if (std::binary_search(variant.dataPositions.begin(), variant.dataPositions.end(), position)) {
+                ++entry.atDataPositions;
+                continue;
+            }
+            ++differing;
+            if (entry.positions.size() < 6 || entry.positions.contains({static_cast<std::uint32_t>(r), static_cast<std::uint32_t>(w)})) {
+                auto& slot = entry.positions[{static_cast<std::uint32_t>(r), static_cast<std::uint32_t>(w)}];
+                ++slot.count;
+                slot.stored = stored;
+                slot.live = fresh;
+                slot.address = begin + w * sizeof(std::uint32_t);
+                const auto groupStart = w & ~std::size_t{7};
+                slot.groupWords = std::min<std::size_t>(8, count - groupStart);
+                for (std::size_t g = 0; g < slot.groupWords; ++g) slot.group[g] = variant.words[base + groupStart + g];
+            }
+        }
+        base += count;
+    }
+    entry.wordsDiffering += differing;
+    if (differing == 0) ++entry.equalNow;
+    else ++entry.byCount[differing == 1 ? 0 : differing <= 4 ? 1 : 2];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    lastReport = now;
+    std::vector<const std::pair<const std::uint64_t, Program>*> order;
+    for (const auto& item : programs) order.push_back(&item);
+    std::sort(order.begin(), order.end(), [](const auto* a, const auto* b) { return a->second.misses > b->second.misses; });
+    std::string text;
+    char item[256];
+    for (std::size_t i = 0; i < order.size() && i < 8; ++i) {
+        const auto& [code, data] = *order[i];
+        std::snprintf(item, sizeof(item), " [%s 0x%llx: %llu misses, %llu words (1: %llu, 2-4: %llu, 5+: %llu), equal now %llu, at data positions %llu, unmapped runs %llu, %zu runs/%zu words:", data.role == ShaderRecompiler::ProgramRole::Fragment ? "ps" : data.role == ShaderRecompiler::ProgramRole::Main ? "vs" : "other", static_cast<unsigned long long>(code), static_cast<unsigned long long>(data.misses), static_cast<unsigned long long>(data.wordsDiffering), static_cast<unsigned long long>(data.byCount[0]), static_cast<unsigned long long>(data.byCount[1]), static_cast<unsigned long long>(data.byCount[2]), static_cast<unsigned long long>(data.equalNow), static_cast<unsigned long long>(data.atDataPositions), static_cast<unsigned long long>(data.unmapped), variant.runs.size(), variant.words.size());
+        text += item;
+        for (const auto& [where, position] : data.positions) {
+            std::snprintf(item, sizeof(item), " r%u+%u@0x%llx %llux %08x->%08x grp", where.first, where.second, static_cast<unsigned long long>(position.address), static_cast<unsigned long long>(position.count), position.stored, position.live);
+            text += item;
+            for (std::size_t g = 0; g < position.groupWords; ++g) {
+                std::snprintf(item, sizeof(item), " %08x", position.group[g]);
+                text += item;
+            }
+        }
+        text += "]";
+    }
+    std::fprintf(stderr, "[draw-miss] %llu differing-stage misses probed (10 s), %zu programs; top by misses (stage code: misses, differing words by count, first positions run+word@address count stored->live):%s\n", static_cast<unsigned long long>(total), programs.size(), text.c_str());
+    programs.clear();
+    total = 0;
 }
 
 }
@@ -113,10 +221,12 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         ++compared;
                         auto* live = dataAllowed ? &liveData[i] : nullptr;
                         const auto compareStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                        const auto waitedAtCompare = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
                         auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
                         if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
                         if (profile) {
-                            compareUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - compareStart).count();
+                            // Without the GPU waits inside (the phase books them as "validate GPU wait").
+                            compareUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - compareStart).count() - (Graphics::Recorder::ThreadWaitedMs() - waitedAtCompare) * 1000.0;
                             ++compareCalls;
                         }
                         if (!anyLayout) outcome = result;
@@ -133,6 +243,13 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     if (!anyLayout) miss = DrawMiss::Layout;
                     else if (outcome != EntryOutcome::Differing) miss = DrawMiss::Gate;
                     else miss = roles[i] == Role::Fragment ? DrawMiss::FragmentDiffering : i == 0 ? DrawMiss::FrontDiffering : DrawMiss::OtherDiffering;
+                    if (*miss != DrawMiss::Layout && *miss != DrawMiss::Gate && traceDrawMisses()) {
+                        for (const auto& variant : variants) {
+                            if (variant->pushOffset != cursor) continue;
+                            probeDrawMiss(programs[i].binary.codeAddress, roles[i], *variant);
+                            break;
+                        }
+                    }
                 }
             }
             drawHit = !miss;

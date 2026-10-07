@@ -21,8 +21,12 @@ void probeKeyChurn(const QueueState& queue) {
     if (!enabled) return;
     constexpr std::size_t Ranges = Graphics::DrawKeyRegisters.size();
     static HostMutex mutex;
-    static std::array<std::unordered_set<std::uint64_t>, Ranges + 1> seen;
-    static std::array<std::uint64_t, Ranges + 1> repeats{};
+    // Variants: each range left out, none left out (Ranges), every shader user-word range left
+    // out (Ranges + 1), those plus the CB_COLOR bases (Ranges + 2).
+    static std::array<std::unordered_set<std::uint64_t>, Ranges + 3> seen;
+    static std::array<std::uint64_t, Ranges + 3> repeats{};
+    const auto userWords = [](const Graphics::DrawKeyRange& range) { return range.bank == Graphics::RegisterBank::Shader && range.count >= 0x21; };
+    const auto colorBases = [](const Graphics::DrawKeyRange& range) { return range.bank == Graphics::RegisterBank::Context && range.first == 0x318; };
     static std::uint64_t total = 0;
     static auto lastReport = std::chrono::steady_clock::now();
     std::array<std::uint64_t, Ranges> rangeHash{};
@@ -39,10 +43,12 @@ void probeKeyChurn(const QueueState& queue) {
     }
     std::lock_guard lock(mutex);
     ++total;
-    for (std::size_t leftOut = 0; leftOut <= Ranges; ++leftOut) {
+    for (std::size_t leftOut = 0; leftOut <= Ranges + 2; ++leftOut) {
         std::uint64_t key = 0xcbf29ce484222325ull;
         for (std::size_t r = 0; r < Ranges; ++r) {
-            if (r != leftOut) key = (key ^ rangeHash[r]) * 0x100000001b3ull;
+            const auto& range = Graphics::DrawKeyRegisters[r];
+            const bool out = leftOut < Ranges ? r == leftOut : leftOut == Ranges ? false : userWords(range) || (leftOut == Ranges + 2 && colorBases(range));
+            if (!out) key = (key ^ rangeHash[r]) * 0x100000001b3ull;
         }
         if (seen[leftOut].size() > (1u << 20u)) seen[leftOut].clear();
         if (!seen[leftOut].insert(key).second) ++repeats[leftOut];
@@ -58,7 +64,7 @@ void probeKeyChurn(const QueueState& queue) {
         std::snprintf(item, sizeof(item), " %s 0x%x+%u: %llu", Graphics::RegisterBankName(range.bank), range.first, range.count, static_cast<unsigned long long>(repeats[r]));
         text += item;
     }
-    std::fprintf(stderr, "[draw-key-churn] %llu keys (10 s), %llu repeat whole; repeats with one range left out (only ranges adding > 2%%):%s\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(repeats[Ranges]), text.c_str());
+    std::fprintf(stderr, "[draw-key-churn] %llu keys (10 s), %llu repeat whole; all user-word ranges left out %llu, those + CB_COLOR bases %llu; repeats with one range left out (only ranges adding > 2%%):%s\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(repeats[Ranges]), static_cast<unsigned long long>(repeats[Ranges + 1]), static_cast<unsigned long long>(repeats[Ranges + 2]), text.c_str());
     repeats.fill(0);
     total = 0;
 }
