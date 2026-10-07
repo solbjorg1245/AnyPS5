@@ -46,7 +46,7 @@ void probeDrawMiss(std::uint64_t program, ShaderRecompiler::ProgramRole role, co
         std::size_t groupWords = 0;
     };
     struct Program {
-        std::uint64_t misses = 0, wordsDiffering = 0, atDataPositions = 0, unmapped = 0, equalNow = 0;
+        std::uint64_t misses = 0, wordsDiffering = 0, atDataPositions = 0, atIgnoredBits = 0, unmapped = 0, equalNow = 0;
         std::array<std::uint64_t, 3> byCount{};
         ShaderRecompiler::ProgramRole role{};
         std::map<std::pair<std::uint32_t, std::uint32_t>, Position> positions;
@@ -82,6 +82,10 @@ void probeDrawMiss(std::uint64_t program, ShaderRecompiler::ProgramRole role, co
                 ++entry.atDataPositions;
                 continue;
             }
+            if (const auto mask = IgnoredMaskAt(variant.ignoredBits, position); mask != 0 && ((stored ^ fresh) & ~mask) == 0) {
+                ++entry.atIgnoredBits;
+                continue;
+            }
             ++differing;
             if (entry.positions.size() < 6 || entry.positions.contains({static_cast<std::uint32_t>(r), static_cast<std::uint32_t>(w)})) {
                 auto& slot = entry.positions[{static_cast<std::uint32_t>(r), static_cast<std::uint32_t>(w)}];
@@ -109,7 +113,7 @@ void probeDrawMiss(std::uint64_t program, ShaderRecompiler::ProgramRole role, co
     char item[256];
     for (std::size_t i = 0; i < order.size() && i < 8; ++i) {
         const auto& [code, data] = *order[i];
-        std::snprintf(item, sizeof(item), " [%s 0x%llx: %llu misses, %llu words (1: %llu, 2-4: %llu, 5+: %llu), equal now %llu, at data positions %llu, unmapped runs %llu, %zu runs/%zu words:", data.role == ShaderRecompiler::ProgramRole::Fragment ? "ps" : data.role == ShaderRecompiler::ProgramRole::Main ? "vs" : "other", static_cast<unsigned long long>(code), static_cast<unsigned long long>(data.misses), static_cast<unsigned long long>(data.wordsDiffering), static_cast<unsigned long long>(data.byCount[0]), static_cast<unsigned long long>(data.byCount[1]), static_cast<unsigned long long>(data.byCount[2]), static_cast<unsigned long long>(data.equalNow), static_cast<unsigned long long>(data.atDataPositions), static_cast<unsigned long long>(data.unmapped), variant.runs.size(), variant.words.size());
+        std::snprintf(item, sizeof(item), " [%s 0x%llx: %llu misses, %llu words (1: %llu, 2-4: %llu, 5+: %llu), equal now %llu, at data positions %llu, at ignored bits %llu, unmapped runs %llu, %zu runs/%zu words:", data.role == ShaderRecompiler::ProgramRole::Fragment ? "ps" : data.role == ShaderRecompiler::ProgramRole::Main ? "vs" : "other", static_cast<unsigned long long>(code), static_cast<unsigned long long>(data.misses), static_cast<unsigned long long>(data.wordsDiffering), static_cast<unsigned long long>(data.byCount[0]), static_cast<unsigned long long>(data.byCount[1]), static_cast<unsigned long long>(data.byCount[2]), static_cast<unsigned long long>(data.equalNow), static_cast<unsigned long long>(data.atDataPositions), static_cast<unsigned long long>(data.atIgnoredBits), static_cast<unsigned long long>(data.unmapped), variant.runs.size(), variant.words.size());
         text += item;
         for (const auto& [where, position] : data.positions) {
             std::snprintf(item, sizeof(item), " r%u+%u@0x%llx %llux %08x->%08x grp", where.first, where.second, static_cast<unsigned long long>(position.address), static_cast<unsigned long long>(position.count), position.stored, position.live);

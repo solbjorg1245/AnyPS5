@@ -161,17 +161,26 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                     break;
                 }
             }
+            // Don't-care bits: the sampled-image T#s' streaming-feedback fields among the words.
+            if (tsharpMask() && !stampValidate()) {
+                static_cast<void>(IgnoredWordBits(variant->runs, variant->words, variant->compiled->bindings, variant->dataPositions, variant->ignoredBits));
+                if (!variant->ignoredBits.empty()) {
+                    std::lock_guard cacheLock(drawCacheMutex);
+                    ++drawEntryCounters.ignoredInserts;
+                    drawEntryCounters.ignoredPositionsInserted += variant->ignoredBits.size();
+                }
+            }
             // A data hit's stage holds the live words and a patched result: both must be what the
-            // capture made (APS5_VERIFY_DATA_HITS).
+            // capture made (APS5_VERIFY_DATA_HITS); the compares look through the don't-care bits.
             const bool dataStage = verifyHit && hits.data && matched[i] != nullptr && i < hits.liveWords.size() && !hits.liveWords[i].empty();
             if (dataStage) {
                 const auto& patched = *hits.results[i];
                 const auto& captured = *stageCapture.compiled;
-                bool same = matched[i]->runs == variant->runs && hits.liveWords[i] == variant->words && captured.variantId == patched.variantId && captured.pushConstants == patched.pushConstants && captured.bindings.size() == patched.bindings.size();
+                bool same = matched[i]->runs == variant->runs && WordsEqualIgnoring(hits.liveWords[i], variant->words, matched[i]->ignoredBits) && captured.variantId == patched.variantId && captured.pushConstants == patched.pushConstants && captured.bindings.size() == patched.bindings.size();
                 for (std::size_t b = 0; same && b < captured.bindings.size(); ++b) {
                     const auto& left = captured.bindings[b];
                     const auto& right = patched.bindings[b];
-                    same = left.kind == right.kind && left.role == right.role && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor;
+                    same = left.kind == right.kind && left.role == right.role && left.binding == right.binding && left.count == right.count && SameDescriptorIgnoringTsharpBits(left, left.guestDescriptor, right.guestDescriptor);
                 }
                 if (!same) {
                     std::fprintf(stderr, "[draw-cache] APS5_VERIFY_DATA_HITS: stage %zu (program 0x%llx) of a data hit disagrees with its capture\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress));
@@ -181,7 +190,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                 std::lock_guard cacheLock(drawCacheMutex);
                 ++drawEntryCounters.dataVerified;
             }
-            if (verifyHit && !dataStage && matched[i] != nullptr && (matched[i]->runs != variant->runs || matched[i]->words != variant->words)) {
+            if (verifyHit && !dataStage && matched[i] != nullptr && (matched[i]->runs != variant->runs || !WordsEqualIgnoring(matched[i]->words, variant->words, matched[i]->ignoredBits))) {
                 ++mismatches;
                 static std::atomic<std::uint64_t> reports{0};
                 if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: stage %zu (program 0x%llx) of a hit captured differently: %zu runs / %zu words matched, %zu / %zu fresh\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), matched[i]->runs.size(), matched[i]->words.size(), variant->runs.size(), variant->words.size());

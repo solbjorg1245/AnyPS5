@@ -19,6 +19,14 @@ bool Driver::verifyDataHits() {
     return verify;
 }
 
+// Draw-cache variants ignore the sampled-image T#s' texture-streaming feedback bits in their stage
+// compares, and the texture keys leave them out (IgnoredWordBits, ShaderResources.cpp
+// MakeTextureKey); APS5_NO_TSHARP_MASK=1 compares and keys on them exactly.
+bool Driver::tsharpMask() {
+    static const bool mask = std::getenv("APS5_NO_TSHARP_MASK") == nullptr;
+    return mask;
+}
+
 std::size_t Driver::dispatchVariants() {
     static const std::size_t variants = [] {
         if (stampValidate()) return std::size_t{1};

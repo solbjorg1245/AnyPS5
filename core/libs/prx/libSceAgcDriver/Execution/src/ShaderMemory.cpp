@@ -770,4 +770,64 @@ DataWordPositionCounts DataWordPositions(std::span<const std::pair<std::uint64_t
     return counts;
 }
 
+std::size_t IgnoredWordBits(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::uint32_t> words, std::span<const ShaderRecompiler::DescriptorBinding> bindings, std::span<const std::uint32_t> dataPositions, std::vector<std::pair<std::uint32_t, std::uint32_t>>& ignored) {
+    constexpr std::size_t TsharpWords = 8;
+    ignored.clear();
+    std::vector<std::size_t> prefix(runs.size() + 1, 0);
+    for (std::size_t i = 0; i < runs.size(); ++i) prefix[i + 1] = prefix[i] + static_cast<std::size_t>((runs[i].second - runs[i].first) / sizeof(std::uint32_t));
+    // The guest address of a position (positions index the runs' words in order).
+    const auto addressOf = [&](std::size_t position) {
+        const auto run = static_cast<std::size_t>(std::upper_bound(prefix.begin(), prefix.end(), position) - prefix.begin()) - 1;
+        return runs[run].first + static_cast<std::uint64_t>(position - prefix[run]) * sizeof(std::uint32_t);
+    };
+    std::size_t located = 0;
+    for (const auto& binding : bindings) {
+        if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::SampledImage) continue;
+        const auto& descriptor = binding.guestDescriptor;
+        for (std::size_t element = 0; element + TsharpWords <= descriptor.size(); element += TsharpWords) {
+            const auto* tsharp = descriptor.data() + element;
+            if (tsharp[0] == 0 && tsharp[1] == 0) continue;
+            for (std::size_t position = 0; position + TsharpWords <= words.size(); ++position) {
+                if (words[position] != tsharp[0] || !std::equal(tsharp, tsharp + TsharpWords, words.begin() + static_cast<std::ptrdiff_t>(position))) continue;
+                if (addressOf(position + TsharpWords - 1) != addressOf(position) + (TsharpWords - 1) * sizeof(std::uint32_t)) continue;
+                const auto word5 = static_cast<std::uint32_t>(position + 5);
+                const auto word6 = static_cast<std::uint32_t>(position + 6);
+                if (std::binary_search(dataPositions.begin(), dataPositions.end(), word5) || std::binary_search(dataPositions.begin(), dataPositions.end(), word6)) continue;
+                ignored.emplace_back(word5, TsharpWord5IgnoredBits);
+                ignored.emplace_back(word6, TsharpWord6IgnoredBits);
+                ++located;
+            }
+        }
+    }
+    std::sort(ignored.begin(), ignored.end());
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < ignored.size(); ++i) {
+        if (kept != 0 && ignored[kept - 1].first == ignored[i].first) ignored[kept - 1].second |= ignored[i].second;
+        else ignored[kept++] = ignored[i];
+    }
+    ignored.resize(kept);
+    return located;
+}
+
+bool WordsEqualIgnoring(std::span<const std::uint32_t> a, std::span<const std::uint32_t> b, std::span<const std::pair<std::uint32_t, std::uint32_t>> ignored) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i] == b[i]) continue;
+        if (((a[i] ^ b[i]) & ~IgnoredMaskAt(ignored, static_cast<std::uint32_t>(i))) != 0) return false;
+    }
+    return true;
+}
+
+bool SameDescriptorIgnoringTsharpBits(const ShaderRecompiler::DescriptorBinding& binding, std::span<const std::uint32_t> left, std::span<const std::uint32_t> right) {
+    if (left.size() != right.size()) return false;
+    const bool sampled = binding.role == ShaderRecompiler::DescriptorRole::GuestImages && binding.kind == ShaderRecompiler::DescriptorKind::SampledImage;
+    for (std::size_t i = 0; i < left.size(); ++i) {
+        if (left[i] == right[i]) continue;
+        const auto word = i % 8;
+        const auto mask = !sampled ? 0u : word == 5 ? TsharpWord5IgnoredBits : word == 6 ? TsharpWord6IgnoredBits : 0u;
+        if (((left[i] ^ right[i]) & ~mask) != 0) return false;
+    }
+    return true;
+}
+
 }

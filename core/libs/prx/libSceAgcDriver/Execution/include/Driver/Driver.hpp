@@ -79,6 +79,7 @@ private:
     static bool stampValidate();
     static bool dataHits();
     static bool verifyDataHits();
+    static bool tsharpMask();
     static bool relocatedHits();
     static RelocationVerdict learnRelocation(const DispatchVariant& old, DispatchVariant& fresh);
     static void traceFailedRelocation(std::uint64_t program, const DispatchVariant& candidate);
@@ -255,6 +256,8 @@ private:
     EntryCounters entryCounters;
 
     std::atomic<std::uint64_t> dataPendingMisses{0};
+    // Words a draw variant compare accepted through its don't-care bits (DispatchVariant::ignoredBits).
+    std::atomic<std::uint64_t> ignoredBitWords{0};
 
     using ValueSet = std::pair<std::vector<std::pair<std::uint64_t, std::uint64_t>>, std::vector<std::uint32_t>>;
     std::unordered_map<std::uint64_t, std::deque<ValueSet>> priorValueSets;

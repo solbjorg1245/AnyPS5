@@ -74,10 +74,23 @@ struct TextureKeyHash {
     }
 };
 
+// The sampled-image T#s' texture-streaming feedback fields (word 5 bit 25, word 6 bits 0-7; see
+// IgnoredWordBits in ShaderMemory.hpp) are left out of the key: the title toggles them per frame,
+// which keyed one surface's view twice and re-snapshotted it on the second. APS5_NO_TSHARP_MASK=1
+// keys on the words as given.
+bool TsharpKeyMask() {
+    static const bool mask = std::getenv("APS5_NO_TSHARP_MASK") == nullptr;
+    return mask;
+}
+
 TextureKey MakeTextureKey(VkDevice device, std::span<const std::uint32_t> words, VkComponentMapping components, bool depthCompare = false) {
     TextureKey key{device, {}, {static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a)}};
     key.depthCompare = depthCompare;
     std::copy(words.begin(), words.end(), key.words.begin());
+    if (TsharpKeyMask() && words.size() == 8) {
+        key.words[5] &= ~TsharpWord5IgnoredBits;
+        key.words[6] &= ~TsharpWord6IgnoredBits;
+    }
     return key;
 }
 

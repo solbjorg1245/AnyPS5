@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_SHADERMEMORY_HPP
 
 #include "Recompiler.hpp"
+#include <algorithm>
 #include <array>
 #include <bitset>
 #include <cstddef>
@@ -139,6 +140,27 @@ struct DataWordPositionCounts {
     std::uint64_t aliased = 0;
 };
 DataWordPositionCounts DataWordPositions(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads, std::span<const std::uint32_t> words, std::span<const std::uint32_t> flattenedSrt, std::vector<std::uint32_t>& positions, std::vector<std::uint32_t>& slots);
+
+// Don't-care bits of a variant's stored words: the texture-streaming feedback fields of each
+// sampled-image T# (an element of a GuestImages / SampledImage binding) located among the words,
+// its eight words consecutive in address (one run, or adjacent runs across a page). Word 5 bit 25
+// is the mip-stats counter enable and word 6 bits 0-7 the counter id (GuestTextureResource.cpp
+// decodes both and reports nothing back); the title toggles them per frame. `ignored` receives
+// (position, mask) sorted by position, duplicates merged; a T# with a word at a data position is
+// left out. Returns how many T#s were located. A null T# (words 0-1 zero) is skipped.
+inline constexpr std::uint32_t TsharpWord5IgnoredBits = 1u << 25u;
+inline constexpr std::uint32_t TsharpWord6IgnoredBits = 0xffu;
+std::size_t IgnoredWordBits(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::uint32_t> words, std::span<const ShaderRecompiler::DescriptorBinding> bindings, std::span<const std::uint32_t> dataPositions, std::vector<std::pair<std::uint32_t, std::uint32_t>>& ignored);
+// The mask of `position` in a sorted (position, mask) list, 0 when absent.
+inline std::uint32_t IgnoredMaskAt(std::span<const std::pair<std::uint32_t, std::uint32_t>> ignored, std::uint32_t position) {
+    const auto it = std::lower_bound(ignored.begin(), ignored.end(), position, [](const std::pair<std::uint32_t, std::uint32_t>& entry, std::uint32_t value) { return entry.first < value; });
+    return it != ignored.end() && it->first == position ? it->second : 0u;
+}
+// Whether two word sequences are equal apart from the masked bits (sizes must match).
+bool WordsEqualIgnoring(std::span<const std::uint32_t> a, std::span<const std::uint32_t> b, std::span<const std::pair<std::uint32_t, std::uint32_t>> ignored);
+// Whether two guest descriptors of `binding` are equal apart from the T# don't-care bits of a
+// sampled-image binding's elements (any other binding: exactly).
+bool SameDescriptorIgnoringTsharpBits(const ShaderRecompiler::DescriptorBinding& binding, std::span<const std::uint32_t> left, std::span<const std::uint32_t> right);
 
 }
 

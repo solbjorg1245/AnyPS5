@@ -37,6 +37,13 @@ struct DispatchVariant {
     std::vector<std::uint32_t> dataPositions;
     std::vector<std::uint32_t> dataSlots;
     std::uint32_t flatBinding = NoFlatBinding;
+    // Don't-care bits (IgnoredWordBits): (position, mask) sorted by position, of the stored words a
+    // compare may differ in without the variant missing: the sampled-image T#s' texture-streaming
+    // feedback fields (word 5 bit 25, the mip-stats counter enable; word 6 bits 0-7, its counter
+    // id), which the title toggles per frame and the port does not implement (~5-8k fragment stage
+    // misses per 10 s in Boletaria). A hit binds the stored words, so the texture keys stay put.
+    // Draw variants only; APS5_NO_TSHARP_MASK=1 compares them exactly.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> ignoredBits;
 
     // Relocation rule (DispatchRelocation.cpp): the low-word positions of the 64-bit pointers
     // through which the walk reached `movedRuns` (run indices). A later dispatch whose pointers all
@@ -92,7 +99,12 @@ struct EntryCounters {
 
 struct DataMask {
     std::span<const std::uint32_t> positions;
+    // Receives (position, live word) for a difference at a data position; null: such a difference
+    // is a miss (positions empty), the mask then serves `ignored` alone.
     std::vector<std::pair<std::uint32_t, std::uint32_t>>* live;
+    // (position, mask) sorted by position: a word differing only in the masked bits compares equal
+    // (DispatchVariant::ignoredBits).
+    std::span<const std::pair<std::uint32_t, std::uint32_t>> ignored;
 };
 
 // Why learnRelocation took or refused a relocation rule (counted per verdict).

@@ -89,7 +89,13 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
             std::memcpy(&fresh, live.data() + i * sizeof(std::uint32_t), sizeof(fresh));
             if (stored == fresh) continue;
             const auto position = static_cast<std::uint32_t>(first + i);
-            if (!std::binary_search(data->positions.begin(), data->positions.end(), position)) return GuestMemory::Compare::Differs;
+            // A don't-care difference (a T#'s streaming-feedback bits) is no difference; counted
+            // for the [draw-cache] data-hits line.
+            if (const auto mask = IgnoredMaskAt(data->ignored, position); mask != 0 && ((stored ^ fresh) & ~mask) == 0) {
+                ignoredBitWords.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            if (data->live == nullptr || !std::binary_search(data->positions.begin(), data->positions.end(), position)) return GuestMemory::Compare::Differs;
             data->live->emplace_back(position, fresh);
         }
         return GuestMemory::Compare::Equal;
@@ -111,7 +117,7 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
         std::size_t first = 0;
         observable.clear();
         reachedPending = 0;
-        if (data != nullptr) data->live->clear();
+        if (data != nullptr && data->live != nullptr) data->live->clear();
         for (std::size_t i = 0; i < captured.size(); ++i) {
             const auto& region = captured[i];
             const bool isPending = next < pending.size() && pending[next] == i;

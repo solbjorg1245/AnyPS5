@@ -2034,6 +2034,70 @@ void dataWordPositionsTests() {
     }
 }
 
+// The don't-care bits of a variant (IgnoredWordBits): a sampled-image T# located among the words
+// yields its word 5 / word 6 masks; a T# whose words are not consecutive in address, a storage
+// image's and one with a word at a data position yield none; adjacent runs count as consecutive.
+void ignoredWordBitsTests() {
+    using AgcDriver::IgnoredWordBits;
+    using AgcDriver::IgnoredMaskAt;
+    using AgcDriver::WordsEqualIgnoring;
+    using AgcDriver::SameDescriptorIgnoringTsharpBits;
+    using AgcDriver::TsharpWord5IgnoredBits;
+    using AgcDriver::TsharpWord6IgnoredBits;
+    using Bits = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
+    const std::vector<std::uint32_t> first{0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18};
+    const std::vector<std::uint32_t> second{0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28};
+    ShaderRecompiler::DescriptorBinding sampled;
+    sampled.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+    sampled.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    sampled.count = 2;
+    sampled.guestDescriptor = first;
+    sampled.guestDescriptor.insert(sampled.guestDescriptor.end(), second.begin(), second.end());
+    // Words: two fillers, the first T# (positions 2-9), two fillers, the second T# (12-19) split
+    // over the last two runs.
+    std::vector<std::uint32_t> words{0xa, 0xb};
+    words.insert(words.end(), first.begin(), first.end());
+    words.insert(words.end(), {0xc, 0xd});
+    words.insert(words.end(), second.begin(), second.end());
+    Bits ignored;
+    {
+        const std::vector<std::pair<std::uint64_t, std::uint64_t>> runs{{0x1000, 0x1030}, {0x2000, 0x2010}, {0x3000, 0x3010}};
+        const auto located = IgnoredWordBits(runs, words, std::span(&sampled, 1), {}, ignored);
+        Require(located == 1 && ignored == Bits{{7, TsharpWord5IgnoredBits}, {8, TsharpWord6IgnoredBits}}, "a T# among the words was not located, or a split one was");
+    }
+    {
+        const std::vector<std::pair<std::uint64_t, std::uint64_t>> runs{{0x1000, 0x1030}, {0x2000, 0x2010}, {0x2010, 0x2020}};
+        const auto located = IgnoredWordBits(runs, words, std::span(&sampled, 1), {}, ignored);
+        Require(located == 2 && ignored == Bits{{7, TsharpWord5IgnoredBits}, {8, TsharpWord6IgnoredBits}, {17, TsharpWord5IgnoredBits}, {18, TsharpWord6IgnoredBits}}, "a T# over adjacent runs was not located");
+        const std::vector<std::uint32_t> dataPositions{8};
+        Require(IgnoredWordBits(runs, words, std::span(&sampled, 1), dataPositions, ignored) == 1 && ignored == Bits{{17, TsharpWord5IgnoredBits}, {18, TsharpWord6IgnoredBits}}, "a T# with a word at a data position was kept");
+        auto storage = sampled;
+        storage.kind = ShaderRecompiler::DescriptorKind::StorageImage;
+        Require(IgnoredWordBits(runs, words, std::span(&storage, 1), {}, ignored) == 0 && ignored.empty(), "a storage image produced don't-care bits");
+    }
+    {
+        const Bits bits{{7, TsharpWord5IgnoredBits}, {8, TsharpWord6IgnoredBits}};
+        Require(IgnoredMaskAt(bits, 8) == TsharpWord6IgnoredBits && IgnoredMaskAt(bits, 9) == 0, "the mask lookup is wrong");
+        auto toggled = words;
+        toggled[7] ^= TsharpWord5IgnoredBits;
+        toggled[8] = (toggled[8] & ~TsharpWord6IgnoredBits) | 0x73u;
+        Require(WordsEqualIgnoring(words, toggled, bits), "words differing only in the don't-care bits compared unequal");
+        toggled[8] ^= 0x100u;
+        Require(!WordsEqualIgnoring(words, toggled, bits), "a difference outside the don't-care bits compared equal");
+        Require(!WordsEqualIgnoring(words, std::span(toggled).first(words.size() - 1), bits), "sequences of different sizes compared equal");
+        auto descriptor = sampled.guestDescriptor;
+        descriptor[5] ^= TsharpWord5IgnoredBits;
+        descriptor[8 + 6] ^= 0x73u;
+        Require(SameDescriptorIgnoringTsharpBits(sampled, sampled.guestDescriptor, descriptor), "descriptors differing only in the don't-care bits compared unequal");
+        descriptor[8 + 6] ^= 0x100u;
+        Require(!SameDescriptorIgnoringTsharpBits(sampled, sampled.guestDescriptor, descriptor), "a descriptor difference outside the don't-care bits compared equal");
+        auto storage = sampled;
+        storage.kind = ShaderRecompiler::DescriptorKind::StorageImage;
+        descriptor[8 + 6] ^= 0x100u;
+        Require(!SameDescriptorIgnoringTsharpBits(storage, storage.guestDescriptor, descriptor), "a storage image's descriptor was compared through the T# mask");
+    }
+}
+
 // A template's data buffers refreshed by words from a patched compiled result (a data-only hit)
 // and back: DataWordsHash() follows the buffers exactly, so a later recipe hit's hash compare
 // (RecordedDispatch::DataRefresh::Hash) decides correctly in both directions.
@@ -2406,6 +2470,7 @@ int main() {
         staleGenerationTests(device, recorder);
         importWindowTests(device, recorder);
         dataWordPositionsTests();
+        ignoredWordBitsTests();
         dataRefreshTests(device, recorder);
         minLodTests(device, recorder);
         firstLayerViewTests(device, recorder);

@@ -67,6 +67,8 @@ struct DrawEntryCounters {
     std::uint64_t partialHits = 0, partialStagesKept = 0;
     // Data hits (DrawStageHits): hits with at least one stage's flat-SRT data words refreshed.
     std::uint64_t dataHits = 0, dataStages = 0, dataWordsRefreshed = 0, dataInserts = 0, dataPositionsInserted = 0, dataVerified = 0;
+    // Variants inserted with don't-care bits (DispatchVariant::ignoredBits) and their positions.
+    std::uint64_t ignoredInserts = 0, ignoredPositionsInserted = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
