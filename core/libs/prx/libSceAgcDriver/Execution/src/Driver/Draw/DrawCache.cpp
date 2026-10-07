@@ -55,22 +55,54 @@ void Driver::accountDrawVariant(const DispatchVariant& variant, bool added) {
     }
 }
 
-void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode) {
+void Driver::insertDrawEntry(const DrawKey& key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, const DrawRelocation* relocation, const std::vector<std::shared_ptr<DispatchVariant>>* matched) {
     std::lock_guard cacheLock(drawCacheMutex);
     auto& counters = drawEntryCounters;
     ++counters.inserts;
-    const auto found = drawCache.find(key);
+    auto found = drawCache.find(key.key);
+    // A miss under a relocation candidate moves the candidate's entry to the new key: the variants
+    // of a shifted stage sit at dead addresses and go, the stages compared in place go on.
+    bool rekey = false;
+    if (found == drawCache.end() && relocation != nullptr && relocation->entry != nullptr) {
+        found = drawCache.find(relocation->key);
+        rekey = found != drawCache.end() && found->second == relocation->entry;
+        if (!rekey) found = drawCache.end();
+    }
     auto replacement = std::make_shared<DrawEntry>();
     replacement->stages.resize(fresh.size());
     replacement->decode = std::move(decode);
     if (found != drawCache.end()) {
         if (found->second->stages.size() == fresh.size()) replacement->stages = found->second->stages;
-        if (found->second->decode != nullptr) replacement->decode = found->second->decode;
+        if (found->second->decode != nullptr && (!rekey || replacement->decode == nullptr)) replacement->decode = found->second->decode;
         replacement->recipes.store(found->second->recipes.load());
+        if (rekey) {
+            // Of a stage whose pointer moved, only a variant whose rule shifts nothing stays.
+            for (std::size_t i = 0; i < replacement->stages.size(); ++i) {
+                if (i >= relocation->deltas.size() || relocation->deltas[i] == 0) continue;
+                auto& variants = replacement->stages[i];
+                std::vector<std::shared_ptr<DispatchVariant>> kept;
+                for (const auto& variant : variants) {
+                    if (staysOnMove(*variant)) {
+                        kept.push_back(variant);
+                    } else {
+                        accountDrawVariant(*variant, false);
+                        ++counters.variantsEvicted;
+                    }
+                }
+                variants = std::move(kept);
+            }
+        }
     }
     for (std::size_t i = 0; i < fresh.size(); ++i) {
-        if (fresh[i] == nullptr) continue;
         auto& variants = replacement->stages[i];
+        // A relocated miss keeps the stages it matched through a shifted variant.
+        if (fresh[i] == nullptr && rekey && matched != nullptr && i < matched->size() && (*matched)[i] != nullptr && i < relocation->relocated.size() && relocation->relocated[i]) {
+            accountDrawVariant(*(*matched)[i], true);
+            variants.insert(variants.begin(), (*matched)[i]);
+            ++counters.variantsInserted;
+            continue;
+        }
+        if (fresh[i] == nullptr) continue;
         const auto present = std::find_if(variants.begin(), variants.end(), [&](const std::shared_ptr<DispatchVariant>& kept) { return kept->pushOffset == fresh[i]->pushOffset && kept->runs == fresh[i]->runs && kept->words == fresh[i]->words; });
         if (present != variants.end()) {
             ++counters.present;
@@ -87,10 +119,23 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
         }
     }
     replacement->touched = drawCacheHits;
+    replacement->baseKey = key.base;
+    replacement->pointerWords = key.words;
+    replacement->pointerPresent = key.present;
     if (found == drawCache.end()) {
-        drawOrder.push_front(key);
+        drawOrder.push_front(key.key);
         replacement->order = drawOrder.begin();
-        drawCache.emplace(key, std::move(replacement));
+        drawCache.emplace(key.key, std::move(replacement));
+        indexDrawKeyLocked(key);
+    } else if (rekey) {
+        replacement->order = found->second->order;
+        *replacement->order = key.key;
+        drawOrder.splice(drawOrder.begin(), drawOrder, replacement->order);
+        unindexDrawKeyLocked(found->second->baseKey, relocation->key);
+        drawCache.erase(found);
+        drawCache.emplace(key.key, std::move(replacement));
+        indexDrawKeyLocked(key);
+        ++counters.rekeys;
     } else {
         replacement->order = found->second->order;
         drawOrder.splice(drawOrder.begin(), drawOrder, replacement->order);
@@ -101,6 +146,7 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
         for (const auto& variants : last->second->stages) {
             for (const auto& variant : variants) accountDrawVariant(*variant, false);
         }
+        unindexDrawKeyLocked(last->second->baseKey, last->first);
         drawOrder.erase(last->second->order);
         drawCache.erase(last);
         ++drawCacheEvictions;

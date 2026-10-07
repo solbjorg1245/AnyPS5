@@ -93,9 +93,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
     const bool registerKey = useDrawEntries && registerKeyEnabled();
-    std::uint64_t drawKey = 0;
+    DrawKey drawKey;
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
+    DrawRelocation relocation;
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial());
@@ -103,17 +104,34 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
         if (profile) drawEntryCounters.keyUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - keyStart).count();
-        const auto found = drawCache.find(drawKey);
+        const auto found = drawCache.find(drawKey.key);
         if (found != drawCache.end()) {
             entry = found->second;
             decode = entry->decode;
         } else {
             ++drawEntryCounters.absent;
+            // A new key under a known base key: its entry, relocated by the pointer pairs' delta
+            // (DrawRelocation.cpp), stands in and moves to the new key on a hit or a miss.
+            if (drawRelocation()) {
+                findRelocationCandidates(drawKey, relocation.candidates);
+                if (!relocation.candidates.empty()) ++drawEntryCounters.relocationCandidates;
+            }
         }
     }
     phaseTiming.Phase(DrawRowKeyLookupValidate);
+    DrawRelocation* relocating = nullptr;
+    if (!relocation.candidates.empty()) {
+        relocating = &relocation;
+        relocation.target = drawKey;
+        if (chooseRelocationCandidate(relocation)) {
+            entry = relocation.entry;
+            // The candidate's decode with the live pointer words: the same registers otherwise.
+            relocation.decode = relocatedDecode(*entry->decode, drawKey);
+            decode = relocation.decode;
+        }
+    }
 
-    resolveDrawDecode(queue, submission, decode, registerKey, drawKey, profile);
+    resolveDrawDecode(queue, submission, decode, registerKey, drawKey.key, profile);
     const auto& graphics = decode->state;
     const auto& pixel = decode->pixel;
     auto& programs = scratch->programs;
@@ -217,7 +235,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     bool drawHit = false;
     bool verifyHit = false;
     if (Graphics::CheckpointsRequested() && !programs.empty()) Graphics::SetCheckpointWork(programs.front().binary.codeAddress, programs.back().binary.codeAddress);
-    lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, hits, drawHit, verifyHit, phaseTiming, phaseMs);
+    lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey.key, entry, matched, matchedRegions, hits, drawHit, verifyHit, phaseTiming, phaseMs, relocating);
 
     if (registerKey) {
 
@@ -278,7 +296,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
 
-    cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, hits, fresh, drawKey, registerKey, decode, phaseTiming);
+    cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, hits, fresh, drawKey, registerKey, decode, phaseTiming, relocating);
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
@@ -425,7 +443,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     std::shared_ptr<const DrawRecipe> recipe;
     if (drawHit && !recipeStages.empty()) {
-        recipe = findDrawRecipe(drawKey, recipeStages);
+        recipe = findDrawRecipe(drawKey.key, recipeStages);
         if (recipe == nullptr) VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
     }
     if (recipe == nullptr) {
@@ -449,7 +467,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);
     phaseTiming.Phase(DrawRowGraphics);
-    if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
+    if (built != nullptr) attachDrawRecipe(drawKey.key, recipeStages, std::move(built));
     timing.Mark("draw_and_resource_release");
     return drawn();
 }

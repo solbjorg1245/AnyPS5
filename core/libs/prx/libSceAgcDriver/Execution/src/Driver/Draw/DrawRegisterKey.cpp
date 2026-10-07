@@ -116,26 +116,53 @@ void probeKeyChurn(const QueueState& queue) {
 
 }
 
-std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial) {
+DrawKey Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial) {
     probeKeyChurn(queue);
+    DrawKey result;
     std::uint64_t key = 0xcbf29ce484222325ull;
+    std::uint64_t base = key;
     const auto mix = [&](std::uint64_t value) {
-        key ^= value;
-        key *= 0x100000001b3ull;
+        key = (key ^ value) * 0x100000001b3ull;
+        base = (base ^ value) * 0x100000001b3ull;
+    };
+    // The pointer registers (DrawPointerRegisters) go into the full key alone; their words ride
+    // along for the relocation of a new key.
+    static_assert(DrawPointerRegisters == std::array<std::uint32_t, 8>{0x08c, 0x08d, 0x090, 0x091, 0x094, 0x095, 0x00c, 0x00d});
+    const auto pointerWord = [](std::uint32_t offset) -> int {
+        switch (offset) {
+        case 0x08c: return 0;
+        case 0x08d: return 1;
+        case 0x090: return 2;
+        case 0x091: return 3;
+        case 0x094: return 4;
+        case 0x095: return 5;
+        case 0x00c: return 6;
+        case 0x00d: return 7;
+        default: return -1;
+        }
     };
     mix(deviceSerial);
     for (const auto& range : Graphics::DrawKeyRegisters) {
         const auto& bank = range.bank == Graphics::RegisterBank::Context ? queue.context : range.bank == Graphics::RegisterBank::Shader ? queue.shader : queue.userConfig;
         mix((static_cast<std::uint64_t>(range.bank) << 32u) | range.first);
         const auto end = range.first + range.count;
+        const bool shader = range.bank == Graphics::RegisterBank::Shader;
         for (auto it = bank.lower_bound(range.first); it != bank.end() && it->first < end; ++it) {
+            const int pointer = shader ? pointerWord(it->first) : -1;
+            if (pointer >= 0) {
+                key = (key ^ it->first) * 0x100000001b3ull;
+                key = (key ^ it->second) * 0x100000001b3ull;
+                result.words[static_cast<std::size_t>(pointer)] = it->second;
+                result.present |= 1u << static_cast<unsigned>(pointer);
+                continue;
+            }
             mix(it->first);
             mix(it->second);
         }
     }
-    for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
-        const auto low = queue.shader.find(base);
-        const auto high = queue.shader.find(base + 1);
+    for (const auto programBase : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
+        const auto low = queue.shader.find(programBase);
+        const auto high = queue.shader.find(programBase + 1);
         if (low == queue.shader.end() || high == queue.shader.end()) {
             mix(0);
             continue;
@@ -150,7 +177,9 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         mix(reinterpret_cast<std::uintptr_t>(it->second.get()));
         mix(address - it->second->codeAddress);
     }
-    return key;
+    result.key = key;
+    result.base = base;
+    return result;
 }
 
 bool Driver::sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b) {

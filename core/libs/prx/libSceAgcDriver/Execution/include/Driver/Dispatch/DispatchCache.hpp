@@ -57,6 +57,13 @@ struct DispatchVariant {
     std::vector<std::uint32_t> movedRuns;
     // (binding, word) of the compiled descriptors' addresses inside the moved runs, shifted with them.
     std::vector<std::pair<std::uint32_t, std::uint32_t>> shiftSlots;
+    // Byte offsets of 64-bit pointers into the moved runs among the push constants (a user SGPR
+    // pair the shader reads at runtime), shifted with them (draw relocation, DrawRelocation.cpp).
+    std::vector<std::uint32_t> pushShiftSlots;
+    // learnRelocation took the rule (draw relocation): a stage whose user-SGPR pointer moved
+    // compares only such variants, shifted; one whose rule shifts nothing is independent of the
+    // pointer and compares in place. A variant without a rule may sit at a dead address.
+    bool relocationLearned = false;
 
     std::uint32_t pushOffset = 0;
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;

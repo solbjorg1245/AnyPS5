@@ -117,7 +117,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
     return stageCapture.compiled;
 }
 
-void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const DrawStageHits& hits, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming) {
+void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const DrawStageHits& hits, std::vector<std::shared_ptr<DispatchVariant>>& fresh, const DrawKey& drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, DrawRelocation* relocation) {
     if (useDrawEntries && !drawHit && !(drawParameters.indirect && indirectCpu)) {
         phaseTiming.Phase(DrawRowVectors);
         std::uint64_t unstable = 0, mismatches = 0;
@@ -331,7 +331,49 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             }
             fresh[i] = std::move(variant);
         }
-        insertDrawEntry(drawKey, fresh, registerKey ? decode : nullptr);
+        // A miss under a relocation candidate teaches the fresh variant of each shifted stage the
+        // rule against the candidate's variant at its push offset (DrawRelocation.cpp).
+        // The candidates in turn: the first whose variant at a shifted stage's push offset
+        // teaches the fresh variant the rule (a learned rule means the same runs, words and
+        // compiled result, moved by the delta: the same object) is the entry the new key takes
+        // over; none learning leaves the candidates alone and inserts a fresh entry.
+        if (relocation != nullptr && !stampValidate()) {
+            std::uint64_t attempts = 0, learned = 0;
+            std::array<std::uint64_t, static_cast<std::size_t>(RelocationVerdict::Count)> verdicts{};
+            const auto validated = relocation->entry;
+            relocation->entry = nullptr;
+            for (const auto& candidate : relocation->candidates) {
+                std::uint64_t learnedHere = 0;
+                for (std::size_t i = 0; i < fresh.size() && i < candidate.deltas.size() && i < candidate.entry->stages.size(); ++i) {
+                    if (fresh[i] == nullptr || candidate.deltas[i] == 0) continue;
+                    for (const auto& old : candidate.entry->stages[i]) {
+                        if (old->pushOffset != fresh[i]->pushOffset) continue;
+                        ++attempts;
+                        const auto verdict = learnRelocation(*old, *fresh[i], candidate.deltas[i]);
+                        ++verdicts[static_cast<std::size_t>(verdict)];
+                        if (verdict == RelocationVerdict::Learned) ++learnedHere;
+                        break;
+                    }
+                }
+                if (learnedHere == 0) continue;
+                learned += learnedHere;
+                relocation->entry = candidate.entry;
+                relocation->key = candidate.key;
+                relocation->deltas = candidate.deltas;
+                break;
+            }
+            // The stages kept through a shifted variant validated under another candidate are
+            // still valid variants at the new address (they compared against live memory).
+            if (relocation->entry != validated && relocation->relocated.size() != fresh.size()) relocation->relocated.assign(fresh.size(), false);
+            if (attempts != 0 || relocation->entry != nullptr) {
+                std::lock_guard cacheLock(drawCacheMutex);
+                drawEntryCounters.relocationLearnAttempts += attempts;
+                drawEntryCounters.relocationLearned += learned;
+                if (relocation->entry != nullptr) ++drawEntryCounters.relocationLearnedFrom;
+                for (std::size_t v = 0; v < verdicts.size(); ++v) drawEntryCounters.relocationVerdicts[v] += verdicts[v];
+            }
+        }
+        insertDrawEntry(drawKey, fresh, registerKey ? decode : nullptr, relocation, &matched);
         if (unstable != 0 || mismatches != 0) {
             std::lock_guard cacheLock(drawCacheMutex);
             drawEntryCounters.unstable += unstable;

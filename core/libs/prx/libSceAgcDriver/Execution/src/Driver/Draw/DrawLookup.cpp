@@ -136,7 +136,7 @@ void probeDrawMiss(std::uint64_t program, ShaderRecompiler::ProgramRole role, co
 
 }
 
-void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, DrawStageHits& hits, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs) {
+void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, DrawStageHits& hits, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, DrawRelocation* relocation) {
     using Role = ShaderRecompiler::ProgramRole;
     if (useDrawEntries) {
         if (!registerKey) {
@@ -210,6 +210,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> liveData(programs.size());
             const bool dataAllowed = dataHits() && !verifyDrawEntries();
             std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0;
+            std::uint64_t relocatedStages = 0, relocatedInPlace = 0, relocationNoRule = 0, relocationDiffering = 0, relocationUnordered = 0;
             double compareUs = 0, patchUs = 0;
             std::uint64_t compareCalls = 0, patchedMade = 0, patchedReused = 0;
             if (entry->stages.size() != programs.size()) miss = DrawMiss::Stages;
@@ -223,11 +224,31 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     if (roles[i] == Role::GeometryBack) continue;
                     ++stageValidations;
                     const auto& variants = entry->stages[i];
+                    // Under a relocation candidate, a stage whose pointer pair moved compares its
+                    // variants shifted by the delta (DrawRelocation.cpp); one without a rule misses.
+                    const auto delta = relocation != nullptr && i < relocation->deltas.size() ? relocation->deltas[i] : 0;
                     auto outcome = EntryOutcome::Differing;
                     bool anyLayout = false;
                     for (std::size_t rank = 0; rank < variants.size(); ++rank) {
-                        const auto& variant = variants[rank];
-                        if (variant->pushOffset != cursor) continue;
+                        const auto& stored = variants[rank];
+                        if (stored->pushOffset != cursor) continue;
+                        std::shared_ptr<DispatchVariant> shifted;
+                        if (delta != 0) {
+                            if (!stored->relocationLearned) {
+                                ++relocationNoRule;
+                                anyLayout = true;
+                                continue;
+                            }
+                            // A rule that shifts nothing: the stage is independent of the pointer.
+                            if (!stored->movedRuns.empty() || !stored->shiftSlots.empty() || !stored->pushShiftSlots.empty()) {
+                                shifted = shiftVariant(*stored, delta, relocationUnordered);
+                                if (shifted == nullptr) {
+                                    anyLayout = true;
+                                    continue;
+                                }
+                            }
+                        }
+                        const auto& variant = shifted != nullptr ? shifted : stored;
                         auto& regions = matchedRegions[i];
                         regions.clear();
                         appendEntryRegions(*variant, regions);
@@ -244,10 +265,22 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         }
                         if (!anyLayout) outcome = result;
                         anyLayout = true;
-                        if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) continue;
+                        if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) {
+                            if (shifted != nullptr) {
+                                ++relocationDiffering;
+                                if (result == EntryOutcome::Differing) traceFailedRelocation(programs[i].binary.codeAddress, *shifted);
+                            }
+                            continue;
+                        }
                         if (result != EntryOutcome::EqualData) liveData[i].clear();
                         matched[i] = variant;
                         ranks[i] = rank;
+                        if (shifted != nullptr) {
+                            relocation->relocated[i] = true;
+                            ++relocatedStages;
+                        } else if (relocation != nullptr) {
+                            ++relocatedInPlace;
+                        }
                         ++stageEqual;
                         cursor += static_cast<std::uint32_t>(variant->compiled->pushConstants.size());
                         break;
@@ -283,8 +316,13 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     if (matched[i] == nullptr) continue;
                     auto& variant = *matched[i];
                     hits.results[i] = variant.compiled;
+                    // A shifted stage binds a fresh variant object no recipe records (hits.data).
+                    const bool shifted = relocation != nullptr && i < relocation->relocated.size() && relocation->relocated[i];
+                    if (shifted) hits.data = true;
                     const bool flat = variant.flatBinding < variant.compiled->bindings.size();
-                    if (liveData[i].empty() || (!flat && variant.baseSlots.empty())) continue;
+                    // A shifted stage always carries its words and result (the verify mode compares
+                    // the shifted descriptors against a fresh capture through them).
+                    if (!shifted && (liveData[i].empty() || (!flat && variant.baseSlots.empty()))) continue;
                     auto& words = hits.liveWords[i];
                     words = variant.words;
                     for (const auto& [position, value] : liveData[i]) words[position] = value;
@@ -296,7 +334,11 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     // results are cleared before this lookup; a holder elsewhere gets its own copy,
                     // which the variant then keeps instead).
                     std::shared_ptr<ShaderRecompiler::RecompileResult> patched;
-                    if (patchedResultReuse() && variant.patched != nullptr && variant.patched.use_count() == 1) {
+                    if (shifted && variant.patched != nullptr && variant.patched.get() == variant.compiled.get()) {
+                        // The shifted copy is the fresh variant's own (shiftVariant): patched in place.
+                        patched = variant.patched;
+                        ++patchedReused;
+                    } else if (patchedResultReuse() && variant.patched != nullptr && variant.patched.use_count() == 1) {
                         patched = variant.patched;
                         ++patchedReused;
                     } else {
@@ -334,6 +376,15 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             counters.patchUs += patchUs;
             counters.patchedMade += patchedMade;
             counters.patchedReused += patchedReused;
+            if (relocation != nullptr) {
+                counters.relocatedStages += relocatedStages;
+                counters.relocatedInPlace += relocatedInPlace;
+                counters.relocationNoRule += relocationNoRule;
+                counters.relocationDiffering += relocationDiffering;
+                counters.relocationUnordered += relocationUnordered;
+                if (drawHit) ++counters.relocatedHits;
+                else if (hits.partial) ++counters.relocatedPartial;
+            }
             if (hits.partial) {
                 ++counters.partialHits;
                 counters.partialStagesKept += stagesKept;
@@ -371,6 +422,9 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         again->second->touched = drawCacheHits;
                         ++counters.touches;
                     }
+                } else if (relocation != nullptr && relocation->entry == entry) {
+                    // A hit through the candidate: its entry moves to the new key.
+                    rekeyDrawEntryLocked(*relocation, matched, ranks);
                 }
                 if (hits.data) {
                     ++counters.dataHits;

@@ -69,9 +69,20 @@ bool Driver::relocatedHits() {
     return enabled;
 }
 
-RelocationVerdict Driver::learnRelocation(const DispatchVariant& old, DispatchVariant& fresh) {
-    if (old.runs.size() != fresh.runs.size() || old.words.size() != fresh.words.size()) return RelocationVerdict::Shape;
-    if (old.compiled == nullptr || fresh.compiled == nullptr || old.flatBinding != fresh.flatBinding || old.dataPositions != fresh.dataPositions || old.dataSlots != fresh.dataSlots) return RelocationVerdict::DataPositions;
+// `externalDelta` (draw relocation, DrawRelocation.cpp): the delta the draw's user-SGPR pointer
+// pair moved by, which the moved runs must match; the pointers leading there may then be absent
+// from the words (they sit in the user data), and push-constant pointers moved by it are shifted.
+RelocationVerdict Driver::learnRelocation(const DispatchVariant& old, DispatchVariant& fresh, std::uint64_t externalDelta) {
+    if (old.runs.size() != fresh.runs.size() || old.words.size() != fresh.words.size() || old.pushOffset != fresh.pushOffset) return RelocationVerdict::Shape;
+    if ((old.vertexInfo != nullptr) != (fresh.vertexInfo != nullptr) || (old.vertexInfo != nullptr && !sameVertexInfo(*old.vertexInfo, *fresh.vertexInfo))) return RelocationVerdict::Shape;
+    const auto samePatchSlots = [](const std::vector<WordPatchSlot>& a, const std::vector<WordPatchSlot>& b) {
+        if (a.size() != b.size()) return false;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            if (a[i].position != b[i].position || a[i].binding != b[i].binding || a[i].word != b[i].word || a[i].mask != b[i].mask) return false;
+        }
+        return true;
+    };
+    if (old.compiled == nullptr || fresh.compiled == nullptr || old.flatBinding != fresh.flatBinding || old.dataPositions != fresh.dataPositions || old.dataSlots != fresh.dataSlots || old.ignoredBits != fresh.ignoredBits || !samePatchSlots(old.baseSlots, fresh.baseSlots)) return RelocationVerdict::DataPositions;
     std::uint64_t delta = 0;
     std::vector<std::uint32_t> moved;
 
@@ -96,7 +107,14 @@ RelocationVerdict Driver::learnRelocation(const DispatchVariant& old, DispatchVa
         delta = begin - oldBegin;
         moved.push_back(static_cast<std::uint32_t>(i));
     }
-    if (moved.empty()) return RelocationVerdict::NothingMoved;
+    if (moved.empty()) {
+        // Nothing read through the moved user-SGPR pointer (draw relocation): a rule that shifts
+        // only what the compiled result holds of the pointer, if anything.
+        if (externalDelta == 0) return RelocationVerdict::NothingMoved;
+        delta = externalDelta;
+    } else if (externalDelta != 0 && delta != externalDelta) {
+        return RelocationVerdict::Deltas;
+    }
 
     // Every differing word outside the moved runs (data words aside) must belong to a pointer that
     // moved by the delta, held in one run.
@@ -110,7 +128,7 @@ RelocationVerdict Driver::learnRelocation(const DispatchVariant& old, DispatchVa
         else if (p > 0 && fits(p - 1)) pointers.push_back(static_cast<std::uint32_t>(p - 1));
         else return RelocationVerdict::OtherWords;
     }
-    if (pointers.empty()) return RelocationVerdict::NoPointer;
+    if (pointers.empty() && externalDelta == 0) return RelocationVerdict::NoPointer;
 
     // The compiled result may depend on the moved addresses only additively: the same variant and
     // bindings, except the flat-SRT data slots, words holding an address inside the moved runs
@@ -131,7 +149,31 @@ RelocationVerdict Driver::learnRelocation(const DispatchVariant& old, DispatchVa
     };
     const auto& a = *old.compiled;
     const auto& b = *fresh.compiled;
-    if (a.variantId == 0 || a.variantId != b.variantId || a.bindings.size() != b.bindings.size() || a.pushConstants != b.pushConstants) return RelocationVerdict::Compiled;
+    if (a.variantId == 0 || a.variantId != b.variantId || a.bindings.size() != b.bindings.size() || a.pushConstants.size() != b.pushConstants.size()) return RelocationVerdict::Compiled;
+    // The push constants (the user words the shader reads at runtime) must be equal, or differ
+    // only in 64-bit pointers moved by the delta (the user-SGPR pair itself, draw relocation).
+    std::vector<std::uint32_t> pushShifts;
+    if (a.pushConstants != b.pushConstants) {
+        if (externalDelta == 0) return RelocationVerdict::Compiled;
+        const auto pairMoved = [&](std::size_t byte) {
+            if (byte + sizeof(std::uint64_t) > a.pushConstants.size()) return false;
+            std::uint64_t x = 0, y = 0;
+            std::memcpy(&x, a.pushConstants.data() + byte, sizeof(x));
+            std::memcpy(&y, b.pushConstants.data() + byte, sizeof(y));
+            return y - x == delta;
+        };
+        for (std::size_t byte = 0; byte < a.pushConstants.size();) {
+            if (a.pushConstants[byte] == b.pushConstants[byte]) {
+                ++byte;
+                continue;
+            }
+            const auto word = byte & ~std::size_t{3};
+            if (pairMoved(word)) pushShifts.push_back(static_cast<std::uint32_t>(word));
+            else if (word >= sizeof(std::uint32_t) && pairMoved(word - sizeof(std::uint32_t))) pushShifts.push_back(static_cast<std::uint32_t>(word - sizeof(std::uint32_t)));
+            else return RelocationVerdict::Compiled;
+            byte = pushShifts.back() + sizeof(std::uint64_t);
+        }
+    }
     std::vector<std::pair<std::uint32_t, std::uint32_t>> shifts;
     for (std::size_t i = 0; i < a.bindings.size(); ++i) {
         const auto& x = a.bindings[i];
@@ -167,6 +209,8 @@ RelocationVerdict Driver::learnRelocation(const DispatchVariant& old, DispatchVa
     fresh.pointerPositions = std::move(pointers);
     fresh.movedRuns = std::move(moved);
     fresh.shiftSlots = std::move(shifts);
+    fresh.pushShiftSlots = std::move(pushShifts);
+    fresh.relocationLearned = true;
     return RelocationVerdict::Learned;
 }
 
@@ -180,7 +224,6 @@ std::shared_ptr<DispatchVariant> Driver::relocateVariant(const DispatchVariant& 
         offset += static_cast<std::size_t>((end - begin) / sizeof(std::uint32_t));
     }
     std::uint64_t delta = 0;
-    auto words = variant.words;
     for (const auto position : variant.pointerPositions) {
         const auto run = static_cast<std::size_t>(std::upper_bound(starts.begin(), starts.end(), position) - starts.begin() - 1);
         const auto address = variant.runs[run].first + (position - starts[run]) * sizeof(std::uint32_t);
@@ -190,8 +233,20 @@ std::shared_ptr<DispatchVariant> Driver::relocateVariant(const DispatchVariant& 
         const auto moved = live - pointerAt(variant.words, position);
         if (moved == 0 || (delta != 0 && moved != delta)) return nullptr;
         delta = moved;
-        words[position] = static_cast<std::uint32_t>(live);
-        words[position + 1] = static_cast<std::uint32_t>(live >> 32u);
+    }
+    return shiftVariant(variant, delta, counterUnordered);
+}
+
+// The variant with its moved runs shifted by `delta`, the pointers leading there (among the words,
+// in the compiled descriptors and in the push constants) moved with them; null when the shifted
+// runs fall out of address order (counted). The shifted compiled copy, when one is made, is the
+// new variant's own (`patched`): a draw data hit patches its data words in place.
+std::shared_ptr<DispatchVariant> Driver::shiftVariant(const DispatchVariant& variant, std::uint64_t delta, std::uint64_t& counterUnordered) {
+    auto words = variant.words;
+    for (const auto position : variant.pointerPositions) {
+        const auto moved = pointerAt(variant.words, position) + delta;
+        words[position] = static_cast<std::uint32_t>(moved);
+        words[position + 1] = static_cast<std::uint32_t>(moved >> 32u);
     }
     auto runs = variant.runs;
     for (const auto run : variant.movedRuns) {
@@ -225,27 +280,64 @@ std::shared_ptr<DispatchVariant> Driver::relocateVariant(const DispatchVariant& 
     const bool keepRule = layout.size() == runs.size();
     runs = std::move(layout);
     auto compiled = variant.compiled;
-    if (!variant.shiftSlots.empty()) {
-        auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
+    std::shared_ptr<ShaderRecompiler::RecompileResult> patched;
+    // Deferred flat words (copied from guest memory when the work runs) inside the moved block
+    // move with it: a deferred leaf is one the walk could not read, so it lies in no run; those
+    // within the pages the moved runs span count as the block's.
+    std::uint64_t movedLow = ~std::uint64_t{0}, movedHigh = 0;
+    for (const auto run : variant.movedRuns) {
+        movedLow = std::min(movedLow, variant.runs[run].first & ~std::uint64_t{page - 1});
+        movedHigh = std::max(movedHigh, (variant.runs[run].second + page - 1) & ~std::uint64_t{page - 1});
+    }
+    const auto deferredInBlock = [&](const ShaderRecompiler::RecompileResult& result) {
+        if (variant.movedRuns.empty()) return false;
+        for (const auto& binding : result.bindings) {
+            for (const auto& [word, address] : binding.deferredWords) {
+                if (address >= movedLow && address < movedHigh) return true;
+            }
+        }
+        return false;
+    };
+    if (!variant.shiftSlots.empty() || !variant.pushShiftSlots.empty() || deferredInBlock(*variant.compiled)) {
+        patched = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
+        for (auto& binding : patched->bindings) {
+            for (auto& [word, address] : binding.deferredWords) {
+                if (!variant.movedRuns.empty() && address >= movedLow && address < movedHigh) address += delta;
+            }
+        }
         for (const auto& [binding, w] : variant.shiftSlots) {
             auto& descriptor = patched->bindings[binding].guestDescriptor;
             std::tie(descriptor[w], descriptor[w + 1]) = ShiftDescriptorAddress(descriptor, w, binding == variant.flatBinding, delta);
         }
-        compiled = std::move(patched);
+        for (const auto offset : variant.pushShiftSlots) {
+            if (offset + sizeof(std::uint64_t) > patched->pushConstants.size()) continue;
+            std::uint64_t value = 0;
+            std::memcpy(&value, patched->pushConstants.data() + offset, sizeof(value));
+            value += delta;
+            std::memcpy(patched->pushConstants.data() + offset, &value, sizeof(value));
+        }
+        compiled = patched;
     }
     auto relocated = std::make_shared<DispatchVariant>();
     relocated->runs = std::move(runs);
     relocated->words = std::move(words);
     relocated->forgetSerial = GuestMemory::ForgetSerial();
     relocated->compiled = std::move(compiled);
+    relocated->patched = std::move(patched);
     relocated->shader = variant.shader;
     relocated->dataPositions = variant.dataPositions;
     relocated->dataSlots = variant.dataSlots;
     relocated->flatBinding = variant.flatBinding;
+    relocated->ignoredBits = variant.ignoredBits;
+    relocated->baseSlots = variant.baseSlots;
+    relocated->pushOffset = variant.pushOffset;
+    relocated->vertexInfo = variant.vertexInfo;
     if (keepRule) {
         relocated->pointerPositions = variant.pointerPositions;
         relocated->movedRuns = variant.movedRuns;
         relocated->shiftSlots = variant.shiftSlots;
+        relocated->pushShiftSlots = variant.pushShiftSlots;
+        relocated->relocationLearned = variant.relocationLearned;
     }
     return relocated;
 }
