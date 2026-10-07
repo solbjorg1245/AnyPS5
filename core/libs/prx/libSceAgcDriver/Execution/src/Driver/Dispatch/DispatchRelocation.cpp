@@ -69,6 +69,11 @@ bool Driver::relocatedHits() {
     return enabled;
 }
 
+bool Driver::relocationFirst() {
+    static const bool enabled = std::getenv("APS5_NO_RELOCATION_FIRST") == nullptr && relocatedHits();
+    return enabled;
+}
+
 // `externalDelta` (draw relocation, DrawRelocation.cpp): the delta the draw's user-SGPR pointer
 // pair moved by, which the moved runs must match; the pointers leading there may then be absent
 // from the words (they sit in the user data), and push-constant pointers moved by it are shifted.

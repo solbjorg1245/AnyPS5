@@ -104,6 +104,10 @@ struct EntryCounters {
     std::array<std::uint64_t, MaxDispatchVariants> dataHitsByRank{};
     std::array<std::uint64_t, 9> relocationVerdicts{};
     std::uint64_t relocatedHits = 0, relocatedDiffering = 0, relocatedUnordered = 0;
+    // Relocation first (DispatchLookup.cpp): candidates validated before the stored variants, of
+    // them differing (the stored variants then compared as before), and the stored validations
+    // the hits skipped.
+    std::uint64_t relocatedFirst = 0, relocatedFirstDiffering = 0, storedValidationsSkipped = 0;
     std::set<std::size_t> differingPositions;
     std::size_t differingFirstPosition = std::numeric_limits<std::size_t>::max(), differingLastPosition = 0;
     std::map<std::uint64_t, std::uint64_t> differingByProgram;

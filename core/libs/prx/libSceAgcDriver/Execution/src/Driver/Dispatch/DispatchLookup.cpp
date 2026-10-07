@@ -31,56 +31,87 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
 
             std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
             std::uint64_t relocatedUnordered = 0, relocatedDiffering = 0;
+            std::uint64_t relocatedFirst = 0, relocatedFirstDiffering = 0, storedSkipped = 0;
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             if (!stampValidate()) {
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DispatchCache);
 
                 std::optional<SampledReadScope> sampling;
 
-                for (std::size_t i = 0; i < variants.size(); ++i) {
+                // A shifted candidate (relocateVariant) validated like a stored variant; on a hit its
+                // data words are refreshed in place: the shifted compiled copy is the candidate's own
+                // (shiftVariant's `patched`), so it is patched instead of copied again.
+                const auto tryRelocated = [&](std::shared_ptr<DispatchVariant> candidate) {
                     regions.clear();
-                    appendEntryRegions(*variants[i], regions);
-                    ++compared;
-                    auto result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData);
-
-                    if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) {
-                        result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData);
-                        ++(result == EntryOutcome::Equal || result == EntryOutcome::EqualData ? retriesEqual : retriesMoved);
+                    appendEntryRegions(*candidate, regions);
+                    const auto result = validateVariant(address, submission.queue, *candidate, regions, imagesFlushed, runsSynced, sampling, &liveData);
+                    if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) {
+                        if (result == EntryOutcome::Differing) traceFailedRelocation(address, *candidate);
+                        ++relocatedDiffering;
+                        return false;
                     }
-                    if (i == 0) outcome = result;
-                    if (result == EntryOutcome::Equal || result == EntryOutcome::EqualData) {
-                        outcome = result;
-                        variant = variants[i];
-                        rank = i;
-                        dataHit = result == EntryOutcome::EqualData;
-                        break;
+                    for (const auto& [position, value] : liveData) candidate->words[position] = value;
+                    if (!liveData.empty()) {
+                        std::shared_ptr<ShaderRecompiler::RecompileResult> patched;
+                        if (relocationFirst() && candidate->patched != nullptr && candidate->patched.get() == candidate->compiled.get()) patched = candidate->patched;
+                        else patched = std::make_shared<ShaderRecompiler::RecompileResult>(*candidate->compiled);
+                        auto& descriptor = patched->bindings[candidate->flatBinding].guestDescriptor;
+                        for (std::size_t k = 0; k < candidate->dataPositions.size(); ++k) {
+                            if (candidate->dataSlots[k] < descriptor.size()) descriptor[candidate->dataSlots[k]] = candidate->words[candidate->dataPositions[k]];
+                        }
+                        candidate->compiled = std::move(patched);
+                    }
+                    relocated = std::move(candidate);
+                    return true;
+                };
+
+                // Relocation first (APS5_NO_RELOCATION_FIRST=1: the stored variants first, as before).
+                // When the front variant's rule pointers moved, the front variant itself cannot
+                // compare equal (its pointer words differ outside the data mask), so the shifted
+                // candidate is validated before the k stored variants; an older variant that sits
+                // at the live addresses would have hit exactly, but the candidate holds the same
+                // non-data words shifted, so it hits in its place. In Boletaria (t291) 56.5k of the
+                // 60k queue-0 hits per 10 s were relocated after 3.6 differing stored compares each.
+                const bool frontRule = relocatedHits() && !variants.front()->pointerPositions.empty();
+                if (frontRule && relocationFirst()) {
+                    if (auto candidate = relocateVariant(*variants.front(), relocatedUnordered); candidate != nullptr) {
+                        ++relocatedFirst;
+                        if (tryRelocated(std::move(candidate))) storedSkipped = variants.size();
+                        else ++relocatedFirstDiffering;
                     }
                 }
-                current = variant != nullptr;
 
-                if (!current && relocatedHits()) {
+                if (relocated == nullptr) {
+                    for (std::size_t i = 0; i < variants.size(); ++i) {
+                        regions.clear();
+                        appendEntryRegions(*variants[i], regions);
+                        ++compared;
+                        auto result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData);
+
+                        if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) {
+                            result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData);
+                            ++(result == EntryOutcome::Equal || result == EntryOutcome::EqualData ? retriesEqual : retriesMoved);
+                        }
+                        if (i == 0) outcome = result;
+                        if (result == EntryOutcome::Equal || result == EntryOutcome::EqualData) {
+                            outcome = result;
+                            variant = variants[i];
+                            rank = i;
+                            dataHit = result == EntryOutcome::EqualData;
+                            break;
+                        }
+                    }
+                    current = variant != nullptr;
+                }
+
+                // The first variant with a rule decides (a candidate that fails ends the attempt);
+                // when that is the front variant, relocation first already tried it.
+                if (!current && relocated == nullptr && relocatedHits() && !(frontRule && relocationFirst())) {
                     for (const auto& stored : variants) {
                         if (stored->pointerPositions.empty()) continue;
                         auto candidate = relocateVariant(*stored, relocatedUnordered);
                         if (candidate == nullptr) break;
-                        regions.clear();
-                        appendEntryRegions(*candidate, regions);
-                        const auto result = validateVariant(address, submission.queue, *candidate, regions, imagesFlushed, runsSynced, sampling, &liveData);
-                        if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) {
-                            if (result == EntryOutcome::Differing) traceFailedRelocation(address, *candidate);
-                            ++relocatedDiffering;
-                            break;
-                        }
-                        for (const auto& [position, value] : liveData) candidate->words[position] = value;
-                        if (!liveData.empty()) {
-                            auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*candidate->compiled);
-                            auto& descriptor = patched->bindings[candidate->flatBinding].guestDescriptor;
-                            for (std::size_t k = 0; k < candidate->dataPositions.size(); ++k) {
-                                if (candidate->dataSlots[k] < descriptor.size()) descriptor[candidate->dataSlots[k]] = candidate->words[candidate->dataPositions[k]];
-                            }
-                            candidate->compiled = std::move(patched);
-                        }
-                        relocated = std::move(candidate);
+                        tryRelocated(std::move(candidate));
                         break;
                     }
                 }
@@ -133,6 +164,9 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
             counters.variantsCompared += compared;
             counters.relocatedUnordered += relocatedUnordered;
             counters.relocatedDiffering += relocatedDiffering;
+            counters.relocatedFirst += relocatedFirst;
+            counters.relocatedFirstDiffering += relocatedFirstDiffering;
+            counters.storedValidationsSkipped += storedSkipped;
             switch (outcome) {
                 case EntryOutcome::Equal: ++counters.equal; break;
                 case EntryOutcome::EqualData: ++counters.equal; break;

@@ -82,6 +82,9 @@ private:
     static bool tsharpMask();
     static bool vsharpBases();
     static bool relocatedHits();
+    // A dispatch lookup tries the front variant's relocation before the stored variants
+    // (DispatchLookup.cpp); APS5_NO_RELOCATION_FIRST=1 compares the stored variants first.
+    static bool relocationFirst();
     static RelocationVerdict learnRelocation(const DispatchVariant& old, DispatchVariant& fresh, std::uint64_t externalDelta = 0);
     static void traceFailedRelocation(std::uint64_t program, const DispatchVariant& candidate);
     static std::shared_ptr<DispatchVariant> relocateVariant(const DispatchVariant& variant, std::uint64_t& counterUnordered);
