@@ -217,8 +217,10 @@ PacketTag CurrentPacket();
 // (GuestBufferMemory.cpp: the flush before a writable mirror's compare, a new mirror's fill).
 // DrawCache: a draw entry's per-stage value validation (Driver.cpp drawCache), where a draw
 // capture's hook waits reappear on a hit.
+// DeferredFlat: a deferred flat SRT word read on the CPU because no host import covers it
+// (Draw.cpp recordDeferredFlat's fallback), apart from the capture's own word reads.
 // Every enumerator needs its name in ReadSiteName's table (GuestMemory.cpp).
-enum class ReadSite : std::uint8_t { Unknown = 0, Capture, DispatchCache, TextureCompare, TextureRead, BufferUpload, IndexBuffer, VertexBuffer, Registers, IndirectArguments, Wait, Label, Scanout, Store, MirrorRefresh, DrawCache, Count };
+enum class ReadSite : std::uint8_t { Unknown = 0, Capture, DispatchCache, TextureCompare, TextureRead, BufferUpload, IndexBuffer, VertexBuffer, Registers, IndirectArguments, Wait, Label, Scanout, Store, MirrorRefresh, DrawCache, DeferredFlat, Count };
 const char* ReadSiteName(ReadSite site);
 // Sets the calling thread's read site and returns the previous one (nested scopes restore it).
 ReadSite SetReadSite(ReadSite site);

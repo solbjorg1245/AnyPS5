@@ -34,6 +34,10 @@ struct CaptureProfile {
     // were read raw on the driver's evidence, or were read both ways (verify) and differed.
     std::atomic<std::uint64_t> pagesWordwise{0};
     std::atomic<std::uint64_t> wordWaits{0};
+    // Of the waits, those on a page that is not word-wise (the guest mapped less than the page, so
+    // page() fetched nothing and every word goes through the hook): until session 31 these reads
+    // were not timed, so the [capture-stalls] line could not see them.
+    std::atomic<std::uint64_t> wordWaitsPartial{0};
     std::atomic<std::uint64_t> wordWaitNanoseconds{0};
     std::atomic<std::uint64_t> wordsRaw{0};
     // RawExpected reads that found another value and re-read through the hook.
@@ -205,7 +209,7 @@ void ReportCaptureStalls(StallStats& stats) {
     if (hot.size() > 8) hot.resize(8);
     std::string line;
     char text[512];
-    std::snprintf(text, sizeof(text), "[capture-stalls] %llu stalled captures, %llu words waited %.0f ms (10 s); by program (stage code: captures/words/ms, max ms, changed words, sample address=value kind, GPU writers of the sample):", static_cast<unsigned long long>(stats.captures), static_cast<unsigned long long>(stats.words), stats.nanoseconds / 1e6);
+    std::snprintf(text, sizeof(text), "[capture-stalls] %llu stalled captures, %llu words waited %.0f ms (10 s; %llu of the waits on pages mapped partially); by program (stage code: captures/words/ms, max ms, changed words, sample address=value kind, GPU writers of the sample):", static_cast<unsigned long long>(stats.captures), static_cast<unsigned long long>(stats.words), stats.nanoseconds / 1e6, static_cast<unsigned long long>(CaptureTotals().wordWaitsPartial.exchange(0)));
     line += text;
     for (const auto& [key, totals] : hot) {
         std::snprintf(text, sizeof(text), " [%s 0x%llx: %llu/%llu/%.0f max %.1f changed %llu 0x%llx=%08x %s writers%s]", StageName(static_cast<ShaderRecompiler::ShaderStage>(key->second)), static_cast<unsigned long long>(key->first), static_cast<unsigned long long>(totals->captures), static_cast<unsigned long long>(totals->words), totals->nanoseconds / 1e6, totals->maxNanoseconds / 1e6, static_cast<unsigned long long>(totals->changed), static_cast<unsigned long long>(totals->sampleAddress), totals->sampleValue, totals->sampleKind.c_str(), totals->writers.empty() ? " none" : totals->writers.c_str());
@@ -478,19 +482,23 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
                 word = waited;
             }
         } else {
-            // On a word-wise page the bytes before the hook's wait are kept for the observer (and
-            // for the stall attribution under APS5_PROFILE_DRAW).
-            const bool accessible = page.wordwise && policy == PendingWrite::Sync && GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word));
-            const bool observed = accessible && self.observe != nullptr;
+            // The bytes before the hook's wait are kept for the observer (word-wise pages only: the
+            // evidence is about words the GPU writes) and for the stall attribution under
+            // APS5_PROFILE_DRAW, which times every hook read (a page the guest mapped partially is
+            // read word by word too, and its waits were invisible to [capture-stalls] before).
+            const bool accessible = policy == PendingWrite::Sync && GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word));
+            const bool observed = page.wordwise && accessible && self.observe != nullptr;
             std::uint32_t before = 0;
             if (accessible) std::memcpy(&before, reinterpret_cast<const void*>(address), sizeof(before));
             const auto waitsBefore = observed ? hookWaits() : 0;
-            const auto started = page.wordwise ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const bool timed = page.wordwise || CaptureProfiled();
+            const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             GuestMemory::Read(address, std::as_writable_bytes(std::span(&word, 1)), alignof(std::uint32_t));
-            if (page.wordwise) {
+            if (timed) {
                 const auto nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
                 if (nanoseconds >= WordWaitNanoseconds) {
                     ++CaptureTotals().wordWaits;
+                    if (!page.wordwise) ++CaptureTotals().wordWaitsPartial;
                     CaptureTotals().wordWaitNanoseconds += nanoseconds;
                     if (CaptureProfiled()) {
                         auto& stalls = ThreadCaptureStalls();

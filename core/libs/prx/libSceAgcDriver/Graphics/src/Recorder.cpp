@@ -652,12 +652,38 @@ struct HookSyncOutcomes {
     std::uint64_t unchecked = 0;
 };
 
+// The writer of the noted range a sync waited for (PendingWriteInfo's tag): the packet and the
+// submission queue that noted it, the note's kind, whether that queue is the reader's own and
+// whether the noted range covers the whole access. Per (key, writer): the syncs, the time waited,
+// how many targeted the open batch and the draws and dispatches that batch had recorded when the
+// wait flushed it, and where in the noted range the access began (item 7's diagnostic: who writes
+// the SRT block a capture waits for, and whether an open-batch wait flushes the reader's own work).
+struct HookSyncWriterKey {
+    std::uint32_t queue;
+    std::uint32_t opcode;
+    Recorder::WriteKind kind;
+    bool sameQueue;
+    bool covers;
+    bool operator<(const HookSyncWriterKey& other) const {
+        return std::tie(queue, opcode, kind, sameQueue, covers) < std::tie(other.queue, other.opcode, other.kind, other.sameQueue, other.covers);
+    }
+};
+
+struct HookSyncWriterTotals {
+    std::uint64_t count = 0;
+    std::uint64_t open = 0;
+    std::uint64_t recordedWork = 0;
+    std::uint64_t offsetBytes = 0;
+    double waitedMs = 0;
+};
+
 struct HookSyncTotals {
     std::uint64_t count = 0;
     HookSyncOutcomes outcomes;
     std::uint64_t rangeBytes = 0;
     std::uint64_t accessBytes = 0;
     double waitedMs = 0;
+    std::map<HookSyncWriterKey, HookSyncWriterTotals> writers;
 };
 
 // Size buckets for the noted ranges and the accesses: <=4K, <=64K, <=1M, <=16M, <=256M, larger.
@@ -676,6 +702,9 @@ std::size_t SizeBucket(std::uint64_t bytes) {
 struct HookSyncStats {
     std::map<HookSyncKey, HookSyncTotals> byKey;
     std::uint64_t count = 0, openTargets = 0, signaledTargets = 0, batchesFinished = 0;
+    // Open targets whose range was noted by a packet of the reader's own submission queue vs
+    // another queue's, and the work (draws and dispatches) the open batch held at those waits.
+    std::uint64_t openSameQueue = 0, openOtherQueue = 0, openRecordedWork = 0;
     HookSyncOutcomes outcomes;
     double waitedMs = 0;
     std::array<std::uint64_t, SizeBuckets> rangeBuckets{};
@@ -716,7 +745,7 @@ void ReportHookSyncs(HookSyncStats& stats) {
     char text[512];
     const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
     const auto& o = stats.outcomes;
-    std::snprintf(text, sizeof(text), "[hooksync] %llu pending-write syncs waited %.0f ms (10 s); read bytes after the wait: unchanged %llu (target open %llu, in flight unsignaled %llu, signaled %llu), changed %llu; stores %llu, unchecked %llu; targets: %llu open, %llu already signaled, %llu batches finished; noted range:", count(stats.count), stats.waitedMs, count(o.unchangedOpen + o.unchangedPending + o.unchangedSignaled), count(o.unchangedOpen), count(o.unchangedPending), count(o.unchangedSignaled), count(o.changed), count(o.stores), count(o.unchecked), count(stats.openTargets), count(stats.signaledTargets), count(stats.batchesFinished));
+    std::snprintf(text, sizeof(text), "[hooksync] %llu pending-write syncs waited %.0f ms (10 s); read bytes after the wait: unchanged %llu (target open %llu, in flight unsignaled %llu, signaled %llu), changed %llu; stores %llu, unchecked %llu; targets: %llu open (noted by the reader's queue %llu, by another %llu; avg %.0f draws+dispatches flushed), %llu already signaled, %llu batches finished; noted range:", count(stats.count), stats.waitedMs, count(o.unchangedOpen + o.unchangedPending + o.unchangedSignaled), count(o.unchangedOpen), count(o.unchangedPending), count(o.unchangedSignaled), count(o.changed), count(o.stores), count(o.unchecked), count(stats.openTargets), count(stats.openSameQueue), count(stats.openOtherQueue), stats.openTargets != 0 ? static_cast<double>(stats.openRecordedWork) / stats.openTargets : 0.0, count(stats.signaledTargets), count(stats.batchesFinished));
     report += text;
     for (std::size_t i = 0; i < SizeBuckets; ++i) {
         if (stats.rangeBuckets[i] == 0) continue;
@@ -729,13 +758,33 @@ void ReportHookSyncs(HookSyncStats& stats) {
         std::snprintf(text, sizeof(text), " %s %llu", SizeBucketNames[i], static_cast<unsigned long long>(stats.accessBuckets[i]));
         report += text;
     }
-    report += "; top by wait (queue packet site frames: count/ms, unchanged open/unsignaled/signaled, changed, stores, avg range/access):";
+    report += "; top by wait (queue packet site [frames]: count/ms, unchanged open/unsignaled/signaled, changed, stores, avg range/access; writers w{packet queue kind same/other-queue covers/partial: count/ms, open-batch targets, avg draws+dispatches flushed, avg access offset into the range}):";
     for (std::size_t i = 0; i < hot.size() && i < 10; ++i) {
         const auto& key = *hot[i].first;
         const auto& totals = *hot[i].second;
         const auto& k = totals.outcomes;
-        std::snprintf(text, sizeof(text), " [0x%x %s %s +0x%llx/+0x%llx/+0x%llx/+0x%llx/+0x%llx/+0x%llx: %llu/%.0fms u%llu/%llu/%llu c%llu s%llu %.0fK/%.0fK]", key.queue, PacketName(key.opcode).c_str(), GuestMemory::ReadSiteName(key.site), key.frames[0], key.frames[1], key.frames[2], key.frames[3], key.frames[4], key.frames[5], count(totals.count), totals.waitedMs, count(k.unchangedOpen), count(k.unchangedPending), count(k.unchangedSignaled), count(k.changed), count(k.stores), totals.rangeBytes / 1024.0 / totals.count, totals.accessBytes / 1024.0 / totals.count);
+        // The return addresses only when the capture found any (all zero otherwise: the read site
+        // names the access).
+        std::string frames;
+        if (std::any_of(key.frames.begin(), key.frames.end(), [](unsigned long long frame) { return frame != 0; })) {
+            for (const auto frame : key.frames) {
+                std::snprintf(text, sizeof(text), "%s+0x%llx", frames.empty() ? " " : "/", frame);
+                frames += text;
+            }
+        }
+        std::snprintf(text, sizeof(text), " [0x%x %s %s%s: %llu/%.0fms u%llu/%llu/%llu c%llu s%llu %.0fK/%.0fK", key.queue, PacketName(key.opcode).c_str(), GuestMemory::ReadSiteName(key.site), frames.c_str(), count(totals.count), totals.waitedMs, count(k.unchangedOpen), count(k.unchangedPending), count(k.unchangedSignaled), count(k.changed), count(k.stores), totals.rangeBytes / 1024.0 / totals.count, totals.accessBytes / 1024.0 / totals.count);
         report += text;
+        std::vector<std::pair<const HookSyncWriterKey*, const HookSyncWriterTotals*>> writers;
+        writers.reserve(totals.writers.size());
+        for (const auto& [writer, sums] : totals.writers) writers.emplace_back(&writer, &sums);
+        std::sort(writers.begin(), writers.end(), [](const auto& a, const auto& b) { return a.second->waitedMs > b.second->waitedMs; });
+        for (std::size_t w = 0; w < writers.size() && w < 3; ++w) {
+            const auto& writer = *writers[w].first;
+            const auto& sums = *writers[w].second;
+            std::snprintf(text, sizeof(text), " w{%s 0x%x %s %s %s: %llu/%.0fms o%llu %.0f %.1fK}", PacketName(writer.opcode).c_str(), writer.queue, Recorder::WriteKindName(writer.kind), writer.sameQueue ? "same-queue" : "other-queue", writer.covers ? "covers" : "partial", count(sums.count), sums.waitedMs, count(sums.open), sums.open != 0 ? static_cast<double>(sums.recordedWork) / sums.open : 0.0, sums.offsetBytes / 1024.0 / sums.count);
+            report += text;
+        }
+        report += "]";
     }
     std::fprintf(stderr, "%s\n", report.c_str());
     stats = HookSyncStats{};
@@ -781,6 +830,18 @@ public:
             if (info->open) ++stats.openTargets;
             if (info->signaled) ++stats.signaledTargets;
             stats.batchesFinished += info->batchesToFinish;
+            // The writer of the range hit, against the reader's packet queue.
+            const bool sameQueue = info->writerQueue == key.queue;
+            auto& writer = totals.writers[HookSyncWriterKey{info->writerQueue, info->writerOpcode, info->writerKind, sameQueue, info->covers}];
+            ++writer.count;
+            writer.waitedMs += ms;
+            writer.offsetBytes += address >= info->rangeBegin ? address - info->rangeBegin : 0;
+            if (info->open) {
+                ++writer.open;
+                writer.recordedWork += info->recordedWork;
+                ++(sameQueue ? stats.openSameQueue : stats.openOtherQueue);
+                stats.openRecordedWork += info->recordedWork;
+            }
         }
         // One outcome per sync, on both the key's and the interval's counters.
         const auto outcome = [&]() -> std::uint64_t HookSyncOutcomes::* {
@@ -1014,6 +1075,22 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     }
 }
 
+}
+
+const char* Recorder::WriteKindName(WriteKind kind) {
+    switch (kind) {
+    case WriteKind::Unknown: return "untagged";
+    case WriteKind::ShaderWrite: return "shader-write";
+    case WriteKind::Fill: return "fill";
+    case WriteKind::Copy: return "copy";
+    case WriteKind::AliasCopy: return "alias-copy";
+    case WriteKind::DccKeys: return "dcc-keys";
+    case WriteKind::TextureStore: return "texture-store";
+    case WriteKind::ShadowPublish: return "shadow-publish";
+    case WriteKind::Label: return "label";
+    case WriteKind::CompletionLabel: return "completion-label";
+    default: return "?";
+    }
 }
 
 Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)) {
@@ -2117,13 +2194,17 @@ void Recorder::OnComplete(std::function<void()> action) {
     writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
 }
 
-bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel) {
+bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, WriteKind kind) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
     ensureOpen();
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
+    // The writer's tag for the [hooksync] attribution: the packet the noting thread executes and
+    // the note's kind (a label when the caller marked the range as its own and named no kind).
+    const auto packet = GuestMemory::CurrentPacket();
+    open->writeTags.push_back(Batch::WriteTag{packet.queue, packet.opcode, ownLabel && kind == WriteKind::Unknown ? WriteKind::Label : kind});
     if (!ownLabel) markOverwritten(address, end);
     // A poller waiting on this range learns that the open batch may now hold its producer.
     if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
@@ -2136,10 +2217,10 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     return true;
 }
 
-void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t bytes, bool ownLabel) {
+void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t bytes, bool ownLabel, WriteKind kind) {
     if (bytes == 0) return;
     if (&batch == open.get()) {
-        if (!noteWrite(address, bytes, ownLabel)) return;
+        if (!noteWrite(address, bytes, ownLabel, kind)) return;
         publishPendingWrites();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         return;
@@ -2149,6 +2230,8 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // moves as well, so a poller re-consults the label table for a completion label.
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
+    const auto packet = GuestMemory::CurrentPacket();
+    batch.writeTags.push_back(Batch::WriteTag{packet.queue, packet.opcode, ownLabel && kind == WriteKind::Unknown ? WriteKind::CompletionLabel : kind});
     if (!ownLabel) markOverwritten(address, address + bytes);
     if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
     if (!SnapshotCovers(address, address + bytes)) publishPendingWrites();
@@ -2162,18 +2245,18 @@ void Recorder::markOverwritten(std::uint64_t address, std::uint64_t end) {
     for (auto it = labels.lower_bound(address >= 3 ? address - 3 : 0); it != labels.end() && it->first < end; ++it) it->second.overwritten = true;
 }
 
-void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes) {
-    if (!noteWrite(address, bytes)) return;
+void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes, WriteKind kind) {
+    if (!noteWrite(address, bytes, false, kind)) return;
     publishPendingWrites();
     // The note precedes this thread's vkQueueSubmit and the label another queue polls for; the
     // fence makes that order hold without relying on x86 store ordering.
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
-void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, WriteKind kind) {
     bool publish = false;
     for (const auto& [begin, end] : ranges) {
-        if (end > begin && noteWrite(begin, static_cast<std::size_t>(end - begin))) publish = true;
+        if (end > begin && noteWrite(begin, static_cast<std::size_t>(end - begin), false, kind)) publish = true;
     }
     if (!publish) return;
     publishPendingWrites();
@@ -2334,27 +2417,43 @@ std::optional<Recorder::PendingWriteInfo> Recorder::DescribePendingWrite(std::ui
     // The same choice SyncThrough makes: the open batch forces a full Sync, otherwise the newest
     // overlapping in-flight batch is the target. Of that batch's ranges the first overlapping one
     // is reported (a dispatch notes each written V# once, so it is the range the access hit).
-    const auto firstOverlap = [&](const Batch& batch) -> const std::pair<std::uint64_t, std::uint64_t>* {
-        for (const auto& range : batch.writes) {
-            if (address < range.second && range.first < end) return &range;
+    const auto firstOverlap = [&](const Batch& batch) -> std::size_t {
+        for (std::size_t i = 0; i < batch.writes.size(); ++i) {
+            if (address < batch.writes[i].second && batch.writes[i].first < end) return i;
         }
-        return nullptr;
+        return batch.writes.size();
+    };
+    // The range hit and its writer's tag (the tag vector mirrors `writes`; a batch without tags
+    // reports no packet), whether the range covers the access, and the open batch's recorded work.
+    const auto describe = [&](const Batch& batch, std::size_t index, std::uint64_t serial, bool isOpen, bool isSignaled, std::size_t toFinish) {
+        const auto& range = batch.writes[index];
+        PendingWriteInfo info{serial, isOpen, isSignaled, range.first, range.second, toFinish};
+        info.batchQueue = batch.queue;
+        if (index < batch.writeTags.size()) {
+            const auto& tag = batch.writeTags[index];
+            info.writerQueue = tag.queue;
+            info.writerOpcode = tag.opcode;
+            info.writerKind = tag.kind;
+        }
+        info.covers = range.first <= address && end <= range.second;
+        info.recordedWork = isOpen ? RecordedWorkSinceSubmit() : 0;
+        return info;
     };
     // With SyncThrough disabled every hit is a full Sync: the open batch (if any) is submitted and
     // everything in flight finishes, whichever batch noted the range.
     const bool syncAll = !SyncThroughEnabled();
     const auto allBatches = inFlight.size() + (open != nullptr ? 1 : 0);
     if (open != nullptr) {
-        if (const auto* range = firstOverlap(*open)) return PendingWriteInfo{submissions + 1, true, false, range->first, range->second, inFlight.size() + 1};
+        if (const auto index = firstOverlap(*open); index < open->writes.size()) return describe(*open, index, submissions + 1, true, false, inFlight.size() + 1);
     }
     std::size_t finished = inFlight.size();
     for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it, --finished) {
-        const auto* range = firstOverlap(**it);
-        if (range == nullptr) continue;
+        const auto index = firstOverlap(**it);
+        if (index == (*it)->writes.size()) continue;
         // In flight means submitted, so the fence is live; signaled = the GPU already ran it.
         const bool signaled = fenceStatus((*it)->fence) == VK_SUCCESS;
-        if (syncAll) return PendingWriteInfo{submissions + (open != nullptr ? 1 : 0), open != nullptr, signaled, range->first, range->second, allBatches};
-        return PendingWriteInfo{(*it)->serial, false, signaled, range->first, range->second, finished};
+        if (syncAll) return describe(**it, index, submissions + (open != nullptr ? 1 : 0), open != nullptr, signaled, allBatches);
+        return describe(**it, index, (*it)->serial, false, signaled, finished);
     }
     return std::nullopt;
 }
@@ -2516,7 +2615,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
     // The table entry before the write note: the note bumps the generation a poller watches, and a
     // poller that sees the bump then finds the label without the GPU mutex.
     noteLabelOn(batch, address, bytes, stamp, queue, behindCompletion);
-    noteWriteOn(batch, address, bytes.size(), true);
+    noteWriteOn(batch, address, bytes.size(), true, WriteKind::CompletionLabel);
     if (&batch == open.get() && activeRecorder == this && pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
         pendingLabelSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
     }

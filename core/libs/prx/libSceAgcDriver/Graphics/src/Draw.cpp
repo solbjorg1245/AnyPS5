@@ -177,6 +177,9 @@ struct DrawOutcome {
     std::uint64_t deferredFlatCopies = 0;
     std::uint64_t deferredFlatCpu = 0;
     std::uint64_t deferredFlatUnchanged = 0;
+    // Words read on the CPU through the flush hook because no host import covers them (the
+    // fallback of recordDeferredFlat: such a read waits for the GPU work writing the word).
+    std::uint64_t deferredFlatFallback = 0;
     // Draw bindings (ShaderResources::PrepareDrawBindings): whether the draw got a set copy of its
     // own and the call's time; what the copy holds: moved elements bound in place, snapshots made
     // and reused, data buffer copies; in-place refusals (no import, offset off the alignment).
@@ -245,6 +248,9 @@ struct DrawProfile {
     std::uint64_t deferredFlatCopies = 0;
     std::uint64_t deferredFlatCpu = 0;
     std::uint64_t deferredFlatUnchanged = 0;
+    // Words read on the CPU through the flush hook because no host import covers them (the
+    // fallback of recordDeferredFlat: such a read waits for the GPU work writing the word).
+    std::uint64_t deferredFlatFallback = 0;
     // Draw bindings (DrawOutcome): draws with a set copy, the calls' time, the copies' contents.
     std::uint64_t drawBindingsSets = 0;
     double drawBindingsUs = 0;
@@ -366,6 +372,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.deferredFlatCopies += outcome.deferredFlatCopies;
     profile.deferredFlatCpu += outcome.deferredFlatCpu;
     profile.deferredFlatUnchanged += outcome.deferredFlatUnchanged;
+    profile.deferredFlatFallback += outcome.deferredFlatFallback;
     if (outcome.drawBindingsSet) ++profile.drawBindingsSets;
     profile.drawBindingsUs += outcome.drawBindingsUs;
     profile.drawBindingsInPlace += outcome.drawBindingsInPlace;
@@ -399,7 +406,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     const auto synchronous = profile.draws - profile.recorded - profile.waited;
     const auto average = [](double total, std::uint64_t count) { return count != 0 ? total / static_cast<double>(count) : 0.0; };
     char line[2048];
-    int n = std::snprintf(line, sizeof(line), "[draws] %llu draws over 10 s (%llu recorded avg %.0f us, of them %llu with completion; %llu recorded then waited avg %.0f us; %llu synchronous avg %.0f us; render passes %llu begun, %llu draws continued one, deferred flat words: %llu copied on the GPU in %llu copies, %llu filled on the CPU, %llu bindings unchanged; draw bindings: %llu set copies in %.1f ms (moved in place %llu, snapshots %llu + %llu reused, data copies %llu; in-place refused: no import %llu, alignment %llu); waited or synchronous because:", static_cast<unsigned long long>(profile.draws), static_cast<unsigned long long>(profile.recorded), average(profile.recordedUs, profile.recorded), static_cast<unsigned long long>(profile.completion), static_cast<unsigned long long>(profile.waited), average(profile.waitedUs, profile.waited), static_cast<unsigned long long>(synchronous), average(profile.synchronousUs, synchronous), static_cast<unsigned long long>(profile.passesBegun), static_cast<unsigned long long>(profile.passesContinued), static_cast<unsigned long long>(profile.deferredFlatWords), static_cast<unsigned long long>(profile.deferredFlatCopies), static_cast<unsigned long long>(profile.deferredFlatCpu), static_cast<unsigned long long>(profile.deferredFlatUnchanged), static_cast<unsigned long long>(profile.drawBindingsSets), profile.drawBindingsUs / 1000.0, static_cast<unsigned long long>(profile.drawBindingsInPlace), static_cast<unsigned long long>(profile.drawBindingsSnapshots), static_cast<unsigned long long>(profile.drawBindingsReused), static_cast<unsigned long long>(profile.drawBindingsDataCopies), static_cast<unsigned long long>(profile.drawBindingsNoImport), static_cast<unsigned long long>(profile.drawBindingsMisaligned));
+    int n = std::snprintf(line, sizeof(line), "[draws] %llu draws over 10 s (%llu recorded avg %.0f us, of them %llu with completion; %llu recorded then waited avg %.0f us; %llu synchronous avg %.0f us; render passes %llu begun, %llu draws continued one, deferred flat words: %llu copied on the GPU in %llu copies, %llu filled on the CPU, %llu bindings unchanged, %llu read on the CPU (no import); draw bindings: %llu set copies in %.1f ms (moved in place %llu, snapshots %llu + %llu reused, data copies %llu; in-place refused: no import %llu, alignment %llu); waited or synchronous because:", static_cast<unsigned long long>(profile.draws), static_cast<unsigned long long>(profile.recorded), average(profile.recordedUs, profile.recorded), static_cast<unsigned long long>(profile.completion), static_cast<unsigned long long>(profile.waited), average(profile.waitedUs, profile.waited), static_cast<unsigned long long>(synchronous), average(profile.synchronousUs, synchronous), static_cast<unsigned long long>(profile.passesBegun), static_cast<unsigned long long>(profile.passesContinued), static_cast<unsigned long long>(profile.deferredFlatWords), static_cast<unsigned long long>(profile.deferredFlatCopies), static_cast<unsigned long long>(profile.deferredFlatCpu), static_cast<unsigned long long>(profile.deferredFlatUnchanged), static_cast<unsigned long long>(profile.deferredFlatFallback), static_cast<unsigned long long>(profile.drawBindingsSets), profile.drawBindingsUs / 1000.0, static_cast<unsigned long long>(profile.drawBindingsInPlace), static_cast<unsigned long long>(profile.drawBindingsSnapshots), static_cast<unsigned long long>(profile.drawBindingsReused), static_cast<unsigned long long>(profile.drawBindingsDataCopies), static_cast<unsigned long long>(profile.drawBindingsNoImport), static_cast<unsigned long long>(profile.drawBindingsMisaligned));
     const auto room = [&] { return n > 0 && static_cast<std::size_t>(n) < sizeof(line); };
     for (std::size_t i = SyncNone + 1; i < SyncCount && room(); ++i) {
         if (profile.reasons[i] != 0) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", SyncReasonNames[i], static_cast<unsigned long long>(profile.reasons[i]));
@@ -1176,7 +1183,8 @@ bool recordDeferredFlat(const Context& context, Recorder& recorder, const Shader
                 outcome.deferredFlatWords += region.last - region.first;
                 const auto* import = HostImportFor(context, address, static_cast<std::size_t>(bytes));
                 if (import == nullptr) {
-                    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Capture);
+                    outcome.deferredFlatFallback += region.last - region.first;
+                    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DeferredFlat);
                     for (std::size_t i = region.first; i < region.last; ++i) {
                         std::uint32_t word = 0;
                         GuestMemory::Read(words[i].second, std::as_writable_bytes(std::span(&word, 1)), alignof(std::uint32_t));

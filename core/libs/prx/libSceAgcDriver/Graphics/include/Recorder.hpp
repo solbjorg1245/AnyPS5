@@ -148,9 +148,17 @@ public:
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr);
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
     void OnComplete(std::function<void()> action);
-    void NotePendingWrite(std::uint64_t address, std::size_t bytes);
+    // What a noted pending write is, for the [hooksync] attribution (the writer of the range a
+    // CPU access waited for, see DescribePendingWrite): a shader's writable element (a dispatch or
+    // a draw, MarkGpuWrites), a buffer fill, a buffer copy (its destination) or a whole-surface
+    // alias copy, a DCC key store, a storage texture's store into its import, a unit shadow's
+    // publish, a GPU label (NoteLabel) or a label stored by a completion action (AfterCompletions).
+    // Diagnostic only: the kind changes nothing about the wait.
+    enum class WriteKind : std::uint8_t { Unknown = 0, ShaderWrite, Fill, Copy, AliasCopy, DccKeys, TextureStore, ShadowPublish, Label, CompletionLabel, Count };
+    static const char* WriteKindName(WriteKind kind);
+    void NotePendingWrite(std::uint64_t address, std::size_t bytes, WriteKind kind = WriteKind::Unknown);
     // Notes several [begin, end) ranges and publishes the snapshot once (a dispatch writes many buffers).
-    void NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+    void NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, WriteKind kind = WriteKind::Unknown);
     bool PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
     // Whether no unfinished batch writes the range any more: no open-batch overlap, and every
     // overlapping in-flight batch's fence has signaled (its in-place GPU stores are final in host
@@ -206,6 +214,18 @@ public:
         std::uint64_t rangeBegin;
         std::uint64_t rangeEnd;
         std::size_t batchesToFinish;
+        // The writer of that range (item 7's diagnostic): the GpuMutex queue tag of the thread that
+        // opened the target batch, the PM4 packet (opcode and submission queue, GuestMemory::
+        // CurrentPacket at the note; 0xfffffffe = no packet) the noting thread was executing, the
+        // note's kind, whether the noted range covers the whole access (false: a partial overlap),
+        // and, for the open batch, the draws and dispatches it had recorded when the wait flushed
+        // it (RecordedWorkSinceSubmit; 0 for a batch in flight).
+        std::uint32_t batchQueue = 0xffffffffu;
+        std::uint32_t writerQueue = 0xffffffffu;
+        std::uint32_t writerOpcode = 0xfffffffeu;
+        WriteKind writerKind = WriteKind::Unknown;
+        bool covers = false;
+        std::uint64_t recordedWork = 0;
     };
     std::optional<PendingWriteInfo> DescribePendingWrite(std::uint64_t address, std::size_t bytes) const;
     // Ends and submits the open batch without waiting.
@@ -539,6 +559,13 @@ private:
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
+        // The writer of each range, parallel to `writes` like writeNotes (see PendingWriteInfo).
+        struct WriteTag {
+            std::uint32_t queue;
+            std::uint32_t opcode;
+            WriteKind kind;
+        };
+        std::vector<WriteTag> writeTags;
         // In-place reads (see NotePendingRead), dying with the batch: a finished batch's reads are done.
         struct Read {
             std::uint64_t begin;
@@ -712,9 +739,9 @@ private:
     // Appends one range to the open batch; returns whether the snapshot must be rebuilt for it.
     // `ownLabel`: the range is a label's own store (NoteLabel, AfterCompletions), which does not
     // overwrite the table entries it covers; any other range flags them (table mutex, briefly).
-    bool noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel = false);
+    bool noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel = false, WriteKind kind = WriteKind::Unknown);
     // Appends one range to `batch` (open or in flight) and publishes the snapshot if needed.
-    void noteWriteOn(Batch& batch, std::uint64_t address, std::size_t bytes, bool ownLabel = false);
+    void noteWriteOn(Batch& batch, std::uint64_t address, std::size_t bytes, bool ownLabel = false, WriteKind kind = WriteKind::Unknown);
     void noteLabelOn(Batch& batch, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool behindCompletion = false);
     // Flags the recorded entries of `batch` over [begin, end) as stored by a completion action.
     void markBehindCompletion(const Batch& batch, std::uint64_t begin, std::uint64_t end);
