@@ -211,6 +211,9 @@ struct LookupRecord {
 };
 
 thread_local std::vector<LookupRecord> lookupLog;
+// APS5_VERIFY_FAST_PROOFS=8: set around the walk beside an accepted proof, so captureValidation
+// diffs only those records (see VerifyFastProofsMode).
+thread_local bool diffRecordsNow = false;
 
 void logLookup(const LookupRecord& record) {
     // The bound drops the oldest half, never everything: one build's lookups (a few dozen at most)
@@ -1501,19 +1504,24 @@ bool VerifyProofs() {
 // one the fast path lacks: 2 = the sampled-texture lookups only, 3 = the storage-image lookups
 // only, 4 = only the pending flush over every snapshot's memory (the sampled lookup's), 5 = only
 // Refresh of every storage image and view source, 6 = no side effect, a spin of
-// APS5_FAST_PROOF_SPIN_US microseconds (default 20) in place of the walk's time.
+// APS5_FAST_PROOF_SPIN_US microseconds (default 20) in place of the walk's time, 7 = the whole
+// walk in binding order (sampled and storage lookups interleaved) without the record update
+// (captureValidation) and without a verdict.
 unsigned VerifyFastProofsMode() {
     static const unsigned mode = [] {
         const char* value = std::getenv("APS5_VERIFY_FAST_PROOFS");
         if (value == nullptr) return 0u;
         const auto parsed = std::strtoul(value, nullptr, 10);
-        return parsed >= 2 && parsed <= 6 ? static_cast<unsigned>(parsed) : 1u;
+        return parsed >= 2 && parsed <= 8 ? static_cast<unsigned>(parsed) : 1u;
     }();
     return mode;
 }
 
+// Modes 1 and 8 walk with a verdict; 8 also diffs the walk's records against the fast path's
+// (captureValidation) and prints the differing fields every 10 s.
 bool VerifyFastProofs() {
-    return VerifyFastProofsMode() == 1;
+    const auto mode = VerifyFastProofsMode();
+    return mode == 1 || mode == 8;
 }
 
 // APS5_NO_SERIAL_MEMO=1 (diagnostic, session 22): the fast proof scans the pending registry on
@@ -1585,11 +1593,55 @@ void ShaderResources::captureValidation() {
         }
         return nullptr;
     };
+    // APS5_VERIFY_FAST_PROOFS=8: the records the walk makes against the ones the fast path kept
+    // (a proof moves generation and keys itself), per field, printed every 10 s with the first case.
+    const bool diffRecords = diffRecordsNow;
+    thread_local std::vector<ValidatedSurface> previous;
+    if (diffRecords) previous = validatedTextures;
     validatedTextures.assign(textures.size(), {});
     for (std::size_t i = 0; i < textures.size(); ++i) {
         if (const auto* found = record(textures[i].get())) validatedTextures[i] = {found->resource, found->bytes, found->keys, found->generation, 0, found->source, true};
     }
     lookupLog.clear();
+    if (diffRecords && previous.size() == validatedTextures.size()) {
+        static std::atomic<std::uint64_t> compared{0}, keysDiff{0}, sourceDiff{0}, bytesDiff{0}, addressDiff{0}, genOlder{0}, genNewer{0}, validDiff{0};
+        static HostMutex caseMutex;
+        static std::string firstCases;
+        static std::atomic<long long> lastReport{0};
+        for (std::size_t i = 0; i < previous.size(); ++i) {
+            const auto& was = previous[i];
+            const auto& now = validatedTextures[i];
+            if (!was.valid || !now.valid) {
+                if (was.valid != now.valid) validDiff.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            compared.fetch_add(1, std::memory_order_relaxed);
+            const char* field = nullptr;
+            if (was.keys != now.keys) { keysDiff.fetch_add(1, std::memory_order_relaxed); field = "keys"; }
+            else if (was.source != now.source) { sourceDiff.fetch_add(1, std::memory_order_relaxed); field = "source"; }
+            else if (was.bytes != now.bytes) { bytesDiff.fetch_add(1, std::memory_order_relaxed); field = "bytes"; }
+            else if (was.resource.baseAddress != now.resource.baseAddress) { addressDiff.fetch_add(1, std::memory_order_relaxed); field = "address"; }
+            else if (now.source == nullptr && now.generation < was.generation) { genOlder.fetch_add(1, std::memory_order_relaxed); field = "generation older"; }
+            else if (now.source == nullptr && now.generation > was.generation) { genNewer.fetch_add(1, std::memory_order_relaxed); field = "generation newer"; }
+            if (field != nullptr) {
+                std::lock_guard caseLock(caseMutex);
+                // One case per surface (the first 24 surfaces), with the collected generation
+                // the proof saw, so the writer between the proof and the walk can be named.
+                static std::set<std::uint64_t> casedSurfaces;
+                if (casedSurfaces.size() < 24 && casedSurfaces.insert(now.resource.baseAddress).second) {
+                    char text[320];
+                    std::snprintf(text, sizeof(text), " [%s: 0x%llx+0x%llx %ux%u f%u t%d mips %u dcc 0x%llx: keys %s -> %s, source %p -> %p, generation %llu (proof collected %llu) -> %llu]", field, static_cast<unsigned long long>(now.resource.baseAddress), static_cast<unsigned long long>(now.bytes), now.resource.width, now.resource.height, static_cast<unsigned>(now.resource.format), static_cast<int>(now.resource.tileMode), now.resource.mipCount, static_cast<unsigned long long>(now.resource.dccAddress), DccKeysName(was.keys), DccKeysName(now.keys), static_cast<const void*>(was.source), static_cast<const void*>(now.source), static_cast<unsigned long long>(was.generation), static_cast<unsigned long long>(was.collected), static_cast<unsigned long long>(now.generation));
+                    firstCases += text;
+                }
+            }
+        }
+        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = lastReport.load();
+        if (nowMs - last >= 10000 && lastReport.compare_exchange_strong(last, nowMs)) {
+            std::lock_guard caseLock(caseMutex);
+            std::fprintf(stderr, "[rescache] walk records vs fast records: %llu compared, keys %llu, source %llu, bytes %llu, address %llu, generation older %llu, newer %llu, validity %llu; first cases:%s\n", static_cast<unsigned long long>(compared.load()), static_cast<unsigned long long>(keysDiff.load()), static_cast<unsigned long long>(sourceDiff.load()), static_cast<unsigned long long>(bytesDiff.load()), static_cast<unsigned long long>(addressDiff.load()), static_cast<unsigned long long>(genOlder.load()), static_cast<unsigned long long>(genNewer.load()), static_cast<unsigned long long>(validDiff.load()), firstCases.c_str());
+        }
+    }
 }
 
 // Proves every texture and storage image still current without repeating its lookup: exactly the
@@ -1901,6 +1953,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // by stage, binding by binding, so the walk repeats that order.
     // The first element the full walk would replace (APS5_VERIFY_FAST_PROOFS).
     char walkMismatch[200] = {};
+    // Mode 7 of APS5_VERIFY_FAST_PROOFS walks without moving the records.
+    bool recordsAfterWalk = true;
     const auto fullWalk = [&] {
         lookupLog.clear();
         std::size_t textureIndex = 0;
@@ -1949,7 +2003,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         // The walk proved every object current again: the records move to what it proved, or one
         // spurious stamp (a label sharing a 64 KiB block with a surface's edge) would keep this
         // object on the full walk for good.
-        captureValidation();
+        if (recordsAfterWalk) captureValidation();
         return true;
     };
     thread_local std::vector<PendingOverlap> overlapping;
@@ -2035,7 +2089,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         const auto kindsBefore = walkOutcomes.counts;
         auto& walkCounters = TextureCounts();
         const std::uint64_t cacheBefore[4] = {walkCounters.replaced.load(std::memory_order_relaxed), walkCounters.storageCreated.load(std::memory_order_relaxed), walkCounters.snapshots.load(std::memory_order_relaxed), walkCounters.fromStorage.load(std::memory_order_relaxed)};
+        diffRecordsNow = VerifyFastProofsMode() == 8;
         const bool same = fullWalk();
+        diffRecordsNow = false;
         for (std::size_t k = 0; k < LookupOutcomes::Count; ++k) {
             if (walkOutcomes.counts[k] != kindsBefore[k]) walkKinds[walkGroup][k].fetch_add(walkOutcomes.counts[k] - kindsBefore[k], std::memory_order_relaxed);
         }
@@ -2100,7 +2156,11 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         // One class of the walk's side effects beside the accepted proof, no verdict (see
         // VerifyFastProofsMode).
         const auto mode = VerifyFastProofsMode();
-        if (mode == 6) {
+        if (mode == 7) {
+            recordsAfterWalk = false;
+            fullWalk();
+            recordsAfterWalk = true;
+        } else if (mode == 6) {
             static const long long spinUs = [] { const char* v = std::getenv("APS5_FAST_PROOF_SPIN_US"); return v != nullptr ? std::strtoll(v, nullptr, 10) : 20ll; }();
             const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(spinUs);
             while (std::chrono::steady_clock::now() < until) {}
