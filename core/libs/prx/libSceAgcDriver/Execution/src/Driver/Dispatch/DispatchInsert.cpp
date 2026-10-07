@@ -6,7 +6,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming) {
+void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming, std::uint64_t baseKey, std::span<const std::uint32_t> userData, const std::vector<UserPointerCandidate>& baseCandidates) {
     if (!noDispatchCache) {
         auto fresh = std::make_shared<DispatchVariant>();
         fresh->compiled = compiledResult;
@@ -36,6 +36,21 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
         }
         auto relocation = RelocationVerdict::Count;
         if (relocatedHits() && !stampValidate() && missedEntry != nullptr && missedDiffering && !missedEntry->variants.empty() && !fresh->dataPositions.empty()) relocation = learnRelocation(*missedEntry->variants.front(), *fresh);
+        // An absent key under a base-key candidate learns the rule against it with the user-pointer delta.
+        // The candidate holding the same instance (its non-data words equal up to pointers moved by
+        // its delta) teaches the rule and its delta becomes the base key's stride; else the newest.
+        auto userPointerVerdict = RelocationVerdict::Count;
+        const UserPointerCandidate* same = nullptr;
+        if (relocation == RelocationVerdict::Count && !baseCandidates.empty() && relocatedHits() && !stampValidate() && !fresh->dataPositions.empty()) {
+            for (const auto& candidate : baseCandidates) {
+                if (sameInstance(*candidate.entry->variants.front(), *fresh, candidate.delta)) {
+                    same = &candidate;
+                    break;
+                }
+            }
+            const auto& teacher = same != nullptr ? *same : baseCandidates.front();
+            userPointerVerdict = learnRelocation(*teacher.entry->variants.front(), *fresh, teacher.delta);
+        }
         bool stable = true;
         if (stampValidate()) {
 
@@ -67,7 +82,16 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
         if (profile && missedEntry != nullptr && missedDiffering) classifyDiffering(address, key, *missedEntry->variants.front(), *fresh, capture.get(), entryCounters);
         if (stable) {
             ++entryCounters.inserts;
-            if (relocation != RelocationVerdict::Count) ++entryCounters.relocationVerdicts[static_cast<std::size_t>(relocation)];
+            if (userPointerVerdict != RelocationVerdict::Count) {
+                ++entryCounters.userPointerVerdicts[static_cast<std::size_t>(userPointerVerdict)];
+                ++(same != nullptr ? entryCounters.userPointerSameFound : entryCounters.userPointerSameMissing);
+                if (same != nullptr) dispatchBaseStride[baseKey] = same->delta;
+            }
+            if (userPointerRelocation()) indexDispatchKey(baseKey, key, userData);
+            if (relocation != RelocationVerdict::Count) {
+                ++entryCounters.relocationVerdicts[static_cast<std::size_t>(relocation)];
+                if (profile) ++entryCounters.queueKeys[DispatchStatsQueue].verdicts[static_cast<std::size_t>(relocation)];
+            }
             entryCounters.runsInserted += fresh->runs.size();
             if (!fresh->dataPositions.empty()) {
                 ++entryCounters.dataInserts;

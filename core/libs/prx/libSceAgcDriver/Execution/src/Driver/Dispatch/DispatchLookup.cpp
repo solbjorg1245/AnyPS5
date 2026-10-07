@@ -4,7 +4,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering, std::shared_ptr<DispatchVariant>& relocated) {
+void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering, std::shared_ptr<DispatchVariant>& relocated, std::uint64_t baseKey, std::span<const std::uint32_t> userData, std::vector<UserPointerCandidate>& baseCandidates) {
     if (!noDispatchCache) {
 
         static const bool validateUnlocked = std::getenv("APS5_NO_UNLOCKED_VALIDATE") == nullptr;
@@ -13,7 +13,8 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
         const auto found = dispatchCache.find(key);
         std::shared_ptr<DispatchEntry> entry = found != dispatchCache.end() ? found->second : nullptr;
         if (entry == nullptr) ++entryCounters.absent;
-        if (validateUnlocked) cacheLock.unlock();
+        if (entry == nullptr && userPointerRelocation()) collectUserPointerCandidates(baseKey, userData, baseCandidates);
+        if (validateUnlocked || !baseCandidates.empty()) cacheLock.unlock();
         phaseTiming.Phase(PhaseLookup);
         if (entry != nullptr) {
             validated = true;
@@ -272,6 +273,10 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 reportDispatchCache(counters);
             }
             phaseTiming.Phase(PhaseRelock);
+        }
+        if (entry == nullptr && !baseCandidates.empty()) {
+            relocateByUserPointer(address, submission, key, baseKey, userData, memory, baseCandidates, compiledResult, captured, cached, relocated);
+            phaseTiming.Phase(PhaseValidate);
         }
     }
 }

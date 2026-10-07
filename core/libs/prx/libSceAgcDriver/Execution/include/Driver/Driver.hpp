@@ -107,8 +107,17 @@ private:
     void eraseDispatchEntry(std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>>::iterator it);
     void classifyDiffering(std::uint64_t program, std::uint64_t key, const DispatchVariant& old, const DispatchVariant& fresh, const ShaderRecompiler::ResourceCapture* capture, EntryCounters& counters);
     void reportDispatchCache(EntryCounters& counters);
-    void lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering, std::shared_ptr<DispatchVariant>& relocated);
-    void insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming);
+    // outcome: 0 hit, 1 no entry, 2 an entry that missed (APS5_PROFILE_DRAW).
+    void noteDispatchKey(std::uint32_t queue, std::uint64_t program, std::uint64_t key, int outcome, const std::vector<std::uint32_t>& userData, const std::array<std::uint32_t, 5>& registers, const void* shader);
+    void lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering, std::shared_ptr<DispatchVariant>& relocated, std::uint64_t baseKey, std::span<const std::uint32_t> userData, std::vector<UserPointerCandidate>& baseCandidates);
+    void insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming, std::uint64_t baseKey, std::span<const std::uint32_t> userData, const std::vector<UserPointerCandidate>& baseCandidates);
+    // User-pointer relocation (DispatchRelocation.cpp).
+    static bool userPointerRelocation();
+    static std::size_t userPointerCandidateLimit();
+    void collectUserPointerCandidates(std::uint64_t baseKey, std::span<const std::uint32_t> userData, std::vector<UserPointerCandidate>& candidates);
+    void indexDispatchKey(std::uint64_t baseKey, std::uint64_t key, std::span<const std::uint32_t> userData);
+    void relocateByUserPointer(std::uint64_t address, const Submission& submission, std::uint64_t key, std::uint64_t baseKey, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::vector<UserPointerCandidate>& candidates, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::vector<ShaderRecompiler::MemoryRegion>& captured, bool& cached, std::shared_ptr<DispatchVariant>& relocated);
+    static bool sameInstance(const DispatchVariant& old, const DispatchVariant& fresh, std::uint64_t delta);
     void dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments = 0);
     void verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffset, std::uint64_t deviceSerial, ShaderRecompiler::RecompileRequest request, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint64_t address, const DispatchVariant& variant, std::span<const std::uint32_t> liveWords, const ShaderRecompiler::RecompileResult& patched);
     static bool drawEntries();
@@ -283,6 +292,14 @@ private:
 
     using ValueSet = std::pair<std::vector<std::pair<std::uint64_t, std::uint64_t>>, std::vector<std::uint32_t>>;
     std::unordered_map<std::uint64_t, std::deque<ValueSet>> priorValueSets;
+    // (queue << 48) ^ program -> the key inputs last used (noteDispatchKey). Under dispatchCacheMutex.
+    std::unordered_map<std::uint64_t, KeyInputs> lastKeyInputs;
+    // Base key (the dispatch key without the user data) -> the keys inserted under it with their
+    // user data, oldest first (user-pointer relocation). Under dispatchCacheMutex.
+    std::unordered_map<std::uint64_t, std::deque<std::pair<std::uint64_t, std::vector<std::uint32_t>>>> dispatchBaseIndex;
+    // Base key -> the user-pointer delta of its last same-instance match (the ring's frame stride):
+    // the candidate at that delta is validated first. Under dispatchCacheMutex.
+    std::unordered_map<std::uint64_t, std::uint64_t> dispatchBaseStride;
 
     std::unordered_map<std::uint64_t, std::shared_ptr<DrawEntry>> drawCache;
     std::list<std::uint64_t> drawOrder;

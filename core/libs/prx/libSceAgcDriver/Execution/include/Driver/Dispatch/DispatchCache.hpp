@@ -9,12 +9,15 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <list>
 #include <map>
 #include <memory>
 #include <set>
 #include <span>
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -60,6 +63,9 @@ struct DispatchVariant {
     // Byte offsets of 64-bit pointers into the moved runs among the push constants (a user SGPR
     // pair the shader reads at runtime), shifted with them (draw relocation, DrawRelocation.cpp).
     std::vector<std::uint32_t> pushShiftSlots;
+    // Low-word positions, inside the moved runs, of 64-bit pointers into the moved block itself
+    // (user-pointer relocation: learned with an external delta), shifted with it.
+    std::vector<std::uint32_t> innerPointers;
     // learnRelocation took the rule (draw relocation): a stage whose user-SGPR pointer moved
     // compares only such variants, shifted; one whose rule shifts nothing is independent of the
     // pointer and compares in place. A variant without a rule may sit at a dead address.
@@ -88,7 +94,41 @@ struct DispatchEntry {
     std::list<std::uint64_t>::iterator order;
 };
 
+// Lookups by queue and why a key was absent (APS5_PROFILE_DRAW diagnostic, Driver::noteDispatchKey):
+// against the key inputs the same queue's last dispatch of the program used, and the keys it used
+// recently (an absent key seen before was evicted or never inserted).
+struct QueueKeyCounters {
+    std::uint64_t lookups = 0, hits = 0, absent = 0, missed = 0, firstSeen = 0, seenBefore = 0, userChanged = 0, registersChanged = 0, shaderChanged = 0, sameInputs = 0;
+    std::array<std::uint64_t, 9> verdicts{};
+};
+struct ProgramKeyCounters {
+    std::uint32_t queue = 0;
+    std::uint64_t lookups = 0, absent = 0, seenBefore = 0, registersChanged = 0, shaderChanged = 0;
+    // User-data word position -> absent lookups it differed in; one sample of the changed words.
+    std::map<std::uint32_t, std::uint64_t> userPositions;
+    std::string sample;
+};
+struct KeyInputs {
+    std::vector<std::uint32_t> userData;
+    std::array<std::uint32_t, 5> registers{};
+    const void* shader = nullptr;
+    std::deque<std::uint64_t> keys;
+};
+
+// An entry under the absent key's base key whose user data differs from the live user data only in
+// one 64-bit pair, moved by `delta` (Driver::collectUserPointerCandidates).
+struct UserPointerCandidate {
+    std::uint64_t key;
+    std::shared_ptr<DispatchEntry> entry;
+    std::uint64_t delta;
+};
+
+// The queue the current thread's dispatch statistics belong to (set by Driver::dispatch).
+inline thread_local std::uint32_t DispatchStatsQueue = 0;
+
 struct EntryCounters {
+    std::map<std::uint32_t, QueueKeyCounters> queueKeys;
+    std::unordered_map<std::uint64_t, ProgramKeyCounters> programKeys;
     std::uint64_t lookups = 0, absent = 0, equal = 0, differing = 0, inaccessible = 0, queuedLabel = 0, flushingImage = 0, publishMoved = 0, pendingMoved = 0, forgetMoved = 0, imagesFlushed = 0, runsSynced = 0, forgetSinceInsert = 0, replaced = 0, inserts = 0, unstable = 0, touches = 0;
 
     std::uint64_t runsValidated = 0, runsInserted = 0, retriesEqual = 0, retriesMoved = 0;
@@ -108,6 +148,11 @@ struct EntryCounters {
     // them differing (the stored variants then compared as before), and the stored validations
     // the hits skipped.
     std::uint64_t relocatedFirst = 0, relocatedFirstDiffering = 0, storedValidationsSkipped = 0;
+    // User-pointer relocation (DispatchRelocation.cpp relocateByUserPointer): absent lookups with
+    // candidates, candidates without a rule, shifted candidates validated / differing / unordered,
+    // hits, copies inserted under the live key; the rules learned against a candidate by verdict.
+    std::uint64_t userPointerLookups = 0, userPointerCandidates = 0, userPointerStrideFirst = 0, userPointerStrideHits = 0, userPointerSameFound = 0, userPointerSameMissing = 0, userPointerNoRule = 0, userPointerValidated = 0, userPointerDiffering = 0, userPointerUnordered = 0, userPointerHits = 0, userPointerCopies = 0;
+    std::array<std::uint64_t, 9> userPointerVerdicts{};
     std::set<std::size_t> differingPositions;
     std::size_t differingFirstPosition = std::numeric_limits<std::size_t>::max(), differingLastPosition = 0;
     std::map<std::uint64_t, std::uint64_t> differingByProgram;

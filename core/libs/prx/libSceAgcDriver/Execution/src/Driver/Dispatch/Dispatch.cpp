@@ -104,14 +104,22 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     const bool noDispatchCache = noDispatchCacheEnv || probeThis;
     std::uint64_t key = 0xcbf29ce484222325ull;
+    // The base key leaves the user data out but its size (user-pointer relocation).
+    std::uint64_t baseKey = 0xcbf29ce484222325ull;
     const auto mix = [&](std::uint64_t value) {
         key ^= value;
         key *= 0x100000001b3ull;
+        baseKey ^= value;
+        baseKey *= 0x100000001b3ull;
     };
     mix(address);
     mix(packet[4] & 0x8000u);
     for (const auto threads : compute.partialThreads) mix(threads);
+    const auto savedBase = baseKey;
     for (const auto word : userData) mix(word);
+    baseKey = savedBase;
+    baseKey ^= userData.size() + 0x5553u;
+    baseKey *= 0x100000001b3ull;
 
     static const bool keyHygiene = std::getenv("APS5_NO_DISPATCH_KEY_HYGIENE") == nullptr;
     if (keyHygiene) {
@@ -144,6 +152,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     bool missedDiffering = false;
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
     std::shared_ptr<DispatchVariant> relocated;
+    std::vector<UserPointerCandidate> baseCandidates;
 
     static const bool traceCache = std::getenv("APS5_TRACE_DISPATCH_CACHE") != nullptr;
     if (traceCache) {
@@ -179,7 +188,17 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
     if (!stampValidate()) mix(reinterpret_cast<std::uintptr_t>(it->second.get()));
     phaseTiming.Phase(PhaseKey);
-    lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering, relocated);
+    lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering, relocated, baseKey, userData, baseCandidates);
+    DispatchStatsQueue = submission.queue;
+    if (profile && !noDispatchCache) {
+        std::array<std::uint32_t, 5> registers{};
+        std::size_t r = 0;
+        for (const auto offset : {0x207u, 0x208u, 0x209u, 0x212u, 0x213u}) {
+            const auto found = queue.shader.find(offset);
+            registers[r++] = found == queue.shader.end() ? 0xffffffffu : found->second;
+        }
+        noteDispatchKey(submission.queue, address, key, cached ? 0 : missedEntry == nullptr ? 1 : 2, userData, registers, it->second.get());
+    }
     if (relocated != nullptr) attachVariant = relocated;
     if (cached) {
         captureMs += phaseTiming.Elapsed();
@@ -230,7 +249,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         recompileMs += phaseTiming.Elapsed();
         phaseTiming.Phase(PhaseRecompile);
-        insertDispatch(address, key, noDispatchCache, profile, it->second, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
+        insertDispatch(address, key, noDispatchCache, profile, it->second, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming, baseKey, userData, baseCandidates);
     }
     if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, localDevice->Serial(), request, memory, address, *keepVariant, liveWords, *compiledResult);
     if (verifyDataHits() && relocated != nullptr) verifyDataHit(snapshot, codeOffset, localDevice->Serial(), request, memory, address, *relocated, relocated->words, *compiledResult);

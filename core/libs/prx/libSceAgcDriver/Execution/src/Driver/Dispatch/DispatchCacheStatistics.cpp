@@ -70,6 +70,64 @@ void Driver::classifyDiffering(std::uint64_t program, std::uint64_t key, const D
     else ++counters.differingMixed;
 }
 
+void Driver::noteDispatchKey(std::uint32_t queue, std::uint64_t program, std::uint64_t key, int outcome, const std::vector<std::uint32_t>& userData, const std::array<std::uint32_t, 5>& registers, const void* shader) {
+    std::lock_guard cacheLock(dispatchCacheMutex);
+    auto& counters = entryCounters;
+    auto& perQueue = counters.queueKeys[queue];
+    auto& perProgram = counters.programKeys[(static_cast<std::uint64_t>(queue) << 48u) ^ program];
+    perProgram.queue = queue;
+    ++perQueue.lookups;
+    ++perProgram.lookups;
+    auto& last = lastKeyInputs[(static_cast<std::uint64_t>(queue) << 48u) ^ program];
+    if (outcome == 0) ++perQueue.hits;
+    else if (outcome == 2) ++perQueue.missed;
+    else {
+        ++perQueue.absent;
+        ++perProgram.absent;
+        if (last.keys.empty()) {
+            ++perQueue.firstSeen;
+        } else if (std::find(last.keys.begin(), last.keys.end(), key) != last.keys.end()) {
+            ++perQueue.seenBefore;
+            ++perProgram.seenBefore;
+        } else {
+            bool user = false;
+            std::string sample;
+            for (std::size_t i = 0; i < userData.size(); ++i) {
+                if (i < last.userData.size() && last.userData[i] == userData[i]) continue;
+                user = true;
+                ++perProgram.userPositions[static_cast<std::uint32_t>(i)];
+                if (sample.size() < 160) {
+                    char text[48];
+                    std::snprintf(text, sizeof(text), " u%zu %x->%x", i, i < last.userData.size() ? last.userData[i] : 0u, userData[i]);
+                    sample += text;
+                }
+            }
+            if (last.userData.size() != userData.size()) user = true;
+            if (user) {
+                ++perQueue.userChanged;
+                perProgram.sample = std::move(sample);
+            }
+            if (last.registers != registers) {
+                ++perQueue.registersChanged;
+                ++perProgram.registersChanged;
+            }
+            if (last.shader != shader) {
+                ++perQueue.shaderChanged;
+                ++perProgram.shaderChanged;
+            }
+            if (!user && last.registers == registers && last.shader == shader) ++perQueue.sameInputs;
+        }
+    }
+    last.userData = userData;
+    last.registers = registers;
+    last.shader = shader;
+    if (std::find(last.keys.begin(), last.keys.end(), key) == last.keys.end()) {
+        last.keys.push_front(key);
+        if (last.keys.size() > 64) last.keys.pop_back();
+    }
+    if (lastKeyInputs.size() > 65536) lastKeyInputs.clear();
+}
+
 void Driver::reportDispatchCache(EntryCounters& counters) {
     const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
     const auto validated = counters.lookups - counters.absent;
@@ -102,6 +160,40 @@ void Driver::reportDispatchCache(EntryCounters& counters) {
     std::fprintf(stderr, "[dispatch-cache] data hits (10 s): %llu (%llu words refreshed; by rank 1..k %s; %llu data variants missed on pending runs, %llu pending runs refreshed through the mask: known bytes %llu, synced %llu), verified %llu; inserts with data positions %llu of %llu (%.1f positions each), leaves skipped: unmapped %llu, mismatched %llu, aliased %llu\n", count(counters.dataHits), count(counters.dataWordsRefreshed), dataRanks.c_str(), count(dataPendingMisses.exchange(0, std::memory_order_relaxed)), count(pendingKnownRefreshed + pendingSyncedRefreshed), count(pendingKnownRefreshed), count(pendingSyncedRefreshed), count(counters.dataVerified), count(counters.dataInserts), count(counters.inserts), counters.dataInserts != 0 ? static_cast<double>(counters.dataPositionsInserted) / static_cast<double>(counters.dataInserts) : 0.0, count(counters.dataLeavesUnmapped), count(counters.dataLeavesMismatched), count(counters.dataLeavesAliased));
     const auto& verdicts = counters.relocationVerdicts;
     std::fprintf(stderr, "[dispatch-cache] relocated hits (10 s): %llu; rules learned %llu, refused: shape %llu, data positions %llu, deltas %llu, nothing moved %llu, other words %llu, no pointer %llu, compiled %llu, descriptors %llu; relocations differing %llu, unordered %llu; relocation first: %llu tried, %llu differing, %llu stored validations skipped\n", count(counters.relocatedHits), count(verdicts[0]), count(verdicts[1]), count(verdicts[2]), count(verdicts[3]), count(verdicts[4]), count(verdicts[5]), count(verdicts[6]), count(verdicts[7]), count(verdicts[8]), count(counters.relocatedDiffering), count(counters.relocatedUnordered), count(counters.relocatedFirst), count(counters.relocatedFirstDiffering), count(counters.storedValidationsSkipped));
+    {
+        const auto& v = counters.userPointerVerdicts;
+        std::fprintf(stderr, "[dispatch-cache] user-pointer relocation (10 s): %llu absent lookups with %llu candidates (%llu at the stride first; %llu without a rule), %llu validated shifted: %llu hits (%llu at the stride; %llu copies inserted), %llu differing, %llu unordered; misses: same instance found %llu, not found %llu; rules against a candidate: learned %llu, refused: shape %llu, data positions %llu, deltas %llu, nothing moved %llu, other words %llu, no pointer %llu, compiled %llu, descriptors %llu\n", count(counters.userPointerLookups), count(counters.userPointerCandidates), count(counters.userPointerStrideFirst), count(counters.userPointerNoRule), count(counters.userPointerValidated), count(counters.userPointerHits), count(counters.userPointerStrideHits), count(counters.userPointerCopies), count(counters.userPointerDiffering), count(counters.userPointerUnordered), count(counters.userPointerSameFound), count(counters.userPointerSameMissing), count(v[0]), count(v[1]), count(v[2]), count(v[3]), count(v[4]), count(v[5]), count(v[6]), count(v[7]), count(v[8]));
+    }
+    {
+        std::string text;
+        for (const auto& [queue, q] : counters.queueKeys) {
+            char item[512];
+            const auto& v = q.verdicts;
+            std::snprintf(item, sizeof(item), "; q0x%x: %llu lookups, %llu hits, %llu missed an entry (rules learned %llu, refused: shape %llu, data positions %llu, deltas %llu, nothing moved %llu, other words %llu, no pointer %llu, compiled %llu, descriptors %llu), %llu no entry (first seen %llu, a recent key %llu, user data changed %llu, registers %llu, shader %llu, same inputs %llu)", queue, count(q.lookups), count(q.hits), count(q.missed), count(v[0]), count(v[1]), count(v[2]), count(v[3]), count(v[4]), count(v[5]), count(v[6]), count(v[7]), count(v[8]), count(q.absent), count(q.firstSeen), count(q.seenBefore), count(q.userChanged), count(q.registersChanged), count(q.shaderChanged), count(q.sameInputs));
+            text += item;
+        }
+        std::fprintf(stderr, "[dispatch-keys] by queue (10 s)%s\n", text.c_str());
+        std::vector<std::pair<std::uint64_t, const ProgramKeyCounters*>> absent;
+        for (const auto& [id, p] : counters.programKeys) {
+            if (p.absent != 0) absent.emplace_back(id, &p);
+        }
+        std::sort(absent.begin(), absent.end(), [](const auto& a, const auto& b) { return a.second->absent > b.second->absent; });
+        std::string top;
+        for (std::size_t i = 0; i < absent.size() && i < 12; ++i) {
+            const auto& p = *absent[i].second;
+            std::vector<std::pair<std::uint32_t, std::uint64_t>> positions(p.userPositions.begin(), p.userPositions.end());
+            std::sort(positions.begin(), positions.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+            char item[256];
+            std::snprintf(item, sizeof(item), "; q0x%x 0x%llx: %llu of %llu lookups absent (recent key %llu, registers %llu, shader %llu; user words", p.queue, static_cast<unsigned long long>(absent[i].first & 0xffffffffffffull), count(p.absent), count(p.lookups), count(p.seenBefore), count(p.registersChanged), count(p.shaderChanged));
+            top += item;
+            for (std::size_t k = 0; k < positions.size() && k < 4; ++k) {
+                std::snprintf(item, sizeof(item), " u%u x%llu", positions[k].first, count(positions[k].second));
+                top += item;
+            }
+            top += "; sample" + p.sample + ")";
+        }
+        std::fprintf(stderr, "[dispatch-keys] top programs by no entry%s\n", top.c_str());
+    }
     counters = EntryCounters{};
 }
 

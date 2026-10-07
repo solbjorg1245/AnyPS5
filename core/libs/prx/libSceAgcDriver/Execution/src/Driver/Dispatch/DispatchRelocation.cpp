@@ -1,12 +1,16 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <functional>
 #include <tuple>
 #include <cstring>
+#include <limits>
+#include <optional>
 
 // Relocated dispatch-cache hits. Per-object dispatches (0x248994d00 and its siblings, ~1000 per
 // frame in Boletaria) read a per-frame constant block through a pointer the game moves every frame
@@ -121,6 +125,24 @@ RelocationVerdict Driver::learnRelocation(const DispatchVariant& old, DispatchVa
         return RelocationVerdict::Deltas;
     }
 
+    // With an external delta, pointers inside the moved runs that moved by it point into the block
+    // itself (the title's per-dispatch SRT blocks link their own sub-tables): they are shifted with
+    // it, so they are the same content, and descriptors read through them shift with the block.
+    std::vector<std::uint32_t> inner;
+    if (externalDelta != 0 && userPointerRelocation()) {
+        for (std::size_t p = 0; p + 1 < fresh.words.size(); ++p) {
+            if (old.words[p] == fresh.words[p] && old.words[p + 1] == fresh.words[p + 1]) continue;
+            if (runOf[p] != runOf[p + 1] || !std::binary_search(moved.begin(), moved.end(), runOf[p]) || dataPosition(fresh, p) || dataPosition(fresh, p + 1)) continue;
+            if (pointerAt(fresh.words, p) - pointerAt(old.words, p) != delta) continue;
+            inner.push_back(static_cast<std::uint32_t>(p));
+            ++p;
+        }
+    }
+    const auto innerWord = [&](std::size_t p) {
+        const auto at = std::upper_bound(inner.begin(), inner.end(), static_cast<std::uint32_t>(p));
+        return at != inner.begin() && *(at - 1) + 1 >= p;
+    };
+
     // Every differing word outside the moved runs (data words aside) must belong to a pointer that
     // moved by the delta, held in one run.
     std::vector<std::uint32_t> pointers;
@@ -142,13 +164,13 @@ RelocationVerdict Driver::learnRelocation(const DispatchVariant& old, DispatchVa
     // (equal again whenever a relocation validates those words).
     bool contentChanged = false;
     for (std::size_t p = 0; p < fresh.words.size() && !contentChanged; ++p) {
-        contentChanged = old.words[p] != fresh.words[p] && !dataPosition(fresh, p) && std::binary_search(moved.begin(), moved.end(), runOf[p]);
+        contentChanged = old.words[p] != fresh.words[p] && !dataPosition(fresh, p) && std::binary_search(moved.begin(), moved.end(), runOf[p]) && !innerWord(p);
     }
     // An address the walk read from the moved runs' contents (a V# stored in the moved block) is
     // content even when it moved by the delta too (frame allocations move together).
     const auto inMovedRuns = [&](const DispatchVariant& variant, std::uint32_t value) {
         for (std::size_t p = 0; p < variant.words.size(); ++p) {
-            if (variant.words[p] == value && std::binary_search(moved.begin(), moved.end(), runOf[p])) return true;
+            if (variant.words[p] == value && std::binary_search(moved.begin(), moved.end(), runOf[p]) && !innerWord(p)) return true;
         }
         return false;
     };
@@ -215,6 +237,7 @@ RelocationVerdict Driver::learnRelocation(const DispatchVariant& old, DispatchVa
     fresh.movedRuns = std::move(moved);
     fresh.shiftSlots = std::move(shifts);
     fresh.pushShiftSlots = std::move(pushShifts);
+    fresh.innerPointers = std::move(inner);
     fresh.relocationLearned = true;
     return RelocationVerdict::Learned;
 }
@@ -248,10 +271,12 @@ std::shared_ptr<DispatchVariant> Driver::relocateVariant(const DispatchVariant& 
 // new variant's own (`patched`): a draw data hit patches its data words in place.
 std::shared_ptr<DispatchVariant> Driver::shiftVariant(const DispatchVariant& variant, std::uint64_t delta, std::uint64_t& counterUnordered) {
     auto words = variant.words;
-    for (const auto position : variant.pointerPositions) {
-        const auto moved = pointerAt(variant.words, position) + delta;
-        words[position] = static_cast<std::uint32_t>(moved);
-        words[position + 1] = static_cast<std::uint32_t>(moved >> 32u);
+    for (const auto& positions : {std::cref(variant.pointerPositions), std::cref(variant.innerPointers)}) {
+        for (const auto position : positions.get()) {
+            const auto moved = pointerAt(variant.words, position) + delta;
+            words[position] = static_cast<std::uint32_t>(moved);
+            words[position + 1] = static_cast<std::uint32_t>(moved >> 32u);
+        }
     }
     auto runs = variant.runs;
     for (const auto run : variant.movedRuns) {
@@ -342,9 +367,193 @@ std::shared_ptr<DispatchVariant> Driver::shiftVariant(const DispatchVariant& var
         relocated->movedRuns = variant.movedRuns;
         relocated->shiftSlots = variant.shiftSlots;
         relocated->pushShiftSlots = variant.pushShiftSlots;
+        relocated->innerPointers = variant.innerPointers;
         relocated->relocationLearned = variant.relocationLearned;
     }
     return relocated;
+}
+
+// User-pointer relocation. The compute queues (and some queue-0 programs) pass each dispatch a
+// fresh block of SRT memory from a linear ring through user SGPRs 0-1, so their dispatch keys,
+// which mix the user data, were new on every dispatch and never seen again (t295: every no-entry
+// lookup differed from the program's previous dispatch in user word 0 alone; ~4.1k on queue 0 and
+// ~4.9k on the other queues per 10 s, each a full capture). An absent key now looks up the entries
+// inserted under its base key (the key without the user data) whose user data differ from the live
+// words only in one 64-bit pair, newest first; the front variant of a candidate with a rule is
+// shifted by the pair's delta (shiftVariant) and validated, and a hit is inserted as a copy under
+// the live key, so the candidate stays for the dispatches still using it. A miss learns the rule
+// against the candidate holding the same instance (learnRelocation with the delta as the external
+// delta), so the next dispatch of the program relocates. A program dispatched for many objects per
+// frame has as many candidates, and only last frame's block of the same object validates (t296:
+// newest first, 12 hits of 43k shifted validations): the delta of the last same-instance match (the
+// ring's frame stride, per base key) picks the candidate first. APS5_NO_USER_POINTER_RELOCATION=1
+// keys and misses as before; APS5_USER_POINTER_CANDIDATES (default 2) bounds the shifted
+// validations per absent lookup.
+bool Driver::userPointerRelocation() {
+    static const bool enabled = std::getenv("APS5_NO_USER_POINTER_RELOCATION") == nullptr && relocatedHits() && !stampValidate();
+    return enabled;
+}
+
+std::size_t Driver::userPointerCandidateLimit() {
+    static const std::size_t limit = [] {
+        const char* text = std::getenv("APS5_USER_POINTER_CANDIDATES");
+        const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 2ull;
+        return static_cast<std::size_t>(std::clamp<unsigned long long>(parsed, 1, 16));
+    }();
+    return limit;
+}
+
+// Under dispatchCacheMutex.
+void Driver::collectUserPointerCandidates(std::uint64_t baseKey, std::span<const std::uint32_t> userData, std::vector<UserPointerCandidate>& candidates) {
+    const auto index = dispatchBaseIndex.find(baseKey);
+    if (index == dispatchBaseIndex.end()) return;
+    const auto pointer = [](std::span<const std::uint32_t> words, std::size_t low) { return static_cast<std::uint64_t>(words[low]) | (static_cast<std::uint64_t>(words[low + 1]) << 32u); };
+    const auto& keys = index->second;
+    for (auto k = keys.rbegin(); k != keys.rend(); ++k) {
+        const auto& [stored, words] = *k;
+        if (words.size() != userData.size() || words.size() < 2) continue;
+        std::size_t first = std::numeric_limits<std::size_t>::max(), last = 0;
+        for (std::size_t i = 0; i < words.size(); ++i) {
+            if (words[i] == userData[i]) continue;
+            first = std::min(first, i);
+            last = i;
+        }
+        if (first == std::numeric_limits<std::size_t>::max()) continue;
+        auto low = first;
+        if (low + 1 >= userData.size()) --low;
+        if (last > low + 1) continue;
+        const auto delta = pointer(userData, low) - pointer(words, low);
+        // A pointer moved within the ring, not unrelated words.
+        if (delta + (std::uint64_t{1} << 30u) > (std::uint64_t{1} << 31u)) continue;
+        const auto found = dispatchCache.find(stored);
+        if (found == dispatchCache.end() || found->second->variants.empty()) continue;
+        candidates.push_back({stored, found->second, delta});
+    }
+    // The candidate at the base key's stride first; the rest stay for the same-instance search of a miss.
+    if (const auto stride = dispatchBaseStride.find(baseKey); stride != dispatchBaseStride.end()) {
+        const auto at = std::find_if(candidates.begin(), candidates.end(), [&](const UserPointerCandidate& c) { return c.delta == stride->second; });
+        if (at != candidates.end()) {
+            std::rotate(candidates.begin(), at, at + 1);
+            ++entryCounters.userPointerStrideFirst;
+        }
+    }
+    if (!candidates.empty()) {
+        ++entryCounters.userPointerLookups;
+        entryCounters.userPointerCandidates += candidates.size();
+    }
+}
+
+// Under dispatchCacheMutex.
+void Driver::indexDispatchKey(std::uint64_t baseKey, std::uint64_t key, std::span<const std::uint32_t> userData) {
+    if (dispatchBaseIndex.size() > 65536) dispatchBaseIndex.clear();
+    auto& keys = dispatchBaseIndex[baseKey];
+    for (auto k = keys.begin(); k != keys.end(); ++k) {
+        if (k->first == key) {
+            keys.erase(k);
+            break;
+        }
+    }
+    keys.emplace_back(key, std::vector<std::uint32_t>(userData.begin(), userData.end()));
+    if (keys.size() > 16) keys.pop_front();
+    if (dispatchBaseStride.size() > 65536) dispatchBaseStride.clear();
+}
+
+// Whether `fresh` captured the same instance as `old` at a block moved by `delta`: the same run
+// layout, and every non-data word equal or part of a 64-bit pointer moved by the delta.
+bool Driver::sameInstance(const DispatchVariant& old, const DispatchVariant& fresh, std::uint64_t delta) {
+    if (old.runs.size() != fresh.runs.size() || old.words.size() != fresh.words.size()) return false;
+    for (std::size_t i = 0; i < old.runs.size(); ++i) {
+        if (old.runs[i].second - old.runs[i].first != fresh.runs[i].second - fresh.runs[i].first) return false;
+    }
+    for (std::size_t p = 0; p < fresh.words.size(); ++p) {
+        if (old.words[p] == fresh.words[p] || dataPosition(fresh, p)) continue;
+        if (p + 1 < fresh.words.size() && pointerAt(fresh.words, p) - pointerAt(old.words, p) == delta) {
+            ++p;
+            continue;
+        }
+        if (p > 0 && pointerAt(fresh.words, p - 1) - pointerAt(old.words, p - 1) == delta) continue;
+        return false;
+    }
+    return true;
+}
+
+// Called without dispatchCacheMutex; on a hit `relocated` is the shifted variant, inserted under `key`.
+void Driver::relocateByUserPointer(std::uint64_t address, const Submission& submission, std::uint64_t key, std::uint64_t baseKey, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::vector<UserPointerCandidate>& candidates, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::vector<ShaderRecompiler::MemoryRegion>& captured, bool& cached, std::shared_ptr<DispatchVariant>& relocated) {
+    std::uint64_t imagesFlushed = 0, runsSynced = 0, unordered = 0, noRule = 0, validated = 0, differing = 0, hitDelta = 0;
+    std::vector<ShaderRecompiler::MemoryRegion> regions;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
+    {
+        const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DispatchCache);
+        std::optional<SampledReadScope> sampling;
+        for (std::size_t c = 0; c < candidates.size() && validated < userPointerCandidateLimit(); ++c) {
+            const auto& candidate = candidates[c];
+            const auto& front = *candidate.entry->variants.front();
+            if (!front.relocationLearned) {
+                ++noRule;
+                continue;
+            }
+            auto shifted = shiftVariant(front, candidate.delta, unordered);
+            if (shifted == nullptr) continue;
+            regions.clear();
+            liveData.clear();
+            appendEntryRegions(*shifted, regions);
+            ++validated;
+            const auto result = validateVariant(address, submission.queue, *shifted, regions, imagesFlushed, runsSynced, sampling, &liveData);
+            if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) {
+                if (result == EntryOutcome::Differing) traceFailedRelocation(address, *shifted);
+                ++differing;
+                continue;
+            }
+            for (const auto& [position, value] : liveData) shifted->words[position] = value;
+            if (!liveData.empty()) {
+                std::shared_ptr<ShaderRecompiler::RecompileResult> patched;
+                if (shifted->patched != nullptr && shifted->patched.get() == shifted->compiled.get()) patched = shifted->patched;
+                else patched = std::make_shared<ShaderRecompiler::RecompileResult>(*shifted->compiled);
+                auto& descriptor = patched->bindings[shifted->flatBinding].guestDescriptor;
+                for (std::size_t k = 0; k < shifted->dataPositions.size(); ++k) {
+                    if (shifted->dataSlots[k] < descriptor.size()) descriptor[shifted->dataSlots[k]] = shifted->words[shifted->dataPositions[k]];
+                }
+                shifted->compiled = std::move(patched);
+            }
+            relocated = std::move(shifted);
+            hitDelta = candidate.delta;
+            break;
+        }
+    }
+    std::lock_guard cacheLock(dispatchCacheMutex);
+    auto& counters = entryCounters;
+    counters.imagesFlushed += imagesFlushed;
+    counters.runsSynced += runsSynced;
+    counters.userPointerNoRule += noRule;
+    counters.userPointerValidated += validated;
+    counters.userPointerDiffering += differing;
+    counters.userPointerUnordered += unordered;
+    if (relocated == nullptr) return;
+    ++counters.userPointerHits;
+    if (const auto stride = dispatchBaseStride.find(baseKey); stride != dispatchBaseStride.end() && stride->second == hitDelta) ++counters.userPointerStrideHits;
+    dispatchBaseStride[baseKey] = hitDelta;
+    ++dispatchCacheHits;
+    compiledResult = relocated->compiled;
+    regions.clear();
+    appendEntryRegions(*relocated, regions);
+    captured.reserve(memory.size() + regions.size());
+    captured.assign(memory.begin(), memory.end());
+    captured.insert(captured.end(), regions.begin(), regions.end());
+    cached = true;
+    if (dispatchCache.find(key) != dispatchCache.end()) return;
+    ++counters.userPointerCopies;
+    auto created = std::make_shared<DispatchEntry>();
+    created->touched = dispatchCacheHits;
+    accountVariant(*relocated, true);
+    created->variants.push_back(relocated);
+    dispatchOrder.push_front(key);
+    created->order = dispatchOrder.begin();
+    dispatchCache.emplace(key, std::move(created));
+    indexDispatchKey(baseKey, key, userData);
+    if (dispatchCache.size() > dispatchCacheEntries()) {
+        eraseDispatchEntry(dispatchCache.find(dispatchOrder.back()));
+        ++dispatchCacheEvictions;
+    }
 }
 
 void Driver::traceFailedRelocation(std::uint64_t program, const DispatchVariant& candidate) {
