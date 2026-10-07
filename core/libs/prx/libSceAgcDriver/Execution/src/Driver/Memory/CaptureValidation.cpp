@@ -5,6 +5,18 @@
 
 namespace AgcDriver::DriverDetail {
 
+namespace {
+
+// A masked region (data positions allowed to differ) is copied once from the mapped pages and
+// compared word by word, instead of CompareMapped and, on a difference (nearly every data hit's
+// region), CopyMapped again. APS5_NO_ONEPASS_COMPARE=1 restores the two walks.
+bool onePassMaskedCompare() {
+    static const bool onePass = std::getenv("APS5_NO_ONEPASS_COMPARE") == nullptr;
+    return onePass;
+}
+
+}
+
 bool Driver::captureStable(std::span<const ShaderRecompiler::MemoryRegion> captured) {
     using Policy = ShaderMemory::PendingWrite;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -118,9 +130,9 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
             } else if (!unsynced) same = GuestMemory::EqualsCommitted(region.guestAddress, region.bytes);
             else if (validateLegacy()) same = GuestMemory::EqualsCommittedUnsynced(region.guestAddress, region.bytes);
             else {
-                auto outcome = GuestMemory::CompareMapped(region.guestAddress, region.bytes);
                 masked = !isPending && data != nullptr;
-                if (outcome == GuestMemory::Compare::Differs && masked) outcome = compareMasked(region, first);
+                auto outcome = masked && onePassMaskedCompare() ? compareMasked(region, first) : GuestMemory::CompareMapped(region.guestAddress, region.bytes);
+                if (outcome == GuestMemory::Compare::Differs && masked && !onePassMaskedCompare()) outcome = compareMasked(region, first);
                 if (outcome == GuestMemory::Compare::Unmapped && unmapped != nullptr) *unmapped = true;
                 same = outcome == GuestMemory::Compare::Equal;
             }

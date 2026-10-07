@@ -60,6 +60,10 @@ struct DrawEntryCounters {
 
     std::uint64_t registerKeyLookups = 0, registerKeyHits = 0, decodeSkipped = 0, decodePartial = 0, facadeMismatches = 0, verifyDecodes = 0, verifyDecodeMismatches = 0;
     double keyUs = 0;
+    // The validate phase split (APS5_PROFILE_DRAW): the stage compares (validateVariant), the
+    // hit's patched results, and the patched copies made or reused.
+    double compareUs = 0, patchUs = 0;
+    std::uint64_t compareCalls = 0, patchedMade = 0, patchedReused = 0;
     // Data hits (DrawStageHits): hits with at least one stage's flat-SRT data words refreshed.
     std::uint64_t dataHits = 0, dataStages = 0, dataWordsRefreshed = 0, dataInserts = 0, dataPositionsInserted = 0, dataVerified = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();

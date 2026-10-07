@@ -53,6 +53,11 @@ struct DispatchVariant {
     std::vector<ShaderRecompiler::MemoryRegion> captured;
     std::vector<std::pair<std::uint64_t, std::size_t>> spans;
     std::atomic<std::uint64_t> generation{0};
+    // Draw data hits (DrawLookup.cpp): the one patched copy of `compiled` the variant's hits bind,
+    // reused while no earlier draw still holds it (use_count 1) instead of a deep copy per hit (a
+    // DescriptorBinding is seven vectors; ~130k copies per 10 s in Boletaria); only the flat
+    // binding's data slots are rewritten. APS5_NO_PATCHED_RESULT_REUSE=1 copies per hit again.
+    std::shared_ptr<ShaderRecompiler::RecompileResult> patched;
 };
 
 struct DispatchEntry {

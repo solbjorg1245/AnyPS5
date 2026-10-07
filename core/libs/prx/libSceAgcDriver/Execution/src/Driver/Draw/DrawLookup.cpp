@@ -1,8 +1,19 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <chrono>
+#include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+bool patchedResultReuse() {
+    static const bool reuse = std::getenv("APS5_NO_PATCHED_RESULT_REUSE") == nullptr;
+    return reuse;
+}
+
+}
 
 void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, DrawStageHits& hits, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs) {
     using Role = ShaderRecompiler::ProgramRole;
@@ -78,6 +89,8 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> liveData(programs.size());
             const bool dataAllowed = dataHits() && !verifyDrawEntries();
             std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0;
+            double compareUs = 0, patchUs = 0;
+            std::uint64_t compareCalls = 0, patchedMade = 0, patchedReused = 0;
             if (entry->stages.size() != programs.size()) miss = DrawMiss::Stages;
 
             std::uint32_t cursor = 0;
@@ -99,8 +112,13 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         appendEntryRegions(*variant, regions);
                         ++compared;
                         auto* live = dataAllowed ? &liveData[i] : nullptr;
+                        const auto compareStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                         auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
                         if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
+                        if (profile) {
+                            compareUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - compareStart).count();
+                            ++compareCalls;
+                        }
                         if (!anyLayout) outcome = result;
                         anyLayout = true;
                         if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) continue;
@@ -121,12 +139,13 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             // The hit's stage results; a data hit's stages carry the live words and a patched copy.
             std::uint64_t dataStages = 0, dataWords = 0;
             if (drawHit) {
+                const auto patchStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 hits.liveWords.assign(programs.size(), {});
                 hits.results.assign(programs.size(), nullptr);
                 hits.data = false;
                 for (std::size_t i = 0; i < programs.size(); ++i) {
                     if (matched[i] == nullptr) continue;
-                    const auto& variant = *matched[i];
+                    auto& variant = *matched[i];
                     hits.results[i] = variant.compiled;
                     if (liveData[i].empty() || variant.flatBinding >= variant.compiled->bindings.size()) continue;
                     auto& words = hits.liveWords[i];
@@ -134,7 +153,20 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     for (const auto& [position, value] : liveData[i]) words[position] = value;
                     matchedRegions[i].clear();
                     appendEntryRegions(variant, matchedRegions[i], &words);
-                    auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
+                    // The patched copy differs from `compiled` only at the flat binding's data slots,
+                    // rewritten below on every hit, so one copy per variant serves every hit nobody
+                    // else still holds (the previous draw's hits.results and results are cleared
+                    // before this lookup; a holder elsewhere gets its own copy, which the variant then
+                    // keeps instead).
+                    std::shared_ptr<ShaderRecompiler::RecompileResult> patched;
+                    if (patchedResultReuse() && variant.patched != nullptr && variant.patched.use_count() == 1) {
+                        patched = variant.patched;
+                        ++patchedReused;
+                    } else {
+                        patched = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
+                        if (patchedResultReuse()) variant.patched = patched;
+                        ++patchedMade;
+                    }
                     auto& descriptor = patched->bindings[variant.flatBinding].guestDescriptor;
                     for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
                         if (variant.dataSlots[k] < descriptor.size()) descriptor[variant.dataSlots[k]] = words[variant.dataPositions[k]];
@@ -144,12 +176,18 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     ++dataStages;
                     dataWords += liveData[i].size();
                 }
+                if (profile) patchUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - patchStart).count();
             }
             std::lock_guard cacheLock(drawCacheMutex);
             auto& counters = drawEntryCounters;
             counters.stageValidations += stageValidations;
             counters.stageEqual += stageEqual;
             counters.variantsCompared += compared;
+            counters.compareUs += compareUs;
+            counters.compareCalls += compareCalls;
+            counters.patchUs += patchUs;
+            counters.patchedMade += patchedMade;
+            counters.patchedReused += patchedReused;
             if (drawHit) {
                 ++counters.hits;
                 if (registerKey) ++counters.registerKeyHits;

@@ -482,13 +482,15 @@ std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope
     return units;
 }
 
-bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes) {
-    if (!UnitShadowEnabled() || bytes == 0) return false;
-    const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
-    auto& registry = Registry();
-    std::lock_guard lock(registry.mutex);
-    for (const auto& shadow : overlapping(registry, address, end)) {
-        if (shadow->liveUnits == 0) continue;
+// Whether a live unit of any shadow covers [address, end), under the registry lock: the byBase
+// walk of overlapping() without its vector.
+bool anyShadowedLocked(const Shadows& registry, std::uint64_t address, std::uint64_t end) {
+    if (end <= address || registry.byBase.empty()) return false;
+    auto it = registry.byBase.upper_bound(address);
+    if (it != registry.byBase.begin()) --it;
+    for (; it != registry.byBase.end() && it->first < end; ++it) {
+        const auto& shadow = it->second;
+        if (shadow->liveUnits == 0 || address >= shadow->ImportEnd() || shadow->importBase >= end) continue;
         const auto begin = std::max(address, shadow->importBase);
         const auto stop = std::min(end, shadow->ImportEnd());
         for (auto unit = shadow->UnitOf(begin); unit <= shadow->UnitOf(stop - 1); ++unit) {
@@ -498,10 +500,21 @@ bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes) {
     return false;
 }
 
+bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes) {
+    if (!UnitShadowEnabled() || bytes == 0) return false;
+    const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    auto& registry = Registry();
+    std::lock_guard lock(registry.mutex);
+    return anyShadowedLocked(registry, address, end);
+}
+
+// One lock for the whole set (a draw-cache validation asks for every run of a variant).
 bool AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
-    if (!UnitShadowEnabled()) return false;
+    if (!UnitShadowEnabled() || ranges.empty()) return false;
+    auto& registry = Registry();
+    std::lock_guard lock(registry.mutex);
     for (const auto& [begin, end] : ranges) {
-        if (end > begin && AnyShadowedOverlaps(begin, static_cast<std::size_t>(end - begin))) return true;
+        if (end > begin && anyShadowedLocked(registry, begin, end)) return true;
     }
     return false;
 }
