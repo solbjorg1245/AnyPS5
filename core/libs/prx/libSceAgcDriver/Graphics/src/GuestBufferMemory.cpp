@@ -2836,17 +2836,23 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
     return result;
 }
 
-std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceReads() const {
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
-    if (!uploaded || committed) return result;
+std::span<const std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const {
+    out.clear();
+    if (!uploaded || committed) return {};
     if (space != nullptr) {
         for (const auto& region : space->base) {
-            if (region.direct != nullptr) result.emplace_back(region.begin, region.end);
+            if (region.direct != nullptr) out.emplace_back(region.begin, region.end);
         }
     }
     for (const auto& region : regions) {
-        if (region.direct != nullptr) result.emplace_back(region.begin, region.end);
+        if (region.direct != nullptr) out.emplace_back(region.begin, region.end);
     }
+    return out;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceReads() const {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
+    InPlaceReads(result);
     return result;
 }
 

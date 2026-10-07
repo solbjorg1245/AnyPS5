@@ -94,14 +94,20 @@ struct VertexInputLayout {
     std::vector<VkVertexInputAttributeDescription> attributes;
 };
 
-inline VertexInputLayout BuildVertexInputLayout(const Context& context, std::span<const ShaderRecompiler::VertexAttribute> attributes) {
+// Lays the attributes out into `result` (cleared first, keeping its capacity: a draw without a
+// recipe builds its layout into its DrawInputScratch). A duplicate location is found among the
+// attributes already laid out (a handful per draw: no set).
+inline void BuildVertexInputLayoutInto(const Context& context, std::span<const ShaderRecompiler::VertexAttribute> attributes, VertexInputLayout& result) {
     Require(attributes.size() <= context.limits.maxVertexInputBindings && attributes.size() <= context.limits.maxVertexInputAttributes, "vertex input count exceeds device limits");
-    VertexInputLayout result;
-    std::set<std::uint32_t> locations;
+    result.bindings.clear();
+    result.attributes.clear();
+    result.bindings.reserve(attributes.size());
+    result.attributes.reserve(attributes.size());
     for (const auto& attribute : attributes) {
         const auto& fields = attribute.resource.fields;
         const auto format = DecodeVertexFormat(attribute);
-        Require(attribute.location < context.limits.maxVertexInputAttributes && locations.insert(attribute.location).second, "invalid or duplicate vertex attribute location");
+        const bool duplicate = std::any_of(result.attributes.begin(), result.attributes.end(), [&](const VkVertexInputAttributeDescription& laid) { return laid.location == attribute.location; });
+        Require(attribute.location < context.limits.maxVertexInputAttributes && !duplicate, "invalid or duplicate vertex attribute location");
         Require(attribute.fetchIndex <= 1, "unsupported vertex fetch index");
         Require((fields[1] & 0x80000000u) == 0 && (fields[3] & 0x00800000u) == 0 && (fields[3] >> 30u) == 0, "unsupported vertex buffer descriptor flags");
         const auto stride = (fields[1] >> 16u) & 0x3fffu;
@@ -116,6 +122,11 @@ inline VertexInputLayout BuildVertexInputLayout(const Context& context, std::spa
         result.bindings.push_back({binding, stride, attribute.fetchIndex == 0 ? VK_VERTEX_INPUT_RATE_VERTEX : VK_VERTEX_INPUT_RATE_INSTANCE});
         result.attributes.push_back({attribute.location, binding, format.format, 0});
     }
+}
+
+inline VertexInputLayout BuildVertexInputLayout(const Context& context, std::span<const ShaderRecompiler::VertexAttribute> attributes) {
+    VertexInputLayout result;
+    BuildVertexInputLayoutInto(context, attributes, result);
     return result;
 }
 
@@ -163,19 +174,31 @@ struct VertexCopyPlan {
     std::vector<std::uint64_t> offsets;
 };
 
-inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
-    VertexCopyPlan plan;
+// Plans into `plan` and `order` (both cleared first, keeping their capacity: a draw plans into its
+// DrawInputScratch). The fetches are ordered by a stable insertion sort: a draw has a handful of
+// them, and std::stable_sort would take a temporary buffer from the heap for every draw.
+inline void PlanVertexCopiesInto(std::span<const VertexFetch> fetches, VertexCopyPlan& plan, std::vector<std::size_t>& order) {
+    plan.copies.clear();
     plan.copyOf.assign(fetches.size(), 0);
     plan.offsets.assign(fetches.size(), 0);
-    std::vector<std::size_t> order(fetches.size());
+    order.resize(fetches.size());
     for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
-    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+    const auto before = [&](std::size_t a, std::size_t b) {
         const auto& x = fetches[a];
         const auto& y = fetches[b];
         if (x.stride != y.stride) return x.stride < y.stride;
         if (x.fetchIndex != y.fetchIndex) return x.fetchIndex < y.fetchIndex;
         return x.begin < y.begin;
-    });
+    };
+    for (std::size_t i = 1; i < order.size(); ++i) {
+        const auto item = order[i];
+        std::size_t j = i;
+        while (j > 0 && before(item, order[j - 1])) {
+            order[j] = order[j - 1];
+            --j;
+        }
+        order[j] = item;
+    }
     std::size_t lead = fetches.size();
     for (const auto i : order) {
         const auto& fetch = fetches[i];
@@ -190,6 +213,12 @@ inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
         plan.copyOf[i] = plan.copies.size() - 1;
         plan.offsets[i] = fetch.begin - copy.first;
     }
+}
+
+inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
+    VertexCopyPlan plan;
+    std::vector<std::size_t> order;
+    PlanVertexCopiesInto(fetches, plan, order);
     return plan;
 }
 

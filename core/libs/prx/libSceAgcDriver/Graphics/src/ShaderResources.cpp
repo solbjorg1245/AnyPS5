@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/FrameTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ScratchLease.hpp"
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -2878,10 +2879,23 @@ bool DataMoved(std::span<const CompiledShader> shaders, std::int32_t shader, std
 
 }
 
+namespace {
+
+// The in-place read ranges one query of a ShaderResources lists (GuestBufferMemory::InPlaceReads),
+// kept with its capacity on the calling thread (ScratchLease): the per-draw queries below listed
+// them into a fresh vector each, three to four times per draw.
+struct InPlaceReadsScratch {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    unsigned depth = 0;
+};
+
+}
+
 bool ShaderResources::RebaseEligible(std::span<const CompiledShader> shaders, const Recorder& recorder, bool& rebased) const {
     rebased = false;
     if (_set == VK_NULL_HANDLE || usesBda) return true;
-    const auto reads = guestMemory.InPlaceReads();
+    ScratchLease<InPlaceReadsScratch> scratch;
+    const auto reads = guestMemory.InPlaceReads(scratch->reads);
     for (const auto& item : allocations) {
         if (!item.guest) {
             if (item.buffer == nullptr || !DataRole(item.role)) continue;
@@ -2913,8 +2927,10 @@ bool ShaderResources::RebaseEligible(std::span<const CompiledShader> shaders, co
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const CompiledShader> shaders) const {
     if (_set == VK_NULL_HANDLE || usesBda) return {};
-    const auto reads = guestMemory.InPlaceReads();
-    auto result = std::make_shared<DrawBindings>();
+    ScratchLease<InPlaceReadsScratch> scratch;
+    const auto reads = guestMemory.InPlaceReads(scratch->reads);
+    // Made once the first snapshot is selected: most draws select none and return nothing.
+    std::shared_ptr<DrawBindings> result;
     std::vector<std::size_t> selected;
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
@@ -2933,6 +2949,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 if (patch.allocation == index && patch.byte < item.size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
             }
             selected.push_back(index);
+            if (result == nullptr) result = std::make_shared<DrawBindings>();
             result->snapshots.push_back({0, std::move(buffer), index});
             continue;
         }
@@ -2954,6 +2971,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
         }
         selected.push_back(index);
+        if (result == nullptr) result = std::make_shared<DrawBindings>();
         result->snapshots.push_back({begin, std::move(buffer), index});
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
@@ -3065,7 +3083,10 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
-    recorder.NotePendingReads(guestMemory.InPlaceReads(), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
+    {
+        ScratchLease<InPlaceReadsScratch> scratch;
+        recorder.NotePendingReads(guestMemory.InPlaceReads(scratch->reads), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
+    }
     if (SkipWriteBack()) {
         recorder.ReleaseClaims();
         return;
@@ -3122,7 +3143,8 @@ bool ShaderResources::WritesMemory() const {
 }
 
 bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) const {
-    const auto reads = guestMemory.InPlaceReads();
+    ScratchLease<InPlaceReadsScratch> scratch;
+    const auto reads = guestMemory.InPlaceReads(scratch->reads);
     return std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; });
 }
 

@@ -241,6 +241,9 @@ public:
     // the GPU copies out of an import (gpuCopy) notes its read itself when the copy is recorded.
     // For the recorder's read tracking (ShaderResources::MarkGpuWrites); nothing once committed.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
+    // The same ranges listed into `out` (cleared first, keeping its capacity), as a span over it:
+    // a per-draw query lists them into a thread's scratch instead of a fresh vector.
+    std::span<const std::pair<std::uint64_t, std::uint64_t>> InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
 
 private:
     struct Region {

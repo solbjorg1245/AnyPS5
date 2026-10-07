@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawScratch.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
@@ -535,12 +536,24 @@ std::map<std::vector<std::uint64_t>, std::string>& validationFailures() {
     return failures;
 }
 
-std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, bool& memoized, bool& hit) {
+// The fragment outputs as a bit per color attachment index: ValidateShaders lists the locations
+// below the attachment count (at most 8), and a draw copies the set three times (the memo, its
+// inputs, its recipe) where a word copies for free.
+std::uint32_t FragmentOutputMask(const std::set<std::uint32_t>& locations) {
+    std::uint32_t mask = 0;
+    for (const auto location : locations) {
+        if (location < 32) mask |= 1u << location;
+    }
+    return mask;
+}
+
+// `key` is the caller's scratch for the memo key (cleared first, keeping its capacity).
+std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, std::vector<std::uint64_t>& key, bool& memoized, bool& hit) {
     memoized = false;
     hit = false;
-    std::vector<std::uint64_t> key;
+    key.clear();
     const bool keyed = ValidationKey(context, shaders, state, key);
-    static std::map<std::vector<std::uint64_t>, std::set<std::uint32_t>> memo;
+    static std::map<std::vector<std::uint64_t>, std::uint32_t> memo;
     if (keyed) {
         memoized = true;
         std::lock_guard lock(validationMutex());
@@ -549,15 +562,15 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
             return found->second;
         }
     }
-    std::set<std::uint32_t> outputs;
+    std::uint32_t outputs = 0;
     try {
-        outputs = ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing);
+        outputs = FragmentOutputMask(ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing));
     } catch (const std::exception& error) {
         if (keyed) {
             std::lock_guard lock(validationMutex());
             auto& failures = validationFailures();
             if (failures.size() >= 1024) failures.clear();
-            failures.emplace(std::move(key), error.what());
+            failures.emplace(key, error.what());
         }
         throw;
     }
@@ -565,7 +578,7 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
         std::lock_guard lock(validationMutex());
         // A handful of configurations recur; a runaway key space is dropped wholesale.
         if (memo.size() >= 1024) memo.clear();
-        memo.emplace(std::move(key), outputs);
+        memo.emplace(key, outputs);
     }
     return outputs;
 }
@@ -781,22 +794,27 @@ struct DrawInputs {
     VkBuffer indexHandle = VK_NULL_HANDLE;
     VkDeviceSize indexOffset = 0;
     std::uint32_t maxIndex = 0;
-    VertexInputLayout vertexInput;
+    // The recipe's layout, or the one built into the draw's DrawInputScratch; the spans below point
+    // into that scratch too (the draw's lease outlives its inputs). `vertexBuffers` stays owned: a
+    // recorded draw moves it into its Kept.
+    const VertexInputLayout* vertexInput = nullptr;
     std::vector<std::shared_ptr<Buffer>> vertexBuffers;
-    std::vector<VkBuffer> vertexHandles;
-    std::vector<VkDeviceSize> vertexOffsets;
+    std::span<const VkBuffer> vertexHandles;
+    std::span<const VkDeviceSize> vertexOffsets;
     // The guest ranges the GPU reads in place, noted on the batch (Recorder::NotePendingReads).
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> inPlaceRanges;
-    std::set<std::uint32_t> fragmentOutputs;
+    std::span<const std::pair<std::uint64_t, std::uint64_t>> inPlaceRanges;
+    // A bit per color attachment index the fragment stage exports to (CachedFragmentOutputs).
+    std::uint32_t fragmentOutputs = 0;
     VkPipelineStageFlags shaderStages = 0;
     std::uint32_t meshGroups = 0;
 };
 
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
-// instead of computed.
-DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe) {
+// instead of computed. `scratch` is the draw's (DrawInputScratch): the inputs point into it.
+DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, DrawInputScratch& scratch) {
     DrawInputs inputs;
+    scratch.inPlaceRanges.clear();
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
     APS5_LOG_OUT_DEBUG("State colorTarget=%u render=%ux%u colorAddress=0x%llx colorBytes=%llu colorExtent=%ux%u", state.hasColorTarget ? 1u : 0u, state.renderExtent.width, state.renderExtent.height, static_cast<unsigned long long>(state.color.address), static_cast<unsigned long long>(state.color.bytes), state.color.extent.width, state.color.extent.height);
     APS5_LOG_OUT_DEBUG("Viewport x=%f y=%f w=%f h=%f minDepth=%f maxDepth=%f", state.viewport.x, state.viewport.y, state.viewport.width, state.viewport.height, state.viewport.minDepth, state.viewport.maxDepth);
@@ -834,7 +852,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         inputs.fragmentOutputs = recipe->fragmentOutputs;
         inputs.shaderStages = recipe->shaderStages;
     } else {
-        inputs.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, outcome.validateMemoized, outcome.validateHit);
+        inputs.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, scratch.validationKey, outcome.validateMemoized, outcome.validateHit);
         inputs.shaderStages = PipelineStages(shaders);
     }
     APS5_LOG_CHARS_OUT_DEBUG("ValidateShaders OK");
@@ -871,7 +889,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (copy.import != nullptr) {
             ++outcome.inPlaceInputs;
             outcome.inPlaceInputBytes += indexBytes;
-            inputs.inPlaceRanges.emplace_back(draw.indexAddress, draw.indexAddress + indexBytes);
+            scratch.inPlaceRanges.emplace_back(draw.indexAddress, draw.indexAddress + indexBytes);
             inputs.indexHandle = copy.import->buffer;
             inputs.indexOffset = copy.importOffset;
         } else if (!copy.reused) {
@@ -905,15 +923,21 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
     const auto& attributes = shaders.front().program->vertexAttributes;
     // Validates the vertex descriptors; the layout also keys and builds the pipeline.
-    if (recipe != nullptr) inputs.vertexInput = recipe->vertexInput;
-    else inputs.vertexInput = BuildVertexInputLayout(context, attributes);
-    inputs.vertexOffsets.assign(attributes.size(), 0);
+    if (recipe != nullptr) {
+        inputs.vertexInput = &recipe->vertexInput;
+    } else {
+        BuildVertexInputLayoutInto(context, attributes, scratch.vertexInput);
+        inputs.vertexInput = &scratch.vertexInput;
+    }
+    auto& vertexOffsets = scratch.vertexOffsets;
+    vertexOffsets.assign(attributes.size(), 0);
     // An indexed draw's vertex offset moves every fetch: the copy must reach the last one.
     if (draw.indexed) {
         Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - inputs.maxIndex, "indexed draw vertex range overflow");
         inputs.maxIndex += draw.firstVertex;
     }
-    std::vector<VertexFetch> fetches;
+    auto& fetches = scratch.fetches;
+    fetches.clear();
     fetches.reserve(attributes.size());
     for (const auto& attribute : attributes) {
         // An indirect draw's counts are unknown here: the descriptor's whole range is copied.
@@ -923,13 +947,17 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         Require(!state.hasColorTarget || address + bytes <= state.color.address || state.color.address + state.color.bytes <= address, "vertex buffer aliases the render target");
         fetches.push_back({address, address + bytes, (fields[1] >> 16u) & 0x3fffu, attribute.fetchIndex, DecodeVertexFormat(attribute).alignment});
     }
-    const auto plan = PlanVertexCopies(fetches);
+    PlanVertexCopiesInto(fetches, scratch.plan, scratch.planOrder);
+    const auto& plan = scratch.plan;
     // Per planned copy: the buffer bound (a copy, or the host import read in place) and the offset
     // of the copy's first byte in it.
-    std::vector<VkBuffer> copyHandles;
-    std::vector<VkDeviceSize> copyBases;
+    auto& copyHandles = scratch.copyHandles;
+    auto& copyBases = scratch.copyBases;
+    copyHandles.clear();
+    copyBases.clear();
     copyHandles.reserve(plan.copies.size());
     copyBases.reserve(plan.copies.size());
+    inputs.vertexBuffers.reserve(plan.copies.size());
     for (const auto& [begin, end] : plan.copies) {
         const auto bytes = static_cast<std::size_t>(end - begin);
         GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
@@ -937,7 +965,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (copy.import != nullptr) {
             ++outcome.inPlaceInputs;
             outcome.inPlaceInputBytes += bytes;
-            inputs.inPlaceRanges.emplace_back(begin, end);
+            scratch.inPlaceRanges.emplace_back(begin, end);
             copyHandles.push_back(copy.import->buffer);
             copyBases.push_back(copy.importOffset);
             inputs.vertexBuffers.push_back(nullptr);
@@ -952,10 +980,16 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         copyBases.push_back(0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
+    auto& vertexHandles = scratch.vertexHandles;
+    vertexHandles.clear();
+    vertexHandles.reserve(attributes.size());
     for (std::size_t i = 0; i < attributes.size(); ++i) {
-        inputs.vertexHandles.push_back(copyHandles[plan.copyOf[i]]);
-        inputs.vertexOffsets[i] = copyBases[plan.copyOf[i]] + plan.offsets[i];
+        vertexHandles.push_back(copyHandles[plan.copyOf[i]]);
+        vertexOffsets[i] = copyBases[plan.copyOf[i]] + plan.offsets[i];
     }
+    inputs.vertexHandles = vertexHandles;
+    inputs.vertexOffsets = vertexOffsets;
+    inputs.inPlaceRanges = scratch.inPlaceRanges;
     timer.phase(PhaseVertex);
     return inputs;
 }
@@ -1642,10 +1676,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
 // The state with the outputs the pixel shader lacks masked: Vulkan leaves attachments a pixel
 // shader has no output for undefined, so their writes are masked (shaders that only store to
 // images or buffers keep their targets as they were). Empty when no mask must change.
-std::optional<State> maskedState(const State& state, const std::set<std::uint32_t>& fragmentOutputs) {
+std::optional<State> maskedState(const State& state, std::uint32_t fragmentOutputs) {
     std::optional<State> masked;
     for (std::size_t index = 0; index < state.blends.size(); ++index) {
-        if (fragmentOutputs.contains(static_cast<std::uint32_t>(index)) || state.blends[index].colorWriteMask == 0) continue;
+        const bool exported = index < 32 && ((fragmentOutputs >> index) & 1u) != 0;
+        if (exported || state.blends[index].colorWriteMask == 0) continue;
         if (!masked.has_value()) masked = state;
         masked->blends[index].colorWriteMask = 0;
     }
@@ -1698,7 +1733,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
     double ownWaitedMs = 0;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
-    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr);
+    ScratchLease<DrawInputScratch> inputScratch;
+    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, *inputScratch);
     if (inputs.nothing) return;
     const auto* args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
@@ -1911,7 +1947,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // The state is copied only when a mask must change.
     auto masked = maskedState(state, inputs.fragmentOutputs);
     const State& pipelineState = masked.has_value() ? *masked : state;
-    auto pipeline = CachedPipeline(context, pipelineState, inputs.vertexInput, *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    auto pipeline = CachedPipeline(context, pipelineState, *inputs.vertexInput, *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     std::vector<std::shared_ptr<StorageTexture>> owners;
@@ -1951,7 +1987,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             passKey = (passKey ^ state.renderExtent.width) * 1099511628211ull;
             passKey = (passKey ^ state.renderExtent.height) * 1099511628211ull;
             recipe->passKey = passKey;
-            recipe->vertexInput = inputs.vertexInput;
+            recipe->vertexInput = *inputs.vertexInput;
             recipe->pushStages = PushConstantStages(shaders);
             if (recipe->pushStages != 0) {
                 recipe->pushBytes = AssemblePushConstants(shaders);
@@ -2206,7 +2242,8 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     auto* recorder = Recorder::Active();
     if (!RecordDraws() || recorder == nullptr || DumpTargetLimit() != 0) return miss(DrawRecipeMiss::NotRecordable);
     Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == state.colors.size(), "draw recipe targets do not match the state");
-    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, &recipe);
+    ScratchLease<DrawInputScratch> inputScratch;
+    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, &recipe, *inputScratch);
     if (inputs.nothing) {
         result.recorded = true;
         return result;

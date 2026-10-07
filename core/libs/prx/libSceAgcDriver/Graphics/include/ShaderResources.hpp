@@ -165,6 +165,7 @@ public:
     // ranges, the regions read in place, and the storage images with whether each is written.
     const std::vector<std::pair<std::uint64_t, std::uint64_t>>& GpuWrites() const { return guestMemory.Writes(); }
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const { return guestMemory.InPlaceReads(); }
+    std::span<const std::pair<std::uint64_t, std::uint64_t>> InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const { return guestMemory.InPlaceReads(out); }
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
     // Whether a use writes guest memory beyond a draw's attachments (storage images, written or
     // copied buffers, an address-based build's unknown writes), or reads `image` (a view of it
