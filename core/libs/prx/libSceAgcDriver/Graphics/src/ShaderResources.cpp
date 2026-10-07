@@ -1489,6 +1489,28 @@ bool VerifyProofs() {
     return enabled;
 }
 
+// APS5_VERIFY_FAST_PROOFS=1 (diagnostic, session 21): after every fast proof that succeeds the full
+// walk runs beside it; when the walk would return another object or upload again, the first stale
+// element is named on stderr (the first two cases per variant, with the template's resources), the case is
+// counted every 10 s and the proof fails, so the template is rebuilt. Found because templates
+// that survive across frames (APS5_RESOURCE_CACHE_ENTRIES=4096) doubled the game's visible set
+// (t231) while APS5_NO_FAST_REVALIDATE=1 did not (t235).
+bool VerifyFastProofs() {
+    static const bool enabled = std::getenv("APS5_VERIFY_FAST_PROOFS") != nullptr;
+    return enabled;
+}
+
+// The fast proof notes a written storage image on the depth surfaces covering its memory
+// (NoteDepthSurfaceWrite), as the build and the full walk do: without the note a surface
+// sampled after a compute pass overwrote it served its own stale depth (DepthSurfaceTexture),
+// which made the game's GPU occlusion culling conservative and doubled the draws per frame
+// once compute templates survived across frames (APS5_RESOURCE_CACHE_ENTRIES=4096, t231;
+// t235/t237 with the walk did not). APS5_NO_FAST_DEPTH_NOTE=1 skips the note as before.
+bool FastDepthNote() {
+    static const bool enabled = std::getenv("APS5_NO_FAST_DEPTH_NOTE") == nullptr;
+    return enabled;
+}
+
 // Whether a sampled surface's keys are the very keys of the image the view follows (the same
 // metadata, extent, format and alpha placement: the same scan), so the image's proof serves it.
 bool SameKeySurface(const StorageTexture* source, const GuestTextureResource& resource, std::uint64_t guestBytes) {
@@ -1647,6 +1669,8 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto& own = image->Descriptor();
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
+        // A written image overwrites the depth surfaces covering its memory (see FastDepthNote).
+        if (i < storageWritten.size() && storageWritten[i] && FastDepthNote()) NoteDepthSurfaceWrite(address, own.width, own.height);
         if (GuestMemory::CollectWrites(address, bytes) == 0) return fail(FastFail::Collect);
         if (own.dccAddress != 0) {
             // Refresh's unchanged branch (its key compare against the keys the content was
@@ -1851,6 +1875,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // else by the same lookups as the build (which refresh or replace them as guest memory changed):
     // they must hand back the very objects the set's views belong to. The build appended them stage
     // by stage, binding by binding, so the walk repeats that order.
+    // The first element the full walk would replace (APS5_VERIFY_FAST_PROOFS).
+    char walkMismatch[200] = {};
     const auto fullWalk = [&] {
         lookupLog.clear();
         std::size_t textureIndex = 0;
@@ -1865,25 +1891,37 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                         const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
                         const auto resource = DecodeTextureResource(words);
                         const VkComponentMapping components{ComponentSwizzleFor(resource.dstSelX), ComponentSwizzleFor(resource.dstSelY), ComponentSwizzleFor(resource.dstSelZ), ComponentSwizzleFor(resource.dstSelW)};
-                        if (textureIndex >= textures.size() || cachedTexture(context, words, resource, components, 0, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element)) != textures[textureIndex]) return false;
+                        if (textureIndex >= textures.size() || cachedTexture(context, words, resource, components, 0, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element)) != textures[textureIndex]) {
+                            std::snprintf(walkMismatch, sizeof(walkMismatch), "sampled texture %zu of %zu (binding %u element %u) 0x%llx %ux%u format %u dcc 0x%llx", textureIndex, textures.size(), binding.binding, element, static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned>(resource.format), static_cast<unsigned long long>(resource.dccAddress));
+                            return false;
+                        }
                         ++textureIndex;
                     }
                 } else if (binding.kind == ShaderRecompiler::DescriptorKind::StorageImage) {
                     for (std::uint32_t element = 0; element < binding.count; ++element) {
                         const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
-                        if (storageIndex >= storageTextures.size()) return false;
+                        if (storageIndex >= storageTextures.size()) {
+                            std::snprintf(walkMismatch, sizeof(walkMismatch), "storage image %zu beyond the %zu recorded", storageIndex, storageTextures.size());
+                            return false;
+                        }
                         const auto resource = DecodeTextureResource(words);
                         if (storageIndex < storageWritten.size() && storageWritten[storageIndex]) NoteDepthSurfaceWrite(resource.baseAddress, resource.width, resource.height);
                         std::shared_ptr<StorageTexture> expected;
                         if (SameAsPreviousStorageElement(binding, element) && StorageDedupeEnabled()) expected = storageTextures[storageIndex - 1];
                         else expected = cachedStorageTexture(context, words, resource, storageMips[storageIndex]);
-                        if (expected != storageTextures[storageIndex]) return false;
+                        if (expected != storageTextures[storageIndex]) {
+                            std::snprintf(walkMismatch, sizeof(walkMismatch), "storage image %zu of %zu (binding %u element %u) 0x%llx %ux%u format %u dcc 0x%llx%s", storageIndex, storageTextures.size(), binding.binding, element, static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned>(resource.format), static_cast<unsigned long long>(resource.dccAddress), storageIndex < storageWritten.size() && storageWritten[storageIndex] ? " written" : "");
+                            return false;
+                        }
                         ++storageIndex;
                     }
                 }
             }
         }
-        if (textureIndex != textures.size() || storageIndex != storageTextures.size()) return false;
+        if (textureIndex != textures.size() || storageIndex != storageTextures.size()) {
+            std::snprintf(walkMismatch, sizeof(walkMismatch), "element counts %zu/%zu textures, %zu/%zu storage images", textureIndex, textures.size(), storageIndex, storageTextures.size());
+            return false;
+        }
         // The walk proved every object current again: the records move to what it proved, or one
         // spurious stamp (a label sharing a 64 KiB block with a surface's edge) would keep this
         // object on the full walk for good.
@@ -1952,6 +1990,54 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             }
             if (profile) Revalidations().proofsVerified.fetch_add(1, std::memory_order_relaxed);
         }
+    }
+    if (fast && VerifyFastProofs()) {
+        // The walk beside the proof: another object, or an upload (a moved content version), is a
+        // decision the fast proof got wrong (APS5_VERIFY_FAST_PROOFS, see VerifyFastProofs).
+        thread_local std::vector<std::pair<const StorageTexture*, std::uint64_t>> fastVersions;
+        fastVersions.clear();
+        for (const auto& surface : validatedTextures) {
+            if (surface.source != nullptr) fastVersions.emplace_back(surface.source, surface.source->Version());
+        }
+        for (const auto& image : storageTextures) fastVersions.emplace_back(image.get(), image->Version());
+        walkMismatch[0] = 0;
+        const bool same = fullWalk();
+        const auto moved = std::find_if(fastVersions.begin(), fastVersions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
+        static std::atomic<std::uint64_t> verified{0};
+        static std::atomic<std::uint64_t> wrong{0};
+        // The first two cases of each variant (64 variants at most), so a case that appears only
+        // in gameplay is printed after the intro's.
+        static HostMutex printedMutex;
+        static std::unordered_map<std::uint64_t, unsigned> printedByVariant;
+        static std::atomic<long long> lastReport{0};
+        verified.fetch_add(1, std::memory_order_relaxed);
+        const bool stale = !same || moved != fastVersions.end();
+        if (stale) {
+            wrong.fetch_add(1, std::memory_order_relaxed);
+            const auto variantId = shaders.front().program != nullptr ? shaders.front().program->variantId : 0;
+            bool print = false;
+            {
+                std::lock_guard printedLock(printedMutex);
+                auto found = printedByVariant.find(variantId);
+                if (found == printedByVariant.end() && printedByVariant.size() < 64) found = printedByVariant.emplace(variantId, 0u).first;
+                if (found != printedByVariant.end() && found->second < 2) {
+                    ++found->second;
+                    print = true;
+                }
+            }
+            if (print) {
+                char movedText[160] = {};
+                if (same && moved != fastVersions.end()) {
+                    const auto& own = moved->first->Descriptor();
+                    std::snprintf(movedText, sizeof(movedText), "image 0x%llx %ux%u format %u re-uploaded (version %llu -> %llu)", static_cast<unsigned long long>(own.baseAddress), own.width, own.height, static_cast<unsigned>(own.format), static_cast<unsigned long long>(moved->second), static_cast<unsigned long long>(moved->first->Version()));
+                }
+                std::fprintf(stderr, "[rescache] fast proof wrong (%s path, stage %u variant 0x%llx, %zu textures %zu storage images): %s%s | %s\n", ownRefreshed ? "T1" : accepted ? "accepted-overlap" : "fast", static_cast<unsigned>(shaders.front().stage), static_cast<unsigned long long>(shaders.front().program != nullptr ? shaders.front().program->variantId : 0), textures.size(), storageTextures.size(), same ? "" : walkMismatch, movedText, Describe().c_str());
+            }
+        }
+        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = lastReport.load();
+        if (nowMs - last >= 10000 && lastReport.compare_exchange_strong(last, nowMs)) std::fprintf(stderr, "[rescache] fast proofs verified %llu, wrong %llu\n", static_cast<unsigned long long>(verified.load()), static_cast<unsigned long long>(wrong.load()));
+        if (stale) return finish(false, false, ProofFailure::Other);
     }
     // (2) The imported buffers the set reads in place: results of storage images pending in them go
     // to guest memory first (as an upload does), then each import must still be the one the set was
@@ -2174,7 +2260,11 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     index.emplace(key, entries.begin());
     // Entries pin their textures and storage images past the texture caches' budgets, so the bound
     // stays modest: APS5_RESOURCE_CACHE_ENTRIES (default 1024) covers several frames of distinct
-    // dispatch and draw content.
+    // dispatch and draw content. Below the working set it thrashes (Boletaria: 11.3k draw-template
+    // builds per 10 s at 66-78 us, most of them templates evicted under the same key; 4096 entries
+    // leave 3.4k and save 3 us per draw packet), but at 4096 compute templates survive across frames
+    // and the fast proof then serves a stale one (the game draws twice as much): the default stays
+    // 1024 until that is fixed (PROGRESS session 21, APS5_VERIFY_FAST_PROOFS).
     static const std::size_t capacity = [] {
         const char* value = std::getenv("APS5_RESOURCE_CACHE_ENTRIES");
         const auto parsed = value ? std::strtoull(value, nullptr, 10) : 1024ull;
