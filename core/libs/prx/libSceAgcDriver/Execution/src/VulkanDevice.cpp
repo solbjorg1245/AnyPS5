@@ -47,6 +47,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <utility>
 
@@ -2654,6 +2655,21 @@ DispatchCounters& Dispatches() {
     return counters;
 }
 
+// The ThreadDeviceSplit row a DispatchTimer phase adds to (SplitRowCount: none).
+std::size_t DeviceSplitRowOf(DispatchPhase which) {
+    switch (which) {
+    case PhaseResourcesImages: return VulkanDevice::SplitImages;
+    case PhaseResourcesUpload: return VulkanDevice::SplitUpload;
+    case PhaseResourcesALocked:
+    case PhaseResourcesAddress: return VulkanDevice::SplitStageA;
+    case PhaseResourcesRevalidate: return VulkanDevice::SplitRevalidate;
+    case PhaseResourcesFullBuild: return VulkanDevice::SplitFullBuild;
+    case PhaseProof: return VulkanDevice::SplitProof;
+    case PhaseRecord: return VulkanDevice::SplitRecord;
+    default: return VulkanDevice::SplitRowCount;
+    }
+}
+
 // The [recipe] line (APS5_PROFILE_DRAW, every 10 s), dispatch and indirect rows apart. The
 // pre-check runs without the mutex, so the counters are atomic.
 enum RecipeMiss : std::size_t { MissNoRecipe, MissDevice, MissTemplateGone, MissObjectsGone, MissNotRecordable, RecipeMissCount };
@@ -2735,6 +2751,7 @@ struct DispatchTimer {
         auto& d = Dispatches();
         callMs[which] += ms;
         d.phaseTotals[which] += ms;
+        if (const auto row = DeviceSplitRowOf(which); row < VulkanDevice::SplitRowCount) VulkanDevice::ThreadDeviceSplit().ms[row] += ms;
         if (indirect) d.indirectHold.phaseMs[which] += ms;
     }
     void phase(DispatchPhase which) {
@@ -2989,6 +3006,28 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
     }
     if (profile) prepared->prepareMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     return prepared;
+}
+
+namespace {
+
+// APS5_PROFILE_DRAW: classifies a build (stage B or full) for ThreadDeviceSplit().missKind against
+// this thread's earlier builds (bounded: the sets restart at 1M entries).
+void ClassifyBuild(const Graphics::CompiledShader& shader) {
+    static thread_local std::unordered_set<std::uint64_t> rebasedKeys, variants;
+    if (rebasedKeys.size() > (1u << 20u)) rebasedKeys.clear();
+    if (variants.size() > (1u << 20u)) variants.clear();
+    const auto key = Graphics::ShaderResources::ContentKey(shader, false, true);
+    const auto hash = std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(key.data()), key.size() * sizeof(std::uint32_t)));
+    const auto variant = shader.program->variantId;
+    auto& split = VulkanDevice::ThreadDeviceSplit();
+    split.missKind = !rebasedKeys.insert(hash).second ? 1 : !variants.insert(variant).second ? 2 : 3;
+}
+
+}
+
+VulkanDevice::DeviceCallSplit& VulkanDevice::ThreadDeviceSplit() {
+    static thread_local DeviceCallSplit split;
+    return split;
 }
 
 std::span<const double, 5> VulkanDevice::PreparePhaseMs(const PreparedDispatch& prepared) {
@@ -3330,6 +3369,8 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         resources->Complete();
         if (profile) {
+            ThreadDeviceSplit().path = DevicePath::StageB;
+            ClassifyBuild(shaders[0]);
             const auto completeWall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - completeStart).count();
             timer.add(PhaseResourcesComplete, completeWall);
             const auto& after = resources->Timing();
@@ -3364,6 +3405,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             if (cached->Revalidate(shaders[0])) {
                 resources = std::move(cached);
                 fromCache = true;
+                if (profile) ThreadDeviceSplit().path = DevicePath::ResourceHit;
                 ++d.cacheHits;
             } else {
                 state->resourceCache.Remove(contentKey, cached.get());
@@ -3380,7 +3422,11 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     if (resources == nullptr) {
         const auto buildStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         resources = std::make_shared<Graphics::ShaderResources>(context, shaders[0], snapshots);
-        if (profile) timer.add(PhaseResourcesFullBuild, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - buildStart).count());
+        if (profile) {
+            timer.add(PhaseResourcesFullBuild, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - buildStart).count());
+            ThreadDeviceSplit().path = DevicePath::FullBuild;
+            ClassifyBuild(shaders[0]);
+        }
         if (cacheable) {
             ++d.cacheMisses;
             if (resources->Reusable()) insert();

@@ -224,6 +224,21 @@ public:
     // APS5_PROFILE_DRAW: the parts of a PrepareDispatch in milliseconds, in the order key, find,
     // precollect, presync, stage A (the driver's 'prepare:' rows).
     static std::span<const double, 5> PreparePhaseMs(const PreparedDispatch& prepared);
+    // APS5_PROFILE_DRAW: this thread's device-call split for the driver's [dispatch] device paths
+    // line: the path the last Dispatch or DispatchIndirect took (the driver names a recipe hit
+    // itself) and the call's resource and record rows, accumulated by the call's timer (the
+    // driver clears it before the call).
+    enum class DevicePath : std::uint8_t { Other, Recipe, ResourceHit, StageB, FullBuild, Count };
+    enum DeviceSplitRow : std::size_t { SplitImages, SplitUpload, SplitStageA, SplitRevalidate, SplitFullBuild, SplitProof, SplitRecord, SplitRowCount };
+    struct DeviceCallSplit {
+        DevicePath path = DevicePath::Other;
+        // A stage-B miss or full build classified against this thread's earlier builds: 0 none,
+        // 1 the read-only-rebased key (ContentKey rebaseReadOnly) was built before, 2 the variant
+        // was built before under other words, 3 a new variant.
+        std::uint8_t missKind = 0;
+        std::array<double, SplitRowCount> ms{};
+    };
+    static DeviceCallSplit& ThreadDeviceSplit();
     // `recipe`, when given, receives the Recipe a successful call built for its dispatch-cache
     // variant (design_cpu_final M4): only when the resource cache served or took the object
     // (reusable, cacheable) and recipes are on (APS5_NO_DISPATCH_RECIPE=1 builds none); else null.

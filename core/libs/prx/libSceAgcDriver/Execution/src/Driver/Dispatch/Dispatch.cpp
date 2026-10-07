@@ -331,6 +331,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         GuestMemory::TagGpuLockSite(indirectArguments != 0 ? GuestMemory::GpuLockSite::Indirect : GuestMemory::GpuLockSite::Dispatch);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         phaseTiming.Phase(PhaseLockWait);
+        if (profile) VulkanDevice::ThreadDeviceSplit() = {};
 
         recordLabelsForPacket(localDevice.get(), submission.queue);
         phaseTiming.Phase(PhaseLabels);
@@ -383,6 +384,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         pending.validated = validated;
         pending.ms = phaseMs;
         pending.tailAt = phaseLap;
+        static_assert(static_cast<std::size_t>(VulkanDevice::DevicePath::Count) == DevicePathCount && VulkanDevice::SplitRowCount == DeviceSplitRows);
+        const auto& split = VulkanDevice::ThreadDeviceSplit();
+        pending.devicePath = static_cast<std::size_t>(recipeHit != nullptr ? VulkanDevice::DevicePath::Recipe : split.path);
+        pending.deviceSplit = split.ms;
+        pending.missKind = split.missKind;
     }
     if (profile && ++dispatches % 100 == 0) std::fprintf(stderr, "[gpu] %llu dispatches (%llu dispatch cache hits, %llu evictions, %llu recompile cache hits): capture %.1f s, cache key %.1f s, recompile %.1f s, device %.1f s\n", static_cast<unsigned long long>(dispatches), static_cast<unsigned long long>(dispatchCacheHits), static_cast<unsigned long long>(dispatchCacheEvictions), static_cast<unsigned long long>(cacheHits), captureMs / 1000, keyMs / 1000, recompileMs / 1000, deviceMs / 1000);
 }

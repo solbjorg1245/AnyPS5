@@ -21,9 +21,25 @@ inline constexpr const char* DispatchClassNames[DispatchClassCount] = {"queue 0 
 
 inline constexpr const char* DispatchOutcomeNames[static_cast<std::size_t>(DispatchOutcome::Count)] = {"skipped", "real", "copy HLE", "fill HLE", "skipped (memo)"};
 
+// The device call by path (VulkanDevice::DevicePath order) and its split rows
+// (VulkanDevice::DeviceSplitRow order), per dispatch-cache miss/hit: the [dispatch] device paths line.
+inline constexpr std::size_t DevicePathCount = 5;
+inline constexpr std::size_t DeviceSplitRows = 7;
+inline constexpr const char* DevicePathNames[DevicePathCount] = {"other", "recipe", "resource hit", "stage B (miss)", "full build"};
+inline constexpr const char* DeviceSplitNames[DeviceSplitRows] = {"images", "upload", "A locked", "revalidate", "full", "proof", "record"};
+
+struct DevicePathTotals {
+    std::uint64_t calls = 0;
+    double deviceMs = 0;
+    std::array<double, DeviceSplitRows> ms{};
+};
+
 struct DriverPhaseTotals {
     std::array<double, DriverPhaseCount> ms{};
     std::uint64_t dispatches = 0, hits = 0, validations = 0;
+    std::array<std::array<DevicePathTotals, DevicePathCount>, 2> paths{};
+    // Builds by VulkanDevice::DeviceCallSplit::missKind (index 0 unused).
+    std::array<std::uint64_t, 4> missKinds{};
 };
 
 struct PendingDispatchPhases {
@@ -33,6 +49,9 @@ struct PendingDispatchPhases {
     bool validated = false;
     std::array<double, DriverPhaseCount> ms{};
     std::chrono::steady_clock::time_point tailAt{};
+    std::size_t devicePath = 0;
+    std::array<double, DeviceSplitRows> deviceSplit{};
+    std::uint8_t missKind = 0;
 };
 
 struct DispatchPhaseTiming {
