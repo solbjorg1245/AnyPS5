@@ -15,6 +15,22 @@ bool onePassMaskedCompare() {
     return onePass;
 }
 
+// A pending region (one recorded GPU work still writes) is compared through the data mask too when
+// its fresh words are final: against its known bytes (a copy HLE transfer whose destination the
+// driver knows, ShaderMemory::PendingWrite::KnownValue) or against the memory it just synced. A
+// word differing at a data position or within a buffer base slot is then a refreshed word, not a
+// miss. Before, only an unsynced non-pending region went through the mask: the per-frame flat SRT
+// block Demon's Souls uploads with its copy kernel is a transfer with known bytes whenever the CPU
+// store is refused (destination pending, a reader), so every draw stage holding one of its pure
+// words missed and was captured again each frame once the copy HLE matched that kernel (t288: 27
+// -> 8050 data variants missed on pending runs per 10 s, front-stage misses 18 -> 1986). The raw
+// (unsynced) compare of a pending region stays exact: its words may still change.
+// APS5_NO_PENDING_DATA_MASK=1 compares pending regions exactly again.
+bool pendingDataMask() {
+    static const bool masked = std::getenv("APS5_NO_PENDING_DATA_MASK") == nullptr;
+    return masked;
+}
+
 }
 
 bool Driver::captureStable(std::span<const ShaderRecompiler::MemoryRegion> captured) {
@@ -77,16 +93,14 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
         if (view.Overlaps(region.guestAddress, region.bytes.size())) pending.push_back(i);
     }
 
-    const auto compareMasked = [&](const ShaderRecompiler::MemoryRegion& region, std::size_t first) {
-        thread_local std::vector<std::byte> live;
-        live.resize(region.bytes.size());
-        const auto copied = GuestMemory::CopyMapped(region.guestAddress, live);
-        if (copied != GuestMemory::Compare::Equal) return copied;
+    // The stored words against `freshBytes` (the mapped pages' copy, a pending region's known bytes
+    // or its synced memory), word by word through the mask.
+    const auto compareMaskedBytes = [&](const ShaderRecompiler::MemoryRegion& region, std::size_t first, std::span<const std::byte> freshBytes) {
         const auto count = region.bytes.size() / sizeof(std::uint32_t);
         for (std::size_t i = 0; i < count; ++i) {
             std::uint32_t stored = 0, fresh = 0;
             std::memcpy(&stored, region.bytes.data() + i * sizeof(std::uint32_t), sizeof(stored));
-            std::memcpy(&fresh, live.data() + i * sizeof(std::uint32_t), sizeof(fresh));
+            std::memcpy(&fresh, freshBytes.data() + i * sizeof(std::uint32_t), sizeof(fresh));
             if (stored == fresh) continue;
             const auto position = static_cast<std::uint32_t>(first + i);
             // A don't-care difference (a T#'s streaming-feedback bits) is no difference; counted
@@ -105,6 +119,17 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
         }
         return GuestMemory::Compare::Equal;
     };
+    const auto compareMasked = [&](const ShaderRecompiler::MemoryRegion& region, std::size_t first) {
+        thread_local std::vector<std::byte> live;
+        live.resize(region.bytes.size());
+        const auto copied = GuestMemory::CopyMapped(region.guestAddress, live);
+        if (copied != GuestMemory::Compare::Equal) return copied;
+        return compareMaskedBytes(region, first, live);
+    };
+    // Pending regions compared through the mask whose only differences were refreshed words (each
+    // would have missed before): against known bytes, against synced memory.
+    std::uint64_t maskedKnownRefreshed = 0, maskedSyncedRefreshed = 0;
+    const auto liveCount = [&] { return data != nullptr && data->live != nullptr ? data->live->size() : std::size_t{0}; };
 
     static constexpr std::size_t NoKnownValue = std::numeric_limits<std::size_t>::max();
     thread_local std::vector<Policy> policies;
@@ -132,14 +157,52 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
             bool same = false;
             bool masked = false;
             if (known) {
-                same = std::memcmp(knownBytes.data() + knownOffsets[next - 1], region.bytes.data(), region.bytes.size()) == 0;
-                if (!rawPending && policies[next - 1] == Policy::VerifyKnownValue) {
-                    const bool synced = GuestMemory::EqualsCommitted(region.guestAddress, region.bytes);
-                    if (synced != same) ++knownMismatches;
-                    same = synced;
+                const auto knownSpan = std::span<const std::byte>(knownBytes).subspan(knownOffsets[next - 1], region.bytes.size());
+                const auto liveBefore = liveCount();
+                if (data != nullptr && pendingDataMask()) {
+                    // The known bytes are the words the transfer writes: final, so through the mask.
+                    masked = true;
+                    same = compareMaskedBytes(region, first, knownSpan) == GuestMemory::Compare::Equal;
+                    if (same && liveCount() != liveBefore) ++maskedKnownRefreshed;
+                } else {
+                    same = std::memcmp(knownSpan.data(), region.bytes.data(), region.bytes.size()) == 0;
                 }
-            } else if (!unsynced) same = GuestMemory::EqualsCommitted(region.guestAddress, region.bytes);
-            else if (validateLegacy()) same = GuestMemory::EqualsCommittedUnsynced(region.guestAddress, region.bytes);
+                if (!rawPending && policies[next - 1] == Policy::VerifyKnownValue) {
+                    if (masked) {
+                        // The verify of a masked compare: the known bytes themselves must be what the
+                        // synced memory holds; when they are not, the synced memory decides.
+                        if (!GuestMemory::EqualsCommitted(region.guestAddress, knownSpan)) {
+                            ++knownMismatches;
+                            if (data->live != nullptr) data->live->resize(liveBefore);
+                            const auto outcome = compareMasked(region, first);
+                            same = outcome == GuestMemory::Compare::Equal;
+                            if (outcome == GuestMemory::Compare::Unmapped && unmapped != nullptr) *unmapped = true;
+                        }
+                    } else {
+                        const bool synced = GuestMemory::EqualsCommitted(region.guestAddress, region.bytes);
+                        if (synced != same) ++knownMismatches;
+                        same = synced;
+                    }
+                }
+            } else if (!unsynced) {
+                if (data != nullptr && pendingDataMask()) {
+                    // Synced memory is final too: flushed, then through the mask (an unmapped page
+                    // falls back to the committed compare, which skips uncommitted pages).
+                    GuestMemory::FlushGpuWrites(region.guestAddress, region.bytes.size());
+                    const auto liveBefore = liveCount();
+                    const auto outcome = compareMasked(region, first);
+                    if (outcome == GuestMemory::Compare::Unmapped) {
+                        if (data->live != nullptr) data->live->resize(liveBefore);
+                        same = GuestMemory::EqualsCommittedUnsynced(region.guestAddress, region.bytes);
+                    } else {
+                        masked = true;
+                        same = outcome == GuestMemory::Compare::Equal;
+                        if (same && liveCount() != liveBefore) ++maskedSyncedRefreshed;
+                    }
+                } else {
+                    same = GuestMemory::EqualsCommitted(region.guestAddress, region.bytes);
+                }
+            } else if (validateLegacy()) same = GuestMemory::EqualsCommittedUnsynced(region.guestAddress, region.bytes);
             else {
                 masked = !isPending && data != nullptr;
                 auto outcome = masked && onePassMaskedCompare() ? compareMasked(region, first) : GuestMemory::CompareMapped(region.guestAddress, region.bytes);
@@ -233,6 +296,8 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
         knownValueVerified.fetch_add(knownServed, std::memory_order_relaxed);
         knownValueMismatches.fetch_add(knownMismatches, std::memory_order_relaxed);
     }
+    if (maskedKnownRefreshed != 0) dataPendingKnownRefreshed.fetch_add(maskedKnownRefreshed, std::memory_order_relaxed);
+    if (maskedSyncedRefreshed != 0) dataPendingSyncedRefreshed.fetch_add(maskedSyncedRefreshed, std::memory_order_relaxed);
     if (profile) {
         std::lock_guard lock(validateMutex);
         auto& counters = validateCounters;

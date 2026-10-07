@@ -271,6 +271,10 @@ private:
     EntryCounters entryCounters;
 
     std::atomic<std::uint64_t> dataPendingMisses{0};
+    // Pending regions a variant compare accepted through the data mask with refreshed words
+    // (CaptureValidation.cpp pendingDataMask): against known bytes, against synced memory.
+    std::atomic<std::uint64_t> dataPendingKnownRefreshed{0};
+    std::atomic<std::uint64_t> dataPendingSyncedRefreshed{0};
     // Words a draw variant compare accepted through its don't-care bits (DispatchVariant::ignoredBits).
     std::atomic<std::uint64_t> ignoredBitWords{0};
 
