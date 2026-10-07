@@ -116,12 +116,32 @@ public:
         DescriptorCache* cache = nullptr;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        // Moved read-only guest elements bound in place through their host import (see
+        // InPlaceBindings): the ranges the recorded draw reads, which recordDraw notes as pending
+        // reads of the batch (the object's own MarkGpuWrites notes only its built ranges).
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> inPlaceReads;
+        // APS5_PROFILE_DRAW: what PrepareDrawBindings did for this draw (the [draws] line).
+        std::uint32_t boundInPlace = 0;
+        std::uint32_t snapshotsMade = 0;
+        std::uint32_t snapshotsReused = 0;
+        std::uint32_t dataCopies = 0;
+        std::uint32_t refusedNoImport = 0;
+        std::uint32_t refusedAlignment = 0;
         ~DrawBindings();
     };
     // With `shaders` (the draw's own stages, which may be a rebased hit, see RebaseEligible), each
     // read-only guest buffer is snapshot from the address the draw's descriptor names, which can
     // differ from the one the object was built for.
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const CompiledShader> shaders = {}) const;
+    // Read-only guest buffer elements a draw binds in place through their host import instead of
+    // snapshotting them (the default; APS5_NO_INPLACE_BINDINGS=1 restores the snapshots, and
+    // APS5_CAPTURE_INPUTS keeps them since the capture samples the snapshots): an unmoved element
+    // stays as the object built it (its set binds the import, MarkGpuWrites notes the range), a
+    // moved one (a rebased hit) binds its import at the draw's offset in the draw's set copy and
+    // its range is noted when the draw is recorded, as an in-place vertex input is. The CPU may not
+    // overwrite the range before the batch ran, which the game's own fences keep (the copy HLE
+    // refuses its CPU path on a noted read); APS5_FLIP_READ_CHECK=1 checks it at the flip.
+    static bool InPlaceBindings();
     // The data buffer a draw binds at Vulkan binding `vulkanBinding` (a ShaderData/FlattenedSrt
     // role): the snapshot PrepareDrawBindings made for it (`hostBytes` then points at its mapped
     // bytes, which only this draw uses), else the object's own (`hostBytes` null); VK_NULL_HANDLE

@@ -769,6 +769,9 @@ void movedMetadataTests(const Device& device, Recorder& recorder) {
 }
 
 void resourceReadTests(const Device& device, Recorder& recorder) {
+    // The draw-snapshot tests below exercise the snapshot path (read once by
+    // ShaderResources::InPlaceBindings, before its first PrepareDrawBindings call).
+    _putenv_s("APS5_NO_INPLACE_BINDINGS", "1");
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
         std::cout << "host imports unavailable: resource read notes not tested\n";
@@ -872,6 +875,7 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
 }
 
 void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
+    _putenv_s("APS5_NO_INPLACE_BINDINGS", "1");
     const auto& context = device.GetContext();
     const auto alignment = context.limits.minStorageBufferOffsetAlignment;
     if (context.hostImportAlignment == 0) {
@@ -954,6 +958,7 @@ void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
 }
 
 void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
+    _putenv_s("APS5_NO_INPLACE_BINDINGS", "1");
     const auto& context = device.GetContext();
     constexpr std::size_t bytes = 65536;
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;

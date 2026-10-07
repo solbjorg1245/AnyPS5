@@ -177,6 +177,17 @@ struct DrawOutcome {
     std::uint64_t deferredFlatCopies = 0;
     std::uint64_t deferredFlatCpu = 0;
     std::uint64_t deferredFlatUnchanged = 0;
+    // Draw bindings (ShaderResources::PrepareDrawBindings): whether the draw got a set copy of its
+    // own and the call's time; what the copy holds: moved elements bound in place, snapshots made
+    // and reused, data buffer copies; in-place refusals (no import, offset off the alignment).
+    bool drawBindingsSet = false;
+    double drawBindingsUs = 0;
+    std::uint64_t drawBindingsInPlace = 0;
+    std::uint64_t drawBindingsSnapshots = 0;
+    std::uint64_t drawBindingsReused = 0;
+    std::uint64_t drawBindingsDataCopies = 0;
+    std::uint64_t drawBindingsNoImport = 0;
+    std::uint64_t drawBindingsMisaligned = 0;
     SyncReason reason = SyncNone;
     // Shader validation memo (see CachedFragmentOutputs).
     bool validateMemoized = false;
@@ -234,6 +245,15 @@ struct DrawProfile {
     std::uint64_t deferredFlatCopies = 0;
     std::uint64_t deferredFlatCpu = 0;
     std::uint64_t deferredFlatUnchanged = 0;
+    // Draw bindings (DrawOutcome): draws with a set copy, the calls' time, the copies' contents.
+    std::uint64_t drawBindingsSets = 0;
+    double drawBindingsUs = 0;
+    std::uint64_t drawBindingsInPlace = 0;
+    std::uint64_t drawBindingsSnapshots = 0;
+    std::uint64_t drawBindingsReused = 0;
+    std::uint64_t drawBindingsDataCopies = 0;
+    std::uint64_t drawBindingsNoImport = 0;
+    std::uint64_t drawBindingsMisaligned = 0;
     std::array<double, PhaseCount> totalsUs{};
     // The longest single draw's time per phase, and the longest draw: the [lock] line's 'draw'
     // hold max (tens of ms against an average well under a millisecond) needs a phase name.
@@ -346,6 +366,14 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.deferredFlatCopies += outcome.deferredFlatCopies;
     profile.deferredFlatCpu += outcome.deferredFlatCpu;
     profile.deferredFlatUnchanged += outcome.deferredFlatUnchanged;
+    if (outcome.drawBindingsSet) ++profile.drawBindingsSets;
+    profile.drawBindingsUs += outcome.drawBindingsUs;
+    profile.drawBindingsInPlace += outcome.drawBindingsInPlace;
+    profile.drawBindingsSnapshots += outcome.drawBindingsSnapshots;
+    profile.drawBindingsReused += outcome.drawBindingsReused;
+    profile.drawBindingsDataCopies += outcome.drawBindingsDataCopies;
+    profile.drawBindingsNoImport += outcome.drawBindingsNoImport;
+    profile.drawBindingsMisaligned += outcome.drawBindingsMisaligned;
     ++profile.reasons[outcome.reason];
     (outcome.recorded ? (outcome.waited ? profile.waitedUs : profile.recordedUs) : profile.synchronousUs) += drawUs;
     profile.targetLookups += outcome.targetLookups;
@@ -371,7 +399,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     const auto synchronous = profile.draws - profile.recorded - profile.waited;
     const auto average = [](double total, std::uint64_t count) { return count != 0 ? total / static_cast<double>(count) : 0.0; };
     char line[2048];
-    int n = std::snprintf(line, sizeof(line), "[draws] %llu draws over 10 s (%llu recorded avg %.0f us, of them %llu with completion; %llu recorded then waited avg %.0f us; %llu synchronous avg %.0f us; render passes %llu begun, %llu draws continued one, deferred flat words: %llu copied on the GPU in %llu copies, %llu filled on the CPU, %llu bindings unchanged; waited or synchronous because:", static_cast<unsigned long long>(profile.draws), static_cast<unsigned long long>(profile.recorded), average(profile.recordedUs, profile.recorded), static_cast<unsigned long long>(profile.completion), static_cast<unsigned long long>(profile.waited), average(profile.waitedUs, profile.waited), static_cast<unsigned long long>(synchronous), average(profile.synchronousUs, synchronous), static_cast<unsigned long long>(profile.passesBegun), static_cast<unsigned long long>(profile.passesContinued), static_cast<unsigned long long>(profile.deferredFlatWords), static_cast<unsigned long long>(profile.deferredFlatCopies), static_cast<unsigned long long>(profile.deferredFlatCpu), static_cast<unsigned long long>(profile.deferredFlatUnchanged));
+    int n = std::snprintf(line, sizeof(line), "[draws] %llu draws over 10 s (%llu recorded avg %.0f us, of them %llu with completion; %llu recorded then waited avg %.0f us; %llu synchronous avg %.0f us; render passes %llu begun, %llu draws continued one, deferred flat words: %llu copied on the GPU in %llu copies, %llu filled on the CPU, %llu bindings unchanged; draw bindings: %llu set copies in %.1f ms (moved in place %llu, snapshots %llu + %llu reused, data copies %llu; in-place refused: no import %llu, alignment %llu); waited or synchronous because:", static_cast<unsigned long long>(profile.draws), static_cast<unsigned long long>(profile.recorded), average(profile.recordedUs, profile.recorded), static_cast<unsigned long long>(profile.completion), static_cast<unsigned long long>(profile.waited), average(profile.waitedUs, profile.waited), static_cast<unsigned long long>(synchronous), average(profile.synchronousUs, synchronous), static_cast<unsigned long long>(profile.passesBegun), static_cast<unsigned long long>(profile.passesContinued), static_cast<unsigned long long>(profile.deferredFlatWords), static_cast<unsigned long long>(profile.deferredFlatCopies), static_cast<unsigned long long>(profile.deferredFlatCpu), static_cast<unsigned long long>(profile.deferredFlatUnchanged), static_cast<unsigned long long>(profile.drawBindingsSets), profile.drawBindingsUs / 1000.0, static_cast<unsigned long long>(profile.drawBindingsInPlace), static_cast<unsigned long long>(profile.drawBindingsSnapshots), static_cast<unsigned long long>(profile.drawBindingsReused), static_cast<unsigned long long>(profile.drawBindingsDataCopies), static_cast<unsigned long long>(profile.drawBindingsNoImport), static_cast<unsigned long long>(profile.drawBindingsMisaligned));
     const auto room = [&] { return n > 0 && static_cast<std::size_t>(n) < sizeof(line); };
     for (std::size_t i = SyncNone + 1; i < SyncCount && room(); ++i) {
         if (profile.reasons[i] != 0) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", SyncReasonNames[i], static_cast<unsigned long long>(profile.reasons[i]));
@@ -423,6 +451,8 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.draws = profile.recorded = profile.waited = profile.completion = 0;
     profile.passesBegun = profile.passesContinued = 0;
     profile.deferredFlatWords = profile.deferredFlatCopies = profile.deferredFlatCpu = profile.deferredFlatUnchanged = 0;
+    profile.drawBindingsSets = profile.drawBindingsInPlace = profile.drawBindingsSnapshots = profile.drawBindingsReused = profile.drawBindingsDataCopies = profile.drawBindingsNoImport = profile.drawBindingsMisaligned = 0;
+    profile.drawBindingsUs = 0;
     profile.reasons.fill(0);
     profile.recordedUs = profile.waitedUs = profile.synchronousUs = 0;
     profile.targetLookups = profile.slowLookups = 0;
@@ -1594,7 +1624,20 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
+    const auto bindingsStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, shaders);
+    if (timer.profile) {
+        outcome.drawBindingsUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - bindingsStart).count();
+        if (drawBindings != nullptr) {
+            outcome.drawBindingsSet = true;
+            outcome.drawBindingsInPlace = drawBindings->boundInPlace;
+            outcome.drawBindingsSnapshots = drawBindings->snapshotsMade;
+            outcome.drawBindingsReused = drawBindings->snapshotsReused;
+            outcome.drawBindingsDataCopies = drawBindings->dataCopies;
+            outcome.drawBindingsNoImport = drawBindings->refusedNoImport;
+            outcome.drawBindingsMisaligned = drawBindings->refusedAlignment;
+        }
+    }
     // Deferred flat slots: the words a stage's capture left to the GPU are copied into the data
     // buffer now, behind the work that writes them (recordDeferredFlat ends an open pass).
     const bool deferredFlat = recordDeferredFlat(context, *recorder, resources, drawBindings.get(), shaders, outcome);
@@ -1612,6 +1655,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const auto drawTiming = !continued ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
     if (!continued && Recorder::BarrierValidate()) {
         auto reads = resources.InPlaceReads();
+        if (drawBindings != nullptr) reads.insert(reads.end(), drawBindings->inPlaceReads.begin(), drawBindings->inPlaceReads.end());
         if (gpuIndirect) {
             reads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
             if (args->countIndirect) reads.emplace_back(args->countAddress, args->countAddress + 4);
@@ -1650,6 +1694,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     // Inputs read in place from their imports when the batch runs (CopyDrawInput).
     if (!inputs.inPlaceRanges.empty()) recorder->NotePendingReads(inputs.inPlaceRanges, Recorder::ReadKind::DrawInput);
+    // Moved read-only elements a rebased hit reads in place (PrepareDrawBindings), noted like the
+    // object's own built ranges are (MarkGpuWrites), which are not this draw's.
+    if (drawBindings != nullptr && !drawBindings->inPlaceReads.empty()) recorder->NotePendingReads(drawBindings->inPlaceReads, Recorder::ReadKind::DispatchElement);
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);

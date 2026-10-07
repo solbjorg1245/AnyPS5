@@ -3364,13 +3364,26 @@ bool ShaderResources::RebaseEligible(std::span<const CompiledShader> shaders, co
     return true;
 }
 
+bool ShaderResources::InPlaceBindings() {
+    static const bool inPlace = std::getenv("APS5_NO_INPLACE_BINDINGS") == nullptr && std::getenv("APS5_CAPTURE_INPUTS") == nullptr;
+    return inPlace;
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const CompiledShader> shaders) const {
     if (_set == VK_NULL_HANDLE || usesBda) return {};
     ScratchLease<InPlaceReadsScratch> scratch;
     const auto reads = guestMemory.InPlaceReads(scratch->reads);
-    // Made once the first snapshot is selected: most draws select none and return nothing.
+    const bool inPlace = InPlaceBindings();
+    // Made once the first element is selected: most draws select none and return nothing.
     std::shared_ptr<DrawBindings> result;
     std::vector<std::size_t> selected;
+    // The descriptor each selected element gets in the draw's set copy, in `selected` order.
+    std::vector<VkDescriptorBufferInfo> infos;
+    const auto select = [&](std::size_t index, const VkDescriptorBufferInfo& info) {
+        if (result == nullptr) result = std::make_shared<DrawBindings>();
+        selected.push_back(index);
+        infos.push_back(info);
+    };
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         if (!item.guest && item.buffer != nullptr && DataRole(item.role)) {
@@ -3387,30 +3400,47 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             for (const auto& patch : dataPatches) {
                 if (patch.allocation == index && patch.byte < item.size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
             }
-            selected.push_back(index);
-            if (result == nullptr) result = std::make_shared<DrawBindings>();
+            select(index, {buffer->Handle(), 0, buffer->Bytes().size()});
+            ++result->dataCopies;
             result->snapshots.push_back({0, std::move(buffer), index});
             continue;
         }
         if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
-        // A rebased hit (RebaseEligible proved the moved range) snapshots the draw's own range.
+        // A rebased hit (RebaseEligible proved the moved range) binds the draw's own range.
         const auto [address, size] = SourceRange(shaders, item.sourceShader, item.sourceBinding, item.sourceElement, {item.address, item.size});
         const bool moved = address != item.address || size != item.size;
         const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
         if (!moved && (!direct || recorder.PendingWriteOverlaps(item.address, item.size))) continue;
         Require(!moved || direct, "a rebased guest buffer is not one the template snapshots");
+        // In place (InPlaceBindings): an unmoved element stays bound as built; a moved one binds its
+        // import at the draw's offset, which must sit on the storage buffer offset alignment as the
+        // built one does (the adjustment is the object's: part of the key). Else a snapshot.
+        if (inPlace && !moved) continue;
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(size) + item.adjustment;
+        if (inPlace) {
+            const auto* import = HostImportFor(context, begin, bytes);
+            if (import != nullptr && (begin - import->base) % context.limits.minStorageBufferOffsetAlignment == 0) {
+                select(index, {import->buffer, begin - import->base, bytes});
+                result->inPlaceReads.emplace_back(begin, begin + bytes);
+                ++result->boundInPlace;
+                CaptureTrace::Log("draw-inplace batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
+                continue;
+            }
+            if (result == nullptr) result = std::make_shared<DrawBindings>();
+            ++(import == nullptr ? result->refusedNoImport : result->refusedAlignment);
+        }
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         const auto generation = GuestMemory::CollectWrites(begin, bytes);
         auto buffer = recorder.ReusableDrawSnapshot(begin, bytes);
+        const bool reused = buffer != nullptr;
         if (buffer == nullptr) {
             buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
             recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
         }
-        selected.push_back(index);
-        if (result == nullptr) result = std::make_shared<DrawBindings>();
+        select(index, {buffer->Handle(), 0, buffer->Bytes().size()});
+        ++(reused ? result->snapshotsReused : result->snapshotsMade);
         result->snapshots.push_back({begin, std::move(buffer), index});
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
@@ -3435,9 +3465,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     const auto update = context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets");
     update(context.device, 0, nullptr, static_cast<std::uint32_t>(copies.size()), copies.data());
-    std::vector<VkDescriptorBufferInfo> infos;
-    infos.reserve(selected.size());
-    for (const auto& snapshot : result->snapshots) infos.push_back({snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()});
     std::vector<VkWriteDescriptorSet> writes;
     for (const auto& binding : bindings) {
         for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
