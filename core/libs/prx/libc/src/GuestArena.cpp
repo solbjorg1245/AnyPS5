@@ -1,4 +1,5 @@
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/WindowsMappings.hpp"
 #include <algorithm>
 #include <cstdint>
@@ -248,6 +249,8 @@ bool GuestArenaWriteWatched_nid_postfix() {
 }
 
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
+    // Resident buffers' guarded pages (GuestPageGuard*) land first: the host write would fail there.
+    GuestWriteWatch::GuestPageGuardTouch_nid_postfix(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #ifdef _WIN32
     return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #else

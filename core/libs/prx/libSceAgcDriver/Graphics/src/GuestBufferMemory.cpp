@@ -197,7 +197,12 @@ void retireImport(const Context& context, HostImports& state, std::map<std::uint
     // size); the holder below outlives the batch that copies them.
     RetireShadow(context, it->second, [&lease](std::uint64_t begin, std::uint64_t end) { return containingRange(lease, begin, end) != nullptr; });
     auto holder = std::make_shared<RetiredImport>(context, it->second);
-    if (auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) recorder->Keep(std::move(holder));
+    if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+        // Resident copy-backs (Recorder::KeepsResidentBuffers) outlive their batch: those storing
+        // into this import are recorded into the open batch, which the holder outlives.
+        if (recorder->KeepsResidentBuffers()) recorder->FlushDeferredWhere([buffer = it->second.buffer](const Recorder::DeferredCopy& copy, bool) { return copy.destination == buffer; }, Recorder::FlushReason::CopyIn);
+        if (!recorder->Idle()) recorder->Keep(std::move(holder));
+    }
     ++state.epoch;
     state.imports.erase(it);
 }
@@ -206,7 +211,11 @@ void retireImport(const Context& context, HostImports& state, std::map<std::uint
 // through the per-allocation imports), so there is nothing to publish.
 void retireSpan(HostImports& state, const Context& context, std::map<std::uint64_t, HostImports::Span>::iterator it) {
     auto holder = std::make_shared<RetiredImport>(context, it->second.entry);
-    if (auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) recorder->Keep(std::move(holder));
+    if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+        // As retireImport: resident copy-backs into the span are recorded with the holder.
+        if (recorder->KeepsResidentBuffers()) recorder->FlushDeferredWhere([buffer = it->second.entry.buffer](const Recorder::DeferredCopy& copy, bool) { return copy.destination == buffer; }, Recorder::FlushReason::CopyIn);
+        if (!recorder->Idle()) recorder->Keep(std::move(holder));
+    }
     ++state.epoch;
     state.spans.erase(it);
 }

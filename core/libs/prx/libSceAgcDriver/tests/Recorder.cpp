@@ -2709,6 +2709,167 @@ void coalesceCopyBackTests(const Device& device, Recorder& recorder) {
     HostImportFor(context, address, bytes);
 }
 
+// The page guards resident buffers use (GuestPageGuard*): a fault runs the resolver, a guard it
+// leaves is released by force, and a page two guards hold stays guarded until both went.
+std::uint64_t guardTestIds[2]{};
+std::atomic<int> guardTestFaults{0};
+
+bool releaseFirstGuard(std::uintptr_t) {
+    guardTestFaults.fetch_add(1);
+    GuestWriteWatch::GuestPageGuardRelease_nid_postfix(guardTestIds[0]);
+    return true;
+}
+
+void pageGuardTests() {
+    constexpr std::size_t page = 4096;
+#ifdef _WIN32
+    auto* block = static_cast<unsigned char*>(VirtualAlloc(nullptr, 4 * page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+#else
+    void* mapped = mmap(nullptr, 4 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    auto* block = static_cast<unsigned char*>(mapped == MAP_FAILED ? nullptr : mapped);
+#endif
+    Require(block != nullptr, "cannot allocate the page guard test block");
+    const auto byteAt = [](std::size_t at) { return static_cast<unsigned char>(at % 251); };
+    for (std::size_t at = 0; at < 4 * page; ++at) block[at] = byteAt(at);
+    const auto base = reinterpret_cast<std::uintptr_t>(block);
+    GuestWriteWatch::GuestPageGuardInstall_nid_postfix(&releaseFirstGuard);
+    guardTestIds[0] = GuestWriteWatch::GuestPageGuardProtect_nid_postfix(base, base + 2 * page);
+    guardTestIds[1] = GuestWriteWatch::GuestPageGuardProtect_nid_postfix(base + page, base + 3 * page);
+    if (guardTestIds[0] == 0 || guardTestIds[1] == 0) {
+        GuestWriteWatch::GuestPageGuardRelease_nid_postfix(guardTestIds[0]);
+        GuestWriteWatch::GuestPageGuardRelease_nid_postfix(guardTestIds[1]);
+        std::cout << "page guards unavailable: not tested\n";
+        return;
+    }
+    Require(GuestWriteWatch::GuestPageGuardProtect_nid_postfix(base + 16, base + page) == 0, "a guard off whole pages was taken");
+    std::uint64_t faults = 0, forced = 0, guards = 0;
+    GuestWriteWatch::GuestPageGuardCounts_nid_postfix(&faults, &forced, nullptr);
+    const volatile unsigned char* read = block;
+    Require(read[7] == byteAt(7) && guardTestFaults.load() == 1, "a read of a guarded page did not run the resolver once");
+    Require(GuestWriteWatch::GuestPageGuardCovers_nid_postfix(base + page), "the page the second guard holds too was released with the first");
+    Require(read[page + 3] == byteAt(page + 3) && guardTestFaults.load() == 2, "a read of a page two guards held did not fault");
+    Require(read[2 * page + 5] == byteAt(2 * page + 5) && read[3 * page] == byteAt(3 * page) && guardTestFaults.load() == 2, "a page no guard holds faulted");
+    std::uint64_t faultsAfter = 0, forcedAfter = 0;
+    GuestWriteWatch::GuestPageGuardCounts_nid_postfix(&faultsAfter, &forcedAfter, &guards);
+    Require(faultsAfter - faults == 2 && forcedAfter - forced == 1 && guards == 0 && !GuestWriteWatch::GuestPageGuardCovers_nid_postfix(base), "page guard counts are off");
+    // Host I/O over guarded pages (GuestArena::HostWrite, the kernel's file writes) resolves them
+    // first, as a fault would; over pages no guard holds it does nothing.
+    guardTestIds[0] = GuestWriteWatch::GuestPageGuardProtect_nid_postfix(base + page, base + 3 * page);
+    Require(guardTestIds[0] != 0, "a guard over released pages was refused");
+    GuestWriteWatch::GuestPageGuardTouch_nid_postfix(base, 16);
+    Require(guardTestFaults.load() == 2 && GuestWriteWatch::GuestPageGuardCovers_nid_postfix(base + page), "touching a page no guard holds resolved a guard");
+    GuestWriteWatch::GuestPageGuardTouch_nid_postfix(base + 2 * page + 100, 8);
+    Require(guardTestFaults.load() == 3 && !GuestWriteWatch::GuestPageGuardCovers_nid_postfix(base + page), "touching a guarded page did not resolve its guard");
+    block[page] = 1;
+    GuestWriteWatch::GuestPageGuardInstall_nid_postfix(nullptr);
+#ifdef _WIN32
+    VirtualFree(block, 0, MEM_RELEASE);
+#else
+    munmap(block, 4 * page);
+#endif
+}
+
+// Resident buffers (APS5_RESIDENT_BUFFERS=1): the whole pages of a copy-back stay resident past
+// Submit (the partial ones land with it), a CPU read of one lands its bytes, a write after that
+// survives, a command records a resident copy, and a label store over one records it first.
+void residentBufferTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: resident buffers not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the resident buffer test block");
+    std::memset(block, 0, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr) {
+        std::cout << "host import of the resident buffer test block refused: resident buffers not tested\n";
+        return;
+    }
+    {
+#ifdef _WIN32
+        _putenv_s("APS5_RESIDENT_BUFFERS", "1");
+#else
+        setenv("APS5_RESIDENT_BUFFERS", "1", 1);
+#endif
+        Recorder resident(context);
+#ifdef _WIN32
+        _putenv_s("APS5_RESIDENT_BUFFERS", "");
+#else
+        unsetenv("APS5_RESIDENT_BUFFERS");
+#endif
+        Require(resident.KeepsResidentBuffers() && resident.CoalescesCopyBacks(), "APS5_RESIDENT_BUFFERS=1 did not turn resident buffers and coalescing on");
+        resident.Activate();
+        constexpr std::size_t sourceBytes = 32768;
+        auto source = std::make_shared<Buffer>(context, sourceBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        const auto sourceByte = [](std::size_t at) { return static_cast<unsigned char>(at * 7 + 3); };
+        for (std::size_t at = 0; at < sourceBytes; ++at) source->Bytes()[at] = std::byte{sourceByte(at)};
+        const auto copyOf = [&](std::uint64_t at, std::uint64_t count) {
+            return std::vector<Recorder::DeferredCopy>{Recorder::DeferredCopy{source, source.get(), source->Handle(), import->buffer, at, address + at - import->base, count, address + at}};
+        };
+        const volatile unsigned char* landed = static_cast<const unsigned char*>(block);
+        const auto before = Recorder::ResidentCounts();
+        // [100, 12388): pages 1 and 2 stay resident, [100, 4096) and [12288, 12388) land at Submit.
+        resident.DeferCopies(copyOf(100, 12288));
+        resident.Submit();
+        Require(resident.HasDeferredCopies() && resident.ResidentCopyBytes() == 8192, "Submit did not keep the whole pages of a copy-back resident");
+        resident.Sync();
+        Require(landed[100] == sourceByte(100) && landed[4095] == sourceByte(4095) && landed[12387] == sourceByte(12387) && landed[12388] == 0 && landed[99] == 0, "the partial pages of a resident copy did not land with its batch");
+        Require(landed[5000] == sourceByte(5000) && landed[9000] == sourceByte(9000), "a read of a resident page did not land its bytes");
+        Require(Recorder::ResidentCounts().resolved - before.resolved == 1, "a fault on a resident page was not resolved once");
+        static_cast<unsigned char*>(block)[6000] = 0xEE;
+        static_cast<void>(resident.Commands());
+        Require(!resident.HasDeferredCopies(), "a command left a landed resident copy queued");
+        resident.Submit();
+        resident.Sync();
+        Require(landed[6000] == 0xEE, "a resident copy a fault landed was recorded again over a later CPU write");
+        // Recorded by a command (no fault): the bytes land with that batch.
+        resident.DeferCopies(copyOf(16384, 8192));
+        resident.Submit();
+        Require(resident.ResidentCopyBytes() == 8192, "a page-aligned copy-back was not kept resident");
+        static_cast<void>(resident.Commands());
+        Require(!resident.HasDeferredCopies(), "a command did not record a resident copy");
+        resident.Submit();
+        resident.Sync();
+        for (std::size_t at = 16384; at < 16384 + 8192; at += 509) {
+            if (landed[at] != sourceByte(at)) throw std::runtime_error("a resident copy recorded by a command stored the wrong byte at offset " + std::to_string(at));
+        }
+        // A label store over a resident copy records the copy ahead of it.
+        resident.DeferCopies(copyOf(28672, 4096));
+        resident.Submit();
+        Require(resident.ResidentCopyBytes() == 4096, "a one-page copy-back was not kept resident");
+        const std::array<std::byte, 4> label{std::byte{0xA1}, std::byte{0xB2}, std::byte{0xC3}, std::byte{0xD4}};
+        resident.RecordStore(import->buffer, address + 28680 - import->base, label, address + 28680);
+        resident.Submit();
+        Require(!resident.HasDeferredCopies(), "a label store over a resident copy left it queued");
+        resident.Sync();
+        Require(landed[28680] == 0xA1 && landed[28683] == 0xD4 && landed[28679] == sourceByte(28679) && landed[28684] == sourceByte(28684), "a label store over a resident copy did not land after it");
+        const auto counts = Recorder::ResidentCounts();
+        Require(counts.made - before.made == 3 && counts.madeBytes - before.madeBytes == 8192 + 8192 + 4096 && counts.skipped - before.skipped == 1 && counts.recorded - before.recorded == 2, "resident buffer counters are off");
+        // A resident copy still queued when its recorder goes lands with the teardown.
+        resident.DeferCopies(copyOf(12288, 4096));
+        resident.Submit();
+        Require(resident.ResidentCopyBytes() == 4096, "a copy-back over a landed page was not kept resident");
+    }
+    Require(static_cast<const volatile unsigned char*>(block)[13000] == static_cast<unsigned char>(13000 * 7 + 3), "a resident copy queued at the recorder's teardown was lost");
+    recorder.Activate();
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+}
+
 int main() {
     try {
         Device device;
@@ -2752,6 +2913,8 @@ int main() {
         metadataPassTests(device, recorder);
         pendingKeyStoreTests(device, recorder);
         coalesceCopyBackTests(device, recorder);
+        pageGuardTests();
+        residentBufferTests(device, recorder);
         std::cout << "Recorder read tracking and label tests passed\n";
         return 0;
     } catch (const std::exception& error) {
