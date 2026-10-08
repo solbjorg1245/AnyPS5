@@ -1112,7 +1112,15 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     if (state->pushDescriptors) {
         state->fastLayouts = std::make_unique<Graphics::FastLayouts>(graphicsContext());
         const char* fastDraw = std::getenv("APS5_FAST_DRAW");
-        if (fastDraw != nullptr && std::strcmp(fastDraw, "0") != 0 && Graphics::FastRing::ConfiguredBytes() != 0) state->fastRing = std::make_unique<Graphics::FastRing>(graphicsContext(), Graphics::FastRing::ConfiguredBytes());
+        // A ring the device cannot allocate (APS5_FAST_RING_MIB above a heap or allocation limit)
+        // leaves the fast path without one, which then declines every draw, instead of failing the device.
+        if (fastDraw != nullptr && std::strcmp(fastDraw, "0") != 0 && Graphics::FastRing::ConfiguredBytes() != 0) {
+            try {
+                state->fastRing = std::make_unique<Graphics::FastRing>(graphicsContext(), Graphics::FastRing::ConfiguredBytes());
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[fastpath] no data ring of %llu MiB: %s\n", static_cast<unsigned long long>(Graphics::FastRing::ConfiguredBytes() >> 20u), error.what());
+            }
+        }
     }
     state->recorder = std::make_unique<Graphics::Recorder>(graphicsContext(), state->timelineSemaphores);
     state->recorder->Activate();

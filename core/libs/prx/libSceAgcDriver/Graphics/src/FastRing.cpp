@@ -28,7 +28,8 @@ struct Retire {
 VkDeviceSize FastRing::ConfiguredBytes() {
     static const VkDeviceSize bytes = [] {
         const char* value = std::getenv("APS5_FAST_RING_MIB");
-        return static_cast<VkDeviceSize>(value != nullptr ? std::strtoull(value, nullptr, 10) : 64) << 20u;
+        // At most 4 GiB (maxMemoryAllocationSize on most drivers); larger values would also overflow the shift.
+        return std::min<VkDeviceSize>(value != nullptr ? std::strtoull(value, nullptr, 10) : 64, 4096) << 20u;
     }();
     return bytes;
 }

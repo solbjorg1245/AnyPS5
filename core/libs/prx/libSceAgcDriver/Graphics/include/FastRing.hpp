@@ -54,7 +54,7 @@ public:
     // Bytes held by batches not known to be finished (wrap padding included).
     VkDeviceSize InUse() const { return head - tail; }
     Stats Counters() const;
-    // The ring size: APS5_FAST_RING_MIB (default 64; 0 = no ring).
+    // The ring size: APS5_FAST_RING_MIB (default 64, at most 4096; 0 = no ring).
     static VkDeviceSize ConfiguredBytes();
 
 private:
