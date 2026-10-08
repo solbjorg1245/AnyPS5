@@ -793,7 +793,13 @@ struct WriteTracker {
         bool noted = false;
         std::array<DriverPiece, 4> pieces{};
     };
+#ifdef _WIN32
     std::vector<DriverPieces> driverPieces;
+#else
+    // Blocks are numbered from address 0 here (no arena range to size a flat table): only the
+    // blocks a driver store touched are held.
+    std::unordered_map<std::uint64_t, DriverPieces> driverPieces;
+#endif
 
     void noteDriverStore(std::uint64_t block, std::uint64_t address, std::uint64_t end, std::uint32_t stampGeneration) {
         const auto begin = blockBegin(block);
