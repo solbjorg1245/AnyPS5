@@ -1,0 +1,14 @@
+MinGW-w64 runtime DLLs shipped with the Windows build of AnyPS5
+==============================================================
+
+libgcc_s_seh-1.dll and libstdc++-6.dll
+    GCC runtime libraries (libgcc, libstdc++), GNU General Public License version 3 with the
+    GCC Runtime Library Exception version 3.1.
+    License texts: https://www.gnu.org/licenses/gpl-3.0.html
+                   https://www.gnu.org/licenses/gcc-exception-3.1.html
+    Source: https://gcc.gnu.org/ (the exact toolchain build is the WinLibs release named in
+    .github/workflows/release.yml, https://github.com/brechtsanders/winlibs_mingw/releases)
+
+libwinpthread-1.dll
+    MinGW-w64 winpthreads, MIT-style license (mingw-w64 COPYING, winpthreads/COPYING).
+    Source: https://www.mingw-w64.org/ and https://sourceforge.net/projects/mingw-w64/

@@ -1,0 +1,25 @@
+# AnyPS5 keyboard and mouse bindings. Rename this file to anyps5-input.ini (next to the game
+# executable) to use it; see INPUT_MAPPING.md for every action and input source.
+# Controllers (Xbox or PlayStation layout, through SDL) work without this file.
+# The first line for an action replaces its built-in keys; later lines add alternatives.
+#
+# Built-in keys when this file is absent:
+#   Cross = Enter / Space     Circle = C        Triangle = I        Square = left mouse
+#   L1 = Q                    R1 = E / Alt      R2 = right mouse    L3 = Shift   R3 = Ctrl
+#   Options = Esc             D-pad = arrow keys                    touchpad = Backspace / Tab
+#   left stick = W A S D      right stick = T F G H                 mouse wheel = D-pad up / down
+#   ToggleMouse = middle mouse                                      ToggleFullscreen = F11
+
+# Example: a Souls-like layout (uncomment to use)
+# Cross = KEY:Space
+# Circle = KEY:Left Shift
+# Triangle = KEY:Left Ctrl
+# Square = KEY:R
+# R1 = MOUSE:Left
+# R2 = MOUSE:Right
+# L1 = KEY:Q
+# L2 = KEY:Z
+# RightStickLeft = KEY:Left
+# RightStickRight = KEY:Right
+# RightStickUp = KEY:Up
+# RightStickDown = KEY:Down
