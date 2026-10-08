@@ -197,7 +197,8 @@ void retireImport(const Context& context, HostImports& state, std::map<std::uint
     // size); the holder below outlives the batch that copies them.
     RetireShadow(context, it->second, [&lease](std::uint64_t begin, std::uint64_t end) { return containingRange(lease, begin, end) != nullptr; });
     auto holder = std::make_shared<RetiredImport>(context, it->second);
-    if (auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) recorder->Keep(std::move(holder));
+    // Resident copy-backs (Recorder::KeepsResidentBuffers) may still store into it with nothing open.
+    if (auto* recorder = Recorder::Active(); recorder != nullptr && (!recorder->Idle() || recorder->HasDeferredCopies())) recorder->Keep(std::move(holder));
     ++state.epoch;
     state.imports.erase(it);
 }
@@ -206,7 +207,7 @@ void retireImport(const Context& context, HostImports& state, std::map<std::uint
 // through the per-allocation imports), so there is nothing to publish.
 void retireSpan(HostImports& state, const Context& context, std::map<std::uint64_t, HostImports::Span>::iterator it) {
     auto holder = std::make_shared<RetiredImport>(context, it->second.entry);
-    if (auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) recorder->Keep(std::move(holder));
+    if (auto* recorder = Recorder::Active(); recorder != nullptr && (!recorder->Idle() || recorder->HasDeferredCopies())) recorder->Keep(std::move(holder));
     ++state.epoch;
     state.spans.erase(it);
 }

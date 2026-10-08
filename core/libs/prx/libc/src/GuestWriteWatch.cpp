@@ -1,6 +1,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
@@ -10,7 +11,15 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #if defined(__linux__)
+#include <csignal>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -252,6 +261,191 @@ private:
 const bool g_opened = (Watch::Get(), true);
 #endif
 
+// Guarded pages (GuestPageGuard*, see GuestWriteWatch.hpp).
+class PageGuard {
+public:
+    static constexpr std::uintptr_t PageBytes = 4096;
+
+    static PageGuard& Get() {
+        // Never destroyed: a guard may be released while the process exits.
+        static auto* guard = new PageGuard;
+        return *guard;
+    }
+
+    void Install(bool (*resolve)(std::uintptr_t)) {
+        _resolve.store(resolve, std::memory_order_release);
+        std::call_once(_installed, &PageGuard::installHandler);
+    }
+
+    std::uint64_t Protect(std::uintptr_t begin, std::uintptr_t end) {
+        if (begin % PageBytes != 0 || end % PageBytes != 0 || end <= begin) return 0;
+        std::unique_lock lock(_lock);
+        // Only the pages no guard holds yet change, and only plain read-write ones may.
+        const auto gaps = uncovered(begin, end);
+        for (const auto& [from, to] : gaps) {
+            if (!readWrite(from, to)) return 0;
+        }
+        for (std::size_t i = 0; i < gaps.size(); ++i) {
+            if (access(gaps[i].first, gaps[i].second, false)) continue;
+            for (std::size_t j = 0; j <= i; ++j) access(gaps[j].first, gaps[j].second, true);
+            return 0;
+        }
+        const auto id = ++_next;
+        _entries.emplace(id, std::make_pair(begin, end));
+        _count.store(_entries.size(), std::memory_order_release);
+        return id;
+    }
+
+    void Release(std::uint64_t id) {
+        std::unique_lock lock(_lock);
+        const auto found = _entries.find(id);
+        if (found == _entries.end()) return;
+        const auto [begin, end] = found->second;
+        _entries.erase(found);
+        _count.store(_entries.size(), std::memory_order_release);
+        for (const auto& [from, to] : uncovered(begin, end)) access(from, to, true);
+    }
+
+    bool Covers(std::uintptr_t address) {
+        if (_count.load(std::memory_order_acquire) == 0) return false;
+        std::shared_lock lock(_lock);
+        return covering(address) != 0;
+    }
+
+    // A fault at `address`: false when no guard holds it (not this handler's fault).
+    bool Fault(std::uintptr_t address) {
+        if (!Covers(address)) return false;
+        _faults.fetch_add(1, std::memory_order_relaxed);
+        const auto resolve = _resolve.load(std::memory_order_acquire);
+        bool forced = resolve == nullptr || !resolve(address);
+        for (;;) {
+            std::uint64_t id = 0;
+            {
+                std::shared_lock lock(_lock);
+                id = covering(address);
+            }
+            if (id == 0) break;
+            forced = true;
+            Release(id);
+        }
+        if (forced) _forced.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    void Counts(std::uint64_t* faults, std::uint64_t* forced, std::uint64_t* guards) const {
+        if (faults != nullptr) *faults = _faults.load(std::memory_order_relaxed);
+        if (forced != nullptr) *forced = _forced.load(std::memory_order_relaxed);
+        if (guards != nullptr) *guards = _count.load(std::memory_order_relaxed);
+    }
+
+private:
+    PageGuard() = default;
+
+    std::uint64_t covering(std::uintptr_t address) const {
+        for (const auto& [id, range] : _entries) {
+            if (range.first <= address && address < range.second) return id;
+        }
+        return 0;
+    }
+
+    // [begin, end) less every guarded range.
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> uncovered(std::uintptr_t begin, std::uintptr_t end) const {
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> held, gaps;
+        for (const auto& [id, range] : _entries) {
+            if (range.first < end && begin < range.second) held.push_back(range);
+        }
+        std::sort(held.begin(), held.end());
+        auto cursor = begin;
+        for (const auto& [from, to] : held) {
+            if (from > cursor) gaps.emplace_back(cursor, from);
+            cursor = std::max(cursor, to);
+        }
+        if (cursor < end) gaps.emplace_back(cursor, end);
+        return gaps;
+    }
+
+#if defined(_WIN32)
+    static bool readWrite(std::uintptr_t begin, std::uintptr_t end) {
+        for (auto cursor = begin; cursor < end;) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(reinterpret_cast<void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || info.Protect != PAGE_READWRITE) return false;
+            cursor = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        }
+        return true;
+    }
+
+    // Region by region (a range may span several views). Back to read-write only where the guard's
+    // no-access still stands: a range mapped again since keeps the protection it was given.
+    static bool access(std::uintptr_t begin, std::uintptr_t end, bool accessible) {
+        bool changed = true;
+        for (auto cursor = begin; cursor < end;) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(reinterpret_cast<void*>(cursor), &info, sizeof(info)) == 0) return false;
+            const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize);
+            if (!accessible || (info.State == MEM_COMMIT && info.Protect == PAGE_NOACCESS)) {
+                DWORD previous = 0;
+                changed = VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, accessible ? PAGE_READWRITE : PAGE_NOACCESS, &previous) != 0 && changed;
+            }
+            cursor = stop;
+        }
+        return changed;
+    }
+
+    static LONG CALLBACK handler(EXCEPTION_POINTERS* exception) {
+        const auto* record = exception->ExceptionRecord;
+        if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+        return Get().Fault(static_cast<std::uintptr_t>(record->ExceptionInformation[1])) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // First in line, ahead of the crash reporter's handler.
+    static void installHandler() { AddVectoredExceptionHandler(1, &PageGuard::handler); }
+#elif defined(__linux__)
+    // Not queried: the guarded ranges are the driver's writable imports.
+    static bool readWrite(std::uintptr_t, std::uintptr_t) { return true; }
+
+    static bool access(std::uintptr_t begin, std::uintptr_t end, bool accessible) {
+        return mprotect(reinterpret_cast<void*>(begin), end - begin, accessible ? PROT_READ | PROT_WRITE : PROT_NONE) == 0;
+    }
+
+    static struct sigaction& previousAction() {
+        static struct sigaction previous{};
+        return previous;
+    }
+
+    static void handler(int signal, siginfo_t* info, void* context) {
+        if (Get().Fault(reinterpret_cast<std::uintptr_t>(info->si_addr))) return;
+        const auto& previous = previousAction();
+        if ((previous.sa_flags & SA_SIGINFO) != 0 && previous.sa_sigaction != nullptr) return previous.sa_sigaction(signal, info, context);
+        if ((previous.sa_flags & SA_SIGINFO) == 0 && previous.sa_handler != SIG_DFL && previous.sa_handler != SIG_IGN) return previous.sa_handler(signal);
+        // Nobody else's either: the access runs again under the default action.
+        struct sigaction fallback{};
+        fallback.sa_handler = SIG_DFL;
+        sigemptyset(&fallback.sa_mask);
+        sigaction(SIGSEGV, &fallback, nullptr);
+    }
+
+    static void installHandler() {
+        struct sigaction action{};
+        action.sa_sigaction = &PageGuard::handler;
+        action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&action.sa_mask);
+        sigaction(SIGSEGV, &action, &previousAction());
+    }
+#else
+    static bool readWrite(std::uintptr_t, std::uintptr_t) { return false; }
+    static bool access(std::uintptr_t, std::uintptr_t, bool) { return false; }
+    static void installHandler() {}
+#endif
+
+    std::shared_mutex _lock;
+    std::map<std::uint64_t, std::pair<std::uintptr_t, std::uintptr_t>> _entries;
+    std::uint64_t _next = 0;
+    std::atomic<std::size_t> _count{0};
+    std::atomic<std::uint64_t> _faults{0}, _forced{0};
+    std::atomic<bool (*)(std::uintptr_t)> _resolve{nullptr};
+    std::once_flag _installed;
+};
+
 }
 
 bool GuestWriteWatchAvailable_nid_postfix() {
@@ -304,6 +498,26 @@ bool GuestWriteWatchCollect_nid_postfix(std::uintptr_t address, std::size_t byte
     static_cast<void>(context);
     return false;
 #endif
+}
+
+void GuestPageGuardInstall_nid_postfix(bool (*resolve)(std::uintptr_t address)) {
+    PageGuard::Get().Install(resolve);
+}
+
+std::uint64_t GuestPageGuardProtect_nid_postfix(std::uintptr_t begin, std::uintptr_t end) {
+    return PageGuard::Get().Protect(begin, end);
+}
+
+void GuestPageGuardRelease_nid_postfix(std::uint64_t id) {
+    if (id != 0) PageGuard::Get().Release(id);
+}
+
+bool GuestPageGuardCovers_nid_postfix(std::uintptr_t address) {
+    return PageGuard::Get().Covers(address);
+}
+
+void GuestPageGuardCounts_nid_postfix(std::uint64_t* faults, std::uint64_t* forced, std::uint64_t* guards) {
+    PageGuard::Get().Counts(faults, forced, guards);
 }
 
 }

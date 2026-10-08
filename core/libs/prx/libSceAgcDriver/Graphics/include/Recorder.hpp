@@ -102,6 +102,7 @@ public:
     // (t175: 5 of 7 runs lost the device ~2 min into gameplay with it, none of 3 without); the
     // default records every copy-back at once, as before. It saves GPU time only (t166: staging
     // class time 1400 -> 870 ms per 10 s), and the frame is CPU-bound.
+    struct ResidentGuard;
     struct DeferredCopy {
         std::shared_ptr<void> keep;
         const void* sourceKey = nullptr;
@@ -112,6 +113,8 @@ public:
         VkDeviceSize bytes = 0;
         // The guest range the copy stores.
         std::uint64_t address = 0;
+        // A resident copy's guard over its host pages (KeepsResidentBuffers); empty otherwise.
+        std::shared_ptr<ResidentGuard> guard {};
     };
     static bool DeferCopyBacks();
     // Copy-back coalescing (APS5_COALESCE_COPY_BACKS=1, read when the recorder is made; without it
@@ -134,6 +137,26 @@ public:
     // see a label only after the copies recorded ahead of its store.
     bool CoalescesCopyBacks() const { return coalesceCopyBacks; }
     bool DefersCopyBacks() const { return coalesceCopyBacks || DeferCopyBacks(); }
+    // Resident buffers (APS5_RESIDENT_BUFFERS=1, which turns coalescing on; docs/design/
+    // resident-memory.md S3): at Submit or a label, the whole host pages of a queued unclaimed
+    // copy stay queued past the batch (its partial pages at either end are recorded as before):
+    // they are made inaccessible (GuestPageGuard*) and wait for the next point that records them
+    // (a command, a dispatch or copy-in over them, a label store over them, a changed mapping,
+    // APS5_RESIDENT_BUFFER_BATCHES or the APS5_RESIDENT_BUFFER_MIB cap) or for the build that takes
+    // their shadow over. A CPU access to such a page (the title's plain reads too) faults, and
+    // ResolveResidentFault lands the bytes from the shadow with a submission of its own; a copy so
+    // landed is not recorded again (the CPU may write the bytes after it). A guard stays until the
+    // batch recording its copy completed.
+    bool KeepsResidentBuffers() const { return residentBuffers; }
+    std::uint64_t ResidentCopyBytes() const;
+    static bool ResolveResidentFault(std::uintptr_t address);
+    // Totals since start (relaxed): copies made resident, those recorded later and those dropped
+    // after a fault, guards refused and flushes at a changed mapping; faults resolved (those under
+    // the GPU lock, those that found every copy landed already) and given up.
+    struct ResidentStatistics {
+        std::uint64_t made, madeBytes, recorded, skipped, refused, remapFlushes, faults, underLock, resolved, landed, forced;
+    };
+    static ResidentStatistics ResidentCounts();
     // Commands() that leaves the queued copy-backs alone under coalescing (the caller recorded
     // those its command touches); Commands() otherwise.
     VkCommandBuffer CommandsKeepingCopyBacks(VkAccessFlags* coveredAccess = nullptr);
@@ -787,6 +810,17 @@ private:
     // Commands() with the queued copy-backs recorded first unless `keepCopyBacks`.
     VkCommandBuffer commandsFor(VkAccessFlags* coveredAccess, bool keepCopyBacks);
     bool coalesceCopyBacks = false;
+    // Resident buffers (KeepsResidentBuffers): at a Submit or label (`reason`), records the queued
+    // copies but keeps the whole pages of the unclaimed ones `stored` does not overlap resident.
+    void flushKeepingResident(FlushReason reason, const std::function<bool(std::uint64_t, std::uint64_t)>& stored);
+    // A resident copy taken over by the build reusing its shadow keeps its pages guarded until the
+    // open batch completed (the build's copy-back lands its bytes by then, or holds them resident).
+    void keepGuards(std::vector<std::shared_ptr<ResidentGuard>> guards);
+    bool resolveResident(std::uintptr_t address, bool owner);
+    // Copies `copies` in order (later ones win) after everything submitted, and waits.
+    void landResident(const std::vector<DeferredCopy>& copies);
+    bool residentBuffers = false;
+    std::uint64_t residentGeneration = 0;
     std::uint64_t passSerials = 0;
     std::vector<DeferredCopy> deferredCopies;
     std::vector<DeferredCopy> claimedCopies;

@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4Opcodes.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include <algorithm>
 #include <array>
@@ -508,6 +509,35 @@ std::atomic<std::uint64_t> keyStoreCount{0}, keyStoreRuns{0}, keyStoreRunsForWri
 // Deferred copy-back counters (Recorder::CopyBackCounts), relaxed likewise.
 std::atomic<std::uint64_t> copyBacksDeferred{0}, copyBackBytesDeferred{0}, copyBacksOverwritten{0}, copyBackBytesOverwritten{0}, copyBacksRecorded{0}, copyBackBytesRecorded{0}, copyBackPasses{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Recorder::FlushReason::Count)> copyBackFlushes{};
+// Resident buffers (Recorder::KeepsResidentBuffers): counters (relaxed, on the [barriers] line),
+// the bytes kept resident at the last decision, and the live guards by sequence, which the fault
+// path searches (a guard's last holder may be a completed batch, released without the GPU mutex).
+std::atomic<std::uint64_t> residentMade{0}, residentMadeBytes{0}, residentSkipped{0}, residentRefused{0}, residentRemapFlushes{0}, residentFaults{0}, residentUnderLock{0}, residentResolved{0}, residentLanded{0}, residentForced{0};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Recorder::FlushReason::Count)> residentRecorded{};
+std::atomic<std::uint64_t> residentKeptBytes{0};
+std::atomic<bool> residentUsed{false};
+HostMutex residentMutex;
+std::map<std::uint64_t, Recorder::ResidentGuard*> residentGuards;
+std::uint64_t residentSequence = 0;
+constexpr std::uint64_t ResidentPageBytes = 4096;
+
+// APS5_RESIDENT_BUFFER_MIB (256): what resident copies may hold back at once;
+// APS5_RESIDENT_BUFFER_BATCHES (16): the batches after its use's past which one is recorded.
+std::uint64_t ResidentCapBytes() {
+    static const std::uint64_t cap = [] {
+        const char* value = std::getenv("APS5_RESIDENT_BUFFER_MIB");
+        return (value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : 256ull) << 20;
+    }();
+    return cap;
+}
+
+std::uint64_t ResidentMaxBatches() {
+    static const std::uint64_t batches = [] {
+        const char* value = std::getenv("APS5_RESIDENT_BUFFER_BATCHES");
+        return value != nullptr && *value != '\0' ? std::max<std::uint64_t>(1, std::strtoull(value, nullptr, 10)) : 16ull;
+    }();
+    return batches;
+}
 
 // Debug aid: APS5_DCC_KEYS_EACH=1 records every DCC key store at once (see Recorder::QueueKeyStore).
 bool KeyStoresEach() {
@@ -1108,6 +1138,15 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
     // Per recorder (not a static): a test makes one with the switch set.
     const char* coalesce = std::getenv("APS5_COALESCE_COPY_BACKS");
     coalesceCopyBacks = coalesce != nullptr && *coalesce != '\0' && std::strcmp(coalesce, "0") != 0;
+    // Resident buffers build on coalescing, which they turn on.
+    const char* resident = std::getenv("APS5_RESIDENT_BUFFERS");
+    residentBuffers = resident != nullptr && *resident != '\0' && std::strcmp(resident, "0") != 0;
+    if (residentBuffers) {
+        coalesceCopyBacks = true;
+        residentGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        residentUsed.store(true, std::memory_order_relaxed);
+        GuestWriteWatch::GuestPageGuardInstall_nid_postfix(&Recorder::ResolveResidentFault);
+    }
     {
         std::lock_guard lock(liveRecordersMutex);
         liveRecorders.push_back(id);
@@ -1396,6 +1435,29 @@ bool Recorder::DeferCopyBacks() {
     return enabled;
 }
 
+// A resident copy's guard (Recorder::KeepsResidentBuffers): the copy of the whole pages a fault
+// lands, the page guard's id, the serials of the batch holding the use that wrote the shadow and
+// of the batch recording the copy (0 until recorded), and whether a fault landed it. The fields
+// change under the GPU mutex; residentGuards lets the fault path find the live guards.
+struct Recorder::ResidentGuard {
+    ResidentGuard() = default;
+    ResidentGuard(const ResidentGuard&) = delete;
+    ResidentGuard& operator=(const ResidentGuard&) = delete;
+    ~ResidentGuard() {
+        {
+            std::lock_guard lock(residentMutex);
+            residentGuards.erase(sequence);
+        }
+        GuestWriteWatch::GuestPageGuardRelease_nid_postfix(id);
+    }
+    DeferredCopy copy;
+    std::uint64_t id = 0;
+    std::uint64_t sequence = 0;
+    std::uint64_t useSerial = 0;
+    std::uint64_t landingSerial = 0;
+    bool resolved = false;
+};
+
 namespace {
 // Moves the copies of `from` whose source is `sourceKey` to the end of `to`.
 void moveCopies(std::vector<Recorder::DeferredCopy>& from, std::vector<Recorder::DeferredCopy>& to, const std::function<bool(const Recorder::DeferredCopy&)>& selected) {
@@ -1443,6 +1505,13 @@ void Recorder::DeferCopies(std::vector<DeferredCopy> copies) {
     if (coalesceCopyBacks) {
         // The bytes a copy stores again lose their earlier queued copy (in program order: within
         // `copies` too), so the queued copies stay disjoint.
+        // Resident buffers: a resident copy under a newer one is recorded first, so none is ever
+        // trimmed (its guard lands the whole range it was made with).
+        if (residentBuffers) {
+            FlushDeferredWhere([&](const DeferredCopy& queued, bool) {
+                return queued.guard != nullptr && std::any_of(copies.begin(), copies.end(), [&](const DeferredCopy& copy) { return copy.address < queued.address + queued.bytes && queued.address < copy.address + copy.bytes; });
+            }, FlushReason::CopyIn);
+        }
         for (auto& copy : copies) {
             dropOverwritten(deferredCopies, copy.address, copy.address + copy.bytes);
             dropOverwritten(claimedCopies, copy.address, copy.address + copy.bytes);
@@ -1466,7 +1535,8 @@ const char* Recorder::FlushReasonName(FlushReason reason) {
 }
 
 void Recorder::FlushDeferredWhere(const std::function<bool(const DeferredCopy&, bool claimed)>& selected, FlushReason reason) {
-    if (open == nullptr || !HasDeferredCopies()) return;
+    // Resident copies outlive their batch: recording them opens one.
+    if ((open == nullptr && !residentBuffers) || !HasDeferredCopies()) return;
     std::vector<DeferredCopy> copies;
     moveCopies(deferredCopies, copies, [&](const DeferredCopy& copy) { return selected(copy, false); });
     moveCopies(claimedCopies, copies, [&](const DeferredCopy& copy) { return selected(copy, true); });
@@ -1501,6 +1571,15 @@ std::vector<Recorder::DeferredCopy> Recorder::TakeClaimedCopies(const void* sour
     std::vector<DeferredCopy> taken;
     if (sourceKey == nullptr) return taken;
     moveCopies(claimedCopies, taken, [&](const DeferredCopy& copy) { return copy.sourceKey == sourceKey; });
+    if (residentBuffers) {
+        // The taker's copy-back holds the union; a copy a fault landed already is not copied again.
+        std::vector<std::shared_ptr<ResidentGuard>> guards;
+        for (const auto& copy : taken) {
+            if (copy.guard != nullptr) guards.push_back(copy.guard);
+        }
+        keepGuards(std::move(guards));
+        taken.erase(std::remove_if(taken.begin(), taken.end(), [](const DeferredCopy& copy) { return copy.guard != nullptr && copy.guard->resolved; }), taken.end());
+    }
     return taken;
 }
 
@@ -1519,8 +1598,205 @@ void Recorder::FlushClaimedOverlapping(std::uint64_t address, std::size_t bytes)
     flushDeferredCopies(false, FlushReason::CopyIn);
 }
 
+void Recorder::keepGuards(std::vector<std::shared_ptr<ResidentGuard>> guards) {
+    for (auto& guard : guards) {
+        ensureOpen();
+        // By the time this batch completed, the newer copy landed or holds a guard of its own.
+        if (guard->landingSerial == 0) guard->landingSerial = submissions + 1;
+        open->kept.push_back(std::move(guard));
+    }
+}
+
+void Recorder::flushKeepingResident(FlushReason reason, const std::function<bool(std::uint64_t, std::uint64_t)>& stored) {
+    if (!HasDeferredCopies()) return;
+    // Claimed copies belong to a build still recording: as before.
+    auto recorded = std::move(claimedCopies);
+    claimedCopies.clear();
+    // A mapping changed: an import a resident copy stores into may retire with the open batch
+    // (retireImport keeps it until that batch completed), so every copy is recorded into it.
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const bool remapped = generation != residentGeneration;
+    residentGeneration = generation;
+    if (remapped) residentRemapFlushes.fetch_add(1, std::memory_order_relaxed);
+    std::uint64_t residentBytes = 0;
+    std::vector<DeferredCopy> kept;
+    for (auto& copy : deferredCopies) {
+        const auto end = copy.address + copy.bytes;
+        if (copy.guard != nullptr) {
+            // Resident already: recorded at a changed mapping, under a label store, or once old.
+            if (remapped || stored(copy.address, end) || copy.guard->useSerial + ResidentMaxBatches() <= submissions + 1) {
+                recorded.push_back(std::move(copy));
+            } else {
+                residentBytes += copy.bytes;
+                kept.push_back(std::move(copy));
+            }
+            continue;
+        }
+        // The whole pages stay; the partial ones at either end are recorded now (a guard there
+        // would fault on bytes the copy does not store).
+        const auto first = (copy.address + ResidentPageBytes - 1) & ~(ResidentPageBytes - 1);
+        const auto last = end & ~(ResidentPageBytes - 1);
+        if (remapped || last <= first || stored(copy.address, end) || residentBytes + (last - first) > ResidentCapBytes()) {
+            recorded.push_back(std::move(copy));
+            continue;
+        }
+        auto guard = std::make_shared<ResidentGuard>();
+        guard->copy = copy;
+        guard->copy.address = first;
+        guard->copy.sourceOffset += first - copy.address;
+        guard->copy.destinationOffset += first - copy.address;
+        guard->copy.bytes = last - first;
+        guard->id = GuestWriteWatch::GuestPageGuardProtect_nid_postfix(first, last);
+        if (guard->id == 0) {
+            residentRefused.fetch_add(1, std::memory_order_relaxed);
+            recorded.push_back(std::move(copy));
+            continue;
+        }
+        guard->useSerial = submissions + 1;
+        {
+            std::lock_guard lock(residentMutex);
+            guard->sequence = ++residentSequence;
+            residentGuards.emplace(guard->sequence, guard.get());
+        }
+        if (first > copy.address) {
+            auto head = copy;
+            head.bytes = first - copy.address;
+            recorded.push_back(std::move(head));
+        }
+        if (end > last) {
+            auto tail = copy;
+            tail.address = last;
+            tail.sourceOffset += last - copy.address;
+            tail.destinationOffset += last - copy.address;
+            tail.bytes = end - last;
+            recorded.push_back(std::move(tail));
+        }
+        residentMade.fetch_add(1, std::memory_order_relaxed);
+        residentMadeBytes.fetch_add(last - first, std::memory_order_relaxed);
+        residentBytes += last - first;
+        auto interior = guard->copy;
+        interior.guard = std::move(guard);
+        kept.push_back(std::move(interior));
+    }
+    deferredCopies = std::move(kept);
+    residentKeptBytes.store(residentBytes, std::memory_order_relaxed);
+    recordDeferredCopies(std::move(recorded), reason);
+}
+
+std::uint64_t Recorder::ResidentCopyBytes() const {
+    std::uint64_t bytes = 0;
+    for (const auto& copy : deferredCopies) bytes += copy.guard != nullptr ? copy.bytes : 0;
+    for (const auto& copy : claimedCopies) bytes += copy.guard != nullptr ? copy.bytes : 0;
+    return bytes;
+}
+
+Recorder::ResidentStatistics Recorder::ResidentCounts() {
+    ResidentStatistics counts{residentMade.load(std::memory_order_relaxed), residentMadeBytes.load(std::memory_order_relaxed), 0, residentSkipped.load(std::memory_order_relaxed), residentRefused.load(std::memory_order_relaxed), residentRemapFlushes.load(std::memory_order_relaxed), residentFaults.load(std::memory_order_relaxed), residentUnderLock.load(std::memory_order_relaxed), residentResolved.load(std::memory_order_relaxed), residentLanded.load(std::memory_order_relaxed), residentForced.load(std::memory_order_relaxed)};
+    for (const auto& recorded : residentRecorded) counts.recorded += recorded.load(std::memory_order_relaxed);
+    return counts;
+}
+
+bool Recorder::ResolveResidentFault(std::uintptr_t address) {
+    // From the fault handler, on any thread (the title's too): nothing may escape.
+    try {
+        const bool owner = GuestMemory::GpuMutex().HeldByThisThread();
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        auto* recorder = Active();
+        return recorder != nullptr && recorder->resolveResident(address, owner);
+    } catch (...) {
+        residentForced.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+}
+
+bool Recorder::resolveResident(std::uintptr_t address, bool owner) {
+    residentFaults.fetch_add(1, std::memory_order_relaxed);
+    if (owner) residentUnderLock.fetch_add(1, std::memory_order_relaxed);
+    const auto page = static_cast<std::uint64_t>(address) & ~(ResidentPageBytes - 1);
+    struct Found {
+        std::uint64_t sequence, id, useSerial, landingSerial;
+        DeferredCopy copy;
+    };
+    std::vector<Found> found;
+    {
+        std::lock_guard lock(residentMutex);
+        for (const auto& [sequence, guard] : residentGuards) {
+            if (!guard->resolved && guard->copy.address <= page && page < guard->copy.address + guard->copy.bytes) found.push_back({sequence, guard->id, guard->useSerial, guard->landingSerial, guard->copy});
+        }
+    }
+    // A guard made at a label of the open batch holds bytes its use has not produced yet: the batch
+    // goes first, unless this thread holds the mutex (it may be recording into it): given up.
+    if (std::any_of(found.begin(), found.end(), [&](const Found& entry) { return entry.useSerial > submissions; })) {
+        if (owner || open == nullptr) {
+            residentForced.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        Submit();
+    }
+    // Oldest first, so a newer guard's bytes win; a copy whose recording batch completed landed.
+    std::sort(found.begin(), found.end(), [](const Found& left, const Found& right) { return left.sequence < right.sequence; });
+    std::vector<DeferredCopy> copies;
+    for (const auto& entry : found) {
+        if (entry.landingSerial != 0 && entry.landingSerial <= submissions && !unsignaled(entry.landingSerial)) continue;
+        copies.push_back(entry.copy);
+    }
+    if (copies.empty()) residentLanded.fetch_add(1, std::memory_order_relaxed);
+    else landResident(copies);
+    {
+        std::lock_guard lock(residentMutex);
+        for (const auto& entry : found) {
+            if (const auto it = residentGuards.find(entry.sequence); it != residentGuards.end()) it->second->resolved = true;
+        }
+    }
+    for (const auto& entry : found) GuestWriteWatch::GuestPageGuardRelease_nid_postfix(entry.id);
+    residentResolved.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void Recorder::landResident(const std::vector<DeferredCopy>& copies) {
+    VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocation.commandPool = context.pool;
+    allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocation.commandBufferCount = 1;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &commands), "vkAllocateCommandBuffers resident");
+    VkFence fence = VK_NULL_HANDLE;
+    const auto cleanup = [&] {
+        if (fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
+        context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
+    };
+    try {
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        Check(function(beginCommandBuffer, "vkBeginCommandBuffer")(commands, &begin), "vkBeginCommandBuffer resident");
+        // Every batch submitted before (the uses that wrote the shadows) precedes the copies; the
+        // open batch is not touched (nothing in it reads or writes a resident range: that records it).
+        recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const auto copy = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
+        for (std::size_t i = 0; i < copies.size(); ++i) {
+            if (i != 0) recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            const VkBufferCopy region{copies[i].sourceOffset, copies[i].destinationOffset, copies[i].bytes};
+            copy(commands, copies[i].source, copies[i].destination, 1, &region);
+        }
+        recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        Check(function(endCommandBuffer, "vkEndCommandBuffer")(commands), "vkEndCommandBuffer resident");
+        VkFenceCreateInfo info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        Check(context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &info, nullptr, &fence), "vkCreateFence resident");
+        VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submission.commandBufferCount = 1;
+        submission.pCommandBuffers = &commands;
+        Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit resident");
+        Check(function(waitForFences, "vkWaitForFences")(context.device, 1, &fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()), "vkWaitForFences resident");
+    } catch (...) {
+        cleanup();
+        throw;
+    }
+    cleanup();
+}
+
 void Recorder::flushDeferredCopies(bool claimed, FlushReason reason) {
-    if (open == nullptr || (deferredCopies.empty() && (!claimed || claimedCopies.empty()))) return;
+    if ((open == nullptr && !residentBuffers) || (deferredCopies.empty() && (!claimed || claimedCopies.empty()))) return;
     auto copies = std::move(deferredCopies);
     deferredCopies.clear();
     if (claimed) {
@@ -1531,6 +1807,20 @@ void Recorder::flushDeferredCopies(bool claimed, FlushReason reason) {
 }
 
 void Recorder::recordDeferredCopies(std::vector<DeferredCopy> copies, FlushReason reason) {
+    if (residentBuffers && !copies.empty()) {
+        // A resident copy a fault landed is dropped (the CPU may have written the bytes since); the
+        // others' pages stay guarded until this batch completed.
+        ensureOpen();
+        const auto landed = std::remove_if(copies.begin(), copies.end(), [](const DeferredCopy& copy) { return copy.guard != nullptr && copy.guard->resolved; });
+        residentSkipped.fetch_add(static_cast<std::uint64_t>(copies.end() - landed), std::memory_order_relaxed);
+        copies.erase(landed, copies.end());
+        for (const auto& copy : copies) {
+            if (copy.guard == nullptr) continue;
+            residentRecorded[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+            copy.guard->landingSerial = submissions + 1;
+            open->kept.push_back(copy.guard);
+        }
+    }
     if (copies.empty()) return;
     copyBackPasses.fetch_add(1, std::memory_order_relaxed);
     copyBackFlushes[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
@@ -1778,8 +2068,9 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
         return;
     }
     // A label says the work before it is done: the queued key stores and the deferred copy-backs
-    // (results of that work) land ahead of every store of the run.
-    flushDeferredCopies(true, FlushReason::StoreRun);
+    // (results of that work) land ahead of every store of the run (resident ones only under it).
+    if (residentBuffers) flushKeepingResident(FlushReason::StoreRun, [&](std::uint64_t begin, std::uint64_t finish) { return address == 0 || (address < finish && begin < address + bytes.size()); });
+    else flushDeferredCopies(true, FlushReason::StoreRun);
     if (!open->keyStores.empty()) recordKeyStores(true);
     if (open->renderPass.open) endOpenRenderPass();
     open->coveredAccess = 0;
@@ -1849,7 +2140,13 @@ bool Recorder::closeStoreRun(bool atSubmit) {
         auto stores = std::move(run.queued);
         run.queued.clear();
         if (stores.empty()) return false;
-        flushDeferredCopies(true, FlushReason::StoreRun);
+        if (residentBuffers) {
+            flushKeepingResident(FlushReason::StoreRun, [&](std::uint64_t begin, std::uint64_t finish) {
+                return std::any_of(stores.begin(), stores.end(), [&](const Batch::StoreRun::Queued& store) { return store.address == 0 || (store.address < finish && begin < store.address + store.bytes.size()); });
+            });
+        } else {
+            flushDeferredCopies(true, FlushReason::StoreRun);
+        }
         // A label says the work before it is done: the queued key stores (results of that work)
         // land ahead of every store of the run, and the pass a draw left open ends.
         if (!open->keyStores.empty()) recordKeyStores(true);
@@ -2011,6 +2308,28 @@ void reportBarriers() {
         }
         std::fprintf(stderr, "; copy-back passes %llu by reason:%s, %llu copies (%.0f MiB) recorded", static_cast<unsigned long long>(counts.passes - last.passes), reasons.c_str(), static_cast<unsigned long long>(counts.recorded - last.recorded), (counts.recordedBytes - last.recordedBytes) / 1048576.0);
         last = counts;
+    }
+    // Resident buffers (APS5_RESIDENT_BUFFERS): copies kept past a Submit or label, those recorded
+    // later by the reason that recorded them, and the CPU faults on guarded pages.
+    if (residentUsed.load(std::memory_order_relaxed)) {
+        static Recorder::ResidentStatistics last{};
+        static std::array<std::uint64_t, static_cast<std::size_t>(Recorder::FlushReason::Count)> lastRecorded{};
+        static std::uint64_t lastPageFaults = 0, lastPageForced = 0;
+        const auto counts = Recorder::ResidentCounts();
+        std::string reasons;
+        for (std::size_t i = 0; i < residentRecorded.size(); ++i) {
+            const auto recorded = residentRecorded[i].load(std::memory_order_relaxed);
+            char text[48];
+            std::snprintf(text, sizeof(text), " %s %llu", Recorder::FlushReasonName(static_cast<Recorder::FlushReason>(i)), static_cast<unsigned long long>(recorded - lastRecorded[i]));
+            reasons += text;
+            lastRecorded[i] = recorded;
+        }
+        std::uint64_t pageFaults = 0, pageForced = 0, guards = 0;
+        GuestWriteWatch::GuestPageGuardCounts_nid_postfix(&pageFaults, &pageForced, &guards);
+        std::fprintf(stderr, "; resident copies %llu made (%.1f MiB), %.1f MiB kept in %llu guards, recorded later by reason:%s, %llu dropped after a fault, %llu refused, %llu remap flushes; page faults %llu (%llu resolved, %llu landed already, %llu under the GPU lock, %llu forced)", static_cast<unsigned long long>(counts.made - last.made), (counts.madeBytes - last.madeBytes) / 1048576.0, residentKeptBytes.load(std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(guards), reasons.c_str(), static_cast<unsigned long long>(counts.skipped - last.skipped), static_cast<unsigned long long>(counts.refused - last.refused), static_cast<unsigned long long>(counts.remapFlushes - last.remapFlushes), static_cast<unsigned long long>(pageFaults - lastPageFaults), static_cast<unsigned long long>(counts.resolved - last.resolved), static_cast<unsigned long long>(counts.landed - last.landed), static_cast<unsigned long long>(counts.underLock - last.underLock), static_cast<unsigned long long>(pageForced - lastPageForced));
+        last = counts;
+        lastPageFaults = pageFaults;
+        lastPageForced = pageForced;
     }
     std::fputc('\n', stderr);
 }
@@ -2903,7 +3222,8 @@ void Recorder::Submit() {
     if (activeRecorder == this) workSinceSubmit.store(0, std::memory_order_relaxed);
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
-    flushDeferredCopies(true, FlushReason::Submit);
+    if (residentBuffers) flushKeepingResident(FlushReason::Submit, [](std::uint64_t, std::uint64_t) { return false; });
+    else flushDeferredCopies(true, FlushReason::Submit);
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     if (open->samples != VK_NULL_HANDLE) context.Function<PFN_vkCmdEndQuery>("vkCmdEndQuery")(open->commands, open->samples, 0);
