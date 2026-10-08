@@ -1486,6 +1486,10 @@ struct RevalidateProfile {
     std::atomic<std::uint64_t> phaseStorage{0};
     std::atomic<std::uint64_t> phaseKeyed{0};
     std::atomic<std::uint64_t> phasePending{0};
+    // One fast-proved Revalidate in 64 per thread, timed around the proof: entry to the proof, the
+    // proof, the checks after it, (2) the imports, (3) the staging copies.
+    std::atomic<std::uint64_t> outerSamples{0};
+    std::array<std::atomic<std::uint64_t>, 5> outerNanoseconds{};
     std::atomic<std::uint64_t> refreshedOverlaps{0};
     std::atomic<std::uint64_t> proofsVerified{0};
     std::atomic<std::int64_t> lastReport{0};
@@ -1641,6 +1645,10 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
         const auto us = [&](std::size_t phase) { return profile.phaseNanoseconds[phase].load() / 1e3 / static_cast<double>(samples); };
         const auto per = [&](const std::atomic<std::uint64_t>& count) { return static_cast<double>(count.load()) / static_cast<double>(samples); };
         std::fprintf(stderr, "[rescache] fast proof phases (%llu sampled proofs, us each): setup %.2f, textures %.2f, storage %.2f, pending scan %.2f, stamps %.2f, cache+records %.2f; per proof %.1f textures, %.1f storage images, %.1f keyed, %.1f pending queries\n", static_cast<unsigned long long>(samples), us(0), us(1), us(2), us(3), us(4), us(5), per(profile.phaseTextures), per(profile.phaseStorage), per(profile.phaseKeyed), per(profile.phasePending));
+    }
+    if (const auto samples = profile.outerSamples.load(); samples != 0) {
+        const auto us = [&](std::size_t phase) { return profile.outerNanoseconds[phase].load() / 1e3 / static_cast<double>(samples); };
+        std::fprintf(stderr, "[rescache] fast revalidate around the proof (%llu sampled, us each): entry %.2f, proof %.2f, after the proof %.2f, imports %.2f, staging copies %.2f\n", static_cast<unsigned long long>(samples), us(0), us(1), us(2), us(3), us(4));
     }
 }
 
@@ -2056,7 +2064,27 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    thread_local std::uint32_t outerTick = 0;
+    const bool outerTimed = profile && (++outerTick & 63u) == 0;
+    std::array<std::chrono::steady_clock::time_point, 5> outerMarks{};
+    const auto outerMark = [&](std::size_t at) {
+        if (outerTimed) outerMarks[at] = std::chrono::steady_clock::now();
+    };
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
+        if (outerTimed && fast && ok) {
+            // Marks: 0 before the proof, 1 after it, 2 before the imports, 3 before the staging
+            // copies, 4 = now; unset marks (a path that skipped them) are taken as the next one.
+            const auto now = std::chrono::steady_clock::now();
+            auto& counts = Revalidations();
+            auto previous = start;
+            for (std::size_t at = 0; at <= 4; ++at) {
+                auto mark = at == 4 ? now : outerMarks[at];
+                if (mark == std::chrono::steady_clock::time_point{}) mark = previous;
+                counts.outerNanoseconds[at].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(mark - previous).count()), std::memory_order_relaxed);
+                previous = mark;
+            }
+            counts.outerSamples.fetch_add(1, std::memory_order_relaxed);
+        }
         if (profile) countRevalidate(fast, ok, start);
         if (report != nullptr) report->failure = ok ? ProofFailure::None : failure;
         return ok;
@@ -2167,7 +2195,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     refreshed.clear();
     FastFail reason = FastFail::Count;
     bool accepted = false;
+    outerMark(0);
     bool fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+    outerMark(1);
     // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
     // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
     // them) and the fast proof run again, which is then authoritative (it accepts what stays
@@ -2479,6 +2509,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // epoch gate the flush runs only for regions one registry scan finds pending images over (none
     // while the serial is the memo's), and the serial loop only while the import table's identity
     // moved since the last proof (a retire bumps its epoch, a registry change its generation).
+    outerMark(2);
     const auto serialLoop = [&] {
         for (const auto& region : directRegions) {
             auto serial = HostImportSerial(context, region.begin, static_cast<std::size_t>(region.end - region.begin), true);
@@ -2512,6 +2543,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in
     // from their imports anew for this use, after the flushes above and before the work is
     // recorded; a failure to record leaves the object unusable for this dispatch, not the batch.
+    outerMark(3);
     if (auto* recorder = Recorder::Active(); recorder != nullptr) {
         try {
             guestMemory.RecordStagingCopies(*recorder);
