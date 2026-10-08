@@ -8,9 +8,9 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include "prx/libc/include/HostThread.hpp"
 #include <windows.h>
 #endif
+#include "prx/libc/include/HostThread.hpp"
 #include "ShaderCacheVersion.hpp"
 #include <algorithm>
 #include <atomic>
@@ -64,13 +64,15 @@ namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
 static_assert(sizeof(RecompileResult) == 176, "RecompileResult changed: update EncodeResult and DecodeResult");
-static_assert(sizeof(DescriptorBinding) == 264, "DescriptorBinding changed: update the binding encoder");
+// deferredWords is not encoded: like guestDescriptor's words, materializeResult re-populates it from
+// each capture's snapshot (DescriptorBindingBuilder::Populate).
+static_assert(sizeof(DescriptorBinding) == 288, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 28, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(FragmentParameter) == 12, "FragmentParameter changed: update the parameter encoder");
 static_assert(sizeof(CompiledShaderInfo) == 304, "CompiledShaderInfo changed: update the info encoder");
 static_assert(sizeof(ShaderInfo) == 200, "ShaderInfo changed: update the info encoder");
 static_assert(sizeof(BufferResource) == 36, "BufferResource changed: update the info encoder");
-static_assert(sizeof(ImageResource) == 80, "ImageResource changed: update the info encoder");
+static_assert(sizeof(ImageResource) == 88, "ImageResource changed: update the info encoder");
 static_assert(sizeof(SamplerResource) == 12, "SamplerResource changed: update the info encoder");
 static_assert(sizeof(SampledResourcePair) == 12, "SampledResourcePair changed: update the info encoder");
 static_assert(sizeof(StageInput) == 56, "StageInput changed: update the info encoder");
@@ -772,7 +774,7 @@ DiskStore& store() {
 // translation (driver state, memory or presentation work) keeps the shaders compiled so far. Entries
 // go stale silently when the translation did change: never set it across recompiler changes.
 std::uint64_t SourceVersion() {
-    static const std::uint64_t version = [] {
+    static const std::uint64_t version = []() -> std::uint64_t {
         const char* value = std::getenv("APS5_SHADER_CACHE_VERSION");
         if (value == nullptr) return Generated::SourceVersion;
         const auto pinned = std::strtoull(value, nullptr, 16);
