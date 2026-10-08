@@ -137,7 +137,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     relocation.Reset();
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial());
+        drawKey = fastState() ? fastDrawKey(queue, submission, localDevice->Serial()) : drawRegisterKey(queue, *submission.shaders, localDevice->Serial());
         std::lock_guard cacheLock(drawCacheMutex);
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
@@ -180,6 +180,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
     }
 
+    // APS5_FAST_STATE: a key without an entry takes its draw state's decode with the live user words.
+    if (registerKey && decode == nullptr && fastState() && !verifyDrawRecipe()) decode = fastDrawDecode(queue, submission);
     resolveDrawDecode(queue, submission, decode, registerKey, drawKey.key, profile);
     const auto& graphics = decode->state;
     const auto& pixel = decode->pixel;

@@ -52,6 +52,7 @@ void Driver::reportDrawCache(DrawEntryCounters& counters) {
         const auto ms = [](double us) { return us / 1000.0; };
         std::fprintf(stderr, "[draw-cache] relocation cost (10 s): candidate search %.1f ms, choice %.1f ms, decode copies %.1f ms, rekeys %.1f ms = %.2f us per lookup\n", ms(counters.relocationFindUs), ms(counters.relocationChooseUs), ms(counters.relocationDecodeUs), ms(counters.relocationRekeyUs), counters.lookups != 0 ? relocationUs / static_cast<double>(counters.lookups) : 0.0);
     }
+    if (fastState()) reportFastState();
     counters = DrawEntryCounters{};
 }
 

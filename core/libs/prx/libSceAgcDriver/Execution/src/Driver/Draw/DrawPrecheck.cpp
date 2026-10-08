@@ -26,6 +26,14 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
     static const bool traceIndirectEnabled = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;
     traceIndirect = traceIndirectEnabled;
     if (traceIndirect && drawParameters.indirect) std::fprintf(stderr, "[draw] indirect packet %s args 0x%llx count %u reached\n", Pm4::Name(packet[0]).c_str(), static_cast<unsigned long long>(drawParameters.indirect->arguments), drawParameters.indirect->count);
+    // APS5_FAST_STATE: the verdict below, memoized per draw state (FastState.cpp).
+    if (fastState()) return fastPrecheckRegisters(queue, submission, drawParameters, rejected);
+    return precheckRegisters(queue, drawParameters.indexed, drawParameters.indexSize, rejected);
+}
+
+// The register-only part of the precheck: a function of the state registers (StateKeyRegisters),
+// `indexed`, the index size and the device's list restart.
+std::optional<DrawVerdict> Driver::precheckRegisters(const QueueState& queue, bool indexed, std::uint32_t indexSize, std::string& rejected) {
     {
         const bool colorWrites = Graphics::WritesColor(queue.context);
         const auto word = [&](std::uint32_t offset) { const auto it = queue.context.find(offset); return it == queue.context.end() ? 0u : it->second; };
@@ -43,12 +51,12 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
             if ((word(0x200) & 3u) == 0 || ((word(0x010) & 3u) == 0 && (word(0x011) & 1u) == 0)) return DrawVerdict::Nothing;
         }
     }
-    if (drawParameters.indexed) {
+    if (indexed) {
         const auto restart = queue.userConfig.find(0x24b);
         if (restart != queue.userConfig.end() && restart->second != 0) {
             const auto resetIndex = queue.context.find(0x103);
             const auto primitive = queue.userConfig.find(0x242);
-            const std::uint32_t allOnes = drawParameters.indexSize == 2 ? 0xffffu : 0xffffffffu;
+            const std::uint32_t allOnes = indexSize == 2 ? 0xffffu : 0xffffffffu;
             const auto type = primitive == queue.userConfig.end() ? 0u : primitive->second & 0x3fu;
             const bool strip = type == 3 || type == 5 || type == 6;
             const bool list = type == 1 || type == 2 || type == 4;
@@ -64,7 +72,7 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
         }
     }
     if (drawPrecheck()) {
-        rejected = Graphics::DrawRejection(queue, drawParameters.indexed);
+        rejected = Graphics::DrawRejection(queue, indexed);
         if (!rejected.empty()) return DrawVerdict::Rejected;
     }
     return std::nullopt;

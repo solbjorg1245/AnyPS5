@@ -146,6 +146,16 @@ private:
     void cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const DrawStageHits& hits, std::vector<std::shared_ptr<DispatchVariant>>& fresh, const DrawKey& drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, DrawRelocation* relocation);
     static bool drawPrecheck();
     std::optional<DrawVerdict> precheckDraw(const QueueState& queue, const Submission& submission, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect);
+    std::optional<DrawVerdict> precheckRegisters(const QueueState& queue, bool indexed, std::uint32_t indexSize, std::string& rejected);
+    // The draw state key and its memo (APS5_FAST_STATE, FastState.cpp): the precheck verdict, the
+    // draw key from the state key and the live user words, and the decode of a key without an entry.
+    static bool fastState();
+    static bool fastStateVerify();
+    FastStateEntry& fastStateEntry(const QueueState& queue, const Submission& submission);
+    std::optional<DrawVerdict> fastPrecheckRegisters(const QueueState& queue, const Submission& submission, const Pm4::DrawParameters& drawParameters, std::string& rejected);
+    DrawKey fastDrawKey(const QueueState& queue, const Submission& submission, std::uint64_t deviceSerial);
+    std::shared_ptr<const DrawDecode> fastDrawDecode(const QueueState& queue, const Submission& submission);
+    static void reportFastState();
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);
     std::optional<Graphics::IndirectDrawPath> classifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect);
     DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected);
