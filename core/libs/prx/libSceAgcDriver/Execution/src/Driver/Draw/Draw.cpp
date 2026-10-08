@@ -40,6 +40,14 @@ struct SnapshotRetry {
 
 constexpr std::uint32_t SnapshotRetryLevels = 3;
 
+// APS5_NO_SNAPSHOT_SERVE=1: no last retry; a draw still differing after the locked capture is
+// dropped as before, so serving the mismatch (words the recompiler baked from the capture beside
+// live memory) can be A/B'd apart from the recaptures.
+std::uint32_t snapshotRetryLimit() {
+    static const std::uint32_t limit = std::getenv("APS5_NO_SNAPSHOT_SERVE") == nullptr ? SnapshotRetryLevels : SnapshotRetryLevels - 1;
+    return limit;
+}
+
 SnapshotRetry& snapshotRetry() {
     static thread_local SnapshotRetry retry;
     return retry;
@@ -348,7 +356,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     // The device's draw, true when it threw SnapshotStale and the packet is to run again
     // (retryStale); the last retry serves the mismatch, so it never gets here.
-    const bool retryable = snapshotRetryEnabled() && retry.level < SnapshotRetryLevels;
+    const bool retryable = snapshotRetryEnabled() && retry.level < snapshotRetryLimit();
     const auto stale = [&](auto&& work) {
         try {
             work();
