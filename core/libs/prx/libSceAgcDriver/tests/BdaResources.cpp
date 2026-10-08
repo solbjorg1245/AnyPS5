@@ -386,9 +386,16 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
             const auto ranges = leased.AddressRanges();
             Require(std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin == blockAddress && range.end == blockAddress + 64; }), "leased block is missing from the BDA table");
             const auto serial = leased.SpaceSerial();
+            // Only a space of shape 0 (every base range served in place or by a fixed mirror) is
+            // rearmed. The mock context imports no host memory, so the writable heap block is served
+            // by a writable mirror (or a copy) and the space is not of that shape: the rearm must be
+            // refused then, and the rearm checks below need a device with host imports.
+            const bool rearmable = leased.LeaseShape() == 0;
             leased.WriteBack();
             Require(!leased.HoldsLease(), "write-back kept the lease");
-            if (AddressSpaceCounters().enabled) {
+            if (AddressSpaceCounters().enabled && !rearmable) {
+                Require(!leased.RearmSpace(serial) && !leased.HoldsLease(), "a committed build rearmed over a space that is not of shape 0");
+            } else if (AddressSpaceCounters().enabled) {
                 // Lease reuse: the committed build takes the unchanged space again for another use.
                 Require(serial != 0 && !leased.RearmSpace(serial + 1), "a rearm took a space of another serial");
                 Require(leased.RearmSpace(serial) && leased.HoldsLease() && leased.SpaceEpochCurrent(), "a committed build did not rearm over its unchanged space");
