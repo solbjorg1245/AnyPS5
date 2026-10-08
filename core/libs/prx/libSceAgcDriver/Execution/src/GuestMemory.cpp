@@ -903,8 +903,19 @@ bool collectMemoEnabled() {
 struct ThreadCollectMemo {
     std::array<WriteTracker::Memo, 64> entries{};
     std::size_t next = 0;
+    // Hits not yet added to collectMemoHits (flushed every 256: the shared counter took a contended
+    // atomic add per hit from every queue thread, ~1.7M per 10 s).
+    std::uint32_t hits = 0;
 };
 thread_local ThreadCollectMemo threadCollectMemo;
+
+// APS5_NO_MEMO_FASTPATH=1: the thread memo scanned oldest slot first with one shared atomic add per
+// hit, as before. Otherwise newest first (a packet's collects repeat its latest walks) with the hits
+// counted per thread.
+bool memoFastPath() {
+    static const bool enabled = std::getenv("APS5_NO_MEMO_FASTPATH") == nullptr;
+    return enabled;
+}
 
 bool sharedCollectMemo() {
     static const bool shared = std::getenv("APS5_SHARED_COLLECT_MEMO") != nullptr;
@@ -1007,13 +1018,29 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (useMemo && !sharedCollectMemo()) {
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
         // initialized and watched; nothing below the lock needs asking.
-        for (const auto& entry : threadCollectMemo.entries) {
-            if (entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end) {
-                // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
-                // overlapping collect) were written before this caller reads, and an older value would
-                // make every later UnchangedSince fail until the epoch ends.
-                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
-                return tracker.generation.load(std::memory_order_relaxed);
+        auto& memo = threadCollectMemo;
+        if (memoFastPath()) {
+            constexpr std::size_t slots = std::tuple_size_v<decltype(memo.entries)>;
+            for (std::size_t back = 1; back <= slots; ++back) {
+                const auto& entry = memo.entries[(memo.next - back) % slots];
+                if (entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end) {
+                    // The current generation (see below).
+                    if (++memo.hits == 256) {
+                        collectMemoHits.fetch_add(memo.hits, std::memory_order_relaxed);
+                        memo.hits = 0;
+                    }
+                    return tracker.generation.load(std::memory_order_relaxed);
+                }
+            }
+        } else {
+            for (const auto& entry : memo.entries) {
+                if (entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end) {
+                    // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
+                    // overlapping collect) were written before this caller reads, and an older value would
+                    // make every later UnchangedSince fail until the epoch ends.
+                    collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                    return tracker.generation.load(std::memory_order_relaxed);
+                }
             }
         }
     }

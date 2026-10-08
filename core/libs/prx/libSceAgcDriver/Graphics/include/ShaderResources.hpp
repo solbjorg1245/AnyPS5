@@ -453,6 +453,10 @@ private:
     // of a Pending failure in element order (empty otherwise), `accepted` whether a foreign overlap
     // was accepted by either rule (the verify switch then runs the full walk beside the proof).
     bool fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted);
+    // The proofs' per-thread vectors and samplers in one thread_local (see the definition); null
+    // under APS5_NO_PROOF_SCRATCH=1, which keeps one thread_local each.
+    struct ProofScratch;
+    static ProofScratch* proofScratch();
     // T1 (design_cpu_final M3): brings the overlapping surfaces' own objects up to date exactly as
     // the full walk's lookups would, in the walk's binding order, without the lookups: a storage
     // image's Refresh (which stores the foreign images over its surface first), a view's source's

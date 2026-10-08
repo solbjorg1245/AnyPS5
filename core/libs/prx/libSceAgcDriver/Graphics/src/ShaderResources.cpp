@@ -1659,6 +1659,37 @@ bool EpochRevalidate() {
     return enabled;
 }
 
+// APS5_NO_PROOF_SCRATCH=1: one thread_local per scratch object, as before the shared one.
+template <typename T, int Slot>
+T& SeparateLocal() {
+    thread_local T value{};
+    return value;
+}
+
+}
+
+// The proofs' scratch in one thread_local: MinGW's thread_local is emulated (one
+// __emutls_get_address call, plus the init guard's, per object a function touches), and a
+// fast-proved Revalidate touched ten of them per call.
+struct ShaderResources::ProofScratch {
+    std::uint32_t outerTick = 0;
+    std::uint32_t phaseTick = 0;
+    std::vector<PendingOverlap> overlapping;
+    std::vector<PendingOverlap> refreshed;
+    std::vector<GuestMemory::UnchangedQuery> queries;
+    std::vector<StorageTexture::PendingQuery> pending;
+    // The element each pending query stands for, in query order.
+    std::vector<PendingOverlap> owners;
+    std::vector<const StorageTexture*> images;
+    std::vector<DccKeys> scannedKeys;
+    std::vector<StorageTexture::PendingQuery> regions;
+};
+
+ShaderResources::ProofScratch* ShaderResources::proofScratch() {
+    static const bool separate = std::getenv("APS5_NO_PROOF_SCRATCH") != nullptr;
+    if (separate) return nullptr;
+    thread_local ProofScratch scratch;
+    return &scratch;
 }
 
 // Turns the lookups' records into this object's per-texture validation records (see
@@ -1741,7 +1772,8 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     overlapping.clear();
     accepted = false;
     if (!EpochRevalidate()) return fastRevalidateEach();
-    thread_local std::uint32_t phaseTick = 0;
+    auto* const scratch = proofScratch();
+    auto& phaseTick = scratch != nullptr ? scratch->phaseTick : SeparateLocal<std::uint32_t, 0>();
     const bool timed = BuildProfiled() && (++phaseTick & 63u) == 0;
     std::array<std::chrono::steady_clock::time_point, 7> marks{};
     std::uint64_t keyed = 0;
@@ -1768,12 +1800,12 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     const bool depthCheck = FastDepthCheck() && depthSerial != depthSerialSeen;
     const bool unchanged = SerialMemoEnabled() && pendingSerialSeen != 0 && pendingSerialSeen == serialBefore;
     const bool keyProofs = KeyFastPath();
-    thread_local std::vector<GuestMemory::UnchangedQuery> queries;
-    thread_local std::vector<StorageTexture::PendingQuery> pending;
+    auto& queries = scratch != nullptr ? scratch->queries : SeparateLocal<std::vector<GuestMemory::UnchangedQuery>, 0>();
+    auto& pending = scratch != nullptr ? scratch->pending : SeparateLocal<std::vector<StorageTexture::PendingQuery>, 0>();
     // The element each pending query stands for, in query order.
-    thread_local std::vector<PendingOverlap> owners;
-    thread_local std::vector<const StorageTexture*> images;
-    thread_local std::vector<DccKeys> scannedKeys;
+    auto& owners = scratch != nullptr ? scratch->owners : SeparateLocal<std::vector<PendingOverlap>, 0>();
+    auto& images = scratch != nullptr ? scratch->images : SeparateLocal<std::vector<const StorageTexture*>, 0>();
+    auto& scannedKeys = scratch != nullptr ? scratch->scannedKeys : SeparateLocal<std::vector<DccKeys>, 0>();
     queries.clear();
     pending.clear();
     owners.clear();
@@ -2064,7 +2096,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    thread_local std::uint32_t outerTick = 0;
+    auto* const scratch = proofScratch();
+    auto& outerTick = scratch != nullptr ? scratch->outerTick : SeparateLocal<std::uint32_t, 1>();
     const bool outerTimed = profile && (++outerTick & 63u) == 0;
     std::array<std::chrono::steady_clock::time_point, 5> outerMarks{};
     const auto outerMark = [&](std::size_t at) {
@@ -2190,8 +2223,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         if (recordsAfterWalk) captureValidation();
         return true;
     };
-    thread_local std::vector<PendingOverlap> overlapping;
-    thread_local std::vector<PendingOverlap> refreshed;
+    auto& overlapping = scratch != nullptr ? scratch->overlapping : SeparateLocal<std::vector<PendingOverlap>, 1>();
+    auto& refreshed = scratch != nullptr ? scratch->refreshed : SeparateLocal<std::vector<PendingOverlap>, 2>();
     refreshed.clear();
     FastFail reason = FastFail::Count;
     bool accepted = false;
@@ -2520,7 +2553,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     };
     if (EpochRevalidate()) {
         if (!directRegions.empty() && !(pendingSerialSeen != 0 && pendingSerialSeen == StorageTexture::PendingSerial())) {
-            thread_local std::vector<StorageTexture::PendingQuery> regions;
+            auto& regions = scratch != nullptr ? scratch->regions : SeparateLocal<std::vector<StorageTexture::PendingQuery>, 1>();
             regions.clear();
             for (const auto& region : directRegions) regions.push_back({region.begin, region.end, nullptr, nullptr, false});
             StorageTexture::ScanPending(regions);
