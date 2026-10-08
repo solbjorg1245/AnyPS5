@@ -172,7 +172,9 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
         if (runtime.expressOnly) return Fail("the express walk did not complete");
         return evaluateInterpreted(program, sources, runtime, results, flat, evaluateFlat, cleanFlatSlots, activeSources);
     }
-    if (!verify) {
+    // The fast walk (expressOnly) never verifies: the interpreter reading through its declining
+    // reader could fail where the express walk ran, which aborts.
+    if (!verify || runtime.expressOnly) {
         results = std::move(expressResults);
         flat = std::move(expressFlat);
         activeSources = std::move(expressActive);
