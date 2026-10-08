@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include <cstdlib>
@@ -58,6 +59,19 @@ void Driver::run(std::uint32_t id) noexcept {
                 workerQueued() = &worker.queued;
                 if (traceGpu && pending.empty()) std::fprintf(stderr, "[gpu] %.1f idle queue=0x%x\n", TraceMs(), id);
                 const auto ready = [&] { return failure || stopping || !pending.empty(); };
+                const auto poll = [&](const auto& done) {
+#ifdef _WIN32
+                    // APS5_NO_HIRES_REAP=1 restores the condition-variable wait, which winpthreads ends on a 15.6 ms tick.
+                    static const bool hiresReap = std::getenv("APS5_NO_HIRES_REAP") == nullptr;
+                    if (hiresReap) {
+                        lock.unlock();
+                        PollSleep();
+                        lock.lock();
+                        return done();
+                    }
+#endif
+                    return changed.wait_for(lock, std::chrono::milliseconds(1), done);
+                };
 
                 while (!ready()) {
                     if (!completionsPending() || (id != 0 && Graphics::Recorder::PendingCompletionLabels() == 0)) {
@@ -66,7 +80,7 @@ void Driver::run(std::uint32_t id) noexcept {
                         if (id == 0) queue0Dormant.store(false, std::memory_order_relaxed);
                         break;
                     }
-                    if (changed.wait_for(lock, std::chrono::milliseconds(1), ready)) break;
+                    if (poll(ready)) break;
                     lock.unlock();
                     reapCompletionLabels();
                     lock.lock();
