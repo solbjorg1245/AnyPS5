@@ -357,6 +357,15 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
                 Require(serial != 0 && !leased.RearmSpace(serial + 1), "a rearm took a space of another serial");
                 Require(leased.RearmSpace(serial) && leased.HoldsLease() && leased.SpaceEpochCurrent(), "a committed build did not rearm over its unchanged space");
                 Require(!leased.RearmSpace(serial), "a rearmed build was rearmed again before its write-back");
+                // Rebased lease templates: a moved read-only range inside the block gets Descriptor's
+                // view in the rearmed space; one leaving the block's base range is refused.
+                VkDescriptorBufferInfo rebasedView{};
+                std::uint32_t rebasedAdjustment = 0;
+                Require(leased.RebasedDescriptor(blockAddress + 16, 32, rebasedView, rebasedAdjustment), "a rearmed space refused a range inside a base range");
+                std::uint32_t expectedAdjustment = 0;
+                const auto expected = leased.Descriptor(blockAddress + 16, 32, expectedAdjustment);
+                Require(rebasedView.buffer == expected.buffer && rebasedView.offset == expected.offset && rebasedView.range == expected.range && rebasedAdjustment == expectedAdjustment, "a rebased view differs from Descriptor's");
+                Require(!leased.RebasedDescriptor(blockAddress + 32, 64, rebasedView, rebasedAdjustment), "a rebased range leaving its base range was served");
                 leased.WriteBack();
                 Require(!leased.HoldsLease(), "the rearmed use's write-back kept the lease");
             }

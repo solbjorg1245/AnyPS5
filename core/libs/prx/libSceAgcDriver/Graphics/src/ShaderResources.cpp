@@ -1317,9 +1317,11 @@ void ShaderResources::noteReusable() {
     reusable = false;
     directRegions.clear();
     // A lease template (see LeaseTemplate): the cached space alone, no copied writes, data buffers
-    // a hit can refresh; set at the build only (a rearmed use keeps it). Off by default: t322-t324
-    // measured no gain (most address-based keys differ in their V# bases per dispatch).
-    static const bool leaseReuse = std::getenv("APS5_LEASE_REUSE") != nullptr;
+    // a hit can refresh; set at the build only (a rearmed use keeps it). On by default with the
+    // rebased lease templates (session 41, t328/t329: the same-key ones alone measured no gain,
+    // t322-t324: most address-based keys differ in their V# bases per dispatch); APS5_NO_LEASE_REBASE=1
+    // turns both off, APS5_LEASE_REUSE=1 then keeps the same-key templates.
+    static const bool leaseReuse = std::getenv("APS5_LEASE_REUSE") != nullptr || (std::getenv("APS5_NO_LEASE_REBASE") == nullptr && TemplateDataRefresh());
     if (leaseReuse && !leaseTemplate && bda != nullptr && HoldsLease() && guestMemory.LeaseShape() == 0 && !guestMemory.HasCopiedWrites() && guestMemory.SpaceSerial() != 0 && !(TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; }))) {
         leaseTemplate = true;
         leaseSerial = guestMemory.SpaceSerial();
@@ -2635,10 +2637,14 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     // 4096 entries leave 3.4k). Compute templates then survive across frames, which exposed the fast
     // proof's missing depth-surface check (fixed in session 23, FastFail::DepthSurface; PROGRESS
     // sessions 21-23): at 4096 the game drew twice as much until then.
+    // With the rebased lease templates (default, see noteReusable) the default is 16384: at 4096 they
+    // were evicted before their key recurred (t327: 8k rebased finds per 10 s found none held, 3k
+    // rearms; t328 at 16384: 5.8k rearms). 16384 alone changed nothing (t329).
     static const std::size_t capacity = [] {
+        const auto fallback = std::getenv("APS5_NO_LEASE_REBASE") == nullptr && TemplateDataRefresh() ? 16384ull : 4096ull;
         const char* value = std::getenv("APS5_RESOURCE_CACHE_ENTRIES");
-        const auto parsed = value ? std::strtoull(value, nullptr, 10) : 4096ull;
-        return static_cast<std::size_t>(parsed != 0 ? parsed : 4096ull);
+        const auto parsed = value ? std::strtoull(value, nullptr, 10) : fallback;
+        return static_cast<std::size_t>(parsed != 0 ? parsed : fallback);
     }();
     while (entries.size() > capacity) {
         if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
@@ -3676,8 +3682,88 @@ bool ShaderResources::RearmLease(std::span<const CompiledShader> shaders) {
         CountLeaseReuse(LeaseReuse::Proof);
         return false;
     }
+    bool moved = false;
+    if (!rebaseLease(shaders, moved)) {
+        guestMemory.DropRearmed();
+        CountLeaseReuse(LeaseReuse::Rebase);
+        return false;
+    }
     leaseIdle.store(false, std::memory_order_relaxed);
     CountLeaseReuse(LeaseReuse::Rearmed);
+    if (moved) CountLeaseReuse(LeaseReuse::Rebased);
+    return true;
+}
+
+bool ShaderResources::rebaseLease(std::span<const CompiledShader> shaders, bool& moved) {
+    moved = false;
+    struct Move {
+        std::size_t index;
+        std::uint64_t address;
+        std::size_t size;
+        VkDescriptorBufferInfo info;
+        std::uint32_t adjustment;
+    };
+    // Every moved element is proved before anything changes: a refusal leaves the template as built.
+    // The key fixes the rest: written elements keep their words, a null element stays null.
+    std::vector<Move> moves;
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& item = allocations[index];
+        if (!item.guest || item.sourceShader < 0) continue;
+        const auto [address, size] = SourceRange(shaders, item.sourceShader, item.sourceBinding, item.sourceElement, {item.address, item.size});
+        if (address == item.address && size == item.size) continue;
+        if (item.written || address == 0 || size == 0 || size > context.limits.maxStorageBufferRange || CheckStaleImports()) return false;
+        Move move{index, address, static_cast<std::size_t>(size), {}, 0};
+        if (!guestMemory.RebasedDescriptor(address, move.size, move.info, move.adjustment)) return false;
+        // As RebaseEligible: no element this dispatch writes may share the moved range.
+        if (guestMemory.WritesOverlap(address, move.size)) return false;
+        // A changed adjustment reaches the shader through a push byte (PatchPushConstants, every
+        // use) or the data buffer's patch, which the record's RefreshData rewrites.
+        if (move.adjustment != item.adjustment && item.pushByte < 0 && (item.dataAllocation < 0 || !TemplateDataRefresh())) return false;
+        moves.push_back(move);
+    }
+    if (moves.empty()) return true;
+    moved = true;
+    std::vector<VkWriteDescriptorSet> writes;
+    writes.reserve(moves.size());
+    for (const auto& binding : bindings) {
+        if (binding.layout.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) continue;
+        for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+            const auto found = std::find_if(moves.begin(), moves.end(), [&](const Move& move) { return move.index == binding.allocations[element]; });
+            if (found == moves.end()) continue;
+            VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            write.dstSet = _set;
+            write.dstBinding = binding.layout.binding;
+            write.dstArrayElement = static_cast<std::uint32_t>(element);
+            write.descriptorCount = 1;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            write.pBufferInfo = &found->info;
+            writes.push_back(write);
+        }
+    }
+    Require(writes.size() == moves.size(), "a rebased guest buffer is not in the template's set");
+    // The template is idle (its previous use completed), so its set is not in use by the GPU.
+    context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    for (const auto& move : moves) {
+        auto& item = allocations[move.index];
+        item.address = move.address;
+        item.size = move.size;
+        if (move.adjustment == item.adjustment) continue;
+        item.adjustment = move.adjustment;
+        // The patch stays listed at zero too: the byte then says 0 again.
+        if (item.pushByte >= 0) {
+            const auto position = static_cast<std::uint32_t>(item.pushByte);
+            auto patch = std::find_if(pushPatches.begin(), pushPatches.end(), [&](const auto& entry) { return entry.first == position; });
+            if (patch != pushPatches.end()) patch->second = move.adjustment;
+            else pushPatches.emplace_back(position, move.adjustment);
+            continue;
+        }
+        const auto data = static_cast<std::size_t>(item.dataAllocation);
+        auto patch = std::find_if(dataPatches.begin(), dataPatches.end(), [&](const DataPatch& entry) { return entry.allocation == data && entry.byte == item.dataByte; });
+        if (patch != dataPatches.end()) patch->adjustment = move.adjustment;
+        else dataPatches.push_back({data, item.dataByte, move.adjustment});
+        // Forgotten words make the record's RefreshData write the buffer with the new patch.
+        allocations[data].dataWords.clear();
+    }
     return true;
 }
 

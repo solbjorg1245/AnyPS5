@@ -143,7 +143,9 @@ struct AddressSpaceStats {
 };
 AddressSpaceStats AddressSpaceCounters();
 // Lease reuse outcomes (ShaderResources::RearmLease), printed in the [address] line.
-enum class LeaseReuse { Rearmed, Busy, Space, Proof };
+// Rebased: a rearm that moved read-only V#s (counted with Rearmed too); Rebase: a rearm refused
+// because a moved V# left the space (ShaderResources::rebaseLease).
+enum class LeaseReuse { Rearmed, Busy, Space, Proof, Rebase, Rebased };
 void CountLeaseReuse(LeaseReuse outcome);
 
 struct MirrorStats {
@@ -249,6 +251,11 @@ public:
     void DropRearmed();
     std::uint64_t SpaceSerial() const;
     bool SpaceEpochCurrent() const;
+    // Rebased lease templates (default; APS5_NO_LEASE_REBASE=1 off): the descriptor a read-only V# moved to
+    // [address, address + bytes) gets in the rearmed space, as Descriptor gives it, when the range
+    // lies inside one base range served in place or by a fixed mirror (shape 0); false (nothing
+    // changed) otherwise, without throwing.
+    bool RebasedDescriptor(std::uint64_t address, std::size_t bytes, VkDescriptorBufferInfo& info, std::uint32_t& adjustment) const;
     // APS5_PROFILE_DRAW: how far an uploaded address-based build is from one a later dispatch could
     // share: 0 the cached space alone, every base range served in place or by a fixed mirror; 1 the
     // same plus per-build regions (V#s, snapshots, copied ranges); 2 a writable or heap mirror in the

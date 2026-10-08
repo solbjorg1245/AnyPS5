@@ -222,7 +222,7 @@ public:
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces() const;
     bool Reusable() const { return reusable; }
-    // Lease templates (APS5_LEASE_REUSE=1; default none): an address-based build over the cached space
+    // Lease templates (default with the rebased ones; APS5_NO_LEASE_REBASE=1 none): an address-based build over the cached space
     // alone (LeaseShape 0) is kept in the resource cache, though not Reusable (its fault buffer and
     // lease are per use), and serves a later dispatch of the same content key once its previous
     // use completed (LeaseIdle: the write-back ran): RearmLease takes the cached space again when it
@@ -231,6 +231,9 @@ public:
     // space moved or the proof failed (counted in the [address] line), the object unchanged.
     bool LeaseTemplate() const { return leaseTemplate; }
     bool LeaseIdle() const { return leaseIdle.load(std::memory_order_acquire); }
+    // By default (APS5_NO_LEASE_REBASE=1 off) the dispatch finds templates by the read-only-rebased key as well
+    // (ContentKey's rebaseReadOnly): RearmLease then rebinds each read-only V# the dispatch moved
+    // (rebaseLease), in place in the idle template's set, and refuses one leaving the space.
     bool RearmLease(std::span<const CompiledShader> shaders);
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
     // and fragment stages, or one compute stage): their bindings are walked like the build did.
@@ -404,6 +407,8 @@ private:
     void prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots);
     VkDescriptorBufferInfo descriptor(Allocation& allocation);
     void noteReusable();
+    // RearmLease's rebase of the moved read-only V#s (see RearmLease): false changes nothing.
+    bool rebaseLease(std::span<const CompiledShader> shaders, bool& moved);
     void reportDescriptorCaches() const;
     // What a sampled texture was proved current against when the build (or the last full Revalidate)
     // looked it up, so the next Revalidate can repeat the proof from write stamps and the DCC keys

@@ -2442,12 +2442,39 @@ bool TemplateDataRefresh() {
 // The content key of a compute stage, naming the device: the cache is process-wide and the driver
 // replaces the headless device with the windowed one while workers may still use the old one, so
 // the key names the device that built the entry (its descriptor set and pooled buffers belong to it).
-ResourceCache::Key DispatchContentKey(const Graphics::CompiledShader& shader, VkDevice device) {
-    auto key = Graphics::ShaderResources::ContentKey(shader, !TemplateDataRefresh());
+ResourceCache::Key DispatchContentKey(const Graphics::CompiledShader& shader, VkDevice device, bool rebased = false) {
+    auto key = Graphics::ShaderResources::ContentKey(shader, !TemplateDataRefresh(), rebased);
     const auto deviceHandle = reinterpret_cast<std::uint64_t>(device);
     key.push_back(static_cast<std::uint32_t>(deviceHandle));
     key.push_back(static_cast<std::uint32_t>(deviceHandle >> 32u));
+    // A rebased key is one word longer: it never equals an exact key.
+    if (rebased) key.push_back(0x4c524b31u);
     return key;
+}
+
+// Rebased lease templates (default; APS5_NO_LEASE_REBASE=1 is the old path): a lease template
+// is cached under the read-only-rebased key (its read-only V# bases and sizes out) and serves a
+// dispatch whose exact key missed, rebinding the moved V#s (ShaderResources::RearmLease). Reusable
+// objects stay under the exact key: their Revalidate does not look at V# bases. Needs the template
+// data refresh (the rebased key leaves the data words out). Session 41's A/B (t328 on / t329 off,
+// both at 16384 cache entries): compute-queue device time per 10 s -13%, queue-0 GPU-mutex wait
+// 431-453 vs 522-550 ms, presents 35 vs 34-35.
+bool LeaseRebase() {
+    static const bool enabled = std::getenv("APS5_NO_LEASE_REBASE") == nullptr && TemplateDataRefresh();
+    return enabled;
+}
+
+// APS5_PROFILE_DRAW: the prepare's rebased-key finds after an exact miss (the [lease-keys] line):
+// an idle template found, a busy one, none held (never inserted or evicted); templates made.
+struct LeaseFindCounts {
+    std::atomic<std::uint64_t> hit{0};
+    std::atomic<std::uint64_t> busy{0};
+    std::atomic<std::uint64_t> none{0};
+    std::atomic<std::uint64_t> templates{0};
+};
+LeaseFindCounts& LeaseFinds() {
+    static LeaseFindCounts counts;
+    return counts;
 }
 
 // The phases of VulkanDevice::dispatch (APS5_PROFILE_DRAW), followed by one row per image lookup
@@ -2474,6 +2501,10 @@ struct PreparedDispatch {
     std::shared_ptr<Graphics::ShaderResources> resources;
     std::shared_ptr<Graphics::ShaderResources> cached;
     ResourceCache::Key key;
+    // LeaseRebase: the read-only-rebased key (made on an exact miss), and whether `cached` was
+    // found under it.
+    ResourceCache::Key leaseKey;
+    bool leaseHit = false;
     // APS5_PROFILE_DRAW: stage A's time, added to the [dispatch] phase totals by the dispatch, and
     // the prepare's parts for the driver's 'prepare:' rows (PreparePhase order).
     double prepareMs = 0;
@@ -2977,12 +3008,22 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
         prepared->key = DispatchContentKey(compute, context.device);
         phase(PreparedDispatch::PrepareKey);
         cached = state->resourceCache.Find(prepared->key);
+        if (cached == nullptr && LeaseRebase()) {
+            prepared->leaseKey = DispatchContentKey(compute, context.device, true);
+            cached = state->resourceCache.Find(prepared->leaseKey);
+            if (cached != nullptr && !cached->LeaseTemplate()) cached = nullptr;
+            prepared->leaseHit = cached != nullptr;
+            if (cached == nullptr) LeaseFinds().none.fetch_add(1, std::memory_order_relaxed);
+            else if (cached->LeaseIdle()) LeaseFinds().hit.fetch_add(1, std::memory_order_relaxed);
+            else LeaseFinds().busy.fetch_add(1, std::memory_order_relaxed);
+        }
         // A lease template whose previous use is still in flight cannot serve this one (its fault
         // buffer and lease are per use): stage A is built here as for a miss, and the build
         // replaces the template in the cache.
         if (cached != nullptr && cached->LeaseTemplate() && !cached->LeaseIdle()) {
             Graphics::CountLeaseReuse(Graphics::LeaseReuse::Busy);
             cached = nullptr;
+            prepared->leaseHit = false;
         }
         prepared->cached = cached;
         phase(PreparedDispatch::PrepareFind);
@@ -3055,6 +3096,7 @@ void ClassifyBuild(const Graphics::CompiledShader& shader, const Graphics::Shade
             const bool rebasedSeen = !rebasedKeys.insert(hash).second;
             static std::atomic<std::uint64_t> builds{0}, exactHits{0}, rebasedHits{0}, lastMs{0};
             builds.fetch_add(1, std::memory_order_relaxed);
+            if (resources.LeaseTemplate()) LeaseFinds().templates.fetch_add(1, std::memory_order_relaxed);
             if (exactSeen) exactHits.fetch_add(1, std::memory_order_relaxed);
             if (rebasedSeen) rebasedHits.fetch_add(1, std::memory_order_relaxed);
             const auto nowMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -3064,7 +3106,12 @@ void ClassifyBuild(const Graphics::CompiledShader& shader, const Graphics::Shade
                 const auto total = builds.exchange(0);
                 const auto exactCount = exactHits.exchange(0);
                 const auto rebasedCount = rebasedHits.exchange(0);
-                std::fprintf(stderr, "[lease-keys] %llu builds over the cached space alone (10 s): same key built before %llu, read-only-rebased key built before %llu\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(exactCount), static_cast<unsigned long long>(rebasedCount));
+                auto& finds = LeaseFinds();
+                const auto templates = static_cast<unsigned long long>(finds.templates.exchange(0));
+                const auto findIdle = static_cast<unsigned long long>(finds.hit.exchange(0));
+                const auto findBusy = static_cast<unsigned long long>(finds.busy.exchange(0));
+                const auto findNone = static_cast<unsigned long long>(finds.none.exchange(0));
+                std::fprintf(stderr, "[lease-keys] %llu builds over the cached space alone (10 s): same key built before %llu, read-only-rebased key built before %llu; lease templates made %llu; rebased finds: idle %llu, busy %llu, none %llu\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(exactCount), static_cast<unsigned long long>(rebasedCount), templates, findIdle, findBusy, findNone);
             }
         }
         return;
@@ -3368,6 +3415,9 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     const auto lookupsBefore = Graphics::DeviceProcLookups();
     std::shared_ptr<Graphics::ShaderResources> resources;
     ResourceCache::Key contentKey;
+    // LeaseRebase: the rebased key a lease template is cached and found under.
+    ResourceCache::Key leaseKey;
+    bool leaseHit = false;
     const bool cacheable = ResourceCacheEnabled() && shader.variantId != 0;
     // The object came from the resource cache: a compute template whose data buffers take this
     // dispatch's words at the record (ShaderResources::RefreshData).
@@ -3394,24 +3444,40 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     if (profile && arguments != 0) Graphics::ThreadLookupOutcomes() = {};
     // The resource cache insert evicts the oldest entry, destroying its ShaderResources here when the
     // cache was the last owner: timed apart from the build.
-    const auto insert = [&] {
+    const auto insert = [&](const ResourceCache::Key& key) {
         const auto insertStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         // The displaced entries go to the open batch: their destruction (descriptor sets, pooled
         // buffers, texture references) then runs on the release thread once the batch completed,
         // not here under the mutex. APS5_NO_DEFERRED_EVICTION=1 destroys them here as before.
         static const bool deferEviction = std::getenv("APS5_NO_DEFERRED_EVICTION") == nullptr;
         std::vector<std::shared_ptr<Graphics::ShaderResources>> evicted;
-        state->resourceCache.Insert(contentKey, resources, deferEviction ? &evicted : nullptr);
+        state->resourceCache.Insert(key, resources, deferEviction ? &evicted : nullptr);
         for (auto& object : evicted) state->recorder->Keep(std::move(object));
         if (profile) {
             timer.add(PhaseResourcesInsert, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - insertStart).count());
             if (arguments != 0) d.indirectHold.phaseCounts[PhaseResourcesInsert] += evicted.size();
         }
     };
+    // A build enters the cache when reusable (exact key) or a recurring lease template (the rebased
+    // key under LeaseRebase, else the exact one).
+    const auto insertBuilt = [&] {
+        if (resources->Reusable()) {
+            insert(contentKey);
+            return;
+        }
+        if (!resources->LeaseTemplate()) return;
+        if (!LeaseRebase()) {
+            if (LeaseKeyRecurs(contentKey)) insert(contentKey);
+            return;
+        }
+        if (leaseKey.empty()) leaseKey = DispatchContentKey(shaders[0], context.device, true);
+        if (LeaseKeyRecurs(leaseKey)) insert(leaseKey);
+    };
     if (prepared != nullptr && prepared->resources != nullptr) {
         // Stage A ran without the mutex (PrepareDispatch); stage B completes the build here.
         resources = std::move(prepared->resources);
         contentKey = std::move(prepared->key);
+        leaseKey = std::move(prepared->leaseKey);
         // The build's own sub-phase totals before and after: the differences are stage B's parts
         // (an address-based build also runs its stage A here, under the mutex: 'A locked').
         const auto before = profile ? resources->Timing() : Graphics::ShaderResources::BuildTiming{};
@@ -3441,7 +3507,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         }
         if (cacheable) {
             ++d.cacheMisses;
-            if (resources->Reusable() || (resources->LeaseTemplate() && LeaseKeyRecurs(contentKey))) insert();
+            insertBuilt();
         }
     } else if (cacheable) {
         // PrepareDispatch made the key already when it found the cached object, and carries the
@@ -3449,7 +3515,18 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         // alone by the pointer-conditional Remove). APS5_NO_PREPARED_FIND=1 looks the key up again.
         static const bool preparedFind = std::getenv("APS5_NO_PREPARED_FIND") == nullptr;
         contentKey = prepared != nullptr && !prepared->key.empty() ? std::move(prepared->key) : DispatchContentKey(shaders[0], context.device);
-        auto cached = preparedFind && prepared != nullptr && prepared->cached != nullptr ? std::move(prepared->cached) : state->resourceCache.Find(contentKey);
+        const bool preparedHit = preparedFind && prepared != nullptr && prepared->cached != nullptr;
+        if (preparedHit) {
+            leaseKey = std::move(prepared->leaseKey);
+            leaseHit = prepared->leaseHit;
+        }
+        auto cached = preparedHit ? std::move(prepared->cached) : state->resourceCache.Find(contentKey);
+        if (cached == nullptr && LeaseRebase()) {
+            leaseKey = DispatchContentKey(shaders[0], context.device, true);
+            cached = state->resourceCache.Find(leaseKey);
+            if (cached != nullptr && !cached->LeaseTemplate()) cached = nullptr;
+            leaseHit = cached != nullptr;
+        }
         if (cached != nullptr) {
             // A lease template is rearmed for this use (Graphics::ShaderResources::RearmLease).
             if (cached->LeaseTemplate() ? cached->RearmLease(shaders) : cached->Revalidate(shaders[0])) {
@@ -3458,7 +3535,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                 if (profile) ThreadDeviceSplit().path = DevicePath::ResourceHit;
                 ++d.cacheHits;
             } else {
-                state->resourceCache.Remove(contentKey, cached.get());
+                state->resourceCache.Remove(leaseHit ? leaseKey : contentKey, cached.get());
                 ++d.cacheInvalidated;
                 // Off the mutex with its batch, as an evicted entry (insert()).
                 state->recorder->Keep(std::move(cached));
@@ -3479,7 +3556,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         }
         if (cacheable) {
             ++d.cacheMisses;
-            if (resources->Reusable() || (resources->LeaseTemplate() && LeaseKeyRecurs(contentKey))) insert();
+            insertBuilt();
         }
     }
     resources->PatchPushConstants(pushBytes);

@@ -116,6 +116,8 @@ struct AddressSpaceCache {
     std::atomic<std::uint64_t> rearmBusy{0};
     std::atomic<std::uint64_t> rearmSpace{0};
     std::atomic<std::uint64_t> rearmProof{0};
+    std::atomic<std::uint64_t> rearmRebase{0};
+    std::atomic<std::uint64_t> rebased{0};
 };
 
 AddressSpaceCache& Spaces() {
@@ -1341,7 +1343,9 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
     const auto rearmBusy = static_cast<unsigned long long>(Spaces().rearmBusy.exchange(0, std::memory_order_relaxed));
     const auto rearmSpace = static_cast<unsigned long long>(Spaces().rearmSpace.exchange(0, std::memory_order_relaxed));
     const auto rearmProof = static_cast<unsigned long long>(Spaces().rearmProof.exchange(0, std::memory_order_relaxed));
-    std::fprintf(stderr, "[address] %llu address-based builds (10 s), us per build: lease %.0f, imports pass %.0f, mirror prepare %.0f, compare %.0f (%.0f blocks, %.1f copied), snapshots %.0f; space hits %llu / rebuilds: generation %llu, epoch %llu, device %llu, waiter drop %llu, first %llu; unpublished %llu, dissolved: overlap %llu, imports %llu%s, spanned %llu (span imports %llu, refused %llu); lease reuse: rearmed %llu, refused: busy %llu, space %llu, proof %llu; [bda-table] hits %llu / misses %llu (space tables %llu), first entry: expired %llu, hash differs low %llu / heap %llu, same hash %llu, none held %llu\n", static_cast<unsigned long long>(totals.builds), per(totals.sums.leaseUs), per(totals.sums.importsUs), per(totals.sums.mirrorsUs), per(totals.sums.compareUs), per(static_cast<double>(totals.sums.blocksCompared)), per(static_cast<double>(totals.sums.blocksCopied)), per(totals.snapshotsUs), delta(space.hits, spaceSeen.hits), delta(space.rebuiltGeneration, spaceSeen.rebuiltGeneration), delta(space.rebuiltEpoch, spaceSeen.rebuiltEpoch), delta(space.rebuiltDevice, spaceSeen.rebuiltDevice), delta(space.rebuiltWaiterDrop, spaceSeen.rebuiltWaiterDrop), delta(space.rebuiltFirst, spaceSeen.rebuiltFirst), delta(space.unpublished, spaceSeen.unpublished), delta(space.dissolvedOverlap, spaceSeen.dissolvedOverlap), delta(space.dissolvedImports, spaceSeen.dissolvedImports), space.enabled ? "" : " (cache off)", spanned, spanImports, spanFailures, rearmed, rearmBusy, rearmSpace, rearmProof, delta(table.hits, seen.hits), delta(table.misses, seen.misses), delta(table.spaceTables, seen.spaceTables), delta(table.firstExpired, seen.firstExpired), delta(table.firstDiffersLow, seen.firstDiffersLow), delta(table.firstDiffersHeap, seen.firstDiffersHeap), delta(table.firstSameHash, seen.firstSameHash), delta(table.firstEmpty, seen.firstEmpty));
+    const auto rearmRebase = static_cast<unsigned long long>(Spaces().rearmRebase.exchange(0, std::memory_order_relaxed));
+    const auto rebased = static_cast<unsigned long long>(Spaces().rebased.exchange(0, std::memory_order_relaxed));
+    std::fprintf(stderr, "[address] %llu address-based builds (10 s), us per build: lease %.0f, imports pass %.0f, mirror prepare %.0f, compare %.0f (%.0f blocks, %.1f copied), snapshots %.0f; space hits %llu / rebuilds: generation %llu, epoch %llu, device %llu, waiter drop %llu, first %llu; unpublished %llu, dissolved: overlap %llu, imports %llu%s, spanned %llu (span imports %llu, refused %llu); lease reuse: rearmed %llu (rebased %llu), refused: busy %llu, space %llu, proof %llu, rebase %llu; [bda-table] hits %llu / misses %llu (space tables %llu), first entry: expired %llu, hash differs low %llu / heap %llu, same hash %llu, none held %llu\n", static_cast<unsigned long long>(totals.builds), per(totals.sums.leaseUs), per(totals.sums.importsUs), per(totals.sums.mirrorsUs), per(totals.sums.compareUs), per(static_cast<double>(totals.sums.blocksCompared)), per(static_cast<double>(totals.sums.blocksCopied)), per(totals.snapshotsUs), delta(space.hits, spaceSeen.hits), delta(space.rebuiltGeneration, spaceSeen.rebuiltGeneration), delta(space.rebuiltEpoch, spaceSeen.rebuiltEpoch), delta(space.rebuiltDevice, spaceSeen.rebuiltDevice), delta(space.rebuiltWaiterDrop, spaceSeen.rebuiltWaiterDrop), delta(space.rebuiltFirst, spaceSeen.rebuiltFirst), delta(space.unpublished, spaceSeen.unpublished), delta(space.dissolvedOverlap, spaceSeen.dissolvedOverlap), delta(space.dissolvedImports, spaceSeen.dissolvedImports), space.enabled ? "" : " (cache off)", spanned, spanImports, spanFailures, rearmed, rebased, rearmBusy, rearmSpace, rearmProof, rearmRebase, delta(table.hits, seen.hits), delta(table.misses, seen.misses), delta(table.spaceTables, seen.spaceTables), delta(table.firstExpired, seen.firstExpired), delta(table.firstDiffersLow, seen.firstDiffersLow), delta(table.firstDiffersHeap, seen.firstDiffersHeap), delta(table.firstSameHash, seen.firstSameHash), delta(table.firstEmpty, seen.firstEmpty));
     totals.tableSeen = table;
     totals.spaceSeen = space;
     totals.builds = 0;
@@ -3122,7 +3126,7 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
 
 void CountLeaseReuse(LeaseReuse outcome) {
     auto& spaces = Spaces();
-    auto& counter = outcome == LeaseReuse::Rearmed ? spaces.rearmed : outcome == LeaseReuse::Busy ? spaces.rearmBusy : outcome == LeaseReuse::Space ? spaces.rearmSpace : spaces.rearmProof;
+    auto& counter = outcome == LeaseReuse::Rearmed ? spaces.rearmed : outcome == LeaseReuse::Busy ? spaces.rearmBusy : outcome == LeaseReuse::Space ? spaces.rearmSpace : outcome == LeaseReuse::Rebase ? spaces.rearmRebase : outcome == LeaseReuse::Rebased ? spaces.rebased : spaces.rearmProof;
     counter.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -3150,6 +3154,25 @@ bool GuestBufferMemory::RearmSpace(std::uint64_t serial) {
     space = std::move(current);
     importsEpoch = space->importsEpoch;
     committed = false;
+    return true;
+}
+
+bool GuestBufferMemory::RebasedDescriptor(std::uint64_t address, std::size_t bytes, VkDescriptorBufferInfo& info, std::uint32_t& adjustment) const {
+    if (!uploaded || committed || space == nullptr || !regions.empty() || address == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    // With no regions of its own the object's owner (Descriptor) is the base range holding the
+    // address: the range must end inside it, as a build's Inside descriptor does.
+    const Region* found = nullptr;
+    if (baseOverlap(address, address + bytes, &found) != BaseOverlap::Inside || found == nullptr) return false;
+    const auto& region = *found;
+    if (region.direct == nullptr && (region.mirror == nullptr || region.mirror->writable || region.mirror->heap)) return false;
+    const auto alignment = context.limits.minStorageBufferOffsetAlignment;
+    if (alignment == 0) return false;
+    const auto base = region.direct != nullptr ? region.direct->base : region.mirror->base;
+    const auto offset = address - base;
+    const auto moved = static_cast<std::uint32_t>(offset % alignment);
+    if (moved % 4 != 0 || bytes + moved > context.limits.maxStorageBufferRange) return false;
+    info = {region.direct != nullptr ? region.direct->buffer : region.mirror->buffer->Handle(), offset - moved, bytes + moved};
+    adjustment = moved;
     return true;
 }
 
