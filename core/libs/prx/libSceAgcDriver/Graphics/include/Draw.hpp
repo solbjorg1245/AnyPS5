@@ -1,4 +1,5 @@
 #include <string>
+#include <string_view>
 #include <optional>
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DRAW_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DRAW_HPP
@@ -74,9 +75,11 @@ const char* IndirectDrawPathName(IndirectDrawPath path);
 
 // Draw packets that drew nothing, for the [draws] line: Nothing (an empty count, or no color writes
 // and no pixel shader), Prechecked (State.hpp's DrawRejection refused it before the decode) and
-// Thrown (the decode or the build threw); `us` is the packet's time in the driver.
+// Thrown (the decode or the build threw); `us` is the packet's time in the driver. `reason` (the
+// rejection or the exception's text) feeds the "[draws] skips by reason" line, counted per reason
+// head (DrawSkipReasons.hpp) unless APS5_NO_DRAW_SKIP_REASONS=1.
 enum class DrawSkip : std::uint8_t { Nothing, Prechecked, Thrown, Count };
-void CountDrawSkip(DrawSkip kind, double us);
+void CountDrawSkip(DrawSkip kind, double us, std::string_view reason = {});
 
 // Recorded draws whose written guest buffers were copied (their results reach guest memory by a CPU
 // write-back when their batch completes), listed until that write-back ran. It is the draw

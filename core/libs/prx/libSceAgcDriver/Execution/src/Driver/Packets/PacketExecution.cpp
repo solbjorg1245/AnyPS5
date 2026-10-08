@@ -319,8 +319,8 @@ void Driver::execute(const Submission& submission) {
                 static const bool profileDraws = std::getenv("APS5_PROFILE_DRAW") != nullptr;
                 const auto color = (static_cast<std::uint64_t>(readRegister(queue.context, 0x390)) << 40u) | (static_cast<std::uint64_t>(readRegister(queue.context, 0x318)) << 8u);
                 const auto started = profileDraws ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                const auto countSkip = [&](Graphics::DrawSkip kind) {
-                    if (profileDraws) Graphics::CountDrawSkip(kind, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count());
+                const auto countSkip = [&](Graphics::DrawSkip kind, std::string_view reason = {}) {
+                    if (profileDraws) Graphics::CountDrawSkip(kind, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count(), reason);
                 };
 
                 const auto skipped = [&](const std::string& what) {
@@ -356,7 +356,7 @@ void Driver::execute(const Submission& submission) {
                         traceVerdict = "rejected";
                         traceReason = rejected;
                         skipped(rejected);
-                        countSkip(Graphics::DrawSkip::Prechecked);
+                        countSkip(Graphics::DrawSkip::Prechecked, rejected);
                     } else if (verdict == DrawVerdict::Nothing) {
                         traceVerdict = "nothing";
                         countSkip(Graphics::DrawSkip::Nothing);
@@ -368,7 +368,7 @@ void Driver::execute(const Submission& submission) {
                     traceVerdict = "failed";
                     traceReason = error.what();
                     skipped(error.what());
-                    countSkip(Graphics::DrawSkip::Thrown);
+                    countSkip(Graphics::DrawSkip::Thrown, error.what());
                 }
                 if (FrameTrace::Active()) {
                     std::vector<std::uint64_t> targets;
