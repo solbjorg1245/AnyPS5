@@ -180,6 +180,9 @@ private:
     static void countIndirect(int path, double readMs);
     void dispatchIndirect(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission);
     static bool& sampledRead();
+    // Set while a draw packet runs again after a SnapshotStale (Draw.cpp): queryPendingWrite answers
+    // Sync for every word a recorded write still covers, so the capture waits for the writer.
+    static bool& forcedSyncReads();
     static bool writeEvidenceEnabled();
     static bool writerKeyedEvidence();
     static bool foreignWriters();

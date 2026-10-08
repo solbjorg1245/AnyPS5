@@ -5,7 +5,9 @@
 #include "BdaAbi.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <memory>
+#include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -18,6 +20,27 @@ struct GuestMemorySnapshot {
     std::uint64_t address;
     std::span<const std::byte> bytes;
 };
+
+// AddSnapshot's mismatch, with the old text: a captured region disagrees with the region serving
+// it. `live`: the owner reads guest memory in place, so the memory changed since the capture (made
+// before the device lock); otherwise two snapshots of one snapshot-backed range disagree.
+// `pending`: recorded GPU work or a label still writes the range. Driver::draw catches it and runs
+// the packet again (Draw.cpp, snapshotRetry); APS5_NO_SNAPSHOT_RETRY=1 drops the draw as before.
+struct SnapshotStale : std::runtime_error {
+    SnapshotStale(bool live, bool pending) : std::runtime_error("AGC graphics: guest snapshot differs from registered memory"), live(live), pending(pending) {}
+    bool live;
+    bool pending;
+};
+
+// Set on a thread, its AddSnapshot binds a mismatching range as it is (the live region, or the
+// range's first snapshot) instead of throwing SnapshotStale: Driver::draw's last retry, which
+// renders with the memory as it is, as hardware would.
+bool& ThreadServesStaleSnapshots();
+
+// APS5_PROFILE_DRAW: a draw packet run again after SnapshotStale, by the retry's level (1 a fresh
+// capture, 2 the capture under the GPU mutex, 3 the mismatch served); `hit` when the attempt that
+// threw bound a draw-cache hit's stage bytes. Counted on the [address-sync] line.
+void CountSnapshotRetry(std::uint32_t level, bool hit);
 
 // A guest allocation imported with VK_EXT_external_memory_host, usable by the GPU in place.
 struct HostImport {
