@@ -377,6 +377,13 @@ public:
     // Whether the lock-free pending-write snapshot (open, in-flight and finishing batches) overlaps
     // the range: false means no recorded work writes it, so a wait on it has nothing to submit.
     static bool SnapshotWriteOverlaps(std::uint64_t address, std::size_t bytes);
+    // Whether one of the calling worker's queued labels (NoteQueuedLabel, not recorded yet)
+    // overlaps the range. The snapshot above does not see them, so a capture's page query over
+    // such a label answered "nothing pending" and the whole-page read had the flush hook record
+    // the group and sync on the open batch; the driver's page query asks this as well, so the
+    // page is read word by word and only a read of the label's own dwords records and waits
+    // (APS5_NO_WORDWISE_QUEUED_LABELS=1: the old path). Counts the true answers.
+    static bool QueuedLabelOverlapsThisThread(std::uint64_t address, std::size_t bytes);
     // The snapshot itself (the sorted, merged union of the pending ranges; null when none), for a
     // reader that tests many ranges against one loaded snapshot: one atomic shared_ptr load per
     // validation instead of one per run, and every test sees the same snapshot (design13 R1's p0).
@@ -473,6 +480,8 @@ public:
         // Store runs recorded at Submit, and in place before a later writer or reader of a queued
         // store's bytes (FlushStores).
         std::uint64_t runsAtSubmit, runsForced;
+        // Page queries a queued label alone overlapped (QueuedLabelOverlapsThisThread).
+        std::uint64_t queuedPageQueries;
     };
     static StoreStatistics StoreCounts();
     // APS5_PROFILE_GPU=1: GPU time of recorded work by key (a guest program address), from timestamp

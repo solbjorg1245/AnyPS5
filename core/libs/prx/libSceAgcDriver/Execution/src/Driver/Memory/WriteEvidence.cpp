@@ -213,10 +213,19 @@ ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, s
 }
 
 ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
+    static const bool wordwiseQueuedLabels = std::getenv("APS5_NO_WORDWISE_QUEUED_LABELS") == nullptr;
     std::uint64_t ValidateCounters::*reason = nullptr;
     PendingView pending;
     pending.Load();
-    return Get().classifyPendingWrite(address, bytes, reason, pending, known);
+    const auto policy = Get().classifyPendingWrite(address, bytes, reason, pending, known);
+    // A page query (ShaderMemory's page fetch, its express walk and deferPureLeaf) over a label
+    // this worker queued but has not recorded: the snapshot misses it, and the whole-page read
+    // would have the flush hook record the group and wait for the open batch (the queue-0x50
+    // [0x50 DISPATCH_INDIRECT capture] hook syncs). Sync makes the page word-wise; its word
+    // queries still answer None, so a word beside the label reads raw and only a read of the
+    // label's dwords goes through the hook's record and sync, as the whole page did.
+    if (policy == ShaderMemory::PendingWrite::None && wordwiseQueuedLabels && bytes >= ShaderMemory::PageBytes && Graphics::Recorder::QueuedLabelOverlapsThisThread(address, bytes)) return ShaderMemory::PendingWrite::Sync;
+    return policy;
 }
 
 }

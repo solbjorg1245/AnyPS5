@@ -345,7 +345,12 @@ void labelTests(Recorder& recorder) {
     // A label this worker queued but has not recorded yet is inside the range for a CPU store decision.
     Recorder::NoteQueuedLabel(0x60010, value, 1, AgcDriver::GuestMemory::GpuLockThreadTag());
     Require(recorder.PendingLabelIn(0x60010, 4) && recorder.PendingLabelIn(0x60000, 0x100) && !recorder.PendingLabelIn(0x60014, 4) && !recorder.PendingLabelIn(0x60000, 0x10), "a queued label is not seen by PendingLabelIn");
+    // The capture's page query sees it (the page is then read word by word); a word beside it does not.
+    const auto pageQueries = Recorder::StoreCounts().queuedPageQueries;
+    Require(Recorder::QueuedLabelOverlapsThisThread(0x60000, 0x1000) && !Recorder::QueuedLabelOverlapsThisThread(0x60014, 4) && !Recorder::QueuedLabelOverlapsThisThread(0x61000, 0x1000), "a queued label's page overlap is wrong");
+    Require(Recorder::StoreCounts().queuedPageQueries == pageQueries + 1, "a queued label's page query was not counted once");
     Recorder::ForgetQueuedLabels();
+    Require(!Recorder::QueuedLabelOverlapsThisThread(0x60000, 0x1000), "a forgotten queued label still overlaps its page");
     Require(!recorder.PendingLabelIn(0x60000, 0x100), "a forgotten queued label is still pending");
     recorder.NoteLabel(0x60020, value, 2, 0);
     Require(recorder.PendingLabelIn(0x60020, 4) && recorder.PendingLabelIn(0x60000, 0x100) && !recorder.PendingLabelIn(0x60000, 0x20), "a recorded label is not seen by PendingLabelIn");
