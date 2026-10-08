@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <chrono>
 #include <algorithm>
+#include <numeric>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -1457,6 +1458,28 @@ void GuestBufferMemory::dissolveSpace(bool resolve) {
     space.reset();
 }
 
+// APS5_PROFILE_DRAW: the first 24 partial overlaps per run that dissolve an address space, with the
+// base ranges the range crosses (a descriptor or snapshot crossing a registered range's end turns the
+// build's ~6k space ranges into per-build regions: t308/t311/t312 made 207-290 such builds per 10 s,
+// t309/t310 none, and with them queue 0's GPU-mutex wait 850-1250 ms against 490-580).
+void GuestBufferMemory::traceDissolve(const char* kind, std::uint64_t begin, std::uint64_t end) const {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static std::atomic<int> traced{0};
+    if (!profile || space == nullptr || traced.fetch_add(1, std::memory_order_relaxed) >= 24) return;
+    const auto& base = space->base;
+    auto it = std::upper_bound(base.begin(), base.end(), begin, [](std::uint64_t value, const Region& region) { return value < region.begin; });
+    if (it != base.begin()) --it;
+    std::string crossed;
+    for (int shown = 0; it != base.end() && it->begin < end && shown < 4; ++it) {
+        if (it->end <= begin) continue;
+        char text[96];
+        std::snprintf(text, sizeof(text), " 0x%llx+0x%llx%s", static_cast<unsigned long long>(it->begin), static_cast<unsigned long long>(it->end - it->begin), it->direct != nullptr ? " import" : it->mirror != nullptr ? " mirror" : "");
+        crossed += text;
+        ++shown;
+    }
+    std::fprintf(stderr, "[address] dissolve by %s 0x%llx+0x%llx (space %llu, %zu base ranges): crosses%s\n", kind, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<unsigned long long>(space->serial), base.size(), crossed.empty() ? " nothing" : crossed.c_str());
+}
+
 const GuestBufferMemory::Region* GuestBufferMemory::owner(std::uint64_t address) const {
     // The region with the greatest begin at or below the address, as the one merged list gave;
     // the caller checks the end, as before.
@@ -1477,6 +1500,7 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
             return;
         case BaseOverlap::Partial:
             Spaces().dissolvedOverlap.fetch_add(1, std::memory_order_relaxed);
+            traceDissolve(atomic ? "atomic descriptor" : "descriptor", address, address + bytes);
             dissolveSpace(false);
             break;
         case BaseOverlap::None:
@@ -1518,6 +1542,7 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
     const Region* owner = nullptr;
     if (baseOverlap(snapshot.address, end, &owner) == BaseOverlap::Partial) {
         Spaces().dissolvedOverlap.fetch_add(1, std::memory_order_relaxed);
+        traceDissolve("snapshot", snapshot.address, end);
         dissolveSpace(false);
     }
     if (owner == nullptr && regionsSorted) {
@@ -1575,6 +1600,18 @@ std::atomic<std::uint64_t> importUs{0};
 std::atomic<std::uint64_t> allocateUs{0};
 std::atomic<std::uint64_t> readUs{0};
 std::atomic<std::uint64_t> uploadsProfiled{0};
+// The parts the rows above leave out: UploadPrepare's sort and merge and its CPU copies,
+// UploadFinish's GPU copy recording and heap references; the regions per upload after the merge.
+std::atomic<std::uint64_t> mergeUs{0};
+std::atomic<std::uint64_t> prepareCopyUs{0};
+std::atomic<std::uint64_t> recordCopiesUs{0};
+std::atomic<std::uint64_t> heapReferencesUs{0};
+std::atomic<std::uint64_t> regionsUploaded{0};
+std::atomic<std::uint64_t> addressableUploads{0};
+// The address-based uploads' share of the sort and merge, and the regions before the merge by class.
+std::atomic<std::uint64_t> mergeAddressableUs{0};
+std::atomic<std::uint64_t> unmergedAddressable{0};
+std::atomic<std::uint64_t> unmergedOther{0};
 
 std::uint64_t microsecondsSince(std::chrono::steady_clock::time_point start) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
@@ -1934,7 +1971,20 @@ bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) 
 void GuestBufferMemory::UploadPrepare(bool addressable) {
     Require(!prepared && !uploaded, "guest memory was already uploaded");
     prepared = true;
-    std::sort(regions.begin(), regions.end(), [](const Region& left, const Region& right) { return left.begin < right.begin; });
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto mergeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (profile) (addressable ? unmergedAddressable : unmergedOther).fetch_add(regions.size(), std::memory_order_relaxed);
+    // The regions are visited in address order through an index list: sorting the Regions themselves
+    // moved every ~200-byte entry (vectors, shared_ptrs) several times per upload, and an address-based
+    // upload carries its space's copied ranges and mirror blocks besides the descriptors.
+    // APS5_NO_INDEX_SORT=1 sorts the Regions in place as before.
+    static const bool indexSort = std::getenv("APS5_NO_INDEX_SORT") == nullptr;
+    thread_local std::vector<std::uint32_t> order;
+    order.resize(regions.size());
+    std::iota(order.begin(), order.end(), 0u);
+    const auto byBegin = [](const Region& left, const Region& right) { return left.begin < right.begin; };
+    if (!indexSort) std::sort(regions.begin(), regions.end(), byBegin);
+    else if (!std::is_sorted(regions.begin(), regions.end(), byBegin)) std::sort(order.begin(), order.end(), [this](std::uint32_t left, std::uint32_t right) { return regions[left].begin < regions[right].begin; });
     // Merged regions stay sparse when either part covered uncommitted pages.
     const auto mergeBacked = [](Region& into, const Region& from) {
         if (!into.sparse && !from.sparse) return;
@@ -1952,7 +2002,9 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
         if (!into.sparse) into.backed.clear();
     };
     std::vector<Region> merged;
-    for (auto& region : regions) {
+    merged.reserve(regions.size());
+    for (const auto index : order) {
+        auto& region = regions[index];
         if (!merged.empty() && region.begin < merged.back().end) {
             auto& previous = merged.back();
             if (previous.mirror != nullptr || region.mirror != nullptr) {
@@ -1992,7 +2044,11 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
         }
     }
     regions = std::move(merged);
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile) {
+        const auto us = microsecondsSince(mergeStart);
+        mergeUs.fetch_add(us, std::memory_order_relaxed);
+        if (addressable) mergeAddressableUs.fetch_add(us, std::memory_order_relaxed);
+    }
     const auto started = std::chrono::steady_clock::now();
     for (auto& region : regions) {
         Require(region.end - region.begin <= std::numeric_limits<std::size_t>::max(), "guest GPU allocation size overflow");
@@ -2074,6 +2130,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
         importsEpoch = state.epoch;
     }
     if (profile) importUs.fetch_add(microsecondsSince(started), std::memory_order_relaxed);
+    const auto copiesStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // Copies that need no device work: a range no descriptor writes needs no reference copy, and
     // GuestMemory::Read stores pending GPU results first (the flush hook locks for itself).
     for (auto& region : regions) {
@@ -2084,6 +2141,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
         }
         copyRegion(region, addressable);
     }
+    if (profile) prepareCopyUs.fetch_add(microsecondsSince(copiesStart), std::memory_order_relaxed);
 }
 
 void GuestBufferMemory::UploadFinish(bool addressable) {
@@ -2225,16 +2283,22 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         copyRegion(region, addressable);
         if (profile) copyUs += microsecondsSince(copyStart);
     }
+    const auto loopUs = profile ? microsecondsSince(loopStart) : 0;
+    const auto tailStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (!gpuCopies.empty()) recordGpuCopies(gpuCopies, addressable);
+    if (profile) recordCopiesUs.fetch_add(microsecondsSince(tailStart), std::memory_order_relaxed);
+    const auto heapStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     takeHeapReferences();
     if (!profile) return;
-    const auto loopUs = microsecondsSince(loopStart);
+    heapReferencesUs.fetch_add(microsecondsSince(heapStart), std::memory_order_relaxed);
+    regionsUploaded.fetch_add(regions.size(), std::memory_order_relaxed);
+    if (addressable) addressableUploads.fetch_add(1, std::memory_order_relaxed);
     readUs.fetch_add(refreshUs, std::memory_order_relaxed);
     importUs.fetch_add(loopUs > refreshUs + copyUs ? loopUs - refreshUs - copyUs : 0, std::memory_order_relaxed);
     const auto uploads = uploadsProfiled.fetch_add(1, std::memory_order_relaxed) + 1;
     if (uploads % 2000 == 0) {
         const auto& copies = Copies();
-        std::fprintf(stderr, "[buffers] %llu uploads: import lookup %.0f ms, buffer allocation %.0f ms, guest read %.0f ms; copies on the GPU: %llu regions (%.0f KiB) copied out of imports, %llu written sub-ranges (%.0f KiB) copied back, %llu staging stores by the CPU at write-back\n", static_cast<unsigned long long>(uploads), importUs.load(std::memory_order_relaxed) / 1000.0, allocateUs.load(std::memory_order_relaxed) / 1000.0, readUs.load(std::memory_order_relaxed) / 1000.0, static_cast<unsigned long long>(copies.gpuCopies.load(std::memory_order_relaxed)), copies.gpuCopyBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.gpuCopyBacks.load(std::memory_order_relaxed)), copies.gpuCopyBackBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.stagingStores.load(std::memory_order_relaxed)));
+        std::fprintf(stderr, "[buffers] %llu uploads: import lookup %.0f ms, buffer allocation %.0f ms, guest read %.0f ms; copies on the GPU: %llu regions (%.0f KiB) copied out of imports, %llu written sub-ranges (%.0f KiB) copied back, %llu staging stores by the CPU at write-back; sort+merge %.0f ms, prepare copies %.0f ms, GPU copy recording %.0f ms, heap references %.0f ms; %.1f regions per upload, %llu address-based (sort+merge %.0f ms; regions before the merge %.1f per address-based upload, %.1f per other)\n", static_cast<unsigned long long>(uploads), importUs.load(std::memory_order_relaxed) / 1000.0, allocateUs.load(std::memory_order_relaxed) / 1000.0, readUs.load(std::memory_order_relaxed) / 1000.0, static_cast<unsigned long long>(copies.gpuCopies.load(std::memory_order_relaxed)), copies.gpuCopyBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.gpuCopyBacks.load(std::memory_order_relaxed)), copies.gpuCopyBackBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.stagingStores.load(std::memory_order_relaxed)), mergeUs.load(std::memory_order_relaxed) / 1000.0, prepareCopyUs.load(std::memory_order_relaxed) / 1000.0, recordCopiesUs.load(std::memory_order_relaxed) / 1000.0, heapReferencesUs.load(std::memory_order_relaxed) / 1000.0, static_cast<double>(regionsUploaded.load(std::memory_order_relaxed)) / static_cast<double>(uploads), static_cast<unsigned long long>(addressableUploads.load(std::memory_order_relaxed)), mergeAddressableUs.load(std::memory_order_relaxed) / 1000.0, static_cast<double>(unmergedAddressable.load(std::memory_order_relaxed)) / static_cast<double>(std::max<std::uint64_t>(1, addressableUploads.load(std::memory_order_relaxed))), static_cast<double>(unmergedOther.load(std::memory_order_relaxed)) / static_cast<double>(std::max<std::uint64_t>(1, uploads - addressableUploads.load(std::memory_order_relaxed))));
     }
     const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     if (ms > 50) {
@@ -2853,6 +2917,14 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
         result.emplace_back(region.begin, region.end);
     }
     return result;
+}
+
+int GuestBufferMemory::LeaseShape() const {
+    if (space == nullptr) return 3;
+    for (const auto& region : space->base) {
+        if (region.direct == nullptr && (region.mirror == nullptr || region.mirror->writable || region.mirror->heap)) return 2;
+    }
+    return regions.empty() ? 0 : 1;
 }
 
 std::span<const std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const {

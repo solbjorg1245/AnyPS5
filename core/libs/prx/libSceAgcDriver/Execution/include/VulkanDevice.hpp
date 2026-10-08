@@ -234,7 +234,10 @@ public:
         DevicePath path = DevicePath::Other;
         // A stage-B miss or full build classified against this thread's earlier builds: 0 none,
         // 1 the read-only-rebased key (ContentKey rebaseReadOnly) was built before, 2 the variant
-        // was built before under other words, 3 a new variant.
+        // was built before under other words, 3 a new variant; not reusable: 4 a lease (address-based), 5 copied writes, 6 another completion
+        // (BDA faults), 7 other (large data buffers, regions not served in place); leases by
+        // GuestBufferMemory::LeaseShape: 4 the cached space alone, 8 + per-build regions, 9 a
+        // writable or heap mirror in the space, 10 the build's own lease.
         std::uint8_t missKind = 0;
         std::array<double, SplitRowCount> ms{};
     };

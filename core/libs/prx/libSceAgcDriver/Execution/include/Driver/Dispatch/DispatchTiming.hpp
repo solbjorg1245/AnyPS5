@@ -39,7 +39,7 @@ struct DriverPhaseTotals {
     std::uint64_t dispatches = 0, hits = 0, validations = 0;
     std::array<std::array<DevicePathTotals, DevicePathCount>, 2> paths{};
     // Builds by VulkanDevice::DeviceCallSplit::missKind (index 0 unused).
-    std::array<std::uint64_t, 4> missKinds{};
+    std::array<std::uint64_t, 11> missKinds{};
 };
 
 struct PendingDispatchPhases {

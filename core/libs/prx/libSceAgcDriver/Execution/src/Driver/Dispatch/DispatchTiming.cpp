@@ -15,7 +15,7 @@ void Driver::addDriverPhases(DispatchClass which, const PendingDispatchPhases& p
     ++path.calls;
     path.deviceMs += ms[PhaseDevice];
     for (std::size_t i = 0; i < DeviceSplitRows; ++i) path.ms[i] += pending.deviceSplit[i];
-    ++totals.missKinds[std::min<std::size_t>(pending.missKind, 3)];
+    ++totals.missKinds[std::min<std::size_t>(pending.missKind, 10)];
     const auto now = std::chrono::steady_clock::now();
     if (now - driverPhasesReport < std::chrono::seconds(10)) return;
     driverPhasesReport = now;
@@ -54,7 +54,7 @@ void Driver::addDriverPhases(DispatchClass which, const PendingDispatchPhases& p
                 paths += ");";
             }
         }
-        std::fprintf(stderr, "[dispatch] device paths %s (10 s, us per call)%s; builds: read-only-rebased key built before %llu, variant built before %llu, new variant %llu\n", DispatchClassNames[cls], paths.c_str(), static_cast<unsigned long long>(line.missKinds[1]), static_cast<unsigned long long>(line.missKinds[2]), static_cast<unsigned long long>(line.missKinds[3]));
+        std::fprintf(stderr, "[dispatch] device paths %s (10 s, us per call)%s; builds: read-only-rebased key built before %llu, variant built before %llu, new variant %llu; not reusable: lease %llu (cached space alone %llu, + per-build regions %llu, writable or heap mirror %llu, own lease %llu), copied writes %llu, other completion %llu, other %llu\n", DispatchClassNames[cls], paths.c_str(), static_cast<unsigned long long>(line.missKinds[1]), static_cast<unsigned long long>(line.missKinds[2]), static_cast<unsigned long long>(line.missKinds[3]), static_cast<unsigned long long>(line.missKinds[4] + line.missKinds[8] + line.missKinds[9] + line.missKinds[10]), static_cast<unsigned long long>(line.missKinds[4]), static_cast<unsigned long long>(line.missKinds[8]), static_cast<unsigned long long>(line.missKinds[9]), static_cast<unsigned long long>(line.missKinds[10]), static_cast<unsigned long long>(line.missKinds[5]), static_cast<unsigned long long>(line.missKinds[6]), static_cast<unsigned long long>(line.missKinds[7]));
         line = {};
     }
 }

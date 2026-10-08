@@ -3012,7 +3012,7 @@ namespace {
 
 // APS5_PROFILE_DRAW: classifies a build (stage B or full) for ThreadDeviceSplit().missKind against
 // this thread's earlier builds (bounded: the sets restart at 1M entries).
-void ClassifyBuild(const Graphics::CompiledShader& shader) {
+void ClassifyBuild(const Graphics::CompiledShader& shader, const Graphics::ShaderResources& resources) {
     static thread_local std::unordered_set<std::uint64_t> rebasedKeys, variants;
     if (rebasedKeys.size() > (1u << 20u)) rebasedKeys.clear();
     if (variants.size() > (1u << 20u)) variants.clear();
@@ -3020,6 +3020,11 @@ void ClassifyBuild(const Graphics::CompiledShader& shader) {
     const auto hash = std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(key.data()), key.size() * sizeof(std::uint32_t)));
     const auto variant = shader.program->variantId;
     auto& split = VulkanDevice::ThreadDeviceSplit();
+    if (!resources.Reusable()) {
+        static constexpr std::uint8_t leaseKinds[] = {4, 8, 9, 10};
+        split.missKind = resources.HoldsLease() ? leaseKinds[std::clamp(resources.LeaseShape(), 0, 3)] : resources.HasCopiedWrites() ? 5 : resources.NeedsCompletion() ? 6 : 7;
+        return;
+    }
     split.missKind = !rebasedKeys.insert(hash).second ? 1 : !variants.insert(variant).second ? 2 : 3;
 }
 
@@ -3370,7 +3375,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         resources->Complete();
         if (profile) {
             ThreadDeviceSplit().path = DevicePath::StageB;
-            ClassifyBuild(shaders[0]);
+            ClassifyBuild(shaders[0], *resources);
             const auto completeWall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - completeStart).count();
             timer.add(PhaseResourcesComplete, completeWall);
             const auto& after = resources->Timing();
@@ -3425,7 +3430,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         if (profile) {
             timer.add(PhaseResourcesFullBuild, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - buildStart).count());
             ThreadDeviceSplit().path = DevicePath::FullBuild;
-            ClassifyBuild(shaders[0]);
+            ClassifyBuild(shaders[0], *resources);
         }
         if (cacheable) {
             ++d.cacheMisses;

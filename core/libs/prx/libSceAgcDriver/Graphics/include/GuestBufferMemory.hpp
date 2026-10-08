@@ -232,6 +232,12 @@ public:
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
     // build's own lease, or by the cached address space it holds.
     bool HoldsLease() const { return !lease.empty() || space != nullptr; }
+    // APS5_PROFILE_DRAW: how far an uploaded address-based build is from one a later dispatch could
+    // share: 0 the cached space alone, every base range served in place or by a fixed mirror; 1 the
+    // same plus per-build regions (V#s, snapshots, copied ranges); 2 a writable or heap mirror in the
+    // space; 3 no cached space (the build's own lease).
+    int LeaseShape() const;
+    void traceDissolve(const char* kind, std::uint64_t begin, std::uint64_t end) const;
     // Every uploaded region as [begin, end) when all of them are served by host imports, in place or
     // through a device-local staging copy of the import (nothing was copied through the CPU, so the
     // upload can serve a later identical build), else nothing.
