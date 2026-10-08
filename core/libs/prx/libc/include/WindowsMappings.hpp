@@ -100,6 +100,7 @@ public:
             const auto base = cursor + done;
             shared->aliases.push_back(base);
             views.emplace(base, View{shared, protection, 0, false, owned, offset + done, 0});
+            if (const auto pinned = pinnedPages.find(base); pinned != pinnedPages.end()) shared->pins += pinned->second;
             invalidate(*shared);
         }
         mappingSerial.fetch_add(1, std::memory_order_release);
@@ -114,10 +115,15 @@ public:
         }
     }
 
+    // Pins follow the guest address (pinnedPages): a view mapped there later, such as a fixed remap of
+    // the range, takes the pin over, and a view unmapped from it gives its page's pin back (Map/reset).
     void Pin(std::uintptr_t address, std::size_t bytes) {
         std::lock_guard lock(mutex);
-        for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
-            auto& page = *it->second.page;
+        for (auto base = address & ~(pageBytes - 1); base < address + bytes; base += pageBytes) {
+            ++pinnedPages[base];
+            const auto found = views.find(base);
+            if (found == views.end()) continue;
+            auto& page = *found->second.page;
             ++page.pins;
             for (const auto alias : page.aliases) {
                 auto& view = views.at(alias);
@@ -132,8 +138,13 @@ public:
 
     void Unpin(std::uintptr_t address, std::size_t bytes) {
         std::lock_guard lock(mutex);
-        for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
-            auto& page = *it->second.page;
+        for (auto base = address & ~(pageBytes - 1); base < address + bytes; base += pageBytes) {
+            const auto pinned = pinnedPages.find(base);
+            if (pinned == pinnedPages.end()) continue;
+            if (--pinned->second == 0) pinnedPages.erase(pinned);
+            const auto found = views.find(base);
+            if (found == views.end()) continue;
+            auto& page = *found->second.page;
             if (page.pins != 0) --page.pins;
             invalidate(page);
         }
@@ -545,7 +556,9 @@ private:
                 if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(cursor), MEM_PRESERVE_PLACEHOLDER)) fail("unmap shared guest page");
                 const auto found = views.find(cursor);
                 if (found != views.end()) {
-                    std::erase(found->second.page->aliases, cursor);
+                    auto& page = *found->second.page;
+                    if (const auto pinned = pinnedPages.find(cursor); pinned != pinnedPages.end()) page.pins -= std::min(page.pins, pinned->second);
+                    std::erase(page.aliases, cursor);
                     views.erase(found);
                 }
             } else if (memory.Type == MEM_PRIVATE) {
@@ -568,6 +581,8 @@ private:
     // as unwritten (nothing can store there), so the commit that makes it memory (zeros, unseen by the
     // write watch) is reported as a write once.
     std::map<std::uintptr_t, std::uintptr_t> freshRanges;
+    // Pin counts by shared page address (Pin/Unpin), carried onto the view mapped there.
+    std::map<std::uintptr_t, std::uint32_t> pinnedPages;
     std::map<std::uintptr_t, View> views;
     // MapSpanAlias's reservations: base -> the pieces mapped into it.
     std::map<void*, std::vector<void*>> spanAliases;
