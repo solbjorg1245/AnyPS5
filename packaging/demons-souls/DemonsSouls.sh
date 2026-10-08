@@ -10,7 +10,7 @@
 #      few small top-level files are copied),
 #   4. starts the game.
 # Later starts: ./DemonsSouls.sh   (extra arguments after -- go to the game)
-# Options: --dump <dir>, --setup-only, --no-patch
+# Options: --dump <dir>, --setup-only, --no-patch, --to-intel (relink for an Intel CPU; untested)
 #
 # Runtime settings (an already exported variable always wins):
 #   APS5_HOST_IMPORT_MIB  guest memory the GPU may read in place; chosen from installed RAM
@@ -24,12 +24,14 @@ supported_build="2025-10-15.877562"
 dump=""
 setup_only=0
 no_patch=0
+to_intel=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --dump) [ $# -ge 2 ] || { echo "--dump needs a directory" >&2; exit 1; }; dump="$2"; shift 2 ;;
         --setup-only) setup_only=1; shift ;;
         --no-patch) no_patch=1; shift ;;
+        --to-intel) to_intel=1; shift ;;
         --) shift; break ;;
         *) break ;;
     esac
@@ -50,8 +52,13 @@ install_game() {
 
     echo "== relinking $eboot"
     mkdir -p "$app0"
-    "$here/tools/relinker" "$eboot" "$exe"
-    chmod +x "$exe"
+    relink_args=()
+    if [ "$to_intel" = 1 ]; then
+        relink_args+=(--to-intel)
+    elif grep -q -m 1 '^vendor_id[[:space:]]*:[[:space:]]*GenuineIntel' /proc/cpuinfo 2>/dev/null; then
+        echo "warning: Intel CPU: the game uses AMD-only instructions; if it dies with SIGILL, run again with --dump ... --to-intel" >&2
+    fi
+    "$here/tools/relinker" ${relink_args[@]+"${relink_args[@]}"} "$eboot" "$exe"
 
     if [ "$no_patch" = 1 ]; then
         echo "warning: skipping the executable patch (--no-patch): job workers will spin and starve the game threads" >&2
@@ -65,6 +72,7 @@ install_game() {
     else
         echo "warning: python3 not found: DemonsSouls.elf is NOT patched and will run much slower" >&2
     fi
+    chmod +x "$exe"
 
     echo "== linking the dump into app0"
     for item in "$dump_dir"/*; do
@@ -98,7 +106,7 @@ fi
 
 ram_kib="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
 swap_kib="$(awk '/^SwapTotal:/ { print $2 }' /proc/meminfo)"
-ram_gib=$(( ram_kib / 1048576 ))
+ram_gib=$(( (ram_kib + 524288) / 1048576 ))  # rounded like the Windows launcher
 if [ $(( (ram_kib + swap_kib) / 1048576 )) -lt 64 ]; then
     echo "warning: RAM + swap is below 64 GiB; the game reserves and touches about 60 GiB. Add swap if it dies with out-of-memory errors." >&2
 fi

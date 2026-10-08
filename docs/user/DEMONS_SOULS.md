@@ -48,7 +48,9 @@ The port is a work in progress. Read [Known issues](#known-issues) before you st
    Run with `-Dump` / `--dump` again after updating AnyPS5.
 
 Options: `-SetupOnly` / `--setup-only` prepares without starting; `-NoPatch` / `--no-patch` skips the
-patch (slow; for troubleshooting only).
+patch (slow; for troubleshooting only). On an Intel CPU, `-ToIntel` / `--to-intel` (together with
+`-Dump` / `--dump`) relinks with the relinker's `--to-intel` conversion of AMD-only instructions;
+it is untested with this game, so use it only if the game crashes with an illegal instruction.
 
 The first launch, and every new area, compiles shaders into `shader_cache/`. This makes the first
 minutes stutter heavily. Saves are stored in `_sd/` in the install folder; back them up from there.

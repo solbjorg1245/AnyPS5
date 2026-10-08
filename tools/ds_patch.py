@@ -18,6 +18,7 @@ exit codes: 0 patched or already present, 1 usage, 2 refused (nothing written)
 """
 import argparse
 import os
+import stat
 import struct
 import sys
 
@@ -219,6 +220,7 @@ def apply(eboot_path, exe_path, check_only=False):
         temporary = exe_path + ".patching"
         with open(temporary, "wb") as f:
             f.write(data)
+        os.chmod(temporary, stat.S_IMODE(os.stat(exe_path).st_mode))  # keep the executable bit (Linux)
         os.replace(temporary, exe_path)
 
 

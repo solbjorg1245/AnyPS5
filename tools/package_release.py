@@ -167,7 +167,7 @@ def elf_type(path):
     return struct.unpack_from("<H", head, 0x10)[0]
 
 
-def check_binaries(platform, libraries, runtime_names):
+def check_binaries(platform, libraries, runtime_names, relinker=None):
     bundled = {name.lower() for name in runtime_names} | {lib.name.lower() for lib in libraries}
     problems = []
     for library in libraries:
@@ -179,6 +179,12 @@ def check_binaries(platform, libraries, runtime_names):
                 problems.append(f"{library.name} imports {dll}")
         elif elf_type(library) != 3:  # ET_DYN
             problems.append(f"{library.name} is not a host ELF shared object (e_type {elf_type(library)})")
+    if platform == "windows" and relinker is not None:
+        # The player runs tools/relinker.exe, which does not sit next to the bundled MinGW DLLs.
+        for dll in pe_imports(relinker):
+            lower = dll.lower()
+            if lower not in WINDOWS_SYSTEM_DLLS and not lower.startswith("api-ms-win-"):
+                problems.append(f"{relinker.name} imports {dll}")
     if problems:
         raise PackagingError("unexpected library dependencies:\n  " + "\n  ".join(problems))
 
@@ -261,7 +267,7 @@ def package(platform, build, output, version, mingw_bin, game=None, dry_run=Fals
     for file in [*libraries, *runtime, relinker]:
         if not file.is_file() or file.stat().st_size == 0:
             raise PackagingError(f"Missing or empty release file: {file}")
-    check_binaries(platform, libraries, MINGW_RUNTIME if platform == "windows" else ())
+    check_binaries(platform, libraries, MINGW_RUNTIME if platform == "windows" else (), relinker)
 
     lib_entries = [(f"libs/{file.name}", file) for file in [*libraries, *runtime]]
     archives = {f"prx-{platform}-{version}.zip": ("zip", lib_entries),

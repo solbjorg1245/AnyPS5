@@ -28,6 +28,7 @@ param(
     [string]$Dump,
     [switch]$SetupOnly,
     [switch]$NoPatch,
+    [switch]$ToIntel,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$GameArgs
 )
@@ -70,7 +71,13 @@ function Install-Game([string]$dumpPath) {
 
     Write-Host "== relinking $eboot"
     New-Item -ItemType Directory -Force -Path $app0 | Out-Null
-    & (Join-Path $here "tools\relinker.exe") --windows $eboot $exe
+    $relinkArgs = @("--windows")
+    if ($ToIntel) {
+        $relinkArgs += "--to-intel"
+    } elseif ((Get-CimInstance Win32_Processor | Select-Object -First 1).Manufacturer -eq "GenuineIntel") {
+        Write-Warning "Intel CPU: the game uses AMD-only instructions (emulated, slower); if it crashes with an illegal instruction, run again with -Dump ... -ToIntel"
+    }
+    & (Join-Path $here "tools\relinker.exe") @relinkArgs $eboot $exe
     if ($LASTEXITCODE -ne 0) { throw "relinker failed with exit code $LASTEXITCODE" }
 
     if ($NoPatch) {
