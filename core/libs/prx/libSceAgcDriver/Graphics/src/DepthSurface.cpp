@@ -92,6 +92,11 @@ public:
         return texture;
     }
 
+    // Whether Sampled hands out `texture` (some key of the current image maps to it).
+    bool Serves(const Texture* texture) const {
+        return std::any_of(textures.begin(), textures.end(), [&](const auto& entry) { return entry.second.get() == texture; });
+    }
+
     // Takes over depth a compute pass left in a storage image of this memory (Demon's Souls downsamples
     // its depth with compute into the half-size target it then depth-tests against): the image's
     // first slice becomes slice 0, through a device buffer, behind the work recorded so far. Only
@@ -397,6 +402,17 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     auto texture = (*found)->Sampled(words, resource, components);
     (*found)->ApplyMetadataClears((*found)->clearDepth, (*found)->clearStencil);
     return texture;
+}
+
+bool DepthSurfaceServes(const Context& context, const GuestTextureResource& resource, const Texture* texture) {
+    std::lock_guard lock(surfacesMutex());
+    const auto& list = surfaces();
+    const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) {
+        return surface->context.device == context.device && surface->Covers(resource.baseAddress, resource.width, resource.height);
+    });
+    if (found == list.rend() || (*found)->overwritten || !(*found)->Serves(texture)) return false;
+    (*found)->ApplyMetadataClears((*found)->clearDepth, (*found)->clearStencil);
+    return true;
 }
 
 std::size_t DumpDepthSurfaces(const Context& context, const std::string& prefix, std::span<const std::uint64_t> addresses) {

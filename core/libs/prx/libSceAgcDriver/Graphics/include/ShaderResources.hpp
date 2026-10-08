@@ -428,6 +428,8 @@ private:
         // Storage-sourced textures: the image the view follows (kept alive by the texture).
         const StorageTexture* source = nullptr;
         bool valid = false;
+        // Served by a depth surface (DepthSurfaceTexture): proved by DepthSurfaceServes alone.
+        bool depth = false;
     };
     void captureValidation();
     // A surface of this object the fast proof found a foreign image pending over: the element

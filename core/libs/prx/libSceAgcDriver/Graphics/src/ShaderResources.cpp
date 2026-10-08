@@ -221,6 +221,8 @@ struct LookupRecord {
     DccKeys keys;
     std::uint64_t generation;
     const StorageTexture* source;
+    // Served by a depth surface (cachedTexture's DepthSurfaceTexture answer).
+    bool depth = false;
 };
 
 thread_local std::vector<LookupRecord> lookupLog;
@@ -348,7 +350,14 @@ std::array<std::uint32_t, 8> NullTextureDescriptor(std::optional<ShaderRecompile
 
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false) {
     CaptureTrace::Log("sampled-lookup address=%llx width=%u height=%u dcc=%llx", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(resource.dccAddress));
-    if (auto depth = DepthSurfaceTexture(context, words, resource, components)) return depth;
+    if (auto depth = DepthSurfaceTexture(context, words, resource, components)) {
+        // Recorded so the fast proof covers the element (DepthSurfaceServes) instead of finding no
+        // record and leaving the object to the full walk on every call. APS5_NO_DEPTH_RECORDS=1
+        // leaves it unrecorded as before.
+        static const bool record = std::getenv("APS5_NO_DEPTH_RECORDS") == nullptr;
+        if (record) logLookup({depth.get(), resource, 0, DccKeys::Uncompressed, 0, nullptr, true});
+        return depth;
+    }
     const auto depthBitsWidth = words.size() >= 4 ? ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) : 0u;
     if (depthBitsWidth == 32u) {
         char text[160];
@@ -1466,6 +1475,9 @@ struct RevalidateProfile {
     std::atomic<std::uint64_t> ownViewRefreshes{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(OwnRefreshFallback::Count)> ownFallbacks{};
     std::atomic<std::uint64_t> ownSourceViews{0};
+    // Elements a depth surface served, proved by DepthSurfaceServes; time of the calls that walked.
+    std::atomic<std::uint64_t> depthRecords{0};
+    std::atomic<std::uint64_t> fullNanoseconds{0};
     std::atomic<std::uint64_t> refreshedOverlaps{0};
     std::atomic<std::uint64_t> proofsVerified{0};
     std::atomic<std::int64_t> lastReport{0};
@@ -1599,6 +1611,7 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     profile.calls.fetch_add(1, std::memory_order_relaxed);
     profile.nanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()), std::memory_order_relaxed);
     (!ok ? profile.failed : fast ? profile.fast : profile.full).fetch_add(1, std::memory_order_relaxed);
+    if (!fast) profile.fullNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()), std::memory_order_relaxed);
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     auto last = profile.lastReport.load();
     if (nowMs - last < 10000 || !profile.lastReport.compare_exchange_strong(last, nowMs)) return;
@@ -1615,6 +1628,7 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto fullReasons = byReason(profile.fullByReason, FastFailNames);
     const auto fallbacks = byReason(profile.ownFallbacks, OwnRefreshFallbackNames);
     std::fprintf(stderr, "[rescache] revalidate %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()));
+    std::fprintf(stderr, "[rescache] revalidate split: calls that walked or failed %.1f ms (fast proofs the rest); depth-served elements proven %llu\n", profile.fullNanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.depthRecords.load()));
 }
 
 // APS5_NO_EPOCH_REVALIDATE=1: the per-element registry, cache and stamp checks and the per-region
@@ -1642,7 +1656,7 @@ void ShaderResources::captureValidation() {
     if (diffRecords) previous = validatedTextures;
     validatedTextures.assign(textures.size(), {});
     for (std::size_t i = 0; i < textures.size(); ++i) {
-        if (const auto* found = record(textures[i].get())) validatedTextures[i] = {found->resource, found->bytes, found->keys, found->generation, 0, found->source, true};
+        if (const auto* found = record(textures[i].get())) validatedTextures[i] = {found->resource, found->bytes, found->keys, found->generation, 0, found->source, true, found->depth};
     }
     lookupLog.clear();
     if (diffRecords && previous.size() == validatedTextures.size()) {
@@ -1743,6 +1757,13 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     for (std::size_t i = 0; i < textures.size(); ++i) {
         auto& surface = validatedTextures[i];
         if (!surface.valid) return fail(FastFail::NoRecord);
+        if (surface.depth) {
+            // The lookup answers from the depth surface before any memory or key check: proved
+            // when it would hand out the same texture (no guest memory is involved).
+            if (!DepthSurfaceServes(context, surface.resource, textures[i].get())) return fail(FastFail::DepthSurface);
+            if (BuildProfiled()) Revalidations().depthRecords.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         if (depthCheck && DepthSurfaceAt(address, surface.resource.width, surface.resource.height)) return fail(FastFail::DepthSurface);
@@ -1853,6 +1874,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     for (const auto* image : images) image->NoteProved();
     for (std::size_t i = 0; i < validatedTextures.size(); ++i) {
         auto& surface = validatedTextures[i];
+        if (surface.depth) continue;
         if (surface.source == nullptr) surface.generation = surface.collected;
         surface.keys = scannedKeys[i];
     }
@@ -1864,7 +1886,7 @@ bool ShaderResources::fastRevalidateEach() {
     if (validatedTextures.size() != textures.size()) return false;
     for (std::size_t i = 0; i < textures.size(); ++i) {
         auto& surface = validatedTextures[i];
-        if (!surface.valid) return false;
+        if (!surface.valid || surface.depth) return false;
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         surface.collected = GuestMemory::CollectWrites(address, bytes);

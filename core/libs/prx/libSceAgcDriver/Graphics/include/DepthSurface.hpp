@@ -38,6 +38,11 @@ void NoteDepthMetadataClear(std::uint64_t begin, std::uint64_t end);
 // VkFormat, then the texels). The GPU must be idle. Returns the number of files written.
 std::size_t DumpDepthSurfaces(const Context& context, const std::string& prefix, std::span<const std::uint64_t> addresses = {});
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components);
+// Whether DepthSurfaceTexture would answer a lookup of `resource` with `texture` again (the newest
+// surface covering it is not overwritten and still hands the texture out), with the lookup's side
+// effect: the surface's pending metadata clears are recorded. The fast proof's check of an element
+// a depth surface served (ShaderResources::fastRevalidate).
+bool DepthSurfaceServes(const Context& context, const GuestTextureResource& resource, const Texture* texture);
 
 }
 
