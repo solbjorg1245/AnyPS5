@@ -157,7 +157,10 @@ int APS5_VABI vasprintf_nid_postfix(char** destination, const char* format, VaLi
         const char* source = text.c_str();
 #else
         char* text = nullptr;
-        const int count = ::vasprintf(&text, format, *reinterpret_cast<std::va_list*>(args));
+        std::va_list copy;
+        va_copy(copy, *reinterpret_cast<std::va_list*>(args));
+        const int count = ::vasprintf(&text, format, copy);
+        va_end(copy);
         std::unique_ptr<char, decltype(&std::free)> owner(text, std::free);
         if (count < 0) return -1;
         const char* source = text;
@@ -180,7 +183,10 @@ int APS5_VABI vfprintf_nid_postfix(FileStream* stream, const char* format, VaLis
     const int result = std::fwrite(buffer.data(), 1, static_cast<size_t>(count), native) ==
         static_cast<size_t>(count) ? count : -1;
 #else
-    const int result = std::vfprintf(native, format, *reinterpret_cast<std::va_list*>(args));
+    std::va_list copy;
+    va_copy(copy, *reinterpret_cast<std::va_list*>(args));
+    const int result = std::vfprintf(native, format, copy);
+    va_end(copy);
 #endif
     stream->SyncStatus();
     return result;
@@ -294,7 +300,11 @@ int APS5_VABI vsscanf_nid_postfix(const char* input, const char* format, VaList*
 #ifdef _WIN32
     return LibcDetail::ScanWindows(input, format, args);
 #else
-    return std::vsscanf(input, format, *reinterpret_cast<std::va_list*>(args));
+    std::va_list copy;
+    va_copy(copy, *reinterpret_cast<std::va_list*>(args));
+    const int result = std::vsscanf(input, format, copy);
+    va_end(copy);
+    return result;
 #endif
 }
 
@@ -342,8 +352,11 @@ int APS5_VABI vprintf_nid_postfix(const char* str, VaList* c) {
 #ifdef _WIN32
     return LibcDetail::PrintWindows(str, c);
 #else
-    std::va_list* va = reinterpret_cast<std::va_list*>(c);
-    return std::vprintf(str, *va);
+    std::va_list copy;
+    va_copy(copy, *reinterpret_cast<std::va_list*>(c));
+    const int result = std::vprintf(str, copy);
+    va_end(copy);
+    return result;
 #endif
 }
 
@@ -351,7 +364,11 @@ int APS5_VABI vsprintf_nid_postfix(char* str, const char* format, VaList* args) 
 #ifdef _WIN32
     return LibcDetail::FormatWindows(str, SIZE_MAX, format, args);
 #else
-    return std::vsprintf(str, format, *reinterpret_cast<std::va_list*>(args));
+    std::va_list copy;
+    va_copy(copy, *reinterpret_cast<std::va_list*>(args));
+    const int result = std::vsprintf(str, format, copy);
+    va_end(copy);
+    return result;
 #endif
 }
 
@@ -359,8 +376,11 @@ int APS5_VABI vsnprintf_nid_postfix(char* str, size_t size, const char* format, 
 #ifdef _WIN32
     return LibcDetail::FormatWindows(str, size, format, c);
 #else
-    std::va_list* va = reinterpret_cast<std::va_list*>(c);
-    return std::vsnprintf(str, size, format, *va);
+    std::va_list copy;
+    va_copy(copy, *reinterpret_cast<std::va_list*>(c));
+    const int result = std::vsnprintf(str, size, format, copy);
+    va_end(copy);
+    return result;
 #endif
 }
 
@@ -385,7 +405,11 @@ int APS5_VABI printf_s_nid_postfix(const char* format, ...) {
 #else
 
 int APS5_VABI vsprintf_s_nid_postfix(char* buffer, size_t size, const char* format, VaList* args) {
-    return std::vsnprintf(buffer, size, format, *reinterpret_cast<std::va_list*>(args));
+    std::va_list copy;
+    va_copy(copy, *reinterpret_cast<std::va_list*>(args));
+    const int result = std::vsnprintf(buffer, size, format, copy);
+    va_end(copy);
+    return result;
 }
 
 int APS5_VABI sprintf_s_nid_postfix(char* buffer, size_t size, const char* format, ...) {
