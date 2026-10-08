@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAWCACHE_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/NewDrawKeyTally.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include <array>
 #include <atomic>
@@ -45,6 +46,8 @@ struct DrawKey {
     std::uint64_t base = 0;
     std::array<std::uint32_t, DrawPointerRegisters.size()> words{};
     std::uint32_t present = 0;
+    // The program addresses (DrawProgramRegisters; 0 = unset), for the never-seen key report.
+    std::array<std::uint64_t, DrawProgramRegisters.size()> programs{};
 };
 
 struct DrawRecipeRecord {
