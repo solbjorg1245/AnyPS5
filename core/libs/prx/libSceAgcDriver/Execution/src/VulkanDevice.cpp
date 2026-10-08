@@ -2466,15 +2466,98 @@ bool LeaseRebase() {
 
 // APS5_PROFILE_DRAW: the prepare's rebased-key finds after an exact miss (the [lease-keys] line):
 // an idle template found, a busy one, none held (never inserted or evicted); templates made.
+// Also: the second slot's finds after a busy first (LeaseSecondSlot), the none-held finds whose key
+// was inserted before (evicted since), and the cacheable builds by where they went (insertBuilt).
 struct LeaseFindCounts {
     std::atomic<std::uint64_t> hit{0};
     std::atomic<std::uint64_t> busy{0};
     std::atomic<std::uint64_t> none{0};
     std::atomic<std::uint64_t> templates{0};
+    std::atomic<std::uint64_t> secondHit{0};
+    std::atomic<std::uint64_t> secondBusy{0};
+    std::atomic<std::uint64_t> secondNone{0};
+    std::atomic<std::uint64_t> noneEvicted{0};
+    std::atomic<std::uint64_t> builtReusable{0};
+    std::atomic<std::uint64_t> builtInserted{0};
+    std::atomic<std::uint64_t> builtSecond{0};
+    std::atomic<std::uint64_t> builtFirst{0};
+    std::atomic<std::uint64_t> builtUncached{0};
 };
 LeaseFindCounts& LeaseFinds() {
     static LeaseFindCounts counts;
     return counts;
+}
+
+// More lease templates per rebased key (APS5_LEASE_SLOTS=N, default 1: one template): a use whose
+// find meets a template still in flight tries the next slot (its key one word longer, naming the
+// slot), takes the first idle one or builds into the first empty one (the last slot when all are
+// busy), instead of building a replacement for the first; uses in flight then rotate (t330: ~550
+// busy finds per 10 s, each a build that replaced the template; t331 with two slots: 436 of 540
+// found the second busy too). Session 42's A/B (t332 at 8 slots / t333 at 1): busy refusals 540 ->
+// 105 per 10 s, rearms +0.5k, but compute-queue device time (~530k us per 10 s), the queue-0 mutex
+// wait (408-452 ms) and presents (34-35) unchanged: off by default.
+std::uint32_t LeaseSlots() {
+    static const std::uint32_t slots = [] {
+        const char* value = std::getenv("APS5_LEASE_SLOTS");
+        const auto parsed = value ? std::strtoul(value, nullptr, 10) : 1ul;
+        return static_cast<std::uint32_t>(std::clamp<unsigned long>(parsed, 1ul, 64ul));
+    }();
+    return slots;
+}
+
+bool LeaseSecondSlot() {
+    return LeaseSlots() > 1;
+}
+
+ResourceCache::Key LeaseSlotKey(const ResourceCache::Key& key, std::uint32_t slot) {
+    auto slotted = key;
+    slotted.push_back(0x4c534b00u | slot);
+    return slotted;
+}
+
+// The rebased keys inserted so far (a lock-free filter of 64K key hashes, as LeaseKeyRecurs): a
+// none-held find of such a key met an evicted template ([lease-keys] 'evicted').
+std::uint64_t LeaseKeyHash(const ResourceCache::Key& key) {
+    return std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(key.data()), key.size() * sizeof(std::uint32_t))) | 1u;
+}
+std::atomic<std::uint64_t>& LeaseInsertedSlot(std::uint64_t hash) {
+    static std::array<std::atomic<std::uint64_t>, 65536> inserted{};
+    return inserted[(hash >> 7u) & 0xffffu];
+}
+
+// The rebased-key find after an exact miss: the first template, else (in flight, LeaseSlots) the
+// further slots in order. `key` comes in as the rebased key and leaves as the key the found template
+// or this use's build goes under; `second` says that is a further slot (its build is inserted
+// without the recurrence filter). A busy result is the caller's to refuse. `count`: the
+// [lease-keys] finds (the 'second slot' counts: the outcome over the further slots).
+std::shared_ptr<Graphics::ShaderResources> FindLeaseTemplate(ResourceCache& cache, ResourceCache::Key& key, bool& second, bool count) {
+    second = false;
+    auto cached = cache.Find(key);
+    if (cached != nullptr && !cached->LeaseTemplate()) cached = nullptr;
+    auto& finds = LeaseFinds();
+    if (count) {
+        if (cached == nullptr) {
+            finds.none.fetch_add(1, std::memory_order_relaxed);
+            const auto hash = LeaseKeyHash(key);
+            if (LeaseInsertedSlot(hash).load(std::memory_order_relaxed) == hash) finds.noneEvicted.fetch_add(1, std::memory_order_relaxed);
+        } else if (cached->LeaseIdle()) {
+            finds.hit.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            finds.busy.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (cached == nullptr || cached->LeaseIdle() || !LeaseSecondSlot()) return cached;
+    const auto base = key;
+    second = true;
+    std::shared_ptr<Graphics::ShaderResources> other;
+    for (std::uint32_t slot = 1; slot < LeaseSlots(); ++slot) {
+        key = LeaseSlotKey(base, slot);
+        other = cache.Find(key);
+        if (other != nullptr && !other->LeaseTemplate()) other = nullptr;
+        if (other == nullptr || other->LeaseIdle()) break;
+    }
+    if (count) (other == nullptr ? finds.secondNone : other->LeaseIdle() ? finds.secondHit : finds.secondBusy).fetch_add(1, std::memory_order_relaxed);
+    return other;
 }
 
 // The phases of VulkanDevice::dispatch (APS5_PROFILE_DRAW), followed by one row per image lookup
@@ -2505,6 +2588,8 @@ struct PreparedDispatch {
     // found under it.
     ResourceCache::Key leaseKey;
     bool leaseHit = false;
+    // LeaseSlots: leaseKey is a further slot's key.
+    bool leaseSecond = false;
     // APS5_PROFILE_DRAW: stage A's time, added to the [dispatch] phase totals by the dispatch, and
     // the prepare's parts for the driver's 'prepare:' rows (PreparePhase order).
     double prepareMs = 0;
@@ -3010,12 +3095,8 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
         cached = state->resourceCache.Find(prepared->key);
         if (cached == nullptr && LeaseRebase()) {
             prepared->leaseKey = DispatchContentKey(compute, context.device, true);
-            cached = state->resourceCache.Find(prepared->leaseKey);
-            if (cached != nullptr && !cached->LeaseTemplate()) cached = nullptr;
+            cached = FindLeaseTemplate(state->resourceCache, prepared->leaseKey, prepared->leaseSecond, true);
             prepared->leaseHit = cached != nullptr;
-            if (cached == nullptr) LeaseFinds().none.fetch_add(1, std::memory_order_relaxed);
-            else if (cached->LeaseIdle()) LeaseFinds().hit.fetch_add(1, std::memory_order_relaxed);
-            else LeaseFinds().busy.fetch_add(1, std::memory_order_relaxed);
         }
         // A lease template whose previous use is still in flight cannot serve this one (its fault
         // buffer and lease are per use): stage A is built here as for a miss, and the build
@@ -3111,7 +3192,16 @@ void ClassifyBuild(const Graphics::CompiledShader& shader, const Graphics::Shade
                 const auto findIdle = static_cast<unsigned long long>(finds.hit.exchange(0));
                 const auto findBusy = static_cast<unsigned long long>(finds.busy.exchange(0));
                 const auto findNone = static_cast<unsigned long long>(finds.none.exchange(0));
-                std::fprintf(stderr, "[lease-keys] %llu builds over the cached space alone (10 s): same key built before %llu, read-only-rebased key built before %llu; lease templates made %llu; rebased finds: idle %llu, busy %llu, none %llu\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(exactCount), static_cast<unsigned long long>(rebasedCount), templates, findIdle, findBusy, findNone);
+                const auto noneEvicted = static_cast<unsigned long long>(finds.noneEvicted.exchange(0));
+                const auto secondIdle = static_cast<unsigned long long>(finds.secondHit.exchange(0));
+                const auto secondBusy = static_cast<unsigned long long>(finds.secondBusy.exchange(0));
+                const auto secondNone = static_cast<unsigned long long>(finds.secondNone.exchange(0));
+                const auto builtReusable = static_cast<unsigned long long>(finds.builtReusable.exchange(0));
+                const auto builtInserted = static_cast<unsigned long long>(finds.builtInserted.exchange(0));
+                const auto builtSecond = static_cast<unsigned long long>(finds.builtSecond.exchange(0));
+                const auto builtFirst = static_cast<unsigned long long>(finds.builtFirst.exchange(0));
+                const auto builtUncached = static_cast<unsigned long long>(finds.builtUncached.exchange(0));
+                std::fprintf(stderr, "[lease-keys] %llu builds over the cached space alone (10 s): same key built before %llu, read-only-rebased key built before %llu; lease templates made %llu; rebased finds: idle %llu, busy %llu, none %llu (evicted %llu); second slot: idle %llu, busy %llu, none %llu; cacheable builds: reusable %llu, template inserted %llu, second slot %llu, first of key %llu, uncached %llu\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(exactCount), static_cast<unsigned long long>(rebasedCount), templates, findIdle, findBusy, findNone, noneEvicted, secondIdle, secondBusy, secondNone, builtReusable, builtInserted, builtSecond, builtFirst, builtUncached);
             }
         }
         return;
@@ -3418,6 +3508,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     // LeaseRebase: the rebased key a lease template is cached and found under.
     ResourceCache::Key leaseKey;
     bool leaseHit = false;
+    bool leaseSecond = false;
     const bool cacheable = ResourceCacheEnabled() && shader.variantId != 0;
     // The object came from the resource cache: a compute template whose data buffers take this
     // dispatch's words at the record (ShaderResources::RefreshData).
@@ -3460,24 +3551,42 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     };
     // A build enters the cache when reusable (exact key) or a recurring lease template (the rebased
     // key under LeaseRebase, else the exact one).
+    // A further slot's build (LeaseSlots) goes in without the recurrence filter: the first slot
+    // proves the key recurs.
     const auto insertBuilt = [&] {
+        auto& finds = LeaseFinds();
         if (resources->Reusable()) {
+            finds.builtReusable.fetch_add(1, std::memory_order_relaxed);
             insert(contentKey);
             return;
         }
-        if (!resources->LeaseTemplate()) return;
+        if (!resources->LeaseTemplate()) {
+            finds.builtUncached.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         if (!LeaseRebase()) {
             if (LeaseKeyRecurs(contentKey)) insert(contentKey);
             return;
         }
-        if (leaseKey.empty()) leaseKey = DispatchContentKey(shaders[0], context.device, true);
-        if (LeaseKeyRecurs(leaseKey)) insert(leaseKey);
+        if (leaseKey.empty()) {
+            leaseKey = DispatchContentKey(shaders[0], context.device, true);
+            leaseSecond = false;
+        }
+        if (leaseSecond || LeaseKeyRecurs(leaseKey)) {
+            (leaseSecond ? finds.builtSecond : finds.builtInserted).fetch_add(1, std::memory_order_relaxed);
+            insert(leaseKey);
+            const auto hash = LeaseKeyHash(leaseKey);
+            LeaseInsertedSlot(hash).store(hash, std::memory_order_relaxed);
+        } else {
+            finds.builtFirst.fetch_add(1, std::memory_order_relaxed);
+        }
     };
     if (prepared != nullptr && prepared->resources != nullptr) {
         // Stage A ran without the mutex (PrepareDispatch); stage B completes the build here.
         resources = std::move(prepared->resources);
         contentKey = std::move(prepared->key);
         leaseKey = std::move(prepared->leaseKey);
+        leaseSecond = prepared->leaseSecond;
         // The build's own sub-phase totals before and after: the differences are stage B's parts
         // (an address-based build also runs its stage A here, under the mutex: 'A locked').
         const auto before = profile ? resources->Timing() : Graphics::ShaderResources::BuildTiming{};
@@ -3519,12 +3628,12 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         if (preparedHit) {
             leaseKey = std::move(prepared->leaseKey);
             leaseHit = prepared->leaseHit;
+            leaseSecond = prepared->leaseSecond;
         }
         auto cached = preparedHit ? std::move(prepared->cached) : state->resourceCache.Find(contentKey);
         if (cached == nullptr && LeaseRebase()) {
             leaseKey = DispatchContentKey(shaders[0], context.device, true);
-            cached = state->resourceCache.Find(leaseKey);
-            if (cached != nullptr && !cached->LeaseTemplate()) cached = nullptr;
+            cached = FindLeaseTemplate(state->resourceCache, leaseKey, leaseSecond, false);
             leaseHit = cached != nullptr;
         }
         if (cached != nullptr) {
