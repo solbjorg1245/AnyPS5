@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Execution/include/HostHeap.hpp"
 
 #include <windows.h>
+#include <intrin.h>
 #include <psapi.h>
 
 // The driver's operator new. The libraries are built without asynchronous unwind tables, so
@@ -131,6 +132,8 @@ struct Config {
     Mode mode = Mode::Heap;
     DWORD tls = TLS_OUT_OF_INDEXES;
     DWORD fls = FLS_OUT_OF_INDEXES;
+    // gs offset of the TLS slot in the TEB's inline array, 0 when TlsGetValue reads it.
+    unsigned long tebOffset = 0;
 };
 
 bool envSet(const char* name) {
@@ -193,8 +196,10 @@ bool hookFree(const char* moduleName) {
     return true;
 }
 
-// The cache is found through a TLS slot (TlsGetValue reads the TEB); an FLS slot holding the same
-// pointer releases it when the thread exits.
+// The cache is found through a TLS slot, read straight from the TEB (gs:[0x1480 + 8 * slot], as
+// FastEmutls.cpp does) for the 64 inline slots: TlsGetValue was 0.6% of the queue-0 thread (t351);
+// APS5_NO_TEB_BLOCK_CACHE=1 calls TlsGetValue. An FLS slot holding the same pointer releases it
+// when the thread exits.
 const Config& config() {
     static const Config made = [] {
         Config result;
@@ -207,6 +212,7 @@ const Config& config() {
             result.fls = FLS_OUT_OF_INDEXES;
             return result;
         }
+        if (result.tls < 64 && !envSet("APS5_NO_TEB_BLOCK_CACHE")) result.tebOffset = 0x1480 + result.tls * sizeof(void*);
         result.mode = Mode::Cache;
         if (!envSet("APS5_NO_BLOCK_ARENA")) {
             if (hookFree("libstdc++-6.dll")) result.mode = Mode::Arena;
@@ -220,7 +226,7 @@ const Config& config() {
 BlockCache* threadCache(bool create) {
     const auto& slots = config();
     if (slots.tls == TLS_OUT_OF_INDEXES) return nullptr;
-    auto* cache = static_cast<BlockCache*>(TlsGetValue(slots.tls));
+    auto* cache = slots.tebOffset != 0 ? reinterpret_cast<BlockCache*>(__readgsqword(slots.tebOffset)) : static_cast<BlockCache*>(TlsGetValue(slots.tls));
     if (cache == nullptr && create) {
         cache = static_cast<BlockCache*>(std::calloc(1, sizeof(BlockCache)));
         if (cache != nullptr && (!FlsSetValue(slots.fls, cache) || !TlsSetValue(slots.tls, cache))) {
