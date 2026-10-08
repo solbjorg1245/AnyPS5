@@ -6,6 +6,7 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include <cstdint>
 #include <memory>
+#include <span>
 
 namespace ShaderRecompiler {
 
@@ -42,6 +43,23 @@ struct SourceHandle {
 };
 [[nodiscard]] std::shared_ptr<const SourceHandle> ResolveSource(const RecompileRequest& request);
 [[nodiscard]] std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& request, const SrtRuntime& runtime, const SourceHandle& handle);
+
+// The fast path's walk (docs/design/draw-fastpath.md section 2.3, F2): the materialization a
+// capture over `handle` makes, by the plan's express walk alone and through the runtime's readers
+// (the driver's direct reader), with no read trace and no deferred slots. What the express walk
+// does not cover declines instead of falling back to the interpreter: no source, an incomplete
+// plan, no walk program, a bindless image table, an unsupported root or a failing op, a read the
+// reader declined (ReadDeclined); Failed is any other materialization error (the reader may have
+// declined a read outside the express walk, the uniform fill's). `runtime`'s userData,
+// shaderBase, walk, trace and deferral fields are replaced.
+enum class WalkStatus : std::uint8_t { Walked, NoSource, IncompletePlan, NoProgram, Bindless, UnsupportedRoot, OpFailed, ReadDeclined, Failed, Count };
+[[nodiscard]] const char* WalkStatusName(WalkStatus status);
+[[nodiscard]] WalkStatus WalkResources(const SourceHandle& handle, std::span<const std::uint32_t> userData, std::uint64_t shaderBase, const SrtRuntime& runtime, ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+// The result Recompile(request, capture) gives for a capture with `snapshot` and `specialization`
+// when `handle`'s source already holds that variant (the request's layout, the specialization):
+// its bindings, push constants and vertex attributes populated over the snapshot, without
+// compiling (false: no such variant).
+[[nodiscard]] bool PopulateVariant(const SourceHandle& handle, const RecompileRequest& request, const ResourceSnapshot& snapshot, const ResourceSpecialization& specialization, RecompileResult& result);
 
 }
 

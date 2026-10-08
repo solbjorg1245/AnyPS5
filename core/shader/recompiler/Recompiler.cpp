@@ -24,6 +24,7 @@
 #include "Optimization/include/Optimization/RequestMemoryView.hpp"
 #include "Optimization/include/Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/SrtWalker/WalkProgram.hpp"
 #include "Optimization/include/Optimization/ResourceTracker.hpp"
 #include "Optimization/include/Optimization/ShaderInfoCollector.hpp"
 #include "Optimization/include/Optimization/SrtWalker.hpp"
@@ -701,6 +702,72 @@ std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& 
     if (profile) capture->sourceNanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
     materializeCapture(*capture, runtime);
     return capture;
+}
+
+const char* WalkStatusName(WalkStatus status) {
+    switch (status) {
+        case WalkStatus::Walked: return "walked";
+        case WalkStatus::NoSource: return "no source";
+        case WalkStatus::IncompletePlan: return "incomplete plan";
+        case WalkStatus::NoProgram: return "no program";
+        case WalkStatus::Bindless: return "bindless";
+        case WalkStatus::UnsupportedRoot: return "unsupported root";
+        case WalkStatus::OpFailed: return "op failed";
+        case WalkStatus::ReadDeclined: return "read declined";
+        case WalkStatus::Failed: return "failed";
+        default: return "?";
+    }
+}
+
+WalkStatus WalkResources(const SourceHandle& handle, std::span<const std::uint32_t> userData, std::uint64_t shaderBase, const SrtRuntime& runtime, ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+    if (handle.source == nullptr || handle.source->plan == nullptr) return WalkStatus::NoSource;
+    const auto& plan = *handle.source->plan;
+    if (!plan.srtPlanComplete || !plan.resourceTrackingComplete) return WalkStatus::IncompletePlan;
+    const auto* walk = walkFor(*handle.source);
+    if (walk == nullptr) return WalkStatus::NoProgram;
+    // A bindless table's keys are enumerated by the interpreter over readMemory (resolveTableImage).
+    for (const auto& image : plan.info.images) {
+        if (image.source < plan.descriptorSources.size() && plan.descriptorSources[image.source].indirectImage.has_value()) return WalkStatus::Bindless;
+    }
+    SrtRuntime fast = runtime;
+    fast.userData = userData;
+    fast.shaderBase = shaderBase;
+    fast.walk = walk;
+    fast.readTrace = nullptr;
+    fast.deferPureLeaf = nullptr;
+    fast.deferredReads = nullptr;
+    fast.expressOnly = true;
+    // Count: the walk program was not reached (a failure before it, the uniform fill's).
+    Detail::NoteWalkOutcome(Detail::WalkOutcome::Count);
+    try {
+        ResourceMaterializer{}.Materialize(plan, fast, snapshot, specialization);
+    } catch (const std::exception&) {
+        switch (Detail::LastWalkOutcome()) {
+            case Detail::WalkOutcome::NoProgram: return WalkStatus::NoProgram;
+            case Detail::WalkOutcome::UnsupportedRoot: return WalkStatus::UnsupportedRoot;
+            case Detail::WalkOutcome::OpFailed: return WalkStatus::OpFailed;
+            case Detail::WalkOutcome::ReadBailed: return WalkStatus::ReadDeclined;
+            default: return WalkStatus::Failed;
+        }
+    }
+    return WalkStatus::Walked;
+}
+
+bool PopulateVariant(const SourceHandle& handle, const RecompileRequest& request, const ResourceSnapshot& snapshot, const ResourceSpecialization& specialization, RecompileResult& result) {
+    if (handle.source == nullptr) return false;
+    std::shared_ptr<const CompiledVariant> variant;
+    {
+        std::lock_guard lock(handle.source->mutex);
+        for (const auto& candidate : handle.source->variants) {
+            if (sameLayout(candidate->layout, request.layout) && candidate->specialization == specialization) {
+                variant = candidate;
+                break;
+            }
+        }
+    }
+    if (variant == nullptr) return false;
+    result = materializeResult(*variant, request, snapshot);
+    return true;
 }
 
 RecompileResult Recompile(const RecompileRequest& request) {

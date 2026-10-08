@@ -1826,6 +1826,22 @@ Compare CopyMapped(std::uint64_t address, std::span<std::byte> out) {
     return queried ? outcome : Compare::Unmapped;
 }
 
+bool ReadableWord(std::uint64_t address, bool* queried) {
+    if (queried != nullptr) *queried = false;
+    if (address == 0 || address > std::numeric_limits<std::uintptr_t>::max() - sizeof(std::uint32_t)) return false;
+    auto& pages = Pages();
+    pages.initialize();
+    const auto at = static_cast<std::uintptr_t>(address);
+    if (const auto* span = pages.spanOf(at); span != nullptr && (span->load(at) & 3u) != 0) return true;
+    if (queried != nullptr) *queried = true;
+    bool readable = false;
+    const bool described = describePages(at, sizeof(std::uint32_t), [&](const PageRun& run) {
+        readable = run.readable;
+        return false;
+    });
+    return described && readable;
+}
+
 void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
     if (Accessible(reinterpret_cast<const void*>(address), current.size(), true)) {

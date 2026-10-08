@@ -50,6 +50,11 @@ Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes);
 // `out` (Equal), or Unmapped as CompareMapped answers it (the dispatch-cache validation's masked
 // re-read of a differing run).
 Compare CopyMapped(std::uint64_t address, std::span<std::byte> out);
+// Whether the dword at `address` (4-aligned) is readable: from the page-state table CompareMapped
+// consults when it knows the page (no VirtualQuery), else by one query that also records the page
+// (`queried` set). The fast walk's direct reader (docs/design/draw-fastpath.md F2) checks each
+// page it reads with it.
+bool ReadableWord(std::uint64_t address, bool* queried = nullptr);
 void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original);
 void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t alignment = 1);
 // Stores the parts of `current` that differ from `original` (the guest bytes the GPU started from), so

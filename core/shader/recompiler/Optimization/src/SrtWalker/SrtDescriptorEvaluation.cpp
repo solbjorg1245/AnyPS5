@@ -158,6 +158,7 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
     const bool standard = runtime.walk != nullptr && runtime.expressRead != nullptr && evaluateFlat && runtime.readMemory == runtime.readSpecializationMemory && sources.data() == program.materializationSources.data() && sources.size() == program.materializationSources.size() && cleanFlatSlots.data() == program.cleanFlatSlots.data() && cleanFlatSlots.size() == program.cleanFlatSlots.size();
     if (!standard) {
         NoteWalkOutcome(WalkOutcome::NoProgram);
+        if (runtime.expressOnly) return Fail("the express walk does not cover this evaluation");
         return evaluateInterpreted(program, sources, runtime, results, flat, evaluateFlat, cleanFlatSlots, activeSources);
     }
     static const bool verify = std::getenv("APS5_VERIFY_EXPRESS") != nullptr;
@@ -168,9 +169,12 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
     // Under verification the interpreter's walk alone traces the reads.
     if (verify) express.readTrace = nullptr;
     if (ExecuteWalkProgram(*runtime.walk, program, express, expressResults, expressFlat, expressActive) != WalkOutcome::Ran) {
+        if (runtime.expressOnly) return Fail("the express walk did not complete");
         return evaluateInterpreted(program, sources, runtime, results, flat, evaluateFlat, cleanFlatSlots, activeSources);
     }
-    if (!verify) {
+    // The fast walk (expressOnly) never verifies: the interpreter reading through its declining
+    // reader could fail where the express walk ran, which aborts.
+    if (!verify || runtime.expressOnly) {
         results = std::move(expressResults);
         flat = std::move(expressFlat);
         activeSources = std::move(expressActive);
