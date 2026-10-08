@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawScratch.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawSkipReasons.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
@@ -329,6 +330,8 @@ struct DrawProfile {
     // Draw packets that drew nothing, by DrawSkip, and their time.
     std::array<std::uint64_t, static_cast<std::size_t>(DrawSkip::Count)> skips{};
     std::array<double, static_cast<std::size_t>(DrawSkip::Count)> skipUs{};
+    // The same packets per reason head (CountDrawSkip's `reason`), by DrawSkip.
+    std::array<DrawSkipReasonTally, static_cast<std::size_t>(DrawSkip::Count)> skipReasons{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 constexpr std::array<const char*, static_cast<std::size_t>(DrawSkip::Count)> DrawSkipNames{"nothing to draw", "prechecked", "thrown"};
@@ -449,6 +452,22 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     std::fprintf(stderr, "%s\n", line);
+    // The skipped packets by reason head: the top 8 per kind with their time (APS5_NO_DRAW_SKIP_REASONS=1: no line).
+    bool anyReason = false;
+    for (const auto& tally : profile.skipReasons) anyReason = anyReason || tally.Keys() != 0 || tally.Overflow() != 0;
+    if (anyReason) {
+        n = std::snprintf(line, sizeof(line), "[draws] skips by reason (10 s):");
+        for (std::size_t i = 0; i < profile.skipReasons.size() && room(); ++i) {
+            const auto& tally = profile.skipReasons[i];
+            if (tally.Keys() == 0 && tally.Overflow() == 0) continue;
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu in %.1f ms under %zu heads (%llu beyond the %zu tracked):", DrawSkipNames[i], static_cast<unsigned long long>(profile.skips[i]), profile.skipUs[i] / 1000.0, tally.Keys(), static_cast<unsigned long long>(tally.Overflow()), DrawSkipReasonTally::MaxKeys);
+            for (const auto& entry : tally.Top(8)) {
+                if (!room()) break;
+                n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %llu x \"%s\" %.1f ms;", static_cast<unsigned long long>(entry.count), entry.key.c_str(), entry.us / 1000.0);
+            }
+        }
+        std::fprintf(stderr, "%s\n", line);
+    }
     std::fprintf(stderr, "[rescache] draws: %llu hits (%llu rebased), %llu misses (%llu rebase refused), %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheRebased), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheRebaseRefused), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     profile.totalsUs.fill(0);
     profile.maxUs.fill(0);
@@ -478,6 +497,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.inputCopies = profile.inputCopyBytes = profile.indicesScanned = profile.inPlaceInputs = profile.inPlaceInputBytes = 0;
     profile.skips.fill(0);
     profile.skipUs.fill(0);
+    for (auto& tally : profile.skipReasons) tally.Clear();
 }
 
 void countCache(std::uint64_t DrawProfile::*counter) {
@@ -715,13 +735,15 @@ void CountIndirectDraw(IndirectDrawPath path, double readMs, bool rewritten) {
     stats.indirectReadUs += readMs * 1000.0;
 }
 
-void CountDrawSkip(DrawSkip kind, double us) {
+void CountDrawSkip(DrawSkip kind, double us, std::string_view reason) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
+    static const bool reasons = std::getenv("APS5_NO_DRAW_SKIP_REASONS") == nullptr;
     auto& stats = Profile();
     std::lock_guard lock(stats.mutex);
     ++stats.skips[static_cast<std::size_t>(kind)];
     stats.skipUs[static_cast<std::size_t>(kind)] += us;
+    if (reasons && !reason.empty()) stats.skipReasons[static_cast<std::size_t>(kind)].Add(reason, us);
 }
 
 
