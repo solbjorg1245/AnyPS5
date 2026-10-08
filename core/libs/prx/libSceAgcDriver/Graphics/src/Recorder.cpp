@@ -511,7 +511,7 @@ bool KeyStoresEach() {
     static const bool each = std::getenv("APS5_DCC_KEYS_EACH") != nullptr;
     return each;
 }
-std::atomic<std::uint64_t> queuedLabelsNoted{0}, queuedLabelsOverRecorded{0}, queuedLabelHits{0}, queuedLabelHookRecords{0}, queuedLabelHookInCompletion{0};
+std::atomic<std::uint64_t> queuedLabelsNoted{0}, queuedLabelsOverRecorded{0}, queuedLabelHits{0}, queuedLabelHookRecords{0}, queuedLabelHookInCompletion{0}, queuedLabelPageQueries{0};
 // Read-tracking counters (Recorder::ReadCounts), relaxed: they are only reported.
 constexpr std::size_t ReadKinds = static_cast<std::size_t>(Recorder::ReadKind::Count);
 std::atomic<std::uint64_t> readsNoted{0}, readQueries{0}, readStaleIgnored{0};
@@ -1319,7 +1319,7 @@ void Recorder::SetQueuedLabelRecorder(void (*recorder)()) {
 }
 
 Recorder::StoreStatistics Recorder::StoreCounts() {
-    return StoreStatistics{storeCount.load(std::memory_order_relaxed), storeRuns.load(std::memory_order_relaxed), storesJoined.load(std::memory_order_relaxed), storesReplaced.load(std::memory_order_relaxed), storeWawBarriers.load(std::memory_order_relaxed), storeJoinsRefused.load(std::memory_order_relaxed), queuedLabelsNoted.load(std::memory_order_relaxed), queuedLabelsOverRecorded.load(std::memory_order_relaxed), queuedLabelHits.load(std::memory_order_relaxed), queuedLabelHookRecords.load(std::memory_order_relaxed), queuedLabelHookInCompletion.load(std::memory_order_relaxed), keyStoreCount.load(std::memory_order_relaxed), keyStoreRuns.load(std::memory_order_relaxed), keyStoreRunsForWriter.load(std::memory_order_relaxed), keyStoresJoined.load(std::memory_order_relaxed), storeRunsAtSubmit.load(std::memory_order_relaxed), storeRunsForced.load(std::memory_order_relaxed)};
+    return StoreStatistics{storeCount.load(std::memory_order_relaxed), storeRuns.load(std::memory_order_relaxed), storesJoined.load(std::memory_order_relaxed), storesReplaced.load(std::memory_order_relaxed), storeWawBarriers.load(std::memory_order_relaxed), storeJoinsRefused.load(std::memory_order_relaxed), queuedLabelsNoted.load(std::memory_order_relaxed), queuedLabelsOverRecorded.load(std::memory_order_relaxed), queuedLabelHits.load(std::memory_order_relaxed), queuedLabelHookRecords.load(std::memory_order_relaxed), queuedLabelHookInCompletion.load(std::memory_order_relaxed), keyStoreCount.load(std::memory_order_relaxed), keyStoreRuns.load(std::memory_order_relaxed), keyStoreRunsForWriter.load(std::memory_order_relaxed), keyStoresJoined.load(std::memory_order_relaxed), storeRunsAtSubmit.load(std::memory_order_relaxed), storeRunsForced.load(std::memory_order_relaxed), queuedLabelPageQueries.load(std::memory_order_relaxed)};
 }
 
 std::uint64_t Recorder::ThreadHookWaits() {
@@ -1328,6 +1328,12 @@ std::uint64_t Recorder::ThreadHookWaits() {
 
 bool Recorder::SnapshotWriteOverlaps(std::uint64_t address, std::size_t bytes) {
     return AgcDriver::Graphics::SnapshotOverlaps(address, bytes);
+}
+
+bool Recorder::QueuedLabelOverlapsThisThread(std::uint64_t address, std::size_t bytes) {
+    if (QueuedLabelRanges().empty() || !QueuedLabelOverlaps(address, bytes)) return false;
+    queuedLabelPageQueries.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 std::shared_ptr<const Recorder::WriteRanges> Recorder::PendingWriteSnapshot() {
