@@ -516,6 +516,14 @@ public:
     // (or APS5_NO_BARRIER_ELISION=1) records every leading barrier, as before.
     static bool MergeBarriers();
     static void CountMerged(CommandClass which);
+    // The dispatch path's merges on top of those (BarrierMerge.hpp; on by default,
+    // APS5_NO_DISPATCH_BARRIER_ELIDE=1 or either switch above records as before): a staging copy
+    // pass (copy-in, copy-back) leaves its leading barrier out after a trailing barrier that covered
+    // transfer reads and writes (a copy-back right after its dispatch's), the batch opening before a
+    // copied region (GuestBufferMemory::UploadFinish) keeps the coverage it records nothing over, and
+    // an indirect dispatch's argument barrier goes into its leading barrier. The [barriers] line sums
+    // the dispatch path's classes, recorded and merged.
+    static bool MergeDispatchBarriers();
     // Hazard tracker, counting mode (APS5_BARRIER_VALIDATE=1): every command tells the tracker
     // what it reads and writes (guest ranges through host imports, images) with its stage before
     // it is recorded; the tracker simulates barriers emitted only on a hazard against the accesses

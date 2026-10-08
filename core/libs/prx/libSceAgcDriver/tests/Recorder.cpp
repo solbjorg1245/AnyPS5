@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BarrierMerge.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -662,6 +663,13 @@ void storeRunTests(const Device& device, Recorder& recorder) {
     Require(covered == (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT), "the covered mask is not reported");
     recorder.Commands(&covered);
     Require(covered == 0, "the covered mask survived a Commands() call");
+    // A caller that records nothing after opening the batch gives the mask back (the batch opening
+    // before a copied region, Recorder::MergeDispatchBarriers): the next caller is told it again.
+    recorder.MarkCovered(StagingCopyAccess);
+    recorder.Commands(&covered);
+    recorder.MarkCovered(covered);
+    recorder.Commands(&covered);
+    Require(covered == StagingCopyAccess, "a covered mask given back was lost");
     recorder.Sync();
     // The hazard tracker (counting mode only): accesses are noted without effect on the batch.
     const std::pair<std::uint64_t, std::uint64_t> range{address, address + 64};
@@ -2010,6 +2018,29 @@ void metadataPassTests(const Device& device, Recorder& recorder) {
     Require(keysUncompressed() && memoryHolds({0xff, 0xff, 0xff, 0xff}), "a pass over a remade resident image did not store the 1111 value");
 }
 
+// The dispatch path's barrier merges (BarrierMerge.hpp, Recorder::MergeDispatchBarriers): a
+// dispatch's trailing barrier covers the leading barrier of a staging copy pass and of the next
+// dispatch; a copy-in pass's coverage (shader accesses) leaves the next pass its barrier; nothing
+// covered, or part of it, records every barrier; the argument barrier merged into the leading one
+// contains both and widens neither's source stages.
+void barrierMergeTests() {
+    Require(DispatchTrailingBarrier.destinationStages == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, "the dispatch's trailing barrier must reach every later stage to cover");
+    Require(LeadingBarrierCovered(DispatchTrailingBarrier.destinationAccess, StagingCopyAccess), "a copy-back after a dispatch keeps its leading barrier");
+    Require(LeadingBarrierCovered(DispatchTrailingBarrier.destinationAccess, DispatchLeadingBarrier.destinationAccess), "a dispatch after a dispatch keeps its leading barrier");
+    constexpr VkAccessFlags copyInCoverage = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    Require(!LeadingBarrierCovered(copyInCoverage, StagingCopyAccess), "a copy-in pass's coverage left out a transfer's barrier");
+    Require(LeadingBarrierCovered(copyInCoverage, DispatchLeadingBarrier.destinationAccess), "a dispatch after a copy-in pass keeps its leading barrier");
+    Require(!LeadingBarrierCovered(0, StagingCopyAccess) && !LeadingBarrierCovered(0, 0), "nothing covered left a barrier out");
+    Require(!LeadingBarrierCovered(VK_ACCESS_TRANSFER_READ_BIT, StagingCopyAccess), "a partly covered pass left its barrier out");
+    constexpr auto merged = MergeAdjacentBarriers(IndirectArgumentsBarrier, DispatchLeadingBarrier);
+    Require(BarrierContains(merged, IndirectArgumentsBarrier) && BarrierContains(merged, DispatchLeadingBarrier), "the merged barrier lost part of one of its two");
+    Require(IndirectArgumentsBarrier.sourceStages == DispatchLeadingBarrier.sourceStages && merged.sourceStages == DispatchLeadingBarrier.sourceStages, "the merge widened a source scope");
+    Require(merged.destinationStages == (VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT), "the merged barrier's destination stages are wrong");
+    Require(merged.destinationAccess == (VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT), "the merged barrier's destination accesses are wrong");
+    Require(!BarrierContains(merged, DispatchTrailingBarrier) && !BarrierContains(DispatchLeadingBarrier, merged), "containment is not strict");
+    Require(BarrierContains(merged, merged), "a barrier does not contain itself");
+}
+
 // The data word positions of a dispatch-cache variant (Driver.cpp's data-only hits): leaves
 // located among the runs' words, aliased, unaligned, out-of-run and mismatched ones skipped.
 void dataWordPositionsTests() {
@@ -2573,6 +2604,7 @@ int main() {
         dataWordPositionsTests();
         ignoredWordBitsTests();
         bufferBaseWordsTests();
+        barrierMergeTests();
         dataRefreshTests(device, recorder);
         minLodTests(device, recorder);
         firstLayerViewTests(device, recorder);

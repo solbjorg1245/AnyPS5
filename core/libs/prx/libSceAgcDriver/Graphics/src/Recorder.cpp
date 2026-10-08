@@ -1844,6 +1844,9 @@ void reportBarriers() {
     if (now - lastReport < std::chrono::seconds(10)) return;
     lastReport = now;
     std::uint64_t total = 0, merged = 0;
+    // The dispatch path's classes (the barriers around a dispatch, its indirect read's, the staging
+    // copy passes'), summed for the APS5_NO_DISPATCH_BARRIER_ELIDE A/B.
+    std::uint64_t pathRecorded = 0, pathMerged = 0;
     std::string line, mergedLine;
     for (std::size_t i = 0; i < CommandClasses; ++i) {
         const auto count = classBarriers[i].exchange(0, std::memory_order_relaxed);
@@ -1852,12 +1855,17 @@ void reportBarriers() {
         std::snprintf(text, sizeof(text), " %s %llu", CommandClassNames[i], static_cast<unsigned long long>(count));
         line += text;
         const auto mergedCount = classMerged[i].exchange(0, std::memory_order_relaxed);
+        const auto which = static_cast<Recorder::CommandClass>(i);
+        if (which == Recorder::CommandClass::DispatchLeading || which == Recorder::CommandClass::DispatchTrailing || which == Recorder::CommandClass::IndirectArguments || which == Recorder::CommandClass::StagingIn || which == Recorder::CommandClass::StagingOut) {
+            pathRecorded += count;
+            pathMerged += mergedCount;
+        }
         if (mergedCount == 0) continue;
         merged += mergedCount;
         std::snprintf(text, sizeof(text), " %s %llu", CommandClassNames[i], static_cast<unsigned long long>(mergedCount));
         mergedLine += text;
     }
-    std::fprintf(stderr, "[barriers] %llu recorded (10 s) by class:%s; merged %llu:%s", static_cast<unsigned long long>(total), line.c_str(), static_cast<unsigned long long>(merged), mergedLine.c_str());
+    std::fprintf(stderr, "[barriers] %llu recorded (10 s) by class:%s; merged %llu:%s; dispatch path (lead, trail, indirect, staging; dispatch merges %s): %llu recorded, %llu merged", static_cast<unsigned long long>(total), line.c_str(), static_cast<unsigned long long>(merged), mergedLine.c_str(), Recorder::MergeDispatchBarriers() ? "on" : "off", static_cast<unsigned long long>(pathRecorded), static_cast<unsigned long long>(pathMerged));
     if (Recorder::BarrierValidate()) {
         std::uint64_t emitted = 0, skipped = 0;
         std::string classes, kinds;
@@ -1899,6 +1907,11 @@ void Recorder::CountBarriers(CommandClass which, std::uint32_t count) {
 
 bool Recorder::MergeBarriers() {
     static const bool merge = std::getenv("APS5_FULL_BARRIERS") == nullptr && std::getenv("APS5_NO_BARRIER_ELISION") == nullptr;
+    return merge;
+}
+
+bool Recorder::MergeDispatchBarriers() {
+    static const bool merge = MergeBarriers() && std::getenv("APS5_NO_DISPATCH_BARRIER_ELIDE") == nullptr;
     return merge;
 }
 

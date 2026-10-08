@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BarrierMerge.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -2509,8 +2510,12 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // the copy reads it: the flush is recorded (GPU-direct into the import) ahead of the copy
             // in the same batch. The batch is opened first so that an import the flush's own
             // reconcile retires is handed to it (retireImport keeps nothing while the recorder is
-            // idle) and outlives the copy.
-            static_cast<void>(recorder->Commands());
+            // idle) and outlives the copy. The opening records nothing of its own, so the coverage of
+            // the last trailing barrier stays for the copy pass's leading barrier and the dispatch's
+            // (Recorder::MergeDispatchBarriers; off, the opening clears it as every Commands() does).
+            VkAccessFlags covered = 0;
+            static_cast<void>(recorder->Commands(&covered));
+            if (Recorder::MergeDispatchBarriers()) recorder->MarkCovered(covered);
             StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "copied buffer region");
             region.gpuCopy = true;
             gpuCopies.push_back(&region);
@@ -2731,15 +2736,23 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             return;
         }
     }
-    const auto commands = recorder->Commands();
+    VkAccessFlags covered = 0;
+    const auto commands = recorder->Commands(&covered);
     const auto timing = recorder->BeginGpuTiming(StagingCopyInKey);
     if (Recorder::BarrierValidate()) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
         for (const auto* region : copies) reads.emplace_back(region->begin, region->end);
         recorder->NoteAccess(Recorder::CommandClass::StagingIn, Recorder::Access{reads, {}, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     }
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+    // Every earlier writer of the sources (and of the buffers the copies overwrite) precedes the
+    // copies; the previous command's trailing barrier did that when it covered transfer reads and
+    // writes (a dispatch's or a copy-back's: Recorder::MergeDispatchBarriers).
+    if (LeadingBarrierCovered(covered, StagingCopyAccess) && Recorder::MergeDispatchBarriers()) {
+        Recorder::CountMerged(Recorder::CommandClass::StagingIn);
+    } else {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+    }
     bool stagedAny = false;
     std::uint64_t copiedBytes = 0;
     for (std::size_t index = 0; index < copies.size(); ++index) {
@@ -2900,11 +2913,19 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 deferred.push_back({region.buffer, region.buffer.get(), region.buffer->Handle(), region.copySource, from - region.begin, from - region.copySourceBase, to - from, from});
             } else {
                 if (!recording) {
-                    commands = recorder.Commands();
+                    VkAccessFlags covered = 0;
+                    commands = recorder.Commands(&covered);
                     timing = recorder.BeginGpuTiming(StagingCopyBackKey);
-                    // The shader's stores into the buffer (whichever stage made them) precede the copy.
-                    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-                    Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+                    // The shader's stores into the buffer (whichever stage made them) precede the copy:
+                    // the work's own trailing barrier, recorded right before (a dispatch's, a draw's
+                    // pass end), did that when it covered transfer reads and writes
+                    // (Recorder::MergeDispatchBarriers).
+                    if (LeadingBarrierCovered(covered, StagingCopyAccess) && Recorder::MergeDispatchBarriers()) {
+                        Recorder::CountMerged(Recorder::CommandClass::StagingOut);
+                    } else {
+                        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                        Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+                    }
                     recording = true;
                 }
                 // Exactly the sub-range the shader may write, in place in the import: what the
