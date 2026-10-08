@@ -161,6 +161,14 @@ bool WordsEqualIgnoring(std::span<const std::uint32_t> a, std::span<const std::u
 // Whether two guest descriptors of `binding` are equal apart from the T# don't-care bits of a
 // sampled-image binding's elements (any other binding: exactly).
 bool SameDescriptorIgnoringTsharpBits(const ShaderRecompiler::DescriptorBinding& binding, std::span<const std::uint32_t> left, std::span<const std::uint32_t> right);
+// Whether a FlattenedSrt word `leftWord` of the `left` bindings and `rightWord` at the same place
+// of the `right` bindings (the same layout) differ only as the flat copy of a sampled T#'s
+// don't-care bits: some sampled-image element (a GuestImages / SampledImage binding of both) holds
+// leftWord on the left and rightWord on the right as its word 5 or 6, and the two differ only in
+// that word's mask (TsharpWord5IgnoredBits / TsharpWord6IgnoredBits). A shader that reads a T# as
+// data too gets its words in the flat SRT; a hit the stage compare accepted through the mask binds
+// the stored copy there (DispatchVariant::ignoredBits), a fresh walk the live one.
+bool FlatTsharpFeedbackCopy(std::span<const ShaderRecompiler::DescriptorBinding> left, std::span<const ShaderRecompiler::DescriptorBinding> right, std::uint32_t leftWord, std::uint32_t rightWord);
 
 // Buffer base slots of a variant's stored words: for each read-only guest-buffer V# (a 4-word
 // element of a GuestBuffers binding the shader proves it never stores to) whose base is located
