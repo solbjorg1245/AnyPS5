@@ -258,7 +258,7 @@ int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInf
  #else
  std::ifstream maps("/proc/self/maps");
  std::string line;
- bool found = false, writable = false, executable = false;
+ bool mapped = false, writable = false, executable = false;
  while (std::getline(maps, line)) {
   std::istringstream fields(line);
   uintptr_t begin = 0, end = 0;
@@ -270,10 +270,10 @@ int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInf
   info->end = end;
   writable = perms[1] == 'w';
   executable = perms[2] == 'x';
-  found = true;
+  mapped = true;
   break;
  }
- if (!found) return SCE_KERNEL_ERROR_EACCES;
+ if (!mapped) return SCE_KERNEL_ERROR_EACCES;
  #endif
  info->protection = 1 | (writable ? 2 : 0) | (executable ? 4 : 0);
  info->is_flexible = 1;
