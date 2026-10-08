@@ -505,6 +505,9 @@ bool LateTrustEnabled() {
 // Store-run and queued-label counters (Recorder::StoreCounts), relaxed: they are only reported.
 std::atomic<std::uint64_t> storeCount{0}, storeRuns{0}, storesJoined{0}, storesReplaced{0}, storeWawBarriers{0}, storeJoinsRefused{0};
 std::atomic<std::uint64_t> keyStoreCount{0}, keyStoreRuns{0}, keyStoreRunsForWriter{0}, keyStoresJoined{0};
+// Deferred copy-back counters (Recorder::CopyBackCounts), relaxed likewise.
+std::atomic<std::uint64_t> copyBacksDeferred{0}, copyBackBytesDeferred{0}, copyBacksOverwritten{0}, copyBackBytesOverwritten{0}, copyBacksRecorded{0}, copyBackBytesRecorded{0}, copyBackPasses{0};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Recorder::FlushReason::Count)> copyBackFlushes{};
 
 // Debug aid: APS5_DCC_KEYS_EACH=1 records every DCC key store at once (see Recorder::QueueKeyStore).
 bool KeyStoresEach() {
@@ -1102,6 +1105,9 @@ const char* Recorder::WriteKindName(WriteKind kind) {
 }
 
 Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)) {
+    // Per recorder (not a static): a test makes one with the switch set.
+    const char* coalesce = std::getenv("APS5_COALESCE_COPY_BACKS");
+    coalesceCopyBacks = coalesce != nullptr && *coalesce != '\0' && std::strcmp(coalesce, "0") != 0;
     {
         std::lock_guard lock(liveRecordersMutex);
         liveRecorders.push_back(id);
@@ -1364,8 +1370,17 @@ std::uint64_t Recorder::ReapsWithWork() {
 }
 
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
+    return commandsFor(coveredAccess, false);
+}
+
+VkCommandBuffer Recorder::CommandsKeepingCopyBacks(VkAccessFlags* coveredAccess) {
+    return commandsFor(coveredAccess, coalesceCopyBacks);
+}
+
+VkCommandBuffer Recorder::commandsFor(VkAccessFlags* coveredAccess, bool keepCopyBacks) {
     ensureOpen();
-    flushDeferredCopies();
+    // Coalescing: a caller that checks nothing may touch any queued copy's bytes, claimed or not.
+    if (!keepCopyBacks) flushDeferredCopies(coalesceCopyBacks, FlushReason::Command);
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
     // for a caller whose ranges overlap a queued store: FlushStores).
@@ -1381,12 +1396,6 @@ bool Recorder::DeferCopyBacks() {
     return enabled;
 }
 
-void Recorder::DeferCopies(std::vector<DeferredCopy> copies) {
-    if (copies.empty()) return;
-    ensureOpen();
-    deferredCopies.insert(deferredCopies.end(), std::make_move_iterator(copies.begin()), std::make_move_iterator(copies.end()));
-}
-
 namespace {
 // Moves the copies of `from` whose source is `sourceKey` to the end of `to`.
 void moveCopies(std::vector<Recorder::DeferredCopy>& from, std::vector<Recorder::DeferredCopy>& to, const std::function<bool(const Recorder::DeferredCopy&)>& selected) {
@@ -1394,6 +1403,93 @@ void moveCopies(std::vector<Recorder::DeferredCopy>& from, std::vector<Recorder:
     to.insert(to.end(), std::make_move_iterator(kept), std::make_move_iterator(from.end()));
     from.erase(kept, from.end());
 }
+
+// Coalescing: drops the guest bytes [begin, end), which a later copy stores again, from the queued
+// copies: one inside goes, one across an edge keeps the part outside (both offsets moved alike),
+// one around it splits in two.
+void dropOverwritten(std::vector<Recorder::DeferredCopy>& copies, std::uint64_t begin, std::uint64_t end) {
+    const auto count = copies.size();
+    bool emptied = false;
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto from = copies[index].address;
+        const auto to = from + copies[index].bytes;
+        if (to <= begin || end <= from) continue;
+        copyBackBytesOverwritten.fetch_add(std::min(to, end) - std::max(from, begin), std::memory_order_relaxed);
+        if (to > end) {
+            auto tail = copies[index];
+            const auto moved = end - from;
+            tail.address = end;
+            tail.sourceOffset += moved;
+            tail.destinationOffset += moved;
+            tail.bytes = to - end;
+            copies.push_back(std::move(tail));
+        }
+        auto& copy = copies[index];
+        copy.bytes = from < begin ? begin - from : 0;
+        if (copy.bytes == 0 && to <= end) copyBacksOverwritten.fetch_add(1, std::memory_order_relaxed);
+        emptied = emptied || copy.bytes == 0;
+    }
+    if (emptied) copies.erase(std::remove_if(copies.begin(), copies.end(), [](const Recorder::DeferredCopy& copy) { return copy.bytes == 0; }), copies.end());
+}
+}
+
+void Recorder::DeferCopies(std::vector<DeferredCopy> copies) {
+    if (copies.empty()) return;
+    ensureOpen();
+    for (const auto& copy : copies) {
+        copyBacksDeferred.fetch_add(1, std::memory_order_relaxed);
+        copyBackBytesDeferred.fetch_add(copy.bytes, std::memory_order_relaxed);
+    }
+    if (coalesceCopyBacks) {
+        // The bytes a copy stores again lose their earlier queued copy (in program order: within
+        // `copies` too), so the queued copies stay disjoint.
+        for (auto& copy : copies) {
+            dropOverwritten(deferredCopies, copy.address, copy.address + copy.bytes);
+            dropOverwritten(claimedCopies, copy.address, copy.address + copy.bytes);
+            deferredCopies.push_back(std::move(copy));
+        }
+        return;
+    }
+    deferredCopies.insert(deferredCopies.end(), std::make_move_iterator(copies.begin()), std::make_move_iterator(copies.end()));
+}
+
+const char* Recorder::FlushReasonName(FlushReason reason) {
+    switch (reason) {
+    case FlushReason::Submit: return "submit";
+    case FlushReason::StoreRun: return "store-run";
+    case FlushReason::Command: return "command";
+    case FlushReason::Dispatch: return "dispatch";
+    case FlushReason::DispatchLease: return "dispatch-lease";
+    case FlushReason::CopyIn: return "copy-in";
+    default: return "?";
+    }
+}
+
+void Recorder::FlushDeferredWhere(const std::function<bool(const DeferredCopy&, bool claimed)>& selected, FlushReason reason) {
+    if (open == nullptr || !HasDeferredCopies()) return;
+    std::vector<DeferredCopy> copies;
+    moveCopies(deferredCopies, copies, [&](const DeferredCopy& copy) { return selected(copy, false); });
+    moveCopies(claimedCopies, copies, [&](const DeferredCopy& copy) { return selected(copy, true); });
+    recordDeferredCopies(std::move(copies), reason);
+}
+
+void Recorder::FlushDeferredOverlapping(std::uint64_t address, std::size_t bytes, const void* exceptSource, FlushReason reason) {
+    if (!HasDeferredCopies() || bytes == 0) return;
+    const auto end = address + bytes;
+    FlushDeferredWhere([&](const DeferredCopy& copy, bool claimed) { return copy.address < end && address < copy.address + copy.bytes && !(claimed && exceptSource != nullptr && copy.sourceKey == exceptSource); }, reason);
+}
+
+std::uint64_t Recorder::DeferredCopyBytes() const {
+    std::uint64_t bytes = 0;
+    for (const auto& copy : deferredCopies) bytes += copy.bytes;
+    for (const auto& copy : claimedCopies) bytes += copy.bytes;
+    return bytes;
+}
+
+Recorder::CopyBackStatistics Recorder::CopyBackCounts() {
+    CopyBackStatistics counts{copyBacksDeferred.load(std::memory_order_relaxed), copyBackBytesDeferred.load(std::memory_order_relaxed), copyBacksOverwritten.load(std::memory_order_relaxed), copyBackBytesOverwritten.load(std::memory_order_relaxed), copyBacksRecorded.load(std::memory_order_relaxed), copyBackBytesRecorded.load(std::memory_order_relaxed), copyBackPasses.load(std::memory_order_relaxed), {}};
+    for (std::size_t i = 0; i < counts.flushes.size(); ++i) counts.flushes[i] = copyBackFlushes[i].load(std::memory_order_relaxed);
+    return counts;
 }
 
 void Recorder::ClaimDeferredCopies(const void* sourceKey) {
@@ -1420,10 +1516,10 @@ void Recorder::FlushClaimedOverlapping(std::uint64_t address, std::size_t bytes)
     if (std::none_of(claimedCopies.begin(), claimedCopies.end(), overlapping)) return;
     // Back to the unclaimed list (their order among themselves kept), recorded now.
     moveCopies(claimedCopies, deferredCopies, overlapping);
-    flushDeferredCopies();
+    flushDeferredCopies(false, FlushReason::CopyIn);
 }
 
-void Recorder::flushDeferredCopies(bool claimed) {
+void Recorder::flushDeferredCopies(bool claimed, FlushReason reason) {
     if (open == nullptr || (deferredCopies.empty() && (!claimed || claimedCopies.empty()))) return;
     auto copies = std::move(deferredCopies);
     deferredCopies.clear();
@@ -1431,7 +1527,14 @@ void Recorder::flushDeferredCopies(bool claimed) {
         copies.insert(copies.end(), std::make_move_iterator(claimedCopies.begin()), std::make_move_iterator(claimedCopies.end()));
         claimedCopies.clear();
     }
+    recordDeferredCopies(std::move(copies), reason);
+}
+
+void Recorder::recordDeferredCopies(std::vector<DeferredCopy> copies, FlushReason reason) {
     if (copies.empty()) return;
+    copyBackPasses.fetch_add(1, std::memory_order_relaxed);
+    copyBackFlushes[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+    copyBacksRecorded.fetch_add(copies.size(), std::memory_order_relaxed);
     if (open->renderPass.open) endOpenRenderPass();
     const auto commands = open->commands;
     const auto timing = beginTiming(ClassKey(CommandClass::StagingOut));
@@ -1439,11 +1542,29 @@ void Recorder::flushDeferredCopies(bool claimed) {
     recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     CountBarriers(CommandClass::StagingOut);
     std::uint64_t bytes = 0;
-    for (const auto& copy : copies) {
-        const VkBufferCopy region{copy.sourceOffset, copy.destinationOffset, copy.bytes};
-        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, copy.source, copy.destination, 1, &region);
-        bytes += copy.bytes;
+    if (coalesceCopyBacks) {
+        // Disjoint destinations (DeferCopies): one vkCmdCopyBuffer per (source, destination) pair.
+        std::sort(copies.begin(), copies.end(), [](const DeferredCopy& left, const DeferredCopy& right) { return std::tie(left.source, left.destination, left.address) < std::tie(right.source, right.destination, right.address); });
+        const auto copy = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
+        std::vector<VkBufferCopy> regions;
+        for (std::size_t first = 0; first < copies.size();) {
+            regions.clear();
+            auto last = first;
+            for (; last < copies.size() && copies[last].source == copies[first].source && copies[last].destination == copies[first].destination; ++last) {
+                regions.push_back({copies[last].sourceOffset, copies[last].destinationOffset, copies[last].bytes});
+                bytes += copies[last].bytes;
+            }
+            copy(commands, copies[first].source, copies[first].destination, static_cast<std::uint32_t>(regions.size()), regions.data());
+            first = last;
+        }
+    } else {
+        for (const auto& copy : copies) {
+            const VkBufferCopy region{copy.sourceOffset, copy.destinationOffset, copy.bytes};
+            context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, copy.source, copy.destination, 1, &region);
+            bytes += copy.bytes;
+        }
     }
+    copyBackBytesRecorded.fetch_add(bytes, std::memory_order_relaxed);
     // As a GPU label store or fill: visible to everything recorded after (shaders, transfers, an
     // indirect dispatch's arguments) and to the host once the batch completed.
     constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
@@ -1658,7 +1779,7 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
     }
     // A label says the work before it is done: the queued key stores and the deferred copy-backs
     // (results of that work) land ahead of every store of the run.
-    flushDeferredCopies(true);
+    flushDeferredCopies(true, FlushReason::StoreRun);
     if (!open->keyStores.empty()) recordKeyStores(true);
     if (open->renderPass.open) endOpenRenderPass();
     open->coveredAccess = 0;
@@ -1728,7 +1849,7 @@ bool Recorder::closeStoreRun(bool atSubmit) {
         auto stores = std::move(run.queued);
         run.queued.clear();
         if (stores.empty()) return false;
-        flushDeferredCopies(true);
+        flushDeferredCopies(true, FlushReason::StoreRun);
         // A label says the work before it is done: the queued key stores (results of that work)
         // land ahead of every store of the run, and the pass a draw left open ends.
         if (!open->keyStores.empty()) recordKeyStores(true);
@@ -1877,6 +1998,19 @@ void reportBarriers() {
             kinds += text;
         }
         std::fprintf(stderr, "; validate: would emit %llu (%s) + %llu batch ends, would skip %llu; emitted/skipped by class:%s", static_cast<unsigned long long>(emitted), kinds.c_str() + 1, static_cast<unsigned long long>(validateBatchEnds.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(skipped), classes.c_str());
+    }
+    // Deferred copy-backs (APS5_DEFER_COPY_BACK, APS5_COALESCE_COPY_BACKS): the passes that
+    // recorded queued copies (two staging-out barriers each) by reason, and the copies recorded.
+    if (const auto counts = Recorder::CopyBackCounts(); counts.deferred != 0) {
+        static Recorder::CopyBackStatistics last{};
+        std::string reasons;
+        for (std::size_t i = 0; i < counts.flushes.size(); ++i) {
+            char text[48];
+            std::snprintf(text, sizeof(text), " %s %llu", Recorder::FlushReasonName(static_cast<Recorder::FlushReason>(i)), static_cast<unsigned long long>(counts.flushes[i] - last.flushes[i]));
+            reasons += text;
+        }
+        std::fprintf(stderr, "; copy-back passes %llu by reason:%s, %llu copies (%.0f MiB) recorded", static_cast<unsigned long long>(counts.passes - last.passes), reasons.c_str(), static_cast<unsigned long long>(counts.recorded - last.recorded), (counts.recordedBytes - last.recordedBytes) / 1048576.0);
+        last = counts;
     }
     std::fputc('\n', stderr);
 }
@@ -2769,7 +2903,7 @@ void Recorder::Submit() {
     if (activeRecorder == this) workSinceSubmit.store(0, std::memory_order_relaxed);
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
-    flushDeferredCopies(true);
+    flushDeferredCopies(true, FlushReason::Submit);
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     if (open->samples != VK_NULL_HANDLE) context.Function<PFN_vkCmdEndQuery>("vkCmdEndQuery")(open->commands, open->samples, 0);

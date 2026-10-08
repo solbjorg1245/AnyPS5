@@ -114,6 +114,48 @@ public:
         std::uint64_t address = 0;
     };
     static bool DeferCopyBacks();
+    // Copy-back coalescing (APS5_COALESCE_COPY_BACKS=1, read when the recorder is made; without it
+    // everything here behaves as above). Copy-backs are deferred, and the queued ones stay queued
+    // past the commands that do not touch their bytes, so only the last copy of a guest byte per
+    // epoch (up to the next point that records them) lands: a copy deferred over bytes an earlier
+    // queued copy stores drops them from that one (nothing read them in between, or the reader
+    // would have recorded it first), so queued copies never overlap and record in any order.
+    // What records them (docs/design/resident-memory.md, "Copy-back coalescing"):
+    // - every queued copy, claimed ones too: Commands() (a caller that checks nothing), a label
+    //   store or store run, a key-store run, Submit (before the batch's host barrier);
+    // - those a dispatch reads or writes through the imports (bound in place, its indirect
+    //   arguments; every one for an address-based build), before it takes CommandsKeepingCopyBacks
+    //   (VulkanDevice recordDispatch);
+    // - those over a range a staging build copies in from its import (all claims made first; a
+    //   region's own claimed copies stay: it copies from that shadow), before its copy pass takes
+    //   CommandsKeepingCopyBacks (GuestBufferMemory::recordGpuCopies).
+    // The CPU reads a copied range only after its batch completed: the use's pending-write notes
+    // make a CPU access sync the batch (Submit records the copies first), and the title's pollers
+    // see a label only after the copies recorded ahead of its store.
+    bool CoalescesCopyBacks() const { return coalesceCopyBacks; }
+    bool DefersCopyBacks() const { return coalesceCopyBacks || DeferCopyBacks(); }
+    // Commands() that leaves the queued copy-backs alone under coalescing (the caller recorded
+    // those its command touches); Commands() otherwise.
+    VkCommandBuffer CommandsKeepingCopyBacks(VkAccessFlags* coveredAccess = nullptr);
+    bool HasDeferredCopies() const { return !deferredCopies.empty() || !claimedCopies.empty(); }
+    // Why queued copy-backs were recorded (the [barriers] digest under deferral).
+    enum class FlushReason : std::uint8_t { Submit = 0, StoreRun, Command, Dispatch, DispatchLease, CopyIn, Count };
+    static const char* FlushReasonName(FlushReason reason);
+    // Records now the queued copies `selected` picks (`claimed`: from the claimed list).
+    void FlushDeferredWhere(const std::function<bool(const DeferredCopy&, bool claimed)>& selected, FlushReason reason);
+    // The queued copies over [address, address + bytes), except those claimed for `exceptSource`.
+    void FlushDeferredOverlapping(std::uint64_t address, std::size_t bytes, const void* exceptSource, FlushReason reason);
+    void FlushDeferredCopies(FlushReason reason) { flushDeferredCopies(true, reason); }
+    // Bytes the queued copies (claimed ones too) would store.
+    std::uint64_t DeferredCopyBytes() const;
+    // Totals since start (relaxed): copies deferred, copies dropped whole and bytes dropped as
+    // stored again by a later copy before any reader (coalescing only), copies recorded and the
+    // passes that recorded them (two barriers each), by reason.
+    struct CopyBackStatistics {
+        std::uint64_t deferred, deferredBytes, overwritten, overwrittenBytes, recorded, recordedBytes, passes;
+        std::array<std::uint64_t, static_cast<std::size_t>(FlushReason::Count)> flushes;
+    };
+    static CopyBackStatistics CopyBackCounts();
     void DeferCopies(std::vector<DeferredCopy> copies);
     // A staging build that takes the shadow `sourceKey` (staging chain) claims its deferred copies:
     // Commands() leaves claimed copies alone while the build records its work (a store run, a key
@@ -739,7 +781,12 @@ private:
     // labelling over one, not at Submit).
     void recordKeyStores(bool forWriter);
     // Records the deferred copy-backs (DeferCopies) with their barrier pair; `claimed` too.
-    void flushDeferredCopies(bool claimed = false);
+    void flushDeferredCopies(bool claimed = false, FlushReason reason = FlushReason::Command);
+    // Records `copies` as one pass (lead barrier, the copies, trail barrier).
+    void recordDeferredCopies(std::vector<DeferredCopy> copies, FlushReason reason);
+    // Commands() with the queued copy-backs recorded first unless `keepCopyBacks`.
+    VkCommandBuffer commandsFor(VkAccessFlags* coveredAccess, bool keepCopyBacks);
+    bool coalesceCopyBacks = false;
     std::uint64_t passSerials = 0;
     std::vector<DeferredCopy> deferredCopies;
     std::vector<DeferredCopy> claimedCopies;

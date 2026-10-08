@@ -3367,8 +3367,29 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     };
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
+    // Copy-back coalescing (APS5_COALESCE_COPY_BACKS=1, Graphics::Recorder::CoalescesCopyBacks):
+    // the queued copy-backs stay queued past this dispatch, except those over what it reads or
+    // writes through the imports (a range bound in place, its indirect arguments) and the
+    // unclaimed ones over a range it writes (a copy-back recorded after the dispatch would undo
+    // its store); an address-based build (unknown ranges) records them all. A copy claimed by
+    // this build's staging stays: the region's copy-back records it after the dispatch.
+    const bool keepCopyBacks = recorder.CoalescesCopyBacks();
+    if (keepCopyBacks && recorder.HasDeferredCopies()) {
+        using FlushReason = Graphics::Recorder::FlushReason;
+        if (resources.HoldsLease()) {
+            recorder.FlushDeferredCopies(FlushReason::DispatchLease);
+        } else {
+            const auto inPlace = resources.InPlaceReads();
+            const auto throughImport = [&](std::uint64_t begin, std::uint64_t end) {
+                return std::any_of(inPlace.begin(), inPlace.end(), [&](const auto& range) { return begin < range.second && range.first < end; }) || (argumentImport != nullptr && begin < arguments + 12 && arguments < end);
+            };
+            recorder.FlushDeferredWhere([&](const Graphics::Recorder::DeferredCopy& copy, bool claimed) {
+                return throughImport(copy.address, copy.address + copy.bytes) || (!claimed && resources.WritesOverlap(copy.address, static_cast<std::size_t>(copy.bytes)));
+            }, FlushReason::Dispatch);
+        }
+    }
     VkAccessFlags covered = 0;
-    const auto commands = recorder.Commands(&covered);
+    const auto commands = keepCopyBacks ? recorder.CommandsKeepingCopyBacks(&covered) : recorder.Commands(&covered);
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
     recorder.Keep(record.resources);
