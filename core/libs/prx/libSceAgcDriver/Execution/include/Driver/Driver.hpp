@@ -155,6 +155,11 @@ private:
     std::optional<DrawVerdict> fastPrecheckRegisters(const QueueState& queue, const Submission& submission, const Pm4::DrawParameters& drawParameters, std::string& rejected);
     DrawKey fastDrawKey(const QueueState& queue, const Submission& submission, std::uint64_t deviceSerial);
     std::shared_ptr<const DrawDecode> fastDrawDecode(const QueueState& queue, const Submission& submission);
+    // The draw fast path (APS5_FAST_DRAW, FastDraw.cpp, draw-fastpath.md F3b): the draw's verdict
+    // when the fast path took it (Drawn, or Rejected by a known validation failure), nullopt when it
+    // declined and Driver::draw goes on with the packet (nothing recorded). `retrying` (a snapshot
+    // retry or the locked prepare) and `debugMode` (a probe or dump) decline at once.
+    std::optional<DrawVerdict> fastDraw(QueueState& queue, const Submission& submission, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool traceIndirect, bool retrying, bool debugMode, DrawPhaseTiming& phaseTiming);
     static void reportFastState();
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);
     std::optional<Graphics::IndirectDrawPath> classifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect);

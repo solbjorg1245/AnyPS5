@@ -26,8 +26,7 @@ namespace {
 
 using ShaderRecompiler::WalkStatus;
 
-// Why a stage's walk declined: the walk's own statuses, then the direct reader's reasons.
-enum class WalkDecline : std::uint8_t { NoSource, IncompletePlan, NoProgram, Bindless, UnsupportedRoot, OpFailed, Pending, Unmapped, QueuedLabel, Boundary, Failed, Count };
+using WalkDecline = FastWalkDecline;
 constexpr std::array<const char*, static_cast<std::size_t>(WalkDecline::Count)> WalkDeclineNames{"no source", "incomplete plan", "no program", "bindless", "unsupported root", "op failed", "pending block", "unmapped", "queued label", "boundary", "failed"};
 
 // What differed between the walk's populated variant and the old path's result.
@@ -368,6 +367,40 @@ void ShadowWalkDraw(const FastWalkDraw& draw) {
     if (!profile || std::chrono::steady_clock::now() - total.lastReport < std::chrono::seconds(10)) return;
     report(total, every);
     total = WalkCounters{};
+}
+
+std::optional<FastWalkDecline> FastResolveVertex(std::span<const DrawProgram> programs, const DrawProgram& program, ShaderRecompiler::ShaderVertexStageInfo& info) {
+    auto& scratch = HostThreadLocal<WalkScratch, WalkScratchTag>();
+    FastReader reader{programs};
+    try {
+        if (Graphics::ResolveVertexFetch(fetchPlanFor(scratch, program), program.userData, &fastSrtRead, &reader, info)) return std::nullopt;
+    } catch (const std::exception&) {
+        return WalkDecline::Failed;
+    }
+    return reader.declined.value_or(WalkDecline::Failed);
+}
+
+std::optional<FastWalkDecline> FastWalkStage(std::span<const DrawProgram> programs, const ShaderRecompiler::SourceHandle& handle, const DrawProgram& program, ShaderRecompiler::ResourceSnapshot& snapshot, ShaderRecompiler::ResourceSpecialization& specialization) {
+    FastReader reader{programs};
+    ShaderRecompiler::SrtRuntime runtime;
+    runtime.userContext = &reader;
+    runtime.readMemory = &fastSrtRead;
+    runtime.readSpecializationMemory = &fastSrtRead;
+    runtime.expressRead = &fastSrtRead;
+    const auto status = ShaderRecompiler::WalkResources(handle, program.userData, program.binary.codeAddress, runtime, snapshot, specialization);
+    if (status == WalkStatus::Walked) return std::nullopt;
+    return declineOf(status, reader);
+}
+
+std::uint32_t CompareWalkedResult(const ShaderRecompiler::RecompileResult& old, const ShaderRecompiler::RecompileResult& walked) {
+    WalkDifference first;
+    std::uint64_t feedbackOnly = 0;
+    std::uint64_t deferredSkipped = 0;
+    return compareResults(old, walked, first, feedbackOnly, deferredSkipped);
+}
+
+std::span<const char* const> FastWalkMismatchNames() {
+    return WalkMismatchNames;
 }
 
 }

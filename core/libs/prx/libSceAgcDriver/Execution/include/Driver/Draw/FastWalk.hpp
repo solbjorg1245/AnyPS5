@@ -8,6 +8,12 @@
 #include <optional>
 #include <span>
 
+namespace ShaderRecompiler {
+struct SourceHandle;
+struct ResourceSnapshot;
+struct ResourceSpecialization;
+}
+
 namespace AgcDriver::DriverDetail {
 
 // F2 of the draw fast path (docs/design/draw-fastpath.md section 2.3), shadow mode:
@@ -39,6 +45,22 @@ struct FastWalkDraw {
 
 // Every FastWalkEvery()th call walks and compares; never throws.
 void ShadowWalkDraw(const FastWalkDraw& draw);
+
+// The direct reader's parts for the fast draw (F3b, FastDraw.cpp), the shadow walk's steps:
+// why a stage's walk declined: the walk's own statuses, then the direct reader's reasons.
+enum class FastWalkDecline : std::uint8_t { NoSource, IncompletePlan, NoProgram, Bindless, UnsupportedRoot, OpFailed, Pending, Unmapped, QueuedLabel, Boundary, Failed, Count };
+// The vertex fetch of a vertex-family stage through the direct reader: the header part memoized per
+// program (DecodeVertexFetchPlan) and the live attribute and V# words, the stage info
+// DecodeVertexStageInfo would build. `programs` are the draw's: their registered regions are read first.
+std::optional<FastWalkDecline> FastResolveVertex(std::span<const DrawProgram> programs, const DrawProgram& program, ShaderRecompiler::ShaderVertexStageInfo& info);
+// The express walk of one stage over its live user words through the direct reader
+// (ShaderRecompiler::WalkResources).
+std::optional<FastWalkDecline> FastWalkStage(std::span<const DrawProgram> programs, const ShaderRecompiler::SourceHandle& handle, const DrawProgram& program, ShaderRecompiler::ResourceSnapshot& snapshot, ShaderRecompiler::ResourceSpecialization& specialization);
+// The shadow walk's comparison of a populated result with the one the old path bound: a bit per
+// kind of FastWalkMismatchNames (0: equal; the T# streaming-feedback bits and the old capture's
+// deferred words are tolerated).
+std::uint32_t CompareWalkedResult(const ShaderRecompiler::RecompileResult& old, const ShaderRecompiler::RecompileResult& walked);
+std::span<const char* const> FastWalkMismatchNames();
 
 }
 

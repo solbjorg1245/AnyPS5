@@ -3409,6 +3409,79 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
     }
 }
 
+std::shared_ptr<Texture> FastSampledTexture(const Context& context, std::span<const std::uint32_t> words, ShaderRecompiler::DescriptorImageShape shape, bool depthCompare, bool& firstLayer, bool& undecodable) {
+    firstLayer = false;
+    undecodable = false;
+    std::array<std::uint32_t, 8> nullWords{};
+    if (NullTextureWords(words)) {
+        nullWords = NullTextureDescriptor(shape, false);
+        words = nullWords;
+    }
+    GuestTextureResource resource{};
+    try {
+        resource = DecodeTextureResource(words);
+    } catch (const std::exception&) {
+        undecodable = true;
+        return nullptr;
+    }
+    firstLayer = shape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
+    if (!firstLayer && !MatchesGuestDimension(shape, resource.dimension)) return nullptr;
+    const VkComponentMapping components{ComponentSwizzleFor(resource.dstSelX), ComponentSwizzleFor(resource.dstSelY), ComponentSwizzleFor(resource.dstSelZ), ComponentSwizzleFor(resource.dstSelW)};
+    return cachedTexture(context, words, resource, components, DescribeSurface(resource).guestBytes, depthCompare);
+}
+
+std::vector<ShaderResources::BoundBinding> ShaderResources::BoundDescriptors() const {
+    std::vector<BoundBinding> result;
+    result.reserve(bindings.size());
+    for (const auto& binding : bindings) {
+        BoundBinding bound{binding.layout.binding, binding.layout.descriptorType, {}};
+        switch (binding.layout.descriptorType) {
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+                for (const auto index : binding.allocations) {
+                    const auto& allocation = allocations[index];
+                    BoundElement element;
+                    if (allocation.guest) {
+                        std::uint32_t adjustment = 0;
+                        element.buffer = guestMemory.Descriptor(allocation.address, allocation.size, adjustment);
+                    } else if (allocation.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
+                        element.buffer = {context.emptyBuffer, 0, allocation.size};
+                    } else if (allocation.buffer != nullptr) {
+                        element.buffer = {allocation.buffer->Handle(), 0, allocation.size};
+                        const auto bytes = allocation.buffer->Bytes();
+                        element.data = std::span<const std::byte>(bytes.data(), std::min(bytes.size(), allocation.size));
+                    }
+                    bound.elements.push_back(element);
+                }
+                break;
+            case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+                for (const auto index : binding.imageAllocations) {
+                    BoundElement element;
+                    element.view = textureFirstLayer[index] ? textures[index]->FirstLayerView() : textures[index]->View();
+                    bound.elements.push_back(element);
+                }
+                break;
+            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+                for (const auto index : binding.imageAllocations) {
+                    BoundElement element;
+                    element.view = storageFirstLayer[index] ? storageTextures[index]->FirstLayerView(storageMips[index]) : storageTextures[index]->View(storageMips[index]);
+                    bound.elements.push_back(element);
+                }
+                break;
+            case VK_DESCRIPTOR_TYPE_SAMPLER:
+                for (const auto index : binding.imageAllocations) {
+                    BoundElement element;
+                    element.sampler = samplers[index]->Handle();
+                    bound.elements.push_back(element);
+                }
+                break;
+            default:
+                break;
+        }
+        result.push_back(std::move(bound));
+    }
+    return result;
+}
+
 std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSurfaces() const {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> surfaces;
     // A surface's lookup reads guest memory on the CPU unless it is served GPU-direct from a host

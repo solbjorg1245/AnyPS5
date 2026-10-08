@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastLayouts.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -318,8 +319,10 @@ void append(std::vector<std::byte>& key, const TValue& value) {
 // Everything the Pipeline objects are built from, or empty when a stage's result has no variant id
 // (the recompiler could not identify it, so nothing else may share its pipeline). The rect-list
 // control and evaluation stages are generated from the vertex and fragment results, which the key
-// already names, so they carry no id of their own.
-std::vector<std::byte> pipelineKey(const Context& context, const State& state, const VertexInputLayout& input, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+// already names, so they carry no id of their own. `layoutKey` is the descriptor set layout key
+// (ShaderResources::LayoutKey, or the fast path's FastBindings::LayoutKey); `pushLayout` the fast
+// path's push layout id (FastLayout::id), 0 for a pipeline on a ShaderResources set.
+std::vector<std::byte> pipelineKey(const Context& context, const State& state, const VertexInputLayout& input, std::span<const std::uint32_t> layoutKey, std::uint32_t pushLayout, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     using Stage = ShaderRecompiler::ShaderStage;
     std::vector<std::byte> key;
     append(key, context.device);
@@ -348,8 +351,9 @@ std::vector<std::byte> pipelineKey(const Context& context, const State& state, c
         append(key, attribute.format);
         append(key, attribute.offset);
     }
-    append(key, resources.LayoutKey().size());
-    for (const auto word : resources.LayoutKey()) append(key, word);
+    append(key, layoutKey.size());
+    for (const auto word : layoutKey) append(key, word);
+    append(key, pushLayout);
     append(key, state.hasColorTarget);
     append(key, state.rectList);
     append(key, state.topology);
@@ -466,18 +470,21 @@ void reportPipelines(PipelineStore& store) {
     store.hits = store.misses = store.uncached = store.evicted = 0;
 }
 
+bool pipelineCacheDisabled() {
+    static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
+    return disabled;
 }
 
-std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
-    static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
-    if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+// The store's pipeline for `key`, made by `make` on a miss (or privately: an empty key, a hash
+// collision); CachedPipeline and CachedFastPipeline.
+template<typename TMake>
+std::shared_ptr<Pipeline> cachedPipeline(const Context& context, const std::vector<std::byte>& key, TMake&& make) {
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);
     reportPipelines(store);
-    const auto key = pipelineKey(context, state, vertexInput, resources, shaders, attachmentLayout);
     if (key.empty()) {
         ++store.uncached;
-        return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+        return make();
     }
     const auto hash = hashKey(key);
     if (const auto found = store.index.find(hash); found != store.index.end()) {
@@ -494,7 +501,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         } else {
             // A different configuration with the same hash keeps the resident entry; this one stays private.
             ++store.uncached;
-            return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+            return make();
         }
     }
     ++store.misses;
@@ -503,7 +510,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     for (auto it = store.entries.begin(); it != store.entries.end();) {
         it = alive(*it, context) ? std::next(it) : abandon(store, it);
     }
-    auto pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+    auto pipeline = make();
     store.entries.push_back({context.device, context.bufferPool, hash, key, pipeline});
     store.index[hash] = std::prev(store.entries.end());
     // A gameplay frame uses more than a thousand pipelines: at the old bound of 256 every frame
@@ -522,6 +529,20 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         ++store.evicted;
     }
     return pipeline;
+}
+
+}
+
+std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    const auto make = [&] { return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout); };
+    if (pipelineCacheDisabled()) return make();
+    return cachedPipeline(context, pipelineKey(context, state, vertexInput, resources.LayoutKey(), 0, shaders, attachmentLayout), make);
+}
+
+std::shared_ptr<Pipeline> CachedFastPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const FastLayout& layout, std::span<const std::uint32_t> layoutKey, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    const auto make = [&] { return std::make_shared<Pipeline>(context, state, vertexInput, layout.pipeline, shaders, attachmentLayout); };
+    if (pipelineCacheDisabled()) return make();
+    return cachedPipeline(context, pipelineKey(context, state, vertexInput, layoutKey, layout.id, shaders, attachmentLayout), make);
 }
 
 void ClearCachedPipelines(VkDevice device) {

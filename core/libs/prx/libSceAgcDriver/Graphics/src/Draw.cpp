@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawSkipReasons.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastDraw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ScratchLease.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
@@ -1792,6 +1794,62 @@ bool RecordDraws() {
     return recordDraws;
 }
 
+// The memory-state decision of an indirect draw's records (Draw, DrawFast): GPU-side from the host
+// import, or why the CPU reads them (see Draw).
+IndirectDrawPath indirectPathFor(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, const HostImport*& import) {
+    if (StorageTexture::FlushPending(address, bytes, nullptr, "indirect draw arguments")) {
+        if (recorder != nullptr) {
+            Recorder::CountSync(2);
+            recorder->Sync();
+        }
+        return IndirectDrawPath::PendingImage;
+    }
+    if (recorder != nullptr && recorder->PendingLabelIn(address, bytes)) return IndirectDrawPath::PendingLabelOrCopy;
+    const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
+    if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
+    if (std::any_of(DrawCopiedWriters()->begin(), DrawCopiedWriters()->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
+    if ((import = HostImportFor(context, address, bytes)) == nullptr) return IndirectDrawPath::NotImported;
+    return IndirectDrawPath::Gpu;
+}
+
+// DrawFast's per-draw vectors, kept with their capacity on the calling thread (ScratchLease).
+struct FastDrawScratch {
+    std::vector<std::shared_ptr<StorageTexture>> targets;
+    std::vector<VkImageView> views;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    std::vector<std::pair<VkImage, bool>> images;
+    unsigned depth = 0;
+};
+
+// The push layout of a layout key, through a per-thread list of the last 16 in front of
+// FastLayouts::Get (a mutex and a map lookup per draw otherwise, see the F3a review). An entry names
+// its device instance by the buffer pool (made and reset with the device, as the pipeline store
+// tells devices apart): a replaced device's layouts are never answered.
+const FastLayout* fastLayoutFor(const Context& context, std::span<const std::uint32_t> key, VkShaderStageFlags pushStages) {
+    struct Entry {
+        const FastLayouts* owner;
+        std::weak_ptr<BufferPool> pool;
+        VkShaderStageFlags stages;
+        std::vector<std::uint32_t> key;
+        const FastLayout* layout;
+    };
+    thread_local std::vector<Entry> recent;
+    for (auto it = recent.begin(); it != recent.end(); ++it) {
+        if (it->owner != context.fastLayouts || it->stages != pushStages || !std::equal(it->key.begin(), it->key.end(), key.begin(), key.end())) continue;
+        if (it->pool.lock() != context.bufferPool) {
+            recent.erase(it);
+            break;
+        }
+        if (it != recent.begin()) std::rotate(recent.begin(), it, it + 1);
+        return recent.front().layout;
+    }
+    const auto* layout = context.fastLayouts->Get(key, pushStages);
+    if (layout == nullptr) return nullptr;
+    if (recent.size() >= 16) recent.pop_back();
+    recent.insert(recent.begin(), Entry{context.fastLayouts, context.bufferPool, pushStages, {key.begin(), key.end()}, layout});
+    return layout;
+}
+
 }
 
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state) {
@@ -1921,8 +1979,12 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const bool recordDraws = RecordDraws();
     auto* recorder = Recorder::Active();
     const bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr; });
-    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, recorder, outcome, timer);
+    // APS5_FAST_DRAW_VERIFY: a draw the fast path would have taken is built afresh (no template) and
+    // compared with the fast path's bindings of the same stages.
+    const bool verifyFast = ThreadFastVerifyArmed();
+    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable && !verifyFast, recorder, outcome, timer);
     auto& resources = resolved.resources;
+    if (verifyFast) VerifyFastBindings(context, *resources, shaders, state.color);
     const auto& contentKey = resolved.contentKey;
     const bool cacheable = resolved.cacheable;
     built = resolved.built;
@@ -1940,21 +2002,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     std::vector<Pm4::DrawArguments> records;
     if (args != nullptr) {
         static const bool gpuIndirectDraws = std::getenv("APS5_NO_GPU_INDIRECT_DRAW") == nullptr;
-        const auto decide = [&](std::uint64_t address, std::size_t bytes, const HostImport*& import) {
-            if (StorageTexture::FlushPending(address, bytes, nullptr, "indirect draw arguments")) {
-                if (recorder != nullptr) {
-                    Recorder::CountSync(2);
-                    recorder->Sync();
-                }
-                return IndirectDrawPath::PendingImage;
-            }
-            if (recorder != nullptr && recorder->PendingLabelIn(address, bytes)) return IndirectDrawPath::PendingLabelOrCopy;
-            const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
-            if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
-            if (std::any_of(DrawCopiedWriters()->begin(), DrawCopiedWriters()->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
-            if ((import = HostImportFor(context, address, bytes)) == nullptr) return IndirectDrawPath::NotImported;
-            return IndirectDrawPath::Gpu;
-        };
+        const auto decide = [&](std::uint64_t address, std::size_t bytes, const HostImport*& import) { return indirectPathFor(context, recorder, address, bytes, import); };
         const auto rangeBytes = args->RangeBytes();
         if (rangeBytes == 0) {
             report(" indirect draw without records");
@@ -2316,6 +2364,198 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         report(" synchronous");
     }
     APS5_LOG_CHARS_OUT_DEBUG("Draw finished");
+}
+
+FastDrawOutcome DrawFast(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+    PerformanceTimer timing("Graphics.DrawFast");
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
+    static const bool gpuIndirectDraws = std::getenv("APS5_NO_GPU_INDIRECT_DRAW") == nullptr;
+    FastDrawOutcome result;
+    auto lap = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto part = [&](double& us) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        us += std::chrono::duration<double, std::micro>(now - lap).count();
+        lap = now;
+    };
+    const auto decline = [&](FastDecline reason) {
+        result.decline = reason;
+        return result;
+    };
+    auto* recorder = Recorder::Active();
+    if (!RecordDraws() || recorder == nullptr || DumpTargetLimit() != 0 || CaptureInputsEnabled()) return decline(FastDecline::NotRecordable);
+    if (context.fastLayouts == nullptr || context.fastRing == nullptr || !context.pushDescriptors) return decline(FastDecline::NoPlumbing);
+    if (state.stages.mesh || state.stages.tessellation || state.rectList) return decline(FastDecline::Shape);
+    DrawOutcome outcome;
+    DrawTimer timer(false);
+    ScratchLease<DrawInputScratch> inputScratch;
+    ScratchLease<FastBindings> bindings;
+    ScratchLease<FastDrawScratch> scratch;
+    auto& targets = scratch->targets;
+    auto& views = scratch->views;
+    targets.clear();
+    views.clear();
+    // The thread's scratch keeps no object past the draw (the batch hold has them).
+    struct Release {
+        FastBindings& bindings;
+        std::vector<std::shared_ptr<StorageTexture>>& targets;
+        ~Release() {
+            bindings.Release();
+            targets.clear();
+        }
+    } release{*bindings, targets};
+    const auto* args = draw.indirect ? &*draw.indirect : nullptr;
+    IndirectRecord indirect;
+    indirect.args = args;
+    DrawInputs inputs;
+    const FastLayout* layout = nullptr;
+    std::shared_ptr<Pipeline> pipeline;
+    std::shared_ptr<Framebuffer> framebuffer;
+    // Up to the record, what fails would fail Draw too (its Requires, a lookup that throws): a
+    // decline, so Draw meets it with its own accounting. Nothing is recorded before the record.
+    try {
+        inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, *inputScratch);
+        if (inputs.nothing) {
+            result.recorded = true;
+            return result;
+        }
+        part(result.inputsUs);
+        // Draw's decision for the records: only the GPU-side path without a rewrite is fast (the
+        // rewrite is recorded outside the pass and needs a scratch copy, F3c).
+        if (args != nullptr) {
+            const auto rangeBytes = args->RangeBytes();
+            if (rangeBytes == 0 || rangeBytes > std::numeric_limits<std::size_t>::max() || !gpuIndirectDraws) return decline(FastDecline::IndirectPath);
+            indirect.path = indirectPathFor(context, recorder, args->arguments, static_cast<std::size_t>(rangeBytes), indirect.argumentImport);
+            if (indirect.path == IndirectDrawPath::Gpu && args->countIndirect) {
+                if (!context.drawIndirectCount) return decline(FastDecline::IndirectPath);
+                indirect.path = indirectPathFor(context, recorder, args->countAddress, 4, indirect.countImport);
+            }
+            if (indirect.path != IndirectDrawPath::Gpu) return decline(FastDecline::IndirectPath);
+            if (rewritesRecords(*args)) return decline(FastDecline::Rewrites);
+        }
+        // Resident targets only, refreshed as Draw refreshes them.
+        for (const auto& color : state.colors) {
+            if (!residentTargets || color.tileMode != ColorTileMode::RenderTarget || context.detiler == nullptr) return decline(FastDecline::NotResident);
+            auto resident = refreshResidentTarget(context, state, color, outcome, false, [&] {
+                const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+                auto surface = CachedStorageSurface(context, SurfaceForTarget(color));
+                Require(surface->Attachable(), "storage format cannot be a color attachment");
+                Require(color.mipCount > 1 || surface->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
+                return surface;
+            });
+            if (resident == nullptr) return decline(FastDecline::NotResident);
+            views.push_back(resident->AttachmentView(color.format, color.mip));
+            targets.push_back(std::move(resident));
+        }
+        if (state.depth) views.push_back(DepthSurfaceView(context, *state.depth));
+        part(result.targetsUs);
+        if (const auto declined = bindings->Build(context, shaders, &state.color, &HostImportResolver, true)) return decline(*declined);
+        // A bound image that is one of the targets owes a barrier inside the pass (Draw's readsTarget).
+        if (std::any_of(targets.begin(), targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return bindings->ReadsImage(target.get()); })) return decline(FastDecline::ReadsTarget);
+        layout = fastLayoutFor(context, bindings->LayoutKey(), bindings->PushStages());
+        if (layout == nullptr) return decline(FastDecline::OverLimit);
+        part(result.bindingsUs);
+        const auto masked = maskedState(state, inputs.fragmentOutputs);
+        pipeline = CachedFastPipeline(context, masked.has_value() ? *masked : state, *inputs.vertexInput, *layout, bindings->LayoutKey(), shaders, VK_IMAGE_LAYOUT_GENERAL);
+        framebuffer = pipeline->AcquireFramebuffer(views, targets, state.renderExtent);
+        part(result.pipelineUs);
+    } catch (const std::exception&) {
+        return decline(FastDecline::Thrown);
+    }
+    // The record, as recordDraw makes it for a recorded draw that writes nothing but its targets.
+    using CommandClass = Recorder::CommandClass;
+    const auto countBarrier = [&](std::uint32_t count) { Recorder::CountBarriers(CommandClass::Draw, count); };
+    std::uint64_t passKey = 14695981039346656037ull;
+    const auto mix = [&](std::uint64_t value) {
+        passKey ^= value;
+        passKey *= 1099511628211ull;
+    };
+    for (const auto view : views) mix(reinterpret_cast<std::uint64_t>(view));
+    mix(state.renderExtent.width);
+    mix(state.renderExtent.height);
+    const auto reads = bindings->InPlaceReads();
+    // A queued DCC key or label store over the elements read in place or over the records lands first.
+    const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
+        if (std::any_of(reads.begin(), reads.end(), [&](const std::pair<std::uint64_t, std::uint64_t>& range) { return begin < range.second && range.first < end; })) return true;
+        if (args == nullptr) return false;
+        return (begin < args->arguments + args->RangeBytes() && args->arguments < end) || (args->countIndirect && begin < args->countAddress + 4 && args->countAddress < end);
+    };
+    if (recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) recorder->FlushKeyStores();
+    if (recorder->HasQueuedStores() && recorder->AnyQueuedStore(touches)) recorder->FlushStores();
+    bool continued = recorder->ContinuesRenderPass(passKey);
+    auto commands = continued ? recorder->CommandsInRenderPass() : recorder->Commands();
+    // The data words go into the ring for the open batch (the batch is open now, so its serial is
+    // Submissions() + 1); a full ring waits for the batches holding it and is asked once more.
+    auto& ring = *context.fastRing;
+    const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 1);
+    const auto dataBytes = bindings->DataBytes(alignment);
+    std::optional<FastRing::Region> region;
+    if (dataBytes != 0) {
+        region = ring.Allocate(dataBytes, recorder->Submissions() + 1);
+        if (!region) {
+            recorder->Sync();
+            ring.Complete(recorder->Submissions());
+            continued = false;
+            commands = recorder->Commands();
+            region = ring.Allocate(dataBytes, recorder->Submissions() + 1);
+            if (!region) return decline(FastDecline::RingFull);
+        }
+    }
+    auto& hold = FastBatchHold(context, *recorder);
+    const auto drawTiming = !continued ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    if (!continued && Recorder::BarrierValidate()) {
+        auto& noted = scratch->reads;
+        noted.assign(reads.begin(), reads.end());
+        if (args != nullptr) {
+            noted.emplace_back(args->arguments, args->arguments + args->RangeBytes());
+            if (args->countIndirect) noted.emplace_back(args->countAddress, args->countAddress + 4);
+        }
+        auto& images = scratch->images;
+        images.clear();
+        for (const auto* source : bindings->Viewed()) images.emplace_back(source->Image(), false);
+        for (const auto& target : targets) images.emplace_back(target->Image(), true);
+        recorder->NoteAccess(CommandClass::Draw, Recorder::Access{noted, {}, images, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages, false});
+    }
+    std::unique_ptr<DeviceBuffer> argumentScratch;
+    VkBuffer argumentBuffer = VK_NULL_HANDLE;
+    VkDeviceSize argumentOffset = 0;
+    if (continued) {
+        if (args != nullptr) recordIndirectArguments(context, commands, recorder, true, indirect, argumentScratch, argumentBuffer, argumentOffset, countBarrier, true);
+        pipeline->Continue(commands, state.viewport, state.scissor);
+    } else {
+        const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT};
+        context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | inputs.shaderStages, 0, 1, &before, 0, nullptr, 0, nullptr);
+        countBarrier(1);
+        if (args != nullptr) recordIndirectArguments(context, commands, recorder, true, indirect, argumentScratch, argumentBuffer, argumentOffset, countBarrier);
+        pipeline->Begin(commands, *framebuffer, state.renderExtent, state.viewport, state.scissor);
+    }
+    PushDescriptors(context, commands, VK_PIPELINE_BIND_POINT_GRAPHICS, *layout, bindings->Writes(region ? &*region : nullptr, alignment));
+    pipeline->PushConstants(commands, bindings->PushStages(), bindings->PushBytes());
+    // Ranges the GPU reads in place when the batch runs: no CPU store may land on them before.
+    if (!inputs.inPlaceRanges.empty()) recorder->NotePendingReads(inputs.inPlaceRanges, Recorder::ReadKind::DrawInput);
+    if (!reads.empty()) recorder->NotePendingReads(reads, Recorder::ReadKind::DispatchElement);
+    recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset);
+    if (args != nullptr) CountIndirectDraw(indirect.path, indirect.readMs, false);
+    if (auto checkRecords = indirectRecordCheck(args != nullptr ? &indirect : nullptr)) recorder->OnComplete(std::move(checkRecords));
+    // A fast draw writes nothing but its attachments: the next draw of the pass may continue it.
+    recorder->LeaveRenderPassOpen(passKey, drawTiming, true);
+    hold.push_back(std::move(pipeline));
+    hold.push_back(std::move(framebuffer));
+    if (inputs.indices != nullptr) hold.push_back(std::move(inputs.indices));
+    for (auto& buffer : inputs.vertexBuffers) {
+        if (buffer != nullptr) hold.push_back(std::move(buffer));
+    }
+    for (auto& target : targets) {
+        target->MarkDirty();
+        hold.push_back(std::move(target));
+    }
+    targets.clear();
+    bindings->KeepObjects(hold);
+    result.recorded = true;
+    result.passContinued = continued;
+    part(result.recordUs);
+    return result;
 }
 
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe) {

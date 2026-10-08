@@ -33,6 +33,13 @@ std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, con
 // would return); a true answer counts as a use for the cache's eviction order, as a lookup would.
 bool StorageImageCached(const Context& context, const StorageTexture* image);
 bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddress);
+// The fast draw path's sampled-image lookup (FastDraw.cpp, draw-fastpath.md 2.6 F3): a sampled
+// element as resolveImageBinding binds it (a null T# takes the null texture's words, the shape
+// check, cachedTexture) without a ShaderResources object. Null when the old path decides the
+// element instead: a T# DecodeTextureResource refuses (`undecodable`; resolveImageBinding reports
+// it and binds the null texture under APS5_NULL_UNDECODABLE=1, else throws) or a dimension the
+// shape does not allow. `firstLayer`: the view to bind is FirstLayerView (2D binding, 2D array).
+std::shared_ptr<Texture> FastSampledTexture(const Context& context, std::span<const std::uint32_t> words, ShaderRecompiler::DescriptorImageShape shape, bool depthCompare, bool& firstLayer, bool& undecodable);
 
 // Defined in Texture.cpp beside the pending-results registry, for the fast Revalidate below: whether
 // a storage image other than `except` has results pending in [address, address + bytes).
@@ -196,6 +203,21 @@ public:
     bool WritesMemory() const;
     bool ReadsImage(const StorageTexture* image) const;
     const std::vector<std::uint32_t>& LayoutKey() const { return layoutKey; }
+    // APS5_FAST_DRAW_VERIFY (FastDraw.cpp VerifyFastBindings): what the set binds, binding by
+    // binding in plan order (the layout key's): per element the buffer view (a data buffer's bytes
+    // too), the image view or the sampler. The address roles (BDA table, fault buffer) list zeros.
+    struct BoundElement {
+        VkDescriptorBufferInfo buffer{};
+        std::span<const std::byte> data;
+        VkImageView view = VK_NULL_HANDLE;
+        VkSampler sampler = VK_NULL_HANDLE;
+    };
+    struct BoundBinding {
+        std::uint32_t binding = 0;
+        VkDescriptorType type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        std::vector<BoundElement> elements;
+    };
+    std::vector<BoundBinding> BoundDescriptors() const;
     // Debug aid: each bound guest resource with the fraction of sampled bytes that are nonzero.
     std::string Describe() const;
 

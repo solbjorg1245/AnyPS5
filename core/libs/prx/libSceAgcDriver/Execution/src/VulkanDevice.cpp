@@ -2503,6 +2503,10 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     if (trace) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
 }
 
+Graphics::FastDrawOutcome VulkanDevice::FastDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders) {
+    return Graphics::DrawFast(graphicsContext(), graphics, draw, shaders);
+}
+
 namespace {
 
 // The resource cache serves dispatches unless disabled; Revalidate proves a hit by texture identity,
