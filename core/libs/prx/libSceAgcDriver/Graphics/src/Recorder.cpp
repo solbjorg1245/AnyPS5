@@ -48,6 +48,9 @@ void trackPendingBlocksFromEnvironment() {
         // The fast draw (APS5_FAST_DRAW, F3b) binds what its walk reads: it needs the same guard.
         const char* fastDraw = std::getenv("APS5_FAST_DRAW");
         if ((every != nullptr && std::strtoul(every, nullptr, 0) != 0) || (fastDraw != nullptr && std::strcmp(fastDraw, "0") != 0)) Recorder::TrackPendingBlocks(true);
+        // The fast dispatch (F5) walks with the same reader.
+        const char* dispatch = std::getenv("APS5_FAST_DISPATCH");
+        if (dispatch != nullptr && std::strcmp(dispatch, "0") != 0) Recorder::TrackPendingBlocks(true);
         return true;
     }();
     static_cast<void>(tracked);

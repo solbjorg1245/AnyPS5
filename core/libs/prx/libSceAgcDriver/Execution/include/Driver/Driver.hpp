@@ -120,6 +120,15 @@ private:
     void relocateByUserPointer(std::uint64_t address, const Submission& submission, std::uint64_t key, std::uint64_t baseKey, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::vector<UserPointerCandidate>& candidates, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::vector<ShaderRecompiler::MemoryRegion>& captured, bool& cached, std::shared_ptr<DispatchVariant>& relocated);
     static bool sameInstance(const DispatchVariant& old, const DispatchVariant& fresh, std::uint64_t delta);
     void dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments = 0);
+    // F5 of the draw fast path (FastDispatch.cpp, docs/design/draw-fastpath.md 2.9; APS5_FAST_DISPATCH=1,
+    // default off): after the HLE checks, the dispatch walked with the direct reader, its variant
+    // populated from the walk, and recorded with push descriptors without capture, dispatch-cache
+    // lookup or ShaderResources. False (a decline, counted on the [fastpath] dispatches line) leaves
+    // the dispatch to the old path; true means it was recorded. APS5_FAST_DISPATCH_VERIFY=1 also
+    // captures each one as the old path would (dry) and declines on any difference.
+    static bool fastDispatchEnabled();
+    static bool fastDispatchVerify();
+    bool fastDispatch(const Submission& submission, const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<VulkanDevice>& localDevice, std::uint64_t address, const std::array<std::uint32_t, 3>& groups, std::uint64_t indirectArguments);
     void verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffset, std::uint64_t deviceSerial, ShaderRecompiler::RecompileRequest request, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint64_t address, const DispatchVariant& variant, std::span<const std::uint32_t> liveWords, const ShaderRecompiler::RecompileResult& patched);
     static bool drawEntries();
     static bool verifyDrawEntries();

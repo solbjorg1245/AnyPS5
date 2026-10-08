@@ -949,6 +949,59 @@ bool SameAsPreviousStorageElement(const ShaderRecompiler::DescriptorBinding& bin
 
 }
 
+std::shared_ptr<Texture> ResolveSampledImage(const Context& context, const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t element, bool& firstLayer) {
+    Require(element < binding.count && binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 8u, "guest texture descriptor must contain 8 dwords");
+    Require(binding.imageShape.has_value(), "guest image binding is missing an image shape");
+    Require(context.textureCache != nullptr, "device texture cache is unavailable");
+    // As resolveImageBinding resolves a sampled element without a stage-A record.
+    auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
+    std::array<std::uint32_t, 8> nullWords{};
+    if (NullTextureWords(words)) {
+        nullWords = NullTextureDescriptor(binding.imageShape, false);
+        words = nullWords;
+    }
+    const auto resource = [&] {
+        try {
+            return DecodeTextureResource(words);
+        } catch (const std::exception& error) {
+            ReportUndecodedTexture(words, error.what());
+            if (!ShaderRecompiler::ResourceMaterializer::NullUndecodable()) throw;
+            sampledNullBound.fetch_add(1, std::memory_order_relaxed);
+            nullWords = NullTextureDescriptor(binding.imageShape, false);
+            words = nullWords;
+            return DecodeTextureResource(words);
+        }
+    }();
+    firstLayer = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
+    if (!firstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension)) throw std::runtime_error("AGC graphics: guest texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
+    const VkComponentMapping components{ComponentSwizzleFor(resource.dstSelX), ComponentSwizzleFor(resource.dstSelY), ComponentSwizzleFor(resource.dstSelZ), ComponentSwizzleFor(resource.dstSelW)};
+    return cachedTexture(context, words, resource, components, DescribeSurface(resource).guestBytes, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element));
+}
+
+StorageImageElement ResolveStorageImage(const Context& context, const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t element, const StorageImageElement* previous) {
+    Require(element < binding.count && binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 8u, "guest storage image descriptors must contain 8 dwords each");
+    Require(context.detiler != nullptr, "device texture detiler is unavailable");
+    // As resolveImageBinding resolves a storage element without a stage-A record.
+    auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
+    std::array<std::uint32_t, 8> nullWords{};
+    if (NullTextureWords(words)) {
+        nullWords = NullTextureDescriptor(binding.imageShape, true);
+        words = nullWords;
+    }
+    const bool sameAsPrevious = previous != nullptr && SameAsPreviousStorageElement(binding, element);
+    StorageImageElement result;
+    result.mipOffset = sameAsPrevious ? previous->mipOffset + 1 : 0;
+    const auto resource = DecodeTextureResource(words);
+    result.firstLayer = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
+    if (binding.imageShape.has_value() && !result.firstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension)) throw std::runtime_error("AGC graphics: guest storage texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
+    result.mip = std::min(resource.baseLevel + result.mipOffset, resource.mipCount - 1u);
+    Require(resource.minLod <= result.mip * 256u, "guest storage texture descriptor clamps its minimum LOD above the level it addresses, which is not implemented");
+    result.written = element >= binding.imageWritten.size() || binding.imageWritten[element];
+    if (result.written) NoteDepthSurfaceWrite(resource.baseAddress, resource.width, resource.height);
+    result.image = sameAsPrevious && StorageDedupeEnabled() ? previous->image : cachedStorageTexture(context, words, resource, result.mip, DescribeSurface(resource).guestBytes);
+    return result;
+}
+
 ShaderResources::ShaderResources(const Context& context, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes) : ShaderResources(context, std::array<CompiledShader, 2>{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, static_cast<std::uint32_t>(vertex.pushConstants.size())}}}, target, indexAddress, indexBytes) {}
 
 ShaderResources::ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots) : context(context), guestMemory(context) {

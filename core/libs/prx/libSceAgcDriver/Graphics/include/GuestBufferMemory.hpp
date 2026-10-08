@@ -90,6 +90,11 @@ std::uint64_t HostImportsEpoch();
 // Whether a readable registered allocation contains [address, address + bytes) right now (one
 // registry lease): a storage image whose memory was freed or re-registered has nothing to store to.
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes);
+// Whether a dispatch build would stage a written (or atomic) element of `bytes` in device-local
+// memory (the written-shadow window, the atomic cap; see GuestBufferMemory.cpp) instead of binding
+// it in place: what the fast dispatch declines until it stages itself (docs/design/draw-fastpath.md
+// 2.9). A merged region's size can differ from one element's, so this is the element's answer.
+bool DeviceStagingWanted(std::uint64_t bytes, bool atomic);
 
 // A persistent device copy of one registered range of the main guest image (which cannot be host
 // imported); see GuestBufferMemory.cpp.

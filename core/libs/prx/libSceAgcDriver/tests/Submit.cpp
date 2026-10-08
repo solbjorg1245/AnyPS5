@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/NewDrawKeyTally.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastRead.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastDispatch.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
@@ -440,6 +442,122 @@ void testFastCensus() {
     check(FastCensusDescriptorBucket(33) == 4 && FastCensusDescriptorBucket(64) == 5 && FastCensusDescriptorBucket(65) == 6, "census: descriptor buckets over the push limit");
 }
 
+// The fast dispatch (F5): the compare its verify mode makes between the old path's capture and the
+// walked variant (APS5_FAST_DISPATCH_VERIFY, CompareWalkedResults), and the push layout key a
+// variant's bindings give, with the bindings it declines (Graphics::FastComputeLayoutKey).
+void testFastDispatchVerify() {
+    using namespace AgcDriver::DriverDetail;
+    using AgcDriver::Graphics::FastDispatchDecline;
+    using Kind = ShaderRecompiler::DescriptorKind;
+    using Role = ShaderRecompiler::DescriptorRole;
+    ShaderRecompiler::RecompileResult old;
+    old.variantId = 7;
+    old.bindings.push_back({Kind::StorageBuffer, Role::GuestBuffers, 0, 0, 1, {1, 2, 3, 4}});
+    old.bindings.push_back({Kind::SampledImage, Role::GuestImages, 0, 1, 1, {0, 1, 2, 3, 4, 5, 6, 7}});
+    old.bindings.push_back({Kind::StorageBuffer, Role::FlattenedSrt, 0, 2, 1, {9, 9}});
+    old.pushConstants.resize(8);
+    const auto mismatch = [](WalkMismatch kind) { return 1u << static_cast<unsigned>(kind); };
+    WalkDifference first;
+    std::uint64_t feedback = 0;
+    std::uint64_t flat = 0;
+    std::uint64_t deferred = 0;
+    auto walked = old;
+    check(CompareWalkedResults(old, walked, first, feedback, flat, deferred) == 0, "fast dispatch verify: equal results differ");
+    // The T# streaming-feedback fields (word 5 bit 25, word 6 bits 0-7) are no difference.
+    walked.bindings[1].guestDescriptor[5] ^= 1u << 25u;
+    walked.bindings[1].guestDescriptor[6] ^= 0x3u;
+    check(CompareWalkedResults(old, walked, first, feedback, flat, deferred) == 0 && feedback == 1, "fast dispatch verify: T# feedback bits differ");
+    walked.bindings[1].guestDescriptor[6] ^= 0x100u;
+    check(CompareWalkedResults(old, walked, first, feedback, flat, deferred) == mismatch(WalkMismatch::Image) && first.binding == 1 && first.word == 6, "fast dispatch verify: a T# word outside the feedback bits is no image mismatch");
+    // A flat copy of a sampled T# word that differs only in its don't-care bits (FlatTsharpFeedbackCopy):
+    // excused and counted; outside those bits it is a flat mismatch.
+    auto copying = old;
+    copying.bindings[2].guestDescriptor[0] = 5;
+    walked = copying;
+    walked.bindings[1].guestDescriptor[5] ^= 1u << 25u;
+    walked.bindings[2].guestDescriptor[0] ^= 1u << 25u;
+    feedback = 0;
+    check(CompareWalkedResults(copying, walked, first, feedback, flat, deferred) == 0 && feedback == 1 && flat == 1, "fast dispatch verify: a flat T# copy differing in the feedback bits differs");
+    check(CompareWalkedResult(copying, walked, true) == 0, "fast draw verify: a flat T# copy differing in the feedback bits differs");
+    walked.bindings[2].guestDescriptor[0] ^= 1u << 24u;
+    check(CompareWalkedResults(copying, walked, first, feedback, flat, deferred) == mismatch(WalkMismatch::Flat) && flat == 1 && first.binding == 2 && first.word == 0, "fast dispatch verify: a flat word beyond the feedback bits is no flat mismatch");
+    // A flat word the capture left to the GPU holds a placeholder: skipped, counted.
+    walked = old;
+    auto deferring = old;
+    deferring.bindings[2].deferredWords.push_back({1, 0x10000});
+    walked.bindings[2].guestDescriptor[1] = 5;
+    check(CompareWalkedResults(deferring, walked, first, feedback, flat, deferred) == 0 && deferred == 1, "fast dispatch verify: a deferred flat word differs");
+    check(CompareWalkedResults(old, walked, first, feedback, flat, deferred) == mismatch(WalkMismatch::Flat), "fast dispatch verify: a flat word is no flat mismatch");
+    // The fast dispatch binds the walked word: a deferred word differs even where the walk read the placeholder.
+    deferred = 0;
+    check(CompareWalkedResults(deferring, deferring, first, feedback, flat, deferred, true) == mismatch(WalkMismatch::Flat) && first.binding == 2 && first.word == 1 && deferred == 0, "fast dispatch verify: a deferred word is no mismatch for the fast dispatch");
+    walked = old;
+    walked.bindings[0].guestDescriptor[0] = 0x100;
+    check(CompareWalkedResults(old, walked, first, feedback, flat, deferred) == mismatch(WalkMismatch::Buffer) && first.kind == WalkMismatch::Buffer && first.binding == 0 && first.word == 0 && first.old == 1 && first.walked == 0x100, "fast dispatch verify: a moved V# is no buffer mismatch");
+    walked = old;
+    walked.variantId = 8;
+    check((CompareWalkedResults(old, walked, first, feedback, flat, deferred) & mismatch(WalkMismatch::Variant)) != 0, "fast dispatch verify: another variant is no variant mismatch");
+    walked = old;
+    walked.pushConstants[3] = std::byte{1};
+    check(CompareWalkedResults(old, walked, first, feedback, flat, deferred) == mismatch(WalkMismatch::Push) && first.word == 3, "fast dispatch verify: a push constant byte is no push mismatch");
+    walked = old;
+    walked.bindings.pop_back();
+    check(CompareWalkedResults(old, walked, first, feedback, flat, deferred) == mismatch(WalkMismatch::Layout), "fast dispatch verify: a missing binding is no layout mismatch");
+
+    std::vector<std::uint32_t> key;
+    const std::vector<std::uint32_t> expected{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT};
+    check(!AgcDriver::Graphics::FastComputeLayoutKey(old, key) && key == expected, "fast dispatch layout key: not the ShaderResources key");
+    auto declined = old;
+    declined.bindings.push_back({Kind::StorageBuffer, Role::BdaPagetable, 0, 3, 1, {}});
+    check(AgcDriver::Graphics::FastComputeLayoutKey(declined, key) == FastDispatchDecline::Bda, "fast dispatch layout key: a BDA table is bound");
+    declined = old;
+    declined.bindings.push_back({Kind::StorageBuffer, Role::Gds, 0, 3, 1, {}});
+    check(AgcDriver::Graphics::FastComputeLayoutKey(declined, key) == FastDispatchDecline::Role, "fast dispatch layout key: GDS is bound");
+    declined = old;
+    declined.bindings[2].binding = 0;
+    check(AgcDriver::Graphics::FastComputeLayoutKey(declined, key) == FastDispatchDecline::Invalid, "fast dispatch layout key: a duplicate binding is bound");
+    declined = old;
+    declined.bindings[2].count = 2;
+    check(AgcDriver::Graphics::FastComputeLayoutKey(declined, key) == FastDispatchDecline::Invalid, "fast dispatch layout key: an array of flat words is bound");
+    for (const auto* name : AgcDriver::Graphics::FastDispatchDeclineNames) check(name != nullptr && *name != '\0', "fast dispatch: a decline without a name");
+    for (const auto* name : WalkDeclineNames) check(name != nullptr && *name != '\0', "fast walk: a decline without a name");
+
+    // The declines made before the lock (Graphics::FastDispatchPrecheck): what a build rejects of a
+    // read-only V# and of the data words; the adjustment slot is required of every element.
+    using AgcDriver::Graphics::FastDispatchPrecheck;
+    AgcDriver::Graphics::Context context{};
+    context.limits.maxStorageBufferRange = 1u << 20u;
+    ShaderRecompiler::RecompileResult shader;
+    shader.bindings.push_back({Kind::StorageBuffer, Role::GuestBuffers, 0, 0, 1, {0x10000u, 4u << 16u, 64u, 0x01016facu}});
+    shader.bindings[0].bufferWritten = {false};
+    shader.bindings.push_back({Kind::StorageBuffer, Role::FlattenedSrt, 0, 1, 1, {9, 9}});
+    check(!FastDispatchPrecheck(context, shader), "fast dispatch precheck: a read V# and flat words declined");
+    auto checked = shader;
+    checked.pushConstants.resize(4);
+    checked.memoryOffsetDword = 1;
+    check(FastDispatchPrecheck(context, checked) == FastDispatchDecline::Invalid, "fast dispatch precheck: an adjustment byte outside the push constants");
+    checked.memoryOffsetDword = 0;
+    check(!FastDispatchPrecheck(context, checked), "fast dispatch precheck: an adjustment byte inside the push constants declined");
+    checked = shader;
+    checked.bindings[0].guestDescriptor[1] |= 0x40000000u;
+    check(FastDispatchPrecheck(context, checked) == FastDispatchDecline::Invalid, "fast dispatch precheck: a reserved V# bit");
+    checked = shader;
+    checked.bindings[0].guestDescriptor = {0, 0, 0, 0};
+    check(FastDispatchPrecheck(context, checked) == FastDispatchDecline::Invalid, "fast dispatch precheck: an empty V# without the placeholder buffer");
+    checked.pushConstants.resize(4);
+    checked.memoryOffsetDword = 1;
+    context.emptyBuffer = reinterpret_cast<VkBuffer>(std::uintptr_t{0x10});
+    check(FastDispatchPrecheck(context, checked) == FastDispatchDecline::Invalid, "fast dispatch precheck: an empty V# outside the push constants");
+    checked.memoryOffsetDword = 0;
+    check(!FastDispatchPrecheck(context, checked), "fast dispatch precheck: an empty V# declined");
+    checked = shader;
+    checked.bindings[1].deferredWords.push_back({1, 0x20000});
+    check(FastDispatchPrecheck(context, checked) == FastDispatchDecline::Deferred, "fast dispatch precheck: deferred flat words");
+    checked = shader;
+    checked.bindings[1].guestDescriptor.assign((1u << 18u) + 1u, 0u);
+    check(FastDispatchPrecheck(context, checked) == FastDispatchDecline::Invalid, "fast dispatch precheck: flat words over the range limit");
+}
+
 }
 
 int main() {
@@ -457,6 +575,7 @@ int main() {
         testSkippedDispatch();
         testNewDrawKeyTally();
         testFastCensus();
+        testFastDispatchVerify();
         LibcRunShutdown_nid_postfix();
         std::puts("AGC driver submit tests passed");
         return 0;

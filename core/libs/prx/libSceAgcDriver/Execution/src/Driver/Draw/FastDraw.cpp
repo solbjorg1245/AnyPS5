@@ -87,6 +87,8 @@ FastDecline walkDecline(FastWalkDecline decline) {
     switch (decline) {
         case FastWalkDecline::NoSource: return FastDecline::NoSource;
         case FastWalkDecline::Pending: return FastDecline::WalkPending;
+        // The reader's storage-image and unit-shadow pages (FastSrtRead), counted with the pending blocks.
+        case FastWalkDecline::PendingStorage: return FastDecline::WalkPending;
         case FastWalkDecline::Unmapped: return FastDecline::WalkUnmapped;
         case FastWalkDecline::QueuedLabel: return FastDecline::WalkQueuedLabel;
         case FastWalkDecline::NoProgram: return FastDecline::WalkNoProgram;

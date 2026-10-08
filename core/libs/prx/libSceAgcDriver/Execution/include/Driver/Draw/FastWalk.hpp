@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_FASTWALK_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastRead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include <cstdint>
@@ -47,9 +48,10 @@ struct FastWalkDraw {
 // Every FastWalkEvery()th call walks and compares; never throws.
 void ShadowWalkDraw(const FastWalkDraw& draw);
 
-// The direct reader's parts for the fast draw (F3b, FastDraw.cpp), the shadow walk's steps:
+// The direct reader's parts for the fast draw (F3b, FastDraw.cpp), the shadow walk's steps over
+// the shared reader (FastRead.hpp: FastSrtRead, the decline reasons, CompareWalkedResult):
 // why a stage's walk declined: the walk's own statuses, then the direct reader's reasons.
-enum class FastWalkDecline : std::uint8_t { NoSource, IncompletePlan, NoProgram, Bindless, UnsupportedRoot, OpFailed, Pending, Unmapped, QueuedLabel, Boundary, Failed, Count };
+using FastWalkDecline = WalkDecline;
 // The vertex fetch of a vertex-family stage through the direct reader: the header part memoized per
 // program (DecodeVertexFetchPlan) and the live attribute and V# words, the stage info
 // DecodeVertexStageInfo would build. `programs` are the draw's: their registered regions are read first.
@@ -57,12 +59,6 @@ std::optional<FastWalkDecline> FastResolveVertex(std::span<const DrawProgram> pr
 // The express walk of one stage over its live user words through the direct reader
 // (ShaderRecompiler::WalkResources).
 std::optional<FastWalkDecline> FastWalkStage(std::span<const DrawProgram> programs, const ShaderRecompiler::SourceHandle& handle, const DrawProgram& program, ShaderRecompiler::ResourceSnapshot& snapshot, ShaderRecompiler::ResourceSpecialization& specialization);
-// The shadow walk's comparison of a populated result with the one the old path bound: a bit per
-// kind of FastWalkMismatchNames (0: equal; the T# streaming-feedback bits are tolerated, and the
-// old capture's deferred words too unless `strictDeferred`: the fast draw binds what the walk read,
-// so a binding the old capture deferred words of is a mismatch there).
-std::uint32_t CompareWalkedResult(const ShaderRecompiler::RecompileResult& old, const ShaderRecompiler::RecompileResult& walked, bool strictDeferred = false);
-std::span<const char* const> FastWalkMismatchNames();
 
 }
 
