@@ -404,10 +404,12 @@ void testFastCensus() {
     check(!ClassifyFastCensusPacket(header(0x12), false, false, false), "census: CLEAR_STATE keeps a run");
     check(!ClassifyFastCensusPacket(custom(0x0b), false, false, false), "census: a marker keeps a run");
     check(!ClassifyFastCensusPacket(custom(0x1a), false, false, false), "census: a context push keeps a run");
+    check(!ClassifyFastCensusPacket(header(0x81), false, false, false), "census: WRITE_CONST_RAM keeps a run");
     check(ClassifyFastCensusPacket(header(0x15), false, false, false) == FastCensusBreak::Dispatch, "census: a dispatch ends a run");
     check(ClassifyFastCensusPacket(header(0x3c), false, false, false) == FastCensusBreak::Wait, "census: WAIT_REG_MEM ends a run");
     check(ClassifyFastCensusPacket(header(0x49), false, false, false) == FastCensusBreak::Label, "census: RELEASE_MEM ends a run");
     check(ClassifyFastCensusPacket(header(0x50), false, false, false) == FastCensusBreak::Dma, "census: DMA_DATA ends a run");
+    check(ClassifyFastCensusPacket(header(0x40), false, false, false) == FastCensusBreak::Dma && ClassifyFastCensusPacket(header(0x83), false, false, false) == FastCensusBreak::Dma, "census: COPY_DATA and DUMP_CONST_RAM are memory copies");
     check(ClassifyFastCensusPacket(custom(0x18), false, false, false) == FastCensusBreak::Label, "census: RELEASE_MEM_CUSTOM ends a run");
     check(ClassifyFastCensusPacket(header(0x69), false, false, true) == FastCensusBreak::Label, "census: a packet that wrote on the GPU ends a run");
     check(ClassifyFastCensusPacket(custom(0x17), true, false, false) == FastCensusBreak::Flip, "census: a flip ends a run");

@@ -101,9 +101,10 @@ inline FastCensusKeys ComputeFastCensusKeys(const QueueState& queue, std::span<c
 
 // What ends a run of fast-eligible draws on queue 0 (F6's hand-over points): a dispatch, a wait
 // (WAIT_REG_MEM, a rendering wait), a label or other memory store (RELEASE_MEM, WRITE_DATA, a
-// packet that wrote on the GPU), DMA_DATA, a flip, a draw the fast path declines, the end of the
-// submission, or any other packet. Register and state packets (SET_*_REG, CLEAR_STATE, the index
-// and instance state, markers, context push/pop, the cache events the port ignores) do not.
+// packet that wrote on the GPU), a memory copy (DMA_DATA, COPY_DATA, DUMP_CONST_RAM), a flip, a draw
+// the fast path declines, the end of the submission, or any other packet. Register and state
+// packets (SET_*_REG, CLEAR_STATE, the index and instance state, WRITE_CONST_RAM, markers, context
+// push/pop, the cache events the port ignores) do not.
 enum class FastCensusBreak : std::uint8_t { Dispatch, Wait, Label, Dma, Flip, DeclinedDraw, SubmissionEnd, Other, Count };
 inline constexpr std::size_t FastCensusBreaks = static_cast<std::size_t>(FastCensusBreak::Count);
 inline constexpr std::array<const char*, FastCensusBreaks> FastCensusBreakNames{"dispatch", "wait", "label", "dma", "flip", "declined draw", "submission end", "other"};
@@ -117,7 +118,7 @@ inline std::optional<FastCensusBreak> ClassifyFastCensusPacket(std::uint32_t hea
     case 0x15: case 0x16: return FastCensusBreak::Dispatch;
     case 0x3c: case 0x93: return FastCensusBreak::Wait;
     case 0x37: case 0x49: return FastCensusBreak::Label;
-    case 0x50: return FastCensusBreak::Dma;
+    case 0x40: case 0x50: case 0x83: return FastCensusBreak::Dma;
     case 0x10:
         if ((header & 0xfcu) == 0) break;
         switch ((header >> 2u) & 0x3fu) {
@@ -130,7 +131,7 @@ inline std::optional<FastCensusBreak> ClassifyFastCensusPacket(std::uint32_t hea
         }
         break;
     case 0x11: case 0x12: case 0x13: case 0x26: case 0x28: case 0x2a: case 0x2f: case 0x42: case 0x46: case 0x58:
-    case 0x63: case 0x64: case 0x68: case 0x69: case 0x76: case 0x79: case 0x7a: case 0x9f: break;
+    case 0x63: case 0x64: case 0x68: case 0x69: case 0x76: case 0x79: case 0x7a: case 0x81: case 0x9f: break;
     default: return FastCensusBreak::Other;
     }
     if (wroteOnGpu) return FastCensusBreak::Label;
