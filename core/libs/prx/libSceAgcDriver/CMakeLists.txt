@@ -50,6 +50,8 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FastClock.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FastEmutls.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/OperatorNew.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/DeviceAccess.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Diagnostics.cpp
@@ -168,7 +170,9 @@ target_link_libraries(libSceAgcDriver PRIVATE
 set_target_properties(libSceAgcDriver PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(libSceAgcDriver)
 if(MINGW)
-    # The driver's own operator new/delete (OperatorNew.cpp) stay private: auto-exported, the NID
+    # The driver's own operator new/delete (OperatorNew.cpp), __emutls_get_address (FastEmutls.cpp)
+    # and std::chrono::steady_clock::now (FastClock.cpp)
+    # stay private: auto-exported, the NID
     # patcher renames them and libSceAgc.prx, which links against the driver, fails to load.
     target_link_options(libSceAgcDriver PRIVATE
             -Wl,--exclude-symbols=_Znwy
@@ -178,7 +182,9 @@ if(MINGW)
             -Wl,--exclude-symbols=_ZdlPv
             -Wl,--exclude-symbols=_ZdaPv
             -Wl,--exclude-symbols=_ZdlPvy
-            -Wl,--exclude-symbols=_ZdaPvy)
+            -Wl,--exclude-symbols=_ZdaPvy
+            -Wl,--exclude-symbols=__emutls_get_address
+            -Wl,--exclude-symbols=_ZNSt6chrono3_V212steady_clock3nowEv)
 endif()
 if(WIN32)
     set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp PROPERTIES COMPILE_DEFINITIONS _WIN32_WINNT=0x0602)
