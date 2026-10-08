@@ -9,6 +9,7 @@
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <list>
 #include <map>
@@ -221,6 +222,16 @@ public:
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces() const;
     bool Reusable() const { return reusable; }
+    // Lease templates (APS5_LEASE_REUSE=1; default none): an address-based build over the cached space
+    // alone (LeaseShape 0) is kept in the resource cache, though not Reusable (its fault buffer and
+    // lease are per use), and serves a later dispatch of the same content key once its previous
+    // use completed (LeaseIdle: the write-back ran): RearmLease takes the cached space again when it
+    // is still the one the build mapped (GuestBufferMemory::RearmSpace) and proves the images as
+    // Revalidate does; the set, layout, images and BDA table are the build's. False: busy, the
+    // space moved or the proof failed (counted in the [address] line), the object unchanged.
+    bool LeaseTemplate() const { return leaseTemplate; }
+    bool LeaseIdle() const { return leaseIdle.load(std::memory_order_acquire); }
+    bool RearmLease(std::span<const CompiledShader> shaders);
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
     // and fragment stages, or one compute stage): their bindings are walked like the build did.
     // How a Revalidate proved (or refused) the object, for the [recipe] line: the proof path taken
@@ -476,6 +487,11 @@ private:
     std::vector<bool> storageWritten;
     std::vector<std::shared_ptr<Sampler>> samplers;
     bool reusable = false;
+    bool leaseTemplate = false;
+    // The cached space's serial the template was built over (LeaseTemplate).
+    std::uint64_t leaseSerial = 0;
+    // Set once a use's write-back ran (WriteBackBuffers), cleared by RearmLease.
+    std::atomic<bool> leaseIdle{false};
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
     // The pending registry's serial at the last Revalidate that proved this object, taken before

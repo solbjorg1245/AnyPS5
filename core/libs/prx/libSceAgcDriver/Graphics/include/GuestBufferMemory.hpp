@@ -142,6 +142,9 @@ struct AddressSpaceStats {
     std::uint64_t waiterDrops = 0;
 };
 AddressSpaceStats AddressSpaceCounters();
+// Lease reuse outcomes (ShaderResources::RearmLease), printed in the [address] line.
+enum class LeaseReuse { Rearmed, Busy, Space, Proof };
+void CountLeaseReuse(LeaseReuse outcome);
 
 struct MirrorStats {
     std::uint64_t heapMirrors = 0;
@@ -235,6 +238,17 @@ public:
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
     // build's own lease, or by the cached address space it holds.
     bool HoldsLease() const { return !lease.empty() || space != nullptr; }
+    // Lease reuse (ShaderResources::RearmLease): a committed build of shape 0 (LeaseShape) takes
+    // the cached space it was built over again for another use while that space is still the
+    // current one (the same serial, registry generation, imports epoch and device, no import
+    // stale): its descriptors and BDA table then name the same imports and nothing is uploaded.
+    // False leaves the object as it was. DropRearmed undoes a rearm whose proof failed (the object
+    // is not recorded); SpaceSerial is the held space's serial (0: none); SpaceEpochCurrent checks
+    // the held space's imports epoch again (last, after the proof's flushes, as UploadFinish does).
+    bool RearmSpace(std::uint64_t serial);
+    void DropRearmed();
+    std::uint64_t SpaceSerial() const;
+    bool SpaceEpochCurrent() const;
     // APS5_PROFILE_DRAW: how far an uploaded address-based build is from one a later dispatch could
     // share: 0 the cached space alone, every base range served in place or by a fixed mirror; 1 the
     // same plus per-build regions (V#s, snapshots, copied ranges); 2 a writable or heap mirror in the

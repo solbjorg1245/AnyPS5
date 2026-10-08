@@ -349,8 +349,17 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
             Require(view.range == 64 + adjustment, "leased block has no descriptor");
             const auto ranges = leased.AddressRanges();
             Require(std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin == blockAddress && range.end == blockAddress + 64; }), "leased block is missing from the BDA table");
+            const auto serial = leased.SpaceSerial();
             leased.WriteBack();
             Require(!leased.HoldsLease(), "write-back kept the lease");
+            if (AddressSpaceCounters().enabled) {
+                // Lease reuse: the committed build takes the unchanged space again for another use.
+                Require(serial != 0 && !leased.RearmSpace(serial + 1), "a rearm took a space of another serial");
+                Require(leased.RearmSpace(serial) && leased.HoldsLease() && leased.SpaceEpochCurrent(), "a committed build did not rearm over its unchanged space");
+                Require(!leased.RearmSpace(serial), "a rearmed build was rearmed again before its write-back");
+                leased.WriteBack();
+                Require(!leased.HoldsLease(), "the rearmed use's write-back kept the lease");
+            }
         }
         const auto after = AddressSpaceCounters();
         if (after.enabled) Require(after.hits == before.hits + 1 && after.rebuiltFirst + after.rebuiltGeneration + after.rebuiltWaiterDrop + after.rebuiltEpoch + after.rebuiltDevice == before.rebuiltFirst + before.rebuiltGeneration + before.rebuiltWaiterDrop + before.rebuiltEpoch + before.rebuiltDevice + 1, "second build did not take the cached address space");

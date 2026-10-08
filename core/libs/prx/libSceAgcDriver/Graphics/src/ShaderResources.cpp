@@ -1316,6 +1316,14 @@ void ShaderResources::noteReusable() {
     captureValidation();
     reusable = false;
     directRegions.clear();
+    // A lease template (see LeaseTemplate): the cached space alone, no copied writes, data buffers
+    // a hit can refresh; set at the build only (a rearmed use keeps it). Off by default: t322-t324
+    // measured no gain (most address-based keys differ in their V# bases per dispatch).
+    static const bool leaseReuse = std::getenv("APS5_LEASE_REUSE") != nullptr;
+    if (leaseReuse && !leaseTemplate && bda != nullptr && HoldsLease() && guestMemory.LeaseShape() == 0 && !guestMemory.HasCopiedWrites() && guestMemory.SpaceSerial() != 0 && !(TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; }))) {
+        leaseTemplate = true;
+        leaseSerial = guestMemory.SpaceSerial();
+    }
     if (NeedsCompletion() || HoldsLease()) return;
     if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; })) return;
     const auto regions = guestMemory.DirectRegions();
@@ -3637,6 +3645,40 @@ void ShaderResources::WriteBackBuffers() {
     if (bda) bda->CheckFault();
     if (SkipWriteBack()) return;
     guestMemory.WriteBack();
+    // The fault buffer is clear again and the lease released: a later dispatch may rearm the object.
+    if (leaseTemplate) leaseIdle.store(true, std::memory_order_release);
+}
+
+bool ShaderResources::RearmLease(std::span<const CompiledShader> shaders) {
+    if (!leaseTemplate || !leaseIdle.load(std::memory_order_acquire)) {
+        CountLeaseReuse(LeaseReuse::Busy);
+        return false;
+    }
+    if (!guestMemory.RearmSpace(leaseSerial)) {
+        CountLeaseReuse(LeaseReuse::Space);
+        return false;
+    }
+    // Revalidate proves reusable objects only: this use is proved like one (its direct regions are
+    // none; the space stands for them), then the object is not reusable again, so no recipe or
+    // draw takes it.
+    reusable = true;
+    bool ok = false;
+    try {
+        ok = Revalidate(shaders) && guestMemory.SpaceEpochCurrent();
+    } catch (...) {
+        reusable = false;
+        guestMemory.DropRearmed();
+        throw;
+    }
+    reusable = false;
+    if (!ok) {
+        guestMemory.DropRearmed();
+        CountLeaseReuse(LeaseReuse::Proof);
+        return false;
+    }
+    leaseIdle.store(false, std::memory_order_relaxed);
+    CountLeaseReuse(LeaseReuse::Rearmed);
+    return true;
 }
 
 bool ShaderResources::WritesMemory() const {
