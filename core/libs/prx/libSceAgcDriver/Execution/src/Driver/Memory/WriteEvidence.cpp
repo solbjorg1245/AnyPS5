@@ -30,6 +30,11 @@ bool& Driver::sampledRead() {
     return sampled;
 }
 
+bool& Driver::forcedSyncReads() {
+    static thread_local bool forced = false;
+    return forced;
+}
+
 bool Driver::writeEvidenceEnabled() {
     static const bool enabled = std::getenv("APS5_NO_WRITE_EVIDENCE") == nullptr;
     return enabled;
@@ -225,6 +230,9 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
     // queries still answer None, so a word beside the label reads raw and only a read of the
     // label's dwords goes through the hook's record and sync, as the whole page did.
     if (policy == ShaderMemory::PendingWrite::None && wordwiseQueuedLabels && bytes >= 4096 && Graphics::Recorder::QueuedLabelOverlapsThisThread(address, bytes)) return ShaderMemory::PendingWrite::Sync;
+    // A draw run again after a SnapshotStale (Draw.cpp): no known value, no evidence-based raw
+    // read; the hook waits for the writer, so the capture holds what the memory will hold.
+    if (policy != ShaderMemory::PendingWrite::None && forcedSyncReads()) return ShaderMemory::PendingWrite::Sync;
     return policy;
 }
 

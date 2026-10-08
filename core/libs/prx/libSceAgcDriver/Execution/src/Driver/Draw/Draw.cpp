@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawScratch.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -17,6 +18,31 @@ struct DrawScratchTag {};
 bool drawScratchEnabled() {
     static const bool enabled = std::getenv("APS5_NO_DRAW_SCRATCH") == nullptr;
     return enabled;
+}
+
+// A draw whose captured regions no longer agree with the memory serving them (AddSnapshot's
+// Graphics::SnapshotStale, ~95 G-buffer draws per 10 s in t360) was dropped: the packet runs again
+// instead, each retry stricter. APS5_NO_SNAPSHOT_RETRY=1: dropped as before.
+bool snapshotRetryEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_SNAPSHOT_RETRY") == nullptr;
+    return enabled;
+}
+
+// The retry of the packet this thread draws: 1 captures every stage fresh (no draw-cache entry,
+// so no stored stage bytes) with every word a recorded write covers read through the hook
+// (Driver::forcedSyncReads), 2 also captures under the GPU mutex (nothing records between the
+// capture and the draw), 3 also binds a range that still differs as it is (the memory the GPU
+// reads, as on hardware). The CPU-indirect records before `resumeRecord` were drawn already.
+struct SnapshotRetry {
+    std::uint32_t level = 0;
+    std::uint32_t resumeRecord = 0;
+};
+
+constexpr std::uint32_t SnapshotRetryLevels = 3;
+
+SnapshotRetry& snapshotRetry() {
+    static thread_local SnapshotRetry retry;
+    return retry;
 }
 
 }
@@ -68,7 +94,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     static const std::uint64_t dumpSlot1 = [] { const char* text = std::getenv("APS5_DUMP_DRAW_SLOT1"); return text ? std::strtoull(text, nullptr, 16) : 0ull; }();
 
-    static const bool lockedPrepare = std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr;
+    static const bool lockedPrepareAlways = std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr;
+    auto& retry = snapshotRetry();
+    const auto resumeRecord = retry.resumeRecord;
+    const bool lockedPrepare = lockedPrepareAlways || retry.level >= 2;
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
     std::shared_ptr<VulkanDevice> localDevice;
     if (lockedPrepare) {
@@ -91,7 +120,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("device_setup");
     phaseTiming.Phase(DrawRowVectors);
 
-    const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
+    const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0 && retry.level == 0;
     const bool registerKey = useDrawEntries && registerKeyEnabled();
     DrawKey drawKey;
     std::shared_ptr<DrawEntry> entry;
@@ -317,6 +346,44 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(queue, packet, submission, rejected);
 
+    // The device's draw, true when it threw SnapshotStale and the packet is to run again
+    // (retryStale); the last retry serves the mismatch, so it never gets here.
+    const bool retryable = snapshotRetryEnabled() && retry.level < SnapshotRetryLevels;
+    const auto stale = [&](auto&& work) {
+        try {
+            work();
+        } catch (const Graphics::SnapshotStale&) {
+            if (!retryable) throw;
+            return true;
+        }
+        return false;
+    };
+    const auto retryStale = [&](std::uint32_t resume) {
+        struct Restore {
+            SnapshotRetry& retry;
+            SnapshotRetry state;
+            bool& sync;
+            bool syncBefore;
+            bool& serves;
+            bool servesBefore;
+            ~Restore() {
+                retry = state;
+                sync = syncBefore;
+                serves = servesBefore;
+            }
+        };
+        auto& sync = forcedSyncReads();
+        auto& serves = Graphics::ThreadServesStaleSnapshots();
+        const Restore restore{retry, retry, sync, sync, serves, serves};
+        retry.level = restore.state.level + 1;
+        retry.resumeRecord = resume;
+        sync = true;
+        serves = retry.level >= SnapshotRetryLevels;
+        Graphics::CountSnapshotRetry(retry.level, drawHit || hits.partial);
+        if (gpuLock.owns_lock()) gpuLock.unlock();
+        return draw(queue, packet, submission, rejected);
+    };
+
     bool rectListBuilt = false;
 
     std::size_t rectIndex = 0;
@@ -389,7 +456,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto baseVertexWord = locate(indirect.baseVertexLocation);
         const auto startInstanceWord = locate(indirect.startInstanceLocation);
         const auto drawIndexWord = indirect.drawIndexEnabled ? locate(indirect.drawIndexLocation) : std::nullopt;
-        for (std::uint32_t record = 0; record < records.size(); ++record) {
+        for (std::uint32_t record = resumeRecord; record < records.size(); ++record) {
             const auto& arguments = records[record];
             if (traceIndirect) std::fprintf(stderr, "[draw]   record %u: count %u instances %u first %u vertexOffset %u startInstance %u\n", record, arguments.count, arguments.instances, arguments.firstVertexOrIndex, arguments.vertexOffset, arguments.firstInstance);
             if (arguments.count == 0 || arguments.instances == 0) continue;
@@ -438,7 +505,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             lockForDraw();
             noteDrawWriters(stages, submission.queue);
             phaseTiming.Phase(DrawRowVectors);
-            localDevice->Draw(graphics, direct, stages, snapshots);
+            if (stale([&] { localDevice->Draw(graphics, direct, stages, snapshots); })) return retryStale(record);
             phaseTiming.Phase(DrawRowGraphics);
         }
         timing.Mark("draw_and_resource_release");
@@ -468,7 +535,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     noteDrawWriters(stages, submission.queue);
     phaseTiming.Phase(DrawRowVectors);
     if (recipe != nullptr) {
-        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe) == RecipeOutcome::Recorded) {
+        bool recorded = false;
+        if (stale([&] { recorded = localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe) == RecipeOutcome::Recorded; })) return retryStale(0);
+        if (recorded) {
             phaseTiming.Phase(DrawRowGraphics);
             timing.Mark("draw_and_resource_release");
             return drawn();
@@ -477,7 +546,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);
+    if (stale([&] { localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built); })) return retryStale(0);
     phaseTiming.Phase(DrawRowGraphics);
     if (built != nullptr) attachDrawRecipe(drawKey.key, recipeStages, std::move(built));
     timing.Mark("draw_and_resource_release");

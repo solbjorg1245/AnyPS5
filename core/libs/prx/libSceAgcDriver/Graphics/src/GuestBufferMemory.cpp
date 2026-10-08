@@ -1027,6 +1027,17 @@ LeaseState& Leases() {
 struct SnapshotStats {
     std::atomic<std::uint64_t> checked{0};
     std::atomic<std::uint64_t> skipped{0};
+    // The compares that differed (SnapshotStale): live or snapshot-backed owner, those over a
+    // pending GPU write or label, those served as bound (ThreadServesStaleSnapshots); and the draw
+    // retries (CountSnapshotRetry) by level, the first ones after a draw-cache hit apart.
+    std::atomic<std::uint64_t> staleLive{0};
+    std::atomic<std::uint64_t> staleBacked{0};
+    std::atomic<std::uint64_t> stalePending{0};
+    std::atomic<std::uint64_t> staleServed{0};
+    std::atomic<std::uint64_t> recaptured{0};
+    std::atomic<std::uint64_t> recapturedAfterHit{0};
+    std::atomic<std::uint64_t> recapturedLocked{0};
+    std::atomic<std::uint64_t> retriedServed{0};
 };
 
 SnapshotStats& Snapshots() {
@@ -1101,6 +1112,23 @@ void ensurePinWaiter() {
 
 }
 
+bool& ThreadServesStaleSnapshots() {
+    static thread_local bool serves = false;
+    return serves;
+}
+
+void CountSnapshotRetry(std::uint32_t level, bool hit) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    auto& stats = Snapshots();
+    if (level <= 1) {
+        stats.recaptured.fetch_add(1, std::memory_order_relaxed);
+        if (hit) stats.recapturedAfterHit.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        (level == 2 ? stats.recapturedLocked : stats.retriedServed).fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 bool SyncLeaseWork() {
     static const bool sync = std::getenv("APS5_SYNC_LEASE_DISPATCH") != nullptr;
     return sync;
@@ -1132,7 +1160,7 @@ void CountLeaseOutcome(bool synced, std::uint64_t batchSerial) {
     const auto& stats = state.stats;
     const auto table = BdaResources::TableCacheCounters();
     const auto& snapshots = Snapshots();
-    std::fprintf(stderr, "[address-sync] leases: %llu released at completion, %llu synced at once; %llu pin-contention waits by guest threads (%llu finished the lease batch, %llu drained the recorder, %llu cache-only drops) %.1f s; BDA table cache %llu hits / %llu misses (%zu tables held); snapshot compares: %llu skipped (live-backed region), %llu made\n", static_cast<unsigned long long>(stats.deferred), static_cast<unsigned long long>(stats.synced), static_cast<unsigned long long>(stats.contentionWaits), static_cast<unsigned long long>(stats.contentionSyncs), static_cast<unsigned long long>(stats.contentionDrains), static_cast<unsigned long long>(stats.cacheDrops), stats.contentionMs / 1000, static_cast<unsigned long long>(table.hits), static_cast<unsigned long long>(table.misses), table.held, static_cast<unsigned long long>(snapshots.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(snapshots.checked.load(std::memory_order_relaxed)));
+    std::fprintf(stderr, "[address-sync] leases: %llu released at completion, %llu synced at once; %llu pin-contention waits by guest threads (%llu finished the lease batch, %llu drained the recorder, %llu cache-only drops) %.1f s; BDA table cache %llu hits / %llu misses (%zu tables held); snapshot compares: %llu skipped (live-backed region), %llu made; differed: %llu live, %llu snapshot-backed (%llu over a pending GPU write or label), %llu served as bound; draws run again: %llu recaptured (%llu after a draw-cache hit), %llu again under the GPU lock, %llu with the memory as it is\n", static_cast<unsigned long long>(stats.deferred), static_cast<unsigned long long>(stats.synced), static_cast<unsigned long long>(stats.contentionWaits), static_cast<unsigned long long>(stats.contentionSyncs), static_cast<unsigned long long>(stats.contentionDrains), static_cast<unsigned long long>(stats.cacheDrops), stats.contentionMs / 1000, static_cast<unsigned long long>(table.hits), static_cast<unsigned long long>(table.misses), table.held, static_cast<unsigned long long>(snapshots.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(snapshots.checked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(snapshots.staleLive.load(std::memory_order_relaxed)), static_cast<unsigned long long>(snapshots.staleBacked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(snapshots.stalePending.load(std::memory_order_relaxed)), static_cast<unsigned long long>(snapshots.staleServed.load(std::memory_order_relaxed)), static_cast<unsigned long long>(snapshots.recaptured.load(std::memory_order_relaxed)), static_cast<unsigned long long>(snapshots.recapturedAfterHit.load(std::memory_order_relaxed)), static_cast<unsigned long long>(snapshots.recapturedLocked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(snapshots.retriedServed.load(std::memory_order_relaxed)));
 }
 
 LeaseStats LeaseCounters() {
@@ -1761,7 +1789,8 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
         // it stays on because it is the one check that the words the recompiler baked into
         // descriptors and specialization still equal what the GPU reads. APS5_NO_SNAPSHOT_CHECK=1
         // skips the compare of live-backed regions (the region serves the GPU whatever the snapshot
-        // held; only the diagnostic is lost).
+        // held; only the diagnostic is lost). A difference throws SnapshotStale, which Driver::draw
+        // answers by running the packet again (Draw.cpp, snapshotRetry) rather than dropping it.
         static const bool checkLive = std::getenv("APS5_NO_SNAPSHOT_CHECK") == nullptr;
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
         const bool live = owner->writable || owner->hostBacked || owner->mirror != nullptr;
@@ -1773,7 +1802,34 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
         }
         const auto offset = static_cast<std::size_t>(snapshot.address - owner->begin);
         const auto* source = live ? reinterpret_cast<const std::byte*>(snapshot.address) : owner->snapshot.data() + offset;
-        Require(std::memcmp(source, snapshot.bytes.data(), snapshot.bytes.size()) == 0, "guest snapshot differs from registered memory");
+        const auto bytes = snapshot.bytes.size();
+        if (std::memcmp(source, snapshot.bytes.data(), bytes) != 0) {
+            // `pending`: recorded GPU work, or a label in the first differing dword, still writes
+            // the range, so the capture served words that change when that work lands (a known
+            // value, an evidence-based raw read); otherwise the guest or another queue wrote it
+            // between the capture and the device lock. The first 32 are listed ([snapshot] lines),
+            // all counted on the [address-sync] line (APS5_PROFILE_DRAW).
+            std::size_t word = 0;
+            while (word < bytes && std::memcmp(source + word, snapshot.bytes.data() + word, std::min<std::size_t>(4, bytes - word)) == 0) word += 4;
+            const bool pending = Recorder::SnapshotWriteOverlaps(snapshot.address, bytes) || Recorder::LookupLabelValue((snapshot.address + word) & ~3ull, 4, 0).has_value();
+            const bool serve = ThreadServesStaleSnapshots();
+            if (profile) {
+                auto& stats = Snapshots();
+                (live ? stats.staleLive : stats.staleBacked).fetch_add(1, std::memory_order_relaxed);
+                if (pending) stats.stalePending.fetch_add(1, std::memory_order_relaxed);
+                if (serve) stats.staleServed.fetch_add(1, std::memory_order_relaxed);
+                static std::atomic<std::uint32_t> reports{0};
+                if (reports.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    std::uint32_t captured = 0;
+                    std::uint32_t current = 0;
+                    std::memcpy(&captured, snapshot.bytes.data() + word, std::min<std::size_t>(4, bytes - word));
+                    std::memcpy(&current, source + word, std::min<std::size_t>(4, bytes - word));
+                    std::fprintf(stderr, "[snapshot] 0x%llx+0x%zx differs from its %s region 0x%llx+0x%llx (writable %d, host-backed %d, mirror %d): first at +0x%zx, captured 0x%08x, %s 0x%08x; pending GPU write or label: %s%s\n", static_cast<unsigned long long>(snapshot.address), bytes, live ? "live" : "snapshot-backed", static_cast<unsigned long long>(owner->begin), static_cast<unsigned long long>(owner->end - owner->begin), owner->writable ? 1 : 0, owner->hostBacked ? 1 : 0, owner->mirror != nullptr ? 1 : 0, word, captured, live ? "memory" : "first snapshot", current, pending ? "yes" : "no", serve ? "; served as bound (last retry)" : "");
+                }
+            }
+            if (serve) return;
+            throw SnapshotStale(live, pending);
+        }
         if (profile) Snapshots().checked.fetch_add(1, std::memory_order_relaxed);
         return;
     }

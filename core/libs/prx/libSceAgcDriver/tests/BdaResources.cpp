@@ -15,6 +15,8 @@
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <optional>
+#include <span>
 #include <string>
 
 namespace {
@@ -250,6 +252,40 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     GuestBufferMemory overflow(context);
     const std::array<std::byte, 8> source{};
     reject([&] { overflow.AddSnapshot({std::numeric_limits<std::uint64_t>::max() - 3, source}); }, "overflow");
+    {
+        // A snapshot that disagrees with the region serving it throws the typed SnapshotStale (the
+        // draw retry catches it): `live` for a region read in place whose memory changed since the
+        // capture, not for two snapshots of one snapshot-backed range; the old text stays, and a
+        // thread serving stale snapshots binds either as it is.
+        alignas(64) std::array<std::uint32_t, 4> live{7, 8, 9, 10};
+        const auto liveAddress = reinterpret_cast<std::uintptr_t>(live.data());
+        GuestBufferMemory stale(context);
+        stale.AddWritable(liveAddress, sizeof(live));
+        std::array<std::uint32_t, 2> captured{7, 8};
+        stale.AddSnapshot({liveAddress, std::as_bytes(std::span(captured))});
+        const auto staleCase = [&](std::uint64_t address, std::span<const std::byte> bytes) -> std::optional<bool> {
+            try {
+                stale.AddSnapshot({address, bytes});
+            } catch (const SnapshotStale& error) {
+                Require(std::string(error.what()).find("guest snapshot differs from registered memory") != std::string::npos, "SnapshotStale lost the old text");
+                return error.live;
+            }
+            return std::nullopt;
+        };
+        live[1] = 80;
+        Require(staleCase(liveAddress, std::as_bytes(std::span(captured))) == std::optional<bool>(true), "a live region changed since the capture is not a live SnapshotStale");
+        const std::uint64_t backed = 0x7fff12350000ULL;
+        const std::array<std::uint32_t, 2> agreeing{1, 2};
+        const std::array<std::uint32_t, 2> disagreeing{1, 3};
+        stale.AddSnapshot({backed, std::as_bytes(std::span(agreeing))});
+        Require(!staleCase(backed, std::as_bytes(std::span(agreeing))).has_value(), "two agreeing snapshots of one range threw");
+        Require(staleCase(backed, std::as_bytes(std::span(disagreeing))) == std::optional<bool>(false), "two disagreeing snapshots of one range are not a snapshot-backed SnapshotStale");
+        ThreadServesStaleSnapshots() = true;
+        const bool servedLive = !staleCase(liveAddress, std::as_bytes(std::span(captured))).has_value();
+        const bool servedBacked = !staleCase(backed, std::as_bytes(std::span(disagreeing))).has_value();
+        ThreadServesStaleSnapshots() = false;
+        Require(servedLive && servedBacked, "a thread serving stale snapshots still threw");
+    }
 
     const std::array<GuestMemorySnapshot, 1> snapshots{{{0x7fff12340000ULL, source}}};
     ShaderRecompiler::RecompileResult shader;
