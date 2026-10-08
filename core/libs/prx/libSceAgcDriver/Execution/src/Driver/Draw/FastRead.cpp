@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastRead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <cstring>
@@ -81,6 +83,15 @@ bool FastSrtRead(void* context, std::uint64_t address, std::uint32_t* value) {
     }
     const auto page = address & ~(ReaderPageBytes - 1);
     if (page != reader.page) {
+        // The old capture's page read runs the flush hook (GuestMemory::FlushGpuWrites), which
+        // stores the storage-image results pending over the page and publishes its unit shadows
+        // first; this reader has none, so such a page is the old path's (the hook-free checks
+        // VariantValidation makes).
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{page, page + ReaderPageBytes}}};
+        if (Graphics::StorageTexture::AnyPendingOverlaps(range) || Graphics::AnyShadowedOverlaps(page, ReaderPageBytes)) {
+            reader.declined = WalkDecline::PendingStorage;
+            return false;
+        }
         bool queried = false;
         const bool readable = GuestMemory::ReadableWord(address, &queried);
         if (queried) ++reader.queries;
@@ -107,7 +118,7 @@ WalkDecline WalkDeclineOf(ShaderRecompiler::WalkStatus status, const FastReader&
     }
 }
 
-std::uint32_t CompareWalkedResults(const ShaderRecompiler::RecompileResult& old, const ShaderRecompiler::RecompileResult& walked, WalkDifference& first, std::uint64_t& feedbackOnly, std::uint64_t& deferredSkipped) {
+std::uint32_t CompareWalkedResults(const ShaderRecompiler::RecompileResult& old, const ShaderRecompiler::RecompileResult& walked, WalkDifference& first, std::uint64_t& feedbackOnly, std::uint64_t& deferredSkipped, bool deferredMismatch) {
     std::uint32_t kinds = 0;
     const auto note = [&](WalkMismatch kind, std::size_t binding, std::size_t word, std::uint32_t oldWord, std::uint32_t walkedWord) {
         if (kinds == 0) first = {kind, binding, word, oldWord, walkedWord};
@@ -123,6 +134,12 @@ std::uint32_t CompareWalkedResults(const ShaderRecompiler::RecompileResult& old,
         const auto& right = walked.bindings[index];
         if (left.kind != right.kind || left.role != right.role || left.descriptorSet != right.descriptorSet || left.binding != right.binding || left.count != right.count || left.guestDescriptor.size() != right.guestDescriptor.size()) {
             note(WalkMismatch::Layout, index, 0, 0, 0);
+            continue;
+        }
+        if (deferredMismatch && !left.deferredWords.empty()) {
+            const std::size_t word = left.deferredWords.front().first;
+            const bool inside = word < left.guestDescriptor.size();
+            note(mismatchOf(left.role), index, word, inside ? left.guestDescriptor[word] : 0, inside ? right.guestDescriptor[word] : 0);
             continue;
         }
         const bool image = left.role == ShaderRecompiler::DescriptorRole::GuestImages && left.guestDescriptor.size() % 8 == 0;

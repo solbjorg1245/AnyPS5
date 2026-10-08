@@ -3366,13 +3366,14 @@ VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompi
     return dispatch(shader, 0, 0, 0, arguments, snapshots, programAddress, std::move(prepared), recipe);
 }
 
-std::optional<Graphics::FastDispatchDecline> VulkanDevice::FastDispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, Graphics::FastDispatchTiming& timing) {
+std::optional<Graphics::FastDispatchDecline> VulkanDevice::PrepareFastDispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, Graphics::FastDispatchCall& call) {
     using Decline = Graphics::FastDispatchDecline;
     if (shader.spirv.size() < 5 || shader.spirv[0] != 0x07230203u || shader.variantId == 0) return Decline::Invalid;
     const auto* limit = state->properties.limits.maxComputeWorkGroupCount;
     if (arguments == 0 && (x > limit[0] || y > limit[1] || z > limit[2])) return Decline::Limits;
     const auto context = graphicsContext();
     if (context.fastLayouts == nullptr) return Decline::NoPush;
+    if (const auto decline = Graphics::FastDispatchPrecheck(context, shader)) return decline;
     // The variant's pipeline on its push layout: the layout key follows from the variant's
     // bindings, so both are made once per variant (FastLayouts::Get stays off the per-dispatch path).
     const Graphics::FastLayout* layout = nullptr;
@@ -3420,6 +3421,13 @@ std::optional<Graphics::FastDispatchDecline> VulkanDevice::FastDispatch(const Sh
         layout = entry.layout;
         objects = entry.objects;
     }
+    call = {&shader, layout, objects->pipeline, objects, x, y, z, arguments, programAddress};
+    return std::nullopt;
+}
+
+std::optional<Graphics::FastDispatchDecline> VulkanDevice::FastDispatch(const Graphics::FastDispatchCall& call, Graphics::FastDispatchTiming& timing) {
+    using Decline = Graphics::FastDispatchDecline;
+    const auto arguments = call.arguments;
     if (arguments != 0) {
         // decideIndirect's CPU reasons, tested without its flush (the old path then takes the
         // dispatch and flushes): storage results pending over the argument dwords, a label pending
@@ -3432,8 +3440,13 @@ std::optional<Graphics::FastDispatchDecline> VulkanDevice::FastDispatch(const Sh
         const auto writes = [&](const auto& writer) { return writer->WritesOverlap(arguments, 12); };
         if (std::any_of(state->copiedWriters->begin(), state->copiedWriters->end(), writes) || std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), writes)) return Decline::IndirectCpu;
     }
-    const Graphics::FastDispatchCall call{&shader, layout, objects->pipeline, objects, x, y, z, arguments, programAddress};
-    return Graphics::RecordFastDispatch(context, *state->recorder, call, timing);
+    return Graphics::RecordFastDispatch(graphicsContext(), *state->recorder, call, timing);
+}
+
+std::optional<Graphics::FastDispatchDecline> VulkanDevice::FastDispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, Graphics::FastDispatchTiming& timing) {
+    Graphics::FastDispatchCall call;
+    if (const auto decline = PrepareFastDispatch(shader, x, y, z, arguments, programAddress, call)) return decline;
+    return FastDispatch(call, timing);
 }
 
 void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& outcome, char* groupsText) {

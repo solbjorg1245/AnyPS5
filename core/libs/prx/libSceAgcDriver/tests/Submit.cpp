@@ -475,6 +475,9 @@ void testFastDispatchVerify() {
     walked.bindings[2].guestDescriptor[1] = 5;
     check(CompareWalkedResults(deferring, walked, first, feedback, deferred) == 0 && deferred == 1, "fast dispatch verify: a deferred flat word differs");
     check(CompareWalkedResults(old, walked, first, feedback, deferred) == mismatch(WalkMismatch::Flat), "fast dispatch verify: a flat word is no flat mismatch");
+    // The fast dispatch binds the walked word: a deferred word differs even where the walk read the placeholder.
+    deferred = 0;
+    check(CompareWalkedResults(deferring, deferring, first, feedback, deferred, true) == mismatch(WalkMismatch::Flat) && first.binding == 2 && first.word == 1 && deferred == 0, "fast dispatch verify: a deferred word is no mismatch for the fast dispatch");
     walked = old;
     walked.bindings[0].guestDescriptor[0] = 0x100;
     check(CompareWalkedResults(old, walked, first, feedback, deferred) == mismatch(WalkMismatch::Buffer) && first.kind == WalkMismatch::Buffer && first.binding == 0 && first.word == 0 && first.old == 1 && first.walked == 0x100, "fast dispatch verify: a moved V# is no buffer mismatch");
@@ -504,6 +507,42 @@ void testFastDispatchVerify() {
     declined.bindings[2].count = 2;
     check(AgcDriver::Graphics::FastComputeLayoutKey(declined, key) == FastDispatchDecline::Invalid, "fast dispatch layout key: an array of flat words is bound");
     for (const auto* name : AgcDriver::Graphics::FastDispatchDeclineNames) check(name != nullptr && *name != '\0', "fast dispatch: a decline without a name");
+    for (const auto* name : WalkDeclineNames) check(name != nullptr && *name != '\0', "fast walk: a decline without a name");
+
+    // The declines made before the lock (Graphics::FastDispatchPrecheck): what a build rejects of a
+    // read-only V# and of the data words; the adjustment slot is required of every element.
+    using AgcDriver::Graphics::FastDispatchPrecheck;
+    AgcDriver::Graphics::Context context{};
+    context.limits.maxStorageBufferRange = 1u << 20u;
+    ShaderRecompiler::RecompileResult shader;
+    shader.bindings.push_back({Kind::StorageBuffer, Role::GuestBuffers, 0, 0, 1, {0x10000u, 4u << 16u, 64u, 0x01016facu}});
+    shader.bindings[0].bufferWritten = {false};
+    shader.bindings.push_back({Kind::StorageBuffer, Role::FlattenedSrt, 0, 1, 1, {9, 9}});
+    check(!FastDispatchPrecheck(context, shader), "fast dispatch precheck: a read V# and flat words declined");
+    auto checked = shader;
+    checked.pushConstants.resize(4);
+    checked.memoryOffsetDword = 1;
+    check(FastDispatchPrecheck(context, checked) == FastDispatchDecline::Invalid, "fast dispatch precheck: an adjustment byte outside the push constants");
+    checked.memoryOffsetDword = 0;
+    check(!FastDispatchPrecheck(context, checked), "fast dispatch precheck: an adjustment byte inside the push constants declined");
+    checked = shader;
+    checked.bindings[0].guestDescriptor[1] |= 0x40000000u;
+    check(FastDispatchPrecheck(context, checked) == FastDispatchDecline::Invalid, "fast dispatch precheck: a reserved V# bit");
+    checked = shader;
+    checked.bindings[0].guestDescriptor = {0, 0, 0, 0};
+    check(FastDispatchPrecheck(context, checked) == FastDispatchDecline::Invalid, "fast dispatch precheck: an empty V# without the placeholder buffer");
+    checked.pushConstants.resize(4);
+    checked.memoryOffsetDword = 1;
+    context.emptyBuffer = reinterpret_cast<VkBuffer>(std::uintptr_t{0x10});
+    check(FastDispatchPrecheck(context, checked) == FastDispatchDecline::Invalid, "fast dispatch precheck: an empty V# outside the push constants");
+    checked.memoryOffsetDword = 0;
+    check(!FastDispatchPrecheck(context, checked), "fast dispatch precheck: an empty V# declined");
+    checked = shader;
+    checked.bindings[1].deferredWords.push_back({1, 0x20000});
+    check(FastDispatchPrecheck(context, checked) == FastDispatchDecline::Deferred, "fast dispatch precheck: deferred flat words");
+    checked = shader;
+    checked.bindings[1].guestDescriptor.assign((1u << 18u) + 1u, 0u);
+    check(FastDispatchPrecheck(context, checked) == FastDispatchDecline::Invalid, "fast dispatch precheck: flat words over the range limit");
 }
 
 }

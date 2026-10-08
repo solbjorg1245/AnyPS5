@@ -47,15 +47,25 @@ struct FastDispatchCall {
 };
 
 // What one RecordFastDispatch spent and did (APS5_PROFILE_DRAW rows of [fastpath] dispatches):
-// resolving the bindings, recording; whether the leading barrier was elided, whether a full ring
-// made it sync. `recorded`: commands went into the batch, so a throw after it must not fall back.
+// resolving the bindings, recording; the guest buffer elements bound in place with a non-zero
+// offset adjustment (the old path binds a copy of those, so verify cannot compare them); whether
+// the leading barrier was elided, whether the ring was full at the first ask. `recorded`: commands
+// went into the batch, so a throw after it must not fall back.
 struct FastDispatchTiming {
     std::uint64_t resolveNs = 0;
     std::uint64_t recordNs = 0;
+    std::uint32_t adjusted = 0;
     bool leadSkipped = false;
-    bool ringSynced = false;
+    bool ringFull = false;
     bool recorded = false;
 };
+
+// The declines of RecordFastDispatch that follow from the walked words and the configuration
+// alone: a V# a build rejects (the adjustment slot a build requires of every element included), a
+// written element a build would stage, data words over the range limit or left to the GPU. Made
+// before GuestMemory::GpuMutex is taken, so these dispatches go to the old path without a second
+// lock; RecordFastDispatch makes them again under it.
+std::optional<FastDispatchDecline> FastDispatchPrecheck(const Context& context, const ShaderRecompiler::RecompileResult& shader);
 
 // F5's device half, under GuestMemory::GpuMutex: binds what ShaderResources would bind for a
 // compute shader without building one, then records the dispatch as VulkanDevice::recordDispatch
@@ -67,8 +77,10 @@ struct FastDispatchTiming {
 // command), the dispatch, the trailing barrier, and the marks MarkGpuWrites makes (pending reads
 // of every in-place range, pending writes, MarkWritten stamps and so PendingBlocks of the written
 // ones, dirty storage images); the batch keeps the pipeline, the images and the ring region.
-// Nothing needs completion work: what a build would copy or stage declines. Returns the decline
-// with nothing recorded, else nothing.
+// Nothing needs completion work: what a build would copy or stage declines. A full ring reaps the
+// batches that finished and asks once more, then declines (no GPU wait under the mutex). The
+// images and samplers resolved are released on every return. Returns the decline with nothing
+// recorded, else nothing.
 std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Recorder& recorder, const FastDispatchCall& call, FastDispatchTiming& timing);
 
 }

@@ -28,7 +28,7 @@ public:
         std::byte* data = nullptr;
     };
     // APS5_PROFILE_DRAW counters (cumulative): regions handed out and their bytes, wraps to the
-    // start, requests the ring could not serve before batches complete (the caller syncs) and
+    // start, requests the ring could not serve before batches complete (the caller reaps) and
     // requests larger than the ring.
     struct Stats {
         std::uint64_t allocations = 0;
@@ -44,7 +44,7 @@ public:
     FastRing& operator=(const FastRing&) = delete;
 
     // A region of `bytes` read by the batch `serial`, or none while the regions of unfinished
-    // batches leave no room (counted as full; the caller syncs, completes and asks again).
+    // batches leave no room (counted as full; the caller reaps finished batches and asks again).
     std::optional<Region> Allocate(VkDeviceSize bytes, std::uint64_t serial);
     // Every batch up to `serial` finished: their regions may be reused.
     void Complete(std::uint64_t serial);

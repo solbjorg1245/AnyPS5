@@ -77,6 +77,36 @@ bool allBuffersWritten() {
     return all;
 }
 
+// A guest buffer element's checks that need neither the lock nor an import, a function of its V#
+// words and the configuration (FastDispatchPrecheck before the lock, step 1 again under it): the
+// adjustment slot ShaderResources requires of every element of a shader with push constants
+// ("guest buffer offset lies outside the shader's push constants"), the reserved bit and type a
+// build rejects, the range limit, a written element a build would stage. An empty V# leaves
+// `element.bytes` 0: the device's placeholder binds.
+std::optional<Decline> checkBufferElement(const Context& context, const ShaderRecompiler::RecompileResult& shader, const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t index, BufferElement& element) {
+    element = {};
+    element.adjustmentByte = shader.memoryOffsetDword * 4u + index;
+    if (!shader.pushConstants.empty() && element.adjustmentByte >= shader.pushConstants.size()) return Decline::Invalid;
+    const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(index) * 4u, 4u);
+    if ((words[1] & 0x40000000u) != 0) return Decline::Invalid;
+    const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
+    if (descriptor.Type() != 0u) return Decline::Invalid;
+    const auto address = descriptor.Base48();
+    const auto bytes = descriptor.GetSize();
+    if (bytes == 0 || address == 0) {
+        if (context.emptyBuffer == VK_NULL_HANDLE) return Decline::Invalid;
+        return std::nullopt;
+    }
+    if (bytes > context.limits.maxStorageBufferRange || bytes > std::numeric_limits<std::uint64_t>::max() - address) return Decline::Invalid;
+    // An element the recompiler did not classify counts as written.
+    element.written = index >= binding.bufferWritten.size() || binding.bufferWritten[index] || allBuffersWritten();
+    const bool atomic = index < binding.bufferAtomic.size() && binding.bufferAtomic[index];
+    if (element.written && DeviceStagingWanted(bytes, atomic)) return Decline::Staged;
+    element.address = address;
+    element.bytes = bytes;
+    return std::nullopt;
+}
+
 }
 
 std::optional<FastDispatchDecline> FastComputeLayoutKey(const ShaderRecompiler::RecompileResult& shader, std::vector<std::uint32_t>& key) {
@@ -113,6 +143,22 @@ std::optional<FastDispatchDecline> FastComputeLayoutKey(const ShaderRecompiler::
     return std::nullopt;
 }
 
+std::optional<FastDispatchDecline> FastDispatchPrecheck(const Context& context, const ShaderRecompiler::RecompileResult& shader) {
+    for (const auto& binding : shader.bindings) {
+        if (binding.role == Role::GuestBuffers) {
+            if (binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) return Decline::Invalid;
+            for (std::uint32_t element = 0; element < binding.count; ++element) {
+                BufferElement checked;
+                if (const auto decline = checkBufferElement(context, shader, binding, element, checked)) return decline;
+            }
+        } else if (binding.role == Role::ShaderData || binding.role == Role::FlattenedSrt) {
+            if (binding.guestDescriptor.empty() || binding.guestDescriptor.size() * sizeof(std::uint32_t) > context.limits.maxStorageBufferRange) return Decline::Invalid;
+            if (!binding.deferredWords.empty()) return Decline::Deferred;
+        }
+    }
+    return std::nullopt;
+}
+
 std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Recorder& recorder, const FastDispatchCall& call, FastDispatchTiming& timing) {
     const auto& shader = *call.shader;
     const auto& layout = *call.layout;
@@ -128,6 +174,16 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
     scratch.keep.clear();
     scratch.dirty.clear();
     scratch.dataPatches.clear();
+    // The images and samplers resolved are the batch's once recorded (moved out below); on every
+    // other return they go now, not at this thread's next fast dispatch (VRAM held by an idle
+    // thread, objects outliving their device).
+    struct Release {
+        Scratch& scratch;
+        ~Release() {
+            scratch.keep.clear();
+            scratch.storage.clear();
+        }
+    } release{scratch};
     // The infos are sized up front: the writes point into them.
     std::size_t bufferCount = 0;
     std::size_t imageCount = 0;
@@ -151,29 +207,19 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
                 write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
                 write.pBufferInfo = scratch.buffers.data() + scratch.buffers.size();
                 for (std::uint32_t element = 0; element < binding.count; ++element) {
-                    const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4u, 4u);
-                    if ((words[1] & 0x40000000u) != 0) return Decline::Invalid;
-                    const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
-                    if (descriptor.Type() != 0u) return Decline::Invalid;
-                    const auto address = descriptor.Base48();
-                    const auto bytes = descriptor.GetSize();
-                    if (bytes == 0 || address == 0) {
+                    BufferElement resolved;
+                    if (const auto decline = checkBufferElement(context, shader, binding, element, resolved)) return decline;
+                    if (resolved.bytes == 0) {
                         // An empty V# binds the device's placeholder, as a build does.
-                        if (context.emptyBuffer == VK_NULL_HANDLE) return Decline::Invalid;
                         scratch.buffers.push_back({context.emptyBuffer, 0, EmptyBufferBytes});
                         continue;
                     }
-                    if (bytes > context.limits.maxStorageBufferRange || bytes > std::numeric_limits<std::uint64_t>::max() - address) return Decline::Invalid;
-                    // An element the recompiler did not classify counts as written.
-                    const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element] || allBuffersWritten();
-                    const bool atomic = element < binding.bufferAtomic.size() && binding.bufferAtomic[element];
-                    if (written && DeviceStagingWanted(bytes, atomic)) return Decline::Staged;
-                    if (!GuestMemory::DescribeCommitted(address, static_cast<std::size_t>(bytes)).whole) return Decline::Sparse;
-                    const auto adjustmentByte = shader.memoryOffsetDword * 4u + element;
-                    scratch.elements.push_back({address, bytes, scratch.buffers.size(), adjustmentByte, written});
+                    if (!GuestMemory::DescribeCommitted(resolved.address, static_cast<std::size_t>(resolved.bytes)).whole) return Decline::Sparse;
+                    resolved.info = scratch.buffers.size();
+                    scratch.elements.push_back(resolved);
                     scratch.buffers.push_back({});
-                    scratch.reads.emplace_back(address, address + bytes);
-                    if (written) scratch.written.emplace_back(address, address + bytes);
+                    scratch.reads.emplace_back(resolved.address, resolved.address + resolved.bytes);
+                    if (resolved.written) scratch.written.emplace_back(resolved.address, resolved.address + resolved.bytes);
                 }
             } else if (binding.role == Role::ShaderData || binding.role == Role::FlattenedSrt) {
                 if (binding.guestDescriptor.empty() || binding.guestDescriptor.size() * sizeof(std::uint32_t) > context.limits.maxStorageBufferRange) return Decline::Invalid;
@@ -232,7 +278,8 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
         return Decline::Image;
     }
     // 2. The ring regions of the data words, tagged with the open batch's serial: a full ring
-    // syncs once (counted), after which every region of the finished batches is free.
+    // reaps the batches that already finished (their releases free their regions) and asks once
+    // more, then declines (counted): no GPU wait under the mutex every queue takes.
     std::uint64_t serial = recorder.Submissions() + 1;
     if (!scratch.data.empty()) {
         if (context.fastRing == nullptr) return Decline::Ring;
@@ -249,9 +296,8 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
             }
             if (!full) break;
             if (attempt != 0) return Decline::Ring;
-            timing.ringSynced = true;
-            recorder.Sync();
-            ring.Complete(recorder.Submissions());
+            timing.ringFull = true;
+            recorder.Reap();
         }
         for (std::size_t i = 0; i < scratch.data.size(); ++i) {
             const auto& words = shader.bindings[scratch.data[i].binding].guestDescriptor;
@@ -274,14 +320,11 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
         const auto adjustment = static_cast<std::uint32_t>(offset % alignment);
         if (adjustment % 4 != 0 || element.bytes + adjustment > context.limits.maxStorageBufferRange) return Decline::Misaligned;
         if (adjustment != 0) {
-            // Where ShaderResources::buildComplete patches it: the push constant byte, else the
-            // byte of the shader data words.
-            if (!shader.pushConstants.empty()) {
-                if (element.adjustmentByte >= shader.pushConstants.size()) return Decline::Misaligned;
-                pushBytes[element.adjustmentByte] = static_cast<std::byte>(adjustment);
-            } else {
-                scratch.dataPatches.emplace_back(element.adjustmentByte, adjustment);
-            }
+            ++timing.adjusted;
+            // Where ShaderResources::buildComplete patches it: the push constant byte (its position
+            // was checked with the V#), else the byte of the shader data words.
+            if (!shader.pushConstants.empty()) pushBytes[element.adjustmentByte] = static_cast<std::byte>(adjustment);
+            else scratch.dataPatches.emplace_back(element.adjustmentByte, adjustment);
         }
         scratch.buffers[element.info] = {import->buffer, offset - adjustment, element.bytes + adjustment};
     }

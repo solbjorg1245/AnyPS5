@@ -21,8 +21,8 @@ namespace AgcDriver::DriverDetail {
 // direct reader, the walk's decline reasons and the compare of a walked result with an old one.
 
 // Why a stage's walk declined: the walk's own statuses, then the direct reader's reasons.
-enum class WalkDecline : std::uint8_t { NoSource, IncompletePlan, NoProgram, Bindless, UnsupportedRoot, OpFailed, Pending, Unmapped, QueuedLabel, Boundary, Failed, Count };
-inline constexpr std::array<const char*, static_cast<std::size_t>(WalkDecline::Count)> WalkDeclineNames{"no source", "incomplete plan", "no program", "bindless", "unsupported root", "op failed", "pending block", "unmapped", "queued label", "boundary", "failed"};
+enum class WalkDecline : std::uint8_t { NoSource, IncompletePlan, NoProgram, Bindless, UnsupportedRoot, OpFailed, Pending, Unmapped, QueuedLabel, PendingStorage, Boundary, Failed, Count };
+inline constexpr std::array<const char*, static_cast<std::size_t>(WalkDecline::Count)> WalkDeclineNames{"no source", "incomplete plan", "no program", "bindless", "unsupported root", "op failed", "pending block", "unmapped", "queued label", "pending storage", "boundary", "failed"};
 
 // What differed between the walk's populated variant and the old path's result.
 enum class WalkMismatch : std::uint8_t { Specialization, Variant, Layout, Buffer, Image, Sampler, Flat, Data, Other, Push, Vertex, Count };
@@ -41,9 +41,10 @@ struct FastReader {
 };
 
 // FastSrtRead (design section 2.3), an SrtRuntime reader over a FastReader: the null page reads
-// zero; a read in a pending block (Recorder::BlockPending), over a queued label of this thread or
-// in a page not mapped declines; otherwise a plain load of the live word (guest addresses are host
-// pointers). No page copy, no flush hook, no snapshot.
+// zero; a read in a pending block (Recorder::BlockPending), over a queued label of this thread, in
+// a page not mapped, or in a page the flush hook would first store storage-image results or
+// publish unit shadows into (the old capture's page read runs it) declines; otherwise a plain load
+// of the live word (guest addresses are host pointers). No page copy, no flush hook, no snapshot.
 bool FastSrtRead(void* context, std::uint64_t address, std::uint32_t* value);
 
 // The decline of a walk that ended with `status` (a read the reader declined names its reason).
@@ -61,8 +62,10 @@ struct WalkDifference {
 // The mismatch kinds of a walked result against the old one, as a bit mask (1 << WalkMismatch):
 // variant identity, layout, every binding word (a FlattenedSrt word the old capture left to the GPU
 // is skipped and counted in `deferredSkipped`; T# words differing only in the streaming-feedback
-// bits count in `feedbackOnly`) and the push constants.
-std::uint32_t CompareWalkedResults(const ShaderRecompiler::RecompileResult& old, const ShaderRecompiler::RecompileResult& walked, WalkDifference& first, std::uint64_t& feedbackOnly, std::uint64_t& deferredSkipped);
+// bits count in `feedbackOnly`) and the push constants. `deferredMismatch` (the fast dispatch,
+// which binds the words it walked): a binding the old capture left words of to the GPU differs,
+// whatever its placeholder holds, since the reader missed the write pending over them.
+std::uint32_t CompareWalkedResults(const ShaderRecompiler::RecompileResult& old, const ShaderRecompiler::RecompileResult& walked, WalkDifference& first, std::uint64_t& feedbackOnly, std::uint64_t& deferredSkipped, bool deferredMismatch = false);
 
 }
 
