@@ -36,6 +36,9 @@ public:
     // before, during and after the pass (GENERAL for resident targets, which then need no
     // transitions).
     Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    // The same on a pipeline layout the caller owns and keeps alive (FastLayouts: a push-descriptor
+    // set and the push range of PushConstantStages(shaders)); the pipeline does not destroy it.
+    Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, VkPipelineLayout layout, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     ~Pipeline();
     Pipeline(const Pipeline&) = delete;
     Pipeline& operator=(const Pipeline&) = delete;
@@ -57,10 +60,14 @@ private:
         VkExtent2D extent;
         std::shared_ptr<Framebuffer> framebuffer;
     };
+    // Both public constructors: a layout of `setLayout` and the push range is made and owned when
+    // `sharedLayout` is null.
+    Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, VkDescriptorSetLayout setLayout, VkPipelineLayout sharedLayout, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout);
     void release() noexcept;
     Context context;
     std::vector<VkShaderModule> _modules;
     VkPipelineLayout layout = VK_NULL_HANDLE;
+    bool ownsLayout = true;
     VkRenderPass renderPass = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     std::size_t attachments = 0;

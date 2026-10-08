@@ -18,6 +18,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastLayouts.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
 #ifdef _WIN32
@@ -300,6 +302,9 @@ struct VulkanDevice::State {
     bool drawIndirectFirstInstance = false;
     bool multiDrawIndirect = false;
     bool drawIndirectCount = false;
+    // VK_KHR_push_descriptor enabled and its limit (see Graphics::Context).
+    bool pushDescriptors = false;
+    std::uint32_t maxPushDescriptors = 0;
     // The device's resolved entry points (Graphics::DeviceFunctions) and the Graphics::Context
     // built once after setup (see graphicsContext); the context's pool reference is dropped before
     // the pool at teardown.
@@ -324,6 +329,10 @@ struct VulkanDevice::State {
     std::unique_ptr<Graphics::PipelineCache> pipelineCache;
     std::unique_ptr<Graphics::DescriptorCache> descriptorCache;
     std::unique_ptr<Graphics::SamplerCache> samplerCache;
+    // The fast path's push layouts and data ring (null without push descriptors; the ring also
+    // without APS5_FAST_DRAW).
+    std::unique_ptr<Graphics::FastLayouts> fastLayouts;
+    std::unique_ptr<Graphics::FastRing> fastRing;
     Graphics::ResourceCache& resourceCache = Graphics::SharedResourceCache();
     // Recorded dispatches that write a copied buffer (their results reach guest memory by a CPU
     // write-back when the batch is reaped), listed until that write-back ran. An indirect dispatch
@@ -605,6 +614,8 @@ struct VulkanDevice::State {
             Graphics::ClearCachedTextures(device);
             Graphics::ClearImageMirrors(device);
             patternBuffers.clear();
+            fastRing.reset();
+            fastLayouts.reset();
             descriptorCache.reset();
             emptyBuffer.reset();
             samplerCache.reset();
@@ -843,6 +854,18 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     // without it resolves such draws on the CPU.
     state->drawIndirectCount = hasExtension(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
     if (state->drawIndirectCount) deviceExtensions.push_back(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
+    // Push descriptors: the fast draw path (docs/design/draw-fastpath.md F3) records each draw's
+    // descriptors into the command buffer instead of copying a set. Nothing uses them until a fast
+    // path is switched on. Debug aid: APS5_NO_PUSH_DESCRIPTORS=1 leaves the extension off.
+    if (hasExtension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME) && std::getenv("APS5_NO_PUSH_DESCRIPTORS") == nullptr) {
+        VkPhysicalDevicePushDescriptorPropertiesKHR pushProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &pushProperties};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &properties);
+        state->maxPushDescriptors = pushProperties.maxPushDescriptors;
+        state->pushDescriptors = state->maxPushDescriptors != 0;
+        if (state->pushDescriptors) deviceExtensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+    }
+    APS5_LOG_OUT("Vulkan push descriptors enabled=%u max=%u", static_cast<unsigned>(state->pushDescriptors), state->maxPushDescriptors);
     // Guest memory is host memory: importing it lets address-based shaders use it in place instead of
     // copying every registered allocation per draw.
     if (hasExtension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) && std::getenv("APS5_NO_HOST_IMPORT") == nullptr) {
@@ -1084,6 +1107,21 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     state->colorTransfer = std::make_unique<Graphics::GpuColorTransfer>(graphicsContext());
     state->descriptorCache = std::make_unique<Graphics::DescriptorCache>(graphicsContext());
     state->samplerCache = std::make_unique<Graphics::SamplerCache>();
+    // The fast path's push layouts, and its data ring only when APS5_FAST_DRAW can use it: the ring
+    // costs APS5_FAST_RING_MIB of host memory, and the commit charge has no room to spare.
+    if (state->pushDescriptors) {
+        state->fastLayouts = std::make_unique<Graphics::FastLayouts>(graphicsContext());
+        const char* fastDraw = std::getenv("APS5_FAST_DRAW");
+        // A ring the device cannot allocate (APS5_FAST_RING_MIB above a heap or allocation limit)
+        // leaves the fast path without one, which then declines every draw, instead of failing the device.
+        if (fastDraw != nullptr && std::strcmp(fastDraw, "0") != 0 && Graphics::FastRing::ConfiguredBytes() != 0) {
+            try {
+                state->fastRing = std::make_unique<Graphics::FastRing>(graphicsContext(), Graphics::FastRing::ConfiguredBytes());
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[fastpath] no data ring of %llu MiB: %s\n", static_cast<unsigned long long>(Graphics::FastRing::ConfiguredBytes() >> 20u), error.what());
+            }
+        }
+    }
     state->recorder = std::make_unique<Graphics::Recorder>(graphicsContext(), state->timelineSemaphores);
     state->recorder->Activate();
     // The entry points every record site uses, resolved once (APS5_NO_PROC_TABLE=1: per call, as
@@ -2436,6 +2474,10 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.descriptorIndexing = state->descriptorIndexing;
     context.primitiveListRestart = state->primitiveListRestart;
     context.imageViewMinLod = state->imageViewMinLod;
+    context.pushDescriptors = state->pushDescriptors;
+    context.maxPushDescriptors = state->maxPushDescriptors;
+    context.fastLayouts = state->fastLayouts.get();
+    context.fastRing = state->fastRing.get();
     return context;
 }
 

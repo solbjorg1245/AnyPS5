@@ -6,6 +6,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ScratchLease.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastLayouts.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastRing.hpp"
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -1396,6 +1398,13 @@ void ShaderResources::reportDescriptorCaches() const {
     const auto samplerHits = context.samplerCache != nullptr ? context.samplerCache->Hits() : 0;
     const auto samplerMisses = context.samplerCache != nullptr ? context.samplerCache->Misses() : 0;
     std::fprintf(stderr, "[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools, samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
+    // The fast path's push layouts and data ring (draw-fastpath F3a; idle until a fast path uses them).
+    if (context.fastLayouts != nullptr) {
+        const auto layouts = context.fastLayouts->Counters();
+        const auto ring = context.fastRing != nullptr ? context.fastRing->Counters() : FastRing::Stats{};
+        const auto ringMiB = context.fastRing != nullptr ? static_cast<double>(context.fastRing->Capacity()) / 1048576.0 : 0.0;
+        std::fprintf(stderr, "[fastpath] plumbing: push descriptors max %u, push layouts %llu hits / %llu created / %llu over the limit; ring %.0f MiB: %llu regions %.1f MiB, %llu wraps, %llu full, %llu oversize\n", context.maxPushDescriptors, static_cast<unsigned long long>(layouts.hits), static_cast<unsigned long long>(layouts.created), static_cast<unsigned long long>(layouts.overLimit), ringMiB, static_cast<unsigned long long>(ring.allocations), static_cast<double>(ring.bytes) / 1048576.0, static_cast<unsigned long long>(ring.wraps), static_cast<unsigned long long>(ring.full), static_cast<unsigned long long>(ring.oversize));
+    }
 }
 
 std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool rebaseReadOnly) {
