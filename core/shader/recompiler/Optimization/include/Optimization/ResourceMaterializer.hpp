@@ -45,8 +45,9 @@ struct ResourceSpecialization {
 };
 
 // Why a bindless image table (a T# loaded from a table buffer at a runtime key) was not bound;
-// counted on the [bindless] line (APS5_PROFILE_DRAW).
-enum class BindlessRejection { Capacity, MaterialScan, NoEntry, Storage, NonUniform, ImageSlots, Count };
+// counted on the [bindless] line (APS5_PROFILE_DRAW). LoopEntry: a loop-counter table entry the
+// driver cannot decode (ResourceMaterializer::StrictLoopTables).
+enum class BindlessRejection { Capacity, MaterialScan, NoEntry, Storage, NonUniform, ImageSlots, LoopEntry, Count };
 
 // Image elements bound as null instead of failing the whole draw (APS5_NO_NULL_UNDECODABLE=1 fails
 // it as before): a T# whose words 5-6 ask for what the driver does not implement (array pitch,
@@ -67,6 +68,9 @@ public:
     static void CountBindlessRejection(BindlessRejection reason);
     // Whether undecodable image elements bind null (APS5_NO_NULL_UNDECODABLE unset).
     static bool NullUndecodable();
+    // Whether an undecodable entry of a loop-counter table fails the draw instead of binding null
+    // (APS5_NO_STRICT_LOOP_TABLES unset): the loop samples every entry up to its count.
+    static bool StrictLoopTables();
     // The elements bound as null for `reason` since the last call (the APS5_PROFILE_DRAW digest).
     static std::uint64_t TakeNullBound(NullBoundImage reason);
 };

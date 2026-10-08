@@ -306,10 +306,20 @@ private:
         return limit;
     }
 
+    // Whether a loop counter's exit test is also read from the block metadata, where the translator
+    // keeps a conditional branch's condition (it emits no BranchConditional instruction). Without
+    // it no exit test was ever found: every loop-counter table spanned the default limit and was
+    // read past its loop's bound (`for (i = 0; i < 3; i++)` captured 32 entries, the data after
+    // the T#s among them). APS5_NO_LOOP_EXIT_BOUND=1 leaves it so.
+    static bool LoopExitBound() {
+        static const bool enabled = std::getenv("APS5_NO_LOOP_EXIT_BOUND") == nullptr;
+        return enabled;
+    }
+
     // How many values a table key can take when nothing else bounds the table (0: unknown): a bit
     // index (the light and decal loops walk a wave-uniform mask with s_ff1), a masked value or a
     // loop counter.
-    static std::uint32_t KeyRange(IrValue* key) {
+    static std::uint32_t KeyRange(IrValue* key, const IrProgram& program) {
         key = key->Resolve();
         switch (key->Opcode()) {
             case IrOpcode::FindILsb32:
@@ -321,7 +331,7 @@ private:
                 }
                 return mask < 0x10000u ? mask + 1u : 0u;
             }
-            case IrOpcode::Phi: return LoopTableLimit() != 0u ? Detail::LoopCounterRange(key, LoopTableLimit()) : 0u;
+            case IrOpcode::Phi: return LoopTableLimit() != 0u ? Detail::LoopCounterRange(key, LoopTableLimit(), LoopExitBound() ? &program : nullptr) : 0u;
             default: return 0u;
         }
     }
@@ -484,10 +494,11 @@ private:
                 return false;
             }
             table.heapAddress = true;
-            table.entryLimit = KeyRange(key);
+            table.entryLimit = KeyRange(key, m_program);
             if (table.entryLimit == 0u) {
                 return false;
             }
+            table.loopKey = key->Resolve()->Opcode() == IrOpcode::Phi;
         }
         DescriptorSource heapSource;
         std::uint32_t heapSourceIndex = 0;
@@ -1173,7 +1184,7 @@ private:
 
 namespace Detail {
 
-std::uint32_t LoopCounterRange(IrValue* key, std::uint32_t limit) {
+std::uint32_t LoopCounterRange(IrValue* key, std::uint32_t limit, const IrProgram* program) {
     key = key->Resolve();
     if (!key->IsPhi()) {
         return 0u;
@@ -1257,46 +1268,87 @@ std::uint32_t LoopCounterRange(IrValue* key, std::uint32_t limit) {
     // Counting up: the loop's exit test, `counter OP immediate` (either side, possibly negated),
     // in a block that can leave the loop. A test elsewhere (an `if (i == 2)` in the body) is no
     // bound, and a value at or below the start is none either.
-    std::uint32_t bound = 0;
+    // The exit blocks' branch conditions: BranchConditional instructions (hand-built IR) and the
+    // conditional terminators of the block metadata, where the translator keeps them.
+    std::vector<IrValue*> conditions;
     for (const IrBlock* block : exits) {
         for (const IrValue* inst : block->Instructions()) {
-            if (inst->Opcode() != IrOpcode::BranchConditional || inst->ArgumentCount() == 0u) {
-                continue;
+            if (inst->Opcode() == IrOpcode::BranchConditional && inst->ArgumentCount() != 0u) {
+                conditions.push_back(inst->Argument(0));
             }
-            IrValue* condition = inst->Argument(0)->Resolve();
-            while (condition->Opcode() == IrOpcode::LogicalNot && condition->ArgumentCount() == 1u) {
-                condition = condition->Argument(0)->Resolve();
-            }
-            if (condition->ArgumentCount() != 2u) {
-                continue;
-            }
-            const bool left = std::ranges::find(members, condition->Argument(0)->Resolve()) != members.end();
-            const bool right = std::ranges::find(members, condition->Argument(1)->Resolve()) != members.end();
-            std::uint32_t value = 0;
-            if (left == right || !immediate(condition->Argument(left ? 1u : 0u), value)) {
-                continue;
-            }
-            // As `counter OP value`: the counter stays below the value for <, >= (the exit), ==
-            // and != (the exit or the loop test), and reaches it for <= and >.
-            bool inclusive = false;
-            switch (condition->Opcode()) {
-                case IrOpcode::ULessThan32:
-                case IrOpcode::SLessThan32:
-                case IrOpcode::UGreaterThanEqual32:
-                case IrOpcode::SGreaterThanEqual32: inclusive = !left; break;
-                case IrOpcode::ULessThanEqual32:
-                case IrOpcode::SLessThanEqual32:
-                case IrOpcode::UGreaterThan32:
-                case IrOpcode::SGreaterThan32: inclusive = left; break;
-                case IrOpcode::IEqual32:
-                case IrOpcode::INotEqual32: break;
-                default: continue;
-            }
-            if (value >= maxRange || value <= largestStart) {
-                continue;
-            }
-            bound = std::max(bound, inclusive ? value + 1u : value);
         }
+    }
+    if (program != nullptr && key->Parent() != nullptr && program->BlockOrder().size() == program->Metadata().blockInfo.size()) {
+        // The loop: the key's block (the header) and every block that reaches a back edge into it
+        // without passing it. A metadata test counts only where it can leave the loop (a successor
+        // outside): a body's `if (i < 2)` at a merge must not cut a loop that runs further.
+        std::vector<const IrBlock*> body {key->Parent()};
+        std::vector<const IrBlock*> pending;
+        for (std::size_t index = 0; index < key->ArgumentCount() && index < key->PhiBlockCount(); index++) {
+            std::uint32_t start = 0;
+            if (!immediate(key->Argument(index), start)) {
+                pending.push_back(key->PhiBlock(index));
+            }
+        }
+        while (!pending.empty()) {
+            const IrBlock* block = pending.back();
+            pending.pop_back();
+            if (block == nullptr || std::ranges::find(body, block) != body.end()) {
+                continue;
+            }
+            body.push_back(block);
+            for (const IrBlock* predecessor : block->Predecessors()) {
+                pending.push_back(predecessor);
+            }
+        }
+        const auto leavesLoop = [&](const IrBlock* block) {
+            return std::ranges::find(body, block) != body.end() && std::ranges::any_of(block->Successors(), [&](const IrBlock* successor) {
+                return std::ranges::find(body, successor) == body.end();
+            });
+        };
+        const auto& order = program->BlockOrder();
+        const auto& infos = program->Metadata().blockInfo;
+        for (std::size_t index = 0; index < order.size(); index++) {
+            if (infos[index].terminator.kind == TerminatorKind::ConditionalBranch && infos[index].condition != nullptr && std::ranges::find(exits, order[index]) != exits.end() && leavesLoop(order[index])) {
+                conditions.push_back(infos[index].condition);
+            }
+        }
+    }
+    std::uint32_t bound = 0;
+    for (IrValue* tested : conditions) {
+        IrValue* condition = tested->Resolve();
+        while (condition->Opcode() == IrOpcode::LogicalNot && condition->ArgumentCount() == 1u) {
+            condition = condition->Argument(0)->Resolve();
+        }
+        if (condition->ArgumentCount() != 2u) {
+            continue;
+        }
+        const bool left = std::ranges::find(members, condition->Argument(0)->Resolve()) != members.end();
+        const bool right = std::ranges::find(members, condition->Argument(1)->Resolve()) != members.end();
+        std::uint32_t value = 0;
+        if (left == right || !immediate(condition->Argument(left ? 1u : 0u), value)) {
+            continue;
+        }
+        // As `counter OP value`: the counter stays below the value for <, >= (the exit), == and
+        // != (the exit or the loop test), and reaches it for <= and >.
+        bool inclusive = false;
+        switch (condition->Opcode()) {
+            case IrOpcode::ULessThan32:
+            case IrOpcode::SLessThan32:
+            case IrOpcode::UGreaterThanEqual32:
+            case IrOpcode::SGreaterThanEqual32: inclusive = !left; break;
+            case IrOpcode::ULessThanEqual32:
+            case IrOpcode::SLessThanEqual32:
+            case IrOpcode::UGreaterThan32:
+            case IrOpcode::SGreaterThan32: inclusive = left; break;
+            case IrOpcode::IEqual32:
+            case IrOpcode::INotEqual32: break;
+            default: continue;
+        }
+        if (value >= maxRange || value <= largestStart) {
+            continue;
+        }
+        bound = std::max(bound, inclusive ? value + 1u : value);
     }
     return bound != 0u ? bound : limit;
 }
