@@ -509,17 +509,35 @@ void verifyBindlessTable() {
     const auto nullMapping = mappingOf(nullCapture->snapshot);
     require(std::vector<std::uint32_t>(nullMapping.begin(), nullMapping.begin() + 5) == std::vector<std::uint32_t>{2u, 0u, 0u, 1u, 1u}, "bindless: a null entry's key was mapped");
     require(nullCapture->snapshot.images[direct + 1u].dwords == heap[0], "bindless: a null entry's slot is not the pad");
-    // An entry whose words 5-6 ask for what the driver does not decode (an array pitch: the walk
-    // read past a T# array into the next struct) is a null entry too when
-    // APS5_NULL_UNDECODABLE=1 (opt-in) is set.
+    // Entries whose words 5-6 ask for what the driver does not decode (an array pitch: the walk
+    // read past a T# array into the next struct), with APS5_NULL_UNDECODABLE=1 (opt-in). One whose
+    // words 0-3 are no T# either (type 0) stays unmapped as without the switch, and is no null
+    // the switch bound (StrictTableEntries; counted as one with APS5_NO_STRICT_TABLE_ENTRIES=1).
+    // One the table maps (a texture in words 0-3) fails the capture as the driver's decode did,
+    // or binds null with APS5_NO_STRICT_TABLE_ENTRIES=1.
     if (ResourceMaterializer::NullUndecodable()) {
+        heap[2] = heap[1];
+        heap[2][3] &= 0x0fffffffu;
+        heap[2][5] = 1u;
+        static_cast<void>(ResourceMaterializer::TakeNullBound(NullBoundImage::TableUndecodable));
+        AgcDriver::ShaderMemory invalidMemory({});
+        const auto invalidCapture = invalidMemory.Capture(request);
+        const auto invalidMapping = mappingOf(invalidCapture->snapshot);
+        require(std::vector<std::uint32_t>(invalidMapping.begin(), invalidMapping.begin() + 5) == std::vector<std::uint32_t>{2u, 0u, 0u, 1u, 1u}, "bindless: an invalid entry with undecodable words 5-6 was mapped");
+        require(invalidCapture->snapshot.images[direct + 1u].dwords == heap[0], "bindless: an invalid entry's slot is not the pad");
+        require((ResourceMaterializer::TakeNullBound(NullBoundImage::TableUndecodable) == 0u) == ResourceMaterializer::StrictTableEntries(), "bindless: an entry the table never maps was counted as bound null");
+
         heap[2] = heap[1];
         heap[2][5] = 1u;
         AgcDriver::ShaderMemory pitchMemory({});
-        const auto pitchCapture = pitchMemory.Capture(request);
-        const auto pitchMapping = mappingOf(pitchCapture->snapshot);
-        require(std::vector<std::uint32_t>(pitchMapping.begin(), pitchMapping.begin() + 5) == std::vector<std::uint32_t>{2u, 0u, 0u, 1u, 1u}, "bindless: an undecodable entry's key was mapped");
-        require(pitchCapture->snapshot.images[direct + 1u].dwords == heap[0], "bindless: an undecodable entry's slot is not the pad");
+        if (ResourceMaterializer::StrictTableEntries()) {
+            expectFailure([&] { static_cast<void>(pitchMemory.Capture(request)); }, "bindless table entry is a texture", "bindless: a mapped texture with undecodable words 5-6 was bound null");
+        } else {
+            const auto pitchCapture = pitchMemory.Capture(request);
+            const auto pitchMapping = mappingOf(pitchCapture->snapshot);
+            require(std::vector<std::uint32_t>(pitchMapping.begin(), pitchMapping.begin() + 5) == std::vector<std::uint32_t>{2u, 0u, 0u, 1u, 1u}, "bindless: an undecodable entry's key was mapped");
+            require(pitchCapture->snapshot.images[direct + 1u].dwords == heap[0], "bindless: an undecodable entry's slot is not the pad");
+        }
         heap[2] = {};
     }
     materials[2][1] = 3u;
@@ -554,8 +572,9 @@ void verifyBindlessTable() {
 // keeps in the block metadata (APS5_NO_LOOP_EXIT_BOUND=1: the default limit). Every key below the
 // bound is sampled, so an entry the driver cannot decode (an array pitch) fails the capture rather
 // than binding null (ResourceMaterializer::StrictLoopTables; nulled with
-// APS5_NO_STRICT_LOOP_TABLES=1), while an entry past the bound is never read. The loop keys are
-// opt-in (APS5_LOOP_TABLE_KEYS=1, which main sets); skipped without them (the plan rejects the
+// APS5_NO_STRICT_LOOP_TABLES=1), while an entry past the bound is never read. The table binds
+// its bound's 3 slots, not the bindless slots (APS5_NO_LOOP_TABLE_SLOTS=1: those). The loop keys
+// are opt-in (APS5_LOOP_TABLE_KEYS=1, which main sets); skipped without them (the plan rejects the
 // key) or with fewer than 3 bindless slots.
 void verifyLoopCounterTable() {
     using namespace ShaderRecompiler;
@@ -616,14 +635,18 @@ void verifyLoopCounterTable() {
     require(tables == 1, "loop table: the table source was not planned");
     // Spanning the default limit, the capture reads the entry past the loop's bound too.
     if (std::getenv("APS5_NO_LOOP_EXIT_BOUND") != nullptr) return;
+    const std::uint32_t tableSlots = std::getenv("APS5_NO_LOOP_TABLE_SLOTS") == nullptr ? 3u : slots;
     const auto mappingOf = [&](const ResourceSnapshot& snapshot) {
-        require(snapshot.flattenedSrt.size() >= 1u + 2u * slots, "loop table: the mapping block is missing from the flattened SRT");
-        return std::vector<std::uint32_t>(snapshot.flattenedSrt.end() - static_cast<std::ptrdiff_t>(1u + 2u * slots), snapshot.flattenedSrt.end());
+        require(snapshot.flattenedSrt.size() >= 1u + 2u * tableSlots, "loop table: the mapping block is missing from the flattened SRT");
+        return std::vector<std::uint32_t>(snapshot.flattenedSrt.end() - static_cast<std::ptrdiff_t>(1u + 2u * tableSlots), snapshot.flattenedSrt.end());
     };
 
-    // Every key below the bound is mapped; the entry past it is never read.
+    // Every key below the bound is mapped; the entry past it is never read. The table holds the
+    // bound's slots: a draw sampling two loop tables at 48 slots needed 97 image slots of 64.
     AgcDriver::ShaderMemory memory({});
     const auto capture = memory.Capture(request);
+    const auto direct = static_cast<std::uint32_t>(plan->info.images.size());
+    require(capture->specialization.images.size() == direct + tableSlots - 1u && capture->snapshot.images.size() == direct + tableSlots - 1u, "loop table: the table does not bind its bound's slots");
     const auto mapping = mappingOf(capture->snapshot);
     require(std::vector<std::uint32_t>(mapping.begin(), mapping.begin() + 7) == std::vector<std::uint32_t>{3u, 0u, 0u, 1u, 1u, 2u, 2u}, "loop table: the keys below the loop's bound are not mapped in order");
     const auto regions = memory.Regions();

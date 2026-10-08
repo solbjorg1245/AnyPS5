@@ -46,8 +46,10 @@ struct ResourceSpecialization {
 
 // Why a bindless image table (a T# loaded from a table buffer at a runtime key) was not bound;
 // counted on the [bindless] line (APS5_PROFILE_DRAW). LoopEntry: a loop-counter table entry the
-// driver cannot decode (ResourceMaterializer::StrictLoopTables).
-enum class BindlessRejection { Capacity, MaterialScan, NoEntry, Storage, NonUniform, ImageSlots, LoopEntry, Count };
+// driver cannot decode (ResourceMaterializer::StrictLoopTables). TableEntry: a keyed table entry
+// the table maps (a texture in words 0-3) whose words 5-6 the driver cannot decode
+// (ResourceMaterializer::StrictTableEntries).
+enum class BindlessRejection { Capacity, MaterialScan, NoEntry, Storage, NonUniform, ImageSlots, LoopEntry, TableEntry, Count };
 
 // Image elements bound as null instead of failing the whole draw (opt-in, APS5_NULL_UNDECODABLE=1;
 // off by default, the draw fails as before): a T# whose words 5-6 ask for what the driver does not implement (array pitch,
@@ -71,6 +73,10 @@ public:
     // Whether an undecodable entry of a loop-counter table fails the draw instead of binding null
     // (APS5_NO_STRICT_LOOP_TABLES unset): the loop samples every entry up to its count.
     static bool StrictLoopTables();
+    // Whether a keyed table entry with undecodable words 5-6 binds null only where the table would
+    // not map it anyway (an invalid T#, another shape) and fails the draw where it would, as the
+    // driver's decode did (APS5_NO_STRICT_TABLE_ENTRIES unset; set: every such entry binds null).
+    static bool StrictTableEntries();
     // The elements bound as null for `reason` since the last call (the APS5_PROFILE_DRAW digest).
     static std::uint64_t TakeNullBound(NullBoundImage reason);
 };
