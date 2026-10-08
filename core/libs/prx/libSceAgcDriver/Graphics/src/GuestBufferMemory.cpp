@@ -2299,6 +2299,14 @@ bool GuestBufferMemory::gpuCopyEligible(const Region& region) const {
     return region.end - region.begin <= gpuCopyLimit();
 }
 
+bool DeviceStagingWanted(std::uint64_t bytes, bool atomic) {
+    // stagingEligible's size rules for a written element, without a region (the fast dispatch
+    // binds in place and declines what a build would stage).
+    if (!gpuCopiesEnabled()) return false;
+    if (atomic && atomicStagingEnabled() && bytes <= atomicStageMax()) return true;
+    return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= writtenShadowMax();
+}
+
 bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) const {
     if (!stagingAllowed || addressable || region.unstaged || !gpuCopiesEnabled() || region.sparse || region.mirror != nullptr) return false;
     const auto bytes = region.end - region.begin;

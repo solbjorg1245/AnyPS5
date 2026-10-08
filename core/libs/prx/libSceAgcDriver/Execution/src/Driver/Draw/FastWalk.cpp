@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastWalk.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastRead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -25,88 +26,6 @@ namespace AgcDriver::DriverDetail {
 namespace {
 
 using ShaderRecompiler::WalkStatus;
-
-// Why a stage's walk declined: the walk's own statuses, then the direct reader's reasons.
-enum class WalkDecline : std::uint8_t { NoSource, IncompletePlan, NoProgram, Bindless, UnsupportedRoot, OpFailed, Pending, Unmapped, QueuedLabel, Boundary, Failed, Count };
-constexpr std::array<const char*, static_cast<std::size_t>(WalkDecline::Count)> WalkDeclineNames{"no source", "incomplete plan", "no program", "bindless", "unsupported root", "op failed", "pending block", "unmapped", "queued label", "boundary", "failed"};
-
-// What differed between the walk's populated variant and the old path's result.
-enum class WalkMismatch : std::uint8_t { Specialization, Variant, Layout, Buffer, Image, Sampler, Flat, Data, Other, Push, Vertex, Count };
-constexpr std::array<const char*, static_cast<std::size_t>(WalkMismatch::Count)> WalkMismatchNames{"specialization", "variant", "layout", "buffer", "image", "sampler", "flat", "data", "other binding", "push", "vertex"};
-
-constexpr std::uint64_t NullPageBytes = 0x10000;
-constexpr std::uint64_t ReaderPageBytes = 0x1000;
-
-// The direct reader's state for one stage: the draw's registered regions (served first, as
-// ShaderMemory serves them), the page last found readable, and why a read declined.
-struct FastReader {
-    std::span<const DrawProgram> programs;
-    std::uint64_t page = std::numeric_limits<std::uint64_t>::max();
-    std::uint64_t reads = 0;
-    std::uint64_t queries = 0;
-    std::optional<WalkDecline> declined;
-};
-
-// FastSrtRead (design section 2.3): the null page reads zero; a read in a pending block, over a
-// queued label of this thread or in a page not mapped declines; otherwise a plain load of the live
-// word (guest addresses are host pointers). No page copy, no flush hook, no snapshot.
-bool fastSrtRead(void* context, std::uint64_t address, std::uint32_t* value) {
-    auto& reader = *static_cast<FastReader*>(context);
-    ++reader.reads;
-    if (address % sizeof(*value) != 0 || address > std::numeric_limits<std::uint64_t>::max() - sizeof(*value)) {
-        reader.declined = WalkDecline::Boundary;
-        return false;
-    }
-    for (const auto& program : reader.programs) {
-        for (const auto& region : program.memory) {
-            if (address < region.guestAddress || address - region.guestAddress >= region.bytes.size()) continue;
-            const auto offset = static_cast<std::size_t>(address - region.guestAddress);
-            if (region.bytes.size() - offset < sizeof(*value)) {
-                reader.declined = WalkDecline::Boundary;
-                return false;
-            }
-            std::memcpy(value, region.bytes.data() + offset, sizeof(*value));
-            return true;
-        }
-    }
-    if (address < NullPageBytes) {
-        *value = 0;
-        return true;
-    }
-    if (Graphics::Recorder::BlockPending(address)) {
-        reader.declined = WalkDecline::Pending;
-        return false;
-    }
-    if (Graphics::Recorder::QueuedLabelOverlapsThisThread(address, sizeof(*value))) {
-        reader.declined = WalkDecline::QueuedLabel;
-        return false;
-    }
-    const auto page = address & ~(ReaderPageBytes - 1);
-    if (page != reader.page) {
-        bool queried = false;
-        const bool readable = GuestMemory::ReadableWord(address, &queried);
-        if (queried) ++reader.queries;
-        if (!readable) {
-            reader.declined = WalkDecline::Unmapped;
-            return false;
-        }
-        reader.page = page;
-    }
-    std::memcpy(value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), sizeof(*value));
-    return true;
-}
-
-WalkDecline declineOf(WalkStatus status, const FastReader& reader) {
-    switch (status) {
-        case WalkStatus::NoSource: return WalkDecline::NoSource;
-        case WalkStatus::IncompletePlan: return WalkDecline::IncompletePlan;
-        case WalkStatus::NoProgram: return WalkDecline::NoProgram;
-        case WalkStatus::Bindless: return WalkDecline::Bindless;
-        case WalkStatus::UnsupportedRoot: return WalkDecline::UnsupportedRoot;
-        case WalkStatus::OpFailed: return WalkDecline::OpFailed;
-        default: return reader.declined.value_or(WalkDecline::Failed);
-    }
-}
 
 struct WalkCounters {
     std::uint64_t draws = 0, stages = 0, walked = 0, walkNs = 0, compareNs = 0, reads = 0, queries = 0;
@@ -156,82 +75,6 @@ bool sameVertexFetch(const ShaderRecompiler::ShaderVertexStageInfo& left, const 
         if (left.resources[i].fields != right.resources[i].fields || a.registerStart != b.registerStart || a.registersNum != b.registersNum || a.attrId != b.attrId || a.fetchIndex != b.fetchIndex) return false;
     }
     return true;
-}
-
-// A sampled image's T# words a hit may differ in (the streaming-feedback fields: word 5 bit 25,
-// word 6 bits 0-7; DispatchVariant::ignoredBits), which the old path keeps as stored.
-std::uint32_t feedbackBits(std::size_t word) {
-    if (word % 8 == 5) return 1u << 25u;
-    if (word % 8 == 6) return 0xffu;
-    return 0;
-}
-
-WalkMismatch mismatchOf(ShaderRecompiler::DescriptorRole role) {
-    using Role = ShaderRecompiler::DescriptorRole;
-    switch (role) {
-        case Role::GuestBuffers: return WalkMismatch::Buffer;
-        case Role::GuestImages: return WalkMismatch::Image;
-        case Role::GuestSamplers: return WalkMismatch::Sampler;
-        case Role::FlattenedSrt: return WalkMismatch::Flat;
-        case Role::ShaderData: return WalkMismatch::Data;
-        default: return WalkMismatch::Other;
-    }
-}
-
-// The first difference of a stage, for the report lines.
-struct WalkDifference {
-    WalkMismatch kind = WalkMismatch::Count;
-    std::size_t binding = 0;
-    std::size_t word = 0;
-    std::uint32_t old = 0;
-    std::uint32_t walked = 0;
-};
-
-// The mismatch kinds of the walk's result against the old one, as a bit mask.
-std::uint32_t compareResults(const ShaderRecompiler::RecompileResult& old, const ShaderRecompiler::RecompileResult& walked, WalkDifference& first, std::uint64_t& feedbackOnly, std::uint64_t& deferredSkipped) {
-    std::uint32_t kinds = 0;
-    const auto note = [&](WalkMismatch kind, std::size_t binding, std::size_t word, std::uint32_t oldWord, std::uint32_t walkedWord) {
-        if (kinds == 0) first = {kind, binding, word, oldWord, walkedWord};
-        kinds |= 1u << static_cast<unsigned>(kind);
-    };
-    if (old.variantId != walked.variantId) note(WalkMismatch::Variant, 0, 0, static_cast<std::uint32_t>(old.variantId), static_cast<std::uint32_t>(walked.variantId));
-    if (old.bindings.size() != walked.bindings.size()) {
-        note(WalkMismatch::Layout, old.bindings.size(), 0, 0, static_cast<std::uint32_t>(walked.bindings.size()));
-        return kinds;
-    }
-    for (std::size_t index = 0; index < old.bindings.size(); ++index) {
-        const auto& left = old.bindings[index];
-        const auto& right = walked.bindings[index];
-        if (left.kind != right.kind || left.role != right.role || left.descriptorSet != right.descriptorSet || left.binding != right.binding || left.count != right.count || left.guestDescriptor.size() != right.guestDescriptor.size()) {
-            note(WalkMismatch::Layout, index, 0, 0, 0);
-            continue;
-        }
-        const bool image = left.role == ShaderRecompiler::DescriptorRole::GuestImages && left.guestDescriptor.size() % 8 == 0;
-        bool feedback = false;
-        for (std::size_t word = 0; word < left.guestDescriptor.size(); ++word) {
-            const auto a = left.guestDescriptor[word];
-            const auto b = right.guestDescriptor[word];
-            if (a == b) continue;
-            // A word the old capture left to the GPU holds a placeholder there.
-            if (left.role == ShaderRecompiler::DescriptorRole::FlattenedSrt && std::any_of(left.deferredWords.begin(), left.deferredWords.end(), [&](const auto& deferred) { return deferred.first == word; })) {
-                ++deferredSkipped;
-                continue;
-            }
-            if (image && ((a ^ b) & ~feedbackBits(word)) == 0) {
-                feedback = true;
-                continue;
-            }
-            note(mismatchOf(left.role), index, word, a, b);
-            break;
-        }
-        if (feedback) ++feedbackOnly;
-    }
-    if (old.pushConstants != walked.pushConstants) {
-        std::size_t at = 0;
-        while (at < old.pushConstants.size() && at < walked.pushConstants.size() && old.pushConstants[at] == walked.pushConstants[at]) ++at;
-        note(WalkMismatch::Push, 0, at, 0, 0);
-    }
-    return kinds;
 }
 
 void report(WalkCounters& total, std::uint32_t every) {
@@ -303,18 +146,18 @@ void ShadowWalkDraw(const FastWalkDraw& draw) {
             FastReader reader{draw.programs};
             ShaderRecompiler::SrtRuntime runtime;
             runtime.userContext = &reader;
-            runtime.readMemory = &fastSrtRead;
-            runtime.readSpecializationMemory = &fastSrtRead;
-            runtime.expressRead = &fastSrtRead;
+            runtime.readMemory = &FastSrtRead;
+            runtime.readSpecializationMemory = &FastSrtRead;
+            runtime.expressRead = &FastSrtRead;
             auto status = ShaderRecompiler::WalkResources(*handle, program.userData, program.binary.codeAddress, runtime, scratch.snapshot, scratch.specialization);
             // The vertex V#s the stage info is built from, through the same reader.
             const bool vertexFetch = status == WalkStatus::Walked && draw.vertexInfos[i].has_value() && program.binary.stage != Stage::Fragment;
-            if (vertexFetch && !Graphics::ResolveVertexFetch(fetchPlanFor(scratch, program), program.userData, &fastSrtRead, &reader, scratch.vertex)) status = WalkStatus::ReadDeclined;
+            if (vertexFetch && !Graphics::ResolveVertexFetch(fetchPlanFor(scratch, program), program.userData, &FastSrtRead, &reader, scratch.vertex)) status = WalkStatus::ReadDeclined;
             local.walkNs += nanosecondsSince(started);
             local.reads += reader.reads;
             local.queries += reader.queries;
             if (status != WalkStatus::Walked) {
-                ++local.declines[static_cast<std::size_t>(declineOf(status, reader))];
+                ++local.declines[static_cast<std::size_t>(WalkDeclineOf(status, reader))];
                 continue;
             }
             ++local.walked;
@@ -325,7 +168,7 @@ void ShadowWalkDraw(const FastWalkDraw& draw) {
                 kinds = 1u << static_cast<unsigned>(WalkMismatch::Specialization);
                 first.kind = WalkMismatch::Specialization;
             } else {
-                kinds = compareResults(old, scratch.walked, first, local.feedbackOnly, local.deferredSkipped);
+                kinds = CompareWalkedResults(old, scratch.walked, first, local.feedbackOnly, local.deferredSkipped);
             }
             if (vertexFetch && !sameVertexFetch(*draw.vertexInfos[i], scratch.vertex)) {
                 if (kinds == 0) first.kind = WalkMismatch::Vertex;

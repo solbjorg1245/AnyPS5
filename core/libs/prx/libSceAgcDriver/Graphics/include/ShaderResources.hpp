@@ -34,6 +34,27 @@ std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, con
 bool StorageImageCached(const Context& context, const StorageTexture* image);
 bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddress);
 
+// One element of a shader's image bindings resolved without a ShaderResources build, for the fast
+// paths (docs/design/draw-fastpath.md 2.6, 2.9): what a build's stage B binds for it
+// (resolveImageBinding without the stage-A records). A sampled element: null T# words bind the null
+// texture, undecodable words throw (bind the null texture under APS5_NULL_UNDECODABLE=1), a
+// dimension the image shape rejects throws, and the texture is the texture cache's; `firstLayer`
+// says the descriptor binds FirstLayerView() (a 2D shape over an array) instead of View(). Under
+// GuestMemory::GpuMutex (the lookups may record uploads and wait for recorded work).
+std::shared_ptr<Texture> ResolveSampledImage(const Context& context, const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t element, bool& firstLayer);
+// A storage element: the storage cache's image of the surface (brought up to date) at the mip the
+// element addresses; consecutive identical elements address successive mips of one image, so
+// `previous` is the same binding's previous element (null for element 0). A written element notes
+// a depth surface write, as a build does; its image is marked dirty once the work is recorded.
+struct StorageImageElement {
+    std::shared_ptr<StorageTexture> image;
+    std::uint32_t mip = 0;
+    std::uint32_t mipOffset = 0;
+    bool firstLayer = false;
+    bool written = false;
+};
+StorageImageElement ResolveStorageImage(const Context& context, const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t element, const StorageImageElement* previous);
+
 // Defined in Texture.cpp beside the pending-results registry, for the fast Revalidate below: whether
 // a storage image other than `except` has results pending in [address, address + bytes).
 bool PendingStorageOverlaps(std::uint64_t address, std::size_t bytes, const StorageTexture* except);
