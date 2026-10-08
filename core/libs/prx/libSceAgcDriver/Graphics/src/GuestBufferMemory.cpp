@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <iterator>
 #include <map>
+#include <unordered_map>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -1925,6 +1926,8 @@ struct CopyStats {
     std::atomic<std::uint64_t> chained{0};
     std::atomic<std::uint64_t> chainedBytes{0};
     std::atomic<std::uint64_t> chainedInPlace{0};
+    // Regions of uses whose regions all stayed in their shadows: no copy pass recorded.
+    std::atomic<std::uint64_t> inPlacePasses{0};
     std::atomic<std::int64_t> lastStagingReport{0};
 };
 
@@ -2051,16 +2054,17 @@ void reportStaging() {
     lastStaged = staged;
     lastIn = in;
     lastOut = out;
-    const auto chained = stats.chained.load(), chainedBytes = stats.chainedBytes.load(), chainedInPlace = stats.chainedInPlace.load();
-    static std::uint64_t lastChained = 0, lastChainedBytes = 0, lastChainedInPlace = 0;
+    const auto chained = stats.chained.load(), chainedBytes = stats.chainedBytes.load(), chainedInPlace = stats.chainedInPlace.load(), inPlacePasses = stats.inPlacePasses.load();
+    static std::uint64_t lastChained = 0, lastChainedBytes = 0, lastChainedInPlace = 0, lastInPlacePasses = 0;
     const auto takenOver = stats.copyBacksTakenOver.load(), takenOverBytes = stats.copyBackBytesTakenOver.load();
     static std::uint64_t lastTakenOver = 0, lastTakenOverBytes = 0;
-    std::fprintf(stderr, "[buffers] staging chain (10 s): %llu copy-ins from the previous staging shadow (%.0f MiB off PCIe), %llu of them in the same shadow (no copy); %llu deferred copy-backs (%.0f MiB) taken over by the next use\n", static_cast<unsigned long long>(chained - lastChained), (chainedBytes - lastChainedBytes) / 1048576.0, static_cast<unsigned long long>(chainedInPlace - lastChainedInPlace), static_cast<unsigned long long>(takenOver - lastTakenOver), (takenOverBytes - lastTakenOverBytes) / 1048576.0);
+    std::fprintf(stderr, "[buffers] staging chain (10 s): %llu copy-ins from the previous staging shadow (%.0f MiB off PCIe), %llu of them in the same shadow (no copy; %llu in uses that recorded no copy pass); %llu deferred copy-backs (%.0f MiB) taken over by the next use\n", static_cast<unsigned long long>(chained - lastChained), (chainedBytes - lastChainedBytes) / 1048576.0, static_cast<unsigned long long>(chainedInPlace - lastChainedInPlace), static_cast<unsigned long long>(inPlacePasses - lastInPlacePasses), static_cast<unsigned long long>(takenOver - lastTakenOver), (takenOverBytes - lastTakenOverBytes) / 1048576.0);
     lastTakenOver = takenOver;
     lastTakenOverBytes = takenOverBytes;
     lastChained = chained;
     lastChainedBytes = chainedBytes;
     lastChainedInPlace = chainedInPlace;
+    lastInPlacePasses = inPlacePasses;
     reportStagedTop();
 }
 
@@ -2087,7 +2091,25 @@ struct StagedShadow {
 struct StagedShadows {
     HostMutex mutex;
     std::map<std::pair<std::uint64_t, std::uint64_t>, StagedShadow> entries;
+    // The ranges each shadow buffer is registered under: a take drops every entry its target holds
+    // without walking the registry (hundreds of entries, per staged region of every reuse).
+    std::unordered_multimap<const Buffer*, std::pair<std::uint64_t, std::uint64_t>> byBuffer;
 };
+
+// APS5_NO_SHADOW_INDEX=1 walks the registry for the target's entries as before.
+bool shadowIndexEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_SHADOW_INDEX") != nullptr;
+    return !disabled;
+}
+
+void unindexShadow(StagedShadows& shadows, const Buffer* buffer, std::pair<std::uint64_t, std::uint64_t> key) {
+    auto [first, last] = shadows.byBuffer.equal_range(buffer);
+    for (; first != last; ++first) {
+        if (first->second != key) continue;
+        shadows.byBuffer.erase(first);
+        return;
+    }
+}
 
 StagedShadows& stagedShadows() {
     static auto* shadows = new StagedShadows();
@@ -2114,10 +2136,20 @@ std::shared_ptr<Buffer> takeStagedShadow(const Recorder* recorder, std::uint64_t
             source = found->second.buffer;
             generation = found->second.generation;
         }
-        if (found != shadows.entries.end()) shadows.entries.erase(found);
-        for (auto it = shadows.entries.begin(); it != shadows.entries.end();) {
-            if (it->second.buffer.get() == target) it = shadows.entries.erase(it);
-            else ++it;
+        if (shadowIndexEnabled()) {
+            if (found != shadows.entries.end()) {
+                unindexShadow(shadows, found->second.buffer.get(), found->first);
+                shadows.entries.erase(found);
+            }
+            auto [first, last] = shadows.byBuffer.equal_range(target);
+            for (auto it = first; it != last; ++it) shadows.entries.erase(it->second);
+            shadows.byBuffer.erase(first, last);
+        } else {
+            if (found != shadows.entries.end()) shadows.entries.erase(found);
+            for (auto it = shadows.entries.begin(); it != shadows.entries.end();) {
+                if (it->second.buffer.get() == target) it = shadows.entries.erase(it);
+                else ++it;
+            }
         }
     }
     if (source == nullptr) return nullptr;
@@ -2128,8 +2160,19 @@ void registerStagedShadow(const Recorder* recorder, std::uint64_t begin, std::ui
     auto& shadows = stagedShadows();
     std::lock_guard lock(shadows.mutex);
     // A few hundred ranges in practice; a runaway set starts over.
-    if (shadows.entries.size() >= 4096) shadows.entries.clear();
-    shadows.entries[{begin, end}] = StagedShadow{recorder, std::move(buffer), generation};
+    if (shadows.entries.size() >= 4096) {
+        shadows.entries.clear();
+        shadows.byBuffer.clear();
+    }
+    if (!shadowIndexEnabled()) {
+        shadows.entries[{begin, end}] = StagedShadow{recorder, std::move(buffer), generation};
+        return;
+    }
+    const std::pair<std::uint64_t, std::uint64_t> key{begin, end};
+    auto& entry = shadows.entries[key];
+    if (entry.buffer != nullptr) unindexShadow(shadows, entry.buffer.get(), key);
+    shadows.byBuffer.emplace(buffer.get(), key);
+    entry = StagedShadow{recorder, std::move(buffer), generation};
 }
 
 }
@@ -2637,6 +2680,57 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         recorder->FlushKeyStoresOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin));
         recorder->FlushStoresOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin));
     }
+    // A region whose shadow is its own buffer, unchanged since its copy-back, copies nothing: its
+    // chain decision comes before the recording, and a use whose regions all stay in place records
+    // no copy pass (its barriers and timing) and snapshots no input. The previous use's copy-back
+    // was recorded with its trailing TRANSFER -> ALL_COMMANDS barrier (or wrote nothing), which
+    // orders this use's shaders after it; deferred copy-backs (APS5_DEFER_COPY_BACK) may not be
+    // recorded yet, so they keep the pass. APS5_NO_INPLACE_STAGING_SKIP=1 records the pass and the
+    // snapshots as before.
+    static const bool inPlaceSkip = std::getenv("APS5_NO_INPLACE_STAGING_SKIP") == nullptr;
+    std::vector<std::uint8_t> inPlace;
+    if (inPlaceSkip && stagingChainEnabled() && !deferring) {
+        inPlace.assign(copies.size(), 0);
+        bool allInPlace = true;
+        for (std::size_t index = 0; index < copies.size(); ++index) {
+            auto* region = copies[index];
+            if (!region->deviceLocal) {
+                allInPlace = false;
+                continue;
+            }
+            if (!chainDecided[index]) {
+                GuestMemory::CollectWrites(region->begin, static_cast<std::size_t>(region->end - region->begin));
+                region->chainGeneration = GuestMemory::TrackerGeneration();
+                chainShadows[index] = takeStagedShadow(recorder, region->begin, region->end, region->buffer.get());
+                chainDecided[index] = 1;
+            }
+            inPlace[index] = chainShadows[index] != nullptr && chainShadows[index] == region->buffer;
+            allInPlace = allInPlace && inPlace[index];
+        }
+        if (allInPlace) {
+            for (std::size_t index = 0; index < copies.size(); ++index) {
+                auto* region = copies[index];
+                recorder->Keep(region->buffer);
+                region->snapshot.clear();
+                traceStaged(region->begin, region->end, region->atomic);
+                if (profile) {
+                    const auto bytes = region->end - region->begin;
+                    Copies().chained.fetch_add(1, std::memory_order_relaxed);
+                    Copies().chainedBytes.fetch_add(bytes, std::memory_order_relaxed);
+                    Copies().chainedInPlace.fetch_add(1, std::memory_order_relaxed);
+                    Copies().inPlacePasses.fetch_add(1, std::memory_order_relaxed);
+                    Copies().gpuCopies.fetch_add(1, std::memory_order_relaxed);
+                    Copies().gpuCopyBytes.fetch_add(bytes, std::memory_order_relaxed);
+                    Copies().staged.fetch_add(1, std::memory_order_relaxed);
+                    Copies().stagedInBytes.fetch_add(bytes, std::memory_order_relaxed);
+                    if (region->atomic) Copies().stagedAtomic.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            if (traceStagingEnabled()) noteStagedBuild(recorder, copies);
+            reportStaging();
+            return;
+        }
+    }
     const auto commands = recorder->Commands();
     const auto timing = recorder->BeginGpuTiming(StagingCopyInKey);
     if (Recorder::BarrierValidate()) {
@@ -2655,12 +2749,13 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         std::vector<std::byte> expected;
         const auto address = region->begin;
         const auto batch = static_cast<unsigned long long>(recorder->Submissions() + 1);
-        const bool pendingWriter = recorder->PendingWriteOverlaps(address, static_cast<std::size_t>(bytes));
-        const bool writable = WritesOverlap(address, static_cast<std::size_t>(bytes));
+        const bool regionInPlace = !inPlace.empty() && inPlace[index];
+        const bool pendingWriter = !regionInPlace && recorder->PendingWriteOverlaps(address, static_cast<std::size_t>(bytes));
+        const bool writable = !regionInPlace && WritesOverlap(address, static_cast<std::size_t>(bytes));
         std::shared_ptr<Buffer> inputSnapshot;
         auto copySource = region->copySource;
         auto copyOffset = region->begin - region->copySourceBase;
-        if (!pendingWriter && !writable) {
+        if (!regionInPlace && !pendingWriter && !writable) {
             inputSnapshot = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             std::memcpy(inputSnapshot->Bytes().data(), reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes));
             copySource = inputSnapshot->Handle();
@@ -2714,7 +2809,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 CaptureTrace::Log("copy-input-result batch=%llu address=%llx bytes=%zu changed=%zu", batch, static_cast<unsigned long long>(address), expected.size(), changed);
             });
         }
-        if (inputSnapshot == nullptr) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
+        if (inputSnapshot == nullptr && !regionInPlace) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
         // Kept by the batch at record time, as every other recorded target is: the caller keeps
         // the resources only after descriptor and pipeline work that may throw, and a released
         // buffer would go back to the pool (reused or destroyed) under this copy command. The
