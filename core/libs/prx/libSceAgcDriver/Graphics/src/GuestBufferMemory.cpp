@@ -1373,6 +1373,23 @@ bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t
     return state.device == context.device && findImport(state, address, address + bytes) != nullptr;
 }
 
+bool HostImportExisting(const Context& context, std::uint64_t address, std::size_t bytes, VkBuffer& buffer, std::uint64_t& base) {
+    if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    const auto* entry = state.device == context.device ? findImport(state, address, address + bytes) : nullptr;
+    if (entry == nullptr) return false;
+    buffer = entry->buffer;
+    base = entry->base;
+    return true;
+}
+
+std::uint64_t HostImportsEpoch() {
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    return state.epoch;
+}
+
 GuestBufferMemory::GuestBufferMemory(const Context& context) : context(context) {}
 
 bool GuestBufferMemory::WritesOverlap(std::uint64_t address, std::size_t bytes) const {
@@ -3080,6 +3097,11 @@ VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std:
     Require(bytes + adjustment <= context.limits.maxStorageBufferRange, "guest buffer view exceeds descriptor range limit");
     const auto handle = region.direct != nullptr ? region.direct->buffer : region.mirror != nullptr ? region.mirror->buffer->Handle() : region.buffer->Handle();
     return {handle, offset - adjustment, bytes + adjustment};
+}
+
+bool GuestBufferMemory::ServedInPlace(std::uint64_t address) const {
+    const auto* found = owner(address);
+    return found != nullptr && address < found->end && found->direct != nullptr;
 }
 
 ShaderRecompiler::BdaAbi::Range GuestBufferMemory::addressRange(const Region& region) {

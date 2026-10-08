@@ -82,6 +82,11 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
 // made outside the device lock (a sampled texture's path, a dispatch's pre-sync); the path taken
 // re-checks with HostImportFor when it binds the import.
 bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t bytes);
+// The existing import covering the range, as HostImportCovers finds it (nothing reconciled or
+// made): its buffer and base, copied under the registry lock.
+bool HostImportExisting(const Context& context, std::uint64_t address, std::size_t bytes, VkBuffer& buffer, std::uint64_t& base);
+// The import registry's epoch, bumped by every retire (one lock).
+std::uint64_t HostImportsEpoch();
 // Whether a readable registered allocation contains [address, address + bytes) right now (one
 // registry lease): a storage image whose memory was freed or re-registered has nothing to store to.
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes);
@@ -231,6 +236,9 @@ public:
     void UploadPrepare(bool addressable);
     void UploadFinish(bool addressable);
     VkDescriptorBufferInfo Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const;
+    // Whether the region owning `address` is read in place from its host import (Descriptor binds
+    // the import), not a copy or a mirror.
+    bool ServedInPlace(std::uint64_t address) const;
     std::vector<ShaderRecompiler::BdaAbi::Range> AddressRanges() const;
     // The BDA table of the cached address space when it serves this upload alone (an address-based
     // build with no region outside it): its ranges, immutable while the space lives, and the

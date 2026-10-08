@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastWalk.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -108,6 +109,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     auto& retry = snapshotRetry();
     const auto resumeRecord = retry.resumeRecord;
     const bool lockedPrepare = lockedPrepareAlways || retry.level >= 2;
+    // APS5_FAST_DRAW (FastDraw.cpp): the fast path takes the draw, or declines it to the path below.
+    if (FastDrawEnabled()) {
+        if (const auto verdict = fastDraw(queue, submission, drawParameters, rejected, traceIndirect, retry.level != 0 || lockedPrepare, ShaderRecompiler::DebugProbeActive() || dumpTarget != 0 || dumpSlot1 != 0, phaseTiming)) return *verdict == DrawVerdict::Drawn ? drawn() : *verdict;
+    }
+    // A comparison the fast path armed for this draw (APS5_FAST_DRAW_VERIFY) ends with it.
+    const FastDrawVerifyScope verifyScope;
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
     std::shared_ptr<VulkanDevice> localDevice;
     if (lockedPrepare) {
@@ -355,6 +362,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         ShadowWalkDraw({programs, roles, graphics, pixel, vertexInfos, linked, drawParameters, *localDevice, programResults, pushOffsets, (drawHit || hits.partial) && (hits.data || hits.partial || relocating != nullptr)});
         if (profile) phaseLap = std::chrono::steady_clock::now();
     }
+    // APS5_FAST_DRAW_VERIFY: the results bound above against the fast path's for this draw.
+    if (FastDrawVerifyPending()) VerifyFastDrawStages(programResults, (drawHit || hits.partial) && (hits.data || hits.partial || relocating != nullptr));
 
     cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, hits, fresh, drawKey, registerKey, decode, phaseTiming, relocating);
     // APS5_FAST_CENSUS: what the fast path would decline on, committed when the packet ends (F0).
@@ -542,7 +551,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();
     }
     std::shared_ptr<const DrawRecipe> recipe;
-    if (drawHit && !recipeStages.empty()) {
+    // A draw compared with the fast path (APS5_FAST_DRAW_VERIFY) builds its resources: no recipe.
+    if (drawHit && !recipeStages.empty() && !Graphics::ThreadFastVerifyArmed()) {
         recipe = findDrawRecipe(drawKey.key, recipeStages);
         if (recipe == nullptr) VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
     }

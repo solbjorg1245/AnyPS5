@@ -1,8 +1,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastWalk.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libc/include/HostMutex.hpp"
@@ -28,8 +31,7 @@ namespace {
 
 using ShaderRecompiler::WalkStatus;
 
-// Why a stage's walk declined: the walk's own statuses, then the direct reader's reasons.
-enum class WalkDecline : std::uint8_t { NoSource, IncompletePlan, NoProgram, Bindless, UnsupportedRoot, OpFailed, Pending, Unmapped, QueuedLabel, Boundary, Failed, Count };
+using WalkDecline = FastWalkDecline;
 constexpr std::array<const char*, static_cast<std::size_t>(WalkDecline::Count)> WalkDeclineNames{"no source", "incomplete plan", "no program", "bindless", "unsupported root", "op failed", "pending block", "unmapped", "queued label", "boundary", "failed"};
 
 // What differed between the walk's populated variant and the old path's result.
@@ -47,11 +49,15 @@ struct FastReader {
     std::uint64_t reads = 0;
     std::uint64_t queries = 0;
     std::optional<WalkDecline> declined;
+    // The labels earlier packets of this thread's command buffer queued and nobody wrote yet.
+    const std::vector<DeferredLabel>* labels = &deferredLabels().labels;
 };
 
 // FastSrtRead (design section 2.3): the null page reads zero; a read in a pending block, over a
-// queued label of this thread or in a page not mapped declines; otherwise a plain load of the live
-// word (guest addresses are host pointers). No page copy, no flush hook, no snapshot.
+// queued label of this thread (noted or still deferred), in a page with storage-image results or
+// a unit shadow pending (the old capture's flush hook stores those first) or in a page not mapped
+// declines; otherwise a plain load of the live word (guest addresses are host pointers). No page
+// copy, no flush hook, no snapshot.
 bool fastSrtRead(void* context, std::uint64_t address, std::uint32_t* value) {
     auto& reader = *static_cast<FastReader*>(context);
     ++reader.reads;
@@ -83,8 +89,20 @@ bool fastSrtRead(void* context, std::uint64_t address, std::uint32_t* value) {
         reader.declined = WalkDecline::QueuedLabel;
         return false;
     }
+    // A deferred label is written only when the packet records its labels: the old path captures
+    // again after recording one over its reads (recordQueuedLabelsAfterCapture).
+    for (const auto& label : *reader.labels) {
+        if (address < label.address + label.size && label.address < address + sizeof(*value)) {
+            reader.declined = WalkDecline::QueuedLabel;
+            return false;
+        }
+    }
     const auto page = address & ~(ReaderPageBytes - 1);
     if (page != reader.page) {
+        if (Graphics::PendingStorageOverlaps(page, ReaderPageBytes, nullptr) || Graphics::AnyShadowedOverlaps(page, ReaderPageBytes)) {
+            reader.declined = WalkDecline::Pending;
+            return false;
+        }
         bool queried = false;
         const bool readable = GuestMemory::ReadableWord(address, &queried);
         if (queried) ++reader.queries;
@@ -202,7 +220,9 @@ struct WalkDifference {
 };
 
 // The mismatch kinds of the walk's result against the old one, as a bit mask.
-std::uint32_t compareResults(const ShaderRecompiler::RecompileResult& old, const ShaderRecompiler::RecompileResult& walked, WalkDifference& first, std::uint64_t& feedbackOnly, std::uint64_t& flatFeedback, std::uint64_t& deferredSkipped) {
+// `strictDeferred` (the fast draw's verify): a word the old capture deferred is a mismatch, as the
+// walk read it with a write still pending.
+std::uint32_t compareResults(const ShaderRecompiler::RecompileResult& old, const ShaderRecompiler::RecompileResult& walked, WalkDifference& first, std::uint64_t& feedbackOnly, std::uint64_t& flatFeedback, std::uint64_t& deferredSkipped, bool strictDeferred) {
     std::uint32_t kinds = 0;
     const auto note = [&](WalkMismatch kind, std::size_t binding, std::size_t word, std::uint32_t oldWord, std::uint32_t walkedWord) {
         if (kinds == 0) first = {kind, binding, word, oldWord, walkedWord};
@@ -218,6 +238,10 @@ std::uint32_t compareResults(const ShaderRecompiler::RecompileResult& old, const
         const auto& right = walked.bindings[index];
         if (left.kind != right.kind || left.role != right.role || left.descriptorSet != right.descriptorSet || left.binding != right.binding || left.count != right.count || left.guestDescriptor.size() != right.guestDescriptor.size()) {
             note(WalkMismatch::Layout, index, 0, 0, 0);
+            continue;
+        }
+        if (strictDeferred && !left.deferredWords.empty() && right.deferredWords.empty()) {
+            note(mismatchOf(left.role), index, left.deferredWords.front().first, 0, 0);
             continue;
         }
         const bool image = left.role == ShaderRecompiler::DescriptorRole::GuestImages && left.guestDescriptor.size() % 8 == 0;
@@ -377,7 +401,7 @@ void ShadowWalkDraw(const FastWalkDraw& draw) {
                 kinds = 1u << static_cast<unsigned>(WalkMismatch::Specialization);
                 first.kind = WalkMismatch::Specialization;
             } else {
-                kinds = compareResults(old, scratch.walked, first, local.feedbackOnly, local.flatFeedback, local.deferredSkipped);
+                kinds = compareResults(old, scratch.walked, first, local.feedbackOnly, local.flatFeedback, local.deferredSkipped, false);
             }
             if (vertexFetch && !sameVertexFetch(*draw.vertexInfos[i], scratch.vertex)) {
                 if (kinds == 0) first.kind = WalkMismatch::Vertex;
@@ -443,6 +467,41 @@ void ShadowWalkDraw(const FastWalkDraw& draw) {
     if (!profile || std::chrono::steady_clock::now() - total.lastReport < std::chrono::seconds(10)) return;
     report(total, every);
     total = WalkCounters{};
+}
+
+std::optional<FastWalkDecline> FastResolveVertex(std::span<const DrawProgram> programs, const DrawProgram& program, ShaderRecompiler::ShaderVertexStageInfo& info) {
+    auto& scratch = HostThreadLocal<WalkScratch, WalkScratchTag>();
+    FastReader reader{programs};
+    try {
+        if (Graphics::ResolveVertexFetch(fetchPlanFor(scratch, program), program.userData, &fastSrtRead, &reader, info)) return std::nullopt;
+    } catch (const std::exception&) {
+        return WalkDecline::Failed;
+    }
+    return reader.declined.value_or(WalkDecline::Failed);
+}
+
+std::optional<FastWalkDecline> FastWalkStage(std::span<const DrawProgram> programs, const ShaderRecompiler::SourceHandle& handle, const DrawProgram& program, ShaderRecompiler::ResourceSnapshot& snapshot, ShaderRecompiler::ResourceSpecialization& specialization) {
+    FastReader reader{programs};
+    ShaderRecompiler::SrtRuntime runtime;
+    runtime.userContext = &reader;
+    runtime.readMemory = &fastSrtRead;
+    runtime.readSpecializationMemory = &fastSrtRead;
+    runtime.expressRead = &fastSrtRead;
+    const auto status = ShaderRecompiler::WalkResources(handle, program.userData, program.binary.codeAddress, runtime, snapshot, specialization);
+    if (status == WalkStatus::Walked) return std::nullopt;
+    return declineOf(status, reader);
+}
+
+std::uint32_t CompareWalkedResult(const ShaderRecompiler::RecompileResult& old, const ShaderRecompiler::RecompileResult& walked, bool strictDeferred) {
+    WalkDifference first;
+    std::uint64_t feedbackOnly = 0;
+    std::uint64_t deferredSkipped = 0;
+    std::uint64_t flatFeedback = 0;
+    return compareResults(old, walked, first, feedbackOnly, flatFeedback, deferredSkipped, strictDeferred);
+}
+
+std::span<const char* const> FastWalkMismatchNames() {
+    return WalkMismatchNames;
 }
 
 }

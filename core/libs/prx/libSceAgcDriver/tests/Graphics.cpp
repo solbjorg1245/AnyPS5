@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastLayouts.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastRing.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastDraw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -1879,6 +1880,194 @@ void fastPlumbingTests() {
     Require(mock.destroyedPipelineLayouts.contains(sharedLayout) && mock.live == live, "push layout cache leaked or over-released Vulkan objects");
 }
 
+// The fast draw path's buffer resolver for these tests: every range is "imported" into one buffer
+// at its page offset plus 64 KiB (so the offset keeps the address's misalignment), except guestThird.
+VkBuffer fakeImport = VK_NULL_HANDLE;
+
+bool fakeResolve(const AgcDriver::Graphics::Context&, std::uint64_t address, std::size_t, VkBuffer& buffer, VkDeviceSize& offset) {
+    if (address == reinterpret_cast<std::uintptr_t>(guestThird.data())) return false;
+    buffer = fakeImport;
+    offset = 0x10000u + (address & 0xfffu);
+    return true;
+}
+
+ShaderRecompiler::DescriptorBinding readOnly(ShaderRecompiler::DescriptorBinding binding) {
+    binding.bufferWritten.assign(binding.count, false);
+    return binding;
+}
+
+// F3b (draw-fastpath.md): the fast bindings of a VS+PS in ShaderResources' plan order, the read-only
+// V#s in place with their adjustments in the shader data or the push constants, the data words in
+// the ring, the push layout and writes, the pipeline on the push layout, the declines, and the
+// verification against a ShaderResources set of the same stages.
+void fastDrawTests() {
+    using AgcDriver::Graphics::FastBindings;
+    using AgcDriver::Graphics::FastDecline;
+    using AgcDriver::Graphics::CompiledShader;
+    using Stage = ShaderRecompiler::ShaderStage;
+    const auto live = mock.live;
+    auto context = mockContext();
+    context.limits.minStorageBufferOffsetAlignment = 16;
+    context.limits.maxPushConstantsSize = 128;
+    context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    context.pushDescriptors = true;
+    context.maxPushDescriptors = 8;
+    context.emptyBuffer = makeHandle<VkBuffer>();
+    fakeImport = makeHandle<VkBuffer>();
+    const auto state = AgcDriver::Graphics::DecodeState(makeState());
+    ShaderRecompiler::RecompileResult vertex;
+    ShaderRecompiler::RecompileResult fragment;
+    vertex.variantId = 101;
+    fragment.variantId = 102;
+    // A read-only V# 4 bytes past an aligned offset and a null V#: no push constants, so the
+    // adjustment goes into the shader data, byte memoryOffsetDword * 4 + element.
+    vertex.bindings.push_back(readOnly(makeBinding(Role::GuestBuffers, 0, 2, join(vsharp(guestSecond.data() + 1, 8), vsharp(nullptr, 0)))));
+    vertex.bindings.push_back(makeBinding(Role::ShaderData, 5, 1, {7, 8, 9}));
+    vertex.memoryOffsetDword = 2;
+    // A read-only V# 12 bytes past: its adjustment goes into the stage's push constants.
+    fragment.pushConstants.assign(16, std::byte{0x5a});
+    fragment.memoryOffsetDword = 1;
+    fragment.bindings.push_back(makeBinding(Role::FlattenedSrt, 43, 1, {1, 2}));
+    fragment.bindings.push_back(readOnly(makeBinding(Role::GuestBuffers, 44, 1, vsharp(guestFirst.data() + 3, 4))));
+    const std::array<CompiledShader, 2> shaders{{{Stage::Vertex, &vertex, 0}, {Stage::Fragment, &fragment, 0}}};
+    {
+        FastBindings bindings;
+        Require(!bindings.Build(context, shaders, &state.color, &fakeResolve, false).has_value(), "fast bindings declined a read-only VS+PS");
+        {
+            AgcDriver::Graphics::ShaderResources resources(context, shaders, state.color, 0, 0);
+            Require(std::equal(resources.LayoutKey().begin(), resources.LayoutKey().end(), bindings.LayoutKey().begin(), bindings.LayoutKey().end()), "the fast bindings' layout key is not the ShaderResources one");
+        }
+        const auto buffers = bindings.Buffers();
+        const auto vertexOffset = 0x10000u + (reinterpret_cast<std::uintptr_t>(guestSecond.data() + 1) & 0xfffu);
+        const auto fragmentOffset = 0x10000u + (reinterpret_cast<std::uintptr_t>(guestFirst.data() + 3) & 0xfffu);
+        Require(buffers.size() == 5 && buffers[0].buffer == fakeImport && buffers[0].offset == vertexOffset - 4 && buffers[0].range == 12, "a misaligned read-only V# is not bound from the aligned offset below it");
+        Require(buffers[1].buffer == context.emptyBuffer && buffers[1].offset == 0 && buffers[1].range == AgcDriver::Graphics::EmptyBufferBytes, "a null V# is not bound to the null buffer");
+        Require(buffers[4].buffer == fakeImport && buffers[4].offset == fragmentOffset - 12 && buffers[4].range == 16, "the fragment V# is not bound in place");
+        Require(bindings.PushStages() == VK_SHADER_STAGE_FRAGMENT_BIT && bindings.PushBytes()[4] == std::byte{12} && bindings.PushBytes()[0] == std::byte{0x5a} && bindings.PushBytes()[5] == std::byte{0x5a}, "the fragment V#'s adjustment is not in its push constants");
+        Require(bindings.InPlaceReads().size() == 2, "the in-place reads are not the two read-only V#s");
+        const auto alignment = context.limits.minStorageBufferOffsetAlignment;
+        Require(bindings.DataBytes(alignment) == 32, "the data words do not take one aligned ring slot per binding");
+        AgcDriver::Graphics::FastRing ring(context, 1024);
+        const auto region = ring.Allocate(bindings.DataBytes(alignment), 1);
+        Require(region.has_value(), "the fast ring refused the data words");
+        const auto writes = bindings.Writes(&*region, alignment);
+        Require(writes.size() == 4 && writes[0].dstBinding == 0 && writes[0].descriptorCount == 2 && writes[1].dstBinding == 5 && writes[2].dstBinding == 43 && writes[3].dstBinding == 44, "one push write per binding in plan order is expected");
+        Require(writes[1].pBufferInfo->buffer == region->buffer && writes[1].pBufferInfo->offset == region->offset && writes[1].pBufferInfo->range == 12 && writes[2].pBufferInfo->offset == region->offset + 16 && writes[2].pBufferInfo->range == 8, "the data bindings are not bound to their ring slots");
+        const auto& ringBytes = bufferBytes(region->buffer);
+        const std::array<std::uint32_t, 3> data{7, 8, 4};
+        const std::array<std::uint32_t, 2> srt{1, 2};
+        Require(std::memcmp(ringBytes.data() + region->offset, data.data(), sizeof(data)) == 0 && std::memcmp(ringBytes.data() + region->offset + 16, srt.data(), sizeof(srt)) == 0, "the ring does not hold the data words with the vertex V#'s adjustment");
+        AgcDriver::Graphics::FastLayouts layouts(context);
+        const auto* layout = layouts.Get(bindings.LayoutKey(), bindings.PushStages());
+        Require(layout != nullptr && layout->descriptors == 5, "no push layout for the fast bindings");
+        AgcDriver::Graphics::PushDescriptors(context, VK_NULL_HANDLE, VK_PIPELINE_BIND_POINT_GRAPHICS, *layout, writes);
+        Require(mock.pushedLayout == layout->pipeline && mock.pushedWrites.size() == 4 && mock.pushedWrites[0].buffers.at(1).buffer == context.emptyBuffer && mock.pushedWrites[3].buffers.at(0).offset == fragmentOffset - 12, "the pushed writes are not the fast bindings");
+        // The pipeline on the push layout is cached under its own key.
+        AgcDriver::Graphics::State pipelineState{};
+        pipelineState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        const AgcDriver::Graphics::VertexInputLayout input{};
+        {
+            const auto first = AgcDriver::Graphics::CachedFastPipeline(context, pipelineState, input, *layout, bindings.LayoutKey(), shaders);
+            const auto again = AgcDriver::Graphics::CachedFastPipeline(context, pipelineState, input, *layout, bindings.LayoutKey(), shaders);
+            Require(first != nullptr && first == again && first->Layout() == layout->pipeline, "fast pipelines are not cached on their push layout");
+            AgcDriver::Graphics::ClearCachedPipelines(context.device);
+        }
+    }
+    Require(mock.live == live, "the fast bindings leaked or over-released Vulkan objects");
+
+    // What the fast path leaves to the old one.
+    const auto declineOf = [&](ShaderRecompiler::RecompileResult changed) {
+        const std::array<CompiledShader, 2> stages{{{Stage::Vertex, &changed, 0}, {Stage::Fragment, &fragment, 0}}};
+        FastBindings bindings;
+        return bindings.Build(context, stages, &state.color, &fakeResolve, false);
+    };
+    const auto changed = [&](auto mutate) {
+        auto result = vertex;
+        mutate(result);
+        return result;
+    };
+    Require(declineOf(changed([](auto& result) { result.bindings[0].bufferWritten[0] = true; })) == FastDecline::Written, "a written element was not declined");
+    Require(declineOf(changed([](auto& result) { result.bindings[0].bufferWritten.clear(); })) == FastDecline::Written, "an unclassified element was not declined as written");
+    Require(declineOf(changed([](auto& result) { result.bindings[0].bufferAtomic.assign(2, true); })) == FastDecline::Written, "an atomic element was not declined");
+    Require(declineOf(changed([](auto& result) { result.bindings[0].guestDescriptor = join(vsharp(guestThird.data(), 8), vsharp(nullptr, 0)); })) == FastDecline::NoImport, "a V# without an import was not declined");
+    Require(declineOf(changed([&](auto& result) { result.bindings[0].guestDescriptor = join(vsharp(reinterpret_cast<const void*>(state.color.address), 64), vsharp(nullptr, 0)); })) == FastDecline::Aliases, "a V# over the render target was not declined");
+    Require(declineOf(changed([](auto& result) { result.bindings[1].deferredWords.emplace_back(0, 0x1000); })) == FastDecline::DeferredWords, "deferred flat words were not declined");
+    Require(declineOf(changed([](auto& result) { result.bindings.pop_back(); })) == FastDecline::Misaligned, "an adjustment with neither push constants nor shader data was not declined");
+    Require(declineOf(changed([](auto& result) { result.bindings[1].binding = 0; })) == FastDecline::Unsupported, "a duplicate binding was not declined");
+    Require(declineOf(changed([](auto& result) {
+        auto binding = makeBinding(Role::BdaPagetable, 9, 1, {});
+        result.bindings.push_back(binding);
+    })) == FastDecline::AddressRole, "a BDA table was not declined");
+    Require(declineOf(changed([](auto& result) {
+        auto binding = makeBinding(Role::GuestImages, 9, 1, std::vector<std::uint32_t>(8, 0));
+        binding.kind = Kind::StorageImage;
+        result.bindings.push_back(binding);
+    })) == FastDecline::StorageImage, "a storage image was not declined");
+    Require(declineOf(changed([](auto& result) {
+        auto binding = makeBinding(Role::GuestSamplers, 9, 1, {0, 0, 0, 0});
+        binding.kind = Kind::Sampler;
+        binding.samplerDepthCompare.assign(1, false);
+        result.bindings.push_back(binding);
+    })) == FastDecline::NoSampler, "a sampler without the device's sampler cache was not declined");
+    // The structural part of those declines, known before the device lock (FastStructuralDecline).
+    const auto structuralOf = [&](ShaderRecompiler::RecompileResult changed) {
+        const std::array<CompiledShader, 2> stages{{{Stage::Vertex, &changed, 0}, {Stage::Fragment, &fragment, 0}}};
+        return AgcDriver::Graphics::FastStructuralDecline(stages);
+    };
+    Require(!structuralOf(vertex).has_value(), "the structural check declined a read-only VS+PS");
+    Require(structuralOf(changed([](auto& result) { result.bindings[0].bufferWritten[0] = true; })) == FastDecline::Written, "the structural check missed a written element");
+    Require(structuralOf(changed([](auto& result) { result.bindings[0].bufferAtomic.assign(2, true); })) == FastDecline::Written, "the structural check missed an atomic element");
+    Require(structuralOf(changed([](auto& result) { result.bindings[1].deferredWords.emplace_back(0, 0x1000); })) == FastDecline::DeferredWords, "the structural check missed deferred words");
+    Require(structuralOf(changed([](auto& result) { result.bindings.push_back(makeBinding(Role::BdaPagetable, 9, 1, {})); })) == FastDecline::AddressRole, "the structural check missed a BDA table");
+    Require(structuralOf(changed([](auto& result) {
+        auto binding = makeBinding(Role::GuestImages, 9, 1, std::vector<std::uint32_t>(8, 0));
+        binding.kind = Kind::StorageImage;
+        result.bindings.push_back(binding);
+    })) == FastDecline::StorageImage, "the structural check missed a storage image");
+    Require(!structuralOf(changed([](auto& result) { result.bindings[0].guestDescriptor = join(vsharp(guestThird.data(), 8), vsharp(nullptr, 0)); })).has_value(), "the structural check declined what only the resolver decides");
+
+    // APS5_FAST_DRAW_VERIFY: the fast bindings against the set ShaderResources builds.
+    {
+        ShaderRecompiler::RecompileResult dataOnly;
+        dataOnly.bindings.push_back(makeBinding(Role::ShaderData, 2, 1, {7, 8, 9}));
+        dataOnly.bindings.push_back(readOnly(makeBinding(Role::GuestBuffers, 3, 1, vsharp(nullptr, 0))));
+        auto other = dataOnly;
+        other.bindings[0].guestDescriptor = {7, 8, 10};
+        const std::array<CompiledShader, 1> same{{{Stage::Vertex, &dataOnly, 0}}};
+        const std::array<CompiledShader, 1> differing{{{Stage::Vertex, &other, 0}}};
+        static_cast<void>(AgcDriver::Graphics::TakeFastVerifyCounts());
+        {
+            AgcDriver::Graphics::ShaderResources resources(context, same, state.color, 0, 0);
+            AgcDriver::Graphics::ThreadFastVerifyArmed() = true;
+            AgcDriver::Graphics::VerifyFastBindings(context, resources, same, state.color, &fakeResolve);
+            Require(!AgcDriver::Graphics::ThreadFastVerifyArmed(), "the comparison stayed armed");
+            AgcDriver::Graphics::VerifyFastBindings(context, resources, differing, state.color, &fakeResolve);
+        }
+        const auto counts = AgcDriver::Graphics::TakeFastVerifyCounts();
+        Require(counts.compared == 2 && counts.matched == 1 && counts.data == 1 && counts.declined == 0 && counts.buffer == 0 && counts.copied == 0, "the fast bindings comparison miscounted");
+        // The mock has no host imports: ShaderResources copies the V#s, which counts apart, and the
+        // adjustments the copies do not need explain the data and push differences.
+        {
+            AgcDriver::Graphics::ShaderResources resources(context, shaders, state.color, 0, 0);
+            AgcDriver::Graphics::VerifyFastBindings(context, resources, shaders, state.color, &fakeResolve);
+        }
+        const auto copied = AgcDriver::Graphics::TakeFastVerifyCounts();
+        Require(copied.compared == 1 && copied.matched == 1 && copied.copied == 2 && copied.data == 0 && copied.push == 0 && copied.layout == 0, "buffers the old path copied were not counted apart");
+        // Only the copied elements' adjustment bytes are excused: another data word that differs
+        // still counts while buffers are copied.
+        {
+            auto otherVertex = vertex;
+            otherVertex.bindings[1].guestDescriptor[1] = 80;
+            const std::array<CompiledShader, 2> otherShaders{{{Stage::Vertex, &otherVertex, 0}, {Stage::Fragment, &fragment, 0}}};
+            AgcDriver::Graphics::ShaderResources resources(context, shaders, state.color, 0, 0);
+            AgcDriver::Graphics::VerifyFastBindings(context, resources, otherShaders, state.color, &fakeResolve);
+        }
+        const auto masked = AgcDriver::Graphics::TakeFastVerifyCounts();
+        Require(masked.compared == 1 && masked.matched == 0 && masked.copied == 2 && masked.data == 1 && masked.push == 0 && masked.buffer == 0, "a data difference beside a copied buffer was not counted");
+    }
+    Require(mock.live == live, "the fast draw verification leaked or over-released Vulkan objects");
+}
+
 int main() {
 #ifdef _WIN32
     _putenv_s("APS5_PIN_WAIT_MS", "200");
@@ -1926,6 +2115,8 @@ int main() {
         rectListTests();
         mock = MockVulkan{};
         fastPlumbingTests();
+        mock = MockVulkan{};
+        fastDrawTests();
         mock = MockVulkan{};
         auto bdaContext = mockContext();
         bdaContext.bufferDeviceAddress = true;
