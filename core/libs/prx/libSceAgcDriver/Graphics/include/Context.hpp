@@ -24,6 +24,8 @@ class Recorder;
 class DescriptorCache;
 class SamplerCache;
 class ShaderResources;
+class FastLayouts;
+class FastRing;
 
 inline void Require(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error("AGC graphics: " + reason);
@@ -71,6 +73,8 @@ struct DeviceFunctions {
     PFN_vkUpdateDescriptorSets updateDescriptorSets = nullptr;
     PFN_vkAllocateDescriptorSets allocateDescriptorSets = nullptr;
     PFN_vkGetFenceStatus getFenceStatus = nullptr;
+    // VK_KHR_push_descriptor (Context::pushDescriptors; null without it).
+    PFN_vkCmdPushDescriptorSetKHR cmdPushDescriptorSet = nullptr;
 };
 
 // Per-thread count of vkGetDeviceProcAddr lookups made through Context::Function (the [vk] line).
@@ -136,6 +140,13 @@ struct Context {
     bool descriptorIndexing = false;
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
+    // VK_KHR_push_descriptor enabled (debug aid APS5_NO_PUSH_DESCRIPTORS=1 leaves it off) and its
+    // maxPushDescriptors; the fast path's push layouts (with the extension) and data ring (only
+    // when APS5_FAST_DRAW asks for one), owned by the device. Off and null in tests.
+    bool pushDescriptors = false;
+    std::uint32_t maxPushDescriptors = 0;
+    FastLayouts* fastLayouts = nullptr;
+    FastRing* fastRing = nullptr;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

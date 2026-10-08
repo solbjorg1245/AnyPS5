@@ -1,6 +1,8 @@
 #include "BdaTests.hpp"
 #include "GraphicsTests.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastLayouts.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastRing.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -672,6 +674,7 @@ struct MockVulkan {
     std::map<VkBuffer, VkDeviceMemory> bufferMemory;
     std::map<VkDeviceMemory, std::vector<std::byte>> memories;
     std::vector<VkDescriptorSetLayoutBinding> layoutBindings;
+    VkDescriptorSetLayoutCreateFlags layoutFlags = 0;
     std::vector<VkDescriptorPoolSize> poolSizes;
     std::uint32_t poolMaxSets = 0;
     std::vector<MockDescriptorWrite> writes;
@@ -679,6 +682,12 @@ struct MockVulkan {
     std::uint32_t boundFirst = 0;
     VkPipelineBindPoint boundPoint = VK_PIPELINE_BIND_POINT_MAX_ENUM;
     std::map<VkPipelineLayout, VkDeviceSize> pipelineLayoutPushConstantSize;
+    std::map<VkPipelineLayout, VkDescriptorSetLayout> pipelineLayoutSets;
+    std::set<VkPipelineLayout> destroyedPipelineLayouts;
+    std::vector<VkPipelineLayout> graphicsPipelineLayouts;
+    VkPipelineLayout pushedLayout = VK_NULL_HANDLE;
+    VkPipelineBindPoint pushedPoint = VK_PIPELINE_BIND_POINT_MAX_ENUM;
+    std::vector<MockDescriptorWrite> pushedWrites;
     std::uint32_t pipelineCreateCount = 0;
     std::vector<std::array<std::uint32_t, 3>> pipelineSpecializations;
     VkPipeline boundPipeline = VK_NULL_HANDLE;
@@ -744,6 +753,7 @@ VKAPI_ATTR void VKAPI_CALL mockFreeMemory(VkDevice, VkDeviceMemory, const VkAllo
 VKAPI_ATTR VkResult VKAPI_CALL mockCreateDescriptorSetLayout(VkDevice, const VkDescriptorSetLayoutCreateInfo* info, const VkAllocationCallbacks*, VkDescriptorSetLayout* layout) {
     *layout = makeHandle<VkDescriptorSetLayout>();
     mock.layoutBindings.assign(info->pBindings, info->pBindings + info->bindingCount);
+    mock.layoutFlags = info->flags;
     ++mock.live;
     return VK_SUCCESS;
 }
@@ -795,12 +805,44 @@ VKAPI_ATTR VkDeviceAddress VKAPI_CALL mockGetBufferDeviceAddress(VkDevice, const
 VKAPI_ATTR VkResult VKAPI_CALL mockCreatePipelineLayout(VkDevice, const VkPipelineLayoutCreateInfo* info, const VkAllocationCallbacks*, VkPipelineLayout* layout) {
     *layout = makeHandle<VkPipelineLayout>();
     mock.pipelineLayoutPushConstantSize[*layout] = info->pushConstantRangeCount > 0 ? info->pPushConstantRanges[0].size : 0;
+    mock.pipelineLayoutSets[*layout] = info->setLayoutCount > 0 ? info->pSetLayouts[0] : VK_NULL_HANDLE;
     ++mock.live;
     return VK_SUCCESS;
 }
 
-VKAPI_ATTR void VKAPI_CALL mockDestroyPipelineLayout(VkDevice, VkPipelineLayout, const VkAllocationCallbacks*) {
+VKAPI_ATTR void VKAPI_CALL mockDestroyPipelineLayout(VkDevice, VkPipelineLayout layout, const VkAllocationCallbacks*) {
+    mock.destroyedPipelineLayouts.insert(layout);
     --mock.live;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockCreateRenderPass(VkDevice, const VkRenderPassCreateInfo*, const VkAllocationCallbacks*, VkRenderPass* pass) {
+    *pass = makeHandle<VkRenderPass>();
+    ++mock.live;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL mockDestroyRenderPass(VkDevice, VkRenderPass, const VkAllocationCallbacks*) {
+    --mock.live;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockCreateGraphicsPipelines(VkDevice, VkPipelineCache, std::uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks*, VkPipeline* pipelines) {
+    Require(count == 1, "mock expects exactly one graphics pipeline per call");
+    mock.graphicsPipelineLayouts.push_back(infos[0].layout);
+    *pipelines = makeHandle<VkPipeline>();
+    ++mock.live;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL mockCmdPushDescriptorSet(VkCommandBuffer, VkPipelineBindPoint point, VkPipelineLayout layout, std::uint32_t set, std::uint32_t count, const VkWriteDescriptorSet* writes) {
+    Require(set == 0, "push descriptors must target set zero");
+    mock.pushedLayout = layout;
+    mock.pushedPoint = point;
+    mock.pushedWrites.clear();
+    for (std::uint32_t i = 0; i < count; ++i) {
+        MockDescriptorWrite write{writes[i].dstBinding, writes[i].descriptorCount, writes[i].descriptorType, {}};
+        if (writes[i].pBufferInfo != nullptr) write.buffers.assign(writes[i].pBufferInfo, writes[i].pBufferInfo + writes[i].descriptorCount);
+        mock.pushedWrites.push_back(write);
+    }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockCreateShaderModule(VkDevice, const VkShaderModuleCreateInfo*, const VkAllocationCallbacks*, VkShaderModule* module) {
@@ -871,6 +913,10 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkCmdBindDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBindDescriptorSets)},
         {"vkCreatePipelineLayout", reinterpret_cast<PFN_vkVoidFunction>(mockCreatePipelineLayout)},
         {"vkDestroyPipelineLayout", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyPipelineLayout)},
+        {"vkCreateRenderPass", reinterpret_cast<PFN_vkVoidFunction>(mockCreateRenderPass)},
+        {"vkDestroyRenderPass", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyRenderPass)},
+        {"vkCreateGraphicsPipelines", reinterpret_cast<PFN_vkVoidFunction>(mockCreateGraphicsPipelines)},
+        {"vkCmdPushDescriptorSetKHR", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPushDescriptorSet)},
         {"vkCreateShaderModule", reinterpret_cast<PFN_vkVoidFunction>(mockCreateShaderModule)},
         {"vkDestroyShaderModule", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyShaderModule)},
         {"vkCreateComputePipelines", reinterpret_cast<PFN_vkVoidFunction>(mockCreateComputePipelines)},
@@ -1730,6 +1776,109 @@ void vertexCopyTests() {
     }
 }
 
+// Draw fast path F3a (docs/design/draw-fastpath.md): the data ring hands out aligned regions and
+// reuses one only after its batch completed; push layouts are identity-stable and respect the push
+// descriptor limit; a pipeline builds on a push layout without taking it over.
+void fastPlumbingTests() {
+    using AgcDriver::Graphics::FastLayouts;
+    using AgcDriver::Graphics::FastRing;
+    const auto live = mock.live;
+    Require(FastRing::ConfiguredBytes() == (64ull << 20u) || std::getenv("APS5_FAST_RING_MIB") != nullptr, "fast ring default size changed");
+    std::shared_ptr<void> lateRetirement;
+    {
+        auto context = mockContext();
+        context.limits.minStorageBufferOffsetAlignment = 64;
+        FastRing ring(context, 1000);
+        Require(ring.Capacity() == 960, "fast ring capacity is not a multiple of the offset alignment");
+        const auto first = ring.Allocate(100, 1);
+        const auto second = ring.Allocate(400, 1);
+        Require(first && second && first->offset == 0 && second->offset == 128 && second->bytes == 400, "fast ring regions are not aligned");
+        Require(first->buffer == second->buffer && second->data == first->data + 128, "fast ring regions are not parts of one mapped buffer");
+        std::memset(second->data, 0x5a, 400);
+        Require(mock.memories.at(mock.bufferMemory.at(second->buffer))[128] == std::byte{0x5a}, "a fast ring region is not the buffer's mapped memory");
+        // 400 more bytes would wrap onto batch 1's regions.
+        Require(!ring.Allocate(400, 2), "fast ring wrapped onto an unfinished batch");
+        const auto third = ring.Allocate(300, 2);
+        Require(third && third->offset == 576, "fast ring did not fill the end first");
+        Require(!ring.Allocate(400, 3), "fast ring reused a region before its batch completed");
+        ring.Complete(1);
+        const auto wrapped = ring.Allocate(400, 3);
+        Require(wrapped && wrapped->offset == 0, "fast ring did not reuse the regions of a completed batch");
+        {
+            auto retirement = ring.Retirement(2);
+            Require(!ring.Allocate(400, 3), "fast ring reused a region of a batch whose retirement is still kept");
+        }
+        const auto afterRetirement = ring.Allocate(400, 3);
+        Require(afterRetirement && afterRetirement->offset == 448, "a released retirement did not complete its batch");
+        expectFailure([&] { ring.Allocate(16, 2); }, "must not go backwards");
+        Require(!ring.Allocate(961, 3), "fast ring served a request larger than itself");
+        ring.Complete(3);
+        const auto whole = ring.Allocate(960, 4);
+        Require(whole && whole->offset == 0 && ring.InUse() == 960, "an idle fast ring did not restart at its beginning");
+        const auto counts = ring.Counters();
+        Require(counts.allocations == 6 && counts.bytes == 2560 && counts.wraps == 1 && counts.full == 3 && counts.oversize == 1, "fast ring counters are wrong");
+        lateRetirement = ring.Retirement(5);
+    }
+    lateRetirement.reset();
+    Require(mock.live == live, "fast ring leaked or over-released Vulkan objects");
+
+    auto context = mockContext();
+    const std::vector<std::uint32_t> key{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2, VK_SHADER_STAGE_VERTEX_BIT, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT};
+    {
+        FastLayouts disabled(context);
+        Require(disabled.Get(key, 0) == nullptr && mock.live == live, "a push layout was made without VK_KHR_push_descriptor");
+    }
+    context.pushDescriptors = true;
+    context.maxPushDescriptors = 3;
+    context.limits.maxPushConstantsSize = 128;
+    context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineLayout sharedLayout = VK_NULL_HANDLE;
+    {
+        FastLayouts layouts(context);
+        const auto* first = layouts.Get(key, VK_SHADER_STAGE_VERTEX_BIT);
+        Require(first != nullptr && first->descriptors == 3 && first->id == 1 && first->pushStages == VK_SHADER_STAGE_VERTEX_BIT, "push layout entry is wrong");
+        Require(mock.layoutFlags == VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR && mock.layoutBindings.size() == 2 && mock.layoutBindings[0].descriptorCount == 2 && mock.layoutBindings[0].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && mock.layoutBindings[1].binding == 1 && mock.layoutBindings[1].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && mock.layoutBindings[1].stageFlags == VK_SHADER_STAGE_FRAGMENT_BIT, "push set layout does not carry the layout key's bindings");
+        Require(mock.pipelineLayoutSets.at(first->pipeline) == first->set && mock.pipelineLayoutPushConstantSize.at(first->pipeline) == AgcDriver::Graphics::PipelinePushConstantBytes, "push pipeline layout lacks its set or the push range");
+        const auto set = first->set;
+        sharedLayout = first->pipeline;
+        Require(layouts.Get(key, VK_SHADER_STAGE_VERTEX_BIT) == first && first->set == set && first->pipeline == sharedLayout, "push layout cache is not identity-stable");
+        const auto* noPush = layouts.Get(key, 0);
+        Require(noPush != nullptr && noPush != first && noPush->id == 2 && mock.pipelineLayoutPushConstantSize.at(noPush->pipeline) == 0, "push constant stages do not separate push layouts");
+        auto wide = key;
+        wide[2] = 3;
+        Require(layouts.Get(wide, VK_SHADER_STAGE_VERTEX_BIT) == nullptr, "a push layout exceeded maxPushDescriptors");
+        Require(layouts.Get(key, VK_SHADER_STAGE_VERTEX_BIT) == first, "push layout cache lost an entry");
+        const auto counts = layouts.Counters();
+        Require(counts.hits == 2 && counts.created == 2 && counts.overLimit == 1, "push layout counters are wrong");
+
+        // One write per binding, recorded against the push layout.
+        const auto bound = makeHandle<VkBuffer>();
+        const std::array<VkDescriptorBufferInfo, 2> buffers{{{bound, 0, 16}, {bound, 64, 32}}};
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstBinding = 0;
+        write.descriptorCount = 2;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.pBufferInfo = buffers.data();
+        AgcDriver::Graphics::PushDescriptors(context, VK_NULL_HANDLE, VK_PIPELINE_BIND_POINT_GRAPHICS, *first, std::span(&write, 1));
+        Require(mock.pushedLayout == sharedLayout && mock.pushedPoint == VK_PIPELINE_BIND_POINT_GRAPHICS && mock.pushedWrites.size() == 1 && mock.pushedWrites[0].count == 2 && mock.pushedWrites[0].buffers.at(1).offset == 64 && mock.pushedWrites[0].buffers.at(1).range == 32, "push descriptors were not recorded as written");
+
+        // A pipeline on the push layout uses it and leaves it to the cache.
+        ShaderRecompiler::RecompileResult vertex;
+        ShaderRecompiler::RecompileResult fragment;
+        vertex.pushConstants.assign(4, std::byte{0});
+        const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+        AgcDriver::Graphics::State state{};
+        state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        const AgcDriver::Graphics::VertexInputLayout input{};
+        {
+            const AgcDriver::Graphics::Pipeline pipeline(context, state, input, sharedLayout, shaders);
+            Require(pipeline.Layout() == sharedLayout && !mock.graphicsPipelineLayouts.empty() && mock.graphicsPipelineLayouts.back() == sharedLayout, "pipeline was not built on the push layout");
+        }
+        Require(!mock.destroyedPipelineLayouts.contains(sharedLayout), "a pipeline destroyed the push layout it was given");
+    }
+    Require(mock.destroyedPipelineLayouts.contains(sharedLayout) && mock.live == live, "push layout cache leaked or over-released Vulkan objects");
+}
+
 int main() {
 #ifdef _WIN32
     _putenv_s("APS5_PIN_WAIT_MS", "200");
@@ -1775,6 +1924,8 @@ int main() {
         vertexCopyTests();
         pixelParameterSlotTests();
         rectListTests();
+        mock = MockVulkan{};
+        fastPlumbingTests();
         mock = MockVulkan{};
         auto bdaContext = mockContext();
         bdaContext.bufferDeviceAddress = true;
