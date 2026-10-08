@@ -1122,6 +1122,42 @@ void verifyTwoLaneUniformValues() {
     require(multiplies(32u) == oneLane, "two-lane uniform values: a two-lane invocation computes a scalar value once per lane");
 }
 
+// The fast walk's shadow compare (FastWalk.cpp) excuses a flattened SRT word that differs from the
+// old result's only as the flat copy of a sampled T#'s don't-care bits (FlatTsharpFeedbackCopy);
+// t387: binding 2 word 11 old 000000b0, walk 020000b0 and word 12 old 00000038, walk 000000e1.
+void verifyFlatTsharpFeedbackCopy() {
+    using namespace ShaderRecompiler;
+    const auto bindings = [](std::uint32_t word5, std::uint32_t word6, DescriptorKind kind) {
+        std::vector<DescriptorBinding> result(2);
+        result[0].kind = kind;
+        result[0].role = DescriptorRole::GuestImages;
+        result[0].count = 2;
+        result[0].guestDescriptor = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x1000, 0x2000, 0x3000, 0x4000, 0x5000, word5, word6, 0x8000};
+        result[1].kind = DescriptorKind::StorageBuffer;
+        result[1].role = DescriptorRole::FlattenedSrt;
+        result[1].count = 1;
+        result[1].guestDescriptor = {0x1000, 0x2000, 0x3000, 0x4000, 0x5000, word5, word6, 0x8000};
+        return result;
+    };
+    const auto old = bindings(0x000000b0u, 0x00000038u, DescriptorKind::SampledImage);
+    const auto walked = bindings(0x020000b0u, 0x000000e1u, DescriptorKind::SampledImage);
+    require(AgcDriver::FlatTsharpFeedbackCopy(old, walked, 0x000000b0u, 0x020000b0u), "a flat T# word 5 differing in bit 25 was not excused");
+    require(AgcDriver::FlatTsharpFeedbackCopy(old, walked, 0x00000038u, 0x000000e1u), "a flat T# word 6 differing in bits 0-7 was not excused");
+    require(!AgcDriver::FlatTsharpFeedbackCopy(old, walked, 0x000000b0u, 0x030000b0u), "a flat word differing beyond the mask was excused");
+    require(!AgcDriver::FlatTsharpFeedbackCopy(old, walked, 0x000000b0u, 0x000000b0u), "equal words were reported as a feedback copy");
+    require(!AgcDriver::FlatTsharpFeedbackCopy(old, walked, 0x00000040u, 0x02000040u), "a flat word no image element holds was excused");
+    // Word 4 of the T# carries no don't-care bits.
+    const auto oldWord4 = bindings(0x000000b0u, 0x00000038u, DescriptorKind::SampledImage);
+    auto walkedWord4 = oldWord4;
+    walkedWord4[0].guestDescriptor[12] = 0x02005000u;
+    require(!AgcDriver::FlatTsharpFeedbackCopy(oldWord4, walkedWord4, 0x5000u, 0x02005000u), "a T# word 4 difference was excused");
+    // A storage image has no feedback fields, and a layout that differs is never excused.
+    const auto storageOld = bindings(0x000000b0u, 0x00000038u, DescriptorKind::StorageImage);
+    const auto storageWalked = bindings(0x020000b0u, 0x000000e1u, DescriptorKind::StorageImage);
+    require(!AgcDriver::FlatTsharpFeedbackCopy(storageOld, storageWalked, 0x000000b0u, 0x020000b0u), "a storage image's word 5 was excused");
+    require(!AgcDriver::FlatTsharpFeedbackCopy(std::span(old).first(1), walked, 0x000000b0u, 0x020000b0u), "bindings of different counts were compared");
+}
+
 int main() {
     // The loop-counter table keys are opt-in in the driver; verifyLoopCounterTable covers them.
     // Set before the first plan reads it (ResourceTracker caches it).
@@ -1146,6 +1182,7 @@ int main() {
         verifyComputedTexelOffsets();
         verifyWaveUniformValues();
         verifyTwoLaneUniformValues();
+        verifyFlatTsharpFeedbackCopy();
 #if ANYPS5_ENABLE_SPIRV_TOOLS
         const std::vector<std::uint32_t> minimalSpirv{
             0x07230203u, 0x00010000u, 0u, 5u, 0u,

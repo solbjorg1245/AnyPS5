@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastWalk.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
@@ -18,6 +19,7 @@
 #include <limits>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
@@ -108,13 +110,25 @@ WalkDecline declineOf(WalkStatus status, const FastReader& reader) {
     }
 }
 
+// A stage's walk and compare time, by program (the costliest few are reported).
+struct ProgramCost {
+    std::uint64_t stages = 0, ns = 0;
+};
+
 struct WalkCounters {
     std::uint64_t draws = 0, stages = 0, walked = 0, walkNs = 0, compareNs = 0, reads = 0, queries = 0;
+    // walkNs split: the request and its source handle, the walk itself (WalkResources), the vertex
+    // V# fetch; compareNs split: populating the walked variant (the rest is the compare).
+    std::uint64_t handleNs = 0, materializeNs = 0, vertexNs = 0, populateNs = 0;
+    // Stages and their walk plus compare time by packet: [0] direct draws (DRAW_INDEX_OFFSET_2,
+    // DRAW_INDEX_AUTO), [1] indirect draws.
+    std::array<std::uint64_t, 2> kindStages{}, kindNs{};
     std::array<std::uint64_t, static_cast<std::size_t>(WalkDecline::Count)> declines{};
     // [0]: plain old results, [1]: results the old path bound by a heuristic.
     std::array<std::array<std::uint64_t, static_cast<std::size_t>(WalkMismatch::Count)>, 2> mismatches{};
     std::array<std::uint64_t, 2> stagesMismatched{};
-    std::uint64_t feedbackOnly = 0, deferredSkipped = 0, exceptions = 0;
+    std::uint64_t feedbackOnly = 0, flatFeedback = 0, deferredSkipped = 0, exceptions = 0;
+    std::unordered_map<std::uint64_t, ProgramCost> programs;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
@@ -188,7 +202,7 @@ struct WalkDifference {
 };
 
 // The mismatch kinds of the walk's result against the old one, as a bit mask.
-std::uint32_t compareResults(const ShaderRecompiler::RecompileResult& old, const ShaderRecompiler::RecompileResult& walked, WalkDifference& first, std::uint64_t& feedbackOnly, std::uint64_t& deferredSkipped) {
+std::uint32_t compareResults(const ShaderRecompiler::RecompileResult& old, const ShaderRecompiler::RecompileResult& walked, WalkDifference& first, std::uint64_t& feedbackOnly, std::uint64_t& flatFeedback, std::uint64_t& deferredSkipped) {
     std::uint32_t kinds = 0;
     const auto note = [&](WalkMismatch kind, std::size_t binding, std::size_t word, std::uint32_t oldWord, std::uint32_t walkedWord) {
         if (kinds == 0) first = {kind, binding, word, oldWord, walkedWord};
@@ -215,6 +229,13 @@ std::uint32_t compareResults(const ShaderRecompiler::RecompileResult& old, const
             // A word the old capture left to the GPU holds a placeholder there.
             if (left.role == ShaderRecompiler::DescriptorRole::FlattenedSrt && std::any_of(left.deferredWords.begin(), left.deferredWords.end(), [&](const auto& deferred) { return deferred.first == word; })) {
                 ++deferredSkipped;
+                continue;
+            }
+            // The flat copy of a sampled T# word the old stage compare accepted through its
+            // don't-care bits (FlatTsharpFeedbackCopy): the hit binds the stored word, the walk the
+            // live one (t387: every flat mismatch, plain and heuristic, was this).
+            if (left.role == ShaderRecompiler::DescriptorRole::FlattenedSrt && FlatTsharpFeedbackCopy(old.bindings, walked.bindings, a, b)) {
+                ++flatFeedback;
                 continue;
             }
             if (image && ((a ^ b) & ~feedbackBits(word)) == 0) {
@@ -249,11 +270,23 @@ void report(WalkCounters& total, std::uint32_t every) {
     }
     const auto stages = static_cast<double>(total.stages != 0 ? total.stages : 1);
     const auto walked = static_cast<double>(total.walked != 0 ? total.walked : 1);
-    std::fprintf(stderr, "[fastpath] walk (10 s, every %u draws): %llu draws, %llu stages, %llu walked (%.1f%%); walk %.2f us per stage, %.1f reads and %.2f page queries per stage; compare %.2f us per walked stage; declines: %s; mismatched stages %llu, after heuristic hits %llu; mismatches by kind (plain/heuristic): %s; T# feedback-only differences %llu, deferred words skipped %llu, exceptions %llu\n", every, count(total.draws), count(total.stages), count(total.walked), 100.0 * static_cast<double>(total.walked) / stages, static_cast<double>(total.walkNs) / 1000.0 / stages, static_cast<double>(total.reads) / stages, static_cast<double>(total.queries) / stages, static_cast<double>(total.compareNs) / 1000.0 / walked, declines.c_str(), count(total.stagesMismatched[0]), count(total.stagesMismatched[1]), kinds.c_str(), count(total.feedbackOnly), count(total.deferredSkipped), count(total.exceptions));
+    const auto perStage = [&](std::uint64_t ns) { return static_cast<double>(ns) / 1000.0 / stages; };
+    const auto perKind = [&](std::size_t kind) { return total.kindStages[kind] != 0 ? static_cast<double>(total.kindNs[kind]) / 1000.0 / static_cast<double>(total.kindStages[kind]) : 0.0; };
+    // The costliest programs of the window by walk plus compare time.
+    std::vector<std::pair<std::uint64_t, ProgramCost>> costliest(total.programs.begin(), total.programs.end());
+    const auto shown = std::min<std::size_t>(costliest.size(), 3);
+    std::partial_sort(costliest.begin(), costliest.begin() + static_cast<std::ptrdiff_t>(shown), costliest.end(), [](const auto& left, const auto& right) { return left.second.ns > right.second.ns; });
+    std::string programs;
+    for (std::size_t i = 0; i < shown; ++i) {
+        const auto& [program, cost] = costliest[i];
+        std::snprintf(item, sizeof(item), "%s0x%llx %llu stages %.1f us each (%.1f ms)", i == 0 ? " " : ", ", static_cast<unsigned long long>(program), count(cost.stages), cost.stages != 0 ? static_cast<double>(cost.ns) / 1000.0 / static_cast<double>(cost.stages) : 0.0, static_cast<double>(cost.ns) / 1e6);
+        programs += item;
+    }
+    std::fprintf(stderr, "[fastpath] walk (10 s, every %u draws): %llu draws, %llu stages, %llu walked (%.1f%%); walk %.2f us per stage (request and source handle %.2f, walk %.2f, vertex fetch %.2f), %.1f reads and %.2f page queries per stage; compare %.2f us per walked stage (populate %.2f); walk and compare us per stage by packet: direct draws %.2f over %llu stages, indirect draws %.2f over %llu stages; costliest programs:%s; declines: %s; mismatched stages %llu, after heuristic hits %llu; mismatches by kind (plain/heuristic): %s; T# feedback-only differences %llu, flat T# copies differing in feedback bits only %llu, deferred words skipped %llu, exceptions %llu\n", every, count(total.draws), count(total.stages), count(total.walked), 100.0 * static_cast<double>(total.walked) / stages, perStage(total.walkNs), perStage(total.handleNs), perStage(total.materializeNs), perStage(total.vertexNs), static_cast<double>(total.reads) / stages, static_cast<double>(total.queries) / stages, static_cast<double>(total.compareNs) / 1000.0 / walked, static_cast<double>(total.populateNs) / 1000.0 / walked, perKind(0), count(total.kindStages[0]), perKind(1), count(total.kindStages[1]), programs.empty() ? " none" : programs.c_str(), declines.c_str(), count(total.stagesMismatched[0]), count(total.stagesMismatched[1]), kinds.c_str(), count(total.feedbackOnly), count(total.flatFeedback), count(total.deferredSkipped), count(total.exceptions));
 }
 
-std::uint64_t nanosecondsSince(std::chrono::steady_clock::time_point started) {
-    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+std::uint64_t nanosecondsBetween(std::chrono::steady_clock::time_point started, std::chrono::steady_clock::time_point ended) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(ended - started).count());
 }
 
 }
@@ -275,6 +308,15 @@ void ShadowWalkDraw(const FastWalkDraw& draw) {
     using Role = ShaderRecompiler::ProgramRole;
     WalkCounters local;
     local.draws = 1;
+    // Each stage's walk plus compare time, for the by-packet and by-program rows.
+    const std::size_t packetKind = draw.drawParameters.indirect.has_value() ? 1 : 0;
+    std::array<std::pair<std::uint64_t, std::uint64_t>, 8> stageCosts{};
+    std::size_t stageCount = 0;
+    const auto noteStage = [&](std::uint64_t program, std::uint64_t ns) {
+        ++local.kindStages[packetKind];
+        local.kindNs[packetKind] += ns;
+        if (stageCount < stageCosts.size()) stageCosts[stageCount++] = {program, ns};
+    };
     try {
         auto& scratch = HostThreadLocal<WalkScratch, WalkScratchTag>();
         for (std::size_t i = 0; i < draw.programs.size() && i < draw.results.size(); ++i) {
@@ -282,6 +324,7 @@ void ShadowWalkDraw(const FastWalkDraw& draw) {
             const auto& program = draw.programs[i];
             const auto& old = *draw.results[i];
             ++local.stages;
+            const auto started = std::chrono::steady_clock::now();
             // The request compileDrawStage builds, without the memory regions (the walk reads live).
             const auto waveSize = program.binary.stage == Stage::Fragment ? draw.graphics.stages.fragmentWaveSize : draw.graphics.stages.vertexWaveSize;
             const auto pushOffset = draw.pushOffsets[i];
@@ -292,12 +335,14 @@ void ShadowWalkDraw(const FastWalkDraw& draw) {
                 {0, 0, pushOffset, (draw.graphics.stages.mesh ? ShaderRecompiler::MeshDrawPushOffsetBytes : Graphics::PipelinePushConstantBytes) - pushOffset},
                 ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, draw.linked, draw.graphics.stages.mesh, draw.graphics.stages.tessellation, {draw.drawParameters.indexAddress, draw.drawParameters.indexCount, draw.drawParameters.indexSize, draw.drawParameters.instanceCount}}
             };
-            const auto started = std::chrono::steady_clock::now();
             const std::string* poisoned = nullptr;
             const auto handle = SourceHandleFor(*program.snapshot, program.codeOffset, draw.device.Serial(), request, false, &poisoned);
+            const auto handled = std::chrono::steady_clock::now();
+            local.handleNs += nanosecondsBetween(started, handled);
             if (handle == nullptr) {
                 ++local.declines[static_cast<std::size_t>(WalkDecline::NoSource)];
-                local.walkNs += nanosecondsSince(started);
+                local.walkNs += nanosecondsBetween(started, handled);
+                noteStage(program.binary.codeAddress, nanosecondsBetween(started, handled));
                 continue;
             }
             FastReader reader{draw.programs};
@@ -307,31 +352,40 @@ void ShadowWalkDraw(const FastWalkDraw& draw) {
             runtime.readSpecializationMemory = &fastSrtRead;
             runtime.expressRead = &fastSrtRead;
             auto status = ShaderRecompiler::WalkResources(*handle, program.userData, program.binary.codeAddress, runtime, scratch.snapshot, scratch.specialization);
+            const auto materialized = std::chrono::steady_clock::now();
+            local.materializeNs += nanosecondsBetween(handled, materialized);
             // The vertex V#s the stage info is built from, through the same reader.
             const bool vertexFetch = status == WalkStatus::Walked && draw.vertexInfos[i].has_value() && program.binary.stage != Stage::Fragment;
             if (vertexFetch && !Graphics::ResolveVertexFetch(fetchPlanFor(scratch, program), program.userData, &fastSrtRead, &reader, scratch.vertex)) status = WalkStatus::ReadDeclined;
-            local.walkNs += nanosecondsSince(started);
+            const auto fetched = vertexFetch ? std::chrono::steady_clock::now() : materialized;
+            local.vertexNs += nanosecondsBetween(materialized, fetched);
+            local.walkNs += nanosecondsBetween(started, fetched);
             local.reads += reader.reads;
             local.queries += reader.queries;
             if (status != WalkStatus::Walked) {
                 ++local.declines[static_cast<std::size_t>(declineOf(status, reader))];
+                noteStage(program.binary.codeAddress, nanosecondsBetween(started, fetched));
                 continue;
             }
             ++local.walked;
-            const auto compareStarted = std::chrono::steady_clock::now();
             WalkDifference first;
             std::uint32_t kinds = 0;
-            if (!ShaderRecompiler::PopulateVariant(*handle, request, scratch.snapshot, scratch.specialization, scratch.walked)) {
+            const bool populated = ShaderRecompiler::PopulateVariant(*handle, request, scratch.snapshot, scratch.specialization, scratch.walked);
+            const auto populatedAt = std::chrono::steady_clock::now();
+            local.populateNs += nanosecondsBetween(fetched, populatedAt);
+            if (!populated) {
                 kinds = 1u << static_cast<unsigned>(WalkMismatch::Specialization);
                 first.kind = WalkMismatch::Specialization;
             } else {
-                kinds = compareResults(old, scratch.walked, first, local.feedbackOnly, local.deferredSkipped);
+                kinds = compareResults(old, scratch.walked, first, local.feedbackOnly, local.flatFeedback, local.deferredSkipped);
             }
             if (vertexFetch && !sameVertexFetch(*draw.vertexInfos[i], scratch.vertex)) {
                 if (kinds == 0) first.kind = WalkMismatch::Vertex;
                 kinds |= 1u << static_cast<unsigned>(WalkMismatch::Vertex);
             }
-            local.compareNs += nanosecondsSince(compareStarted);
+            const auto compared = std::chrono::steady_clock::now();
+            local.compareNs += nanosecondsBetween(fetched, compared);
+            noteStage(program.binary.codeAddress, nanosecondsBetween(started, compared));
             if (kinds == 0) continue;
             const auto column = draw.heuristic ? 1u : 0u;
             ++local.stagesMismatched[column];
@@ -355,6 +409,26 @@ void ShadowWalkDraw(const FastWalkDraw& draw) {
     total.walked += local.walked;
     total.walkNs += local.walkNs;
     total.compareNs += local.compareNs;
+    total.handleNs += local.handleNs;
+    total.materializeNs += local.materializeNs;
+    total.vertexNs += local.vertexNs;
+    total.populateNs += local.populateNs;
+    for (std::size_t column = 0; column < 2; ++column) {
+        total.kindStages[column] += local.kindStages[column];
+        total.kindNs[column] += local.kindNs[column];
+    }
+    // Bounded: a window with more programs than this keeps the first ones' costs.
+    constexpr std::size_t MaxPrograms = 4096;
+    for (std::size_t stage = 0; stage < stageCount; ++stage) {
+        const auto [program, ns] = stageCosts[stage];
+        auto found = total.programs.find(program);
+        if (found == total.programs.end()) {
+            if (total.programs.size() >= MaxPrograms) continue;
+            found = total.programs.emplace(program, ProgramCost{}).first;
+        }
+        ++found->second.stages;
+        found->second.ns += ns;
+    }
     total.reads += local.reads;
     total.queries += local.queries;
     for (std::size_t reason = 0; reason < total.declines.size(); ++reason) total.declines[reason] += local.declines[reason];
@@ -363,6 +437,7 @@ void ShadowWalkDraw(const FastWalkDraw& draw) {
         for (std::size_t kind = 0; kind < WalkMismatchNames.size(); ++kind) total.mismatches[column][kind] += local.mismatches[column][kind];
     }
     total.feedbackOnly += local.feedbackOnly;
+    total.flatFeedback += local.flatFeedback;
     total.deferredSkipped += local.deferredSkipped;
     total.exceptions += local.exceptions;
     if (!profile || std::chrono::steady_clock::now() - total.lastReport < std::chrono::seconds(10)) return;

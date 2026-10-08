@@ -911,4 +911,21 @@ bool SameDescriptorIgnoringTsharpBits(const ShaderRecompiler::DescriptorBinding&
     return true;
 }
 
+bool FlatTsharpFeedbackCopy(std::span<const ShaderRecompiler::DescriptorBinding> left, std::span<const ShaderRecompiler::DescriptorBinding> right, std::uint32_t leftWord, std::uint32_t rightWord) {
+    constexpr std::size_t TsharpWords = 8;
+    if (leftWord == rightWord || left.size() != right.size()) return false;
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        const auto& a = left[index];
+        const auto& b = right[index];
+        const auto sampled = [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::GuestImages && binding.kind == ShaderRecompiler::DescriptorKind::SampledImage; };
+        if (!sampled(a) || !sampled(b) || a.guestDescriptor.size() != b.guestDescriptor.size()) continue;
+        for (std::size_t element = 0; element + TsharpWords <= a.guestDescriptor.size(); element += TsharpWords) {
+            for (const auto& [word, mask] : {std::pair{std::size_t{5}, TsharpWord5IgnoredBits}, std::pair{std::size_t{6}, TsharpWord6IgnoredBits}}) {
+                if (a.guestDescriptor[element + word] == leftWord && b.guestDescriptor[element + word] == rightWord && ((leftWord ^ rightWord) & ~mask) == 0) return true;
+            }
+        }
+    }
+    return false;
+}
+
 }
