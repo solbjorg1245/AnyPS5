@@ -19,7 +19,8 @@ namespace AgcDriver::DriverDetail {
 // F2 of the draw fast path (docs/design/draw-fastpath.md section 2.3), shadow mode:
 // APS5_FAST_WALK=N walks the stages of every Nth draw again with the direct reader (live guest
 // words: no page copies, no snapshot; a read in a pending 64 KiB block (Recorder::BlockPending),
-// over a queued label of the thread or in an unmapped page declines), fetches the vertex V#s the
+// over a queued or deferred label of the thread, in a page with storage-image results or a unit
+// shadow pending or in an unmapped page declines), fetches the vertex V#s the
 // same way, populates the variant the walk's specialization selects and compares it with the
 // result the old path bound (its lookup or capture): bindings word by word, push constants,
 // variant identity, vertex V#s. Counted on the [fastpath] walk line every 10 s under
@@ -57,9 +58,10 @@ std::optional<FastWalkDecline> FastResolveVertex(std::span<const DrawProgram> pr
 // (ShaderRecompiler::WalkResources).
 std::optional<FastWalkDecline> FastWalkStage(std::span<const DrawProgram> programs, const ShaderRecompiler::SourceHandle& handle, const DrawProgram& program, ShaderRecompiler::ResourceSnapshot& snapshot, ShaderRecompiler::ResourceSpecialization& specialization);
 // The shadow walk's comparison of a populated result with the one the old path bound: a bit per
-// kind of FastWalkMismatchNames (0: equal; the T# streaming-feedback bits and the old capture's
-// deferred words are tolerated).
-std::uint32_t CompareWalkedResult(const ShaderRecompiler::RecompileResult& old, const ShaderRecompiler::RecompileResult& walked);
+// kind of FastWalkMismatchNames (0: equal; the T# streaming-feedback bits are tolerated, and the
+// old capture's deferred words too unless `strictDeferred`: the fast draw binds what the walk read,
+// so a binding the old capture deferred words of is a mismatch there).
+std::uint32_t CompareWalkedResult(const ShaderRecompiler::RecompileResult& old, const ShaderRecompiler::RecompileResult& walked, bool strictDeferred = false);
 std::span<const char* const> FastWalkMismatchNames();
 
 }

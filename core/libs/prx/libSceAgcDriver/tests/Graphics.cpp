@@ -2009,6 +2009,22 @@ void fastDrawTests() {
         binding.samplerDepthCompare.assign(1, false);
         result.bindings.push_back(binding);
     })) == FastDecline::NoSampler, "a sampler without the device's sampler cache was not declined");
+    // The structural part of those declines, known before the device lock (FastStructuralDecline).
+    const auto structuralOf = [&](ShaderRecompiler::RecompileResult changed) {
+        const std::array<CompiledShader, 2> stages{{{Stage::Vertex, &changed, 0}, {Stage::Fragment, &fragment, 0}}};
+        return AgcDriver::Graphics::FastStructuralDecline(stages);
+    };
+    Require(!structuralOf(vertex).has_value(), "the structural check declined a read-only VS+PS");
+    Require(structuralOf(changed([](auto& result) { result.bindings[0].bufferWritten[0] = true; })) == FastDecline::Written, "the structural check missed a written element");
+    Require(structuralOf(changed([](auto& result) { result.bindings[0].bufferAtomic.assign(2, true); })) == FastDecline::Written, "the structural check missed an atomic element");
+    Require(structuralOf(changed([](auto& result) { result.bindings[1].deferredWords.emplace_back(0, 0x1000); })) == FastDecline::DeferredWords, "the structural check missed deferred words");
+    Require(structuralOf(changed([](auto& result) { result.bindings.push_back(makeBinding(Role::BdaPagetable, 9, 1, {})); })) == FastDecline::AddressRole, "the structural check missed a BDA table");
+    Require(structuralOf(changed([](auto& result) {
+        auto binding = makeBinding(Role::GuestImages, 9, 1, std::vector<std::uint32_t>(8, 0));
+        binding.kind = Kind::StorageImage;
+        result.bindings.push_back(binding);
+    })) == FastDecline::StorageImage, "the structural check missed a storage image");
+    Require(!structuralOf(changed([](auto& result) { result.bindings[0].guestDescriptor = join(vsharp(guestThird.data(), 8), vsharp(nullptr, 0)); })).has_value(), "the structural check declined what only the resolver decides");
 
     // APS5_FAST_DRAW_VERIFY: the fast bindings against the set ShaderResources builds.
     {
@@ -2037,6 +2053,17 @@ void fastDrawTests() {
         }
         const auto copied = AgcDriver::Graphics::TakeFastVerifyCounts();
         Require(copied.compared == 1 && copied.matched == 1 && copied.copied == 2 && copied.data == 0 && copied.push == 0 && copied.layout == 0, "buffers the old path copied were not counted apart");
+        // Only the copied elements' adjustment bytes are excused: another data word that differs
+        // still counts while buffers are copied.
+        {
+            auto otherVertex = vertex;
+            otherVertex.bindings[1].guestDescriptor[1] = 80;
+            const std::array<CompiledShader, 2> otherShaders{{{Stage::Vertex, &otherVertex, 0}, {Stage::Fragment, &fragment, 0}}};
+            AgcDriver::Graphics::ShaderResources resources(context, shaders, state.color, 0, 0);
+            AgcDriver::Graphics::VerifyFastBindings(context, resources, otherShaders, state.color, &fakeResolve);
+        }
+        const auto masked = AgcDriver::Graphics::TakeFastVerifyCounts();
+        Require(masked.compared == 1 && masked.matched == 0 && masked.copied == 2 && masked.data == 1 && masked.push == 0 && masked.buffer == 0, "a data difference beside a copied buffer was not counted");
     }
     Require(mock.live == live, "the fast draw verification leaked or over-released Vulkan objects");
 }

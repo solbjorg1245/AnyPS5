@@ -13,6 +13,7 @@
 #include <cstring>
 #include <exception>
 #include <mutex>
+#include <tuple>
 
 namespace AgcDriver::Graphics {
 
@@ -20,7 +21,7 @@ namespace {
 
 constexpr std::array<const char*, static_cast<std::size_t>(FastDecline::Count)> FastDeclineNames{
     "indirect (APS5_FAST_DRAW_INDIRECT=0)", "debug mode", "snapshot retry", "no device", "decode", "shape", "no source", "walk: pending block", "walk: unmapped", "walk: queued label", "walk: no program", "walk: incomplete plan", "walk: bindless", "walk: other", "no variant", "push constants", "CPU-side indirect", "device replaced", "known rejection", "verify",
-    "not recordable", "no plumbing", "written element", "storage image", "address role", "deferred words", "unsupported binding", "over maxPushDescriptors", "aliases the target", "no import", "misaligned", "undecodable T#", "image shape", "no sampler cache", "non-resident target", "reads a target", "indirect records path", "rewritten records", "ring full", "thrown"};
+    "not recordable", "no plumbing", "written element", "storage image", "address role", "deferred words", "unsupported binding", "over maxPushDescriptors", "aliases the target", "no import", "misaligned", "undecodable T#", "image shape", "no sampler cache", "non-resident target", "reads a target", "indirect records path", "rewritten records", "ring full", "imports retired", "thrown"};
 
 bool overlaps(std::uint64_t first, std::uint64_t firstBytes, std::uint64_t second, std::uint64_t secondBytes) {
     return first < second + secondBytes && second < first + firstBytes;
@@ -44,6 +45,45 @@ bool HostImportResolver(const Context& context, std::uint64_t address, std::size
     return true;
 }
 
+bool HostImportPeekResolver(const Context& context, std::uint64_t address, std::size_t bytes, VkBuffer& buffer, VkDeviceSize& offset) {
+    std::uint64_t base = 0;
+    if (!HostImportExisting(context, address, bytes, buffer, base)) return false;
+    offset = address - base;
+    return true;
+}
+
+std::optional<FastDecline> FastStructuralDecline(std::span<const CompiledShader> shaders) {
+    using Role = ShaderRecompiler::DescriptorRole;
+    using Kind = ShaderRecompiler::DescriptorKind;
+    static const bool allWritten = std::getenv("APS5_ALL_BUFFERS_WRITTEN") != nullptr;
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) return FastDecline::Unsupported;
+        for (const auto& binding : shader.program->bindings) {
+            if (binding.descriptorSet != 0 || binding.count == 0 || binding.readOnly) return FastDecline::Unsupported;
+            switch (binding.role) {
+                case Role::GuestBuffers:
+                    for (std::uint32_t element = 0; element < binding.count; ++element) {
+                        const bool written = allWritten || element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+                        if (written || (element < binding.bufferAtomic.size() && binding.bufferAtomic[element])) return FastDecline::Written;
+                    }
+                    break;
+                case Role::ShaderData:
+                case Role::FlattenedSrt:
+                    if (!binding.deferredWords.empty()) return FastDecline::DeferredWords;
+                    break;
+                case Role::GuestImages:
+                    if (binding.kind == Kind::StorageImage || std::any_of(binding.imageWritten.begin(), binding.imageWritten.end(), [](bool written) { return written; })) return FastDecline::StorageImage;
+                    break;
+                case Role::GuestSamplers:
+                    break;
+                default:
+                    return FastDecline::AddressRole;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 std::optional<FastDecline> FastBindings::Build(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget* target, FastBufferResolver resolve, bool flush) {
     using Role = ShaderRecompiler::DescriptorRole;
     using Kind = ShaderRecompiler::DescriptorKind;
@@ -56,6 +96,7 @@ std::optional<FastDecline> FastBindings::Build(const Context& context, std::span
     layoutKey.clear();
     occupied.clear();
     inPlaceReads.clear();
+    sites.clear();
     objects.clear();
     viewed.clear();
     // APS5_ALL_BUFFERS_WRITTEN=1 (ShaderResources::addGuestBuffer): every element counts as written.
@@ -74,9 +115,9 @@ std::optional<FastDecline> FastBindings::Build(const Context& context, std::span
     images.reserve(imageCount);
     push = AssemblePushConstants(shaders);
     pushStages = PushConstantStages(shaders);
-    // A stage's adjustments for its ShaderData words (byte, adjustment), applied once its bindings
-    // are planned: the ShaderData binding may follow the guest buffers.
-    thread_local std::vector<std::pair<std::uint32_t, std::uint32_t>> dataPatches;
+    // A stage's adjustments for its ShaderData words (byte, adjustment, element in buffers),
+    // applied once its bindings are planned: the ShaderData binding may follow the guest buffers.
+    thread_local std::vector<std::tuple<std::uint32_t, std::uint32_t, std::size_t>> dataPatches;
     for (const auto& shader : shaders) {
         const auto& program = *shader.program;
         const auto flags = static_cast<std::uint32_t>(VulkanStage(shader.stage));
@@ -119,14 +160,16 @@ std::optional<FastDecline> FastBindings::Build(const Context& context, std::span
                         // difference added by the shader (push constants or shader data, buildComplete).
                         const auto adjustment = static_cast<std::uint32_t>(offset % alignment);
                         if (adjustment % 4 != 0 || size + adjustment > context.limits.maxStorageBufferRange) return FastDecline::Misaligned;
-                        if (adjustment != 0) {
-                            const auto position = program.memoryOffsetDword * 4u + element;
-                            if (!program.pushConstants.empty()) {
-                                if (position >= program.pushConstants.size() || shader.pushConstantOffset + position >= push.size()) return FastDecline::Unsupported;
+                        const auto position = program.memoryOffsetDword * 4u + element;
+                        if (!program.pushConstants.empty()) {
+                            const bool inside = position < program.pushConstants.size() && shader.pushConstantOffset + position < push.size();
+                            if (adjustment != 0) {
+                                if (!inside) return FastDecline::Unsupported;
                                 push[shader.pushConstantOffset + position] = static_cast<std::byte>(adjustment);
-                            } else {
-                                dataPatches.emplace_back(position, adjustment);
                             }
+                            if (inside) sites.push_back({buffers.size(), -1, shader.pushConstantOffset + position});
+                        } else {
+                            dataPatches.emplace_back(position, adjustment, buffers.size());
                         }
                         // Storage results pending in the range are stored into the import first, as
                         // UploadFinish does for a region it binds in place.
@@ -191,11 +234,17 @@ std::optional<FastDecline> FastBindings::Build(const Context& context, std::span
             layoutKey.insert(layoutKey.end(), {item.binding, static_cast<std::uint32_t>(item.type), item.count, flags});
         }
         // buildComplete: an adjustment without push constants goes into the stage's shader data.
-        for (const auto& [byte, adjustment] : dataPatches) {
+        for (const auto& [byte, adjustment, buffer] : dataPatches) {
+            if (adjustment == 0) {
+                // Nothing to patch; the site is still where verification excuses a copied element.
+                if (shaderData >= 0 && byte < data[static_cast<std::size_t>(shaderData)].words * sizeof(std::uint32_t)) sites.push_back({buffer, shaderData, byte});
+                continue;
+            }
             if (shaderData < 0) return FastDecline::Misaligned;
             const auto& part = data[static_cast<std::size_t>(shaderData)];
             if (byte >= part.words * sizeof(std::uint32_t)) return FastDecline::Unsupported;
             reinterpret_cast<std::byte*>(words.data() + part.first)[byte] = static_cast<std::byte>(adjustment);
+            sites.push_back({buffer, shaderData, byte});
         }
     }
     return std::nullopt;
@@ -306,7 +355,12 @@ void VerifyFastBindings(const Context& context, const ShaderResources& resources
     local.compared = 1;
     ScratchLease<FastBindings> fast;
     std::optional<FastDecline> declined;
+    // The old set's side first (it reads the old build's in-place regions), then the dry build.
+    std::vector<ShaderResources::BoundBinding> bound;
+    auto block = AssemblePushConstants(shaders);
     try {
+        bound = resources.BoundDescriptors();
+        resources.PatchPushConstants(block);
         declined = fast->Build(context, shaders, &target, resolve, false);
     } catch (const std::exception&) {
         declined = FastDecline::Thrown;
@@ -319,8 +373,10 @@ void VerifyFastBindings(const Context& context, const ShaderResources& resources
     if (declined) {
         local.declined = 1;
     } else {
-        const auto bound = resources.BoundDescriptors();
         const auto fastBindings = fast->Bindings();
+        // The fast elements whose old counterpart is a copy: their adjustment bytes are excused.
+        std::vector<std::size_t> copiedBuffers;
+        const auto excused = [&](const FastBindings::AdjustmentSite& site) { return std::find(copiedBuffers.begin(), copiedBuffers.end(), site.buffer) != copiedBuffers.end(); };
         if (bound.size() != fastBindings.size()) {
             note(&FastVerifyCounts::layout, bound.size(), fastBindings.size());
         } else {
@@ -334,15 +390,18 @@ void VerifyFastBindings(const Context& context, const ShaderResources& resources
                 for (std::size_t element = 0; element < old.elements.size(); ++element) {
                     const auto& was = old.elements[element];
                     if (item.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && item.data >= 0) {
-                        const auto words = fast->DataWords(item);
-                        if (was.data.size() < words.size_bytes() || std::memcmp(was.data.data(), words.data(), words.size_bytes()) != 0) note(&FastVerifyCounts::data, index, element);
+                        continue;
                     } else if (item.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
                         const auto& is = fast->Buffers()[item.first + element];
                         if (was.buffer.buffer == is.buffer && was.buffer.offset == is.offset && was.buffer.range == is.range) continue;
                         // The old path copies a range it does not bind in place (no import, or a
-                        // region start off the alignment): another buffer at offset zero.
-                        if (was.buffer.buffer != is.buffer && was.buffer.offset == 0) note(&FastVerifyCounts::copied, index, element);
-                        else note(&FastVerifyCounts::buffer, index, element);
+                        // region start off the alignment); one it binds in place must be the same.
+                        if (was.guest && !was.inPlace && is.buffer != context.emptyBuffer) {
+                            note(&FastVerifyCounts::copied, index, element);
+                            copiedBuffers.push_back(item.first + element);
+                        } else {
+                            note(&FastVerifyCounts::buffer, index, element);
+                        }
                     } else if (item.type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
                         if (was.view != fast->Images()[item.first + element].imageView) note(&FastVerifyCounts::image, index, element);
                     } else if (item.type == VK_DESCRIPTOR_TYPE_SAMPLER) {
@@ -350,12 +409,29 @@ void VerifyFastBindings(const Context& context, const ShaderResources& resources
                     }
                 }
             }
+            // The data words, once every copied element is known (a stage's ShaderData binding may
+            // come before its guest buffers).
+            std::vector<std::byte> expected;
+            for (std::size_t index = 0; index < bound.size(); ++index) {
+                const auto& item = fastBindings[index];
+                if (item.type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || item.data < 0 || bound[index].elements.size() != 1) continue;
+                const auto& was = bound[index].elements[0];
+                const auto words = std::as_bytes(fast->DataWords(item));
+                if (was.data.size() < words.size()) {
+                    note(&FastVerifyCounts::data, index, 0);
+                    continue;
+                }
+                expected.assign(was.data.begin(), was.data.begin() + static_cast<std::ptrdiff_t>(words.size()));
+                for (const auto& site : fast->AdjustmentSites()) {
+                    if (site.data == item.data && site.byte < expected.size() && excused(site)) expected[site.byte] = words[site.byte];
+                }
+                if (std::memcmp(expected.data(), words.data(), words.size()) != 0) note(&FastVerifyCounts::data, index, 0);
+            }
         }
-        auto block = AssemblePushConstants(shaders);
-        resources.PatchPushConstants(block);
+        for (const auto& site : fast->AdjustmentSites()) {
+            if (site.data < 0 && site.byte < block.size() && excused(site)) block[site.byte] = fast->PushBytes()[site.byte];
+        }
         if (block != fast->PushBytes()) note(&FastVerifyCounts::push, 0, 0);
-        // A copied buffer's adjustment is 0: the words that hold the in-place one differ.
-        if (local.copied != 0) local.data = local.push = 0;
         if (local.layout + local.buffer + local.data + local.image + local.sampler + local.push == 0) local.matched = 1;
     }
     fast->Release();

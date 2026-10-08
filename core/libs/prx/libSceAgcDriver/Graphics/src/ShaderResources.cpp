@@ -3443,6 +3443,8 @@ std::vector<ShaderResources::BoundBinding> ShaderResources::BoundDescriptors() c
                     if (allocation.guest) {
                         std::uint32_t adjustment = 0;
                         element.buffer = guestMemory.Descriptor(allocation.address, allocation.size, adjustment);
+                        element.guest = true;
+                        element.inPlace = guestMemory.ServedInPlace(allocation.address);
                     } else if (allocation.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
                         element.buffer = {context.emptyBuffer, 0, allocation.size};
                     } else if (allocation.buffer != nullptr) {

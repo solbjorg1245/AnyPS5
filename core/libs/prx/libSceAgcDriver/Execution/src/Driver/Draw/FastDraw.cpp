@@ -124,6 +124,8 @@ void report(const FastDrawCounters& total) {
 }
 
 void commit(const FastDrawCounters& local) {
+    // Nothing reports the counters without APS5_PROFILE_DRAW: no shared lock per offered draw then.
+    if (!profileDraw()) return;
     auto& shared = totals();
     std::lock_guard lock(shared.mutex);
     auto& total = shared.counters;
@@ -187,6 +189,7 @@ std::uint32_t FastDrawVerifyEvery() {
 }
 
 bool FastDrawVerifyPending() {
+    if (FastDrawVerifyEvery() == 0) return false;
     const auto& stash = HostThreadLocal<VerifyStash, VerifyStashTag>();
     return stash.armed && !stash.compared;
 }
@@ -206,7 +209,7 @@ void VerifyFastDrawStages(std::span<const ShaderRecompiler::RecompileResult* con
             // The old path bound no result for the stage the fast path populated: a layout difference.
             kinds = 1u << 2u;
         } else {
-            kinds = CompareWalkedResult(*old[i], stash.results[i]);
+            kinds = CompareWalkedResult(*old[i], stash.results[i], true);
             attributes = sameAttributes(*old[i], stash.results[i]);
         }
         if (kinds == 0 && attributes) continue;
@@ -222,6 +225,7 @@ void VerifyFastDrawStages(std::span<const ShaderRecompiler::RecompileResult* con
 }
 
 FastDrawVerifyScope::~FastDrawVerifyScope() {
+    if (FastDrawVerifyEvery() == 0) return;
     auto& stash = HostThreadLocal<VerifyStash, VerifyStashTag>();
     if (!stash.armed) return;
     const bool compared = stash.compared;
@@ -359,6 +363,9 @@ std::optional<DrawVerdict> Driver::fastDraw(QueueState& queue, const Submission&
     }
     const auto& graphics = decode->state;
     const std::span<const Graphics::CompiledShader> stages(scratch.stages.data(), count);
+    // The bindings' structural declines (written elements, storage images, address roles, deferred
+    // words) follow from the results alone: decided here, not under the lock after the inputs.
+    if (const auto structural = Graphics::FastStructuralDecline(stages)) return declined(*structural);
     // APS5_FAST_DRAW_VERIFY: every Nth draw goes to the old path with the fast results kept for the compare.
     if (const auto every = FastDrawVerifyEvery(); every != 0) {
         static std::atomic<std::uint64_t> calls{0};

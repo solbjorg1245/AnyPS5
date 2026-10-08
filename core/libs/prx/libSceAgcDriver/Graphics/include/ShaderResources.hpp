@@ -208,6 +208,10 @@ public:
     // too), the image view or the sampler. The address roles (BDA table, fault buffer) list zeros.
     struct BoundElement {
         VkDescriptorBufferInfo buffer{};
+        // A guest buffer element (GuestBufferMemory::Descriptor), and whether its region is read
+        // in place from a host import rather than copied or mirrored (fast draw verification).
+        bool guest = false;
+        bool inPlace = false;
         std::span<const std::byte> data;
         VkImageView view = VK_NULL_HANDLE;
         VkSampler sampler = VK_NULL_HANDLE;

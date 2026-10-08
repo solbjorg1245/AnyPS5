@@ -34,7 +34,7 @@ class StorageTexture;
 // taken by the old path on purpose to be compared (APS5_FAST_DRAW_VERIFY).
 enum class FastDecline : std::uint8_t {
     Indirect, DebugMode, Retry, NoDevice, Decode, Shape, NoSource, WalkPending, WalkUnmapped, WalkQueuedLabel, WalkNoProgram, WalkIncomplete, WalkBindless, WalkOther, NoVariant, PushOverflow, CpuIndirect, DeviceReplaced, Rejected, Verify,
-    NotRecordable, NoPlumbing, Written, StorageImage, AddressRole, DeferredWords, Unsupported, OverLimit, Aliases, NoImport, Misaligned, Undecodable, ImageShape, NoSampler, NotResident, ReadsTarget, IndirectPath, Rewrites, RingFull, Thrown,
+    NotRecordable, NoPlumbing, Written, StorageImage, AddressRole, DeferredWords, Unsupported, OverLimit, Aliases, NoImport, Misaligned, Undecodable, ImageShape, NoSampler, NotResident, ReadsTarget, IndirectPath, Rewrites, RingFull, ImportsRetired, Thrown,
     Count
 };
 const char* FastDeclineName(FastDecline decline);
@@ -44,6 +44,9 @@ const char* FastDeclineName(FastDecline decline);
 // false when nothing covers the range. Tests pass their own.
 using FastBufferResolver = bool (*)(const Context& context, std::uint64_t address, std::size_t bytes, VkBuffer& buffer, VkDeviceSize& offset);
 bool HostImportResolver(const Context& context, std::uint64_t address, std::size_t bytes, VkBuffer& buffer, VkDeviceSize& offset);
+// Verification's resolver: an existing import only (HostImportExisting), nothing reconciled or
+// made, so the comparison cannot retire an import the draw it checks binds.
+bool HostImportPeekResolver(const Context& context, std::uint64_t address, std::size_t bytes, VkBuffer& buffer, VkDeviceSize& offset);
 
 // The push-descriptor bindings of a draw's stages, in ShaderResources' plan order (stage by stage,
 // binding by binding), so LayoutKey() is the key a ShaderResources build of the same stages has. A
@@ -94,6 +97,14 @@ public:
     std::span<const VkDescriptorBufferInfo> Buffers() const { return buffers; }
     std::span<const VkDescriptorImageInfo> Images() const { return images; }
     std::span<const std::uint32_t> DataWords(const Binding& binding) const;
+    // Where an in-place element's adjustment byte is (whatever its value): byte `byte` of the push
+    // block (data -1) or of data binding `data`'s words; `buffer` indexes Buffers().
+    struct AdjustmentSite {
+        std::size_t buffer = 0;
+        std::int64_t data = -1;
+        std::uint32_t byte = 0;
+    };
+    std::span<const AdjustmentSite> AdjustmentSites() const { return sites; }
 
     unsigned depth = 0;
 
@@ -111,11 +122,18 @@ private:
     std::vector<std::uint32_t> layoutKey;
     std::vector<std::uint32_t> occupied;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> inPlaceReads;
+    std::vector<AdjustmentSite> sites;
     std::vector<std::shared_ptr<void>> objects;
     std::vector<const StorageTexture*> viewed;
     std::array<std::byte, PipelinePushConstantBytes> push{};
     VkShaderStageFlags pushStages = 0;
 };
+
+// The declines of FastBindings::Build that follow from the populated results alone (nothing
+// resolved): a written or atomic guest buffer element, a storage image or written sampled image,
+// deferred data words, an address, fault or GDS role, a binding outside set 0 or read-only. The
+// driver asks before it takes the device lock; Build keeps its own checks.
+std::optional<FastDecline> FastStructuralDecline(std::span<const CompiledShader> shaders);
 
 // What DrawFast did: recorded, or the decline that left the draw to Draw (nothing recorded then).
 // The parts' times in microseconds under APS5_PROFILE_DRAW.
@@ -150,10 +168,10 @@ std::vector<std::shared_ptr<void>>& FastBatchHold(const Context& context, Record
 bool& ThreadFastVerifyArmed();
 // Compares the fast bindings of `shaders`, built dry, with the set `resources` binds: per element
 // the buffer, offset and range, the data words, the image view and the sampler; and the patched
-// push constant blocks. A buffer the old path copied (another buffer at offset 0) counts apart, and
-// then the data and push differences are not counted: its adjustment is 0 where the in-place
-// binding's is not.
-void VerifyFastBindings(const Context& context, const ShaderResources& resources, std::span<const CompiledShader> shaders, const ColorTarget& target, FastBufferResolver resolve = &HostImportResolver);
+// push constant blocks. A buffer the old path copied (its element not served in place) counts
+// apart, and only that element's adjustment byte is excused in the data words and push constants
+// (the copy's adjustment differs from the in-place one); any other difference counts.
+void VerifyFastBindings(const Context& context, const ShaderResources& resources, std::span<const CompiledShader> shaders, const ColorTarget& target, FastBufferResolver resolve = &HostImportPeekResolver);
 struct FastVerifyCounts {
     std::uint64_t compared = 0, matched = 0, declined = 0, layout = 0, buffer = 0, copied = 0, data = 0, image = 0, sampler = 0, push = 0;
 };

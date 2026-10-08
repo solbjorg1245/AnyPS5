@@ -2371,6 +2371,8 @@ FastDrawOutcome DrawFast(const Context& context, const State& state, const Pm4::
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
     static const bool gpuIndirectDraws = std::getenv("APS5_NO_GPU_INDIRECT_DRAW") == nullptr;
+    // Draw's debug aid (per-draw transitions, one pass per draw): fast draws record lean only.
+    static const bool drawTransitions = std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
     FastDrawOutcome result;
     auto lap = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto part = [&](double& us) {
@@ -2384,7 +2386,7 @@ FastDrawOutcome DrawFast(const Context& context, const State& state, const Pm4::
         return result;
     };
     auto* recorder = Recorder::Active();
-    if (!RecordDraws() || recorder == nullptr || DumpTargetLimit() != 0 || CaptureInputsEnabled()) return decline(FastDecline::NotRecordable);
+    if (!RecordDraws() || recorder == nullptr || DumpTargetLimit() != 0 || CaptureInputsEnabled() || drawTransitions) return decline(FastDecline::NotRecordable);
     if (context.fastLayouts == nullptr || context.fastRing == nullptr || !context.pushDescriptors) return decline(FastDecline::NoPlumbing);
     if (state.stages.mesh || state.stages.tessellation || state.rectList) return decline(FastDecline::Shape);
     DrawOutcome outcome;
@@ -2412,28 +2414,21 @@ FastDrawOutcome DrawFast(const Context& context, const State& state, const Pm4::
     const FastLayout* layout = nullptr;
     std::shared_ptr<Pipeline> pipeline;
     std::shared_ptr<Framebuffer> framebuffer;
+    // The import registry's epoch (bumped by every retire): a reconcile from here to the record
+    // (the inputs, the target refresh, Build's imports and flushes, the store flushes, a ring
+    // sync) may retire an import whose buffer the bindings or the records already name, destroyed
+    // at once while the recorder is idle. Draw's UploadFinish re-checks the same way.
+    const auto importsEpoch = HostImportsEpoch();
     // Up to the record, what fails would fail Draw too (its Requires, a lookup that throws): a
     // decline, so Draw meets it with its own accounting. Nothing is recorded before the record.
     try {
+        if (args != nullptr && (args->RangeBytes() == 0 || args->RangeBytes() > std::numeric_limits<std::size_t>::max() || !gpuIndirectDraws)) return decline(FastDecline::IndirectPath);
         inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, *inputScratch);
         if (inputs.nothing) {
             result.recorded = true;
             return result;
         }
         part(result.inputsUs);
-        // Draw's decision for the records: only the GPU-side path without a rewrite is fast (the
-        // rewrite is recorded outside the pass and needs a scratch copy, F3c).
-        if (args != nullptr) {
-            const auto rangeBytes = args->RangeBytes();
-            if (rangeBytes == 0 || rangeBytes > std::numeric_limits<std::size_t>::max() || !gpuIndirectDraws) return decline(FastDecline::IndirectPath);
-            indirect.path = indirectPathFor(context, recorder, args->arguments, static_cast<std::size_t>(rangeBytes), indirect.argumentImport);
-            if (indirect.path == IndirectDrawPath::Gpu && args->countIndirect) {
-                if (!context.drawIndirectCount) return decline(FastDecline::IndirectPath);
-                indirect.path = indirectPathFor(context, recorder, args->countAddress, 4, indirect.countImport);
-            }
-            if (indirect.path != IndirectDrawPath::Gpu) return decline(FastDecline::IndirectPath);
-            if (rewritesRecords(*args)) return decline(FastDecline::Rewrites);
-        }
         // Resident targets only, refreshed as Draw refreshes them.
         for (const auto& color : state.colors) {
             if (!residentTargets || color.tileMode != ColorTileMode::RenderTarget || context.detiler == nullptr) return decline(FastDecline::NotResident);
@@ -2453,6 +2448,18 @@ FastDrawOutcome DrawFast(const Context& context, const State& state, const Pm4::
         if (const auto declined = bindings->Build(context, shaders, &state.color, &HostImportResolver, true)) return decline(*declined);
         // A bound image that is one of the targets owes a barrier inside the pass (Draw's readsTarget).
         if (std::any_of(targets.begin(), targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return bindings->ReadsImage(target.get()); })) return decline(FastDecline::ReadsTarget);
+        // Draw's decision for the records, made after the build as Draw makes it (the build may
+        // retire imports): only the GPU-side path without a rewrite is fast (the rewrite is
+        // recorded outside the pass and needs a scratch copy, F3c).
+        if (args != nullptr) {
+            indirect.path = indirectPathFor(context, recorder, args->arguments, static_cast<std::size_t>(args->RangeBytes()), indirect.argumentImport);
+            if (indirect.path == IndirectDrawPath::Gpu && args->countIndirect) {
+                if (!context.drawIndirectCount) return decline(FastDecline::IndirectPath);
+                indirect.path = indirectPathFor(context, recorder, args->countAddress, 4, indirect.countImport);
+            }
+            if (indirect.path != IndirectDrawPath::Gpu) return decline(FastDecline::IndirectPath);
+            if (rewritesRecords(*args)) return decline(FastDecline::Rewrites);
+        }
         layout = fastLayoutFor(context, bindings->LayoutKey(), bindings->PushStages());
         if (layout == nullptr) return decline(FastDecline::OverLimit);
         part(result.bindingsUs);
@@ -2494,6 +2501,8 @@ FastDrawOutcome DrawFast(const Context& context, const State& state, const Pm4::
     if (dataBytes != 0) {
         region = ring.Allocate(dataBytes, recorder->Submissions() + 1);
         if (!region) {
+            // A request larger than the ring (counted oversize) is not helped by a wait.
+            if (dataBytes > ring.Capacity()) return decline(FastDecline::RingFull);
             recorder->Sync();
             ring.Complete(recorder->Submissions());
             continued = false;
@@ -2503,6 +2512,10 @@ FastDrawOutcome DrawFast(const Context& context, const State& state, const Pm4::
         }
     }
     auto& hold = FastBatchHold(context, *recorder);
+    // The sync above runs completions, which may refute the records' zero constant
+    // (APS5_CHECK_INDIRECT_ARGS): a rewrite now needed is left to Draw, as nothing is recorded yet.
+    if (args != nullptr && rewritesRecords(*args)) return decline(FastDecline::Rewrites);
+    if (HostImportsEpoch() != importsEpoch) return decline(FastDecline::ImportsRetired);
     const auto drawTiming = !continued ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
     if (!continued && Recorder::BarrierValidate()) {
         auto& noted = scratch->reads;

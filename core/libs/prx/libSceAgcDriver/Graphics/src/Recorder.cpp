@@ -45,7 +45,9 @@ std::atomic<std::uint64_t> completedBlockSerial{0};
 void trackPendingBlocksFromEnvironment() {
     static const bool tracked = [] {
         const char* every = std::getenv("APS5_FAST_WALK");
-        if (every != nullptr && std::strtoul(every, nullptr, 0) != 0) Recorder::TrackPendingBlocks(true);
+        // The fast draw (APS5_FAST_DRAW, F3b) binds what its walk reads: it needs the same guard.
+        const char* fastDraw = std::getenv("APS5_FAST_DRAW");
+        if ((every != nullptr && std::strtoul(every, nullptr, 0) != 0) || (fastDraw != nullptr && std::strcmp(fastDraw, "0") != 0)) Recorder::TrackPendingBlocks(true);
         return true;
     }();
     static_cast<void>(tracked);
