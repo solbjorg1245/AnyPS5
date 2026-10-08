@@ -322,6 +322,15 @@ struct VulkanDevice::State {
     // references to its objects.
     HostMutex computePipelinesMutex;
     std::map<std::uint64_t, std::shared_ptr<ComputePipelineObjects>> computePipelines;
+    // The fast dispatch's pipelines (F5) by variant, under the same mutex: the push layout of the
+    // variant's bindings and the objects built on it (their layout stays null: FastLayouts owns it),
+    // or why the variant's bindings decline (remembered, so FastLayouts is asked once).
+    struct FastComputePipeline {
+        const Graphics::FastLayout* layout = nullptr;
+        std::shared_ptr<ComputePipelineObjects> objects;
+        std::optional<Graphics::FastDispatchDecline> decline;
+    };
+    std::map<std::uint64_t, FastComputePipeline> fastComputePipelines;
     std::unique_ptr<Graphics::GpuColorTransfer> colorTransfer;
     std::shared_ptr<Graphics::BufferPool> bufferPool;
     std::unique_ptr<Graphics::Buffer> emptyBuffer;
@@ -606,6 +615,7 @@ struct VulkanDevice::State {
             {
                 std::lock_guard pipelines(computePipelinesMutex);
                 computePipelines.clear();
+                fastComputePipelines.clear();
             }
             // Every ShaderResources (kept by the recorder or the resource cache) is gone now, so the
             // sets and samplers they borrowed can go.
@@ -1107,11 +1117,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     state->colorTransfer = std::make_unique<Graphics::GpuColorTransfer>(graphicsContext());
     state->descriptorCache = std::make_unique<Graphics::DescriptorCache>(graphicsContext());
     state->samplerCache = std::make_unique<Graphics::SamplerCache>();
-    // The fast path's push layouts, and its data ring only when APS5_FAST_DRAW can use it: the ring
-    // costs APS5_FAST_RING_MIB of host memory, and the commit charge has no room to spare.
+    // The fast path's push layouts, and its data ring only when APS5_FAST_DRAW or APS5_FAST_DISPATCH
+    // can use it: the ring costs APS5_FAST_RING_MIB of host memory, and the commit charge has no
+    // room to spare.
     if (state->pushDescriptors) {
         state->fastLayouts = std::make_unique<Graphics::FastLayouts>(graphicsContext());
         const char* fastDraw = std::getenv("APS5_FAST_DRAW");
+        if (fastDraw == nullptr || std::strcmp(fastDraw, "0") == 0) fastDraw = std::getenv("APS5_FAST_DISPATCH");
         // A ring the device cannot allocate (APS5_FAST_RING_MIB above a heap or allocation limit)
         // leaves the fast path without one, which then declines every draw, instead of failing the device.
         if (fastDraw != nullptr && std::strcmp(fastDraw, "0") != 0 && Graphics::FastRing::ConfiguredBytes() != 0) {
@@ -3352,6 +3364,76 @@ void VulkanDevice::Dispatch(const ShaderRecompiler::RecompileResult& shader, std
 VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompiler::RecompileResult& shader, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipe) {
     WatchMemory(programAddress | (1ull << 63u));
     return dispatch(shader, 0, 0, 0, arguments, snapshots, programAddress, std::move(prepared), recipe);
+}
+
+std::optional<Graphics::FastDispatchDecline> VulkanDevice::FastDispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, Graphics::FastDispatchTiming& timing) {
+    using Decline = Graphics::FastDispatchDecline;
+    if (shader.spirv.size() < 5 || shader.spirv[0] != 0x07230203u || shader.variantId == 0) return Decline::Invalid;
+    const auto* limit = state->properties.limits.maxComputeWorkGroupCount;
+    if (arguments == 0 && (x > limit[0] || y > limit[1] || z > limit[2])) return Decline::Limits;
+    const auto context = graphicsContext();
+    if (context.fastLayouts == nullptr) return Decline::NoPush;
+    // The variant's pipeline on its push layout: the layout key follows from the variant's
+    // bindings, so both are made once per variant (FastLayouts::Get stays off the per-dispatch path).
+    const Graphics::FastLayout* layout = nullptr;
+    std::shared_ptr<ComputePipelineObjects> objects;
+    {
+        std::lock_guard pipelines(state->computePipelinesMutex);
+        if (const auto found = state->fastComputePipelines.find(shader.variantId); found != state->fastComputePipelines.end()) {
+            if (found->second.decline) return found->second.decline;
+            layout = found->second.layout;
+            objects = found->second.objects;
+        }
+    }
+    if (objects == nullptr) {
+        const auto remember = [&](Decline decline) {
+            std::lock_guard pipelines(state->computePipelinesMutex);
+            state->fastComputePipelines.try_emplace(shader.variantId, State::FastComputePipeline{nullptr, nullptr, decline});
+            return decline;
+        };
+        std::vector<std::uint32_t> key;
+        if (const auto decline = Graphics::FastComputeLayoutKey(shader, key)) return remember(*decline);
+        const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
+        const auto pushStages = Graphics::PushConstantStages(shaders);
+        if (pushStages != 0 && state->properties.limits.maxPushConstantsSize < Graphics::PipelinePushConstantBytes) return remember(Decline::Limits);
+        layout = context.fastLayouts->Get(key, pushStages);
+        if (layout == nullptr) return remember(Decline::PushLimit);
+        objects = std::make_shared<ComputePipelineObjects>();
+        objects->device = state->device;
+        objects->destroyModule = state->DeviceFunction<PFN_vkDestroyShaderModule>("vkDestroyShaderModule");
+        objects->destroyLayout = state->DeviceFunction<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout");
+        objects->destroyPipeline = state->DeviceFunction<PFN_vkDestroyPipeline>("vkDestroyPipeline");
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = shader.spirv.size() * sizeof(std::uint32_t);
+        moduleInfo.pCode = shader.spirv.data();
+        check(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule")(state->device, &moduleInfo, nullptr, &objects->module), "vkCreateShaderModule");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = objects->module;
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.layout = layout->pipeline;
+        check(state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(state->device, context.pipelineCache, 1, &pipelineInfo, nullptr, &objects->pipeline), "vkCreateComputePipelines");
+        std::lock_guard pipelines(state->computePipelinesMutex);
+        const auto& entry = state->fastComputePipelines.try_emplace(shader.variantId, State::FastComputePipeline{layout, objects, std::nullopt}).first->second;
+        if (entry.decline) return entry.decline;
+        layout = entry.layout;
+        objects = entry.objects;
+    }
+    if (arguments != 0) {
+        // decideIndirect's CPU reasons, tested without its flush (the old path then takes the
+        // dispatch and flushes): storage results pending over the argument dwords, a label pending
+        // on them, a copied writer (its CPU write-back) over them.
+        auto& recorder = *state->recorder;
+        if (Graphics::PendingStorageOverlaps(arguments, 12, nullptr)) return Decline::IndirectCpu;
+        for (std::uint64_t dword = arguments; dword < arguments + 12; dword += 4) {
+            if (recorder.PendingLabel(dword, 4, 0).has_value()) return Decline::IndirectCpu;
+        }
+        const auto writes = [&](const auto& writer) { return writer->WritesOverlap(arguments, 12); };
+        if (std::any_of(state->copiedWriters->begin(), state->copiedWriters->end(), writes) || std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), writes)) return Decline::IndirectCpu;
+    }
+    const Graphics::FastDispatchCall call{&shader, layout, objects->pipeline, objects, x, y, z, arguments, programAddress};
+    return Graphics::RecordFastDispatch(context, *state->recorder, call, timing);
 }
 
 void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& outcome, char* groupsText) {

@@ -46,6 +46,9 @@ void trackPendingBlocksFromEnvironment() {
     static const bool tracked = [] {
         const char* every = std::getenv("APS5_FAST_WALK");
         if (every != nullptr && std::strtoul(every, nullptr, 0) != 0) Recorder::TrackPendingBlocks(true);
+        // The fast dispatch (F5) walks with the same reader.
+        const char* dispatch = std::getenv("APS5_FAST_DISPATCH");
+        if (dispatch != nullptr && std::strcmp(dispatch, "0") != 0) Recorder::TrackPendingBlocks(true);
         return true;
     }();
     static_cast<void>(tracked);

@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastDispatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <functional>
 #include <memory>
@@ -283,6 +284,14 @@ public:
     // (`shader` carries live flat-SRT words the recipe's hash does not name), so the template's
     // data refresh is decided by the per-word compare instead of the hash.
     RecipeOutcome DispatchRecipe(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, const std::shared_ptr<RecipeHit>& hit, IndirectOutcome& outcome, const std::shared_ptr<PreparedDispatch>& verify = nullptr, bool refreshByWords = false);
+    // F5 of the draw fast path (docs/design/draw-fastpath.md 2.9; the driver's FastDispatch.cpp,
+    // APS5_FAST_DISPATCH), under GuestMemory::GpuMutex after the packet's labels: `shader` is the
+    // variant populated from the fast walk. Its pipeline on the push layout of its bindings is made
+    // once per variant; an indirect dispatch whose arguments DispatchIndirect would read on the CPU
+    // (results pending over them, a label pending on them, a copied writer over them) declines
+    // without side effects; then Graphics::RecordFastDispatch binds and records. The decline
+    // leaves the dispatch to the old path; nothing (none) means it was recorded.
+    std::optional<Graphics::FastDispatchDecline> FastDispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, Graphics::FastDispatchTiming& timing);
     // Whether dispatch-cache hits use recipes (APS5_NO_DISPATCH_RECIPE unset) and whether every
     // hit is verified (APS5_VERIFY_RECIPE=1).
     static bool DispatchRecipes();
