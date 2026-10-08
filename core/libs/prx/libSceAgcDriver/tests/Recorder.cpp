@@ -2577,6 +2577,100 @@ void keysFillTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 }
 
+// Copy-back coalescing (APS5_COALESCE_COPY_BACKS=1, read by a recorder made with it set): a later
+// deferred copy drops the bytes it stores again from the queued ones (splitting one around it, its
+// offsets moved alike); queued copies stay past CommandsKeepingCopyBacks, a flush over other bytes
+// and their own claimant's flush, and land at an overlapping flush, at Commands() and at Submit,
+// each byte from its last copy.
+void coalesceCopyBackTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: copy-back coalescing not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the copy-back test block");
+    std::memset(block, 0, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr) {
+        std::cout << "host import of the copy-back test block refused: copy-back coalescing not tested\n";
+        return;
+    }
+    {
+        _putenv_s("APS5_COALESCE_COPY_BACKS", "1");
+        Recorder coalescing(context);
+        _putenv_s("APS5_COALESCE_COPY_BACKS", "");
+        Require(coalescing.CoalescesCopyBacks() && coalescing.DefersCopyBacks(), "APS5_COALESCE_COPY_BACKS=1 did not turn coalescing on");
+        coalescing.Activate();
+        constexpr std::size_t sourceBytes = 8192;
+        auto first = std::make_shared<Buffer>(context, sourceBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        auto second = std::make_shared<Buffer>(context, sourceBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        const auto firstByte = [](std::size_t at) { return static_cast<unsigned char>(at * 7 + 1); };
+        const auto secondByte = [](std::size_t at) { return static_cast<unsigned char>(at * 13 + 5); };
+        for (std::size_t at = 0; at < sourceBytes; ++at) {
+            first->Bytes()[at] = std::byte{firstByte(at)};
+            second->Bytes()[at] = std::byte{secondByte(at)};
+        }
+        // The shadow's byte `at` goes to the block's byte `at`, as a staged region's copy-back.
+        const auto copyOf = [&](const std::shared_ptr<Buffer>& source, std::uint64_t at, std::uint64_t count) {
+            return std::vector<Recorder::DeferredCopy>{Recorder::DeferredCopy{source, source.get(), source->Handle(), import->buffer, at, address + at - import->base, count, address + at}};
+        };
+        using Reason = Recorder::FlushReason;
+        const auto before = Recorder::CopyBackCounts();
+        coalescing.DeferCopies(copyOf(first, 0, 1024));
+        coalescing.DeferCopies(copyOf(second, 512, 1024));
+        Require(coalescing.DeferredCopyBytes() == 1536, "a later copy did not drop the bytes it stores again");
+        coalescing.DeferCopies(copyOf(first, 768, 256));
+        Require(coalescing.DeferredCopyBytes() == 1536, "a copy inside a queued one did not split it");
+        auto counts = Recorder::CopyBackCounts();
+        Require(counts.deferred - before.deferred == 3 && counts.overwrittenBytes - before.overwrittenBytes == 768 && counts.overwritten == before.overwritten, "coalescing counters are off");
+        // Queued: first [0, 512), second [512, 768), first [768, 1024), second [1024, 1536).
+        static_cast<void>(coalescing.CommandsKeepingCopyBacks());
+        coalescing.FlushDeferredOverlapping(address + 8192, 64, nullptr, Reason::CopyIn);
+        Require(coalescing.HasDeferredCopies() && coalescing.DeferredCopyBytes() == 1536, "copies were recorded by a command or flush that does not touch them");
+        coalescing.FlushDeferredOverlapping(address + 100, 4, nullptr, Reason::CopyIn);
+        Require(coalescing.DeferredCopyBytes() == 1024, "an overlapping flush did not record exactly the copy over its bytes");
+        coalescing.ClaimDeferredCopies(second.get());
+        coalescing.FlushDeferredOverlapping(address + 600, 4, second.get(), Reason::CopyIn);
+        Require(coalescing.DeferredCopyBytes() == 1024, "a build's own claimed copy was recorded before its copy-back");
+        coalescing.FlushDeferredOverlapping(address + 600, 4, nullptr, Reason::CopyIn);
+        Require(coalescing.DeferredCopyBytes() == 768, "a claimed copy over another range's copy-in was not recorded");
+        coalescing.ReleaseClaims();
+        static_cast<void>(coalescing.Commands());
+        Require(!coalescing.HasDeferredCopies(), "Commands() left queued copies");
+        coalescing.DeferCopies(copyOf(second, 4096, 256));
+        coalescing.Submit();
+        Require(!coalescing.HasDeferredCopies(), "Submit left queued copies");
+        coalescing.Sync();
+        counts = Recorder::CopyBackCounts();
+        const auto flushes = [&](Reason reason) { return counts.flushes[static_cast<std::size_t>(reason)] - before.flushes[static_cast<std::size_t>(reason)]; };
+        Require(counts.passes - before.passes == 4 && flushes(Reason::CopyIn) == 2 && flushes(Reason::Command) == 1 && flushes(Reason::Submit) == 1 && counts.recorded - before.recorded == 5 && counts.recordedBytes - before.recordedBytes == 1536 + 256, "copy-back pass counters are off");
+        const auto* landed = static_cast<const unsigned char*>(block);
+        for (std::size_t at = 0; at < 8192; ++at) {
+            const bool fromFirst = at < 512 || (at >= 768 && at < 1024);
+            const bool fromSecond = (at >= 512 && at < 768) || (at >= 1024 && at < 1536) || (at >= 4096 && at < 4352);
+            const unsigned char want = fromFirst ? firstByte(at) : fromSecond ? secondByte(at) : 0;
+            if (landed[at] != want) throw std::runtime_error("a coalesced copy-back stored the wrong byte at offset " + std::to_string(at));
+        }
+    }
+    recorder.Activate();
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+}
+
 int main() {
     try {
         Device device;
@@ -2618,6 +2712,7 @@ int main() {
         firstLayerViewTests(device, recorder);
         metadataPassTests(device, recorder);
         pendingKeyStoreTests(device, recorder);
+        coalesceCopyBackTests(device, recorder);
         std::cout << "Recorder read tracking and label tests passed\n";
         return 0;
     } catch (const std::exception& error) {

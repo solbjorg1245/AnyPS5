@@ -2141,7 +2141,18 @@ void reportStaging() {
     static std::uint64_t lastChained = 0, lastChainedBytes = 0, lastChainedInPlace = 0, lastInPlacePasses = 0;
     const auto takenOver = stats.copyBacksTakenOver.load(), takenOverBytes = stats.copyBackBytesTakenOver.load();
     static std::uint64_t lastTakenOver = 0, lastTakenOverBytes = 0;
-    std::fprintf(stderr, "[buffers] staging chain (10 s): %llu copy-ins from the previous staging shadow (%.0f MiB off PCIe), %llu of them in the same shadow (no copy; %llu in uses that recorded no copy pass); %llu deferred copy-backs (%.0f MiB) taken over by the next use\n", static_cast<unsigned long long>(chained - lastChained), (chainedBytes - lastChainedBytes) / 1048576.0, static_cast<unsigned long long>(chainedInPlace - lastChainedInPlace), static_cast<unsigned long long>(inPlacePasses - lastInPlacePasses), static_cast<unsigned long long>(takenOver - lastTakenOver), (takenOverBytes - lastTakenOverBytes) / 1048576.0);
+    // Deferral (APS5_DEFER_COPY_BACK, APS5_COALESCE_COPY_BACKS): copy-backs deferred, and those
+    // dropped whole plus the bytes dropped because a later copy stored them again before any
+    // reader (coalescing); the passes that recorded the rest are on the [barriers] line.
+    std::string deferral;
+    if (const auto counts = Recorder::CopyBackCounts(); counts.deferred != 0) {
+        static Recorder::CopyBackStatistics last{};
+        char text[192];
+        std::snprintf(text, sizeof(text), "; %llu copy-backs deferred (%.0f MiB), %llu dropped whole and %.0f MiB dropped as stored again before any reader", static_cast<unsigned long long>(counts.deferred - last.deferred), (counts.deferredBytes - last.deferredBytes) / 1048576.0, static_cast<unsigned long long>(counts.overwritten - last.overwritten), (counts.overwrittenBytes - last.overwrittenBytes) / 1048576.0);
+        deferral = text;
+        last = counts;
+    }
+    std::fprintf(stderr, "[buffers] staging chain (10 s): %llu copy-ins from the previous staging shadow (%.0f MiB off PCIe), %llu of them in the same shadow (no copy; %llu in uses that recorded no copy pass); %llu deferred copy-backs (%.0f MiB) taken over by the next use%s\n", static_cast<unsigned long long>(chained - lastChained), (chainedBytes - lastChainedBytes) / 1048576.0, static_cast<unsigned long long>(chainedInPlace - lastChainedInPlace), static_cast<unsigned long long>(inPlacePasses - lastInPlacePasses), static_cast<unsigned long long>(takenOver - lastTakenOver), (takenOverBytes - lastTakenOverBytes) / 1048576.0, deferral.c_str());
     lastTakenOver = takenOver;
     lastTakenOverBytes = takenOverBytes;
     lastChained = chained;
@@ -2592,8 +2603,9 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // the copy reads it: the flush is recorded (GPU-direct into the import) ahead of the copy
             // in the same batch. The batch is opened first so that an import the flush's own
             // reconcile retires is handed to it (retireImport keeps nothing while the recorder is
-            // idle) and outlives the copy.
-            static_cast<void>(recorder->Commands());
+            // idle) and outlives the copy. Queued copy-backs stay under coalescing (the copy pass
+            // records those over its ranges; a flush that records anything takes Commands()).
+            static_cast<void>(recorder->CommandsKeepingCopyBacks());
             StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "copied buffer region");
             region.gpuCopy = true;
             gpuCopies.push_back(&region);
@@ -2735,7 +2747,13 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     // earlier use claims that use's deferred copy-backs, which its own copy-back takes over. Copy-
     // backs another build claimed over these ranges are recorded first: the copy-ins may read the
     // imports. A range a queued label or key store overlaps decides below, after those stores.
-    const bool deferring = Recorder::DeferCopyBacks();
+    const bool deferring = recorder->DefersCopyBacks();
+    // Copy-back coalescing (APS5_COALESCE_COPY_BACKS, see Recorder::CoalescesCopyBacks): every
+    // region claims first, and the copy-backs queued over the ranges the copy pass reads from the
+    // imports are recorded once all claims are made (below), not per region here: a region
+    // flushing before a later region of the build claimed over its range would read the import
+    // without that claim's copy-back.
+    const bool coalescing = recorder->CoalescesCopyBacks();
     // Claims an earlier use left behind (it failed before its copy-backs) are not this build's.
     if (deferring) recorder->ReleaseClaims();
     std::vector<std::shared_ptr<Buffer>> chainShadows(copies.size());
@@ -2744,7 +2762,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         auto* region = copies[index];
         const auto bytes = region->end - region->begin;
         region->claimedShadow = nullptr;
-        if (deferring) recorder->FlushClaimedOverlapping(region->begin, static_cast<std::size_t>(bytes));
+        if (deferring && !coalescing) recorder->FlushClaimedOverlapping(region->begin, static_cast<std::size_t>(bytes));
         if (region->buffer == nullptr) allocateRegionBuffer(*region, addressable);
         if (!region->deviceLocal || !stagingChainEnabled()) continue;
         if (recorder->QueuedStoreOverlaps(region->begin, static_cast<std::size_t>(bytes)) || (recorder->HasQueuedKeyStores() && recorder->QueuedKeyStoreOverlaps(region->begin, static_cast<std::size_t>(bytes)))) continue;
@@ -2769,15 +2787,17 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     // was recorded with its trailing TRANSFER -> ALL_COMMANDS barrier (or wrote nothing), which
     // orders this use's shaders after it; deferred copy-backs (APS5_DEFER_COPY_BACK) may not be
     // recorded yet, so they keep the pass. APS5_NO_INPLACE_STAGING_SKIP=1 records the pass and the
-    // snapshots as before.
+    // snapshots as before. Under coalescing a region in place took its own shadow's queued copies
+    // over (claimed above), which its copy-back records after its work; a region whose chain was
+    // not decided above (a queued store over it) is not in place.
     static const bool inPlaceSkip = std::getenv("APS5_NO_INPLACE_STAGING_SKIP") == nullptr;
     std::vector<std::uint8_t> inPlace;
-    if (inPlaceSkip && stagingChainEnabled() && !deferring) {
+    if (inPlaceSkip && stagingChainEnabled() && (!deferring || coalescing)) {
         inPlace.assign(copies.size(), 0);
         bool allInPlace = true;
         for (std::size_t index = 0; index < copies.size(); ++index) {
             auto* region = copies[index];
-            if (!region->deviceLocal) {
+            if (!region->deviceLocal || (coalescing && !chainDecided[index])) {
                 allInPlace = false;
                 continue;
             }
@@ -2814,7 +2834,17 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             return;
         }
     }
-    const auto commands = recorder->Commands();
+    if (coalescing) {
+        // The copy pass reads the import of every region not in place: the queued copy-backs over
+        // it land first, claimed ones too (an earlier region of this build may have claimed over a
+        // later one's range), but not a region's own claims (it copies from that shadow).
+        for (std::size_t index = 0; index < copies.size(); ++index) {
+            if (!inPlace.empty() && inPlace[index]) continue;
+            const auto* region = copies[index];
+            recorder->FlushDeferredOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin), region->claimedShadow, Recorder::FlushReason::CopyIn);
+        }
+    }
+    const auto commands = recorder->CommandsKeepingCopyBacks();
     const auto timing = recorder->BeginGpuTiming(StagingCopyInKey);
     if (Recorder::BarrierValidate()) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
@@ -2927,7 +2957,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     // Deferred (Recorder::DeferCopies) unless a draw's render pass is open: a copy cannot go into
     // it, and the next draw may continue the pass without Commands().
-    const bool defer = Recorder::DeferCopyBacks() && !recorder.RenderPassOpen();
+    const bool defer = recorder.DefersCopyBacks() && !recorder.RenderPassOpen();
     // The written ranges, merged: a V# bound twice would otherwise copy the same bytes twice.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
     if (!writes.empty()) {
