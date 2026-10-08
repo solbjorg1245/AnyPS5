@@ -125,6 +125,28 @@ bool imageAddressBelowUserLimit(const DescriptorValue& descriptor) {
     return baseAddress < MaxImageAddress;
 }
 
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(NullBoundImage::Count)> nullBoundCounts{};
+
+void countNullBound(NullBoundImage reason) {
+    nullBoundCounts[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+// The fields of words 5-6 the driver's T# decoder rejects as unimplemented (GuestTextureResource:
+// array pitch, corner sampling, a partially resident default color, MSAA depth). The ones seen in
+// Demon's Souls are no T#: the last element of a T# array whose words 4-7 the walk read from the
+// struct after it (a pointer or floats). Bound as null they sample zeros where the draw used to be
+// dropped; a 128-bit T# has no such words.
+bool undecodableImageBits(const DescriptorValue& descriptor, bool r128) {
+    if (r128 || !ResourceMaterializer::NullUndecodable()) {
+        return false;
+    }
+    const auto arrayPitch = descriptor.dwords[5] & 0xfu;
+    const bool cornerSample = ((descriptor.dwords[5] >> 23u) & 1u) != 0u;
+    const bool prtDefColor = ((descriptor.dwords[5] >> 26u) & 1u) != 0u;
+    const bool msaaDepth = ((descriptor.dwords[6] >> 10u) & 1u) != 0u;
+    return arrayPitch != 0u || cornerSample || prtDefColor || msaaDepth;
+}
+
 bool validImageDescriptor(const DescriptorValue& descriptor, bool r128) {
     const auto type = rawImageType(descriptor);
     const auto format = rawImageFormat(descriptor);
@@ -399,8 +421,26 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         auto& candidate = candidates[i];
         candidate.dwordCount = 8u;
         const std::uint64_t address = heapBase + table.entryOffset + static_cast<std::uint64_t>(keys[i]) * TableEntryBytes;
-        for (std::uint32_t dword = 0; dword < (image.r128 ? 4u : 8u); dword++) {
-            readWord(address + dword * sizeof(std::uint32_t), candidate.dwords[dword]);
+        // An entry in unreadable memory (a table bounded past its end) is a null entry rather than
+        // the end of the draw.
+        bool readable = true;
+        for (std::uint32_t dword = 0; dword < (image.r128 ? 4u : 8u) && readable; dword++) {
+            if (!ResourceMaterializer::NullUndecodable()) {
+                readWord(address + dword * sizeof(std::uint32_t), candidate.dwords[dword]);
+            } else {
+                readable = runtime.readMemory(runtime.userContext, address + dword * sizeof(std::uint32_t), &candidate.dwords[dword]);
+            }
+        }
+        if (!readable) {
+            candidate.dwords.fill(0u);
+            countNullBound(NullBoundImage::TableUnreadable);
+            paddedNull++;
+            continue;
+        }
+        if (!nullImageDescriptor(candidate) && undecodableImageBits(candidate, image.r128)) {
+            countNullBound(NullBoundImage::TableUndecodable);
+            paddedNull++;
+            continue;
         }
         DecodedImage decoded;
         bool usable = !nullImageDescriptor(candidate) && validImageDescriptor(candidate, image.r128) && imageAddressBelowUserLimit(candidate);
@@ -522,7 +562,9 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         // walk's last four come from whatever follows it (Demon's Souls: a pointer or floats, read
         // as an array pitch or corner sampling).
         if (image.r128) std::fill(descriptor.dwords.begin() + 4, descriptor.dwords.end(), 0u);
-        if ((!validImageDescriptor(descriptor, image.r128) || !plausibleImageAddress(descriptor)) && !nullImageDescriptor(descriptor)) {
+        const bool undecodable = !nullImageDescriptor(descriptor) && undecodableImageBits(descriptor, image.r128);
+        if (undecodable) countNullBound(NullBoundImage::Undecodable);
+        if ((!validImageDescriptor(descriptor, image.r128) || !plausibleImageAddress(descriptor) || undecodable) && !nullImageDescriptor(descriptor)) {
             static std::atomic<int> reports{0};
             if (reports.fetch_add(1, std::memory_order_relaxed) < 32) {
                 const auto& w = descriptor.dwords;
@@ -930,6 +972,15 @@ std::uint32_t ResourceMaterializer::BindlessSlots() {
 
 void ResourceMaterializer::CountBindlessRejection(BindlessRejection reason) {
     if (reason < BindlessRejection::Count) bindlessCounters().rejected[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+bool ResourceMaterializer::NullUndecodable() {
+    static const bool enabled = std::getenv("APS5_NO_NULL_UNDECODABLE") == nullptr;
+    return enabled;
+}
+
+std::uint64_t ResourceMaterializer::TakeNullBound(NullBoundImage reason) {
+    return reason < NullBoundImage::Count ? nullBoundCounts[static_cast<std::size_t>(reason)].exchange(0, std::memory_order_relaxed) : 0u;
 }
 
 bool ResourceSpecialization::Buffer::operator==(const Buffer& other) const {

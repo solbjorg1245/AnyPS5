@@ -20,6 +20,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libc/include/General.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
+#include "Optimization/include/Optimization/ResourceMaterializer.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <cstring>
 #include <limits>
@@ -198,6 +199,9 @@ TextureCounters& TextureCounts() {
     return counters;
 }
 
+// Sampled elements the driver could not decode and bound as null (see decodeBoundSampled).
+std::atomic<std::uint64_t> sampledNullBound{0};
+
 void reportTextureCounters() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
@@ -207,6 +211,15 @@ void reportTextureCounters() {
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
     std::fprintf(stderr, "[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; cache %llu MiB, %llu budget evictions (%llu MiB, %llu of 64 MiB or more), %llu replaced, %llu made beside another key of the surface, %llu views of a shared image\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.cachedBytes) >> 20u, count(counters.budgetEvictions), count(counters.evictedBytes) >> 20u, count(counters.largeEvictions), count(counters.replaced), count(counters.sameSurface), count(counters.sharedImages));
+    // The image elements bound as null over these 10 s instead of dropping their draws (see
+    // ShaderRecompiler::NullBoundImage and decodeBoundSampled); each was a thrown draw before.
+    using ShaderRecompiler::NullBoundImage;
+    using ShaderRecompiler::ResourceMaterializer;
+    const auto taken = [](NullBoundImage reason) { return static_cast<unsigned long long>(ResourceMaterializer::TakeNullBound(reason)); };
+    const auto direct = taken(NullBoundImage::Undecodable);
+    const auto tableBits = taken(NullBoundImage::TableUndecodable);
+    const auto tableUnreadable = taken(NullBoundImage::TableUnreadable);
+    std::fprintf(stderr, "[draws] undecodable image elements bound as null (10 s%s): capture %llu (T# words 5-6), table entries %llu (words 5-6) + %llu (unreadable), driver decode %llu\n", ResourceMaterializer::NullUndecodable() ? "" : ", off: APS5_NO_NULL_UNDECODABLE", direct, tableBits, tableUnreadable, static_cast<unsigned long long>(sampledNullBound.exchange(0, std::memory_order_relaxed)));
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -346,6 +359,25 @@ std::array<std::uint32_t, 8> NullTextureDescriptor(std::optional<ShaderRecompile
     else if (shape == ShaderRecompiler::DescriptorImageShape::Image3D) type = 10;
     constexpr auto rgba8 = static_cast<std::uint32_t>(ShaderRecompiler::IrBufferFormat::Format8_8_8_8UNorm);
     return {static_cast<std::uint32_t>(base >> 8u), static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (rgba8 << 20u), 0u, 0xfacu | (type << 28u), 0u, 0u, 0u, 0u};
+}
+
+// A sampled element as the build bound it (resolveImageBinding): a null T# and one the driver
+// cannot decode take the null texture's words (`words` then names `nullWords`). Walks repeating
+// the build's lookups (Revalidate) decode through this so they meet the build's objects: decoding
+// the guest words, they threw on such an element and dropped the draw. APS5_NO_NULL_UNDECODABLE=1
+// decodes the guest words as before.
+GuestTextureResource decodeBoundSampled(std::span<const std::uint32_t>& words, std::array<std::uint32_t, 8>& nullWords, std::optional<ShaderRecompiler::DescriptorImageShape> shape) {
+    if (!ShaderRecompiler::ResourceMaterializer::NullUndecodable()) return DecodeTextureResource(words);
+    if (!NullTextureWords(words)) {
+        try {
+            return DecodeTextureResource(words);
+        } catch (const std::exception&) {
+            // Bound as null by the build.
+        }
+    }
+    nullWords = NullTextureDescriptor(shape, false);
+    words = nullWords;
+    return DecodeTextureResource(words);
 }
 
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false) {
@@ -2172,8 +2204,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                 if (binding.kind == ShaderRecompiler::DescriptorKind::SampledImage) {
                     const auto elementWords = binding.count != 0 ? binding.guestDescriptor.size() / binding.count : 0;
                     for (std::uint32_t element = 0; element < binding.count; ++element) {
-                        const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
-                        const auto resource = DecodeTextureResource(words);
+                        auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
+                        std::array<std::uint32_t, 8> nullWords{};
+                        const auto resource = decodeBoundSampled(words, nullWords, binding.imageShape);
                         const VkComponentMapping components{ComponentSwizzleFor(resource.dstSelX), ComponentSwizzleFor(resource.dstSelY), ComponentSwizzleFor(resource.dstSelZ), ComponentSwizzleFor(resource.dstSelW)};
                         const auto found = textureIndex < textures.size() ? cachedTexture(context, words, resource, components, 0, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element)) : decltype(textures)::value_type{};
                         if (textureIndex >= textures.size() || found != textures[textureIndex]) {
@@ -2517,8 +2550,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                         if (mode != 2) continue;
                         const auto elementWords = binding.count != 0 ? binding.guestDescriptor.size() / binding.count : 0;
                         for (std::uint32_t element = 0; element < binding.count; ++element) {
-                            const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
-                            const auto resource = DecodeTextureResource(words);
+                            auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
+                            std::array<std::uint32_t, 8> nullWords{};
+                            const auto resource = decodeBoundSampled(words, nullWords, binding.imageShape);
                             const VkComponentMapping components{ComponentSwizzleFor(resource.dstSelX), ComponentSwizzleFor(resource.dstSelY), ComponentSwizzleFor(resource.dstSelZ), ComponentSwizzleFor(resource.dstSelW)};
                             cachedTexture(context, words, resource, components, 0, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element));
                         }
@@ -3294,13 +3328,19 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             }
             const auto* record = nextRecord();
             // A descriptor the driver cannot decode is reported once per word set with where the
-            // capture read it (the walk can read data that is no T#, see validImageDescriptor).
+            // capture read it (the walk can read data that is no T#, see validImageDescriptor),
+            // and binds the null texture instead of failing the draw (decodeBoundSampled; the
+            // capture nulls the known cases already). APS5_NO_NULL_UNDECODABLE=1 rethrows.
             const auto decode = [&] {
                 try {
                     return DecodeTextureResource(words);
                 } catch (const std::exception& error) {
                     ReportUndecodedTexture(words, error.what());
-                    throw;
+                    if (!ShaderRecompiler::ResourceMaterializer::NullUndecodable()) throw;
+                    sampledNullBound.fetch_add(1, std::memory_order_relaxed);
+                    nullWords = NullTextureDescriptor(binding.imageShape, false);
+                    words = nullWords;
+                    return DecodeTextureResource(words);
                 }
             };
             const auto resource = record != nullptr && record->decoded ? record->resource : decode();

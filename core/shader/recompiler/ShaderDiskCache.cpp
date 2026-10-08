@@ -559,6 +559,8 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_DUMP_IR",
     "APS5_NO_CODE_HASH_KEY",
     "APS5_NO_FAILURE_MEMO",
+    // Only which descriptors a capture binds as null: the specialization (part of the key) follows.
+    "APS5_NO_NULL_UNDECODABLE",
     "APS5_NO_RESULT_MEMO",
     "APS5_SHADER_CACHE_VERSION",
     "APS5_TRACE_BINDLESS",

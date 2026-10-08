@@ -3,6 +3,7 @@
 #include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/ResourceTracker.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
@@ -101,6 +102,93 @@ void verifyEvaluatedValues() {
     require(table.Find(values[7].get(), found) && found == 21u, "evaluated values: a second insert replaced the first value");
     IrValue absent(IrOpcode::Void, IrType::U32, 1000u);
     require(!table.Find(&absent, found), "evaluated values: a value that was never inserted was found");
+}
+
+// A bindless table key that is a loop counter (Detail::LoopCounterRange): counting up, the loop's
+// exit test against an immediate bounds it (either side, negated or not), else the limit does;
+// counting down, its start does. A test in another block, an invariant phi, a step that is no
+// immediate and a key that is no phi are no counter or no bound.
+void verifyLoopCounterRange() {
+    using namespace ShaderRecompiler;
+    std::vector<std::unique_ptr<IrValue>> values;
+    std::vector<std::unique_ptr<IrBlock>> blocks;
+    std::uint32_t ids = 0;
+    const auto make = [&](IrOpcode opcode, IrType type) -> IrValue& {
+        values.push_back(std::make_unique<IrValue>(opcode, type, ids++));
+        return *values.back();
+    };
+    const auto constant = [&](std::uint32_t value) -> IrValue& {
+        auto& immediate = make(IrOpcode::Void, IrType::U32);
+        immediate.SetImmediateU32(value);
+        return immediate;
+    };
+    const auto block = [&]() -> IrBlock& {
+        blocks.push_back(std::make_unique<IrBlock>(static_cast<std::uint32_t>(blocks.size())));
+        return *blocks.back();
+    };
+    const auto binary = [&](IrOpcode opcode, IrType type, IrValue& first, IrValue& second) -> IrValue& {
+        auto& value = make(opcode, type);
+        value.AddArgument(&first);
+        value.AddArgument(&second);
+        return value;
+    };
+    const auto branch = [&](IrBlock& at, IrValue& condition) {
+        auto& inst = make(IrOpcode::BranchConditional, IrType::Void);
+        inst.AddArgument(&condition);
+        at.AppendInstruction(&inst);
+    };
+    struct Loop {
+        IrValue* key;
+        IrValue* next;
+        IrBlock* header;
+    };
+    // A single-block do-while: key = phi(start, next), next = key + step.
+    const auto loop = [&](std::uint32_t start, IrValue& step) {
+        auto& entry = block();
+        auto& header = block();
+        auto& key = make(IrOpcode::Phi, IrType::U32);
+        header.AppendInstruction(&key);
+        auto& next = binary(IrOpcode::IAdd32, IrType::U32, key, step);
+        header.AppendInstruction(&next);
+        key.AddPhiOperand(&entry, &constant(start));
+        key.AddPhiOperand(&header, &next);
+        return Loop{&key, &next, &header};
+    };
+    constexpr std::uint32_t limit = 20;
+
+    auto below = loop(0u, constant(1u));
+    branch(*below.header, binary(IrOpcode::ULessThan32, IrType::U1, *below.next, constant(6u)));
+    require(Detail::LoopCounterRange(below.key, limit) == 6u, "loop counter: next < 6 does not bound the key by 6");
+
+    auto negated = loop(0u, constant(1u));
+    auto& swapped = binary(IrOpcode::ULessThan32, IrType::U1, constant(7u), *negated.key);
+    auto& inverse = make(IrOpcode::LogicalNot, IrType::U1);
+    inverse.AddArgument(&swapped);
+    branch(*negated.header, inverse);
+    require(Detail::LoopCounterRange(negated.key, limit) == 8u, "loop counter: !(7 < key) does not bound the key by 8");
+
+    auto unbounded = loop(0u, constant(1u));
+    require(Detail::LoopCounterRange(unbounded.key, limit) == limit, "loop counter: a loop without an immediate exit test does not take the limit");
+
+    auto inBody = loop(0u, constant(1u));
+    auto& body = block();
+    branch(body, binary(IrOpcode::IEqual32, IrType::U1, *inBody.key, constant(2u)));
+    require(Detail::LoopCounterRange(inBody.key, limit) == limit, "loop counter: a test outside the exit blocks bounded the key");
+
+    auto down = loop(5u, constant(0xffffffffu));
+    require(Detail::LoopCounterRange(down.key, limit) == 6u, "loop counter: a count-down from 5 does not cover 6 values");
+
+    auto& invariantEntry = block();
+    auto& invariantHeader = block();
+    auto& invariant = make(IrOpcode::Phi, IrType::U32);
+    invariantHeader.AppendInstruction(&invariant);
+    invariant.AddPhiOperand(&invariantEntry, &constant(0u));
+    invariant.AddPhiOperand(&invariantHeader, &invariant);
+    require(Detail::LoopCounterRange(&invariant, limit) == 0u, "loop counter: an invariant phi was taken for a counter");
+
+    auto runtimeStep = loop(0u, make(IrOpcode::GetUserData, IrType::U32));
+    require(Detail::LoopCounterRange(runtimeStep.key, limit) == 0u, "loop counter: a step that is no immediate was taken for a counter");
+    require(Detail::LoopCounterRange(&constant(3u), limit) == 0u, "loop counter: an immediate was taken for a counter");
 }
 
 // The pure flat slots of a hand-built plan (Detail::ComputePureFlatSlots): a slot is pure unless
@@ -371,6 +459,19 @@ void verifyBindlessTable() {
     const auto nullMapping = mappingOf(nullCapture->snapshot);
     require(std::vector<std::uint32_t>(nullMapping.begin(), nullMapping.begin() + 5) == std::vector<std::uint32_t>{2u, 0u, 0u, 1u, 1u}, "bindless: a null entry's key was mapped");
     require(nullCapture->snapshot.images[direct + 1u].dwords == heap[0], "bindless: a null entry's slot is not the pad");
+    // An entry whose words 5-6 ask for what the driver does not decode (an array pitch: the walk
+    // read past a T# array into the next struct) is a null entry too, unless
+    // APS5_NO_NULL_UNDECODABLE=1 keeps it.
+    if (ResourceMaterializer::NullUndecodable()) {
+        heap[2] = heap[1];
+        heap[2][5] = 1u;
+        AgcDriver::ShaderMemory pitchMemory({});
+        const auto pitchCapture = pitchMemory.Capture(request);
+        const auto pitchMapping = mappingOf(pitchCapture->snapshot);
+        require(std::vector<std::uint32_t>(pitchMapping.begin(), pitchMapping.begin() + 5) == std::vector<std::uint32_t>{2u, 0u, 0u, 1u, 1u}, "bindless: an undecodable entry's key was mapped");
+        require(pitchCapture->snapshot.images[direct + 1u].dwords == heap[0], "bindless: an undecodable entry's slot is not the pad");
+        heap[2] = {};
+    }
     materials[2][1] = 3u;
 
     // Mode T: every entry keeps its slot; the null entry's slot holds the pad and its key is
@@ -883,6 +984,7 @@ int main() {
         verifyRegisterSources();
         verifyEvaluatedValues();
         verifyPureFlatSlots();
+        verifyLoopCounterRange();
         verifyBindlessTable();
         verifyDescriptorPhis();
         verifyProgramCounterRelativeData();
