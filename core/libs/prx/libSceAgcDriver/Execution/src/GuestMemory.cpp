@@ -1361,16 +1361,36 @@ bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
 
 std::string DescribePage(std::uint64_t address) {
     char text[512];
+#ifdef _WIN32
     MEMORY_BASIC_INFORMATION info{};
     const bool queried = VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == sizeof(info);
+#endif
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     const bool covered = tracker.watched && tracker.covers(address, 1);
     const auto block = covered ? tracker.blockOf(address) : 0;
+#ifdef _WIN32
     char mapping[192] = "";
     GuestArena::GuestArenaDescribePage_nid_postfix(static_cast<std::uintptr_t>(address), mapping, sizeof(mapping));
     std::snprintf(text, sizeof(text), "page 0x%llx: %s type 0x%lx state 0x%lx protect 0x%lx allocation 0x%llx region 0x%llx+0x%llx; watched %d stamp %u written %u cpu %u; %s", static_cast<unsigned long long>(address), queried ? "queried" : "no query", queried ? info.Type : 0ul, queried ? info.State : 0ul, queried ? info.Protect : 0ul, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info.AllocationBase)), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info.BaseAddress)), static_cast<unsigned long long>(info.RegionSize), covered ? 1 : 0, covered ? tracker.stampOf(block) : 0u, covered ? tracker.writtenStampOf(block) : 0u, covered ? tracker.cpuStampOf(block) : 0u, mapping);
+#else
+    // No arena on Linux: the /proc/self/maps line holding the page stands in for the query.
+    std::string mapping = "no mapping";
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps, line)) {
+        std::istringstream fields(line);
+        std::uintptr_t first = 0;
+        std::uintptr_t last = 0;
+        char separator = 0;
+        if (!(fields >> std::hex >> first >> separator >> last) || separator != '-') break;
+        if (address < first || address >= last) continue;
+        mapping = line;
+        break;
+    }
+    std::snprintf(text, sizeof(text), "page 0x%llx: watched %d stamp %u written %u cpu %u; %s", static_cast<unsigned long long>(address), covered ? 1 : 0, covered ? tracker.stampOf(block) : 0u, covered ? tracker.writtenStampOf(block) : 0u, covered ? tracker.cpuStampOf(block) : 0u, mapping.c_str());
+#endif
     return text;
 }
 

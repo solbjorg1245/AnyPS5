@@ -50,9 +50,6 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FastClock.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FastEmutls.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/OperatorNew.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/DeviceAccess.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Diagnostics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/FrameTrace.cpp
@@ -146,6 +143,21 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Submit/src/CommandBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Submit/src/Dcb.cpp
 )
+
+# The host replacements below work around MinGW's runtime (winpthreads' clock_gettime, emulated TLS,
+# the msvcrt-style heap) through Win32 and PE import tricks; on Linux glibc does all three natively,
+# and HostStubs.cpp supplies the counters the profile lines read from them.
+if(MINGW)
+    list(APPEND agcDriverSources
+            ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FastClock.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FastEmutls.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/OperatorNew.cpp
+    )
+else()
+    list(APPEND agcDriverSources
+            ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HostStubs.cpp
+    )
+endif()
 
 add_library(libSceAgcDriver SHARED EXCLUDE_FROM_ALL
         ${agcDriverSources}
@@ -490,6 +502,10 @@ if(BUILD_TESTING)
         set_target_properties(${agcTest} PROPERTIES EXCLUDE_FROM_ALL OFF)
         add_test(NAME ${agcTestName} COMMAND ${agcTest})
         set_tests_properties(${agcTestName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77)
+        # Tests that open a Vulkan device carry the gpu label (ctest -LE gpu runs the rest).
+        if(agcTest STREQUAL "agc_driver_graphics_tests" OR agcTest IN_LIST agcExecutionTests)
+            set_tests_properties(${agcTestName} PROPERTIES LABELS gpu)
+        endif()
         if(WIN32)
             set_tests_properties(${agcTestName} PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
