@@ -255,6 +255,12 @@ target_include_directories(agc_shader_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_shader_memory_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_memory_tests)
+# The fast walk's decline must not throw: tests/ShaderMemory.cpp counts every C++ throw of the
+# test's objects and static libraries through a __cxa_throw wrapper (GNU ld and lld --wrap).
+if(MINGW OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(agc_shader_memory_tests PRIVATE -Wl,--wrap=__cxa_throw)
+    target_compile_definitions(agc_shader_memory_tests PRIVATE APS5_COUNT_CXX_THROWS=1)
+endif()
 
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp

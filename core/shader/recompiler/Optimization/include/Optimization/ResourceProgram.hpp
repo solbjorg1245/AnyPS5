@@ -51,7 +51,9 @@ struct SourceHandle {
 // plan, no walk program, a bindless image table, an unsupported root or a failing op, a read the
 // reader declined (ReadDeclined); Failed is any other materialization error (the reader may have
 // declined a read outside the express walk, the uniform fill's). `runtime`'s userData,
-// shaderBase, walk, trace and deferral fields are replaced.
+// shaderBase, walk, trace and deferral fields are replaced. A walk or uniform-fill evaluation that
+// does not complete declines without an exception (ResourceMaterializer::TryMaterialize); only a
+// malformed plan or descriptor throws inside, caught here as before.
 enum class WalkStatus : std::uint8_t { Walked, NoSource, IncompletePlan, NoProgram, Bindless, UnsupportedRoot, OpFailed, ReadDeclined, Failed, Count };
 [[nodiscard]] const char* WalkStatusName(WalkStatus status);
 [[nodiscard]] WalkStatus WalkResources(const SourceHandle& handle, std::span<const std::uint32_t> userData, std::uint64_t shaderBase, const SrtRuntime& runtime, ResourceSnapshot& snapshot, ResourceSpecialization& specialization);

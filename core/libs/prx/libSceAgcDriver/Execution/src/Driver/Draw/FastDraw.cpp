@@ -61,6 +61,8 @@ struct FastDrawCounters {
     double takenUs = 0;
     double declinedUs = 0;
     std::array<std::uint64_t, DeclineCount> declines{};
+    // declinedUs by reason: the time a draw spent before declining for it.
+    std::array<double, DeclineCount> declineUs{};
     std::uint64_t verifyDraws = 0, verifyStages = 0, verifyNotCompared = 0, verifyVertex = 0;
     // [0]: plain old results, [1]: results the old path bound by a heuristic.
     std::array<std::uint64_t, 2> verifyMismatched{};
@@ -108,7 +110,7 @@ void report(const FastDrawCounters& total) {
     }
     for (std::size_t reason = 0; reason < DeclineCount; ++reason) {
         if (total.declines[reason] == 0) continue;
-        std::snprintf(item, sizeof(item), "%s%s %llu", declines.empty() ? "" : ", ", Graphics::FastDeclineName(static_cast<FastDecline>(reason)), count(total.declines[reason]));
+        std::snprintf(item, sizeof(item), "%s%s %llu (%.1f us each)", declines.empty() ? "" : ", ", Graphics::FastDeclineName(static_cast<FastDecline>(reason)), count(total.declines[reason]), total.declineUs[reason] / static_cast<double>(total.declines[reason]));
         declines += item;
     }
     std::fprintf(stderr, "[fastpath] draws (10 s): %llu offered, %llu taken (%.1f%%; %llu indirect, %llu continued a pass); us per taken draw: %s = %.2f; %.1f allocations per taken draw; declined draws spent %.1f ms before declining; declines: %s\n", count(total.offered), count(total.taken), total.offered != 0 ? 100.0 * static_cast<double>(total.taken) / static_cast<double>(total.offered) : 0.0, count(total.indirect), count(total.continued), parts.c_str(), total.takenUs / taken, static_cast<double>(total.allocations) / taken, total.declinedUs / 1000.0, declines.empty() ? "none" : declines.c_str());
@@ -139,7 +141,10 @@ void commit(const FastDrawCounters& local) {
     }
     total.takenUs += local.takenUs;
     total.declinedUs += local.declinedUs;
-    for (std::size_t reason = 0; reason < DeclineCount; ++reason) total.declines[reason] += local.declines[reason];
+    for (std::size_t reason = 0; reason < DeclineCount; ++reason) {
+        total.declines[reason] += local.declines[reason];
+        total.declineUs[reason] += local.declineUs[reason];
+    }
     total.verifyDraws += local.verifyDraws;
     total.verifyStages += local.verifyStages;
     total.verifyNotCompared += local.verifyNotCompared;
@@ -258,6 +263,9 @@ std::optional<DrawVerdict> Driver::fastDraw(QueueState& queue, const Submission&
     const auto declined = [&](FastDecline reason) -> std::optional<DrawVerdict> {
         ++local.declines[static_cast<std::size_t>(reason)];
         local.declinedUs = elapsedUs();
+        local.declineUs[static_cast<std::size_t>(reason)] = local.declinedUs;
+        // The fast path's time since its last phase goes to its own row, not to the old path's next one.
+        phaseTiming.Phase(DrawRowFastDeclined);
         commit(local);
         return std::nullopt;
     };

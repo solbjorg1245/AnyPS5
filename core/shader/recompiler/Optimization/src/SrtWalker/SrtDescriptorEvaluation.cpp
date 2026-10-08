@@ -37,6 +37,13 @@ bool Fail(std::string reason) {
     return false;
 }
 
+// A fixed reason (the fast walk's declines, every draw that meets a pending block): assigned into
+// the thread's string, no allocation once it has the capacity.
+bool Fail(const char* reason) {
+    failureReason().assign(reason);
+    return false;
+}
+
 const DescriptorSource* Source(const IrResourcePlan& program, std::uint32_t source) {
     if (source >= program.descriptorSources.size()) {
         return nullptr;
@@ -162,19 +169,24 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
         return evaluateInterpreted(program, sources, runtime, results, flat, evaluateFlat, cleanFlatSlots, activeSources);
     }
     static const bool verify = std::getenv("APS5_VERIFY_EXPRESS") != nullptr;
-    std::vector<DescriptorValue> expressResults;
-    std::vector<std::uint32_t> expressFlat;
-    std::vector<std::uint8_t> expressActive;
     SrtRuntime express = runtime;
     // Under verification the interpreter's walk alone traces the reads.
     if (verify) express.readTrace = nullptr;
+    // The fast walk (expressOnly) neither falls back nor verifies (the interpreter reading through
+    // its declining reader could fail where the express walk ran, which aborts): the walk writes
+    // the outputs in place, the caller's per-thread vectors keeping their capacity; a walk that
+    // does not complete leaves them unspecified.
+    if (runtime.expressOnly) {
+        if (ExecuteWalkProgram(*runtime.walk, program, express, results, flat, activeSources) != WalkOutcome::Ran) return Fail("the express walk did not complete");
+        return true;
+    }
+    std::vector<DescriptorValue> expressResults;
+    std::vector<std::uint32_t> expressFlat;
+    std::vector<std::uint8_t> expressActive;
     if (ExecuteWalkProgram(*runtime.walk, program, express, expressResults, expressFlat, expressActive) != WalkOutcome::Ran) {
-        if (runtime.expressOnly) return Fail("the express walk did not complete");
         return evaluateInterpreted(program, sources, runtime, results, flat, evaluateFlat, cleanFlatSlots, activeSources);
     }
-    // The fast walk (expressOnly) never verifies: the interpreter reading through its declining
-    // reader could fail where the express walk ran, which aborts.
-    if (!verify || runtime.expressOnly) {
+    if (!verify) {
         results = std::move(expressResults);
         flat = std::move(expressFlat);
         activeSources = std::move(expressActive);

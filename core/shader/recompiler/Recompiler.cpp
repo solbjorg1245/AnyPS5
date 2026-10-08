@@ -739,9 +739,7 @@ WalkStatus WalkResources(const SourceHandle& handle, std::span<const std::uint32
     fast.expressOnly = true;
     // Count: the walk program was not reached (a failure before it, the uniform fill's).
     Detail::NoteWalkOutcome(Detail::WalkOutcome::Count);
-    try {
-        ResourceMaterializer{}.Materialize(plan, fast, snapshot, specialization);
-    } catch (const std::exception&) {
+    const auto declined = [] {
         switch (Detail::LastWalkOutcome()) {
             case Detail::WalkOutcome::NoProgram: return WalkStatus::NoProgram;
             case Detail::WalkOutcome::UnsupportedRoot: return WalkStatus::UnsupportedRoot;
@@ -749,6 +747,14 @@ WalkStatus WalkResources(const SourceHandle& handle, std::span<const std::uint32
             case Detail::WalkOutcome::ReadBailed: return WalkStatus::ReadDeclined;
             default: return WalkStatus::Failed;
         }
+    };
+    // A walk that does not complete (a declined read, above all a pending block) returns false: no
+    // exception, which cost about 1.6 ms per declined draw (s53-fastdraw-diag). Only a malformed
+    // plan or descriptor still throws.
+    try {
+        if (!ResourceMaterializer{}.TryMaterialize(plan, fast, snapshot, specialization)) return declined();
+    } catch (const std::exception&) {
+        return declined();
     }
     return WalkStatus::Walked;
 }

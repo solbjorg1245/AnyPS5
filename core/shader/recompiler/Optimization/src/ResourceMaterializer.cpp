@@ -1,5 +1,6 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "prx/libc/include/HostMutex.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
@@ -525,15 +526,59 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     if (BindlessTraced()) traceTable(plan, image, table, heapBase, materialBase, {materialMode, entries, materialEntries, static_cast<std::uint32_t>(resolution.mapping.size())});
 }
 
-void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, SrtWalker& walker, ResourceSnapshot& snapshot, std::vector<TableResolution>& tables) {
-    snapshot = ResourceSnapshot{};
+// The working vectors of one materialization; TryMaterialize's live per thread, their capacity
+// reused from walk to walk.
+struct MaterializeScratch {
+    std::vector<DescriptorValue> values;
+    std::vector<std::uint8_t> activeSources;
+    std::vector<TableResolution> tables;
+};
+struct MaterializeScratchTag {};
+
+// Moves `from`'s storage, emptied, into `to` (a member of a fresh object): its capacity is kept.
+template<typename TVector>
+void keepCapacity(TVector& from, TVector& to) {
+    from.clear();
+    to = std::move(from);
+}
+
+// A fresh snapshot and specialization, but their vectors keep the capacity they had.
+void resetSnapshot(ResourceSnapshot& snapshot) {
+    ResourceSnapshot fresh;
+    keepCapacity(snapshot.buffers, fresh.buffers);
+    keepCapacity(snapshot.images, fresh.images);
+    keepCapacity(snapshot.samplers, fresh.samplers);
+    keepCapacity(snapshot.flattenedSrt, fresh.flattenedSrt);
+    keepCapacity(snapshot.userData, fresh.userData);
+    keepCapacity(snapshot.deferredFlat, fresh.deferredFlat);
+    snapshot = std::move(fresh);
+}
+
+void resetSpecialization(ResourceSpecialization& specialization) {
+    ResourceSpecialization fresh;
+    keepCapacity(specialization.buffers, fresh.buffers);
+    keepCapacity(specialization.images, fresh.images);
+    keepCapacity(specialization.boundDescriptors, fresh.boundDescriptors);
+    specialization = std::move(fresh);
+}
+
+// quiet (TryMaterialize): an SRT or uniform-fill evaluation that fails (the fast walk's declined
+// read) returns false instead of throwing; every other failure throws either way.
+bool materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, SrtWalker& walker, bool quiet, MaterializeScratch& scratch, ResourceSnapshot& snapshot) {
+    resetSnapshot(snapshot);
+    auto& tables = scratch.tables;
     if (plan.uniformFill.fill.kind != UniformFillKind::None) {
         const auto words = plan.uniformFill.fill.words;
         if (words == 0u || words > plan.uniformFill.values.size()) {
             throw std::runtime_error("uniform fill plan has an invalid word count");
         }
         std::array<std::uint32_t, 4> stored{};
-        walker.EvaluateUniformValues(plan, std::span(plan.uniformFill.values).first(words), runtime, std::span(stored).first(words));
+        const auto fillValues = std::span(plan.uniformFill.values).first(words);
+        if (quiet) {
+            if (!walker.TryEvaluateUniformValues(plan, fillValues, runtime, std::span(stored).first(words))) return false;
+        } else {
+            walker.EvaluateUniformValues(plan, fillValues, runtime, std::span(stored).first(words));
+        }
         for (std::uint32_t i = 1; i < words; i++) {
             if (stored[i] != stored[0]) {
                 throw std::runtime_error("uniform fill values diverge at runtime");
@@ -547,9 +592,13 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
     }
     snapshot.userData.assign(runtime.userData.begin(), runtime.userData.begin() + plan.userDataCount);
 
-    std::vector<DescriptorValue> values;
-    std::vector<std::uint8_t> activeSources;
-    walker.EvaluateRuntimeSources(plan, plan.materializationSources, runtime, values, snapshot.flattenedSrt, plan.cleanFlatSlots, activeSources);
+    auto& values = scratch.values;
+    auto& activeSources = scratch.activeSources;
+    if (quiet) {
+        if (!walker.TryEvaluateRuntimeSources(plan, plan.materializationSources, runtime, values, snapshot.flattenedSrt, plan.cleanFlatSlots, activeSources)) return false;
+    } else {
+        walker.EvaluateRuntimeSources(plan, plan.materializationSources, runtime, values, snapshot.flattenedSrt, plan.cleanFlatSlots, activeSources);
+    }
 
     std::size_t cursor = 0;
     if (values.size() < plan.info.buffers.size()) {
@@ -619,10 +668,13 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         throw std::runtime_error("materialization sources are missing sampler descriptors");
     }
     snapshot.samplers.assign(values.begin() + cursor, values.begin() + cursor + plan.info.samplers.size());
+    return true;
 }
 
 void buildResourceSpecialization(const IrResourcePlan& plan, ResourceSnapshot& snapshot, const std::vector<TableResolution>& tables, ResourceSpecialization& specialization) {
-    ResourceSpecialization result;
+    // Built in place (TryMaterialize's per-thread specialization keeps its capacity).
+    auto& result = specialization;
+    resetSpecialization(result);
     result.buffers.reserve(plan.info.buffers.size());
     for (std::uint32_t i = 0; i < plan.info.buffers.size(); i++) {
         const ShaderBufferResource decoded = decodeBufferDescriptor(snapshot.buffers[i]);
@@ -706,7 +758,56 @@ void buildResourceSpecialization(const IrResourcePlan& plan, ResourceSnapshot& s
     for (std::uint32_t index = 0; index < result.images.size(); index++) {
         result.boundDescriptors.push_back(index);
     }
-    specialization = std::move(result);
+}
+
+// APS5_NO_WALK_REUSE=1: TryMaterialize builds into fresh objects as Materialize does (the A/B of
+// the in-place build).
+bool walkReuse() {
+    static const bool reuse = std::getenv("APS5_NO_WALK_REUSE") == nullptr;
+    return reuse;
+}
+
+// Materialize (quiet false) and TryMaterialize (quiet: false returned for a failed SRT or
+// uniform-fill evaluation, with the same [bindless] report a throw makes on its way out).
+// Materialize builds into fresh objects, moved out once complete (a throw leaves the outputs as
+// they were); TryMaterialize, the fast walk's, builds in place, so the caller's per-thread
+// snapshot and specialization and this thread's scratch keep their capacity (no allocation for
+// them on a walked draw), and a false return or a throw leaves the outputs unspecified.
+bool materialize(const IrResourcePlan& plan, const SrtRuntime& runtime, bool quiet, ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+    if (!plan.resourceTrackingComplete) {
+        throw std::runtime_error("ResourceMaterializer::Materialize requires a completed resource plan");
+    }
+    if (plan.requiresSpecializationMemory && runtime.readMemory == nullptr) {
+        throw std::runtime_error("ResourceMaterializer::Materialize requires runtime memory access for indirect images");
+    }
+    SrtWalker walker;
+    MaterializeScratch localScratch;
+    ResourceSnapshot nextSnapshot;
+    ResourceSpecialization nextSpecialization;
+    const bool inPlace = quiet && walkReuse();
+    auto& scratch = inPlace ? HostThreadLocal<MaterializeScratch, MaterializeScratchTag>() : localScratch;
+    auto& snapshotOut = inPlace ? snapshot : nextSnapshot;
+    auto& specializationOut = inPlace ? specialization : nextSpecialization;
+    bool evaluated = false;
+    try {
+        evaluated = materializeSnapshot(plan, runtime, walker, quiet, scratch, snapshotOut);
+    } catch (...) {
+        reportBindless();
+        throw;
+    }
+    if (!evaluated) {
+        reportBindless();
+        return false;
+    }
+    const auto started = MaterializeProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    buildResourceSpecialization(plan, snapshotOut, scratch.tables, specializationOut);
+    if (MaterializeProfiled()) specializationNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
+    if (!inPlace) {
+        snapshot = std::move(nextSnapshot);
+        specialization = std::move(nextSpecialization);
+    }
+    reportBindless();
+    return true;
 }
 
 }
@@ -972,29 +1073,11 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
 }
 
 void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, ResourceSpecialization& specialization) const {
-    const IrResourcePlan& plan = program;
-    if (!plan.resourceTrackingComplete) {
-        throw std::runtime_error("ResourceMaterializer::Materialize requires a completed resource plan");
-    }
-    if (plan.requiresSpecializationMemory && runtime.readMemory == nullptr) {
-        throw std::runtime_error("ResourceMaterializer::Materialize requires runtime memory access for indirect images");
-    }
-    SrtWalker walker;
-    ResourceSnapshot nextSnapshot;
-    std::vector<TableResolution> tables;
-    try {
-        materializeSnapshot(plan, runtime, walker, nextSnapshot, tables);
-    } catch (...) {
-        reportBindless();
-        throw;
-    }
-    ResourceSpecialization nextSpecialization;
-    const auto started = MaterializeProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    buildResourceSpecialization(plan, nextSnapshot, tables, nextSpecialization);
-    if (MaterializeProfiled()) specializationNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
-    snapshot = std::move(nextSnapshot);
-    specialization = std::move(nextSpecialization);
-    reportBindless();
+    static_cast<void>(materialize(program, runtime, false, snapshot, specialization));
+}
+
+bool ResourceMaterializer::TryMaterialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, ResourceSpecialization& specialization) const {
+    return materialize(program, runtime, true, snapshot, specialization);
 }
 
 std::uint64_t ResourceMaterializer::SpecializationNanoseconds() {

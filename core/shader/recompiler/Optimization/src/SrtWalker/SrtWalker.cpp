@@ -22,6 +22,12 @@ bool SrtWalker::ValidateRuntimeValue(const IrResourcePlan& program, const IrValu
 }
 
 void SrtWalker::EvaluateUniformValues(const IrResourcePlan& program, std::span<IrValue* const> values, const SrtRuntime& runtime, std::span<std::uint32_t> results) const {
+    if (!TryEvaluateUniformValues(program, values, runtime, results)) {
+        throw std::runtime_error("SrtWalker::EvaluateUniformValues failed to evaluate a uniform value");
+    }
+}
+
+bool SrtWalker::TryEvaluateUniformValues(const IrResourcePlan& program, std::span<IrValue* const> values, const SrtRuntime& runtime, std::span<std::uint32_t> results) const {
     if (values.size() != results.size()) {
         throw std::runtime_error("SrtWalker::EvaluateUniformValues value and result counts differ");
     }
@@ -29,10 +35,9 @@ void SrtWalker::EvaluateUniformValues(const IrResourcePlan& program, std::span<I
     clean.readMemory = runtime.readSpecializationMemory != nullptr ? runtime.readSpecializationMemory : +[](void*, std::uint64_t, std::uint32_t*) { return false; };
     Detail::Evaluator evaluator(program, clean);
     for (std::size_t i = 0; i < values.size(); ++i) {
-        if (!evaluator.Evaluate(values[i], results[i])) {
-            throw std::runtime_error("SrtWalker::EvaluateUniformValues failed to evaluate a uniform value");
-        }
+        if (!evaluator.Evaluate(values[i], results[i])) return false;
     }
+    return true;
 }
 
 void SrtWalker::EvaluateDescriptorSource(const IrResourcePlan& program, std::uint32_t source, const SrtRuntime& runtime, DescriptorValue& result) const {
@@ -50,9 +55,13 @@ void SrtWalker::EvaluateDescriptorSources(const IrResourcePlan& program, std::sp
 }
 
 void SrtWalker::EvaluateRuntimeSources(const IrResourcePlan& program, std::span<const std::uint32_t> sources, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::span<const std::uint8_t> cleanFlatSlots, std::vector<std::uint8_t>& activeSources) const {
-    if (!Detail::EvaluateRuntimeSourcesImpl(program, sources, runtime, results, flat, true, cleanFlatSlots, activeSources)) {
+    if (!TryEvaluateRuntimeSources(program, sources, runtime, results, flat, cleanFlatSlots, activeSources)) {
         throw std::runtime_error("SrtWalker::EvaluateRuntimeSources failed to evaluate runtime sources: " + Detail::RuntimeSourceFailureReason());
     }
+}
+
+bool SrtWalker::TryEvaluateRuntimeSources(const IrResourcePlan& program, std::span<const std::uint32_t> sources, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::span<const std::uint8_t> cleanFlatSlots, std::vector<std::uint8_t>& activeSources) const {
+    return Detail::EvaluateRuntimeSourcesImpl(program, sources, runtime, results, flat, true, cleanFlatSlots, activeSources);
 }
 
 void SrtWalker::Walk(const IrResourcePlan& program, const SrtRuntime& runtime, std::vector<std::uint32_t>& flat) const {

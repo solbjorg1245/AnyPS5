@@ -7,6 +7,7 @@
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
+#include "Optimization/SrtWalker/WalkProgram.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
@@ -26,13 +27,41 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <typeinfo>
 #include <utility>
 #include <vector>
+
+// APS5_COUNT_CXX_THROWS (CMakeLists.txt: the test links with --wrap=__cxa_throw): every C++ throw
+// of the test's objects and static libraries (the recompiler) passes this wrapper, which counts
+// it per thread. A rethrow (__cxa_rethrow) is not counted. Without it nothing is counted.
+#ifndef APS5_COUNT_CXX_THROWS
+#define APS5_COUNT_CXX_THROWS 0
+#endif
+#if APS5_COUNT_CXX_THROWS
+namespace ShaderMemoryTests {
+thread_local std::uint64_t cxxThrows = 0;
+}
+extern "C" [[noreturn]] void __real___cxa_throw(void* object, std::type_info* type, void (*destructor)(void*));
+extern "C" [[noreturn]] void __wrap___cxa_throw(void* object, std::type_info* type, void (*destructor)(void*)) {
+    ++ShaderMemoryTests::cxxThrows;
+    __real___cxa_throw(object, type, destructor);
+}
+#endif
 
 namespace {
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+// The C++ throws on this thread so far (APS5_COUNT_CXX_THROWS; 0 without it).
+constexpr bool CountsThrows = APS5_COUNT_CXX_THROWS != 0;
+std::uint64_t thrownSoFar() {
+#if APS5_COUNT_CXX_THROWS
+    return ShaderMemoryTests::cxxThrows;
+#else
+    return 0;
+#endif
 }
 
 template<typename TAction>
@@ -55,6 +84,92 @@ void verifyResult(const ShaderRecompiler::RecompileResult& first, const ShaderRe
         const auto& right = second.bindings[index];
         require(left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly, "replayed binding differs");
     }
+}
+
+// A pending block (the driver's FastSrtRead declining a read) at the walk's first and last read:
+// the fast walk declines with ReadDeclined and without a C++ exception (a throw cost about 1.6 ms
+// per declined draw in the game, port/reports/s53-fastdraw-diag.md), with the counters the
+// throwing form kept: the reads up to the declined one and the walk outcome the driver's decline
+// reason follows (ReadBailed). Materialize over the same express-only runtime still throws its
+// message and leaves its outputs as they were; TryMaterialize returns false. A walk into the
+// outputs the declines left half written (the fast path's per-thread scratch, reused in place)
+// then materializes exactly the capture's snapshot and specialization.
+void verifyWalkDeclineWithoutThrow(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::ResourceCapture& capture, const ShaderRecompiler::SourceHandle& handle, std::uint32_t walkReads) {
+    using namespace ShaderRecompiler;
+    struct Reader {
+        std::uint32_t reads = 0;
+        std::uint32_t declineAt = 0;
+    } reader;
+    const SrtMemoryReader pending = +[](void* context, std::uint64_t address, std::uint32_t* value) {
+        auto& self = *static_cast<Reader*>(context);
+        if (++self.reads >= self.declineAt) return false;
+        std::memcpy(value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), sizeof(*value));
+        return true;
+    };
+    SrtRuntime runtime;
+    runtime.userContext = &reader;
+    runtime.readMemory = pending;
+    runtime.readSpecializationMemory = pending;
+    runtime.expressRead = pending;
+    // The runtime WalkResources hands the materializer (Recompiler.cpp), for its two forms.
+    const auto walk = Detail::CompileWalkProgram(*capture.plan);
+    require(walk != nullptr, "the plan compiled no walk program");
+    SrtRuntime fast = runtime;
+    fast.userData = request.context.userData;
+    fast.shaderBase = request.shader.codeAddress;
+    fast.walk = walk.get();
+    fast.expressOnly = true;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    for (const auto declineAt : {1u, walkReads}) {
+        // The throwing form, as WalkResources called it before: the decline is an exception.
+        reader = {0, declineAt};
+        Detail::NoteWalkOutcome(Detail::WalkOutcome::Count);
+        auto kept = capture.snapshot;
+        auto keptSpecialization = capture.specialization;
+        auto before = thrownSoFar();
+        expectFailure([&] { ResourceMaterializer{}.Materialize(*capture.plan, fast, kept, keptSpecialization); }, "SrtWalker::EvaluateRuntimeSources failed to evaluate runtime sources: the express walk did not complete", "Materialize did not throw for a declined read");
+        require(!CountsThrows || thrownSoFar() == before + 1, "the throw counter did not count Materialize's one exception");
+        require(kept.flattenedSrt == capture.snapshot.flattenedSrt && kept.userData == capture.snapshot.userData && keptSpecialization == capture.specialization, "Materialize changed its outputs before it threw");
+        const auto thrownReads = reader.reads;
+        const auto thrownOutcome = Detail::LastWalkOutcome();
+        require(thrownReads == declineAt && thrownOutcome == Detail::WalkOutcome::ReadBailed, "Materialize did not stop at the declined read");
+
+        // The non-throwing form: false, the same reads and outcome, no exception.
+        reader = {0, declineAt};
+        Detail::NoteWalkOutcome(Detail::WalkOutcome::Count);
+        before = thrownSoFar();
+        require(!ResourceMaterializer{}.TryMaterialize(*capture.plan, fast, snapshot, specialization), "TryMaterialize completed a walk whose read was declined");
+        require(thrownSoFar() == before, "TryMaterialize threw for a declined read");
+        require(reader.reads == thrownReads && Detail::LastWalkOutcome() == thrownOutcome, "TryMaterialize's reads or walk outcome differ from Materialize's");
+
+        // The fast walk: ReadDeclined (the driver's "walk: pending block"), no exception.
+        reader = {0, declineAt};
+        before = thrownSoFar();
+        require(WalkResources(handle, request.context.userData, request.shader.codeAddress, runtime, snapshot, specialization) == WalkStatus::ReadDeclined, "a pending block did not decline the fast walk as a declined read");
+        require(thrownSoFar() == before, "the fast walk threw for a pending block");
+        require(reader.reads == thrownReads && Detail::LastWalkOutcome() == thrownOutcome, "the fast walk's reads or walk outcome differ from Materialize's");
+    }
+    // Left-overs a reused scratch could carry reach no later walk.
+    snapshot.flattenedSrt.push_back(0xdeadbeefu);
+    snapshot.deferredFlat.emplace_back(0u, 0x1000u);
+    snapshot.uniformFill.value = 0xdeadbeefu;
+    specialization.boundDescriptors.push_back(99u);
+    reader = {0, ~0u};
+    const auto before = thrownSoFar();
+    require(WalkResources(handle, request.context.userData, request.shader.codeAddress, runtime, snapshot, specialization) == WalkStatus::Walked, "the fast walk declined after declines into the same snapshot");
+    require(thrownSoFar() == before && reader.reads == walkReads, "a completed fast walk threw or read differently");
+    const auto sameValues = [](const std::vector<DescriptorValue>& left, const std::vector<DescriptorValue>& right) {
+        if (left.size() != right.size()) return false;
+        for (std::size_t i = 0; i < left.size(); ++i) {
+            if (left[i].dwordCount != right[i].dwordCount || !std::equal(left[i].dwords.begin(), left[i].dwords.begin() + left[i].dwordCount, right[i].dwords.begin())) return false;
+        }
+        return true;
+    };
+    const auto& captured = capture.snapshot;
+    require(sameValues(snapshot.buffers, captured.buffers) && sameValues(snapshot.images, captured.images) && sameValues(snapshot.samplers, captured.samplers), "a walk into a reused snapshot has other descriptors than the capture");
+    require(snapshot.flattenedSrt == captured.flattenedSrt && snapshot.userData == captured.userData && snapshot.uniformFill == captured.uniformFill && snapshot.deferredFlat.empty(), "a walk into a reused snapshot kept words of an earlier one");
+    require(specialization == capture.specialization && specialization.boundDescriptors == capture.specialization.boundDescriptors, "a walk into a reused specialization differs from the capture's");
 }
 
 // The fast walk (WalkResources, docs/design/draw-fastpath.md F2) with a direct reader of live
@@ -84,6 +199,7 @@ void verifyWalkResources(const ShaderRecompiler::RecompileRequest& request, cons
     ResourceSpecialization specialization;
     require(WalkResources(*handle, request.context.userData, request.shader.codeAddress, runtime, snapshot, specialization) == WalkStatus::Walked, "the fast walk declined a request the capture walked");
     require(reader.reads != 0, "the fast walk read nothing through its reader");
+    const auto walkReads = reader.reads;
     const auto sameValues = [](const std::vector<DescriptorValue>& left, const std::vector<DescriptorValue>& right) {
         if (left.size() != right.size()) return false;
         for (std::size_t i = 0; i < left.size(); ++i) {
@@ -104,6 +220,7 @@ void verifyWalkResources(const ShaderRecompiler::RecompileRequest& request, cons
     require(!PopulateVariant(*handle, otherLayout, snapshot, specialization, walked), "a layout never compiled selected a variant");
     reader.decline = true;
     require(WalkResources(*handle, request.context.userData, request.shader.codeAddress, runtime, snapshot, specialization) == WalkStatus::ReadDeclined, "a declined read did not decline the fast walk");
+    verifyWalkDeclineWithoutThrow(request, capture, *handle, walkReads);
 }
 
 void verifyRegisterSources() {
