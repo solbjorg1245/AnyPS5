@@ -1939,7 +1939,7 @@ VkBufferUsageFlags gpuCopyUsage(bool addressable) {
 // since store extents are not known), for the batch's latency; the staging window keeps the
 // exposure to the elements named on the [buffers] staging line and APS5_TRACE_STAGING.
 // APS5_NO_WRITTEN_SHADOW=1 and APS5_NO_ATOMIC_STAGING=1 bind those elements in place as before;
-// APS5_WRITTEN_SHADOW_MIN_KIB / APS5_WRITTEN_SHADOW_MAX_KIB (16 / 2048) bound the written window
+// APS5_WRITTEN_SHADOW_MIN_KIB / APS5_WRITTEN_SHADOW_MAX_KIB (16 / 16384) bound the written window
 // (a kernel streaming once through a large buffer, the engine's memcpy kernel over 4-8 MiB video
 // frames, would only gain the two copies), APS5_ATOMIC_STAGE_MAX_KIB (1024) the atomic one.
 bool writtenShadowEnabled() {
@@ -1963,7 +1963,7 @@ std::uint64_t writtenShadowMin() {
 }
 
 std::uint64_t writtenShadowMax() {
-    static const std::uint64_t bytes = kibSetting("APS5_WRITTEN_SHADOW_MAX_KIB", 2048);
+    static const std::uint64_t bytes = kibSetting("APS5_WRITTEN_SHADOW_MAX_KIB", 16384);
     return bytes;
 }
 

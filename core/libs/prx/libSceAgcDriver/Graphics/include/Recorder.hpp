@@ -472,7 +472,7 @@ public:
     // worker sleeps, as for the labels above;
     static std::uint64_t PendingWriteBackCompletions();
     // dispatches and draws recorded since the last submit (the driver counts them: CountRecordedWork),
-    // so a batch is submitted after a bounded amount of work (APS5_BATCH_CAP).
+    // so a batch can be submitted after a bounded amount of work (APS5_BATCH_CAP; 0, the default: uncapped).
     static std::uint64_t RecordedWorkSinceSubmit();
     static void CountRecordedWork();
 

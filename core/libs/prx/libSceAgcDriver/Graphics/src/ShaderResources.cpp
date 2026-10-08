@@ -219,7 +219,7 @@ void reportTextureCounters() {
     const auto direct = taken(NullBoundImage::Undecodable);
     const auto tableBits = taken(NullBoundImage::TableUndecodable);
     const auto tableUnreadable = taken(NullBoundImage::TableUnreadable);
-    std::fprintf(stderr, "[draws] undecodable image elements bound as null (10 s%s): capture %llu (T# words 5-6), table entries %llu (words 5-6) + %llu (unreadable), driver decode %llu\n", ResourceMaterializer::NullUndecodable() ? "" : ", off: APS5_NO_NULL_UNDECODABLE", direct, tableBits, tableUnreadable, static_cast<unsigned long long>(sampledNullBound.exchange(0, std::memory_order_relaxed)));
+    std::fprintf(stderr, "[draws] undecodable image elements bound as null (10 s%s): capture %llu (T# words 5-6), table entries %llu (words 5-6) + %llu (unreadable), driver decode %llu\n", ResourceMaterializer::NullUndecodable() ? "" : ", off: set APS5_NULL_UNDECODABLE=1", direct, tableBits, tableUnreadable, static_cast<unsigned long long>(sampledNullBound.exchange(0, std::memory_order_relaxed)));
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -364,8 +364,8 @@ std::array<std::uint32_t, 8> NullTextureDescriptor(std::optional<ShaderRecompile
 // A sampled element as the build bound it (resolveImageBinding): a null T# and one the driver
 // cannot decode take the null texture's words (`words` then names `nullWords`). Walks repeating
 // the build's lookups (Revalidate) decode through this so they meet the build's objects: decoding
-// the guest words, they threw on such an element and dropped the draw. APS5_NO_NULL_UNDECODABLE=1
-// decodes the guest words as before.
+// the guest words, they threw on such an element and dropped the draw. Opt-in (APS5_NULL_UNDECODABLE=1);
+// by default the guest words are decoded as before.
 GuestTextureResource decodeBoundSampled(std::span<const std::uint32_t>& words, std::array<std::uint32_t, 8>& nullWords, std::optional<ShaderRecompiler::DescriptorImageShape> shape) {
     if (!ShaderRecompiler::ResourceMaterializer::NullUndecodable()) return DecodeTextureResource(words);
     if (!NullTextureWords(words)) {
@@ -3330,7 +3330,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             // A descriptor the driver cannot decode is reported once per word set with where the
             // capture read it (the walk can read data that is no T#, see validImageDescriptor),
             // and binds the null texture instead of failing the draw (decodeBoundSampled; the
-            // capture nulls the known cases already). APS5_NO_NULL_UNDECODABLE=1 rethrows.
+            // capture nulls the known cases already); opt-in, APS5_NULL_UNDECODABLE=1, else it rethrows.
             const auto decode = [&] {
                 try {
                     return DecodeTextureResource(words);

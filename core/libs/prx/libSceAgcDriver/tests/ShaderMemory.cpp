@@ -460,8 +460,8 @@ void verifyBindlessTable() {
     require(std::vector<std::uint32_t>(nullMapping.begin(), nullMapping.begin() + 5) == std::vector<std::uint32_t>{2u, 0u, 0u, 1u, 1u}, "bindless: a null entry's key was mapped");
     require(nullCapture->snapshot.images[direct + 1u].dwords == heap[0], "bindless: a null entry's slot is not the pad");
     // An entry whose words 5-6 ask for what the driver does not decode (an array pitch: the walk
-    // read past a T# array into the next struct) is a null entry too, unless
-    // APS5_NO_NULL_UNDECODABLE=1 keeps it.
+    // read past a T# array into the next struct) is a null entry too when
+    // APS5_NULL_UNDECODABLE=1 (opt-in) is set.
     if (ResourceMaterializer::NullUndecodable()) {
         heap[2] = heap[1];
         heap[2][5] = 1u;

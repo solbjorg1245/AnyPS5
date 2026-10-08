@@ -292,11 +292,11 @@ private:
     // A table key that is a loop counter (Detail::LoopCounterRange) bounds an address table by its
     // loop's immediate bound, else by APS5_TABLE_LOOP_LIMIT entries (default 32, at most the bindless
     // slots: a key past it misses the mapping and samples zeros). Before, such a T# failed the whole
-    // draw ("GetImageResource dword 0 is not a valid runtime value"); APS5_NO_LOOP_TABLE_KEYS=1
-    // leaves it so.
+    // draw ("GetImageResource dword 0 is not a valid runtime value"), and still does by default:
+    // the loop keys are opt-in (APS5_LOOP_TABLE_KEYS=1).
     static std::uint32_t LoopTableLimit() {
         static const std::uint32_t limit = [] {
-            if (std::getenv("APS5_NO_LOOP_TABLE_KEYS") != nullptr) {
+            if (std::getenv("APS5_LOOP_TABLE_KEYS") == nullptr) {
                 return 0u;
             }
             const char* text = std::getenv("APS5_TABLE_LOOP_LIMIT");

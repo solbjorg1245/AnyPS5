@@ -977,7 +977,7 @@ void ResourceMaterializer::CountBindlessRejection(BindlessRejection reason) {
 }
 
 bool ResourceMaterializer::NullUndecodable() {
-    static const bool enabled = std::getenv("APS5_NO_NULL_UNDECODABLE") == nullptr;
+    static const bool enabled = std::getenv("APS5_NULL_UNDECODABLE") != nullptr;
     return enabled;
 }
 
