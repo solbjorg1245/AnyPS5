@@ -1,10 +1,12 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/NewDrawKeyTally.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Query.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawSkipReasons.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include <array>
 #include <atomic>
@@ -56,6 +58,32 @@ void testEvents() {
     expectFailure([&] { sceAgcDriverGetEqEventType(&event); });
     expectFailure([] { sceAgcDriverGetEqEventType(nullptr); });
     expectFailure([&] { sceAgcDriverGetEqEventType(reinterpret_cast<const KernelEvent*>(reinterpret_cast<const std::byte*>(&event) + 1)); });
+}
+
+// The draw skip reason heads: numbers that vary per draw fold into '#', small ones and the text stay,
+// the " [packet]" suffix and further lines are cut; the tally's order, overflow and reset.
+void testDrawSkipReasonTally() {
+    using AgcDriver::Graphics::DrawSkipReasonKey;
+    using AgcDriver::Graphics::DrawSkipReasonTally;
+    check(DrawSkipReasonKey("GetImageResource dword 0 invalid at 0x7f12ab00") == "GetImageResource dword 0 invalid at #", "hex address not folded");
+    check(DrawSkipReasonKey("array pitch 4096 != 2048 [DRAW_INDEX_2, color target 0x1234]") == "array pitch # != #", "decimal runs or suffix not folded");
+    check(DrawSkipReasonKey("stage 1 differs\nRecompileRequest:\n...") == "stage 1 differs", "second line kept");
+    check(DrawSkipReasonKey("0x") == "0x", "bare 0x folded");
+    check(DrawSkipReasonKey(std::string(200, 'a')).size() == 72, "head not capped");
+    DrawSkipReasonTally tally;
+    tally.Add("corner sampling at 0x100", 10.0);
+    tally.Add("corner sampling at 0x200", 30.0);
+    tally.Add("array pitch 4096", 50.0);
+    tally.Add("guest snapshot differs from registered memory", 5.0);
+    tally.Add("guest snapshot differs from registered memory", 1.0);
+    check(tally.Keys() == 3, "heads not merged");
+    const auto top = tally.Top(2);
+    check(top.size() == 2 && top[0].key == "corner sampling at #" && top[0].count == 2 && top[0].us == 40.0, "top head wrong");
+    check(top[1].key == "guest snapshot differs from registered memory" && top[1].count == 2, "second head wrong");
+    for (std::size_t i = 0; i < DrawSkipReasonTally::MaxKeys; ++i) tally.Add("reason " + std::string(1, static_cast<char>('a' + i % 26)) + std::string(1, static_cast<char>('a' + i / 26)), 1.0);
+    check(tally.Keys() == DrawSkipReasonTally::MaxKeys && tally.Overflow() == 3 && tally.OverflowUs() == 3.0, "overflow not counted");
+    tally.Clear();
+    check(tally.Keys() == 0 && tally.Overflow() == 0 && tally.Top(8).empty(), "tally not cleared");
 }
 
 void testValidation() {
@@ -309,11 +337,40 @@ void testSkippedDispatch() {
     AgcDriverWaitIdle_nid_postfix();
 }
 
+// The never-seen draw key tally: keys per base key, the pointer words that changed between them,
+// a key absent again with the same words, the top order and the reset.
+void testNewDrawKeyTally() {
+    using AgcDriver::DriverDetail::NewDrawKeyTally;
+    NewDrawKeyTally tally;
+    const std::array<std::uint64_t, 5> programs{0x1000, 0, 0, 0, 0x2000};
+    std::array<std::uint32_t, 8> words{0x10, 0x20, 0, 0, 0, 0, 0x30, 0x40};
+    const std::uint32_t present = 0xc3;
+    tally.Note(7, true, words, present, programs);
+    words[0] = 0x110;
+    tally.Note(7, true, words, present, programs);
+    tally.Note(7, false, words, present, programs);
+    words[6] = 0x130;
+    words[2] = 0x99; // not present: ignored
+    tally.Note(7, false, words, present, programs);
+    tally.Note(9, false, words, present, programs);
+    check(tally.keys == 5 && tally.bases.size() == 2 && tally.untracked == 0, "tally counts keys and bases");
+    const auto top = tally.Top(10);
+    check(top.size() == 2 && top[0].first == 7 && top[1].first == 9, "tally top orders by keys");
+    const auto& base = *top[0].second;
+    check(base.keys == 4 && base.known == 2 && base.sameWords == 1, "tally counts known and same-word keys");
+    check(base.changed == 0x41, "tally marks the changed present pointer words");
+    check(base.programs[0] == 0x1000 && base.programs[4] == 0x2000, "tally keeps the program addresses");
+    check(tally.Top(1).size() == 1, "tally top keeps the count asked for");
+    tally.Reset();
+    check(tally.keys == 0 && tally.bases.empty() && tally.Top(10).empty(), "tally reset");
+}
+
 }
 
 int main() {
     try {
         testEvents();
+        testDrawSkipReasonTally();
         testValidation();
         testClearState();
         testSubmissions();
@@ -323,6 +380,7 @@ int main() {
         testLabelHeldAtSubmission();
         testWideLabelStoredSinceSubmission();
         testSkippedDispatch();
+        testNewDrawKeyTally();
         LibcRunShutdown_nid_postfix();
         std::puts("AGC driver submit tests passed");
         return 0;

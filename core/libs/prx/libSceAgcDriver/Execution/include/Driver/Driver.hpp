@@ -131,12 +131,14 @@ private:
     static std::size_t drawCacheEntries();
     static std::size_t drawEvictedKeyBound();
     void noteDrawEvictionLocked(std::uint64_t key);
-    void noteAbsentDrawKeyLocked(std::uint64_t key, std::uint64_t base);
+    void noteAbsentDrawKeyLocked(std::uint64_t key, std::uint64_t base, const DrawKey* drawKey = nullptr);
+    static bool newDrawKeyTop();
     void accountDrawVariant(const DispatchVariant& variant, bool added);
     void insertDrawEntry(const DrawKey& key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, const DrawRelocation* relocation, const std::vector<std::shared_ptr<DispatchVariant>>* matched);
     std::shared_ptr<const DrawRecipe> findDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages);
     void attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe);
     void reportDrawCache(DrawEntryCounters& counters);
+    void reportNewDrawKeys();
     static DrawKey drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial);
     static bool sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b);
     static bool sameDecode(const DrawDecode& a, const DrawDecode& b);
@@ -318,6 +320,9 @@ private:
     // eviction, so an expiry pops its front. Under drawCacheMutex.
     std::unordered_map<std::uint64_t, std::uint64_t> drawEvictedKeys;
     std::deque<std::pair<std::uint64_t, std::uint64_t>> drawEvictedOrder;
+    // The never-seen keys of the report window by base key (APS5_PROFILE_DRAW with the evicted-key
+    // window; APS5_NO_NEW_DRAW_KEY_TOP=1 = off). Under drawCacheMutex.
+    NewDrawKeyTally drawNewKeys;
 
     DrawEntryCounters drawEntryCounters;
 
