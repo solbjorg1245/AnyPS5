@@ -27,6 +27,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 extern "C" {
 void* APS5_VABI mmap_nid_postfix(void*, std::size_t, int, int, int, std::int64_t) noexcept;
@@ -163,6 +166,29 @@ static void CheckDirectMemoryFollowsPhysicalPages() {
     Require(sceKernelReleaseDirectMemory(again, page * 2) == 0);
 }
 
+static void CheckReleaseDirectMemoryClearsMappings() {
+    constexpr std::size_t page = 0x4000;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * 2, 0, 0, &phys) == 0);
+    void* mapped = nullptr;
+    Require(sceKernelMapDirectMemory(&mapped, page * 2, 3, 0, phys, 0) == 0);
+    VirtualQueryInfo before{};
+    Require(sceKernelVirtualQuery(mapped, 0, &before, sizeof(before)) == 0);
+    Require(before.is_direct && before.offset == static_cast<std::uint64_t>(phys));
+    Require(sceKernelReleaseDirectMemory(phys + page, page) == 0);
+    VirtualQueryInfo split{};
+    Require(sceKernelVirtualQuery(mapped, 0, &split, sizeof(split)) == 0);
+    Require(split.is_direct && split.offset == static_cast<std::uint64_t>(phys));
+    VirtualQueryInfo dropped{};
+    Require(sceKernelVirtualQuery(static_cast<unsigned char*>(mapped) + page, 0, &dropped, sizeof(dropped)) == 0);
+    Require(!dropped.is_direct && dropped.offset == 0);
+    Require(sceKernelReleaseDirectMemory(phys, page) == 0);
+    VirtualQueryInfo cleared{};
+    Require(sceKernelVirtualQuery(mapped, 0, &cleared, sizeof(cleared)) == 0);
+    Require(!cleared.is_direct && cleared.offset == 0);
+    Require(sceKernelMunmap(mapped, page * 2) == 0);
+}
+
 static void CheckFixedVirtualReservation() {
     constexpr std::size_t page = 0x4000;
     void* probe = nullptr;
@@ -178,6 +204,29 @@ static void CheckFixedVirtualReservation() {
     Require(pooled == requested);
     Require(sceKernelMunmap(pooled, page * 2) == 0);
 }
+
+#ifdef _WIN32
+static void CheckNoOverwriteRejectsHostOccupiedMapping() {
+    constexpr std::size_t page = 0x4000;
+    void* reservation = nullptr;
+    Require(sceKernelReserveVirtualRange(&reservation, page * 4, 0, 0) == 0);
+    Require(sceKernelMunmap(reservation, page * 4) == 0);
+    void* target = static_cast<unsigned char*>(reservation) + page;
+    GuestArena::GuestArenaCommit_nid_postfix(target, page, PAGE_READWRITE, page);
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page, 0, 0, &phys) == 0);
+    void* fixed = target;
+    bool rejected = false;
+    try {
+        rejected = sceKernelMapDirectMemory(&fixed, page, 3, 0x90, phys, 0) != 0;
+    } catch (const std::exception&) {
+        rejected = true;
+    }
+    Require(rejected);
+    GuestArena::GuestArenaReset_nid_postfix(target, page);
+    Require(sceKernelReleaseDirectMemory(phys, page) == 0);
+}
+#endif
 
 static void CheckSharedDirectMemoryLifecycle() {
     constexpr std::size_t page = 0x4000;
@@ -617,10 +666,14 @@ int main() {
     CheckNamedAndHintedMappings();
     CheckInternalNamedFlexibleMapping();
     CheckDirectMemoryFollowsPhysicalPages();
+    CheckReleaseDirectMemoryClearsMappings();
     CheckFixedVirtualReservation();
     CheckSharedDirectMemoryLifecycle();
     CheckReservedHolesAreUncommitted();
     CheckHeapAfterMappingReuse();
+#ifdef _WIN32
+    CheckNoOverwriteRejectsHostOccupiedMapping();
+#endif
     CheckSharedWriteTracking();
     CheckPlaceholderCollect();
     CheckReadsIntoSharedWriteTracking();

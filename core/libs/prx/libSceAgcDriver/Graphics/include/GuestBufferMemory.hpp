@@ -27,6 +27,7 @@ struct HostImport {
     VkDeviceMemory memory;
     VkDeviceAddress address;
     void* alias = nullptr;
+    std::weak_ptr<const GuestAllocations::Range> range {};
     // Identity for the life of this import (see HostImportSerial); 0 until first asked for.
     std::uint64_t serial = 0;
     bool unwatched = false;
@@ -156,6 +157,7 @@ struct MirrorStats {
     std::uint64_t heapRefills = 0;
 };
 MirrorStats MirrorCounters();
+void ClearImageMirrors(VkDevice device);
 
 struct AddressCopy {
     std::uint64_t begin;

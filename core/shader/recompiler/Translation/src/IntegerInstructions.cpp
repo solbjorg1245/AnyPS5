@@ -448,10 +448,11 @@ bool TranslationContext::sBitreplicateB64B32(const RdnaInstruction& inst) {
 }
 
 IrU32 TranslationContext::readRelativeScalar(std::uint32_t base, IrValue& offset) {
-    IrU32 result(ir.GetScalarReg(static_cast<ScalarReg>(base)));
+    IrValue& inRange = ir.ULessThan(ir.ISub(offset, ir.Constant(1u)), ir.Constant(NumScalarRegs - base - 1u));
+    IrU32 result(ir.Select(inRange, ir.Constant(0u), ir.GetScalarReg(static_cast<ScalarReg>(base))));
     for (std::uint32_t reg = base + 1u; reg < NumScalarRegs; ++reg) {
         IrValue& hit = ir.IEqual(offset, ir.Constant(reg - base));
-        result = IrU32(ir.Select(hit, ir.GetScalarReg(static_cast<ScalarReg>(reg)), result.Value()));
+        result = IrU32(ir.BitwiseOr(result.Value(), ir.Select(hit, ir.GetScalarReg(static_cast<ScalarReg>(reg)), ir.Constant(0u))));
     }
     return result;
 }
