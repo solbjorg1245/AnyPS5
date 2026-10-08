@@ -562,7 +562,9 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         // walk's last four come from whatever follows it (Demon's Souls: a pointer or floats, read
         // as an array pitch or corner sampling).
         if (image.r128) std::fill(descriptor.dwords.begin() + 4, descriptor.dwords.end(), 0u);
-        const bool undecodable = !nullImageDescriptor(descriptor) && undecodableImageBits(descriptor, image.r128);
+        // Sampled only: a storage image bound as null would drop its writes silently, so the driver
+        // keeps failing the draw on one.
+        const bool undecodable = image.resourceClass == ImageResourceClass::Sampled && !nullImageDescriptor(descriptor) && undecodableImageBits(descriptor, image.r128);
         if (undecodable) countNullBound(NullBoundImage::Undecodable);
         if ((!validImageDescriptor(descriptor, image.r128) || !plausibleImageAddress(descriptor) || undecodable) && !nullImageDescriptor(descriptor)) {
             static std::atomic<int> reports{0};
