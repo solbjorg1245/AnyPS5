@@ -56,6 +56,55 @@ void verifyResult(const ShaderRecompiler::RecompileResult& first, const ShaderRe
     }
 }
 
+// The fast walk (WalkResources, docs/design/draw-fastpath.md F2) with a direct reader of live
+// memory materializes what the capture did, and the variant it selects populates to the result the
+// capture compiled; a reader declining a read declines the walk.
+void verifyWalkResources(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::ResourceCapture& capture, const ShaderRecompiler::RecompileResult& compiled) {
+    using namespace ShaderRecompiler;
+    const auto handle = ResolveSource(request);
+    require(handle != nullptr, "the cached request has no source handle");
+    struct Reader {
+        std::uint32_t reads = 0;
+        bool decline = false;
+    } reader;
+    const SrtMemoryReader live = +[](void* context, std::uint64_t address, std::uint32_t* value) {
+        auto& self = *static_cast<Reader*>(context);
+        ++self.reads;
+        if (self.decline) return false;
+        std::memcpy(value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), sizeof(*value));
+        return true;
+    };
+    SrtRuntime runtime;
+    runtime.userContext = &reader;
+    runtime.readMemory = live;
+    runtime.readSpecializationMemory = live;
+    runtime.expressRead = live;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    require(WalkResources(*handle, request.context.userData, request.shader.codeAddress, runtime, snapshot, specialization) == WalkStatus::Walked, "the fast walk declined a request the capture walked");
+    require(reader.reads != 0, "the fast walk read nothing through its reader");
+    const auto sameValues = [](const std::vector<DescriptorValue>& left, const std::vector<DescriptorValue>& right) {
+        if (left.size() != right.size()) return false;
+        for (std::size_t i = 0; i < left.size(); ++i) {
+            if (left[i].dwordCount != right[i].dwordCount || !std::equal(left[i].dwords.begin(), left[i].dwords.begin() + left[i].dwordCount, right[i].dwords.begin())) return false;
+        }
+        return true;
+    };
+    const auto& captured = capture.snapshot;
+    require(sameValues(snapshot.buffers, captured.buffers) && sameValues(snapshot.images, captured.images) && sameValues(snapshot.samplers, captured.samplers), "the fast walk's descriptors differ from the capture's");
+    require(snapshot.flattenedSrt == captured.flattenedSrt && snapshot.userData == captured.userData, "the fast walk's flattened SRT or user data differ from the capture's");
+    require(specialization == capture.specialization, "the fast walk's specialization differs from the capture's");
+    RecompileResult walked;
+    require(PopulateVariant(*handle, request, snapshot, specialization, walked), "the walk's specialization did not select the compiled variant");
+    require(walked.variantId == compiled.variantId && walked.pushConstants == compiled.pushConstants && walked.bindings.size() == compiled.bindings.size(), "the walk's populated variant differs from the compiled result");
+    for (std::size_t i = 0; i < walked.bindings.size(); ++i) require(walked.bindings[i].guestDescriptor == compiled.bindings[i].guestDescriptor && walked.bindings[i].role == compiled.bindings[i].role, "a binding of the walk's populated variant differs from the compiled result");
+    auto otherLayout = request;
+    otherLayout.layout.pushConstantSizeBytes = 32;
+    require(!PopulateVariant(*handle, otherLayout, snapshot, specialization, walked), "a layout never compiled selected a variant");
+    reader.decline = true;
+    require(WalkResources(*handle, request.context.userData, request.shader.codeAddress, runtime, snapshot, specialization) == WalkStatus::ReadDeclined, "a declined read did not decline the fast walk");
+}
+
 void verifyRegisterSources() {
     using namespace ShaderRecompiler;
     IrResourcePlan plan;
@@ -1059,6 +1108,7 @@ int main() {
         const auto cached = Recompile(request);
         require(cached.cacheHit, "unchanged shader did not hit the cache");
         verifyResult(first, cached);
+        verifyWalkResources(request, *capture, first);
         auto relocated = request;
         relocated.shader.codeAddress += 0x1000;
         require(Recompile(relocated).cacheHit, "shader relocation caused recompilation");
@@ -1103,6 +1153,7 @@ int main() {
         updated.context.memory = updatedRegions;
         const auto updatedCached = Recompile(updated);
         require(updatedCached.cacheHit, "dynamic shader data caused recompilation");
+        verifyWalkResources(updated, *updatedCapture, updatedCached);
         updated.useCache = false;
         verifyResult(updatedCached, Recompile(updated));
         bool changedData = updatedCached.pushConstants != first.pushConstants;

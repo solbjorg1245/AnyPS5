@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawScratch.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastWalk.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -343,6 +344,13 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         require(result.pushConstants.size() <= Graphics::PipelinePushConstantBytes - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
         stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes});
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
+    }
+    // APS5_FAST_WALK=N (FastWalk.cpp): the fast walk in shadow mode, compared with the results
+    // bound above; its time is reported on its own line, not in the phase rows.
+    if (FastWalkEvery() != 0) {
+        phaseTiming.Phase(DrawRowVectors);
+        ShadowWalkDraw({programs, roles, graphics, pixel, vertexInfos, linked, drawParameters, *localDevice, programResults, pushOffsets, (drawHit || hits.partial) && (hits.data || hits.partial || relocating != nullptr)});
+        if (profile) phaseLap = std::chrono::steady_clock::now();
     }
 
     cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, hits, fresh, drawKey, registerKey, decode, phaseTiming, relocating);

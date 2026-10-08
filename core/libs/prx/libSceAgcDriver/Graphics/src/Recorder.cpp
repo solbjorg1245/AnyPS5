@@ -33,6 +33,23 @@ namespace {
 
 Recorder* activeRecorder = nullptr;
 
+// Pending blocks (Recorder::BlockPending): one slot per 64 KiB block, hashed over 2^18 slots
+// (16 GiB of distinct blocks), allocated on the first TrackPendingBlocks(true).
+constexpr unsigned PendingBlockShift = 16;
+constexpr std::size_t PendingBlockSlots = std::size_t{1} << 18;
+std::atomic<bool> pendingBlocksOn{false};
+std::atomic<std::atomic<std::uint64_t>*> pendingBlockTable{nullptr};
+std::atomic<std::uint64_t> completedBlockSerial{0};
+
+void trackPendingBlocksFromEnvironment() {
+    static const bool tracked = [] {
+        const char* every = std::getenv("APS5_FAST_WALK");
+        if (every != nullptr && std::strtoul(every, nullptr, 0) != 0) Recorder::TrackPendingBlocks(true);
+        return true;
+    }();
+    static_cast<void>(tracked);
+}
+
 bool DrawProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return profiled;
@@ -1105,6 +1122,8 @@ const char* Recorder::WriteKindName(WriteKind kind) {
 }
 
 Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)) {
+    trackPendingBlocksFromEnvironment();
+    blockSerialBase = (id + 1) << 40u;
     // Per recorder (not a static): a test makes one with the switch set.
     const char* coalesce = std::getenv("APS5_COALESCE_COPY_BACKS");
     coalesceCopyBacks = coalesce != nullptr && *coalesce != '\0' && std::strcmp(coalesce, "0") != 0;
@@ -1235,6 +1254,9 @@ Recorder* Recorder::Active() {
 
 void Recorder::Activate() {
     activeRecorder = this;
+    // Marks of earlier recorders (lower offsets) read completed from here on; a recorder activated
+    // again restores its own completed serial, below a later recorder's marks (they read pending).
+    if (PendingBlocksTracked()) completedBlockSerial.store(blockSerialBase + blocksFinished, std::memory_order_release);
     {
         std::lock_guard tableLock(labelTableMutex);
         labelTableOwner = this;
@@ -1334,6 +1356,61 @@ std::uint64_t Recorder::ThreadHookWaits() {
 
 bool Recorder::SnapshotWriteOverlaps(std::uint64_t address, std::size_t bytes) {
     return AgcDriver::Graphics::SnapshotOverlaps(address, bytes);
+}
+
+void Recorder::TrackPendingBlocks(bool enabled) {
+    static HostMutex mutex;
+    std::lock_guard lock(mutex);
+    if (enabled && pendingBlockTable.load(std::memory_order_acquire) == nullptr) {
+        auto* table = new std::atomic<std::uint64_t>[PendingBlockSlots];
+        for (std::size_t slot = 0; slot < PendingBlockSlots; ++slot) table[slot].store(0, std::memory_order_relaxed);
+        pendingBlockTable.store(table, std::memory_order_release);
+    }
+    pendingBlocksOn.store(enabled, std::memory_order_release);
+}
+
+bool Recorder::PendingBlocksTracked() {
+    return pendingBlocksOn.load(std::memory_order_acquire);
+}
+
+bool Recorder::BlockPending(std::uint64_t address) {
+    if (!PendingBlocksTracked()) return false;
+    const auto* table = pendingBlockTable.load(std::memory_order_acquire);
+    if (table == nullptr) return false;
+    const auto completed = completedBlockSerial.load(std::memory_order_acquire);
+    return table[(address >> PendingBlockShift) & (PendingBlockSlots - 1)].load(std::memory_order_acquire) > completed;
+}
+
+std::uint64_t Recorder::CompletedSerial() {
+    return completedBlockSerial.load(std::memory_order_acquire);
+}
+
+void Recorder::markPendingBlocks(std::uint64_t address, std::uint64_t end, std::uint64_t serial) const {
+    if (!PendingBlocksTracked() || activeRecorder != this || end <= address) return;
+    auto* table = pendingBlockTable.load(std::memory_order_acquire);
+    if (table == nullptr) return;
+    const auto value = blockSerialBase + serial;
+    const auto first = address >> PendingBlockShift;
+    // A range over more blocks than slots marks every slot once.
+    const auto count = std::min<std::uint64_t>(((end - 1) >> PendingBlockShift) - first + 1, PendingBlockSlots);
+    for (std::uint64_t block = first; block < first + count; ++block) {
+        auto& slot = table[block & (PendingBlockSlots - 1)];
+        auto seen = slot.load(std::memory_order_relaxed);
+        while (seen < value && !slot.compare_exchange_weak(seen, value, std::memory_order_release, std::memory_order_relaxed)) {
+        }
+    }
+}
+
+void Recorder::noteBlocksFinished(std::uint64_t serial) {
+    if (!PendingBlocksTracked() || serial == 0) return;
+    // A completion that finished later batches (a nested sync) must not clear this batch's blocks
+    // while its completions run: only serials with every earlier batch finished count.
+    for (const auto* other : finishing) {
+        if (other->serial != 0 && other->serial < serial) serial = other->serial - 1;
+    }
+    if (serial <= blocksFinished) return;
+    blocksFinished = serial;
+    if (activeRecorder == this) completedBlockSerial.store(blockSerialBase + serial, std::memory_order_release);
 }
 
 bool Recorder::QueuedLabelOverlapsThisThread(std::uint64_t address, std::size_t bytes) {
@@ -2349,6 +2426,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
+    markPendingBlocks(address, end, submissions + 1);
     // The writer's tag for the [hooksync] attribution: the packet the noting thread executes and
     // the note's kind (a label when the caller marked the range as its own and named no kind).
     const auto packet = GuestMemory::CurrentPacket();
@@ -2378,6 +2456,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // moves as well, so a poller re-consults the label table for a completion label.
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
+    markPendingBlocks(address, address + bytes, batch.serial);
     const auto packet = GuestMemory::CurrentPacket();
     batch.writeTags.push_back(Batch::WriteTag{packet.queue, packet.opcode, ownLabel && kind == WriteKind::Unknown ? WriteKind::CompletionLabel : kind});
     if (!ownLabel) markOverwritten(address, address + bytes);
@@ -3437,6 +3516,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
         }
     }
     if (profile) holdCounters.completions += batch->completions.size();
+    noteBlocksFinished(batch->serial);
     const auto keptStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // Deferred only from inside a hold: the unlock that releases the list is this thread's own, and
     // a caller finishing batches without the mutex (a test) might never make one.

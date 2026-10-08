@@ -48,6 +48,9 @@ struct SrtRuntime {
     // driver copies each word on the GPU into the data buffer of every draw using the result.
     SrtMemoryReader deferPureLeaf = nullptr;
     std::vector<std::uint64_t>* deferredReads = nullptr;
+    // The fast walk (WalkResources, docs/design/draw-fastpath.md F2): an evaluation the express
+    // walk does not run or complete fails instead of falling back to the interpreter.
+    bool expressOnly = false;
 };
 
 enum class RuntimeValueType {

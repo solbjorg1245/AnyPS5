@@ -426,6 +426,19 @@ public:
     // page is read word by word and only a read of the label's own dwords records and waits
     // (APS5_NO_WORDWISE_QUEUED_LABELS=1: the old path). Counts the true answers.
     static bool QueuedLabelOverlapsThisThread(std::uint64_t address, std::size_t bytes);
+    // Pending blocks (docs/design/draw-fastpath.md section 2.3, F2): per 64 KiB block of guest
+    // memory, the serial of the newest batch of the active recorder that noted a pending write
+    // into it (every noted range: NotePendingWrite(s), labels, completion stores), set beside the
+    // snapshot publish. The block is pending while that serial is above CompletedSerial(), which
+    // advances once a batch's completions ran. Lock-free, for the fast walk's direct reader. The
+    // table is hashed: a block shares its slot with the blocks 16 GiB apart, so a collision reads
+    // pending, never clear. Kept while APS5_FAST_WALK is set (nonzero) or after
+    // TrackPendingBlocks(true); untracked, no block reads pending. The serials are offset per
+    // recorder, so a replaced device's marks read completed once its successor is activated.
+    static void TrackPendingBlocks(bool enabled);
+    static bool PendingBlocksTracked();
+    static bool BlockPending(std::uint64_t address);
+    static std::uint64_t CompletedSerial();
     // The snapshot itself (the sorted, merged union of the pending ranges; null when none), for a
     // reader that tests many ranges against one loaded snapshot: one atomic shared_ptr load per
     // validation instead of one per run, and every test sees the same snapshot (design13 R1's p0).
@@ -806,6 +819,14 @@ private:
     bool signaled(const Batch& batch) const;
     // Rebuilds the lock-free snapshot of pending writes from open, inFlight and finishing.
     void publishPendingWrites() const;
+    // Pending blocks (see BlockPending): marks the blocks of [address, end) with the batch serial
+    // (the active recorder only), and advances CompletedSerial once a batch's completions ran.
+    void markPendingBlocks(std::uint64_t address, std::uint64_t end, std::uint64_t serial) const;
+    void noteBlocksFinished(std::uint64_t serial);
+    // This recorder's offset of the pending-block serials, and the newest serial whose batch and
+    // every earlier one finished.
+    std::uint64_t blockSerialBase = 0;
+    std::uint64_t blocksFinished = 0;
     // Publishes the snapshot with [address, end) added: a copy of the current snapshot with the
     // range merged in (O(N) over the merged ranges: no gathering of every batch's writes and no
     // sort), which keeps the snapshot a superset of the pending union as the full rebuild does; a

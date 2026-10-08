@@ -245,6 +245,44 @@ void writeSettledTests(const Device& device, Recorder& recorder) {
     Require(recorder.Idle() && !recorder.PendingWriteOverlaps(0x50000, 0x100), "writes outlived their batches");
 }
 
+// Pending blocks (the fast walk's reader, docs/design/draw-fastpath.md F2): a noted write marks
+// its 64 KiB blocks with its batch's serial; they read pending while the batch is open, in flight
+// or signaled but not reaped, and clear once CompletedSerial reaches the batch.
+void pendingBlockTests(const Device& device, Recorder& recorder) {
+    Recorder::TrackPendingBlocks(true);
+    recorder.Sync();
+    constexpr std::uint64_t base = 0x7a0000;
+    Require(!Recorder::BlockPending(base) && !Recorder::BlockPending(base + 0x10000), "a block reads pending before any note");
+    const auto before = Recorder::CompletedSerial();
+    recorder.NotePendingWrite(base + 0xff00, 0x200);
+    Require(Recorder::BlockPending(base) && Recorder::BlockPending(base + 0xfffc) && Recorder::BlockPending(base + 0x10000) && Recorder::BlockPending(base + 0x1fffc), "a noted write did not mark its blocks pending");
+    Require(!Recorder::BlockPending(base + 0x20000) && !Recorder::BlockPending(base - 4), "a noted write marked a block it does not touch");
+    recorder.Submit();
+    device.WaitQueue();
+    Require(Recorder::BlockPending(base), "a signaled batch's block cleared before the batch was reaped");
+    recorder.NotePendingWrite(base + 0x20000, 4);
+    recorder.Sync();
+    Require(Recorder::CompletedSerial() > before && !Recorder::BlockPending(base) && !Recorder::BlockPending(base + 0x10000) && !Recorder::BlockPending(base + 0x20000), "blocks stayed pending after their batches finished");
+    // The older of two batches finishing clears its own block, not the newer one's.
+    recorder.NotePendingWrite(base, 4);
+    recorder.Submit();
+    recorder.NotePendingWrite(base + 0x40000, 4);
+    const auto newest = recorder.SubmitAndEpoch();
+    recorder.FinishUpTo(newest - 1);
+    Require(!Recorder::BlockPending(base) && Recorder::BlockPending(base + 0x40000), "finishing the older batch did not clear exactly its own block");
+    recorder.Sync();
+    Require(!Recorder::BlockPending(base + 0x40000), "the newer batch's block stayed pending after it finished");
+    // A block 16 GiB away shares the slot: a collision reads pending, never clear.
+    recorder.NotePendingWrite(base + (std::uint64_t{1} << 34u), 4);
+    Require(Recorder::BlockPending(base), "a slot collision read clear");
+    recorder.Sync();
+    Require(!Recorder::BlockPending(base), "a collided slot stayed pending after its batch finished");
+    Recorder::TrackPendingBlocks(false);
+    recorder.NotePendingWrite(base, 4);
+    Require(!Recorder::BlockPending(base), "an untracked note marked a block pending");
+    recorder.Sync();
+}
+
 // Completion counting: a write-back completion (OnComplete) is pending until its batch finished;
 // a completion label the GPU also stored (AfterCompletions storedOnGpu) is pending only once a CPU
 // write-back overlapped it (NoteWrittenBack, once per label), one the GPU has no view of from its
@@ -2680,6 +2718,7 @@ int main() {
         recorder.Activate();
         readTrackingTests(device, recorder);
         writeSettledTests(device, recorder);
+        pendingBlockTests(device, recorder);
         completionCountTests(device, recorder);
         afterRecordedWorkTests(device, recorder);
         batchStampTests(recorder);
