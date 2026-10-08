@@ -21,6 +21,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
+#include "prx/libc/include/PreciseWait.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 
 namespace {
@@ -559,11 +560,19 @@ void VideoOutDriver::vblankLoop(std::stop_token token) {
     using Frame = std::chrono::duration<int64_t, std::ratio<1001, 60000>>;
     using Clock = std::chrono::steady_clock;
     const double hz = vblankHz();
+    // APS5_NO_PRECISE_VBLANK=1 restores the condition-variable wait_until, which winpthreads ends on a
+    // 15.6 ms tick (vblank intervals of 2-34 ms instead of 16.68 ms).
+    static const bool precise = std::getenv("APS5_NO_PRECISE_VBLANK") == nullptr;
     const auto start = Clock::now();
     try {
         for (int64_t frame = 1; !token.stop_requested(); ++frame) {
             const auto next = start + (hz == 0.0 ? std::chrono::duration_cast<Clock::duration>(Frame(frame)) : std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(static_cast<double>(frame) / hz)));
-            {
+            if (precise) {
+                const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(next - Clock::now()).count();
+                if (remaining > 0) PreciseSleepUs(static_cast<unsigned long long>(remaining));
+                std::lock_guard lock(flipQueue->mutex);
+                if (token.stop_requested() || flipQueue->failure) return;
+            } else {
                 std::unique_lock lock(flipQueue->mutex);
                 flipQueue->changed.wait_until(lock, next, [&] { return token.stop_requested() || flipQueue->failure; });
                 if (token.stop_requested() || flipQueue->failure) return;
