@@ -107,6 +107,10 @@ struct AddressSpaceCache {
     std::atomic<std::uint64_t> dissolvedOverlap{0};
     std::atomic<std::uint64_t> dissolvedImports{0};
     std::atomic<std::uint64_t> waiterDrops{0};
+    // Descriptors served by a span import instead of a dissolve; span imports made and refused.
+    std::atomic<std::uint64_t> spanned{0};
+    std::atomic<std::uint64_t> spanImports{0};
+    std::atomic<std::uint64_t> spanFailures{0};
 };
 
 AddressSpaceCache& Spaces() {
@@ -128,6 +132,16 @@ struct HostImports {
     PFN_vkFreeMemory freeMemory = nullptr;
     std::map<std::uint64_t, HostImport> imports;
     std::set<std::uint64_t> failed;
+    // Span imports by base: one import over back-to-back registered ranges that are each imported
+    // (`parts`, address and size), for a descriptor that crosses them. They alias the parts' host
+    // pages, so writes through either are the same bytes; retired with any part (refreshImports).
+    struct Span {
+        HostImport entry;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> parts;
+    };
+    std::map<std::uint64_t, Span> spans;
+    // Span ranges whose import failed (cleared when the registry changes).
+    std::set<std::pair<std::uint64_t, std::uint64_t>> spanFailed;
     // Registry generation the imports were last reconciled with.
     std::uint64_t refreshedGeneration = 0;
     // Bumped whenever an import is dropped, so HostImport pointers taken under the lock earlier can be
@@ -178,6 +192,15 @@ void retireImport(const Context& context, HostImports& state, std::map<std::uint
     if (auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) recorder->Keep(std::move(holder));
     ++state.epoch;
     state.imports.erase(it);
+}
+
+// Drops a span import like retireImport. No shadow is ever made for a span (shadows are found
+// through the per-allocation imports), so there is nothing to publish.
+void retireSpan(HostImports& state, const Context& context, std::map<std::uint64_t, HostImports::Span>::iterator it) {
+    auto holder = std::make_shared<RetiredImport>(context, it->second.entry);
+    if (auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) recorder->Keep(std::move(holder));
+    ++state.epoch;
+    state.spans.erase(it);
 }
 
 const char* createImport(const Context& context, HostImport& entry, VkResult& failure) {
@@ -390,8 +413,16 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
             GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
         }
+        for (const auto& [address, span] : state.spans) {
+            if (state.device != VK_NULL_HANDLE && state.destroyBuffer != nullptr && state.freeMemory != nullptr) {
+                state.destroyBuffer(state.device, span.entry.buffer, nullptr);
+                state.freeMemory(state.device, span.entry.memory, nullptr);
+            }
+        }
         state.imports.clear();
         state.failed.clear();
+        state.spans.clear();
+        state.spanFailed.clear();
         state.device = context.device;
         state.destroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
         state.freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
@@ -413,6 +444,23 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         it = next;
     }
     for (auto it = state.failed.begin(); it != state.failed.end();) it = leasedRangeAt(lease, *it) != nullptr ? std::next(it) : state.failed.erase(it);
+    // A span stays while every part is still registered at its size and imported (the part imports
+    // were just reconciled above).
+    for (auto it = state.spans.begin(); it != state.spans.end();) {
+        bool kept = true;
+        for (const auto& [base, bytes] : it->second.parts) {
+            const auto* range = leasedRangeAt(lease, base);
+            const auto part = state.imports.find(base);
+            if (range == nullptr || range->bytes != bytes || part == state.imports.end() || part->second.bytes != bytes) {
+                kept = false;
+                break;
+            }
+        }
+        const auto next = std::next(it);
+        if (!kept) retireSpan(state, context, it);
+        it = next;
+    }
+    state.spanFailed.clear();
 }
 
 // Whether `entry` holds all of [begin, end). UploadPrepare merges overlapping regions and keeps the
@@ -431,6 +479,94 @@ const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint6
     --found;
     const auto& entry = found->second;
     return begin >= entry.base && end <= entry.base + entry.bytes ? &entry : nullptr;
+}
+
+bool spanImportsEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_SPAN_IMPORT") != nullptr;
+    return !disabled;
+}
+
+const HostImport* findSpan(HostImports& state, std::uint64_t begin, std::uint64_t end) {
+    auto found = state.spans.upper_bound(begin);
+    if (found == state.spans.begin()) return nullptr;
+    --found;
+    const auto& entry = found->second.entry;
+    return begin >= entry.base && end <= entry.base + entry.bytes ? &entry : nullptr;
+}
+
+// One import over the back-to-back readable registered ranges that hold [begin, end), each imported
+// itself first (so its pages passed importAllocation's checks and are pinned already, and its
+// write-watch state was decided). Parts imported through a read-write alias (shared guest memory)
+// need one alias over the whole span (MapSpanAlias: one view per run of section pages). Null
+// when the ranges do not adjoin, a part cannot be imported, or the span is refused (remembered until
+// the registry changes; the first reasons are printed).
+const HostImport* importSpan(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease) {
+    if (const auto* entry = findSpan(state, begin, end)) return entry;
+    if (state.spanFailed.contains({begin, end})) return nullptr;
+    static std::atomic<int> refusals{0};
+    const auto refuse = [&](std::uint64_t first, std::uint64_t last, const char* reason) -> const HostImport* {
+        // The request itself is remembered too, so a region that cannot span is not walked again.
+        state.spanFailed.emplace(begin, end);
+        if (last > first) state.spanFailed.emplace(first, last);
+        Spaces().spanFailures.fetch_add(1, std::memory_order_relaxed);
+        if (refusals.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[gpu] span import for 0x%llx+0x%llx refused: %s\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), reason);
+        return nullptr;
+    };
+    auto it = std::upper_bound(lease.begin(), lease.end(), begin, [](std::uint64_t value, const auto& range) { return value < range->address; });
+    if (it == lease.begin()) return refuse(0, 0, "no registered range at its start");
+    --it;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> parts;
+    std::uint64_t cursor = (*it)->address;
+    const auto first = cursor;
+    std::size_t aliased = 0;
+    for (; it != lease.end() && cursor < end; ++it) {
+        const auto& range = **it;
+        if (range.address != cursor) return refuse(0, 0, "the registered ranges do not adjoin");
+        if (!range.readable) return refuse(0, 0, "a registered range is not readable");
+        const auto* part = importAllocation(context, state, range.address, range.bytes, lease);
+        if (part == nullptr) return refuse(0, 0, "a part has no import");
+        if (part->alias != nullptr) ++aliased;
+        parts.emplace_back(range.address, range.bytes);
+        cursor += range.bytes;
+    }
+    if (cursor < end || parts.size() < 2) return refuse(0, 0, "the registered ranges end before it");
+    if (state.spanFailed.contains({first, cursor})) return nullptr;
+    if (aliased != 0 && aliased != parts.size()) return refuse(first, cursor, "only some parts are shared memory");
+    HostImport entry{first, cursor - first, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+    entry.span = true;
+#ifdef _WIN32
+    if (aliased != 0) {
+        try {
+            entry.alias = GuestArena::GuestArenaMapSpanAlias_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(cursor - first));
+        } catch (const std::exception& error) {
+            return refuse(first, cursor, error.what());
+        }
+    }
+#endif
+    VkResult result = VK_SUCCESS;
+    const char* step = nullptr;
+    GuestMemory::ImportWatched(first, static_cast<std::size_t>(cursor - first), [&] {
+        step = createImport(context, entry, result);
+        return step == nullptr;
+    });
+    if (step != nullptr) {
+#ifdef _WIN32
+        GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
+#endif
+        state.spanFailed.emplace(first, cursor);
+        Spaces().spanFailures.fetch_add(1, std::memory_order_relaxed);
+        std::fprintf(stderr, "[gpu] span import of 0x%llx+0x%llx (%zu ranges) failed at %s (%d); the descriptor is copied\n", static_cast<unsigned long long>(first), static_cast<unsigned long long>(cursor - first), parts.size(), step, static_cast<int>(result));
+        return nullptr;
+    }
+    Spaces().spanImports.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> traced{0};
+    if (traced.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[gpu] span import of 0x%llx+0x%llx over %zu ranges%s\n", static_cast<unsigned long long>(first), static_cast<unsigned long long>(cursor - first), parts.size(), aliased != 0 ? " (shared memory alias)" : "");
+    // A shorter span from the same base is replaced (its holders keep the retired buffer alive).
+    if (const auto shorter = state.spans.find(first); shorter != state.spans.end()) retireSpan(state, context, shorter);
+    auto& span = state.spans[first];
+    span.entry = entry;
+    span.parts = std::move(parts);
+    return &span.entry;
 }
 
 // Whether the imports need reconciling before a lookup: the registry changed since the last walk.
@@ -1193,7 +1329,10 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
     const auto delta = [](std::uint64_t now, std::uint64_t before) { return static_cast<unsigned long long>(now - before); };
     const auto space = AddressSpaceCounters();
     const auto& spaceSeen = totals.spaceSeen;
-    std::fprintf(stderr, "[address] %llu address-based builds (10 s), us per build: lease %.0f, imports pass %.0f, mirror prepare %.0f, compare %.0f (%.0f blocks, %.1f copied), snapshots %.0f; space hits %llu / rebuilds: generation %llu, epoch %llu, device %llu, waiter drop %llu, first %llu; unpublished %llu, dissolved: overlap %llu, imports %llu%s; [bda-table] hits %llu / misses %llu (space tables %llu), first entry: expired %llu, hash differs low %llu / heap %llu, same hash %llu, none held %llu\n", static_cast<unsigned long long>(totals.builds), per(totals.sums.leaseUs), per(totals.sums.importsUs), per(totals.sums.mirrorsUs), per(totals.sums.compareUs), per(static_cast<double>(totals.sums.blocksCompared)), per(static_cast<double>(totals.sums.blocksCopied)), per(totals.snapshotsUs), delta(space.hits, spaceSeen.hits), delta(space.rebuiltGeneration, spaceSeen.rebuiltGeneration), delta(space.rebuiltEpoch, spaceSeen.rebuiltEpoch), delta(space.rebuiltDevice, spaceSeen.rebuiltDevice), delta(space.rebuiltWaiterDrop, spaceSeen.rebuiltWaiterDrop), delta(space.rebuiltFirst, spaceSeen.rebuiltFirst), delta(space.unpublished, spaceSeen.unpublished), delta(space.dissolvedOverlap, spaceSeen.dissolvedOverlap), delta(space.dissolvedImports, spaceSeen.dissolvedImports), space.enabled ? "" : " (cache off)", delta(table.hits, seen.hits), delta(table.misses, seen.misses), delta(table.spaceTables, seen.spaceTables), delta(table.firstExpired, seen.firstExpired), delta(table.firstDiffersLow, seen.firstDiffersLow), delta(table.firstDiffersHeap, seen.firstDiffersHeap), delta(table.firstSameHash, seen.firstSameHash), delta(table.firstEmpty, seen.firstEmpty));
+    const auto spanned = static_cast<unsigned long long>(Spaces().spanned.exchange(0, std::memory_order_relaxed));
+    const auto spanImports = static_cast<unsigned long long>(Spaces().spanImports.exchange(0, std::memory_order_relaxed));
+    const auto spanFailures = static_cast<unsigned long long>(Spaces().spanFailures.exchange(0, std::memory_order_relaxed));
+    std::fprintf(stderr, "[address] %llu address-based builds (10 s), us per build: lease %.0f, imports pass %.0f, mirror prepare %.0f, compare %.0f (%.0f blocks, %.1f copied), snapshots %.0f; space hits %llu / rebuilds: generation %llu, epoch %llu, device %llu, waiter drop %llu, first %llu; unpublished %llu, dissolved: overlap %llu, imports %llu%s, spanned %llu (span imports %llu, refused %llu); [bda-table] hits %llu / misses %llu (space tables %llu), first entry: expired %llu, hash differs low %llu / heap %llu, same hash %llu, none held %llu\n", static_cast<unsigned long long>(totals.builds), per(totals.sums.leaseUs), per(totals.sums.importsUs), per(totals.sums.mirrorsUs), per(totals.sums.compareUs), per(static_cast<double>(totals.sums.blocksCompared)), per(static_cast<double>(totals.sums.blocksCopied)), per(totals.snapshotsUs), delta(space.hits, spaceSeen.hits), delta(space.rebuiltGeneration, spaceSeen.rebuiltGeneration), delta(space.rebuiltEpoch, spaceSeen.rebuiltEpoch), delta(space.rebuiltDevice, spaceSeen.rebuiltDevice), delta(space.rebuiltWaiterDrop, spaceSeen.rebuiltWaiterDrop), delta(space.rebuiltFirst, spaceSeen.rebuiltFirst), delta(space.unpublished, spaceSeen.unpublished), delta(space.dissolvedOverlap, spaceSeen.dissolvedOverlap), delta(space.dissolvedImports, spaceSeen.dissolvedImports), space.enabled ? "" : " (cache off)", spanned, spanImports, spanFailures, delta(table.hits, seen.hits), delta(table.misses, seen.misses), delta(table.spaceTables, seen.spaceTables), delta(table.firstExpired, seen.firstExpired), delta(table.firstDiffersLow, seen.firstDiffersLow), delta(table.firstDiffersHeap, seen.firstDiffersHeap), delta(table.firstSameHash, seen.firstSameHash), delta(table.firstEmpty, seen.firstEmpty));
     totals.tableSeen = table;
     totals.spaceSeen = space;
     totals.builds = 0;
@@ -1443,8 +1582,14 @@ void GuestBufferMemory::dissolveSpace(bool resolve) {
         // registered ranges), so the merge keeps the order Descriptor searches.
         std::merge(space->base.begin(), space->base.end(), std::make_move_iterator(regions.begin()), std::make_move_iterator(regions.end()), std::back_inserter(merged), [](const Region& left, const Region& right) { return left.begin < right.begin; });
     } else {
+        // Span regions become ordinary descriptors again: UploadPrepare merges them with the base
+        // ranges they cross, as before spans. After UploadPrepare (a dissolve for changed imports)
+        // they stay spans: they overlap the base ranges in the list, out of the BDA table, and the
+        // greatest-begin search (owner) finds a region that holds any address of either.
         merged.assign(space->base.begin(), space->base.end());
         merged.insert(merged.end(), std::make_move_iterator(regions.begin()), std::make_move_iterator(regions.end()));
+        for (auto& region : merged) region.span = false;
+        spansHeld = false;
         regionsSorted = false;
     }
     if (resolve) {
@@ -1487,18 +1632,51 @@ const GuestBufferMemory::Region* GuestBufferMemory::owner(std::uint64_t address)
         const auto found = std::upper_bound(list.begin(), list.end(), address, [](std::uint64_t value, const Region& region) { return value < region.begin; });
         return found == list.begin() ? nullptr : &*std::prev(found);
     };
+    if (spansHeld) {
+        // A span overlaps base ranges (in the space or, after a dissolve for changed imports, in
+        // `regions` itself): it serves every address it holds, whatever starts later.
+        for (const auto& region : regions) {
+            if (region.span && region.begin <= address && address < region.end) return &region;
+        }
+    }
     const auto* own = candidate(regions);
     const auto* shared = space != nullptr ? candidate(space->base) : nullptr;
     if (own == nullptr || (shared != nullptr && shared->begin > own->begin)) return shared;
     return own;
 }
 
+bool GuestBufferMemory::spannable(std::uint64_t begin, std::uint64_t end) const {
+    if (!spanImportsEnabled() || space == nullptr || context.hostImportAlignment == 0) return false;
+    const auto& base = space->base;
+    auto it = std::upper_bound(base.begin(), base.end(), begin, [](std::uint64_t value, const Region& region) { return value < region.begin; });
+    if (it == base.begin()) return false;
+    --it;
+    if (begin >= it->end) return false;
+    const auto first = it->begin;
+    auto cursor = first;
+    for (; it != base.end() && cursor < end; ++it) {
+        if (it->begin != cursor || it->direct == nullptr || it->mirror != nullptr) return false;
+        cursor = it->end;
+    }
+    if (cursor < end) return false;
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    return !state.spanFailed.contains({first, cursor});
+}
+
 void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t bytes, bool atomic) {
     validate(address, bytes);
+    bool span = false;
     switch (baseOverlap(address, address + bytes, nullptr)) {
         case BaseOverlap::Inside:
             return;
         case BaseOverlap::Partial:
+            // Served by one import over the crossed ranges (UploadFinish makes it), the space kept.
+            if (spannable(address, address + bytes)) {
+                Spaces().spanned.fetch_add(1, std::memory_order_relaxed);
+                span = true;
+                break;
+            }
             Spaces().dissolvedOverlap.fetch_add(1, std::memory_order_relaxed);
             traceDissolve(atomic ? "atomic descriptor" : "descriptor", address, address + bytes);
             dissolveSpace(false);
@@ -1510,6 +1688,8 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
     // the shader stores to them; what is written back is decided by Writes() alone.
     Region region{address, address + bytes, true, {}, nullptr};
     region.atomic = atomic;
+    region.span = span;
+    spansHeld = spansHeld || span;
     auto committed = GuestMemory::DescribeCommitted(address, bytes);
     if (!committed.whole) {
         // A GPU heap bound whole while the guest commits its pages on demand, or a descriptor left
@@ -2020,6 +2200,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             }
             mergeBacked(previous, region);
             previous.atomic = previous.atomic || region.atomic;
+            previous.span = previous.span || region.span;
             // A range starting before the mirror (only possible after the swap) keeps its prefix; the
             // earlier merged region ends at or before it, so the merged list stays sorted.
             previous.begin = std::min(previous.begin, region.begin);
@@ -2086,6 +2267,9 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
                 continue;
             }
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
+            // A span import also serves a region of a build without a space that crosses the
+            // same imported ranges (a descriptor-only upload of the spanning V#).
+            if (entry == nullptr && (region.span || !state.spans.empty())) entry = findSpan(state, region.begin, region.end);
             if (entry == nullptr) {
                 region.pending = true;
                 continue;
@@ -2230,6 +2414,9 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
             if (entry == nullptr) {
                 if (const auto* range = containingRange(importRanges(), region.begin, region.end)) entry = importAllocation(context, state, range->address, range->bytes, importRanges());
+                // A region crossing imported ranges (its first byte lies in one): one span import
+                // over them serves it in place instead of a per-use CPU copy (APS5_NO_SPAN_IMPORT=1).
+                else if (region.span || (spanImportsEnabled() && findImport(state, region.begin, region.begin + 1) != nullptr)) entry = importSpan(context, state, region.begin, region.end, importRanges());
             }
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
@@ -2688,7 +2875,10 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
     Require(uploaded && !committed, "guest GPU address ranges are not available");
     std::vector<ShaderRecompiler::BdaAbi::Range> result;
     result.reserve(regions.size() + (space != nullptr ? space->ranges.size() : 0));
-    for (const auto& region : regions) result.push_back(addressRange(region));
+    // A span overlaps base ranges whose imports serve its addresses (the same host pages).
+    for (const auto& region : regions) {
+        if (!region.span) result.push_back(addressRange(region));
+    }
     if (space == nullptr) return result;
     // The table is searched by address (the recompiler's lookup bisects it): both lists are sorted
     // and disjoint, so a merge keeps it so.
@@ -2904,6 +3094,8 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
         // of its copy-in and the destination of its copy-back, both recorded per use.
         const bool fixedMirror = region.mirror != nullptr && !region.mirror->writable && !region.mirror->heap;
         const bool staged = region.gpuCopy && region.deviceLocal;
+        // A span's import is not the registry's per-range one the caller's serials name.
+        if (region.span || (region.direct != nullptr && region.direct->span)) return std::nullopt;
         if (region.direct == nullptr && !fixedMirror && !staged) return std::nullopt;
         if (staged) {
             // A later use copies from `copySource` again, so it must still be the import serving

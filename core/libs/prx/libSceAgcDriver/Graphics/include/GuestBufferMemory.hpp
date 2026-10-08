@@ -30,6 +30,9 @@ struct HostImport {
     // Identity for the life of this import (see HostImportSerial); 0 until first asked for.
     std::uint64_t serial = 0;
     bool unwatched = false;
+    // A span import (over several adjoining registered ranges): not in the per-range registry, so
+    // no serial names it and recipes do not key on it.
+    bool span = false;
 };
 
 enum class ImportWatch : std::uint8_t { Watch, Unwatch };
@@ -311,11 +314,19 @@ private:
         // The device refused the shadow (memory or allocations exhausted): the region takes the
         // path it would take without staging, in both upload stages.
         bool unstaged = false;
+        // A descriptor crossing back-to-back imported ranges of the address space (see spannable):
+        // it overlaps the space's base ranges, so it stays out of the BDA table (the base imports
+        // serve those addresses) and binds one span import over the same host pages.
+        bool span = false;
     };
 
     // How [begin, end) lies against the space's base regions.
     enum class BaseOverlap { None, Inside, Partial };
     BaseOverlap baseOverlap(std::uint64_t begin, std::uint64_t end, const Region** owner) const;
+    // Whether a descriptor partially overlapping the base regions can be served by a span import
+    // instead of dissolving the space: it starts inside a base region and every base region it
+    // crosses is imported and adjoins the next (APS5_NO_SPAN_IMPORT=1 dissolves as before).
+    bool spannable(std::uint64_t begin, std::uint64_t end) const;
     // Copies the space's base regions into this build's own regions (today's per-build form) and
     // drops the space: for a region that partially overlaps a base region, and for a build whose
     // imports changed under the space (`resolve`: the direct regions are re-resolved by UploadFinish).
@@ -368,6 +379,9 @@ private:
     // Whether `regions` is in ascending address order (true right after AcquireRegistered, whose
     // regions follow the registry's order), so AddSnapshot can search instead of scanning.
     bool regionsSorted = false;
+    // Some region of `regions` is a span (Region::span): owner() prefers the span holding an address
+    // over the base range that starts later, so a view or write-back crossing base ranges finds it.
+    bool spansHeld = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
     std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> heapReferences;
     // UploadPrepare ran (regions are frozen); `uploaded` once UploadFinish ran.

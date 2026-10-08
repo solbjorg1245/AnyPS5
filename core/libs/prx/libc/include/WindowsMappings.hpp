@@ -183,8 +183,65 @@ public:
         return static_cast<char*>(alias) + lead;
     }
 
+    // A read-write alias of shared guest memory made of several runs of views (adjacent guest
+    // allocations backed by unrelated section offsets, which MapAlias refuses): one placeholder
+    // reservation, split per run, each run's view mapped into its piece (page-granular, as the guest
+    // views themselves). The pieces are remembered for UnmapAlias.
+    void* MapSpanAlias(std::uintptr_t address, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        const auto refuse = [&](const char* reason) {
+            char text[192];
+            std::snprintf(text, sizeof(text), "read-write span alias of shared guest memory 0x%llx+0x%llx: %s", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), reason);
+            return std::runtime_error(text);
+        };
+        if (address % pageBytes != 0 || bytes % pageBytes != 0 || bytes == 0) throw refuse("the range is not made of whole shared pages");
+        struct Run {
+            HANDLE section;
+            std::uint64_t offset;
+            std::size_t bytes;
+        };
+        std::vector<Run> runs;
+        auto view = views.find(address);
+        for (std::size_t done = 0; done < bytes; done += pageBytes, ++view) {
+            if (view == views.end() || view->first != address + done) throw refuse("a page is not a shared view");
+            const auto& page = view->second;
+            if (!runs.empty() && runs.back().offset + runs.back().bytes == page.offset && (runs.back().section == page.section->handle || sameSection(runs.back().section, page.section->handle))) {
+                runs.back().bytes += pageBytes;
+                continue;
+            }
+            runs.push_back({page.section->handle, page.offset, pageBytes});
+        }
+        auto* base = static_cast<char*>(allocate(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
+        if (base == nullptr) throw refuse("no placeholder could be reserved");
+        std::vector<void*> pieces;
+        std::size_t cursor = 0;
+        const auto undo = [&](const char* reason) {
+            for (auto* piece : pieces) unmap(GetCurrentProcess(), piece, 0);
+            if (cursor < bytes) VirtualFree(base + cursor, 0, MEM_RELEASE);
+            return refuse(reason);
+        };
+        for (const auto& run : runs) {
+            if (cursor + run.bytes < bytes && !VirtualFree(base + cursor, run.bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) throw undo("splitting the placeholder failed");
+            if (map(run.section, GetCurrentProcess(), base + cursor, run.offset, run.bytes, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) == nullptr) throw undo("mapping a run failed");
+            pieces.push_back(base + cursor);
+            cursor += run.bytes;
+        }
+        spanAliases.emplace(base, std::move(pieces));
+        return base;
+    }
+
     void UnmapAlias(void* alias) {
         if (alias == nullptr) return;
+        {
+            std::lock_guard lock(mutex);
+            if (const auto span = spanAliases.find(alias); span != spanAliases.end()) {
+                for (auto* piece : span->second) {
+                    if (!unmap(GetCurrentProcess(), piece, 0)) fail("unmap shared guest span alias");
+                }
+                spanAliases.erase(span);
+                return;
+            }
+        }
         SYSTEM_INFO system{};
         GetSystemInfo(&system);
         const auto base = reinterpret_cast<std::uintptr_t>(alias) & ~(static_cast<std::uintptr_t>(system.dwAllocationGranularity) - 1);
@@ -451,6 +508,8 @@ private:
     // write watch) is reported as a write once.
     std::map<std::uintptr_t, std::uintptr_t> freshRanges;
     std::map<std::uintptr_t, View> views;
+    // MapSpanAlias's reservations: base -> the pieces mapped into it.
+    std::map<void*, std::vector<void*>> spanAliases;
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::mutex mutex;
     std::atomic<std::uint64_t> mappingSerial{0};
