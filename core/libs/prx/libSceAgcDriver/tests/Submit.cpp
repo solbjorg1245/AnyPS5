@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/NewDrawKeyTally.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
@@ -13,6 +14,7 @@
 #include <chrono>
 #include <cstdio>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -365,6 +367,79 @@ void testNewDrawKeyTally() {
     check(tally.keys == 0 && tally.bases.empty() && tally.Top(10).empty(), "tally reset");
 }
 
+// The fast-path census core (docs/design/draw-fastpath.md F0): the state key leaves out the shader
+// user words and merged-stage pointers, the target-free state key also the color and depth bases;
+// which packets end a run of eligible draws; the run, decline and descriptor tallies.
+void testFastCensus() {
+    using namespace AgcDriver::DriverDetail;
+    const std::array<FastCensusRange, 6> ranges{{{0, 0x012, 4}, {0, 0x1e0, 8}, {0, 0x318, 0x78}, {0, 0x390, 8}, {1, 0x008, 0x24}, {1, 0x082, 2}}};
+    auto queue = std::make_unique<AgcDriver::QueueState>();
+    queue->shader.insert_or_assign(0x008, 0x1000);
+    queue->shader.insert_or_assign(0x00c, 0x10);
+    const auto base = ComputeFastCensusKeys(*queue, ranges);
+    check(base.full == ComputeFastCensusKeys(*queue, ranges).full, "census keys are deterministic");
+    const auto after = [&](std::uint8_t bank, std::uint32_t offset, std::uint32_t value) {
+        auto changed = std::make_unique<AgcDriver::QueueState>(*queue);
+        (bank == 0 ? changed->context : changed->shader).insert_or_assign(offset, value);
+        return ComputeFastCensusKeys(*changed, ranges);
+    };
+    const auto expect = [&](const FastCensusKeys& keys, bool full, bool state, bool stateNoTargets, const char* what) {
+        check((keys.full != base.full) == full && (keys.state != base.state) == state && (keys.stateNoTargets != base.stateNoTargets) == stateNoTargets, what);
+    };
+    expect(after(1, 0x00c, 0x20), true, false, false, "census: a pixel user word changes the full key alone");
+    expect(after(1, 0x082, 0x1234), true, false, false, "census: the geometry-back pointer changes the full key alone");
+    expect(after(1, 0x008, 0x2000), true, true, true, "census: a program address is state");
+    expect(after(0, 0x1e0, 0x12345678), true, true, true, "census: a blend control is state");
+    expect(after(0, 0x318, 0x4000), true, true, false, "census: CB_COLOR0_BASE is a target base");
+    expect(after(0, 0x318 + 15 + 13, 0x4000), true, true, false, "census: CB_COLOR1_DCC_BASE is a target base");
+    expect(after(0, 0x391, 0x1), true, true, false, "census: CB_COLOR1_BASE_EXT is a target base");
+    expect(after(0, 0x014, 0x4000), true, true, false, "census: DB_Z_WRITE_BASE is a target base");
+    expect(after(0, 0x31c, 0x4000), true, true, true, "census: CB_COLOR0_INFO is state");
+    expect(after(0, 0x2ff, 0x1), false, false, false, "census: a register outside the ranges changes no key");
+
+    const auto header = [](std::uint32_t opcode) { return 0xc0000000u | (opcode << 8u); };
+    const auto custom = [&](std::uint32_t kind) { return header(0x10) | (kind << 2u); };
+    check(!ClassifyFastCensusPacket(header(0x69), false, false, false), "census: SET_CONTEXT_REG keeps a run");
+    check(!ClassifyFastCensusPacket(header(0x76), false, false, false), "census: SET_SH_REG keeps a run");
+    check(!ClassifyFastCensusPacket(header(0x12), false, false, false), "census: CLEAR_STATE keeps a run");
+    check(!ClassifyFastCensusPacket(custom(0x0b), false, false, false), "census: a marker keeps a run");
+    check(!ClassifyFastCensusPacket(custom(0x1a), false, false, false), "census: a context push keeps a run");
+    check(!ClassifyFastCensusPacket(header(0x81), false, false, false), "census: WRITE_CONST_RAM keeps a run");
+    check(ClassifyFastCensusPacket(header(0x15), false, false, false) == FastCensusBreak::Dispatch, "census: a dispatch ends a run");
+    check(ClassifyFastCensusPacket(header(0x3c), false, false, false) == FastCensusBreak::Wait, "census: WAIT_REG_MEM ends a run");
+    check(ClassifyFastCensusPacket(header(0x49), false, false, false) == FastCensusBreak::Label, "census: RELEASE_MEM ends a run");
+    check(ClassifyFastCensusPacket(header(0x50), false, false, false) == FastCensusBreak::Dma, "census: DMA_DATA ends a run");
+    check(ClassifyFastCensusPacket(header(0x40), false, false, false) == FastCensusBreak::Dma && ClassifyFastCensusPacket(header(0x83), false, false, false) == FastCensusBreak::Dma, "census: COPY_DATA and DUMP_CONST_RAM are memory copies");
+    check(ClassifyFastCensusPacket(custom(0x18), false, false, false) == FastCensusBreak::Label, "census: RELEASE_MEM_CUSTOM ends a run");
+    check(ClassifyFastCensusPacket(header(0x69), false, false, true) == FastCensusBreak::Label, "census: a packet that wrote on the GPU ends a run");
+    check(ClassifyFastCensusPacket(custom(0x17), true, false, false) == FastCensusBreak::Flip, "census: a flip ends a run");
+    check(ClassifyFastCensusPacket(custom(0x06), false, true, false) == FastCensusBreak::Wait, "census: a rendering wait ends a run");
+    check(ClassifyFastCensusPacket(header(0x22), false, false, false) == FastCensusBreak::Other, "census: an unlisted packet ends a run");
+
+    check(FastCensusRuns::Bucket(1) == 0 && FastCensusRuns::Bucket(2) == 1 && FastCensusRuns::Bucket(3) == 1 && FastCensusRuns::Bucket(4) == 2, "census: short run buckets");
+    check(FastCensusRuns::Bucket(127) == 6 && FastCensusRuns::Bucket(128) == 7 && FastCensusRuns::Bucket(1u << 20u) == 7, "census: long run buckets");
+    FastCensusRuns runs;
+    runs.Close(0, FastCensusBreak::Wait);
+    runs.Close(3, FastCensusBreak::Dispatch);
+    runs.Close(20, FastCensusBreak::SubmissionEnd);
+    check(runs.Runs() == 2 && runs.packets == 23 && runs.longPackets == 20 && runs.runs[1] == 1 && runs.runs[4] == 1, "census: runs by length");
+    check(runs.breaks[static_cast<std::size_t>(FastCensusBreak::Wait)] == 1 && runs.breaks[static_cast<std::size_t>(FastCensusBreak::Dispatch)] == 1 && runs.breaks[static_cast<std::size_t>(FastCensusBreak::SubmissionEnd)] == 1, "census: what ended the runs");
+    runs.Reset();
+    check(runs.Runs() == 0 && runs.packets == 0 && runs.breaks[static_cast<std::size_t>(FastCensusBreak::Wait)] == 0, "census: runs reset");
+
+    FastCensusTally decline;
+    const auto writes = static_cast<std::size_t>(FastCensusReason::Writes);
+    const auto bindless = static_cast<std::size_t>(FastCensusReason::Bindless);
+    decline.Note(0);
+    decline.Note(FastCensusBit(FastCensusReason::Writes));
+    decline.Note(FastCensusBit(FastCensusReason::Writes) | FastCensusBit(FastCensusReason::Bindless));
+    check(decline.draws == 3 && decline.eligible == 1, "census: eligible draws");
+    check(decline.any[writes] == 2 && decline.sole[writes] == 1 && decline.any[bindless] == 1 && decline.sole[bindless] == 0, "census: declines any and sole");
+
+    check(FastCensusDescriptorBucket(0) == 0 && FastCensusDescriptorBucket(8) == 0 && FastCensusDescriptorBucket(9) == 1 && FastCensusDescriptorBucket(32) == 3, "census: descriptor buckets to the push limit");
+    check(FastCensusDescriptorBucket(33) == 4 && FastCensusDescriptorBucket(64) == 5 && FastCensusDescriptorBucket(65) == 6, "census: descriptor buckets over the push limit");
+}
+
 }
 
 int main() {
@@ -381,6 +456,7 @@ int main() {
         testWideLabelStoredSinceSubmission();
         testSkippedDispatch();
         testNewDrawKeyTally();
+        testFastCensus();
         LibcRunShutdown_nid_postfix();
         std::puts("AGC driver submit tests passed");
         return 0;

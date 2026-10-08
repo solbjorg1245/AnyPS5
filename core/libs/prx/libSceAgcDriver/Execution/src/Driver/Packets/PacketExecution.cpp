@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/FrameTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
@@ -179,6 +180,8 @@ void Driver::execute(const Submission& submission) {
     PacketHistory recent{submission.commands};
 
     static const bool profilePackets = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    // APS5_FAST_CENSUS (with APS5_PROFILE_DRAW): each packet's effect on a run of fast-eligible draws (F0).
+    static const bool fastCensus = FastCensusActive();
 
     thread_local PacketProfile packetProfile;
     ++packetProfile.submissions;
@@ -381,6 +384,7 @@ void Driver::execute(const Submission& submission) {
                 }
             }); });
             finishDrawPacket(drawn);
+            if (fastCensus && !drawn) NoteFastCensusDropped();
         } else if (sampleDump) {
             dumpSampleCounters(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u));
         } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
@@ -393,8 +397,10 @@ void Driver::execute(const Submission& submission) {
             if (endOfPipeInterrupt && !interruptDeferred) AgcDriverDeliverEopInterrupt(submission.queue);
         }
         if (drawPacket) Graphics::Recorder::CountRecordedWork();
+        if (fastCensus) NoteFastCensusPacket(submission.queue, header, drawPacket, header == FlipPacketHeader, header == RenderingWaitPacketHeader, wroteOnGpu);
         cursor += count;
     }
+    if (fastCensus) NoteFastCensusSubmissionEnd(submission.queue);
 
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;
     if (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value() || Graphics::Recorder::RecordedWorkSinceSubmit() != 0) {

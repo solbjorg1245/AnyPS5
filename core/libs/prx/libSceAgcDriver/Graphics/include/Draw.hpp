@@ -73,6 +73,29 @@ enum class IndirectDrawPath : std::uint8_t { Gpu, NotFolded, FetchUnknown, NonVe
 void CountIndirectDraw(IndirectDrawPath path, double readMs, bool rewritten = false);
 const char* IndirectDrawPathName(IndirectDrawPath path);
 
+// APS5_FAST_CENSUS=1 with APS5_PROFILE_DRAW (docs/design/draw-fastpath.md F0): what Draw learned
+// about the calling thread's last draw that the fast path would decline on, read and cleared by the
+// driver's census when the packet ends (Execution/src/Driver/Draw/FastCensus.cpp); Draw and
+// DrawWithRecipe fill it. A draw that ended early (nothing to draw, empty indirect records) leaves
+// it unseen.
+struct DrawCensusNote {
+    bool seen = false;
+    // A color target without its resident storage image (copied in and out per draw).
+    bool notResident = false;
+    // A bound image is one of the draw's targets (a pass of its own).
+    bool readsTarget = false;
+    bool copiedWrites = false;
+    // An address-based build's lease.
+    bool lease = false;
+    bool indirect = false;
+    IndirectDrawPath path = IndirectDrawPath::Gpu;
+    bool rewritesRecords = false;
+};
+// Whether the census runs (APS5_FAST_CENSUS and APS5_PROFILE_DRAW set).
+bool FastCensus();
+// The calling thread's note; null while the census is off.
+DrawCensusNote* ThreadDrawCensusNote();
+
 // Draw packets that drew nothing, for the [draws] line: Nothing (an empty count, or no color writes
 // and no pixel shader), Prechecked (State.hpp's DrawRejection refused it before the decode) and
 // Thrown (the decode or the build threw); `us` is the packet's time in the driver. `reason` (the

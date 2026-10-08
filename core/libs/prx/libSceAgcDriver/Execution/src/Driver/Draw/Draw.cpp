@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawScratch.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -346,6 +347,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, hits, fresh, drawKey, registerKey, decode, phaseTiming, relocating);
+    // APS5_FAST_CENSUS: what the fast path would decline on, committed when the packet ends (F0).
+    if (FastCensusActive()) NoteFastCensusDraw(queue, graphics, roles, programs, programResults, recompiled, stageCaptures, matchedRegions, decodeReads, drawParameters.indirect.has_value(), indirectCpu, ShaderRecompiler::DebugProbeActive() || dumpTarget != 0 || dumpSlot1 != 0);
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
