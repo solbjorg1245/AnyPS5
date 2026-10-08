@@ -3,6 +3,7 @@
 #include "prx/libkernel/File/include/FileFlags.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -10,6 +11,8 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
+#include <vector>
 extern "C" {
 int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode);
 int APS5_VABI sceKernelClose(int d);
@@ -86,5 +89,31 @@ int main() {
     Check(sceKernelAioPollRequest(id, nullptr) == SCE_KERNEL_ERROR_EFAULT);
     Check(sceKernelAioPollRequest(0, &polled) == SCE_KERNEL_ERROR_EINVAL);
     Check(sceKernelAioDeleteRequest(id, nullptr) == SCE_KERNEL_ERROR_EFAULT);
+    // Four threads read four distinct blocks of one descriptor: no request may transfer at another's offset.
+    const auto shared = root / "shared.bin";
+    std::string sharedContents;
+    for (char letter : {'A', 'B', 'C', 'D'}) sharedContents.append(1024, letter);
+    { std::ofstream stream(shared, std::ios::binary); stream << sharedContents; }
+    const int sharedFd = sceKernelOpen(shared.string().c_str(), SCE_KERNEL_O_RDONLY, 0);
+    Check(sharedFd >= 0);
+    std::atomic<bool> misread{false};
+    std::vector<std::thread> readers;
+    for (std::int64_t offset = 0; offset < 4096; offset += 1024) {
+        readers.emplace_back([&, offset] {
+            for (int i = 0; i < 2000 && !misread; ++i) {
+                std::array<char, 16> bytes{};
+                KernelAioResult result{-1, 0};
+                KernelAioRwRequest request{offset, bytes.size(), bytes.data(), &result, sharedFd};
+                std::int32_t requestId = 0;
+                if (sceKernelAioSubmitReadCommands(&request, 1, 0, &requestId) != 0 || result.state != 3 ||
+                    result.return_value != 16 || std::memcmp(bytes.data(), sharedContents.data() + offset, 16) != 0) {
+                    misread = true;
+                }
+            }
+        });
+    }
+    for (auto& reader : readers) reader.join();
+    Check(!misread);
+    Check(sceKernelClose(sharedFd) == 0);
     Check(std::filesystem::remove_all(root) > 0);
 }
