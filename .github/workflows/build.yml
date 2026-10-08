@@ -45,6 +45,12 @@ jobs:
         env:
           ANYPS5_REQUIRE_VULKAN: 1
           GALLIUM_OVERRIDE_CPU_CAPS: avx
+      - name: DIAG backtrace write tracking
+        if: failure()
+        run: |
+          sudo apt-get install -y --no-install-recommends gdb
+          build/tests/agc_write_tracking_tests || true
+          gdb -batch -ex "handle SIGSEGV stop print pass" -ex run -ex bt -ex "info registers rip" -ex c -ex bt -ex c -ex bt -ex c -ex bt -ex c -ex bt build/tests/agc_write_tracking_tests || true
 
   windows:
     runs-on: windows-latest
