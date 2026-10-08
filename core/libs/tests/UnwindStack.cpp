@@ -115,7 +115,10 @@ int main() {
     if (remembered.ips[1] <= trampoline || remembered.ips[1] - trampoline > 64) return Fail("return address in the remember_state frame");
     const auto through = reinterpret_cast<std::uintptr_t>(WalkThroughRememberedState);
     if (remembered.ips[2] <= through || remembered.ips[2] - through > 256) return Fail("frame above the remember_state frame");
-    for (int i = 1; i < direct.count; ++i)
+    // Frame 1 returns into Measure's one call site; frame 2 is main, which calls Measure from a
+    // different site per walk, so its address differs by design. Frames from 3 on must match again.
+    if (remembered.ips[3] != direct.ips[1]) return Fail("Measure frame differs");
+    for (int i = 3; i < direct.count; ++i)
         if (remembered.ips[i + 2] != direct.ips[i]) return Fail("outer frames differ");
 
     // A 16 KiB job fiber must keep room for the guest's own frames and the personality routine.
