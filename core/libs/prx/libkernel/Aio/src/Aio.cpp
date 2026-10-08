@@ -9,6 +9,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/File/include/ReadTrace.hpp"
 
@@ -111,6 +112,8 @@ int SubmitCommands(KernelAioRwRequest* req, std::int32_t size, bool write, std::
     const std::int32_t queue = AllocateId();
     bool aborted = false;
     for (std::int32_t i = 0; i < size; ++i) {
+        // A guarded page (resident buffers) lands first: the write would fail there, not fault.
+        if (write) GuestWriteWatch::GuestPageGuardTouch_nid_postfix(reinterpret_cast<std::uintptr_t>(req[i].buf), req[i].nbyte);
         const std::int64_t done = write
             ? NativePwrite(req[i].fd, req[i].buf, req[i].nbyte, req[i].offset)
             : NativePread(req[i].fd, req[i].buf, req[i].nbyte, req[i].offset);

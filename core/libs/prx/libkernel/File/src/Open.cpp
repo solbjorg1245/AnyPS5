@@ -2,6 +2,7 @@
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
@@ -142,6 +143,8 @@ std::int64_t APS5_VABI sceKernelWrite(int d, const void* buf, std::size_t nbytes
     if (buf == nullptr) {
         throw std::invalid_argument(std::string(__func__) + ": buf is null");
     }
+    // A guarded page (resident buffers) lands first: the write would fail there, not fault.
+    GuestWriteWatch::GuestPageGuardTouch_nid_postfix(reinterpret_cast<std::uintptr_t>(buf), nbytes);
     auto n = NativeWrite(d, buf, nbytes);
     if (n < 0) {
         throw std::runtime_error(std::string(__func__) + ": write failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));

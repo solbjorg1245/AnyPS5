@@ -2714,6 +2714,14 @@ void pageGuardTests() {
     std::uint64_t faultsAfter = 0, forcedAfter = 0;
     GuestWriteWatch::GuestPageGuardCounts_nid_postfix(&faultsAfter, &forcedAfter, &guards);
     Require(faultsAfter - faults == 2 && forcedAfter - forced == 1 && guards == 0 && !GuestWriteWatch::GuestPageGuardCovers_nid_postfix(base), "page guard counts are off");
+    // Host I/O over guarded pages (GuestArena::HostWrite, the kernel's file writes) resolves them
+    // first, as a fault would; over pages no guard holds it does nothing.
+    guardTestIds[0] = GuestWriteWatch::GuestPageGuardProtect_nid_postfix(base + page, base + 3 * page);
+    Require(guardTestIds[0] != 0, "a guard over released pages was refused");
+    GuestWriteWatch::GuestPageGuardTouch_nid_postfix(base, 16);
+    Require(guardTestFaults.load() == 2 && GuestWriteWatch::GuestPageGuardCovers_nid_postfix(base + page), "touching a page no guard holds resolved a guard");
+    GuestWriteWatch::GuestPageGuardTouch_nid_postfix(base + 2 * page + 100, 8);
+    Require(guardTestFaults.load() == 3 && !GuestWriteWatch::GuestPageGuardCovers_nid_postfix(base + page), "touching a guarded page did not resolve its guard");
     block[page] = 1;
     GuestWriteWatch::GuestPageGuardInstall_nid_postfix(nullptr);
 #ifdef _WIN32
@@ -2810,7 +2818,12 @@ void residentBufferTests(const Device& device, Recorder& recorder) {
         Require(landed[28680] == 0xA1 && landed[28683] == 0xD4 && landed[28679] == sourceByte(28679) && landed[28684] == sourceByte(28684), "a label store over a resident copy did not land after it");
         const auto counts = Recorder::ResidentCounts();
         Require(counts.made - before.made == 3 && counts.madeBytes - before.madeBytes == 8192 + 8192 + 4096 && counts.skipped - before.skipped == 1 && counts.recorded - before.recorded == 2, "resident buffer counters are off");
+        // A resident copy still queued when its recorder goes lands with the teardown.
+        resident.DeferCopies(copyOf(12288, 4096));
+        resident.Submit();
+        Require(resident.ResidentCopyBytes() == 4096, "a copy-back over a landed page was not kept resident");
     }
+    Require(static_cast<const volatile unsigned char*>(block)[13000] == static_cast<unsigned char>(13000 * 7 + 3), "a resident copy queued at the recorder's teardown was lost");
     recorder.Activate();
     {
         GuestAllocations::Mutation mutation;

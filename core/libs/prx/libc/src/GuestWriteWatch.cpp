@@ -16,6 +16,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "prx/libc/include/WindowsMappings.hpp"
 #endif
 
 #if defined(__linux__)
@@ -304,6 +305,11 @@ public:
         _entries.erase(found);
         _count.store(_entries.size(), std::memory_order_release);
         for (const auto& [from, to] : uncovered(begin, end)) access(from, to, true);
+        // Remembered for a fault that raced this release (see raced).
+        auto& slot = _released[_releasedNext++ % _released.size()];
+        slot.begin = begin;
+        slot.end = end;
+        slot.retries.store(0, std::memory_order_relaxed);
     }
 
     bool Covers(std::uintptr_t address) {
@@ -314,7 +320,7 @@ public:
 
     // A fault at `address`: false when no guard holds it (not this handler's fault).
     bool Fault(std::uintptr_t address) {
-        if (!Covers(address)) return false;
+        if (!Covers(address)) return raced(address);
         _faults.fetch_add(1, std::memory_order_relaxed);
         const auto resolve = _resolve.load(std::memory_order_acquire);
         bool forced = resolve == nullptr || !resolve(address);
@@ -332,6 +338,28 @@ public:
         return true;
     }
 
+    // Host I/O into or out of guarded pages fails where a CPU access would fault (ReadFile and
+    // WriteFile report ERROR_NOACCESS, read and write EFAULT): every guard over [begin, end) is
+    // resolved first, as a fault on it would be.
+    void Touch(std::uintptr_t begin, std::uintptr_t end) {
+        while (_count.load(std::memory_order_acquire) != 0) {
+            std::uintptr_t at = 0;
+            bool found = false;
+            {
+                std::shared_lock lock(_lock);
+                for (const auto& [id, range] : _entries) {
+                    if (range.first < end && begin < range.second) {
+                        at = std::max(begin, range.first);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) return;
+            Fault(at);
+        }
+    }
+
     void Counts(std::uint64_t* faults, std::uint64_t* forced, std::uint64_t* guards) const {
         if (faults != nullptr) *faults = _faults.load(std::memory_order_relaxed);
         if (forced != nullptr) *forced = _forced.load(std::memory_order_relaxed);
@@ -340,6 +368,17 @@ public:
 
 private:
     PageGuard() = default;
+
+    // A fault no guard holds that raced a release: the page was guarded when the access faulted and
+    // another thread's resolve released it before this handler looked. The access runs again, a
+    // bounded number of times per release (a later genuine fault there is passed on).
+    bool raced(std::uintptr_t address) {
+        std::shared_lock lock(_lock);
+        for (auto& slot : _released) {
+            if (slot.begin <= address && address < slot.end) return slot.retries.fetch_add(1, std::memory_order_relaxed) < 64;
+        }
+        return false;
+    }
 
     std::uint64_t covering(std::uintptr_t address) const {
         for (const auto& [id, range] : _entries) {
@@ -366,6 +405,9 @@ private:
 
 #if defined(_WIN32)
     static bool readWrite(std::uintptr_t begin, std::uintptr_t end) {
+        // Shared views re-protect their pages for write tracking (WindowsMappings::Collect and
+        // HandleWrite), which would lift a guard: refused.
+        if (GuestArena::WindowsMappings::Get().HasView(begin, end - begin)) return false;
         for (auto cursor = begin; cursor < end;) {
             MEMORY_BASIC_INFORMATION info{};
             if (VirtualQuery(reinterpret_cast<void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || info.Protect != PAGE_READWRITE) return false;
@@ -444,6 +486,13 @@ private:
     std::atomic<std::uint64_t> _faults{0}, _forced{0};
     std::atomic<bool (*)(std::uintptr_t)> _resolve{nullptr};
     std::once_flag _installed;
+    // The last releases, for raced (written under the exclusive lock).
+    struct Released {
+        std::uintptr_t begin = 0, end = 0;
+        std::atomic<std::uint32_t> retries{0};
+    };
+    std::array<Released, 64> _released{};
+    std::size_t _releasedNext = 0;
 };
 
 }
@@ -510,6 +559,10 @@ std::uint64_t GuestPageGuardProtect_nid_postfix(std::uintptr_t begin, std::uintp
 
 void GuestPageGuardRelease_nid_postfix(std::uint64_t id) {
     if (id != 0) PageGuard::Get().Release(id);
+}
+
+void GuestPageGuardTouch_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    if (bytes != 0) PageGuard::Get().Touch(address, address + bytes);
 }
 
 bool GuestPageGuardCovers_nid_postfix(std::uintptr_t address) {

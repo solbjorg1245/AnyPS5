@@ -521,6 +521,51 @@ std::map<std::uint64_t, Recorder::ResidentGuard*> residentGuards;
 std::uint64_t residentSequence = 0;
 constexpr std::uint64_t ResidentPageBytes = 4096;
 
+// The resident fault resolver. A fault arrives on the stack that faulted, a title's 16 KiB job fiber
+// among them (docs/research/loading-deaths-2.md), too small for a submission and its wait in the
+// Vulkan driver: a thread that does not hold the GPU mutex queues the fault here and waits. One
+// thread for the process, started with the first resident recorder and leaked like the release
+// queue; a request lives on the waiter's stack until it is done.
+struct ResidentResolver {
+    struct Request {
+        std::uintptr_t address = 0;
+        bool done = false;
+        bool result = false;
+        Request* next = nullptr;
+    };
+    std::mutex mutex;
+    std::condition_variable wake, finished;
+    Request* first = nullptr;
+    Request* last = nullptr;
+};
+
+void ResidentResolverMain(ResidentResolver& resolver) {
+    CpuTopology::PinHelperThread("resident resolver");
+    std::unique_lock lock(resolver.mutex);
+    for (;;) {
+        resolver.wake.wait(lock, [&] { return resolver.first != nullptr; });
+        auto* request = resolver.first;
+        resolver.first = request->next;
+        if (resolver.first == nullptr) resolver.last = nullptr;
+        lock.unlock();
+        const bool result = Recorder::ResolveResidentFaultHere(request->address);
+        lock.lock();
+        request->result = result;
+        request->done = true;
+        resolver.finished.notify_all();
+    }
+}
+
+ResidentResolver& ResidentResolverQueue() {
+    static ResidentResolver* const resolver = [] {
+        auto* made = new ResidentResolver;
+        HostThread thread([made] { ResidentResolverMain(*made); });
+        thread.detach();
+        return made;
+    }();
+    return *resolver;
+}
+
 // APS5_RESIDENT_BUFFER_MIB (256): what resident copies may hold back at once;
 // APS5_RESIDENT_BUFFER_BATCHES (16): the batches after its use's past which one is recorded.
 std::uint64_t ResidentCapBytes() {
@@ -1145,6 +1190,7 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
         coalesceCopyBacks = true;
         residentGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         residentUsed.store(true, std::memory_order_relaxed);
+        static_cast<void>(ResidentResolverQueue());
         GuestWriteWatch::GuestPageGuardInstall_nid_postfix(&Recorder::ResolveResidentFault);
     }
     {
@@ -1181,6 +1227,8 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
 
 Recorder::~Recorder() {
     try {
+        // Resident copies outlive Submit: recorded now, so Sync lands them before their guards go.
+        if (residentBuffers && HasDeferredCopies()) flushDeferredCopies(true, FlushReason::Submit);
         Sync();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[gpu] recorder teardown: %s\n", error.what());
@@ -1436,7 +1484,7 @@ bool Recorder::DeferCopyBacks() {
 }
 
 // A resident copy's guard (Recorder::KeepsResidentBuffers): the copy of the whole pages a fault
-// lands, the page guard's id, the serials of the batch holding the use that wrote the shadow and
+// lands, the recorder that made it (its buffers are that device's), the page guard's id, the serials of the batch holding the use that wrote the shadow and
 // of the batch recording the copy (0 until recorded), and whether a fault landed it. The fields
 // change under the GPU mutex; residentGuards lets the fault path find the live guards.
 struct Recorder::ResidentGuard {
@@ -1451,6 +1499,7 @@ struct Recorder::ResidentGuard {
         GuestWriteWatch::GuestPageGuardRelease_nid_postfix(id);
     }
     DeferredCopy copy;
+    const Recorder* owner = nullptr;
     std::uint64_t id = 0;
     std::uint64_t sequence = 0;
     std::uint64_t useSerial = 0;
@@ -1623,8 +1672,9 @@ void Recorder::flushKeepingResident(FlushReason reason, const std::function<bool
     for (auto& copy : deferredCopies) {
         const auto end = copy.address + copy.bytes;
         if (copy.guard != nullptr) {
-            // Resident already: recorded at a changed mapping, under a label store, or once old.
-            if (remapped || stored(copy.address, end) || copy.guard->useSerial + ResidentMaxBatches() <= submissions + 1) {
+            // Resident already: recorded at a changed mapping, under a label store, or once old; one
+            // a fault landed is dropped there (it only held the cap).
+            if (copy.guard->resolved || remapped || stored(copy.address, end) || copy.guard->useSerial + ResidentMaxBatches() <= submissions + 1) {
                 recorded.push_back(std::move(copy));
             } else {
                 residentBytes += copy.bytes;
@@ -1641,6 +1691,7 @@ void Recorder::flushKeepingResident(FlushReason reason, const std::function<bool
             continue;
         }
         auto guard = std::make_shared<ResidentGuard>();
+        guard->owner = this;
         guard->copy = copy;
         guard->copy.address = first;
         guard->copy.sourceOffset += first - copy.address;
@@ -1699,6 +1750,25 @@ Recorder::ResidentStatistics Recorder::ResidentCounts() {
 bool Recorder::ResolveResidentFault(std::uintptr_t address) {
     // From the fault handler, on any thread (the title's too): nothing may escape.
     try {
+        // A holder of the GPU mutex resolves here (the resolver would wait for the mutex).
+        if (GuestMemory::GpuMutex().HeldByThisThread()) return ResolveResidentFaultHere(address);
+        auto& resolver = ResidentResolverQueue();
+        ResidentResolver::Request request;
+        request.address = address;
+        std::unique_lock lock(resolver.mutex);
+        (resolver.last != nullptr ? resolver.last->next : resolver.first) = &request;
+        resolver.last = &request;
+        resolver.wake.notify_one();
+        resolver.finished.wait(lock, [&] { return request.done; });
+        return request.result;
+    } catch (...) {
+        residentForced.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+}
+
+bool Recorder::ResolveResidentFaultHere(std::uintptr_t address) {
+    try {
         const bool owner = GuestMemory::GpuMutex().HeldByThisThread();
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(GuestMemory::GpuMutex());
@@ -1722,7 +1792,7 @@ bool Recorder::resolveResident(std::uintptr_t address, bool owner) {
     {
         std::lock_guard lock(residentMutex);
         for (const auto& [sequence, guard] : residentGuards) {
-            if (!guard->resolved && guard->copy.address <= page && page < guard->copy.address + guard->copy.bytes) found.push_back({sequence, guard->id, guard->useSerial, guard->landingSerial, guard->copy});
+            if (guard->owner == this && !guard->resolved && guard->copy.address <= page && page < guard->copy.address + guard->copy.bytes) found.push_back({sequence, guard->id, guard->useSerial, guard->landingSerial, guard->copy});
         }
     }
     // A guard made at a label of the open batch holds bytes its use has not produced yet: the batch

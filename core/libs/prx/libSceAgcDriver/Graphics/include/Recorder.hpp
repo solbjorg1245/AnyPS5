@@ -150,6 +150,10 @@ public:
     bool KeepsResidentBuffers() const { return residentBuffers; }
     std::uint64_t ResidentCopyBytes() const;
     static bool ResolveResidentFault(std::uintptr_t address);
+    // ResolveResidentFault's work on the calling thread, under the GPU mutex it takes. The fault
+    // handler's call runs it on the resolver thread unless the faulting thread holds the mutex
+    // (the faulting stack may be a title's 16 KiB job fiber, too small for a submission).
+    static bool ResolveResidentFaultHere(std::uintptr_t address);
     // Totals since start (relaxed): copies made resident, those recorded later and those dropped
     // after a fault, guards refused and flushes at a changed mapping; faults resolved (those under
     // the GPU lock, those that found every copy landed already) and given up.

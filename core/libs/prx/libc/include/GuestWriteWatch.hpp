@@ -26,6 +26,10 @@ void GuestPageGuardInstall_nid_postfix(bool (*resolve)(std::uintptr_t address));
 std::uint64_t GuestPageGuardProtect_nid_postfix(std::uintptr_t begin, std::uintptr_t end);
 void GuestPageGuardRelease_nid_postfix(std::uint64_t id);
 bool GuestPageGuardCovers_nid_postfix(std::uintptr_t address);
+// Resolves every guard over [address, address + bytes) as a fault would: host I/O into or out of
+// guest memory (GuestArena::HostWrite, the kernel's writes) fails on a guarded page instead of
+// faulting. One atomic load while no guard is live.
+void GuestPageGuardTouch_nid_postfix(std::uintptr_t address, std::size_t bytes);
 // Totals since start: faults on guarded pages and those that left a guard to release by force;
 // the live guards.
 void GuestPageGuardCounts_nid_postfix(std::uint64_t* faults, std::uint64_t* forced, std::uint64_t* guards);

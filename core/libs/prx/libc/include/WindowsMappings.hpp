@@ -299,6 +299,13 @@ public:
         std::snprintf(text, size, "view protection 0x%lx seen %llu generation %llu armed %d host writes %u aliases %zu section offset 0x%llx (clean %d fresh %d)", view.protection, static_cast<unsigned long long>(view.seen), static_cast<unsigned long long>(view.page->generation), view.armed ? 1 : 0, view.hostWrites, view.page->aliases.size(), static_cast<unsigned long long>(view.offset), clean ? 1 : 0, fresh ? 1 : 0);
     }
 
+    // Whether a shared view lies in [address, address + bytes).
+    bool HasView(std::uintptr_t address, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        const auto found = views.lower_bound(address & ~(pageBytes - 1));
+        return found != views.end() && found->first < address + bytes;
+    }
+
     bool Protection(std::uintptr_t address, std::uint32_t* protection) {
         std::lock_guard lock(mutex);
         const auto found = views.find(address & ~(pageBytes - 1));
