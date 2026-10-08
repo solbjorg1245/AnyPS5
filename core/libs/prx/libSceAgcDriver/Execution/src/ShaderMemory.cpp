@@ -911,4 +911,28 @@ bool SameDescriptorIgnoringTsharpBits(const ShaderRecompiler::DescriptorBinding&
     return true;
 }
 
+CopyCost ResultCopyCost(const ShaderRecompiler::RecompileResult& result) {
+    CopyCost cost;
+    const auto add = [&](std::size_t bytes) {
+        cost.bytes += bytes;
+        if (bytes != 0) ++cost.allocations;
+    };
+    const auto bits = [](const std::vector<bool>& flags) { return (flags.size() + 7) / 8; };
+    add(result.bindings.size() * sizeof(ShaderRecompiler::DescriptorBinding));
+    for (const auto& binding : result.bindings) {
+        add(binding.guestDescriptor.size() * sizeof(std::uint32_t));
+        add(bits(binding.samplerDepthCompare));
+        add(bits(binding.imageWritten));
+        add(bits(binding.imageDepthCompare));
+        add(bits(binding.bufferAtomic));
+        add(bits(binding.bufferWritten));
+        add(binding.deferredWords.size() * sizeof(std::pair<std::uint32_t, std::uint64_t>));
+    }
+    add(result.pushConstants.size());
+    add(result.vertexAttributes.size() * sizeof(ShaderRecompiler::VertexAttribute));
+    add(result.parameterExports.size() * sizeof(std::uint32_t));
+    add(result.fragmentParameters.size() * sizeof(ShaderRecompiler::FragmentParameter));
+    return cost;
+}
+
 }

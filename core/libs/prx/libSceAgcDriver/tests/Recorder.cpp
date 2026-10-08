@@ -2199,6 +2199,33 @@ void bufferBaseWordsTests() {
     }
 }
 
+// What a deep copy of a compiled result copies (ResultCopyCost, the dispatch cache's copy
+// counters): the bindings and every non-empty vector's bytes with one allocation each, a
+// vector<bool> at a bit per element rounded up to bytes; the shared SPIR-V counts nowhere.
+void resultCopyCostTests() {
+    using AgcDriver::ResultCopyCost;
+    ShaderRecompiler::RecompileResult result;
+    result.spirv = std::vector<std::uint32_t>(64, 0u);
+    const auto empty = ResultCopyCost(result);
+    Require(empty.bytes == 0 && empty.allocations == 0, "a result holding only SPIR-V cost a copy");
+    ShaderRecompiler::DescriptorBinding flat{};
+    flat.guestDescriptor.assign(10, 0u);
+    flat.deferredWords = {{1, 0x1000}, {2, 0x1008}};
+    ShaderRecompiler::DescriptorBinding images{};
+    images.guestDescriptor.assign(16, 0u);
+    images.imageWritten.assign(9, false);
+    images.samplerDepthCompare.assign(2, true);
+    result.bindings = {flat, images};
+    result.pushConstants.resize(12);
+    result.parameterExports = {1, 2, 3};
+    const auto cost = ResultCopyCost(result);
+    const std::uint64_t bytes = 2 * sizeof(ShaderRecompiler::DescriptorBinding) + 10 * 4 + 2 * sizeof(std::pair<std::uint32_t, std::uint64_t>) + 16 * 4 + 2 + 1 + 12 + 3 * 4;
+    Require(cost.bytes == bytes, "a result copy's bytes are wrong");
+    // The bindings, the flat binding's descriptor and deferred words, the image binding's
+    // descriptor and two flag vectors, the push constants, the parameter exports.
+    Require(cost.allocations == 8, "a result copy's allocations are wrong");
+}
+
 // A template's data buffers refreshed by words from a patched compiled result (a data-only hit)
 // and back: DataWordsHash() follows the buffers exactly, so a later recipe hit's hash compare
 // (RecordedDispatch::DataRefresh::Hash) decides correctly in both directions.
@@ -2573,6 +2600,7 @@ int main() {
         dataWordPositionsTests();
         ignoredWordBitsTests();
         bufferBaseWordsTests();
+        resultCopyCostTests();
         dataRefreshTests(device, recorder);
         minLodTests(device, recorder);
         firstLayerViewTests(device, recorder);

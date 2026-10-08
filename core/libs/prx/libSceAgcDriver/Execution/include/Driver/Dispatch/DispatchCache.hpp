@@ -135,6 +135,50 @@ struct DispatchBaseIndex {
 // The queue the current thread's dispatch statistics belong to (set by Driver::dispatch).
 inline thread_local std::uint32_t DispatchStatsQueue = 0;
 
+// The validate path's copies and sub-steps (Driver::lookupDispatch, the [dispatch-cache] validate
+// copies line; APS5_PROFILE_DRAW, APS5_NO_VARIANT_COPY_COUNT=1 leaves them out): validateVariant
+// calls on stored variants and on shifted candidates; relocateVariant calls by result with their
+// us; shiftVariant calls, the unordered among them, and the vectors a shifted variant copies; the
+// RecompileResult deep copies by site with their bytes and allocations (ResultCopyCost), the shift
+// copies of candidates that then differed and the relocated data hits that patched the shift's own
+// copy instead; a stored data hit's live words; the compares' (GPU waits apart) and the data-word
+// patches' us.
+enum ResultCopySite : std::size_t { CopyShift, CopyRelocatedData, CopyStoredData, ResultCopySiteCount };
+enum RelocateResult : std::size_t { RelocateWithCopy, RelocateWithoutCopy, RelocateNone, RelocateResultCount };
+struct ValidateCopyCounters {
+    std::uint64_t validations = 0, storedCompares = 0, shiftedCompares = 0, shiftCalls = 0, unordered = 0, shiftCopiesDiffering = 0, shiftCopiesPatched = 0;
+    std::array<std::uint64_t, RelocateResultCount> relocateCalls{};
+    std::array<double, RelocateResultCount> relocateUs{};
+    std::array<std::uint64_t, ResultCopySiteCount> resultCopies{}, resultBytes{}, resultAllocations{};
+    std::uint64_t shiftedBytes = 0, shiftedAllocations = 0, liveWordsBytes = 0;
+    double compareUs = 0, patchUs = 0, storedPatchUs = 0;
+
+    void Add(const ValidateCopyCounters& other) {
+        validations += other.validations;
+        storedCompares += other.storedCompares;
+        shiftedCompares += other.shiftedCompares;
+        shiftCalls += other.shiftCalls;
+        unordered += other.unordered;
+        shiftCopiesDiffering += other.shiftCopiesDiffering;
+        shiftCopiesPatched += other.shiftCopiesPatched;
+        for (std::size_t r = 0; r < RelocateResultCount; ++r) {
+            relocateCalls[r] += other.relocateCalls[r];
+            relocateUs[r] += other.relocateUs[r];
+        }
+        for (std::size_t s = 0; s < ResultCopySiteCount; ++s) {
+            resultCopies[s] += other.resultCopies[s];
+            resultBytes[s] += other.resultBytes[s];
+            resultAllocations[s] += other.resultAllocations[s];
+        }
+        shiftedBytes += other.shiftedBytes;
+        shiftedAllocations += other.shiftedAllocations;
+        liveWordsBytes += other.liveWordsBytes;
+        compareUs += other.compareUs;
+        patchUs += other.patchUs;
+        storedPatchUs += other.storedPatchUs;
+    }
+};
+
 struct EntryCounters {
     std::map<std::uint32_t, QueueKeyCounters> queueKeys;
     std::unordered_map<std::uint64_t, ProgramKeyCounters> programKeys;
@@ -157,6 +201,7 @@ struct EntryCounters {
     // them differing (the stored variants then compared as before), and the stored validations
     // the hits skipped.
     std::uint64_t relocatedFirst = 0, relocatedFirstDiffering = 0, storedValidationsSkipped = 0;
+    ValidateCopyCounters copies;
     // User-pointer relocation (DispatchRelocation.cpp relocateByUserPointer): absent lookups with
     // candidates, candidates without a rule, shifted candidates validated / differing / unordered,
     // hits, copies inserted under the live key; the rules learned against a candidate by verdict.

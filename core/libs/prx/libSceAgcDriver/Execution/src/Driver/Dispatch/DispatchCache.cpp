@@ -19,6 +19,13 @@ bool Driver::verifyDataHits() {
     return verify;
 }
 
+// The [dispatch-cache] validate copies line: the validate path's copies and sub-steps, counted
+// under APS5_PROFILE_DRAW (DispatchLookup.cpp); APS5_NO_VARIANT_COPY_COUNT=1 leaves them out.
+bool Driver::variantCopyCount() {
+    static const bool count = std::getenv("APS5_PROFILE_DRAW") != nullptr && std::getenv("APS5_NO_VARIANT_COPY_COUNT") == nullptr;
+    return count;
+}
+
 // Draw-cache variants ignore the sampled-image T#s' texture-streaming feedback bits in their stage
 // compares, and the texture keys leave them out (IgnoredWordBits, ShaderResources.cpp
 // MakeTextureKey); APS5_NO_TSHARP_MASK=1 compares and keys on them exactly.

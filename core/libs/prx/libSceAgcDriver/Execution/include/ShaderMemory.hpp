@@ -201,6 +201,16 @@ inline std::uint32_t PatchMaskAt(std::span<const WordPatchSlot> slots, std::uint
     return it != slots.end() && it->position == position ? it->mask : 0u;
 }
 
+// What a deep copy of a compiled result copies: the bytes of its bindings and of every vector they
+// and the result hold (a vector<bool> at a bit per element, rounded up to bytes), and one
+// allocation per non-empty vector; the SPIR-V words are shared (SharedSpirv) and count nowhere.
+// For the dispatch cache's validate-path copy counters (Driver::lookupDispatch, APS5_PROFILE_DRAW).
+struct CopyCost {
+    std::uint64_t bytes = 0;
+    std::uint64_t allocations = 0;
+};
+CopyCost ResultCopyCost(const ShaderRecompiler::RecompileResult& result);
+
 }
 
 #endif

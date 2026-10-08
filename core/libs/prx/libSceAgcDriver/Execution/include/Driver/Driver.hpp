@@ -85,6 +85,9 @@ private:
     // A dispatch lookup tries the front variant's relocation before the stored variants
     // (DispatchLookup.cpp); APS5_NO_RELOCATION_FIRST=1 compares the stored variants first.
     static bool relocationFirst();
+    // The validate path's copy counters and sub-step timers (APS5_PROFILE_DRAW, DispatchLookup.cpp);
+    // APS5_NO_VARIANT_COPY_COUNT=1 leaves them out.
+    static bool variantCopyCount();
     static RelocationVerdict learnRelocation(const DispatchVariant& old, DispatchVariant& fresh, std::uint64_t externalDelta = 0);
     static void traceFailedRelocation(std::uint64_t program, const DispatchVariant& candidate);
     static std::shared_ptr<DispatchVariant> relocateVariant(const DispatchVariant& variant, std::uint64_t& counterUnordered);
