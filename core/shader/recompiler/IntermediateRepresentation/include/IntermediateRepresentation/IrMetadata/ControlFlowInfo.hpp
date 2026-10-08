@@ -36,6 +36,9 @@ struct DescriptorSource {
         bool hasMaterial = false;
         bool heapAddress = false;
         std::uint32_t entryLimit = 0;
+        // The key is a loop counter: the loop samples every entry from its start up to its count,
+        // so no entry inside `entryLimit` is one the draw leaves unselected.
+        bool loopKey = false;
 
         bool operator==(const IndirectImage& other) const = default;
     };

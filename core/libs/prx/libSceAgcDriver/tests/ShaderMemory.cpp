@@ -15,6 +15,7 @@
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <iostream>
@@ -499,6 +500,100 @@ void verifyBindlessTable() {
 }
 
 
+// A compute program sampling, in a counted loop (`for (i = 0; i < 3; i++)`), the T# at `i * 32`
+// behind an SRT pointer: a loop-counter table bounded by the loop's exit test, which the translator
+// keeps in the block metadata (APS5_NO_LOOP_EXIT_BOUND=1: the default limit). Every key below the
+// bound is sampled, so an entry the driver cannot decode (an array pitch) fails the capture rather
+// than binding null (ResourceMaterializer::StrictLoopTables; nulled with
+// APS5_NO_STRICT_LOOP_TABLES=1), while an entry past the bound is never read. The loop keys are
+// opt-in (APS5_LOOP_TABLE_KEYS=1, which main sets); skipped without them (the plan rejects the
+// key) or with fewer than 3 bindless slots.
+void verifyLoopCounterTable() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t Format8888UNorm = 56;
+    constexpr std::uint32_t Type2D = 9;
+    const std::uint32_t slots = ResourceMaterializer::BindlessSlots();
+    if (slots < 3u || std::getenv("APS5_LOOP_TABLE_KEYS") == nullptr) return;
+
+    struct alignas(256) Texture { std::array<std::uint8_t, 256> bytes{}; };
+    static Texture textures[3];
+    std::array<std::array<std::uint32_t, 8>, 4> table{};
+    const auto makeTexture = [&](std::uint32_t entry, const Texture& texture) {
+        const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texture.bytes.data()));
+        table[entry] = {static_cast<std::uint32_t>(base >> 8u), static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (Format8888UNorm << 20u) | (3u << 30u), 3u << 14u, 0xfacu | (Type2D << 28u), 0u, 0u, 0u, 0u};
+    };
+    for (std::uint32_t entry = 0; entry < 3u; entry++) makeTexture(entry, textures[entry]);
+    // Past the loop's bound: no T# (words 4-7 a tagged pointer, as Demon's Souls' captures read).
+    table[3] = table[0];
+    table[3][4] = 0x3860d730u;
+    table[3][5] = 0x00500005u;
+    std::array<std::uint32_t, 4> output{};
+    const auto tableAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(table.data()));
+    const auto outputAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
+    std::array<std::uint32_t, 12> srt{static_cast<std::uint32_t>(tableAddress), static_cast<std::uint32_t>(tableAddress >> 32u), 0u, 0u, 0u, 0u, 0u, 0u, static_cast<std::uint32_t>(outputAddress), static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu), 16u, 0xfacu};
+    const auto srtAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(srt.data()));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(srtAddress), static_cast<std::uint32_t>(srtAddress >> 32u)};
+    const std::array<std::uint32_t, 1> capabilities{29u};
+
+    // s_load_dwordx2 s[2:3], s[0:1], 0; s_load_dwordx4 s[8:11], s[0:1], 0x10 (S#);
+    // s_load_dwordx4 s[28:31], s[0:1], 0x20 (output V#); s_mov_b32 s16, 0;
+    // loop: s_lshl_b32 s17, s16, 5; s_load_dwordx8 s[20:27], s[2:3], s17; s_waitcnt lgkmcnt(0);
+    // image_sample_lz v[4:7], v[0:1], s[20:27], s[8:11]; s_waitcnt vmcnt(0);
+    // buffer_store_dword v4, off, s[28:31], 0; s_add_i32 s16, s16, 1; s_cmp_lt_u32 s16, 3;
+    // s_cbranch_scc1 loop; s_endpgm.
+    const std::vector<std::uint32_t> code{0xf4040080u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000020u, 0xbe900380u, 0x8f118510u, 0xf40c0501u, 0x22000000u, 0xbf8cc07fu, 0xf09c0f08u, 0x00450400u, 0xbf8c3f70u, 0xe0700000u, 0x80070400u, 0x81108110u, 0xbf0a8310u, 0xbf85fff4u, 0xbf810000u};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Compute, 0x20000u, code, 0, {}};
+    request.context.waveSize = 64;
+    request.context.userDataBaseRegister = 0;
+    request.context.userData = userData;
+    request.context.compute = ShaderComputeStageInfo{{64u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 32;
+    request.target.supportedCapabilities = capabilities;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+
+    const auto plan = GetResourcePlan(request);
+    std::size_t tables = 0;
+    for (const auto& source : plan->descriptorSources) {
+        if (!source.indirectImage.has_value()) continue;
+        ++tables;
+        const auto& indirect = *source.indirectImage;
+        require(indirect.heapAddress && indirect.loopKey && !indirect.hasMaterial && indirect.entryOffset == 0u, "loop table: the counter table was not planned");
+        require(indirect.entryLimit == (std::getenv("APS5_NO_LOOP_EXIT_BOUND") == nullptr ? 3u : std::min(slots, 32u)), "loop table: the table does not span the loop's bound (the exit test in the block metadata)");
+    }
+    require(tables == 1, "loop table: the table source was not planned");
+    // Spanning the default limit, the capture reads the entry past the loop's bound too.
+    if (std::getenv("APS5_NO_LOOP_EXIT_BOUND") != nullptr) return;
+    const auto mappingOf = [&](const ResourceSnapshot& snapshot) {
+        require(snapshot.flattenedSrt.size() >= 1u + 2u * slots, "loop table: the mapping block is missing from the flattened SRT");
+        return std::vector<std::uint32_t>(snapshot.flattenedSrt.end() - static_cast<std::ptrdiff_t>(1u + 2u * slots), snapshot.flattenedSrt.end());
+    };
+
+    // Every key below the bound is mapped; the entry past it is never read.
+    AgcDriver::ShaderMemory memory({});
+    const auto capture = memory.Capture(request);
+    const auto mapping = mappingOf(capture->snapshot);
+    require(std::vector<std::uint32_t>(mapping.begin(), mapping.begin() + 7) == std::vector<std::uint32_t>{3u, 0u, 0u, 1u, 1u, 2u, 2u}, "loop table: the keys below the loop's bound are not mapped in order");
+    const auto regions = memory.Regions();
+    request.context.memory = regions;
+    require(!Recompile(request, *capture)->spirv.empty(), "loop table: the loop-counter table did not compile");
+    request.context.memory = {};
+
+    // An entry the loop reaches whose words 5-6 the driver cannot decode.
+    table[1][5] = 1u;
+    AgcDriver::ShaderMemory pitchMemory({});
+    if (ResourceMaterializer::NullUndecodable() && ResourceMaterializer::StrictLoopTables()) {
+        expectFailure([&] { static_cast<void>(pitchMemory.Capture(request)); }, "loop-counter table entry", "loop table: an undecodable entry the loop samples was bound");
+    } else if (ResourceMaterializer::NullUndecodable()) {
+        const auto pitchMapping = mappingOf(pitchMemory.Capture(request)->snapshot);
+        require(std::vector<std::uint32_t>(pitchMapping.begin(), pitchMapping.begin() + 5) == std::vector<std::uint32_t>{2u, 0u, 0u, 2u, 2u}, "loop table: APS5_NO_STRICT_LOOP_TABLES did not bind the entry null");
+    }
+    table[1][5] = 0u;
+}
+
 void verifyDescriptorPhis() {
     using namespace ShaderRecompiler;
     constexpr std::uint32_t Format8888UNorm = 56;
@@ -979,6 +1074,13 @@ void verifyTwoLaneUniformValues() {
 }
 
 int main() {
+    // The loop-counter table keys are opt-in in the driver; verifyLoopCounterTable covers them.
+    // Set before the first plan reads it (ResourceTracker caches it).
+#ifdef _WIN32
+    _putenv_s("APS5_LOOP_TABLE_KEYS", "1");
+#else
+    setenv("APS5_LOOP_TABLE_KEYS", "1", 1);
+#endif
     try {
         using namespace ShaderRecompiler;
         verifyRegisterSources();
@@ -986,6 +1088,7 @@ int main() {
         verifyPureFlatSlots();
         verifyLoopCounterRange();
         verifyBindlessTable();
+        verifyLoopCounterTable();
         verifyDescriptorPhis();
         verifyProgramCounterRelativeData();
         verifyMeshConfiguration();

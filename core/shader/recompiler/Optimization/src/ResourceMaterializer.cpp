@@ -253,6 +253,7 @@ bool BindlessTraced() {
 struct BindlessCounters {
     std::atomic<std::uint64_t> tablesMaterial{0};
     std::atomic<std::uint64_t> tablesWhole{0};
+    std::atomic<std::uint64_t> tablesLoop{0};
     std::atomic<std::uint64_t> keys{0};
     std::atomic<std::uint64_t> paddedNull{0};
     std::atomic<std::uint64_t> paddedShape{0};
@@ -293,10 +294,11 @@ void reportBindless() {
     }
     if (material + whole + rejections == 0) return;
     const auto tables = material + whole;
-    std::fprintf(stderr, "[bindless] (10 s): tables bound %llu (mode M %llu, mode T %llu), slots %u, keys avg %.1f, entries unmapped (sample zeros): null/invalid %llu, shape %llu, conversion %llu, out of range %llu; rejected: capacity %llu, material scan %llu, no entry %llu, storage %llu, non-uniform %llu, image slots %llu\n",
-        static_cast<unsigned long long>(tables), static_cast<unsigned long long>(material), static_cast<unsigned long long>(whole), ResourceMaterializer::BindlessSlots(), tables != 0 ? static_cast<double>(keys) / static_cast<double>(tables) : 0.0,
+    std::fprintf(stderr, "[bindless] (10 s): tables bound %llu (mode M %llu, mode T %llu; loop-counter %llu), slots %u, keys avg %.1f, entries unmapped (sample zeros): null/invalid %llu, shape %llu, conversion %llu, out of range %llu; rejected: capacity %llu, material scan %llu, no entry %llu, storage %llu, non-uniform %llu, image slots %llu, loop entry %llu%s\n",
+        static_cast<unsigned long long>(tables), static_cast<unsigned long long>(material), static_cast<unsigned long long>(whole), static_cast<unsigned long long>(counters.tablesLoop.exchange(0, std::memory_order_relaxed)), ResourceMaterializer::BindlessSlots(), tables != 0 ? static_cast<double>(keys) / static_cast<double>(tables) : 0.0,
         static_cast<unsigned long long>(counters.paddedNull.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.paddedShape.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.paddedConversion.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.outOfRange.exchange(0, std::memory_order_relaxed)),
-        static_cast<unsigned long long>(rejected[0]), static_cast<unsigned long long>(rejected[1]), static_cast<unsigned long long>(rejected[2]), static_cast<unsigned long long>(rejected[3]), static_cast<unsigned long long>(rejected[4]), static_cast<unsigned long long>(rejected[5]));
+        static_cast<unsigned long long>(rejected[0]), static_cast<unsigned long long>(rejected[1]), static_cast<unsigned long long>(rejected[2]), static_cast<unsigned long long>(rejected[3]), static_cast<unsigned long long>(rejected[4]), static_cast<unsigned long long>(rejected[5]), static_cast<unsigned long long>(rejected[6]),
+        ResourceMaterializer::StrictLoopTables() ? "" : " (off: APS5_NO_STRICT_LOOP_TABLES)");
 }
 
 // A bindless image table's bound slots and its (key, slot) mapping, keys ascending. Slots the
@@ -438,6 +440,13 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
             continue;
         }
         if (!nullImageDescriptor(candidate) && undecodableImageBits(candidate, image.r128)) {
+            // A loop-counter table's loop samples every entry from its start up to its count, so
+            // such an entry is no key the draw leaves unselected: bound null, the loop sampled zeros
+            // in its place (t378: a white blob and blue splotches). The draw fails as before WP7
+            // (t379); APS5_NO_STRICT_LOOP_TABLES=1 binds it null.
+            if (table.loopKey && ResourceMaterializer::StrictLoopTables()) {
+                rejectTable(BindlessRejection::LoopEntry, "bindless loop-counter table entry uses T# words 5-6 the driver does not decode (its loop samples every entry)");
+            }
             countNullBound(NullBoundImage::TableUndecodable);
             paddedNull++;
             continue;
@@ -484,6 +493,7 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     resolved = resolution.slots[0];
 
     (materialMode ? counters.tablesMaterial : counters.tablesWhole).fetch_add(1, std::memory_order_relaxed);
+    if (table.loopKey) counters.tablesLoop.fetch_add(1, std::memory_order_relaxed);
     counters.keys.fetch_add(resolution.mapping.size(), std::memory_order_relaxed);
     counters.paddedNull.fetch_add(paddedNull, std::memory_order_relaxed);
     counters.paddedShape.fetch_add(paddedShape, std::memory_order_relaxed);
@@ -978,6 +988,11 @@ void ResourceMaterializer::CountBindlessRejection(BindlessRejection reason) {
 
 bool ResourceMaterializer::NullUndecodable() {
     static const bool enabled = std::getenv("APS5_NULL_UNDECODABLE") != nullptr;
+    return enabled;
+}
+
+bool ResourceMaterializer::StrictLoopTables() {
+    static const bool enabled = std::getenv("APS5_NO_STRICT_LOOP_TABLES") == nullptr;
     return enabled;
 }
 

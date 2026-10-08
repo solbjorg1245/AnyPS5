@@ -564,6 +564,8 @@ constexpr std::string_view NeutralSwitches[] = {
     // Only which descriptors a capture binds as null: the specialization (part of the key) follows.
     "APS5_NULL_UNDECODABLE",
     "APS5_NO_RESULT_MEMO",
+    // Only whether a capture fails on a loop-counter table entry or binds it null (as above).
+    "APS5_NO_STRICT_LOOP_TABLES",
     "APS5_SHADER_CACHE_VERSION",
     "APS5_TRACE_BINDLESS",
 };

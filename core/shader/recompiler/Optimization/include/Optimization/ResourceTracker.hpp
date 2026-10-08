@@ -16,7 +16,9 @@ namespace Detail {
 // a phi over immediate starts and small immediate steps of itself (Demon's Souls walks a T# table
 // behind an SRT pointer in a counted loop). Counting up, the bound is the immediate the loop's exit
 // branch compares the counter against, else `limit`; counting down, the largest start plus one.
-std::uint32_t LoopCounterRange(IrValue* key, std::uint32_t limit);
+// The exit branches are BranchConditional instructions and, with `program`, the conditional
+// terminators of its block metadata (where the translator keeps them).
+std::uint32_t LoopCounterRange(IrValue* key, std::uint32_t limit, const IrProgram* program = nullptr);
 
 }
 
