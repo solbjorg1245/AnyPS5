@@ -69,7 +69,9 @@ Registers& registersFor(QueueState& queue, std::uint32_t opcode) {
 void writeRegister(QueueState& queue, std::uint32_t opcode, std::uint32_t offset, std::uint32_t value) {
     if ((opcode == 0x69 || opcode == 0x9f) && (offset == 0x8e || offset == 0x8f || offset == 0x318 || offset == 0x31b || offset == 0x31c || offset == 0x31d || offset == 0x390 || offset == 0x3b0 || offset == 0x3b8))
         APS5_LOG_OUT_DEBUG("CONTEXT WRITE opcode=0x%x offset=0x%x value=0x%x", opcode, offset, value);
-    registersFor(queue, opcode).insert_or_assign(offset, value);
+    // A changed draw state register bumps the queue's state serial (APS5_FAST_STATE's serial skip).
+    const std::uint32_t bank = opcode == 0x69 || opcode == 0x9f ? 0u : opcode == 0x76 || opcode == 0x63 ? 1u : 2u;
+    if (registersFor(queue, opcode).assign(offset, value) && StateKeyRegister(bank, offset)) ++queue.stateSerial;
     if (TraceContextState() && (opcode == 0x69 || opcode == 0x9f) && ((offset >= 0x318 && offset < 0x318 + 8 * 0xf && (offset - 0x318) % 0xf == 0) || offset == 0x8e)) std::fprintf(stderr, "[context]   write %x = %08x (0x%x)\n", offset, value, opcode);
     if ((opcode == 0x64 || opcode == 0x79 || opcode == 0x7a) && offset == 0x243) queue.indexType = value & 3u;
 }
@@ -693,6 +695,7 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
                             queue.savedContext.reset();
                             break;
                     }
+                    ++queue.stateSerial;
                     APS5_LOG_OUT_DEBUG("CONTEXT_STATE done operation=%u targetMaskAfter=0x%x shaderMaskAfter=0x%x", packet[1], queue.context.contains(0x8e) ? queue.context.at(0x8e) : 0u, queue.context.contains(0x8f) ? queue.context.at(0x8f) : 0u);
                     return;
                 default: throw std::runtime_error("custom packet requires driver execution");
