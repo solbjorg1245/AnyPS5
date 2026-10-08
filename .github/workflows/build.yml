@@ -35,7 +35,7 @@ jobs:
       - name: Install lavapipe for the GPU execution tests
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers
       - run: cmake -S . -B build $CONFIGURE
-      - run: cmake --build build
+      - run: cmake --build build -- -k 0
       - run: cmake --build build --target libs
       - run: ctest --test-dir build --output-on-failure --timeout 120 --repeat until-fail:3 -LE gpu
       # Tests that open a Vulkan device (label gpu) run on lavapipe; on the port's branches they
@@ -78,7 +78,7 @@ jobs:
       - shell: cmd
         run: cmake -S . -B build %CONFIGURE%
       - shell: cmd
-        run: cmake --build build
+        run: cmake --build build -- -k 0
       - shell: cmd
         run: cmake --build build --target libs
       - shell: cmd
