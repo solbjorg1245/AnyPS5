@@ -32,7 +32,8 @@ void require(bool condition, const char* reason) {
 // The vblank rate, 0 for the default 59.94 Hz (60000/1001 exactly). APS5_VBLANK_HZ=119.88 pairs with
 // patch_game.py --fps120, which turns the title's 60 FPS mode into 120: the title steps physics once
 // per frame by 1/refresh, so it must flip at the refresh it was patched for. A value within 0.01 of an
-// NTSC rate (29.97, 59.94, 119.88) snaps to its exact n*1000/1001.
+// NTSC rate (29.97, 59.94, 119.88) snaps to its exact n*1000/1001; a whole number is taken as is
+// (below 10 Hz every integer lies within 0.01 of n/1.001).
 double vblankHz() {
     const char* value = std::getenv("APS5_VBLANK_HZ");
     if (value == nullptr) return 0.0;
@@ -43,7 +44,7 @@ double vblankHz() {
         return 0.0;
     }
     const double ntsc = std::round(hz * 1.001);
-    if (std::abs(hz * 1.001 - ntsc) < 0.01) hz = ntsc / 1.001;
+    if (hz != std::round(hz) && std::abs(hz * 1.001 - ntsc) < 0.01) hz = ntsc / 1.001;
     std::fprintf(stderr, "[videoout] vblank at %.4f Hz (APS5_VBLANK_HZ=%s)\n", hz, value);
     return hz;
 }
