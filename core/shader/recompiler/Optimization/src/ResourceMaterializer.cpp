@@ -245,6 +245,17 @@ std::uint32_t MaterialScanLimit() {
     return limit;
 }
 
+// The slots a bindless image table binds: the bindless slots, or for a loop-counter table
+// (APS5_LOOP_TABLE_KEYS=1) no more than its loop's bound, since no key reaches past it. At 48
+// slots a draw sampling two such tables needed 97 image slots of 64 and was dropped before its
+// tables were read (t386: "loop-counter 0" on every [bindless] line, the loop-table draws
+// thrown as "need 97 image slots"). APS5_NO_LOOP_TABLE_SLOTS=1 binds the bindless slots.
+std::uint32_t tableSlotCount(const DescriptorSource::IndirectImage& table) {
+    static const bool bounded = std::getenv("APS5_NO_LOOP_TABLE_SLOTS") == nullptr;
+    const auto slots = ResourceMaterializer::BindlessSlots();
+    return bounded && table.loopKey && table.entryLimit != 0u ? std::min(slots, table.entryLimit) : slots;
+}
+
 bool BindlessTraced() {
     static const bool traced = std::getenv("APS5_TRACE_BINDLESS") != nullptr;
     return traced;
@@ -294,11 +305,11 @@ void reportBindless() {
     }
     if (material + whole + rejections == 0) return;
     const auto tables = material + whole;
-    std::fprintf(stderr, "[bindless] (10 s): tables bound %llu (mode M %llu, mode T %llu; loop-counter %llu), slots %u, keys avg %.1f, entries unmapped (sample zeros): null/invalid %llu, shape %llu, conversion %llu, out of range %llu; rejected: capacity %llu, material scan %llu, no entry %llu, storage %llu, non-uniform %llu, image slots %llu, loop entry %llu%s\n",
+    std::fprintf(stderr, "[bindless] (10 s): tables bound %llu (mode M %llu, mode T %llu; loop-counter %llu), slots %u, keys avg %.1f, entries unmapped (sample zeros): null/invalid %llu, shape %llu, conversion %llu, out of range %llu; rejected: capacity %llu, material scan %llu, no entry %llu, storage %llu, non-uniform %llu, image slots %llu, loop entry %llu, table entry %llu%s%s\n",
         static_cast<unsigned long long>(tables), static_cast<unsigned long long>(material), static_cast<unsigned long long>(whole), static_cast<unsigned long long>(counters.tablesLoop.exchange(0, std::memory_order_relaxed)), ResourceMaterializer::BindlessSlots(), tables != 0 ? static_cast<double>(keys) / static_cast<double>(tables) : 0.0,
         static_cast<unsigned long long>(counters.paddedNull.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.paddedShape.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.paddedConversion.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.outOfRange.exchange(0, std::memory_order_relaxed)),
-        static_cast<unsigned long long>(rejected[0]), static_cast<unsigned long long>(rejected[1]), static_cast<unsigned long long>(rejected[2]), static_cast<unsigned long long>(rejected[3]), static_cast<unsigned long long>(rejected[4]), static_cast<unsigned long long>(rejected[5]), static_cast<unsigned long long>(rejected[6]),
-        ResourceMaterializer::StrictLoopTables() ? "" : " (off: APS5_NO_STRICT_LOOP_TABLES)");
+        static_cast<unsigned long long>(rejected[0]), static_cast<unsigned long long>(rejected[1]), static_cast<unsigned long long>(rejected[2]), static_cast<unsigned long long>(rejected[3]), static_cast<unsigned long long>(rejected[4]), static_cast<unsigned long long>(rejected[5]), static_cast<unsigned long long>(rejected[6]), static_cast<unsigned long long>(rejected[7]),
+        ResourceMaterializer::StrictLoopTables() ? "" : " (off: APS5_NO_STRICT_LOOP_TABLES)", ResourceMaterializer::StrictTableEntries() ? "" : " (off: APS5_NO_STRICT_TABLE_ENTRIES)");
 }
 
 // A bindless image table's bound slots and its (key, slot) mapping, keys ascending. Slots the
@@ -339,7 +350,7 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     if (image.resourceClass != ImageResourceClass::Sampled) {
         rejectTable(BindlessRejection::Storage, "bindless storage image tables are unsupported");
     }
-    const auto slots = ResourceMaterializer::BindlessSlots();
+    const auto slots = tableSlotCount(table);
     DescriptorValue heapValue;
     walker.EvaluateDescriptorSource(plan, table.heapSource, runtime, heapValue);
     // A table behind a raw address has no size: the key's range bounds it, and a null address
@@ -439,7 +450,13 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
             paddedNull++;
             continue;
         }
-        if (!nullImageDescriptor(candidate) && undecodableImageBits(candidate, image.r128)) {
+        // Words 5-6 the driver does not decode. A keyed table's entry goes through the checks
+        // below like any other (StrictTableEntries): most such entries are no T# at all (their
+        // words 0-3 are invalid too) and stay unmapped as they were with APS5_NULL_UNDECODABLE
+        // unset; t386 counted ~3k of them per 10 s as nulled, with the same unmapped totals and
+        // keys as t385. Only one the table would map reaches the driver's decoder (below).
+        const bool undecodable = !nullImageDescriptor(candidate) && undecodableImageBits(candidate, image.r128);
+        if (undecodable && (table.loopKey || !ResourceMaterializer::StrictTableEntries())) {
             // A loop-counter table's loop samples every entry from its start up to its count, so
             // such an entry is no key the draw leaves unselected: bound null, the loop sampled zeros
             // in its place (t378: a white blob and blue splotches). The draw fails as before WP7
@@ -471,6 +488,13 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         if (shape.has_value() && (decoded.numericClass != shape->numericClass || decoded.dimension != shape->dimension || decoded.cube != shape->cube)) {
             paddedShape++;
             continue;
+        }
+        // A texture (words 0-3) the table would map, with words 5-6 the driver rejects: bound
+        // null, the key the material selects sampled zeros where the texture is (a black or
+        // garbage surface). The draw fails as the driver's decode failed it before
+        // (APS5_NULL_UNDECODABLE unset); APS5_NO_STRICT_TABLE_ENTRIES=1 binds it null.
+        if (undecodable) {
+            rejectTable(BindlessRejection::TableEntry, "bindless table entry is a texture whose T# words 5-6 the driver does not decode (bound null, its key would sample zeros)");
         }
         if (!shape.has_value()) shape = decoded;
         valid[i] = 1u;
@@ -537,17 +561,21 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
     snapshot.images.resize(plan.info.images.size());
     tables.assign(plan.info.images.size(), {});
     std::uint32_t activeTables = 0;
+    std::size_t imageSlots = plan.info.images.size();
     for (std::uint32_t i = 0; i < plan.info.images.size(); i++) {
         const auto& image = plan.info.images[i];
         if (image.source >= plan.descriptorSources.size()) {
             throw std::runtime_error("image resource references an unknown descriptor source");
         }
         const bool active = image.source >= activeSources.size() || activeSources[image.source] != 0u;
-        if (plan.descriptorSources[image.source].indirectImage.has_value() && active) activeTables++;
+        const auto& indirect = plan.descriptorSources[image.source].indirectImage;
+        if (indirect.has_value() && active) {
+            activeTables++;
+            imageSlots += tableSlotCount(*indirect) - 1u;
+        }
     }
-    const auto tableSlots = ResourceMaterializer::BindlessSlots();
-    if (activeTables != 0u && plan.info.images.size() + static_cast<std::size_t>(tableSlots - 1u) * activeTables > ShaderInfo::MaxImages) {
-        rejectTable(BindlessRejection::ImageSlots, "bindless image tables need " + std::to_string(plan.info.images.size() + static_cast<std::size_t>(tableSlots - 1u) * activeTables) + " image slots, limit " + std::to_string(ShaderInfo::MaxImages));
+    if (activeTables != 0u && imageSlots > ShaderInfo::MaxImages) {
+        rejectTable(BindlessRejection::ImageSlots, "bindless image tables need " + std::to_string(imageSlots) + " image slots, limit " + std::to_string(ShaderInfo::MaxImages));
     }
     for (std::uint32_t i = 0; i < plan.info.images.size(); i++) {
         const auto& image = plan.info.images[i];
@@ -993,6 +1021,11 @@ bool ResourceMaterializer::NullUndecodable() {
 
 bool ResourceMaterializer::StrictLoopTables() {
     static const bool enabled = std::getenv("APS5_NO_STRICT_LOOP_TABLES") == nullptr;
+    return enabled;
+}
+
+bool ResourceMaterializer::StrictTableEntries() {
+    static const bool enabled = std::getenv("APS5_NO_STRICT_TABLE_ENTRIES") == nullptr;
     return enabled;
 }
 
