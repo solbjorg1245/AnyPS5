@@ -1478,6 +1478,14 @@ struct RevalidateProfile {
     // Elements a depth surface served, proved by DepthSurfaceServes; time of the calls that walked.
     std::atomic<std::uint64_t> depthRecords{0};
     std::atomic<std::uint64_t> fullNanoseconds{0};
+    // One proved fastRevalidate in 64 per thread, timed by phase (setup, sampled textures, storage
+    // images, pending scan, stamp queries, cache touch + record moves) with its element counts.
+    std::atomic<std::uint64_t> phaseSamples{0};
+    std::array<std::atomic<std::uint64_t>, 6> phaseNanoseconds{};
+    std::atomic<std::uint64_t> phaseTextures{0};
+    std::atomic<std::uint64_t> phaseStorage{0};
+    std::atomic<std::uint64_t> phaseKeyed{0};
+    std::atomic<std::uint64_t> phasePending{0};
     std::atomic<std::uint64_t> refreshedOverlaps{0};
     std::atomic<std::uint64_t> proofsVerified{0};
     std::atomic<std::int64_t> lastReport{0};
@@ -1629,6 +1637,11 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto fallbacks = byReason(profile.ownFallbacks, OwnRefreshFallbackNames);
     std::fprintf(stderr, "[rescache] revalidate %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()));
     std::fprintf(stderr, "[rescache] revalidate split: calls that walked or failed %.1f ms (fast proofs the rest); depth-served elements proven %llu\n", profile.fullNanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.depthRecords.load()));
+    if (const auto samples = profile.phaseSamples.load(); samples != 0) {
+        const auto us = [&](std::size_t phase) { return profile.phaseNanoseconds[phase].load() / 1e3 / static_cast<double>(samples); };
+        const auto per = [&](const std::atomic<std::uint64_t>& count) { return static_cast<double>(count.load()) / static_cast<double>(samples); };
+        std::fprintf(stderr, "[rescache] fast proof phases (%llu sampled proofs, us each): setup %.2f, textures %.2f, storage %.2f, pending scan %.2f, stamps %.2f, cache+records %.2f; per proof %.1f textures, %.1f storage images, %.1f keyed, %.1f pending queries\n", static_cast<unsigned long long>(samples), us(0), us(1), us(2), us(3), us(4), us(5), per(profile.phaseTextures), per(profile.phaseStorage), per(profile.phaseKeyed), per(profile.phasePending));
+    }
 }
 
 // APS5_NO_EPOCH_REVALIDATE=1: the per-element registry, cache and stamp checks and the per-region
@@ -1720,6 +1733,14 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     overlapping.clear();
     accepted = false;
     if (!EpochRevalidate()) return fastRevalidateEach();
+    thread_local std::uint32_t phaseTick = 0;
+    const bool timed = BuildProfiled() && (++phaseTick & 63u) == 0;
+    std::array<std::chrono::steady_clock::time_point, 7> marks{};
+    std::uint64_t keyed = 0;
+    const auto mark = [&](std::size_t phase) {
+        if (timed) marks[phase] = std::chrono::steady_clock::now();
+    };
+    mark(0);
     const auto fail = [&reason](FastFail why) {
         reason = why;
         countFastFail(why);
@@ -1754,6 +1775,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         pending.push_back({begin, end, except, identity, false});
         owners.push_back(owner);
     };
+    mark(1);
     for (std::size_t i = 0; i < textures.size(); ++i) {
         auto& surface = validatedTextures[i];
         if (!surface.valid) return fail(FastFail::NoRecord);
@@ -1770,6 +1792,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         surface.collected = GuestMemory::CollectWrites(address, bytes);
         if (surface.collected == 0) return fail(FastFail::Collect);
         const auto* source = surface.source;
+        if (timed && surface.resource.dccAddress != 0) ++keyed;
         if (!keyProofs) {
             // Without proofs the keys are compared with the record's (a cleared view's identity
             // below is the record's too): the scan repeats on every call, as before.
@@ -1812,6 +1835,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             queries.push_back({address, bytes, surface.generation});
         }
     }
+    mark(2);
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
         if (storageTextures[i] != nullptr && (i >= storageKeys.size() || !StorageImageServesKeys(*storageTextures[i], storageKeys[i]))) return fail(FastFail::StorageKeys);
         if (i != 0 && storageTextures[i] == storageTextures[i - 1]) continue;
@@ -1835,6 +1859,8 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         queries.push_back({address, bytes, image->Generation()});
         images.push_back(image);
     }
+    mark(3);
+    const auto pendingQueries = pending.size();
     if (!pending.empty()) {
         if (!StorageTexture::ScanPending(pending)) return fail(FastFail::ClearedView);
         // A foreign image over a view under uncompressed keys is no failure while FindPending
@@ -1869,7 +1895,9 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     } else if (unchanged && BuildProfiled()) {
         Revalidations().serialSkips.fetch_add(1, std::memory_order_relaxed);
     }
+    mark(4);
     if (!GuestMemory::UnchangedSinceAll(queries)) return fail(FastFail::Changed);
+    mark(5);
     if (!StorageImagesCached(context, images)) return fail(FastFail::Evicted);
     for (const auto* image : images) image->NoteProved();
     for (std::size_t i = 0; i < validatedTextures.size(); ++i) {
@@ -1879,6 +1907,17 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         surface.keys = scannedKeys[i];
     }
     depthSerialSeen = depthSerial;
+    if (timed) {
+        mark(6);
+        auto& profile = Revalidations();
+        // Phase 0 (setup) runs from the first mark to the loops; the rest between marks.
+        for (std::size_t phase = 0; phase < 6; ++phase) profile.phaseNanoseconds[phase].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(marks[phase + 1] - marks[phase]).count()), std::memory_order_relaxed);
+        profile.phaseSamples.fetch_add(1, std::memory_order_relaxed);
+        profile.phaseTextures.fetch_add(textures.size(), std::memory_order_relaxed);
+        profile.phaseStorage.fetch_add(storageTextures.size(), std::memory_order_relaxed);
+        profile.phaseKeyed.fetch_add(keyed, std::memory_order_relaxed);
+        profile.phasePending.fetch_add(pendingQueries, std::memory_order_relaxed);
+    }
     return true;
 }
 

@@ -313,7 +313,7 @@ public:
                 }
                 cursor = stop;
             } else {
-                const auto memory = query(cursor);
+                const auto memory = queryRegion(cursor);
                 const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
                 // A placeholder holds no memory, so nothing stores there: unwritten (a later commit over it
                 // is reported through freshRanges, a shared mapping through its unseen views).
@@ -449,6 +449,40 @@ private:
         return memory;
     }
 
+    // Collect's region query, answered from the regions it queried before while the mapping serial
+    // is the one they were queried under (caller holds the mutex; every commit over a placeholder,
+    // reset and shared map bumps the serial under it). Collect reads only the state, the type and
+    // the region's end; what changes them inside the arena goes through those bumps. A protection
+    // change (VirtualProtect, the kernel's mprotect) can split a private region into several, which
+    // a cached answer then spans: the span stays one MEM_WRITE_WATCH allocation in one state, so its
+    // write watch is read in one call instead of one per protection run (a VirtualQuery walk of the
+    // process's VAD tree was ~3% of the queue-0 thread, t339). APS5_NO_REGION_CACHE=1 queries always.
+    MEMORY_BASIC_INFORMATION queryRegion(std::uintptr_t address) {
+        static const bool disabled = std::getenv("APS5_NO_REGION_CACHE") != nullptr;
+        if (disabled) return query(address);
+        const auto serial = mappingSerial.load(std::memory_order_relaxed);
+        if (serial != regionSerial) {
+            regions.clear();
+            regionSerial = serial;
+        }
+        if (const auto next = regions.upper_bound(address); next != regions.begin()) {
+            const auto found = std::prev(next);
+            if (address < found->second.end) {
+                MEMORY_BASIC_INFORMATION memory{};
+                memory.BaseAddress = reinterpret_cast<void*>(found->first);
+                memory.RegionSize = found->second.end - found->first;
+                memory.State = found->second.state;
+                memory.Type = found->second.type;
+                return memory;
+            }
+        }
+        const auto memory = query(address);
+        if (regions.size() >= 16384) regions.clear();
+        const auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
+        regions[base] = CachedRegion{base + memory.RegionSize, memory.State, memory.Type};
+        return memory;
+    }
+
     static void split(std::uintptr_t address, std::size_t bytes) {
         auto memory = query(address);
         memory = query(reinterpret_cast<std::uintptr_t>(memory.AllocationBase));
@@ -513,6 +547,14 @@ private:
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::mutex mutex;
     std::atomic<std::uint64_t> mappingSerial{0};
+    // queryRegion's answers (base -> end, state, type), valid while mappingSerial is regionSerial.
+    struct CachedRegion {
+        std::uintptr_t end;
+        DWORD state;
+        DWORD type;
+    };
+    std::map<std::uintptr_t, CachedRegion> regions;
+    std::uint64_t regionSerial = ~std::uint64_t{0};
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;
     UnmapFunction unmap = nullptr;
