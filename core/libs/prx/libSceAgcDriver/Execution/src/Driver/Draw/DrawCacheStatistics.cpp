@@ -2,6 +2,27 @@
 
 namespace AgcDriver::DriverDetail {
 
+// The never-seen keys' top 10 base keys: keys, of them with a known base, with the last pointer
+// words again (never inserted), the pointer words that changed (DrawPointerRegisters bits:
+// 0x08c 0x08d 0x090 0x091 0x094 0x095 0x00c 0x00d), the program addresses by register.
+void Driver::reportNewDrawKeys() {
+    auto& tally = drawNewKeys;
+    std::string text;
+    char item[192];
+    for (const auto& [base, entry] : tally.Top(10)) {
+        std::snprintf(item, sizeof(item), " [base 0x%016llx: %llu keys, known %llu, same words %llu, changed 0x%02x, programs", static_cast<unsigned long long>(base), static_cast<unsigned long long>(entry->keys), static_cast<unsigned long long>(entry->known), static_cast<unsigned long long>(entry->sameWords), entry->changed);
+        text += item;
+        for (std::size_t i = 0; i < DrawProgramRegisters.size(); ++i) {
+            if (entry->programs[i] == 0) continue;
+            std::snprintf(item, sizeof(item), " 0x%03x=0x%llx", DrawProgramRegisters[i], static_cast<unsigned long long>(entry->programs[i]));
+            text += item;
+        }
+        text += "]";
+    }
+    std::fprintf(stderr, "[draw-cache] never-seen keys by base key (10 s): %llu keys under %zu base keys (%llu beyond the %zu tracked); top 10:%s\n", static_cast<unsigned long long>(tally.keys), tally.bases.size(), static_cast<unsigned long long>(tally.untracked), NewDrawKeyTally::Bound, text.c_str());
+    tally.Reset();
+}
+
 void Driver::reportDrawCache(DrawEntryCounters& counters) {
     const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
     const auto validated = counters.lookups - counters.absent;
@@ -20,6 +41,7 @@ void Driver::reportDrawCache(DrawEntryCounters& counters) {
         std::uint64_t evicted = 0;
         for (const auto value : counters.absentEvicted) evicted += value;
         std::fprintf(stderr, "[draw-cache] absent keys (10 s): %llu evicted before (would have hit with <= %llu entries %llu, <= %llu %llu, <= %llu %llu, <= %llu %llu, <= %llu %llu, more %llu), %llu never seen (new, or evicted beyond the last %zu evictions; %llu with a known base key); %zu evicted keys remembered\n", count(evicted), entries * 2, count(counters.absentEvicted[0]), entries * 4, count(counters.absentEvicted[1]), entries * 8, count(counters.absentEvicted[2]), entries * 16, count(counters.absentEvicted[3]), entries * 32, count(counters.absentEvicted[4]), count(counters.absentEvicted[5]), count(counters.absentNew), drawEvictedKeyBound(), count(counters.absentNewBaseKnown), drawEvictedKeys.size());
+        if (newDrawKeyTop()) reportNewDrawKeys();
     }
     const auto perValidated = [&](double us) { return validated != 0 ? us / static_cast<double>(validated) : 0.0; };
     std::fprintf(stderr, "[draw-cache] validate split (10 s), us per validated lookup: key %.2f, stage compares %.2f (%llu validateVariant calls), patched results %.2f (%llu made, %llu reused), rest %.2f\n", perValidated(counters.keyUs), perValidated(counters.compareUs), count(counters.compareCalls), perValidated(counters.patchUs), count(counters.patchedMade), count(counters.patchedReused), perValidated(counters.validateUs - counters.keyUs - counters.compareUs - counters.patchUs));

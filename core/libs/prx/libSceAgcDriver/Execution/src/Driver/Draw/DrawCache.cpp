@@ -74,13 +74,20 @@ void Driver::noteDrawEvictionLocked(std::uint64_t key) {
 // An absent key that was evicted would have hit with a cache of the entries plus the evictions
 // since (every eviction at capacity is one new entry): bucket it by that size as a multiple of
 // the cache's entries.
-void Driver::noteAbsentDrawKeyLocked(std::uint64_t key, std::uint64_t base) {
+bool Driver::newDrawKeyTop() {
+    static const bool top = std::getenv("APS5_NO_NEW_DRAW_KEY_TOP") == nullptr;
+    return top;
+}
+
+void Driver::noteAbsentDrawKeyLocked(std::uint64_t key, std::uint64_t base, const DrawKey* drawKey) {
     if (drawEvictedKeyBound() == 0) return;
     auto& counters = drawEntryCounters;
     const auto found = drawEvictedKeys.find(key);
     if (found == drawEvictedKeys.end()) {
         ++counters.absentNew;
-        if (base != 0 && drawBaseIndex.contains(base)) ++counters.absentNewBaseKnown;
+        const bool known = base != 0 && drawBaseIndex.contains(base);
+        if (known) ++counters.absentNewBaseKnown;
+        if (drawKey != nullptr && newDrawKeyTop()) drawNewKeys.Note(base, known, drawKey->words, drawKey->present, drawKey->programs);
         return;
     }
     const auto entries = drawCacheEntries();

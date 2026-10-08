@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/NewDrawKeyTally.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
@@ -309,6 +310,34 @@ void testSkippedDispatch() {
     AgcDriverWaitIdle_nid_postfix();
 }
 
+// The never-seen draw key tally: keys per base key, the pointer words that changed between them,
+// a key absent again with the same words, the top order and the reset.
+void testNewDrawKeyTally() {
+    using AgcDriver::DriverDetail::NewDrawKeyTally;
+    NewDrawKeyTally tally;
+    const std::array<std::uint64_t, 5> programs{0x1000, 0, 0, 0, 0x2000};
+    std::array<std::uint32_t, 8> words{0x10, 0x20, 0, 0, 0, 0, 0x30, 0x40};
+    const std::uint32_t present = 0xc3;
+    tally.Note(7, true, words, present, programs);
+    words[0] = 0x110;
+    tally.Note(7, true, words, present, programs);
+    tally.Note(7, false, words, present, programs);
+    words[6] = 0x130;
+    words[2] = 0x99; // not present: ignored
+    tally.Note(7, false, words, present, programs);
+    tally.Note(9, false, words, present, programs);
+    check(tally.keys == 5 && tally.bases.size() == 2 && tally.untracked == 0, "tally counts keys and bases");
+    const auto top = tally.Top(10);
+    check(top.size() == 2 && top[0].first == 7 && top[1].first == 9, "tally top orders by keys");
+    const auto& base = *top[0].second;
+    check(base.keys == 4 && base.known == 2 && base.sameWords == 1, "tally counts known and same-word keys");
+    check(base.changed == 0x41, "tally marks the changed present pointer words");
+    check(base.programs[0] == 0x1000 && base.programs[4] == 0x2000, "tally keeps the program addresses");
+    check(tally.Top(1).size() == 1, "tally top keeps the count asked for");
+    tally.Reset();
+    check(tally.keys == 0 && tally.bases.empty() && tally.Top(10).empty(), "tally reset");
+}
+
 }
 
 int main() {
@@ -323,6 +352,7 @@ int main() {
         testLabelHeldAtSubmission();
         testWideLabelStoredSinceSubmission();
         testSkippedDispatch();
+        testNewDrawKeyTally();
         LibcRunShutdown_nid_postfix();
         std::puts("AGC driver submit tests passed");
         return 0;

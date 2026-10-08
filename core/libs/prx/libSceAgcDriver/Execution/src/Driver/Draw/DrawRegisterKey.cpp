@@ -160,7 +160,8 @@ DrawKey Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& r
             mix(it->second);
         }
     }
-    for (const auto programBase : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
+    for (std::size_t program = 0; program < DrawProgramRegisters.size(); ++program) {
+        const auto programBase = DrawProgramRegisters[program];
         const auto low = queue.shader.find(programBase);
         const auto high = queue.shader.find(programBase + 1);
         if (low == queue.shader.end() || high == queue.shader.end()) {
@@ -168,6 +169,7 @@ DrawKey Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& r
             continue;
         }
         const auto address = (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(high->second & 0xffu) << 40u);
+        result.programs[program] = address;
         auto it = registry.upper_bound(address);
         if (it == registry.begin()) {
             mix(1);

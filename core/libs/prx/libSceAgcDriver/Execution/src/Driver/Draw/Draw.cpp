@@ -111,7 +111,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             decode = entry->decode;
         } else {
             ++drawEntryCounters.absent;
-            noteAbsentDrawKeyLocked(drawKey.key, drawKey.base);
+            noteAbsentDrawKeyLocked(drawKey.key, drawKey.base, &drawKey);
             // A new key under a known base key: its entry, relocated by the pointer pairs' delta
             // (DrawRelocation.cpp), stands in and moves to the new key on a hit or a miss.
             if (drawRelocation()) {
