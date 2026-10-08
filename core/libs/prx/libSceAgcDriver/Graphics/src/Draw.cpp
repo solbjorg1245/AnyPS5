@@ -752,6 +752,17 @@ bool DrawRecipes() {
     return !noDrawRecipe;
 }
 
+bool FastCensus() {
+    static const bool enabled = std::getenv("APS5_FAST_CENSUS") != nullptr && std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return enabled;
+}
+
+DrawCensusNote* ThreadDrawCensusNote() {
+    if (!FastCensus()) return nullptr;
+    static thread_local DrawCensusNote note;
+    return &note;
+}
+
 const char* DrawRecipeMissName(DrawRecipeMiss miss) {
     constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof"};
     return names[static_cast<std::size_t>(miss)];
@@ -2011,6 +2022,17 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         else outcome.recorded = false;
     }
     const bool recorded = outcome.recorded;
+    // APS5_FAST_CENSUS: the fast path's declines this draw shows (draw-fastpath.md F0).
+    if (auto* note = ThreadDrawCensusNote()) {
+        note->seen = true;
+        note->notResident = std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident == nullptr; });
+        note->readsTarget = std::any_of(targets.begin(), targets.end(), [&](const TargetBinding& binding) { return binding.resident != nullptr && resources->ReadsImage(binding.resident.get()); });
+        note->copiedWrites = copiedWrites;
+        note->lease = resources->HoldsLease();
+        note->indirect = args != nullptr;
+        note->path = indirect.path;
+        note->rewritesRecords = args != nullptr && indirect.path == IndirectDrawPath::Gpu && rewritesRecords(*args);
+    }
     // A build this recorded draw can share with later identical ones goes into the cache (a cache
     // hit is reusable by construction, so `recorded` holds for it; one with completion work is
     // never reusable).
@@ -2388,6 +2410,14 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     record.targets = std::move(targets);
     record.pushBytes = &recipe.pushBytes;
     record.pushStages = recipe.pushStages;
+    // APS5_FAST_CENSUS: a recipe hit's targets are resident and its build reusable (no completion
+    // work), so only a target it reads remains to note (draw-fastpath.md F0).
+    if (auto* note = ThreadDrawCensusNote()) {
+        *note = {};
+        note->seen = true;
+        note->readsTarget = std::any_of(record.targets.begin(), record.targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return record.resources->ReadsImage(target.get()); });
+        note->lease = record.resources->HoldsLease();
+    }
     recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs);
     if (profile) {
         result.recordUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - recordStart).count();

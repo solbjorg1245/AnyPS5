@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <cstdlib>
@@ -21,6 +22,7 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
         const std::shared_ptr<VulkanDevice> localDevice = device;
         recordLabelsForPacket(localDevice.get(), submission.queue);
         localDevice->ColorMetadataPass(*pass);
+        NoteFastCensusMetadataPass();
         return DrawVerdict::Drawn;
     }
     static const bool traceIndirectEnabled = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;
