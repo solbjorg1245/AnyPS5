@@ -32,14 +32,16 @@ constexpr auto MismatchCount = static_cast<std::size_t>(WalkMismatch::Count);
 
 // The [fastpath] dispatches line's counters (10 s windows under APS5_PROFILE_DRAW): the phases of
 // taken dispatches in nanoseconds (walk, variant, verify, prepare, lock wait, resolve, record, whole
-// call), the elements they bound in place with an offset adjustment (no verify covers those), the
-// declines by reason and the walk's own by reason, and the verify compare's results.
+// call), the whole calls of declined ones (what they spent before the old path took over), the
+// elements they bound in place with an offset adjustment (no verify covers those), the declines by
+// reason and the walk's own by reason, and the verify compare's results (a binding the old capture
+// left words of to the GPU is the "deferred" mismatch kind).
 struct Counters {
     std::uint64_t dispatches = 0, taken = 0, takenIndirect = 0, leadSkipped = 0, ringFull = 0, adjusted = 0;
-    std::uint64_t walkNs = 0, variantNs = 0, verifyNs = 0, prepareNs = 0, lockNs = 0, resolveNs = 0, recordNs = 0, totalNs = 0;
+    std::uint64_t walkNs = 0, variantNs = 0, verifyNs = 0, prepareNs = 0, lockNs = 0, resolveNs = 0, recordNs = 0, totalNs = 0, declinedNs = 0;
     std::array<std::uint64_t, DeclineCount> declines{};
     std::array<std::uint64_t, WalkDeclineCount> walkDeclines{};
-    std::uint64_t verified = 0, verifyMismatched = 0, feedbackOnly = 0, flatFeedback = 0, deferredSkipped = 0;
+    std::uint64_t verified = 0, verifyMismatched = 0, feedbackOnly = 0, flatFeedback = 0;
     std::array<std::uint64_t, MismatchCount> mismatches{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
@@ -94,7 +96,7 @@ void report(const Counters& total) {
         std::snprintf(item, sizeof(item), "%s%s %llu", kind == 0 ? "" : ", ", WalkMismatchNames[kind], count(total.mismatches[kind]));
         kinds += item;
     }
-    std::fprintf(stderr, "[fastpath] dispatches (10 s): %llu seen, %llu taken (%.1f%%, %llu indirect); us per taken: walk %.2f, variant %.2f, verify %.2f, prepare %.2f, lock wait %.2f, resolve %.2f, record %.2f, total %.2f; lead barriers skipped %llu, ring full %llu, adjusted in place %llu; declines: %s; walk declines: %s; verify: %llu compared, %llu mismatched (%s), T# feedback-only %llu, flat T# copies feedback-only %llu, deferred words skipped %llu\n", count(total.dispatches), count(total.taken), 100.0 * static_cast<double>(total.taken) / static_cast<double>(total.dispatches != 0 ? total.dispatches : 1), count(total.takenIndirect), perTaken(total.walkNs), perTaken(total.variantNs), perTaken(total.verifyNs), perTaken(total.prepareNs), perTaken(total.lockNs), perTaken(total.resolveNs), perTaken(total.recordNs), perTaken(total.totalNs), count(total.leadSkipped), count(total.ringFull), count(total.adjusted), declines.c_str(), walks.c_str(), count(total.verified), count(total.verifyMismatched), kinds.c_str(), count(total.feedbackOnly), count(total.flatFeedback), count(total.deferredSkipped));
+    std::fprintf(stderr, "[fastpath] dispatches (10 s): %llu seen, %llu taken (%.1f%%, %llu indirect); us per taken: walk %.2f, variant %.2f, verify %.2f, prepare %.2f, lock wait %.2f, resolve %.2f, record %.2f, total %.2f; declined dispatches spent %.1f ms before declining; lead barriers skipped %llu, ring full %llu, adjusted in place %llu; declines: %s; walk declines: %s; verify: %llu compared, %llu mismatched (%s), T# feedback-only %llu, flat T# copies feedback-only %llu\n", count(total.dispatches), count(total.taken), 100.0 * static_cast<double>(total.taken) / static_cast<double>(total.dispatches != 0 ? total.dispatches : 1), count(total.takenIndirect), perTaken(total.walkNs), perTaken(total.variantNs), perTaken(total.verifyNs), perTaken(total.prepareNs), perTaken(total.lockNs), perTaken(total.resolveNs), perTaken(total.recordNs), perTaken(total.totalNs), static_cast<double>(total.declinedNs) / 1e6, count(total.leadSkipped), count(total.ringFull), count(total.adjusted), declines.c_str(), walks.c_str(), count(total.verified), count(total.verifyMismatched), kinds.c_str(), count(total.feedbackOnly), count(total.flatFeedback));
 }
 
 }
@@ -167,19 +169,26 @@ bool Driver::fastDispatch(const Submission& submission, const ShaderSnapshot& sn
         }
         // APS5_FAST_DISPATCH_VERIFY: the old path's capture of the same request (dry: nothing is
         // recorded) and its result, compared binding word by binding word; any difference declines.
+        // The old result is a fresh capture (no cache hit, no stage compare), so the flat T# copy
+        // excuse fires only when a T#'s feedback bits changed in memory between the walk and the
+        // capture: "flat T# copies feedback-only" then comes with "T# feedback-only" bindings.
         lap = std::chrono::steady_clock::now();
         if (!declined && fastDispatchVerify()) {
-            ++local.verified;
             ShaderMemory shaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
             const auto capture = shaderMemory.Capture(request, handle.get());
             auto captured = request;
             const auto regions = shaderMemory.Regions();
             captured.context.memory = regions;
             const auto old = ShaderRecompiler::Recompile(captured, *capture);
+            // Counted once the old result exists: a capture or recompile that throws is an
+            // exception decline, not a comparison.
+            ++local.verified;
             WalkDifference first;
-            // A word the old capture left to the GPU is a mismatch here: the walk bound a word whose
-            // producer the reader did not see.
-            const auto kinds = CompareWalkedResults(*old, scratch.walked, first, local.feedbackOnly, local.flatFeedback, local.deferredSkipped, true);
+            // A binding the old capture left words of to the GPU is a mismatch here (kind
+            // "deferred"): the walk bound words whose producer the reader did not see. Nothing is
+            // skipped in this mode, so the skip count stays local.
+            std::uint64_t deferredSkipped = 0;
+            const auto kinds = CompareWalkedResults(*old, scratch.walked, first, local.feedbackOnly, local.flatFeedback, deferredSkipped, true);
             if (kinds != 0) {
                 ++local.verifyMismatched;
                 for (std::size_t kind = 0; kind < MismatchCount; ++kind) {
@@ -231,6 +240,7 @@ bool Driver::fastDispatch(const Submission& submission, const ShaderSnapshot& sn
         local.adjusted = timing.adjusted;
     } else {
         local.walkNs = local.variantNs = local.verifyNs = local.prepareNs = local.lockNs = 0;
+        local.declinedNs = nanosecondsSince(started);
         if (declined) ++local.declines[static_cast<std::size_t>(*declined)];
         if (walkDecline != WalkDecline::Count) ++local.walkDeclines[static_cast<std::size_t>(walkDecline)];
     }
@@ -253,13 +263,13 @@ bool Driver::fastDispatch(const Submission& submission, const ShaderSnapshot& sn
     total.resolveNs += local.resolveNs;
     total.recordNs += local.recordNs;
     total.totalNs += local.totalNs;
+    total.declinedNs += local.declinedNs;
     for (std::size_t reason = 0; reason < DeclineCount; ++reason) total.declines[reason] += local.declines[reason];
     for (std::size_t reason = 0; reason < WalkDeclineCount; ++reason) total.walkDeclines[reason] += local.walkDeclines[reason];
     total.verified += local.verified;
     total.verifyMismatched += local.verifyMismatched;
     total.feedbackOnly += local.feedbackOnly;
     total.flatFeedback += local.flatFeedback;
-    total.deferredSkipped += local.deferredSkipped;
     for (std::size_t kind = 0; kind < MismatchCount; ++kind) total.mismatches[kind] += local.mismatches[kind];
     if (std::chrono::steady_clock::now() - total.lastReport >= std::chrono::seconds(10)) {
         report(total);

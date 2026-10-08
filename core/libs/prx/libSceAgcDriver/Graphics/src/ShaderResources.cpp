@@ -949,7 +949,11 @@ bool SameAsPreviousStorageElement(const ShaderRecompiler::DescriptorBinding& bin
 
 }
 
-std::shared_ptr<Texture> ResolveSampledImage(const Context& context, const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t element, bool& firstLayer) {
+void NoteSampledNullBound(std::uint64_t count) {
+    sampledNullBound.fetch_add(count, std::memory_order_relaxed);
+}
+
+std::shared_ptr<Texture> ResolveSampledImage(const Context& context, const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t element, bool& firstLayer, std::uint32_t* nullBound) {
     Require(element < binding.count && binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 8u, "guest texture descriptor must contain 8 dwords");
     Require(binding.imageShape.has_value(), "guest image binding is missing an image shape");
     Require(context.textureCache != nullptr, "device texture cache is unavailable");
@@ -966,7 +970,8 @@ std::shared_ptr<Texture> ResolveSampledImage(const Context& context, const Shade
         } catch (const std::exception& error) {
             ReportUndecodedTexture(words, error.what());
             if (!ShaderRecompiler::ResourceMaterializer::NullUndecodable()) throw;
-            sampledNullBound.fetch_add(1, std::memory_order_relaxed);
+            if (nullBound != nullptr) ++*nullBound;
+            else sampledNullBound.fetch_add(1, std::memory_order_relaxed);
             nullWords = NullTextureDescriptor(binding.imageShape, false);
             words = nullWords;
             return DecodeTextureResource(words);

@@ -18,6 +18,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastLayouts.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -3434,10 +3435,14 @@ std::optional<Graphics::FastDispatchDecline> VulkanDevice::FastDispatch(const Gr
     const auto arguments = call.arguments;
     if (arguments != 0) {
         // decideIndirect's CPU reasons, tested without its flush (the old path then takes the
-        // dispatch and flushes): storage results pending over the argument dwords, a label pending
-        // on them, a copied writer (its CPU write-back) over them.
+        // dispatch and flushes): storage results pending over the argument dwords (pending or
+        // being flushed by another thread), a label pending on them, a copied writer (its CPU
+        // write-back) over them. Also unit shadows over them: the old path's FlushPending
+        // (PublishScope::Whole) publishes those into the import before the GPU reads the
+        // arguments from it, and the fast dispatch publishes nothing.
         auto& recorder = *state->recorder;
-        if (Graphics::PendingStorageOverlaps(arguments, 12, nullptr)) return Decline::IndirectCpu;
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> argumentRange{{{arguments, arguments + 12}}};
+        if (Graphics::StorageTexture::AnyPendingOverlaps(argumentRange) || Graphics::AnyShadowedOverlaps(arguments, 12)) return Decline::IndirectCpu;
         for (std::uint64_t dword = arguments; dword < arguments + 12; dword += 4) {
             if (recorder.PendingLabel(dword, 4, 0).has_value()) return Decline::IndirectCpu;
         }

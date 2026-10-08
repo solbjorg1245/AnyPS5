@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastRing.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -2769,6 +2770,37 @@ void pageGuardTests() {
 #endif
 }
 
+// The fast ring's reclaim without a GPU wait (ReclaimFastRing; the fast draw and the fast dispatch
+// share one ring): under the GPU mutex a reaped batch's kept retirement is released only at this
+// thread's unlock, so a reap alone leaves the ring full; the reclaim completes the serials of the
+// batches no longer in flight and the ring serves again. A batch still in flight keeps its region.
+void fastRingReclaimTests(const Device& device, Recorder& recorder) {
+    using AgcDriver::Graphics::FastRing;
+    recorder.Sync();
+    FastRing ring(device.GetContext(), 1u << 16u);
+    const auto capacity = ring.Capacity();
+    const auto serial = recorder.Submissions() + 1;
+    Require(ring.Allocate(capacity, serial).has_value(), "the fast ring refused its whole capacity");
+    recorder.Keep(ring.Retirement(serial));
+    recorder.Submit();
+    Require(recorder.Submissions() == serial, "the batch holding the ring region was not submitted");
+    device.WaitQueue();
+    Require(!ring.Allocate(capacity, serial + 1), "the fast ring served a region of a batch nobody reaped");
+    recorder.Reap();
+    Require(recorder.InFlightBatches() == 0, "the finished batch was not reaped");
+    // APS5_RELEASE_UNDER_LOCK releases kept objects at the reap: the reap alone would do then.
+    if (std::getenv("APS5_RELEASE_UNDER_LOCK") == nullptr) Require(!ring.Allocate(capacity, serial + 1), "the reap released the kept retirement under the mutex");
+    AgcDriver::Graphics::ReclaimFastRing(ring, recorder);
+    Require(ring.Allocate(capacity, serial + 1).has_value(), "the fast ring did not serve again after the reclaim of a finished batch");
+    // The region of the open batch (serial + 1) stays held: a reclaim with that batch in flight
+    // frees nothing.
+    recorder.Keep(ring.Retirement(serial + 1));
+    recorder.Submit();
+    AgcDriver::Graphics::ReclaimFastRing(ring, recorder);
+    if (recorder.InFlightBatches() != 0) Require(!ring.Allocate(capacity, serial + 2), "the fast ring served a region of a batch still in flight");
+    recorder.Sync();
+}
+
 // Resident buffers (APS5_RESIDENT_BUFFERS=1): the whole pages of a copy-back stay resident past
 // Submit (the partial ones land with it), a CPU read of one lands its bytes, a write after that
 // survives, a command records a resident copy, and a label store over one records it first.
@@ -2915,6 +2947,7 @@ int main() {
         coalesceCopyBackTests(device, recorder);
         pageGuardTests();
         residentBufferTests(device, recorder);
+        fastRingReclaimTests(device, recorder);
         std::cout << "Recorder read tracking and label tests passed\n";
         return 0;
     } catch (const std::exception& error) {

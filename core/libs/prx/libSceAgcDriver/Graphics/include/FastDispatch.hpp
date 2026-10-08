@@ -21,7 +21,8 @@ class Recorder;
 // device's (a BDA or other unbound role, a layout over maxPushDescriptors, a V# a build would
 // reject, a written element a build would stage, a sparse range, a range outside one host import, a
 // misaligned element without an adjustment slot, an image lookup that threw, deferred words, the
-// data ring full or missing, indirect arguments the old path reads on the CPU, workgroup limits).
+// data ring full or missing, indirect arguments the old path reads on the CPU or first flushes
+// storage results or publishes unit shadows into, workgroup limits).
 enum class FastDispatchDecline : std::uint8_t { Debug, NoDevice, Untracked, Walk, VariantMiss, Verify, Exception, NoPush, Bda, Role, PushLimit, Invalid, Staged, Sparse, NoImport, Misaligned, Image, Deferred, Ring, IndirectCpu, Limits, Count };
 inline constexpr std::array<const char*, static_cast<std::size_t>(FastDispatchDecline::Count)> FastDispatchDeclineNames{"debug mode", "no device", "untracked blocks", "walk", "variant miss", "verify mismatch", "exception", "no push descriptors", "BDA", "role", "push limit", "invalid", "staged", "sparse", "no import", "misaligned", "image", "deferred words", "ring", "indirect on the CPU", "limits"};
 
@@ -77,10 +78,10 @@ std::optional<FastDispatchDecline> FastDispatchPrecheck(const Context& context, 
 // command), the dispatch, the trailing barrier, and the marks MarkGpuWrites makes (pending reads
 // of every in-place range, pending writes, MarkWritten stamps and so PendingBlocks of the written
 // ones, dirty storage images); the batch keeps the pipeline, the images and the ring region.
-// Nothing needs completion work: what a build would copy or stage declines. A full ring reaps the
-// batches that finished and asks once more, then declines (no GPU wait under the mutex). The
-// images and samplers resolved are released on every return. Returns the decline with nothing
-// recorded, else nothing.
+// Nothing needs completion work: what a build would copy or stage declines. A full ring reclaims
+// the regions of the batches that finished (ReclaimFastRing) and asks once more, then declines (no
+// GPU wait under the mutex). The images and samplers resolved are released on every return.
+// Returns the decline with nothing recorded, else nothing.
 std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Recorder& recorder, const FastDispatchCall& call, FastDispatchTiming& timing);
 
 }

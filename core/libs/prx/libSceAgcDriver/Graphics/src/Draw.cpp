@@ -2493,7 +2493,10 @@ FastDrawOutcome DrawFast(const Context& context, const State& state, const Pm4::
     bool continued = recorder->ContinuesRenderPass(passKey);
     auto commands = continued ? recorder->CommandsInRenderPass() : recorder->Commands();
     // The data words go into the ring for the open batch (the batch is open now, so its serial is
-    // Submissions() + 1); a full ring waits for the batches holding it and is asked once more.
+    // Submissions() + 1). A full ring reclaims the regions of the batches that already finished
+    // and is asked once more, then declines: no GPU wait under the mutex every queue takes (the
+    // fast dispatch shares the ring and does the same). APS5_FAST_RING_SYNC=1 drains the GPU
+    // instead (FastRing::DrainWhenFull).
     auto& ring = *context.fastRing;
     const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 1);
     const auto dataBytes = bindings->DataBytes(alignment);
@@ -2503,16 +2506,26 @@ FastDrawOutcome DrawFast(const Context& context, const State& state, const Pm4::
         if (!region) {
             // A request larger than the ring (counted oversize) is not helped by a wait.
             if (dataBytes > ring.Capacity()) return decline(FastDecline::RingFull);
-            recorder->Sync();
-            ring.Complete(recorder->Submissions());
-            continued = false;
-            commands = recorder->Commands();
+            if (FastRing::DrainWhenFull()) {
+                recorder->Sync();
+                ring.Complete(recorder->Submissions());
+                continued = false;
+                commands = recorder->Commands();
+            } else {
+                ReclaimFastRing(ring, *recorder);
+                // The reaped batches' completions ran on this open batch: a store they queued over
+                // the reads lands first, and a pass something ended meanwhile is not continued.
+                if (recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) recorder->FlushKeyStores();
+                if (recorder->HasQueuedStores() && recorder->AnyQueuedStore(touches)) recorder->FlushStores();
+                continued = continued && recorder->ContinuesRenderPass(passKey);
+                commands = continued ? recorder->CommandsInRenderPass() : recorder->Commands();
+            }
             region = ring.Allocate(dataBytes, recorder->Submissions() + 1);
             if (!region) return decline(FastDecline::RingFull);
         }
     }
     auto& hold = FastBatchHold(context, *recorder);
-    // The sync above runs completions, which may refute the records' zero constant
+    // The sync or reclaim above runs completions, which may refute the records' zero constant
     // (APS5_CHECK_INDIRECT_ARGS): a rewrite now needed is left to Draw, as nothing is recorded yet.
     if (args != nullptr && rewritesRecords(*args)) return decline(FastDecline::Rewrites);
     if (HostImportsEpoch() != importsEpoch) return decline(FastDecline::ImportsRetired);

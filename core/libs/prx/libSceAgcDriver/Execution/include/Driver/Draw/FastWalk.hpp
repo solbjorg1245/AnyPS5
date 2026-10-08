@@ -20,8 +20,9 @@ namespace AgcDriver::DriverDetail {
 // F2 of the draw fast path (docs/design/draw-fastpath.md section 2.3), shadow mode:
 // APS5_FAST_WALK=N walks the stages of every Nth draw again with the direct reader (live guest
 // words: no page copies, no snapshot; a read in a pending 64 KiB block (Recorder::BlockPending),
-// over a queued or deferred label of the thread, in a page with storage-image results or a unit
-// shadow pending or in an unmapped page declines), fetches the vertex V#s the
+// over a queued or deferred label of the thread, in a page with storage-image results pending or
+// being flushed or a unit shadow pending (counted as "pending storage", not "pending block") or
+// in an unmapped page declines), fetches the vertex V#s the
 // same way, populates the variant the walk's specialization selects and compares it with the
 // result the old path bound (its lookup or capture): bindings word by word, push constants,
 // variant identity, vertex V#s. Counted on the [fastpath] walk line every 10 s under

@@ -193,6 +193,9 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
     const std::array<CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
     auto pushBytes = AssemblePushConstants(shaders);
     const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 1);
+    // Undecodable sampled elements bound as null: counted ([draws] "driver decode") only once the
+    // dispatch is recorded, since a declined one is resolved and counted again by the old path.
+    std::uint32_t nullBound = 0;
     // 1. What needs no import: V# decode and checks, the storage results over in-place ranges
     // flushed (UploadFinish's rule), the image and sampler lookups (they may record uploads and wait
     // for recorded work, so they come before the ring region and the imports).
@@ -233,7 +236,7 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
                 write.pImageInfo = scratch.images.data() + scratch.images.size();
                 for (std::uint32_t element = 0; element < binding.count; ++element) {
                     bool firstLayer = false;
-                    auto texture = ResolveSampledImage(context, binding, element, firstLayer);
+                    auto texture = ResolveSampledImage(context, binding, element, firstLayer, &nullBound);
                     scratch.images.push_back({VK_NULL_HANDLE, firstLayer ? texture->FirstLayerView() : texture->View(), texture->Layout()});
                     scratch.keep.push_back(std::move(texture));
                 }
@@ -278,8 +281,9 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
         return Decline::Image;
     }
     // 2. The ring regions of the data words, tagged with the open batch's serial: a full ring
-    // reaps the batches that already finished (their releases free their regions) and asks once
-    // more, then declines (counted): no GPU wait under the mutex every queue takes.
+    // reclaims the regions of the batches that already finished (ReclaimFastRing: the reap alone
+    // frees nothing, their releases wait for this thread's unlock) and asks once more, then
+    // declines (counted): no GPU wait under the mutex every queue takes.
     std::uint64_t serial = recorder.Submissions() + 1;
     if (!scratch.data.empty()) {
         if (context.fastRing == nullptr) return Decline::Ring;
@@ -297,7 +301,7 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
             if (!full) break;
             if (attempt != 0) return Decline::Ring;
             timing.ringFull = true;
-            recorder.Reap();
+            ReclaimFastRing(ring, recorder);
         }
         for (std::size_t i = 0; i < scratch.data.size(); ++i) {
             const auto& words = shader.bindings[scratch.data[i].binding].guestDescriptor;
@@ -410,6 +414,7 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
     for (auto* image : scratch.dirty) image->MarkDirty();
     recorder.NotePendingWrites(scratch.written, Recorder::WriteKind::ShaderWrite);
     for (const auto& [begin, end] : scratch.written) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+    if (nullBound != 0) NoteSampledNullBound(nullBound);
     timing.recordNs = nanosecondsSince(recordStart);
     return std::nullopt;
 }

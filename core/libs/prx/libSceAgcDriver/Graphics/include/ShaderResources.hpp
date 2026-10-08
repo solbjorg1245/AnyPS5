@@ -47,8 +47,12 @@ std::shared_ptr<Texture> FastSampledTexture(const Context& context, std::span<co
 // texture, undecodable words throw (bind the null texture under APS5_NULL_UNDECODABLE=1), a
 // dimension the image shape rejects throws, and the texture is the texture cache's; `firstLayer`
 // says the descriptor binds FirstLayerView() (a 2D shape over an array) instead of View(). Under
-// GuestMemory::GpuMutex (the lookups may record uploads and wait for recorded work).
-std::shared_ptr<Texture> ResolveSampledImage(const Context& context, const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t element, bool& firstLayer);
+// GuestMemory::GpuMutex (the lookups may record uploads and wait for recorded work). `nullBound`:
+// an undecodable element bound as null is counted there instead of in the [draws] "driver decode"
+// count (the caller adds it with NoteSampledNullBound once its work is recorded).
+std::shared_ptr<Texture> ResolveSampledImage(const Context& context, const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t element, bool& firstLayer, std::uint32_t* nullBound = nullptr);
+// Adds undecodable sampled elements bound as null to the [draws] "driver decode" count.
+void NoteSampledNullBound(std::uint64_t count);
 // A storage element: the storage cache's image of the surface (brought up to date) at the mip the
 // element addresses; consecutive identical elements address successive mips of one image, so
 // `previous` is the same binding's previous element (null for element 0). A written element notes

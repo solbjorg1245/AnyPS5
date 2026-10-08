@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/FastRing.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <utility>
 
 namespace AgcDriver::Graphics {
@@ -32,6 +34,21 @@ VkDeviceSize FastRing::ConfiguredBytes() {
         return std::min<VkDeviceSize>(value != nullptr ? std::strtoull(value, nullptr, 10) : 64, 4096) << 20u;
     }();
     return bytes;
+}
+
+bool FastRing::DrainWhenFull() {
+    static const bool drain = [] {
+        const char* value = std::getenv("APS5_FAST_RING_SYNC");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    return drain;
+}
+
+void ReclaimFastRing(FastRing& ring, Recorder& recorder) {
+    recorder.Reap();
+    const auto inFlight = static_cast<std::uint64_t>(recorder.InFlightBatches());
+    const auto submitted = recorder.Submissions();
+    if (submitted > inFlight) ring.Complete(submitted - inFlight);
 }
 
 FastRing::FastRing(const Context& context, VkDeviceSize bytes) : context(context), alignment(std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 1)), completed(std::make_shared<std::atomic<std::uint64_t>>(0)) {

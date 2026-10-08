@@ -488,9 +488,19 @@ void testFastDispatchVerify() {
     walked.bindings[2].guestDescriptor[1] = 5;
     check(CompareWalkedResults(deferring, walked, first, feedback, flat, deferred) == 0 && deferred == 1, "fast dispatch verify: a deferred flat word differs");
     check(CompareWalkedResults(old, walked, first, feedback, flat, deferred) == mismatch(WalkMismatch::Flat), "fast dispatch verify: a flat word is no flat mismatch");
-    // The fast dispatch binds the walked word: a deferred word differs even where the walk read the placeholder.
+    // The fast dispatch binds the walked word: a deferred word differs even where the walk read the
+    // placeholder, as its own kind (not a wrong flat word), and nothing is skipped.
     deferred = 0;
-    check(CompareWalkedResults(deferring, deferring, first, feedback, flat, deferred, true) == mismatch(WalkMismatch::Flat) && first.binding == 2 && first.word == 1 && deferred == 0, "fast dispatch verify: a deferred word is no mismatch for the fast dispatch");
+    check(CompareWalkedResults(deferring, deferring, first, feedback, flat, deferred, true) == mismatch(WalkMismatch::Deferred) && first.kind == WalkMismatch::Deferred && first.binding == 2 && first.word == 1 && deferred == 0, "fast dispatch verify: a deferred word is no mismatch for the fast dispatch");
+    // The fast draw's verify (F3b, strictDeferred): walked results carry no deferred words of
+    // their own (WalkResources claims no pure leaf), and the binding the old capture deferred
+    // differs whatever the walk read; without the strict mode the deferred word is skipped.
+    check(CompareWalkedResult(deferring, old, true) == mismatch(WalkMismatch::Deferred), "fast draw verify: a binding the old capture deferred is no mismatch");
+    check(CompareWalkedResult(deferring, walked, true) == mismatch(WalkMismatch::Deferred), "fast draw verify: a deferred binding the walk read differently is no mismatch");
+    check(CompareWalkedResult(deferring, walked, false) == 0, "fast walk compare: a deferred flat word differs without the strict mode");
+    check(CompareWalkedResult(old, deferring, true) == 0, "fast draw verify: deferred words on the walked side alone differ");
+    check(std::string(FastWalkMismatchNames()[static_cast<std::size_t>(WalkMismatch::Deferred)]) == "deferred", "fast walk: the deferred mismatch kind is not named");
+    for (const auto* name : WalkMismatchNames) check(name != nullptr && *name != '\0', "fast walk: a mismatch kind without a name");
     walked = old;
     walked.bindings[0].guestDescriptor[0] = 0x100;
     check(CompareWalkedResults(old, walked, first, feedback, flat, deferred) == mismatch(WalkMismatch::Buffer) && first.kind == WalkMismatch::Buffer && first.binding == 0 && first.word == 0 && first.old == 1 && first.walked == 0x100, "fast dispatch verify: a moved V# is no buffer mismatch");
@@ -558,6 +568,70 @@ void testFastDispatchVerify() {
     check(FastDispatchPrecheck(context, checked) == FastDispatchDecline::Invalid, "fast dispatch precheck: flat words over the range limit");
 }
 
+// The fast paths' direct reader (FastSrtRead, shared by the F2 shadow walk, the fast draw and the
+// fast dispatch): a draw program's registered region is served first, then the reader's own
+// regions (a dispatch's code and header); a word a region holds only partly, or a misaligned one,
+// declines Boundary; the null page reads zero; a deferred label of this thread over the word
+// declines QueuedLabel; anything else is a plain load of a readable page.
+void testFastReader() {
+    using namespace AgcDriver::DriverDetail;
+    const std::array<std::uint32_t, 4> programWords{0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+    const std::array<std::uint32_t, 4> regionWords{0xaaaaaaaau, 0xbbbbbbbbu, 0xccccccccu, 0xddddddddu};
+    // Guest addresses the regions serve: never dereferenced.
+    constexpr std::uint64_t base = 0x7f0000000000ull;
+    std::vector<DrawProgram> programs(1);
+    programs[0].memory[0] = {base, std::as_bytes(std::span(programWords))};
+    const std::array<ShaderRecompiler::MemoryRegion, 1> regions{{{base + 8, std::as_bytes(std::span(regionWords))}}};
+    const std::vector<DeferredLabel> noLabels;
+    const auto read = [&](FastReader& reader, std::uint64_t address, std::uint32_t& value) {
+        reader.labels = &noLabels;
+        value = 0xdeadbeefu;
+        return FastSrtRead(&reader, address, &value);
+    };
+    std::uint32_t value = 0;
+    {
+        FastReader reader{programs, regions};
+        check(read(reader, base + 4, value) && value == 0x22222222u && !reader.declined, "fast reader: a program word is not served from its region");
+        check(read(reader, base + 8, value) && value == 0x33333333u, "fast reader: the reader's own region won over a program's");
+        check(read(reader, base + 20, value) && value == 0xddddddddu && !reader.declined, "fast reader: a word only the reader's region holds is not served");
+        check(read(reader, 0x100, value) && value == 0, "fast reader: the null page does not read zero");
+        check(reader.reads == 4, "fast reader: reads are not counted");
+        check(!read(reader, base + 2, value) && reader.declined == WalkDecline::Boundary, "fast reader: a misaligned word did not decline");
+    }
+    {
+        // A region of six bytes holds the word at +4 only partly: Boundary, also when another
+        // region would hold it.
+        const std::array<ShaderRecompiler::MemoryRegion, 1> wide{{{base, std::as_bytes(std::span(regionWords))}}};
+        FastReader reader{programs, wide};
+        programs[0].memory[0].bytes = programs[0].memory[0].bytes.first(6);
+        check(!read(reader, base + 4, value) && reader.declined == WalkDecline::Boundary, "fast reader: a word a program region holds partly did not decline");
+        programs[0].memory[0].bytes = std::as_bytes(std::span(programWords));
+        const std::array<ShaderRecompiler::MemoryRegion, 1> partial{{{base + 0x100, std::as_bytes(std::span(regionWords)).first(6)}}};
+        FastReader own{{}, partial};
+        check(!read(own, base + 0x104, value) && own.declined == WalkDecline::Boundary, "fast reader: a word the reader's region holds partly did not decline");
+    }
+    {
+        // A label an earlier packet of this thread deferred (written only when its packet records
+        // its labels): the old path captures again, the reader declines.
+        const std::vector<DeferredLabel> labels{{base + 0x100002, 4, {}}};
+        FastReader reader{{}, {}};
+        value = 0;
+        reader.labels = &labels;
+        check(!FastSrtRead(&reader, base + 0x100000, &value) && reader.declined == WalkDecline::QueuedLabel, "fast reader: a word under a deferred label did not decline");
+        FastReader unlabeled{programs, {}};
+        unlabeled.labels = nullptr;
+        check(FastSrtRead(&unlabeled, base, &value) && value == 0x11111111u, "fast reader: a reader without a label list did not read");
+    }
+    {
+        // A readable host page: a plain load of the live word, the page then known readable.
+        const std::vector<std::uint32_t> host{0x01020304u, 0x05060708u};
+        const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(host.data()));
+        FastReader reader{{}, {}};
+        check(read(reader, address, value) && value == 0x01020304u && !reader.declined, "fast reader: a readable host word was not loaded");
+        check(reader.page == (address & ~std::uint64_t{0xfff}), "fast reader: the readable page is not remembered");
+    }
+}
+
 }
 
 int main() {
@@ -576,6 +650,7 @@ int main() {
         testNewDrawKeyTally();
         testFastCensus();
         testFastDispatchVerify();
+        testFastReader();
         LibcRunShutdown_nid_postfix();
         std::puts("AGC driver submit tests passed");
         return 0;

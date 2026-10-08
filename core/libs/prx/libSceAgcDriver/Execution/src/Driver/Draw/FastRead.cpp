@@ -147,10 +147,13 @@ std::uint32_t CompareWalkedResults(const ShaderRecompiler::RecompileResult& old,
             note(WalkMismatch::Layout, index, 0, 0, 0);
             continue;
         }
+        // Walked results have no deferredWords (WalkResources clears deferPureLeaf), so only the
+        // old side's are looked at (a `right.deferredWords.empty()` term would always hold;
+        // tests/Submit.cpp pins both sides).
         if (deferredMismatch && !left.deferredWords.empty()) {
             const std::size_t word = left.deferredWords.front().first;
             const bool inside = word < left.guestDescriptor.size();
-            note(mismatchOf(left.role), index, word, inside ? left.guestDescriptor[word] : 0, inside ? right.guestDescriptor[word] : 0);
+            note(WalkMismatch::Deferred, index, word, inside ? left.guestDescriptor[word] : 0, inside ? right.guestDescriptor[word] : 0);
             continue;
         }
         const bool image = left.role == ShaderRecompiler::DescriptorRole::GuestImages && left.guestDescriptor.size() % 8 == 0;

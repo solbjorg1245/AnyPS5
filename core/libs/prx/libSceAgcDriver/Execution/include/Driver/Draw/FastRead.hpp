@@ -27,9 +27,11 @@ namespace AgcDriver::DriverDetail {
 enum class WalkDecline : std::uint8_t { NoSource, IncompletePlan, NoProgram, Bindless, UnsupportedRoot, OpFailed, Pending, Unmapped, QueuedLabel, PendingStorage, Boundary, Failed, Count };
 inline constexpr std::array<const char*, static_cast<std::size_t>(WalkDecline::Count)> WalkDeclineNames{"no source", "incomplete plan", "no program", "bindless", "unsupported root", "op failed", "pending block", "unmapped", "queued label", "pending storage", "boundary", "failed"};
 
-// What differed between the walk's populated variant and the old path's result.
-enum class WalkMismatch : std::uint8_t { Specialization, Variant, Layout, Buffer, Image, Sampler, Flat, Data, Other, Push, Vertex, Count };
-inline constexpr std::array<const char*, static_cast<std::size_t>(WalkMismatch::Count)> WalkMismatchNames{"specialization", "variant", "layout", "buffer", "image", "sampler", "flat", "data", "other binding", "push", "vertex"};
+// What differed between the walk's populated variant and the old path's result. `Deferred`: a
+// binding the old capture left words of to the GPU, under CompareWalkedResults' `deferredMismatch`
+// (the reader missed the write pending over them; kept apart from a wrong word of the role).
+enum class WalkMismatch : std::uint8_t { Specialization, Variant, Layout, Buffer, Image, Sampler, Flat, Data, Other, Push, Vertex, Deferred, Count };
+inline constexpr std::array<const char*, static_cast<std::size_t>(WalkMismatch::Count)> WalkMismatchNames{"specialization", "variant", "layout", "buffer", "image", "sampler", "flat", "data", "other binding", "push", "vertex", "deferred"};
 
 // The direct reader's state for one walk: the registered regions the old path's ShaderMemory
 // serves first (a draw's programs, or a dispatch's code and header), the page last found readable,
@@ -70,11 +72,16 @@ struct WalkDifference {
 // - a FlattenedSrt word the old capture left to the GPU (counted in `deferredSkipped`);
 // - the flat copy of a sampled T# word that differs only in that word's don't-care bits
 //   (FlatTsharpFeedbackCopy, counted in `flatFeedback`): the old stage compare accepted it through
-//   those bits, so its hit binds the stored word and the walk the live one;
+//   those bits, so its hit binds the stored word and the walk the live one (in the fast dispatch's
+//   verify, whose old result is a fresh capture with no stage compare, it fires only when the
+//   feedback bits changed in memory between the walk and the capture: such a dispatch also counts
+//   a T# feedback-only binding);
 // - T# words differing only in the streaming-feedback bits (the binding counts in `feedbackOnly`).
 // `deferredMismatch` (the fast dispatch and the fast draw's verify, which bind the words they
-// walked): a binding the old capture left words of to the GPU differs, whatever its placeholder
-// holds, since the reader missed the write pending over them.
+// walked): a binding the old capture left words of to the GPU differs (WalkMismatch::Deferred),
+// whatever its placeholder holds, since the reader missed the write pending over them. Walked
+// results come from WalkResources, which claims no pure leaf, so they have no deferredWords of
+// their own; the test does not look at them.
 std::uint32_t CompareWalkedResults(const ShaderRecompiler::RecompileResult& old, const ShaderRecompiler::RecompileResult& walked, WalkDifference& first, std::uint64_t& feedbackOnly, std::uint64_t& flatFeedback, std::uint64_t& deferredSkipped, bool deferredMismatch = false);
 
 // CompareWalkedResults' kinds alone, without its counters or first difference (the fast draw's
