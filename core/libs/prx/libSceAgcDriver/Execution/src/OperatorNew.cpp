@@ -56,8 +56,22 @@ void reportCallers() {
     std::fprintf(stderr, "\n");
 }
 
+AgcDriver::HostHeap::CommitStatus readCommit() {
+    AgcDriver::HostHeap::CommitStatus status;
+    MEMORYSTATUSEX memory{};
+    memory.dwLength = sizeof(memory);
+    if (GlobalMemoryStatusEx(&memory)) {
+        status.limitBytes = memory.ullTotalPageFile;
+        status.systemBytes = memory.ullTotalPageFile - memory.ullAvailPageFile;
+    }
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters))) status.privateBytes = counters.PrivateUsage;
+    return status;
+}
+
 [[noreturn]] void allocationFailed(std::size_t bytes) {
-    std::fprintf(stderr, "[gpu] host allocation of %zu bytes failed\n", bytes);
+    const auto commit = readCommit();
+    std::fprintf(stderr, "[gpu] host allocation of %zu bytes failed (system commit %.1f of %.1f GiB, process private %.1f GiB)\n", bytes, static_cast<double>(commit.systemBytes) / 1073741824, static_cast<double>(commit.limitBytes) / 1073741824, static_cast<double>(commit.privateBytes) / 1073741824);
     reportCallers();
     throw std::bad_alloc();
 }
@@ -74,7 +88,9 @@ void reportCallers() {
 //   is a table lookup; any other pointer (the heap's: larger requests, libstdc++'s own allocations)
 //   goes to free(). A thread holding more than ClassBytesLimit of a class hands a batch (one
 //   chunk's worth of blocks) to the class's shared stack, and refills from it before carving a new
-//   chunk, so blocks freed on another thread come back. Nothing is decommitted.
+//   chunk, so blocks freed on another thread come back. Nothing is decommitted. APS5_BLOCK_ARENA_MIB
+//   caps the committed chunks (default: the whole reservation); past the cap a request takes a
+//   heap block, as when the commit runs out.
 // - the block cache (APS5_NO_BLOCK_ARENA=1): every block an ordinary heap block, classified by its
 //   heap size at free (_msize: RtlSizeHeap was 4.2% of the draw thread, t212) and kept on the
 //   freeing thread's list up to ClassBytesLimit per class.
@@ -121,6 +137,7 @@ struct ArenaState {
     std::atomic<std::uintptr_t> base{0};    // 0 until reserved; a block's existence orders the store before its free
     std::size_t chunksUsed = 0;
     bool failed = false;
+    bool capped = false;                    // APS5_BLOCK_ARENA_MIB reached (reported once)
     std::atomic<std::uint64_t> orphans{0};  // frees of arena addresses in no carved chunk (a wild pointer)
     SharedClass classes[MaxShift + 1];
     std::uint8_t chunkClass[ArenaChunkCount] = {};   // a chunk's class shift; 0 while uncarved
@@ -134,6 +151,7 @@ struct Config {
     DWORD fls = FLS_OUT_OF_INDEXES;
     // gs offset of the TLS slot in the TEB's inline array, 0 when TlsGetValue reads it.
     unsigned long tebOffset = 0;
+    std::size_t chunkLimit = ArenaChunkCount;
 };
 
 bool envSet(const char* name) {
@@ -215,6 +233,9 @@ const Config& config() {
         if (result.tls < 64 && !envSet("APS5_NO_TEB_BLOCK_CACHE")) result.tebOffset = 0x1480 + result.tls * sizeof(void*);
         result.mode = Mode::Cache;
         if (!envSet("APS5_NO_BLOCK_ARENA")) {
+            if (const char* text = std::getenv("APS5_BLOCK_ARENA_MIB"); text != nullptr && std::strtoull(text, nullptr, 10) != 0) {
+                result.chunkLimit = static_cast<std::size_t>(std::min<unsigned long long>(ArenaChunkCount, std::strtoull(text, nullptr, 10) << 20 >> ChunkShift));
+            }
             if (hookFree("libstdc++-6.dll")) result.mode = Mode::Arena;
             else std::fprintf(stderr, "[gpu] block arena: no single `free` import in libstdc++-6.dll to redirect; using the block cache\n");
         }
@@ -259,7 +280,11 @@ void* carveChunk(unsigned shift) {
         }
     }
     void* chunk = nullptr;
-    if (!arena.failed && arena.chunksUsed < ArenaChunkCount) {
+    if (!arena.failed && arena.chunksUsed >= config().chunkLimit && !arena.capped) {
+        arena.capped = true;
+        std::fprintf(stderr, "[gpu] block arena: APS5_BLOCK_ARENA_MIB cap of %zu MiB reached; further small blocks come from the heap\n", (config().chunkLimit * ChunkBytes) >> 20);
+    }
+    if (!arena.failed && arena.chunksUsed < config().chunkLimit) {
         const auto index = arena.chunksUsed;
         auto* address = reinterpret_cast<void*>(arena.base.load(std::memory_order_relaxed) + index * ChunkBytes);
         if (VirtualAlloc(address, ChunkBytes, MEM_COMMIT, PAGE_READWRITE) != nullptr) {
@@ -473,6 +498,10 @@ ArenaStatus Arena() {
         status.sharedBytes += static_cast<std::uint64_t>(shared.batchCount) * ChunkBytes + (static_cast<std::uint64_t>(shared.looseCount) << shift);
     }
     return status;
+}
+
+CommitStatus Commit() {
+    return readCommit();
 }
 
 }

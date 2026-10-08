@@ -18,6 +18,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#include "prx/libc/include/CommitBudget.hpp"
 
 namespace GuestHeap {
 namespace {
@@ -118,7 +119,8 @@ private:
     // frees and re-allocates hundreds of MB of temporary buffers every frame, and decommitting each
     // one made every re-touch a demand-zero page fault plus a TLB shootdown across every thread
     // (over 100K faults per second, a third of the main thread's time in the kernel). The cache is
-    // bounded (APS5_HEAP_CACHE_MIB, default 4096); past the budget the oldest blocks are decommitted
+    // bounded (APS5_HEAP_CACHE_MIB, default 4096, scaled down on a machine with less than 48 GiB of
+    // system commit: CommitBudget.hpp); past the budget the oldest blocks are decommitted
     // and released, which is also the only time the GPU driver's page cache needs invalidating.
     class LargeCache {
     public:
@@ -158,7 +160,7 @@ private:
         static std::size_t budget() {
             static const std::size_t value = [] {
                 const char* text = std::getenv("APS5_HEAP_CACHE_MIB");
-                return (text ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::size_t{4096}) << 20;
+                return (text ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : CommitBudget::Scaled(std::size_t{4096})) << 20;
             }();
             return value;
         }

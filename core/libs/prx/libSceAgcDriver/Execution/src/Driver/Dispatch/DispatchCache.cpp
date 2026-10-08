@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include <cstdlib>
+#include "prx/libc/include/CommitBudget.hpp"
 
 namespace AgcDriver::DriverDetail {
 
@@ -55,7 +56,9 @@ std::size_t Driver::dispatchCacheEntries() {
         const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
         if (parsed != 0) return static_cast<std::size_t>(parsed);
         if (stampValidate()) return std::size_t{4096};
-        return dispatchVariants() > 2 ? std::size_t{8192} : std::size_t{16384};
+        // Cached resources pin textures and buffers: 32768 entries ran a 65 GB machine out of
+        // commit (t334), so a smaller machine gets fewer (CommitBudget.hpp).
+        return CommitBudget::Scaled(dispatchVariants() > 2 ? std::size_t{8192} : std::size_t{16384});
     }();
     return entries;
 }

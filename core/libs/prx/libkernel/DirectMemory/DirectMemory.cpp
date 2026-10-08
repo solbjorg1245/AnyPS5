@@ -3,6 +3,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <iterator>
 #include <map>
@@ -139,6 +140,26 @@ namespace {
 
 constexpr int GuestMapFixedFlag = 0x10;
 
+// Direct memory is backed sparsely; APS5_NO_SEC_RESERVE=1 restores the fully charged backing.
+// Windows: a pagefile section created whole charges the system commit for all of it at once, and
+// Demon's Souls allocates the whole 13.5 GiB pool at boot whether it maps it or not; a SEC_RESERVE
+// section is charged only for what PhysicalBacking::Commit commits when a range is first mapped.
+// Linux: the memfd backing is sparse already; anonymous guest mappings are made MAP_NORESERVE so
+// they stay out of the overcommit accounting (heuristic mode; strict mode ignores the flag).
+bool ReserveOnlyBacking() {
+    static const bool enabled = std::getenv("APS5_NO_SEC_RESERVE") == nullptr;
+    return enabled;
+}
+
+int NoReserveFlag() {
+#if defined(__linux__)
+    static const int flag = ReserveOnlyBacking() ? MAP_NORESERVE : 0;
+    return flag;
+#else
+    return 0;
+#endif
+}
+
 #if defined(__linux__)
 void* MapAtOrAbove(std::uintptr_t start, size_t len, int prot, size_t alignment) {
     constexpr std::uintptr_t UserLimit = 0x7fff00000000ull;
@@ -160,7 +181,7 @@ void* MapAtOrAbove(std::uintptr_t start, size_t len, int prot, size_t alignment)
             candidate = (end + alignment - 1) & ~(static_cast<std::uintptr_t>(alignment) - 1);
         }
         if (candidate + len > UserLimit || candidate + len < candidate) throw std::runtime_error("No free range above the mapping address hint");
-        void* result = mmap(reinterpret_cast<void*>(candidate), len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        void* result = mmap(reinterpret_cast<void*>(candidate), len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | NoReserveFlag(), -1, 0);
         if (result != MAP_FAILED) return result;
         if (errno != EEXIST) throw std::system_error(errno, std::generic_category(), "Hinted mmap failed");
     }
@@ -220,17 +241,43 @@ void Trace(const char* format, ...) {
     va_end(args);
 }
 
+#ifdef _WIN32
+// Direct memory allocated, and the part of it charged to the system commit (all of it with
+// APS5_NO_SEC_RESERVE=1). APS5_PROFILE_DRAW or APS5_TRACE_MEMORY print a line per GiB committed.
+std::atomic<std::uint64_t> g_directAllocatedBytes{0};
+std::atomic<std::uint64_t> g_directCommittedBytes{0};
+
+void NoteDirectCommit(std::uint64_t bytes) {
+    static const bool report = std::getenv("APS5_PROFILE_DRAW") != nullptr || TraceEnabled();
+    const auto before = g_directCommittedBytes.fetch_add(bytes, std::memory_order_relaxed);
+    const auto after = before + bytes;
+    if (report && ReserveOnlyBacking() && (before >> 30) != (after >> 30)) {
+        std::fprintf(stderr, "[memory] direct memory committed on map: %llu MiB of %llu MiB allocated (SEC_RESERVE)\n", static_cast<unsigned long long>(after >> 20), static_cast<unsigned long long>(g_directAllocatedBytes.load(std::memory_order_relaxed) >> 20));
+    }
+}
+#endif
+
 class PhysicalBacking {
 public:
     explicit PhysicalBacking(std::size_t bytes, int memoryType) : memoryType(memoryType) {
 #ifdef _WIN32
         const auto size = static_cast<std::uint64_t>(bytes);
-        section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, static_cast<DWORD>(size >> 32), static_cast<DWORD>(size), nullptr);
+        reserveOnly = ReserveOnlyBacking();
+        const DWORD attributes = PAGE_EXECUTE_READWRITE | (reserveOnly ? SEC_RESERVE : 0);
+        section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, attributes, static_cast<DWORD>(size >> 32), static_cast<DWORD>(size), nullptr);
         if (!section) {
             const auto error = static_cast<int>(GetLastError());
             char message[96];
             std::snprintf(message, sizeof(message), "create direct memory backing of 0x%llx bytes (%llu MiB)", static_cast<unsigned long long>(size), static_cast<unsigned long long>((size + 0xFFFFF) >> 20));
             throw std::system_error(error, std::system_category(), message);
+        }
+        sectionBytes = size;
+        g_directAllocatedBytes.fetch_add(size, std::memory_order_relaxed);
+        if (reserveOnly) {
+            committed.assign(static_cast<std::size_t>((size + CommitChunkBytes - 1) / CommitChunkBytes), 0);
+        } else {
+            committedBytes = size;
+            NoteDirectCommit(size);
         }
 #else
         file = memfd_create("direct memory", MFD_CLOEXEC);
@@ -248,6 +295,8 @@ public:
     ~PhysicalBacking() {
 #ifdef _WIN32
         CloseHandle(section);
+        g_directAllocatedBytes.fetch_sub(sectionBytes, std::memory_order_relaxed);
+        g_directCommittedBytes.fetch_sub(committedBytes, std::memory_order_relaxed);
 #else
         ::close(file);
 #endif
@@ -256,8 +305,10 @@ public:
     PhysicalBacking(const PhysicalBacking&) = delete;
     PhysicalBacking& operator=(const PhysicalBacking&) = delete;
 
-    void Map(std::uintptr_t address, std::size_t bytes, std::uint64_t offset, int protection) const {
+    // Callers hold g_directLock (AddMapping), which also guards `committed`.
+    void Map(std::uintptr_t address, std::size_t bytes, std::uint64_t offset, int protection) {
 #ifdef _WIN32
+        Commit(offset, bytes);
         GuestArena::GuestArenaMap_nid_postfix(reinterpret_cast<void*>(address), bytes, section, offset, WinProtFromPosix(protection));
 #else
         if (::mmap(reinterpret_cast<void*>(address), bytes, protection, MAP_SHARED | MAP_FIXED, file, static_cast<off_t>(offset)) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map direct memory backing");
@@ -265,9 +316,51 @@ public:
     }
 
 private:
+#ifdef _WIN32
+    // A page of a SEC_RESERVE section committed through any view is committed in every view of it
+    // (the guest's, the driver's read-write aliases). The range is committed through a short-lived
+    // view of whole 64 KiB chunks (a view's offset unit) before the guest view is mapped, so no view
+    // ever holds a reserved page: a touch cannot fault on one, and a Vulkan host-pointer import of
+    // guest memory (which needs committed pages) cannot fail on one either. Never decommitted: the
+    // section's pages are given back when the allocation is released.
+    void Commit(std::uint64_t offset, std::size_t bytes) {
+        if (!reserveOnly) return;
+        auto chunk = static_cast<std::size_t>(offset / CommitChunkBytes);
+        const auto last = static_cast<std::size_t>((offset + bytes + CommitChunkBytes - 1) / CommitChunkBytes);
+        while (chunk < last) {
+            if (committed[chunk] != 0) {
+                ++chunk;
+                continue;
+            }
+            auto runEnd = chunk + 1;
+            while (runEnd < last && committed[runEnd] == 0) ++runEnd;
+            const auto viewOffset = static_cast<std::uint64_t>(chunk) * CommitChunkBytes;
+            const auto viewBytes = std::min<std::uint64_t>(static_cast<std::uint64_t>(runEnd) * CommitChunkBytes, sectionBytes) - viewOffset;
+            void* view = MapViewOfFile(section, FILE_MAP_ALL_ACCESS | FILE_MAP_EXECUTE, static_cast<DWORD>(viewOffset >> 32), static_cast<DWORD>(viewOffset), static_cast<SIZE_T>(viewBytes));
+            if (view == nullptr) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "map direct memory backing to commit it");
+            const bool done = VirtualAlloc(view, static_cast<SIZE_T>(viewBytes), MEM_COMMIT, PAGE_EXECUTE_READWRITE) != nullptr;
+            const auto error = GetLastError();
+            UnmapViewOfFile(view);
+            if (!done) {
+                std::fprintf(stderr, "[memory] committing direct memory backing 0x%llx+0x%llx failed (error %lu; %llu MiB of %llu MiB direct memory committed): the system commit limit is likely reached, enlarge the pagefile or set APS5_NO_SEC_RESERVE=1\n", static_cast<unsigned long long>(viewOffset), static_cast<unsigned long long>(viewBytes), static_cast<unsigned long>(error), static_cast<unsigned long long>(g_directCommittedBytes.load(std::memory_order_relaxed) >> 20), static_cast<unsigned long long>(g_directAllocatedBytes.load(std::memory_order_relaxed) >> 20));
+                throw std::system_error(static_cast<int>(error), std::system_category(), "commit direct memory backing");
+            }
+            std::fill(committed.begin() + static_cast<std::ptrdiff_t>(chunk), committed.begin() + static_cast<std::ptrdiff_t>(runEnd), std::uint8_t{1});
+            committedBytes += viewBytes;
+            NoteDirectCommit(viewBytes);
+            chunk = runEnd;
+        }
+    }
+#endif
+
     int memoryType;
 #ifdef _WIN32
+    static constexpr std::uint64_t CommitChunkBytes = 0x10000;
     HANDLE section = nullptr;
+    std::uint64_t sectionBytes = 0;
+    std::uint64_t committedBytes = 0;
+    bool reserveOnly = false;
+    std::vector<std::uint8_t> committed;   // per CommitChunkBytes chunk, 1 once committed
 #else
     int file = -1;
 #endif
@@ -410,7 +503,7 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
             GuestArena::GuestArenaReset_nid_postfix(addr, len);
             if (nativeProtection != PROT_NONE) CommitArenaRange(addr, len, WinProtFromPosix(nativeProtection));
 #else
-            if (::mmap(addr, len, nativeProtection, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "remap anonymous memory");
+            if (::mmap(addr, len, nativeProtection, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | NoReserveFlag(), -1, 0) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "remap anonymous memory");
             GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(addr, len);
 #endif
         }
@@ -473,7 +566,7 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
 #else
         const int placement = MAP_FIXED;
 #endif
-        void* result = mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | placement, -1, 0);
+        void* result = mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | placement | NoReserveFlag(), -1, 0);
         if (result == MAP_FAILED) {
             // return SCE_KERNEL_ERROR_ENOMEM;
             throw std::system_error(errno, std::generic_category(), "Fixed mmap failed");
@@ -494,7 +587,7 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
         throw std::overflow_error("Aligned mapping size overflow");
     }
     const size_t allocLen = len + alignment;
-    void* result = mmap(nullptr, allocLen, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void* result = mmap(nullptr, allocLen, prot, MAP_PRIVATE | MAP_ANONYMOUS | NoReserveFlag(), -1, 0);
     if (result == MAP_FAILED) {
         // return SCE_KERNEL_ERROR_ENOMEM;
         throw std::system_error(errno, std::generic_category(), "Aligned mmap failed");

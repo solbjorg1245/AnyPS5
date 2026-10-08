@@ -30,6 +30,17 @@ struct ArenaStatus {
 
 ArenaStatus Arena();
 
+// The system's committed bytes and commit limit (RAM plus the current pagefile), and this
+// process's private bytes; 0 when unknown. Direct memory (guest sections) is in the system figure
+// only: with SEC_RESERVE (DirectMemory.cpp) only its mapped part.
+struct CommitStatus {
+    std::uint64_t systemBytes = 0;
+    std::uint64_t limitBytes = 0;
+    std::uint64_t privateBytes = 0;
+};
+
+CommitStatus Commit();
+
 }
 
 #endif
