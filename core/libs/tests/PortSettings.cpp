@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <string>
 
@@ -170,7 +171,47 @@ static void TestOverlay() {
     std::filesystem::remove(settingsPath);
 }
 
+// Review fixes: number parsing, build identity, atomic writes, override folders, non-ASCII paths.
+static void TestReviewFixes() {
+    double value = 0.0;
+    Require(PortSettings::ParseNumber("29.97", value) && Near(value, 29.97, 1e-9), "decimal number");
+    Require(!PortSettings::ParseNumber("0x14", value), "hex refused");
+    Require(!PortSettings::ParseNumber("29,97", value), "comma refused");
+    Require(!PortSettings::ParseNumber("20abc", value) && !PortSettings::ParseNumber("", value) && !PortSettings::ParseNumber("nan", value), "junk refused");
+
+    Require(PortSettings::BuildVersionSupported("+BuildVersion=2025-10-15.877562\r\n\r\n"), "supported build");
+    Require(PortSettings::BuildVersionSupported("BuildVersion=2025-10-15.877562"), "supported build, no plus");
+    Require(!PortSettings::BuildVersionSupported("+BuildVersion=2025-10-15.877563\r\n"), "other build refused");
+    Require(!PortSettings::BuildVersionSupported("") && !PortSettings::BuildVersionSupported("something else"), "no build refused");
+
+    const auto windows = PortSettings::UserDirectory(true, [](const char* name) { return std::string(name) == "LOCALAPPDATA" ? std::filesystem::path("C:/Users/x/AppData/Local") : std::filesystem::path{}; });
+    Require(windows == std::filesystem::path("C:/Users/x/AppData/Local") / "AnyPS5", "windows user folder");
+    const auto xdg = PortSettings::UserDirectory(false, [](const char* name) { return std::string(name) == "XDG_CONFIG_HOME" ? std::filesystem::path("/cfg") : std::filesystem::path("/home/x"); });
+    Require(xdg == std::filesystem::path("/cfg") / "anyps5", "XDG folder");
+    const auto home = PortSettings::UserDirectory(false, [](const char* name) { return std::string(name) == "HOME" ? std::filesystem::path("/home/x") : std::filesystem::path{}; });
+    Require(home == std::filesystem::path("/home/x") / ".config" / "anyps5", "home folder");
+    Require(PortSettings::UserDirectory(false, [](const char*) { return std::filesystem::path{}; }).empty(), "no user folder");
+    Require(PortSettings::OverrideDirectories("/exe", {}).size() == 1 && PortSettings::OverrideDirectories("/exe", "/user").size() == 2, "override folders");
+
+    // A non-ASCII folder: written atomically, read back, no temporary left behind, no narrow round trip.
+    const auto base = std::filesystem::temp_directory_path() / std::filesystem::path(u8"aps5-\u00e4\u00f6-test");
+    std::filesystem::remove_all(base);
+    std::string error;
+    std::filesystem::create_directories(base);
+    { std::ofstream file(base / "blocked-by-file", std::ios::binary); file << "x"; }
+    const auto written = PortSettings::WriteOverrideFile({base / "blocked-by-file" / "inner", base / "ok"}, "a.txt", "first", error);
+    Require(written == base / "ok" / "a.txt", "falls through to the next folder");
+    Require(PortSettings::WriteFileAtomic(written, "second", error), "overwrite");
+    { std::ifstream file(written, std::ios::binary); std::string text((std::istreambuf_iterator<char>(file)), {}); Require(text == "second", "overwritten content"); }
+    std::size_t entries = 0;
+    for ([[maybe_unused]] const auto& entry : std::filesystem::directory_iterator(base / "ok")) ++entries;
+    Require(entries == 1, "no temporary file left");
+    Require(!PortSettings::PathText(base).empty() && PortSettings::PathText(base).find('?') == std::string::npos, "path text keeps non-ASCII");
+    std::filesystem::remove_all(base);
+}
+
 int main() {
+    TestReviewFixes();
     TestParse();
     TestEnvironment();
     TestRenderTier();

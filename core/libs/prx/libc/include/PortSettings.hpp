@@ -3,14 +3,19 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -25,7 +30,7 @@
 //   Timestep = fixed          APS5_TIMESTEP         variable (1): the frame step follows the frame time
 //   TimestepMinHz = 19.98     APS5_TIMESTEP_MIN_HZ  slowest step rate; slower frames slow the game down
 //   WindowMode = windowed     APS5_WINDOW_MODE      or fullscreen (desktop size, the frame scaled into it)
-//   Upscaler = off            APS5_UPSCALER         reserved: fsr, dlss; UpscalerQuality, FrameGeneration
+//   Upscaler = off            APS5_UPSCALER         reserved: fsr, dlss (UpscalerQuality and FrameGeneration: file only, reserved)
 // The title takes one fixed physics step of 1/refresh per rendered frame (59.94 Hz in its 60 FPS mode,
 // 29.97 Hz in its 30 FPS mode), so any other limit, and any frame rate below the limit, changes the game
 // speed unless Timestep = variable (libSceVideoOut TimestepPatch) feeds it the measured frame rate.
@@ -90,12 +95,103 @@ inline std::string_view Trim(std::string_view value) {
     return value;
 }
 
+// Decimal numbers only, and never the C locale's decimal separator (no strtod: it follows setlocale
+// and accepts hex floats).
 inline bool ParseNumber(std::string_view text, double& value) {
-    const std::string copy(text);
-    if (copy.empty()) return false;
-    char* end = nullptr;
-    value = std::strtod(copy.c_str(), &end);
-    return end == copy.c_str() + copy.size() && std::isfinite(value);
+    if (text.empty()) return false;
+    const char* const first = text.data();
+    const char* const last = first + text.size();
+    double parsed = 0.0;
+    const auto result = std::from_chars(first, last, parsed);
+    if (result.ec != std::errc{} || result.ptr != last || !std::isfinite(parsed)) return false;
+    value = parsed;
+    return true;
+}
+
+// UTF-8 text of a host path (logs, Settings::source); path.string() would use the ANSI code page.
+inline std::string PathText(const std::filesystem::path& path) {
+    const auto text = path.u8string();
+    return std::string(text.begin(), text.end());
+}
+
+// The only game build the timestep patch's table layout is known for (gameversion.txt of the title).
+inline constexpr const char* SupportedBuildVersion = "2025-10-15.877562";
+
+// True when gameversion.txt text has a "BuildVersion=<id>" line (a leading '+' is the title's own
+// argument syntax) with exactly the supported id.
+inline bool BuildVersionSupported(std::string_view text) {
+    while (!text.empty()) {
+        const auto end = text.find('\n');
+        auto line = Trim(text.substr(0, end));
+        text = end == std::string_view::npos ? std::string_view{} : text.substr(end + 1);
+        if (line.starts_with('+')) line.remove_prefix(1);
+        constexpr std::string_view key = "BuildVersion=";
+        if (line.starts_with(key)) return Trim(line.substr(key.size())) == SupportedBuildVersion;
+    }
+    return false;
+}
+
+// Writes `content` to a temporary sibling and renames it over `target`, so a reader (or a second
+// instance writing the same name) sees the old or the new file, never a half-written one.
+inline bool WriteFileAtomic(const std::filesystem::path& target, std::string_view content, std::string& error) {
+    static std::atomic<std::uint64_t> counter{0};
+    auto temporary = target;
+    temporary += ".tmp" + std::to_string(counter.fetch_add(1)) + "-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    {
+        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+        if (file) file.write(content.data(), static_cast<std::streamsize>(content.size()));
+        if (file) file.close();
+        if (!file) {
+            error = "cannot write " + PathText(temporary);
+            std::error_code ignored;
+            std::filesystem::remove(temporary, ignored);
+            return false;
+        }
+    }
+    std::error_code rename;
+    std::filesystem::rename(temporary, target, rename);
+    if (rename) {
+        error = "cannot replace " + PathText(target) + ": " + rename.message();
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        return false;
+    }
+    return true;
+}
+
+// The per-user folder for files the executable's folder cannot take: %LOCALAPPDATA%\AnyPS5 on Windows,
+// $XDG_CONFIG_HOME/anyps5 or ~/.config/anyps5 elsewhere; empty when the variables are unset.
+// `lookup` returns the variable's value as a path, empty when unset.
+inline std::filesystem::path UserDirectory(bool windows, const std::function<std::filesystem::path(const char*)>& lookup) {
+    if (windows) {
+        const auto base = lookup("LOCALAPPDATA");
+        return base.empty() ? std::filesystem::path{} : base / "AnyPS5";
+    }
+    if (const auto config = lookup("XDG_CONFIG_HOME"); !config.empty()) return config / "anyps5";
+    const auto home = lookup("HOME");
+    return home.empty() ? std::filesystem::path{} : home / ".config" / "anyps5";
+}
+
+// Where the merged copies go, in order of preference: next to the executable, then the user folder.
+inline std::vector<std::filesystem::path> OverrideDirectories(const std::filesystem::path& executableDirectory, const std::filesystem::path& userDirectory) {
+    std::vector<std::filesystem::path> directories{executableDirectory / OverrideDirectoryName};
+    if (!userDirectory.empty()) directories.push_back(userDirectory / OverrideDirectoryName);
+    return directories;
+}
+
+// Writes `content` as `name` into the first of `directories` that takes it; returns the file written.
+inline std::filesystem::path WriteOverrideFile(const std::vector<std::filesystem::path>& directories, const std::filesystem::path& name, std::string_view content, std::string& error) {
+    for (const auto& directory : directories) {
+        std::error_code created;
+        std::filesystem::create_directories(directory, created);
+        if (created) {
+            error = "cannot create " + PathText(directory) + ": " + created.message();
+            continue;
+        }
+        const auto target = directory / name;
+        if (WriteFileAtomic(target, content, error)) return target;
+    }
+    return {};
 }
 
 inline bool ParseResolution(std::string_view text, std::uint32_t& width, std::uint32_t& height) {

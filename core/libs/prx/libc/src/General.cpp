@@ -18,7 +18,7 @@ namespace {
 // the PS5 hands the title a short mount point ("/savedata0") whose files live under _sd/<dir name>.
 struct PathAliases {
     std::mutex mutex;
-    std::vector<std::pair<std::string, std::string>> entries;
+    std::vector<std::pair<std::string, std::filesystem::path>> entries;
 };
 
 PathAliases& Aliases() {
@@ -134,8 +134,8 @@ int DirectoryFailure(const std::error_code& error) {
 }
 }
 
-extern "C" void AddPathAlias_nid_no_patch(const char* guestPrefix, const char* hostPath) {
-    if (guestPrefix == nullptr || hostPath == nullptr) {
+void AddPathAliasHost_nid_no_patch(const char* guestPrefix, const std::filesystem::path& hostPath) {
+    if (guestPrefix == nullptr || hostPath.empty()) {
         APS5_INVALID_ARG_EX;
     }
     auto& aliases = Aliases();
@@ -148,6 +148,13 @@ extern "C" void AddPathAlias_nid_no_patch(const char* guestPrefix, const char* h
         }
     }
     aliases.entries.emplace_back(prefix, hostPath);
+}
+
+extern "C" void AddPathAlias_nid_no_patch(const char* guestPrefix, const char* hostPath) {
+    if (guestPrefix == nullptr || hostPath == nullptr) {
+        APS5_INVALID_ARG_EX;
+    }
+    AddPathAliasHost_nid_no_patch(guestPrefix, std::filesystem::path(hostPath));
 }
 
 extern "C" void RemovePathAlias_nid_no_patch(const char* guestPrefix) {
