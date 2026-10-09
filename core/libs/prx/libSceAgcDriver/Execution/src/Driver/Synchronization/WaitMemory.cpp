@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <cstdlib>
 #include <mutex>
 #include <set>
@@ -14,9 +15,18 @@
 
 namespace AgcDriver::DriverDetail {
 
+#ifdef _WIN32
+namespace {
+HANDLE PollTimer() {
+    thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    return timer;
+}
+}
+#endif
+
 void PollSleep() {
 #ifdef _WIN32
-    thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    const HANDLE timer = PollTimer();
     if (timer != nullptr) {
         LARGE_INTEGER due{};
         due.QuadPart = -2000;
@@ -27,6 +37,47 @@ void PollSleep() {
     }
 #endif
     std::this_thread::sleep_for(std::chrono::microseconds(200));
+}
+
+void* PollWakeEvent() {
+#ifdef _WIN32
+    // In a fiber-local slot, not a thread_local (MinGW emutls), like the recorder's per-thread state.
+    struct Event {
+        HANDLE handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        ~Event() {
+            if (handle != nullptr) CloseHandle(handle);
+        }
+    };
+    struct EventTag {};
+    return HostThreadLocal<Event, EventTag>().handle;
+#else
+    return nullptr;
+#endif
+}
+
+bool PollSleepOrWake(void* wake, std::chrono::microseconds interval) {
+#ifdef _WIN32
+    const HANDLE timer = PollTimer();
+    if (timer == nullptr || wake == nullptr) return false;
+    LARGE_INTEGER due{};
+    due.QuadPart = -static_cast<LONGLONG>(interval.count()) * 10;
+    if (!SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) return false;
+    const HANDLE handles[2] = {static_cast<HANDLE>(wake), timer};
+    if (WaitForMultipleObjects(2, handles, FALSE, INFINITE) == WAIT_OBJECT_0) CancelWaitableTimer(timer);
+    return true;
+#else
+    static_cast<void>(wake);
+    static_cast<void>(interval);
+    return false;
+#endif
+}
+
+void PollWake(void* wake) {
+#ifdef _WIN32
+    if (wake != nullptr) SetEvent(static_cast<HANDLE>(wake));
+#else
+    static_cast<void>(wake);
+#endif
 }
 
 int Driver::waitTimeoutMs() {

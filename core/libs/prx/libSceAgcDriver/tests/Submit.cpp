@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/NewDrawKeyTally.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastRead.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastDispatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/KeyedMemo.hpp"
@@ -375,6 +376,34 @@ void testNewDrawKeyTally() {
     check(tally.Top(1).size() == 1, "tally top keeps the count asked for");
     tally.Reset();
     check(tally.keys == 0 && tally.bases.empty() && tally.Top(10).empty(), "tally reset");
+}
+
+// The idle queue worker's sleep between completion reaps (QueueWorker.cpp): on Windows a wake
+// signalled before or during the sleep ends it at once, and the high-resolution timer ends it
+// otherwise; elsewhere there is no wake event and the worker keeps its condition-variable wait.
+void testPollWake() {
+    using namespace AgcDriver::DriverDetail;
+    using Clock = std::chrono::steady_clock;
+    void* wake = PollWakeEvent();
+#ifdef _WIN32
+    check(wake != nullptr && PollWakeEvent() == wake, "poll wake: no wake event, or a second one, on this thread");
+    PollWake(wake);
+    auto start = Clock::now();
+    check(PollSleepOrWake(wake, std::chrono::seconds(30)) && Clock::now() - start < std::chrono::seconds(10), "poll wake: a wake signalled before the sleep did not end it");
+    std::thread waker([wake] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        PollWake(wake);
+    });
+    start = Clock::now();
+    const bool slept = PollSleepOrWake(wake, std::chrono::seconds(30));
+    const auto woken = Clock::now() - start;
+    waker.join();
+    check(slept && woken < std::chrono::seconds(10), "poll wake: a wake signalled during the sleep did not end it");
+    start = Clock::now();
+    check(PollSleepOrWake(wake, std::chrono::milliseconds(2)) && Clock::now() - start >= std::chrono::milliseconds(1), "poll wake: the timer did not hold an unwoken sleep");
+#else
+    check(wake == nullptr && !PollSleepOrWake(wake, std::chrono::milliseconds(1)), "poll wake: a wake event outside Windows");
+#endif
 }
 
 // The fast-path census core (docs/design/draw-fastpath.md F0): the state key leaves out the shader
@@ -931,6 +960,7 @@ int main() {
         testSkippedDispatch();
         testNewDrawKeyTally();
         testFastCensus();
+        testPollWake();
         testFastDispatchVerify();
         testFastReader();
         testFastReaderLabels();

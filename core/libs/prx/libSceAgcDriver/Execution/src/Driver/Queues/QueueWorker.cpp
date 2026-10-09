@@ -62,12 +62,17 @@ void Driver::run(std::uint32_t id) noexcept {
                 const auto poll = [&](const auto& done) {
 #ifdef _WIN32
                     // APS5_NO_HIRES_REAP=1 restores the condition-variable wait, which winpthreads ends on a 15.6 ms tick.
+                    // Otherwise the worker sleeps one PollTryInterval (the try rate waitMemory's poll keeps for
+                    // GpuMutex) on a high-resolution timer, and enqueue signals its wake event, so a submission
+                    // still ends the sleep at once as the condition variable's notify did.
                     static const bool hiresReap = std::getenv("APS5_NO_HIRES_REAP") == nullptr;
-                    if (hiresReap) {
+                    if (void* wake = hiresReap ? PollWakeEvent() : nullptr) {
+                        worker.pollWake = wake;
                         lock.unlock();
-                        PollSleep();
+                        const bool slept = PollSleepOrWake(wake, PollTryInterval);
                         lock.lock();
-                        return done();
+                        worker.pollWake = nullptr;
+                        if (slept) return done();
                     }
 #endif
                     return changed.wait_for(lock, std::chrono::milliseconds(1), done);

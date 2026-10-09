@@ -180,6 +180,7 @@ void Driver::enqueue(Submission submission) {
     for (const auto dword : submission.labelWrites) ++worker.unfinishedWrites[dword];
     worker.pending.push_back(std::move(submission));
     worker.queued.fetch_add(1, std::memory_order_acq_rel);
+    if (worker.pollWake != nullptr) PollWake(worker.pollWake);
     if (!worker.thread.joinable()) worker.thread = HostThread([this, queue] { run(queue); });
 }
 
