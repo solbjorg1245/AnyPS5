@@ -260,7 +260,14 @@ void reportTextureCounters() {
     const auto direct = taken(NullBoundImage::Undecodable);
     const auto tableBits = taken(NullBoundImage::TableUndecodable);
     const auto tableUnreadable = taken(NullBoundImage::TableUnreadable);
-    std::fprintf(stderr, "[draws] undecodable image elements bound as null (10 s%s): capture %llu (T# words 5-6), table entries %llu (words 5-6) + %llu (unreadable), driver decode %llu\n", ResourceMaterializer::NullUndecodable() ? "" : ", off: set APS5_NULL_UNDECODABLE=1", direct, tableBits, tableUnreadable, static_cast<unsigned long long>(sampledNullBound.exchange(0, std::memory_order_relaxed)));
+    // APS5_ARRAY_PITCH: rejected T# words 4-7 decoded from an intact copy (or a 3D view bit read)
+    // instead of throwing, and those left to throw.
+    char repairs[192] = "";
+    if (UpperHalfRepairEnabled()) {
+        const auto repairsOf = [](UpperHalfRepair kind) { return static_cast<unsigned long long>(TakeUpperHalfRepairs(kind)); };
+        std::snprintf(repairs, sizeof(repairs), "; T# words 4-7 served instead of thrown (APS5_ARRAY_PITCH): %llu from an intact copy, %llu 3D views, %llu not repaired", repairsOf(UpperHalfRepair::Copied), repairsOf(UpperHalfRepair::View3D), repairsOf(UpperHalfRepair::Unrepaired));
+    }
+    std::fprintf(stderr, "[draws] undecodable image elements bound as null (10 s%s): capture %llu (T# words 5-6), table entries %llu (words 5-6) + %llu (unreadable), driver decode %llu%s\n", ResourceMaterializer::NullUndecodable() ? "" : ", off: set APS5_NULL_UNDECODABLE=1", direct, tableBits, tableUnreadable, static_cast<unsigned long long>(sampledNullBound.exchange(0, std::memory_order_relaxed)), repairs);
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,

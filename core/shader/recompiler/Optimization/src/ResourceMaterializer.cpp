@@ -251,10 +251,14 @@ std::uint32_t MaterialScanLimit() {
 // slots a draw sampling two such tables needed 97 image slots of 64 and was dropped before its
 // tables were read (t386: "loop-counter 0" on every [bindless] line, the loop-table draws
 // thrown as "need 97 image slots"). APS5_NO_LOOP_TABLE_SLOTS=1 binds the bindless slots.
-std::uint32_t tableSlotCount(const DescriptorSource::IndirectImage& table) {
+bool loopTableSlotsBounded() {
     static const bool bounded = std::getenv("APS5_NO_LOOP_TABLE_SLOTS") == nullptr;
+    return bounded;
+}
+
+std::uint32_t tableSlotCount(const DescriptorSource::IndirectImage& table) {
     const auto slots = ResourceMaterializer::BindlessSlots();
-    return bounded && table.loopKey && table.entryLimit != 0u ? std::min(slots, table.entryLimit) : slots;
+    return loopTableSlotsBounded() && table.loopKey && table.entryLimit != 0u ? std::min(slots, table.entryLimit) : slots;
 }
 
 bool BindlessTraced() {
@@ -271,6 +275,9 @@ struct BindlessCounters {
     std::atomic<std::uint64_t> paddedShape{0};
     std::atomic<std::uint64_t> paddedConversion{0};
     std::atomic<std::uint64_t> outOfRange{0};
+    // APS5_LOOP_TABLE_FIT: loop-counter tables cut to fit the image slots, and the entries cut.
+    std::atomic<std::uint64_t> loopFitted{0};
+    std::atomic<std::uint64_t> loopEntriesCut{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(BindlessRejection::Count)> rejected{};
     std::atomic<long long> lastReport{0};
 };
@@ -306,11 +313,17 @@ void reportBindless() {
     }
     if (material + whole + rejections == 0) return;
     const auto tables = material + whole;
-    std::fprintf(stderr, "[bindless] (10 s): tables bound %llu (mode M %llu, mode T %llu; loop-counter %llu), slots %u, keys avg %.1f, entries unmapped (sample zeros): null/invalid %llu, shape %llu, conversion %llu, out of range %llu; rejected: capacity %llu, material scan %llu, no entry %llu, storage %llu, non-uniform %llu, image slots %llu, loop entry %llu, table entry %llu%s%s\n",
+    // APS5_LOOP_TABLE_FIT: the loop tables cut to fit the image slots (served instead of thrown as
+    // "need N image slots"); keys at or past the cut sample zeros.
+    char fitted[128] = "";
+    if (ResourceMaterializer::LoopTableFit()) {
+        std::snprintf(fitted, sizeof(fitted), "; loop tables fitted to the image slots %llu (entries cut %llu)", static_cast<unsigned long long>(counters.loopFitted.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.loopEntriesCut.exchange(0, std::memory_order_relaxed)));
+    }
+    std::fprintf(stderr, "[bindless] (10 s): tables bound %llu (mode M %llu, mode T %llu; loop-counter %llu), slots %u, keys avg %.1f, entries unmapped (sample zeros): null/invalid %llu, shape %llu, conversion %llu, out of range %llu; rejected: capacity %llu, material scan %llu, no entry %llu, storage %llu, non-uniform %llu, image slots %llu, loop entry %llu, table entry %llu%s%s%s\n",
         static_cast<unsigned long long>(tables), static_cast<unsigned long long>(material), static_cast<unsigned long long>(whole), static_cast<unsigned long long>(counters.tablesLoop.exchange(0, std::memory_order_relaxed)), ResourceMaterializer::BindlessSlots(), tables != 0 ? static_cast<double>(keys) / static_cast<double>(tables) : 0.0,
         static_cast<unsigned long long>(counters.paddedNull.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.paddedShape.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.paddedConversion.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.outOfRange.exchange(0, std::memory_order_relaxed)),
         static_cast<unsigned long long>(rejected[0]), static_cast<unsigned long long>(rejected[1]), static_cast<unsigned long long>(rejected[2]), static_cast<unsigned long long>(rejected[3]), static_cast<unsigned long long>(rejected[4]), static_cast<unsigned long long>(rejected[5]), static_cast<unsigned long long>(rejected[6]), static_cast<unsigned long long>(rejected[7]),
-        ResourceMaterializer::StrictLoopTables() ? "" : " (off: APS5_NO_STRICT_LOOP_TABLES)", ResourceMaterializer::StrictTableEntries() ? "" : " (off: APS5_NO_STRICT_TABLE_ENTRIES)");
+        ResourceMaterializer::StrictLoopTables() ? "" : " (off: APS5_NO_STRICT_LOOP_TABLES)", ResourceMaterializer::StrictTableEntries() ? "" : " (off: APS5_NO_STRICT_TABLE_ENTRIES)", fitted);
 }
 
 // A bindless image table's bound slots and its (key, slot) mapping, keys ascending. Slots the
@@ -623,6 +636,42 @@ bool materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
             imageSlots += tableSlotCount(*indirect) - 1u;
         }
     }
+    // APS5_LOOP_TABLE_FIT: loop-counter tables whose loop has no immediate exit bound span the
+    // default limit (32): the pc 0x258 screen pass samples two of them and needs 65 image slots of
+    // 64 (t390, "need 65 image slots", 8-16 per 10 s; "GetImageResource dword 0" with the loop keys
+    // off). Cut every loop table to the largest span that fits; keys at or past it sample zeros,
+    // which a loop whose count stays below the span never reads.
+    std::uint32_t loopSpan = 0;
+    if (activeTables != 0u && imageSlots > ShaderInfo::MaxImages && ResourceMaterializer::LoopTableFit() && loopTableSlotsBounded()) {
+        std::vector<std::uint32_t> loopSlots;
+        std::size_t fixedSlots = plan.info.images.size();
+        for (const auto& image : plan.info.images) {
+            const auto& indirect = plan.descriptorSources[image.source].indirectImage;
+            if (!indirect.has_value() || (image.source < activeSources.size() && activeSources[image.source] == 0u)) continue;
+            if (indirect->loopKey) {
+                loopSlots.push_back(tableSlotCount(*indirect));
+            } else {
+                fixedSlots += tableSlotCount(*indirect) - 1u;
+            }
+        }
+        if (!loopSlots.empty() && fixedSlots <= ShaderInfo::MaxImages) {
+            loopSpan = ResourceMaterializer::LoopTableSpan(static_cast<std::uint32_t>(fixedSlots), loopSlots, ShaderInfo::MaxImages);
+        }
+        if (loopSpan != 0u) {
+            imageSlots = fixedSlots;
+            std::uint64_t fittedTables = 0;
+            std::uint64_t entriesCut = 0;
+            for (const auto slots : loopSlots) {
+                imageSlots += std::min(slots, loopSpan) - 1u;
+                if (slots > loopSpan) {
+                    fittedTables++;
+                    entriesCut += slots - loopSpan;
+                }
+            }
+            bindlessCounters().loopFitted.fetch_add(fittedTables, std::memory_order_relaxed);
+            bindlessCounters().loopEntriesCut.fetch_add(entriesCut, std::memory_order_relaxed);
+        }
+    }
     if (activeTables != 0u && imageSlots > ShaderInfo::MaxImages) {
         rejectTable(BindlessRejection::ImageSlots, "bindless image tables need " + std::to_string(imageSlots) + " image slots, limit " + std::to_string(ShaderInfo::MaxImages));
     }
@@ -632,6 +681,13 @@ bool materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         if (source.indirectImage.has_value()) {
             if (image.source < activeSources.size() && activeSources[image.source] == 0u) {
                 snapshot.images[i].dwordCount = 8u;
+                continue;
+            }
+            if (loopSpan != 0u && source.indirectImage->loopKey && tableSlotCount(*source.indirectImage) > loopSpan) {
+                // The span bounds the table's slots and, behind a raw address, its entries.
+                auto fitted = *source.indirectImage;
+                fitted.entryLimit = loopSpan;
+                resolveTableImage(plan, i, fitted, runtime, walker, snapshot.images[i], tables[i]);
                 continue;
             }
             resolveTableImage(plan, i, *source.indirectImage, runtime, walker, snapshot.images[i], tables[i]);
@@ -1115,6 +1171,23 @@ bool ResourceMaterializer::StrictLoopTables() {
 bool ResourceMaterializer::StrictTableEntries() {
     static const bool enabled = std::getenv("APS5_NO_STRICT_TABLE_ENTRIES") == nullptr;
     return enabled;
+}
+
+bool ResourceMaterializer::LoopTableFit() {
+    static const bool enabled = std::getenv("APS5_LOOP_TABLE_FIT") != nullptr;
+    return enabled;
+}
+
+std::uint32_t ResourceMaterializer::LoopTableSpan(std::uint32_t fixedSlots, const std::vector<std::uint32_t>& loopSlots, std::uint32_t limit) {
+    if (fixedSlots > limit) return 0u;
+    std::uint32_t span = 1u;
+    for (const auto slots : loopSlots) span = std::max(span, slots);
+    for (; span >= 1u; span--) {
+        std::uint64_t needed = fixedSlots;
+        for (const auto slots : loopSlots) needed += std::min(slots, span) - 1u;
+        if (needed <= limit) return span;
+    }
+    return 0u;
 }
 
 std::uint64_t ResourceMaterializer::TakeNullBound(NullBoundImage reason) {

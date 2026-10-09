@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_GUESTTEXTURERESOURCE_HPP
 
 #include "Recompiler.hpp"
+#include <array>
 #include <cstdint>
 #include <span>
 
@@ -66,6 +67,20 @@ struct GuestTextureResource {
 float EffectiveMinLod(const GuestTextureResource& resource);
 
 GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words);
+
+// APS5_ARRAY_PITCH=1 (off by default): words 4-7 of a layered T# (3D, cube, 2D array) the decoder
+// rejects are repaired instead of dropping the draw (see DecodeTextureResource). Whether words 4-7
+// hold what the decoder rejects: an array pitch, corner sampling, a partially resident default
+// color, MSAA depth, or a base array the view cannot have.
+bool TextureUpperHalfRejected(std::span<const std::uint32_t> words);
+// `words` with `intact` as words 4-7, or (null) a 3D T# whose ARRAY_PITCH is the view bit 1 read
+// from slice 0 at level 0, where it names the whole volume as 0 does; false: no repair.
+bool RepairTextureUpperHalf(std::span<const std::uint32_t> words, const std::array<std::uint32_t, 4>* intact, std::array<std::uint32_t, 8>& repaired);
+// Decodes repaired from an intact copy, 3D view bits read, and rejected T#s left to throw.
+enum class UpperHalfRepair { Copied, View3D, Unrepaired, Count };
+// The decodes of `kind` since the last call (the APS5_PROFILE_DRAW digest).
+std::uint64_t TakeUpperHalfRepairs(UpperHalfRepair kind);
+bool UpperHalfRepairEnabled();
 bool MatchesGuestDimension(ShaderRecompiler::DescriptorImageShape shape, TextureDimension dimension);
 
 }

@@ -1,7 +1,12 @@
 #include <cstdio>
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libc/include/HostMutex.hpp"
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -38,9 +43,8 @@ TextureDimension resolveDimension(std::uint32_t raw) {
     }
 }
 
-}
-
-GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words) {
+// The guest words as the hardware reads them (DecodeTextureResource adds the APS5_ARRAY_PITCH repair).
+GuestTextureResource decodeTextureWords(std::span<const std::uint32_t> words) {
     Require(words.size() == 8, "guest texture descriptor must contain 8 dwords");
 
     const auto base40 = (static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1]) << 32u)) & 0xffffffffffull;
@@ -177,6 +181,125 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     result.dccAlphaOnMsb = dccAlphaPos;
     result.minLod = minLod;
     return result;
+}
+
+bool upperHalfRepairEnabled() {
+    static const bool enabled = std::getenv("APS5_ARRAY_PITCH") != nullptr;
+    return enabled;
+}
+
+// 3D, cube and 2D array: the types whose depth and base array live in words 4-7.
+bool layeredTexture(std::span<const std::uint32_t> words) {
+    const auto type = (words[3] >> 28u) & 0xfu;
+    return type == 10u || type == 11u || type == 13u;
+}
+
+// The last decodable words 4-7 seen for a layered T#'s words 0-3, direct-mapped (a newer copy of
+// other words 0-3 in the same entry replaces it).
+struct IntactUpperHalves {
+    struct Entry {
+        std::array<std::uint32_t, 8> words{};
+        bool valid = false;
+    };
+    HostMutex mutex;
+    std::array<Entry, 1024> entries{};
+};
+
+IntactUpperHalves& intactUpperHalves() {
+    static IntactUpperHalves halves;
+    return halves;
+}
+
+std::size_t upperHalfEntry(std::span<const std::uint32_t> words) {
+    std::uint32_t hash = 2166136261u;
+    for (std::size_t i = 0; i < 4; ++i) hash = (hash ^ words[i]) * 16777619u;
+    return (hash ^ (hash >> 16u)) & 1023u;
+}
+
+void rememberUpperHalf(std::span<const std::uint32_t> words) {
+    auto& halves = intactUpperHalves();
+    std::lock_guard lock(halves.mutex);
+    auto& entry = halves.entries[upperHalfEntry(words)];
+    if (entry.valid && std::equal(words.begin(), words.end(), entry.words.begin())) return;
+    std::copy(words.begin(), words.end(), entry.words.begin());
+    entry.valid = true;
+}
+
+bool findUpperHalf(std::span<const std::uint32_t> words, std::array<std::uint32_t, 4>& upper) {
+    auto& halves = intactUpperHalves();
+    std::lock_guard lock(halves.mutex);
+    const auto& entry = halves.entries[upperHalfEntry(words)];
+    if (!entry.valid || !std::equal(words.begin(), words.begin() + 4, entry.words.begin())) return false;
+    std::copy(entry.words.begin() + 4, entry.words.end(), upper.begin());
+    return true;
+}
+
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(UpperHalfRepair::Count)> upperHalfRepairs{};
+
+}
+
+bool TextureUpperHalfRejected(std::span<const std::uint32_t> words) {
+    if (words.size() != 8) return false;
+    const auto type = (words[3] >> 28u) & 0xfu;
+    const auto depth = words[4] & 0x1fffu;
+    const auto baseArray = (words[4] >> 16u) & 0x1fffu;
+    const bool fields = (words[5] & 0xfu) != 0u || ((words[5] >> 23u) & 1u) != 0u || ((words[5] >> 26u) & 1u) != 0u || ((words[6] >> 10u) & 1u) != 0u;
+    const bool range = ((type == 11u || type == 13u) && baseArray > depth) || (type == 10u && baseArray != 0u);
+    return fields || range;
+}
+
+bool RepairTextureUpperHalf(std::span<const std::uint32_t> words, const std::array<std::uint32_t, 4>* intact, std::array<std::uint32_t, 8>& repaired) {
+    if (words.size() != 8 || !layeredTexture(words)) return false;
+    std::copy(words.begin(), words.end(), repaired.begin());
+    if (intact != nullptr) {
+        std::copy(intact->begin(), intact->end(), repaired.begin() + 4);
+        return true;
+    }
+    // A 3D T#'s ARRAY_PITCH bit 0 picks the UAV reading of BASE_ARRAY and DEPTH (first and last
+    // slice of the view at the base level) over the SRV one (the whole volume). From slice 0 at
+    // level 0 both name the whole volume, which is what the decoder builds.
+    const auto type = (words[3] >> 28u) & 0xfu;
+    const auto baseLevel = (words[3] >> 12u) & 0xfu;
+    const auto baseArray = (words[4] >> 16u) & 0x1fffu;
+    if (type != 10u || (words[5] & 0xfu) != 1u || baseArray != 0u || baseLevel != 0u) return false;
+    repaired[5] &= ~0xfu;
+    return !TextureUpperHalfRejected(repaired);
+}
+
+std::uint64_t TakeUpperHalfRepairs(UpperHalfRepair kind) {
+    return kind < UpperHalfRepair::Count ? upperHalfRepairs[static_cast<std::size_t>(kind)].exchange(0, std::memory_order_relaxed) : 0u;
+}
+
+bool UpperHalfRepairEnabled() {
+    return upperHalfRepairEnabled();
+}
+
+// APS5_ARRAY_PITCH=1: a layered T# whose words 4-7 the decoder rejects (array pitch, corner
+// sampling, MSAA depth, a base array past the last slice) is decoded with the words 4-7 last
+// decoded for the same words 0-3, or a 3D T#'s view bit is read as the hardware does. In Demon's
+// Souls these are 2D arrays whose words 4-7 hold a tagged pointer, 0x400 and 0x5204 (an array
+// pitch of 5 and a base array past the last slice) where the same words 0-3 elsewhere carry
+// 0x3f 0x00700090 0 0: the memory was rewritten after the game wrote the T#, and the draw was
+// dropped. Without an intact copy the decoder throws as before; off, every such T# does.
+GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words) {
+    if (!upperHalfRepairEnabled() || words.size() != 8 || !layeredTexture(words)) return decodeTextureWords(words);
+    if (TextureUpperHalfRejected(words)) {
+        std::array<std::uint32_t, 8> repaired{};
+        if (RepairTextureUpperHalf(words, nullptr, repaired)) {
+            upperHalfRepairs[static_cast<std::size_t>(UpperHalfRepair::View3D)].fetch_add(1, std::memory_order_relaxed);
+            return decodeTextureWords(repaired);
+        }
+        std::array<std::uint32_t, 4> upper{};
+        if (findUpperHalf(words, upper) && RepairTextureUpperHalf(words, &upper, repaired)) {
+            upperHalfRepairs[static_cast<std::size_t>(UpperHalfRepair::Copied)].fetch_add(1, std::memory_order_relaxed);
+            return decodeTextureWords(repaired);
+        }
+        upperHalfRepairs[static_cast<std::size_t>(UpperHalfRepair::Unrepaired)].fetch_add(1, std::memory_order_relaxed);
+        return decodeTextureWords(words);
+    }
+    const auto resource = decodeTextureWords(words);
+    rememberUpperHalf(words);
+    return resource;
 }
 
 float EffectiveMinLod(const GuestTextureResource& resource) {
