@@ -47,7 +47,10 @@ struct BufferAllocation {
 // Device-local allocations (the detiler's scratch buffers and the staging shadows of written guest
 // buffers, see GuestBufferMemory) are retained in a third tier with a budget of their own, video
 // memory instead of pinned host memory: APS5_STAGING_POOL_MIB (default 2048: 512 evicted ~4000 per
-// 10 s of gameplay); 0 keeps them in the two host tiers as before.
+// 10 s of gameplay); 0 keeps them in the two host tiers as before. Under the video-memory budget
+// (VramBudget) a released device-local allocation is destroyed instead of retained while video
+// memory is over the target, and TrimDevice gives retained ones back; the device-local ones are
+// accounted as the "pool" class while retained (APS5_NO_VRAM_BUDGET=1: retained as before).
 class BufferPool {
 public:
     explicit BufferPool(const Context& context);
@@ -62,6 +65,10 @@ public:
     // retains (all released, so no work uses one) and returns their bytes; 0 when it held none.
     // Counted as evictions.
     VkDeviceSize ReleaseDevice() noexcept;
+    // Video-memory budget (VramBudget's "pool" reclaimer, any thread): destroys the device tier's
+    // least recently retained allocations until about `want` bytes went, by try_lock (0 when the
+    // pool is busy); `evicted` gets their count. Counted as evictions.
+    VkDeviceSize TrimDevice(VkDeviceSize want, std::uint64_t& evicted) noexcept;
     // AllocateDeviceMemory's outcomes since the start (the [bufferpool] line): allocations refused
     // with VK_ERROR_OUT_OF_DEVICE_MEMORY, releases that freed something and their bytes, and the
     // allocations made on the try after a release.

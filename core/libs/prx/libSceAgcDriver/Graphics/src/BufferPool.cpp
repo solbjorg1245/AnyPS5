@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -21,6 +22,11 @@ bool sharedTiers() {
 bool outOfMemoryReclaim() {
     static const bool enabled = std::getenv("APS5_NO_OOM_RECLAIM") == nullptr;
     return enabled;
+}
+
+// Device-local without a host mapping: the allocations the device tier holds and the budget counts.
+bool deviceOnly(VkMemoryPropertyFlags properties) {
+    return (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0;
 }
 
 struct OutOfMemoryCounters {
@@ -61,6 +67,7 @@ void BufferPool::destroy(const BufferAllocation& allocation) noexcept {
     if (allocation.mapping != nullptr) unmap(device, allocation.memory);
     ForgetDeviceAddress(allocation.address);
     destroyBuffer(device, allocation.buffer, nullptr);
+    ForgetDeviceMemory(device, allocation.memory);
     freeMemory(device, allocation.memory, nullptr);
 }
 
@@ -102,6 +109,8 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
     tier.retainedBytes -= result.allocationBytes;
     --tier.slots;
     ++tier.hits;
+    // In use again: accounted under the taker's class (a leaf lock).
+    if (deviceOnly(properties)) ReclassDeviceMemory(device, result.memory, CurrentVramClass());
     return result;
 }
 
@@ -133,9 +142,17 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
     // may throw on growth; a Put that cannot retain simply destroys, as noexcept requires.
     std::vector<BufferAllocation> evicted;
     try {
+        // Over the video-memory budget a released device-local allocation goes back to the driver
+        // (no work uses it: Buffers are released once their batch completed).
+        const bool deviceLocal = deviceOnly(allocation.properties);
+        const bool pressure = deviceLocal && VramPressure();
         std::lock_guard lock(mutex);
         auto& tier = tierFor(allocation.bytes, allocation.properties);
-        if (allocation.allocationBytes > tier.budget) {
+        if (pressure) {
+            evicted.push_back(allocation);
+            ++tier.evictions;
+            Vram().CountNotRetained(allocation.allocationBytes);
+        } else if (allocation.allocationBytes > tier.budget) {
             evicted.push_back(allocation);
         } else {
             const auto maxSlots = MaxSlots();
@@ -143,6 +160,7 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
             tier.free[SlotKey{allocation.bytes, allocation.usage, allocation.properties}].push_back({allocation, ++clock});
             ++tier.slots;
             tier.retainedBytes += allocation.allocationBytes;
+            if (deviceLocal) ReclassDeviceMemory(device, allocation.memory, VramClass::Pool);
         }
     } catch (...) {
         destroy(allocation);
@@ -175,25 +193,51 @@ VkDeviceSize BufferPool::ReleaseDevice() noexcept {
     return bytes;
 }
 
+VkDeviceSize BufferPool::TrimDevice(VkDeviceSize want, std::uint64_t& evicted) noexcept {
+    evicted = 0;
+    std::vector<BufferAllocation> released;
+    VkDeviceSize bytes = 0;
+    try {
+        std::unique_lock lock(mutex, std::try_to_lock);
+        if (!lock.owns_lock()) return 0;
+        while (!deviceTier.free.empty() && bytes < want) {
+            evictOldest(deviceTier, released);
+            bytes += released.back().allocationBytes;
+        }
+    } catch (...) {
+        // The vector could not grow: the slot stayed retained (evictOldest pushes first).
+    }
+    for (const auto& gone : released) destroy(gone);
+    evicted = released.size();
+    return bytes;
+}
+
 BufferPool::OutOfMemoryCounts BufferPool::OutOfMemory() {
     const auto& counters = outOfMemoryCounters();
     return {counters.refused.load(std::memory_order_relaxed), counters.reclaims.load(std::memory_order_relaxed), counters.reclaimedBytes.load(std::memory_order_relaxed), counters.madeAfter.load(std::memory_order_relaxed)};
 }
 
-VkResult AllocateDeviceMemory(const Context& context, const VkMemoryAllocateInfo& allocation, VkDeviceMemory* memory) {
+VkResult AllocateDeviceMemory(const Context& context, const VkMemoryAllocateInfo& allocation, VkDeviceMemory* memory, VramClass type) {
+    // The budgeted heap: over the target, the Inline reclaimers (the pool's retained memory, the
+    // shadow registry) make room first; the allocation is made either way.
+    const bool budgeted = VramBudgeted(context, allocation.memoryTypeIndex);
+    if (budgeted) VramBeforeAllocation(allocation.allocationSize);
     const auto allocate = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory");
     auto result = allocate(context.device, &allocation, nullptr, memory);
-    if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY) return result;
-    auto& counters = outOfMemoryCounters();
-    counters.refused.fetch_add(1, std::memory_order_relaxed);
-    if (!outOfMemoryReclaim()) return result;
-    // Nothing released: the same refusal again (each costs milliseconds), so no second try.
-    const auto released = GetBufferPool(context)->ReleaseDevice();
-    if (released == 0) return result;
-    counters.reclaims.fetch_add(1, std::memory_order_relaxed);
-    counters.reclaimedBytes.fetch_add(released, std::memory_order_relaxed);
-    result = allocate(context.device, &allocation, nullptr, memory);
-    if (result == VK_SUCCESS) counters.madeAfter.fetch_add(1, std::memory_order_relaxed);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        auto& counters = outOfMemoryCounters();
+        counters.refused.fetch_add(1, std::memory_order_relaxed);
+        if (budgeted) Vram().CountDriverRefusal();
+        if (!outOfMemoryReclaim()) return result;
+        // Nothing released: the same refusal again (each costs milliseconds), so no second try.
+        const auto released = GetBufferPool(context)->ReleaseDevice();
+        if (released == 0) return result;
+        counters.reclaims.fetch_add(1, std::memory_order_relaxed);
+        counters.reclaimedBytes.fetch_add(released, std::memory_order_relaxed);
+        result = allocate(context.device, &allocation, nullptr, memory);
+        if (result == VK_SUCCESS) counters.madeAfter.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (result == VK_SUCCESS && budgeted) Vram().NoteAllocation(context.device, *memory, type, allocation.allocationSize);
     return result;
 }
 

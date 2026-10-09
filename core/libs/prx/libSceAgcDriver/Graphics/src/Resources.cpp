@@ -47,7 +47,10 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         } else {
             allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, properties);
         }
-        Check(AllocateDeviceMemory(context, allocation, &memory), "vkAllocateMemory buffer");
+        // Device-local buffers under the thread's class (staging shadows unless a scope says
+        // otherwise, see VramClassScope).
+        const bool deviceOnly = (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0;
+        Check(AllocateDeviceMemory(context, allocation, &memory, deviceOnly ? CurrentVramClass() : VramClass::Other), "vkAllocateMemory buffer");
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory");
         initializeAddress(usage);
         if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) Check(context.Function<PFN_vkMapMemory>("vkMapMemory")(context.device, memory, 0, VK_WHOLE_SIZE, 0, &mapping), "vkMapMemory");
@@ -70,7 +73,7 @@ void Buffer::release() noexcept {
     if (mapping) context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")(context.device, memory);
     ForgetDeviceAddress(deviceAddress);
     if (buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
-    if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (memory) FreeDeviceMemory(context, memory);
 }
 
 VkBuffer Buffer::Handle() const {
@@ -112,7 +115,7 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         allocation.allocationSize = requirements.size;
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        Check(AllocateDeviceMemory(context, allocation, &memory), "vkAllocateMemory device buffer");
+        Check(AllocateDeviceMemory(context, allocation, &memory, VramClass::Buffers), "vkAllocateMemory device buffer");
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory device");
     } catch (...) {
         release();
@@ -130,7 +133,7 @@ void DeviceBuffer::release() noexcept {
         return;
     }
     if (buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
-    if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (memory) FreeDeviceMemory(context, memory);
 }
 
 VkBuffer DeviceBuffer::Handle() const {
@@ -208,7 +211,7 @@ RenderTarget::RenderTarget(const Context& context, const ColorTarget& target, bo
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        Check(AllocateDeviceMemory(context, allocation, &memory), "vkAllocateMemory render target");
+        Check(AllocateDeviceMemory(context, allocation, &memory, VramClass::Targets), "vkAllocateMemory render target");
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory");
         VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         viewInfo.image = image;
@@ -229,7 +232,7 @@ RenderTarget::~RenderTarget() {
 void RenderTarget::release() noexcept {
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
-    if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (memory) FreeDeviceMemory(context, memory);
 }
 
 VkImage RenderTarget::Image() const {

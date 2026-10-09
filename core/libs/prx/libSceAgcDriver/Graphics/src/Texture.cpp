@@ -247,7 +247,12 @@ std::uint64_t ImageMemoryPool::DedicatedImages() { return dedicatedImageCount.lo
 ImageMemoryPool::ImageMemoryPool(const Context& context) : device(context.device), context(context) {}
 
 ImageMemoryPool::~ImageMemoryPool() {
-    for (const auto& block : blocks) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(device, block->memory, nullptr);
+    for (const auto& block : blocks) {
+        // Images still placed in it (none at a clean teardown) go back to its slack, which the
+        // forget then removes whole.
+        if (block->budgeted) Vram().Move(VramClass::Textures, VramClass::Slack, block->ranges.Used());
+        FreeDeviceMemory(context, block->memory);
+    }
 }
 
 ImageMemoryPool::Allocation ImageMemoryPool::AllocateAndBind(VkImage image, VkMemoryPropertyFlags properties) {
@@ -280,6 +285,7 @@ ImageMemoryPool::Allocation ImageMemoryPool::AllocateAndBind(VkImage image, VkMe
                 block.ranges.Free(*offset, requirements.size);
                 return std::nullopt;
             }
+            if (block.budgeted) Vram().Move(VramClass::Slack, VramClass::Textures, requirements.size);
             return Allocation{block.memory, *offset, requirements.size, true};
         };
         for (const auto& block : blocks) {
@@ -295,7 +301,10 @@ ImageMemoryPool::Allocation ImageMemoryPool::AllocateAndBind(VkImage image, VkMe
         VkDeviceMemory memory = VK_NULL_HANDLE;
         // A failed block (video memory exhausted) falls through to the dedicated path below.
         if (context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(device, &allocate, nullptr, &memory) == VK_SUCCESS) {
-            blocks.push_back(std::make_unique<Block>(Block{memory, type, RangeAllocator(blockBytes)}));
+            // The whole block is free space (slack) until images are placed in it.
+            const bool budgeted = VramBudgeted(context, type);
+            NoteDeviceMemory(context, memory, allocate, VramClass::Slack);
+            blocks.push_back(std::make_unique<Block>(Block{memory, type, RangeAllocator(blockBytes), budgeted}));
             if (auto result = place(*blocks.back())) {
                 ++pooledImageCount;
                 return *result;
@@ -309,9 +318,9 @@ ImageMemoryPool::Allocation ImageMemoryPool::AllocateAndBind(VkImage image, VkMe
     allocate.allocationSize = requirements.size;
     allocate.memoryTypeIndex = type;
     Allocation result{VK_NULL_HANDLE, 0, requirements.size, false};
-    Check(AllocateDeviceMemory(context, allocate, &result.memory), "vkAllocateMemory texture");
+    Check(AllocateDeviceMemory(context, allocate, &result.memory, VramClass::Textures), "vkAllocateMemory texture");
     if (const auto status = bind(device, image, result.memory, 0); status != VK_SUCCESS) {
-        context.Function<PFN_vkFreeMemory>("vkFreeMemory")(device, result.memory, nullptr);
+        FreeDeviceMemory(context, result.memory);
         Check(status, "vkBindImageMemory");
     }
     ++dedicatedImageCount;
@@ -321,7 +330,7 @@ ImageMemoryPool::Allocation ImageMemoryPool::AllocateAndBind(VkImage image, VkMe
 void ImageMemoryPool::Release(const Allocation& allocation) noexcept {
     if (allocation.memory == VK_NULL_HANDLE) return;
     if (!allocation.pooled) {
-        context.Function<PFN_vkFreeMemory>("vkFreeMemory")(device, allocation.memory, nullptr);
+        FreeDeviceMemory(context, allocation.memory);
         return;
     }
     VkDeviceMemory empty = VK_NULL_HANDLE;
@@ -331,10 +340,12 @@ void ImageMemoryPool::Release(const Allocation& allocation) noexcept {
             auto& block = **it;
             if (block.memory != allocation.memory) continue;
             block.ranges.Free(allocation.offset, allocation.size);
+            if (block.budgeted) Vram().Move(VramClass::Textures, VramClass::Slack, allocation.size);
             if (block.ranges.Empty()) {
                 // Keep one empty block per memory type for reuse; return the rest to the driver.
                 const auto spare = std::count_if(blocks.begin(), blocks.end(), [&](const auto& other) { return other.get() != &block && other->type == block.type && other->ranges.Empty(); });
-                if (spare > 0) {
+                // Over the video-memory budget no empty block is kept.
+                if (spare > 0 || (block.budgeted && VramPressure())) {
                     empty = block.memory;
                     blocks.erase(it);
                 }
@@ -342,7 +353,7 @@ void ImageMemoryPool::Release(const Allocation& allocation) noexcept {
             break;
         }
     }
-    if (empty != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(device, empty, nullptr);
+    if (empty != VK_NULL_HANDLE) FreeDeviceMemory(context, empty);
 }
 
 std::shared_ptr<ImageMemoryPool> GetImageMemoryPool(const Context& context) {
@@ -878,7 +889,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        Check(AllocateDeviceMemory(context, allocation, &memory), "vkAllocateMemory storage texture");
+        Check(AllocateDeviceMemory(context, allocation, &memory, VramClass::Textures), "vkAllocateMemory storage texture");
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory storage");
         uploadReason = "first";
         upload();
@@ -3795,7 +3806,7 @@ void StorageTexture::release() noexcept {
     attachmentViews.clear();
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
-    if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (memory) FreeDeviceMemory(context, memory);
 }
 
 std::uint64_t StorageTexture::GuestBytes() const {

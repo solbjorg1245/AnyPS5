@@ -166,6 +166,35 @@ void touchTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
     cache.entries.splice(cache.entries.begin(), cache.entries, it);
 }
 
+// Video-memory budget (VramBudget): under the cache's lock, moves into `victims` the textures of the
+// entries the cache alone holds, least recently used first, and erases those entries, until about
+// `want` bytes of images went. Held by the cache alone = use count 1 under the lock: no build, no
+// batch (Recorder::Keep) and no caller holds it, and only a lookup under this lock hands it out.
+// Views (no image of their own) are left, and images in the image pool's blocks are left once the
+// pool's slack reached the budget's headroom (another hole there frees nothing). `keep`: the entry
+// just made. At most 256 victims and 4096 entries looked at per call.
+VkDeviceSize evictColdTexturesLocked(TextureCache& cache, VkDeviceSize want, std::vector<std::shared_ptr<Texture>>& victims, const Texture* keep = nullptr) {
+    auto& budget = Vram();
+    const bool pooledToo = budget.Tracked(VramClass::Slack) < budget.Headroom();
+    VkDeviceSize freed = 0;
+    std::size_t scanned = 0;
+    auto it = cache.entries.end();
+    while (it != cache.entries.begin() && freed < want && scanned < 4096 && victims.size() < 256) {
+        --it;
+        ++scanned;
+        const auto& texture = it->texture;
+        if (texture == nullptr || texture.get() == keep || texture.use_count() != 1) continue;
+        const auto bytes = texture->AllocationBytes();
+        if (bytes == 0 || (!pooledToo && texture->PooledMemory())) continue;
+        freed += bytes;
+        victims.push_back(std::move(it->texture));
+        const auto next = std::next(it);
+        eraseTexture(cache, it);
+        it = next;
+    }
+    return freed;
+}
+
 // APS5_PROFILE_DRAW: what the sampled-texture and storage-image lookups did, printed as [textures]
 // every 10 s (cumulative). Storage-sourced sampled textures need no CPU read; snapshots do, and a
 // pending read is a snapshot compare or read made while recorded work still wrote the surface (the
@@ -520,6 +549,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     }
     auto& cache = Textures();
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
+    // Textures the video-memory budget evicts below: destroyed after the lock is released.
+    std::vector<std::shared_ptr<Texture>> vramVictims;
     std::lock_guard lock(cache.mutex);
     if (auto it = findTexture(cache, key); it != cache.entries.end()) {
         if (it->source != nullptr) {
@@ -700,6 +731,13 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     cache.entries.push_front(std::move(entry));
     cache.index[key] = cache.entries.begin();
     if (ownsSnapshot) cache.surfaces[address] = cache.entries.begin();
+    // Over the video-memory budget, a new image makes the coldest ones go (the safe points'
+    // reclaimers cover the other classes; APS5_NO_VRAM_BUDGET=1: never over).
+    if (auto& budget = Vram(); budget.Over()) {
+        const auto freed = evictColdTexturesLocked(cache, budget.Excess(), vramVictims, texture.get());
+        budget.CountInlineTextureEvictions(vramVictims.size(), freed);
+        counters.cachedBytes.store(cache.bytes, std::memory_order_relaxed);
+    }
     reportTextureCounters();
     if (profile) LookupOutcomes::Add(source != nullptr ? LookupOutcomes::SampledMadeView : LookupOutcomes::SampledMadeSnapshot, start);
     return texture;
@@ -841,6 +879,37 @@ void FlushCachedTextures(VkDevice device) {
     for (const auto& entry : cache.entries) {
         if (entry.key.device == device) entry.texture->Flush();
     }
+}
+
+VkDeviceSize EvictColdTextures(VkDeviceSize want, std::uint64_t& evicted) {
+    evicted = 0;
+    std::vector<std::shared_ptr<Texture>> victims;
+    VkDeviceSize freed = 0;
+    {
+        auto& cache = Textures();
+        std::unique_lock lock(cache.mutex, std::try_to_lock);
+        if (!lock.owns_lock()) return 0;
+        freed = evictColdTexturesLocked(cache, want, victims);
+        TextureCounts().cachedBytes.store(cache.bytes, std::memory_order_relaxed);
+    }
+    evicted = victims.size();
+    // The victims are destroyed here, after the lock.
+    return freed;
+}
+
+VramCacheCensus SampledTextureCensus() {
+    VramCacheCensus census;
+    auto& cache = Textures();
+    std::unique_lock lock(cache.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return census;
+    census.measured = true;
+    census.entries = cache.entries.size();
+    for (const auto& entry : cache.entries) {
+        if (entry.texture == nullptr || entry.texture.use_count() != 1 || entry.texture->AllocationBytes() == 0) continue;
+        ++census.cold;
+        census.coldBytes += entry.texture->AllocationBytes();
+    }
+    return census;
 }
 
 void ClearCachedTextures(VkDevice device) {
@@ -2854,6 +2923,9 @@ void ResourceCache::noteMiss(const Key& key) {
 }
 
 void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
+    // A safe point of the video-memory budget (no cache lock held here): over the target its
+    // reclaimers run, this cache's "builds" among them (by try_lock, before the lock below).
+    RelieveVram();
     std::lock_guard lock(mutex);
     if (const auto found = index.find(key); found != index.end()) {
         if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
@@ -2892,6 +2964,42 @@ void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
         if (found == index.end() || found->second->second.get() != object) return;
     }
     erase(key);
+}
+
+VkDeviceSize ResourceCache::EvictCold(VkDeviceSize want, std::vector<std::shared_ptr<ShaderResources>>& victims) {
+    std::unique_lock lock(mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return 0;
+    constexpr std::size_t maxScan = 4096;
+    constexpr std::size_t maxVictims = 256;
+    VkDeviceSize estimate = 0;
+    std::size_t scanned = 0;
+    auto it = entries.end();
+    while (it != entries.begin() && scanned < maxScan && victims.size() < maxVictims && estimate < want) {
+        --it;
+        ++scanned;
+        // Held by the cache alone: no batch keeps it (Recorder::Keep), no recipe and no caller of
+        // Find holds it; only Find and FindLeaseTemplate under this lock hand it out.
+        if (it->second == nullptr || it->second.use_count() != 1) continue;
+        estimate += it->second->DeviceBytesHeldAlone();
+        victims.push_back(std::move(it->second));
+        index.erase(it->first);
+        it = entries.erase(it);
+    }
+    return estimate;
+}
+
+VramCacheCensus ResourceCache::ColdCensus() {
+    VramCacheCensus census;
+    std::unique_lock lock(mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return census;
+    census.measured = true;
+    census.entries = entries.size();
+    for (const auto& [key, object] : entries) {
+        if (object == nullptr || object.use_count() != 1) continue;
+        ++census.cold;
+        census.coldBytes += object->DeviceBytesHeldAlone();
+    }
+    return census;
 }
 
 bool ResourceCache::Touch(const Key& key) {
@@ -3952,6 +4060,22 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSur
 
 ShaderResources::~ShaderResources() {
     release();
+}
+
+VkDeviceSize ShaderResources::DeviceBytesHeldAlone() const {
+    VkDeviceSize bytes = guestMemory.DeviceBytesHeldAlone();
+    for (const auto& allocation : allocations) {
+        if (allocation.buffer != nullptr && allocation.buffer->DeviceLocalOnly()) bytes += allocation.buffer->AllocationBytes();
+    }
+    for (std::size_t index = 0; index < textures.size(); ++index) {
+        const auto& texture = textures[index];
+        if (texture == nullptr || texture.use_count() > 2) continue;
+        // A texture bound twice is counted once (and its two references are both this object's).
+        const auto earlier = textures.begin() + static_cast<std::ptrdiff_t>(index);
+        if (std::find(textures.begin(), earlier, texture) != earlier) continue;
+        bytes += texture->AllocationBytes();
+    }
+    return bytes;
 }
 
 void ShaderResources::release() noexcept {

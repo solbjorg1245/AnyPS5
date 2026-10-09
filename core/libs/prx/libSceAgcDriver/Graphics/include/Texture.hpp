@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -46,7 +47,7 @@ struct OwnedImage {
     ~OwnedImage() {
         if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
         if (pool) pool->Release(allocation);
-        else if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+        else if (memory) FreeDeviceMemory(context, memory);
     }
     Context context;
     VkImage image;
@@ -82,6 +83,8 @@ public:
     // The layout the image is kept in while sampled.
     VkImageLayout Layout() const { return layout; }
     VkDeviceSize AllocationBytes() const { return allocationBytes; }
+    // Its image lives in a block of the image pool (freeing it leaves a hole there, see VramBudget).
+    bool PooledMemory() const { return owned != nullptr && owned->allocation.pooled; }
     // Whether this texture is a view of a storage image (no snapshot of its own).
     bool ViewsStorageImage() const { return storageSource != nullptr; }
     const StorageTexture* StorageSource() const { return storageSource.get(); }

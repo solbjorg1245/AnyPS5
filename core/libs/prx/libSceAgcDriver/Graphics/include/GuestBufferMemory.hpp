@@ -210,6 +210,15 @@ void NoteResidentReadsFinished(std::uint64_t recorderId, std::uint64_t serial);
 // Drops every cached copy (a holder keeps its own): tests, and the device teardown. Returns the
 // copies still alive (held by builds).
 std::size_t ClearResidentReads();
+// Video-memory budget ("resident" reclaimer, a safe point): drops the cached copies nothing else
+// holds (no build), least recently used first, until about `want` bytes went; by try_lock.
+VkDeviceSize TrimResidentReads(VkDeviceSize want, std::uint64_t& evicted);
+// Video-memory budget ("shadows" reclaimer, any thread): drops staging-chain registry entries
+// whose shadow nothing else holds (no build, no batch, no queued copy-back), so the shadow goes
+// back to the pool; the next use of such a range copies from its import, as after the registry's
+// own reset. By try_lock.
+VkDeviceSize TrimStagedShadows(VkDeviceSize want, std::uint64_t& evicted);
+VramCacheCensus StagedShadowCensus();
 // Tests: the resident checks take every write-watch collect as failed.
 void ResidentReadsFailCollectForTests(bool fail);
 
@@ -447,6 +456,9 @@ public:
     // ranges (an address-based build: sorted and merged, immutable, the same list for every build
     // of the space) returned by reference, or null without a space. Nothing once committed.
     std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> InPlaceReadSet(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
+    // The device-local bytes of the regions' buffers nothing but this object holds (staging
+    // shadows; see ShaderResources::DeviceBytesHeldAlone).
+    VkDeviceSize DeviceBytesHeldAlone() const;
 
 private:
     struct Region {
