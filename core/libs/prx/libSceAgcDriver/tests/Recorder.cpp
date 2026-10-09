@@ -2902,6 +2902,16 @@ void residentBufferTests(const Device& device, Recorder& recorder) {
     HostImportFor(context, address, bytes);
 }
 
+// Sets (or, for an empty value, removes) an environment variable.
+void setEnvironment(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    if (*value != '\0') setenv(name, value, 1);
+    else unsetenv(name);
+#endif
+}
+
 bool lineHas(const std::vector<std::string>& lines, const std::string& prefix, const std::string& part) {
     return std::any_of(lines.begin(), lines.end(), [&](const std::string& line) { return line.rfind(prefix, 0) == 0 && line.find(part) != std::string::npos; });
 }
@@ -2949,6 +2959,10 @@ void gpuTimingDigestTests() {
     pass.inPlaceInputs = MiB;
     pass.inPlaceRead = 2 * MiB;
     ranges.push_back(pass);
+    // Ended by Submit (a throw between Begin and End): it spans the rest of the batch.
+    auto open = range(Recorder::ClassKey(Class::DccClear), Kind::Class, 1, 9100, 10000);
+    open.leftOpen = true;
+    ranges.push_back(open);
     GpuTimingDigest digest;
     // One tick is a microsecond: 1000 ticks are a millisecond.
     digest.AddBatch(ranges, 1000.0);
@@ -2963,10 +2977,13 @@ void gpuTimingDigestTests() {
     Require(approx(queues.at(0).timedMs, 5.1) && approx(queues.at(0).programMs, 2) && approx(queues.at(0).classMs, 3.1) && approx(queues.at(0).batchMs, 10) && queues.at(0).batches == 1, "digest: wrong queue 0 split");
     Require(approx(queues.at(1).timedMs, 4) && approx(queues.at(1).programMs, 0) && approx(queues.at(1).classMs, 4) && queues.at(1).ranges == 3, "digest: wrong queue 1 split (a transfer counted as a dispatch?)");
     Require(digest.Passes().count(0x50000) == 1 && digest.Passes().at(0x50000).draws == 3 && digest.Passes().at(0x50000).inputs == MiB && approx(digest.Passes().at(0x50000).ms, 3), "digest: wrong draw pass");
-    const auto lines = digest.Report(2, 0, 512);
+    Require(digest.LeftOpen() == 1 && digest.Class(Class::DccClear).count == 0, "digest: a range left open entered the class totals");
+    const auto lines = digest.Report(2, 4, 512, 3);
     Require(lines.size() == 15, "digest: wrong report line count");
     Require(lines.front().rfind("[gputime] 3 ms of GPU time in 1 batches", 0) == 0 && lines.front().find(" 0x248994d00 x1 2ms r1.0/w0.5MiB") != std::string::npos, "digest: wrong program line");
     Require(lineHas(lines, "[gputime] row busy:", "5.00 ms per present") && lineHas(lines, "[gputime] row programs:", "1.00 ms per present (20.0% of busy)"), "digest: wrong busy or programs row");
+    Require(lines.front().find("4 ranges dropped at the 512 cap; 1 left open, ended at submit and not counted; 3 refused inside a render pass)") != std::string::npos, "digest: wrong dropped, left-open or refused counts");
+    Require(lineHas(lines, "[gputime] row busy:", "untimed holds the work of x2.0 ranges dropped at the 512 cap and x0.5 left open"), "digest: the busy row lost the dropped ranges");
     Require(lineHas(lines, "[gputime] row copy-back:", "1.50 ms per present (30.0% of busy), x0.5, 1.00 MiB"), "digest: wrong copy-back row");
     Require(lineHas(lines, "[gputime] row barriers:", "0.05 ms per present") && lineHas(lines, "[gputime] row guest-transfers:", "0.50 ms per present") && lineHas(lines, "[gputime] row untimed:", "0.45 ms per present"), "digest: wrong barrier, guest or untimed row");
     Require(lineHas(lines, "[gputime] row present-blit:", "0.35 ms per present"), "digest: wrong present-blit row");
@@ -3009,9 +3026,9 @@ void gpuTimingRecorderTests(const Device& device, Recorder& recorder) {
         return;
     }
     {
-        _putenv_s("APS5_COALESCE_COPY_BACKS", "1");
+        setEnvironment("APS5_COALESCE_COPY_BACKS", "1");
         Recorder coalescing(context);
-        _putenv_s("APS5_COALESCE_COPY_BACKS", "");
+        setEnvironment("APS5_COALESCE_COPY_BACKS", "");
         Require(coalescing.CoalescesCopyBacks(), "APS5_COALESCE_COPY_BACKS=1 did not turn coalescing on");
         coalescing.Activate();
         auto source = std::make_shared<Buffer>(context, 4096, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
@@ -3068,7 +3085,51 @@ void gpuTimingRecorderTests(const Device& device, Recorder& recorder) {
         Require(totals.Queues().count(7) == 1 && totals.Queues().at(7).ranges >= 1, "the program range lost its queue tag");
         Require(totals.Passes().count(0x70000) == 1 && totals.Passes().at(0x70000).draws == 2 && totals.Passes().at(0x70000).inputs == 8192, "the draw pass lost its target or draws");
         Require(totals.Transfers().count >= 1 && totals.Programs().count(0xdef000) == 1, "the transfer range was not read as a transfer");
-        Require(totals.Class(Class::DccClear).count >= 1, "the range left open was not ended at Submit");
+        Require(totals.LeftOpen() >= 1 && totals.Class(Class::DccClear).count == 0, "the range left open was not ended at Submit, or entered the class totals");
+        // More ranges in one batch than the old cap of 512: none dropped.
+        const auto cap = Recorder::GpuTimingRangeCap();
+        if (cap >= 700) {
+            const auto fills = totals.Class(Class::Fill).count;
+            static_cast<void>(coalescing.Commands());
+            for (int i = 0; i < 600; ++i) coalescing.EndGpuTiming(coalescing.BeginGpuTiming(Class::Fill));
+            coalescing.Submit();
+            coalescing.Sync();
+            Require(Recorder::GpuTimingTotals().Class(Class::Fill).count == fills + 600, "ranges past 512 in one batch were dropped");
+        } else {
+            std::cout << "APS5_PROFILE_GPU_RANGES=" << cap << ": the large batch not tested\n";
+        }
+        // A range begun while a render pass is open (no caller does this) is refused and counted;
+        // the pass ends at Submit as usual.
+        if (!Recorder::GpuTimingFlushes()) {
+            VkSubpassDescription subpass{};
+            subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+            VkRenderPassCreateInfo passInfo{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+            passInfo.subpassCount = 1;
+            passInfo.pSubpasses = &subpass;
+            VkRenderPass renderPass = VK_NULL_HANDLE;
+            Check(context.Function<PFN_vkCreateRenderPass>("vkCreateRenderPass")(context.device, &passInfo, nullptr, &renderPass), "vkCreateRenderPass");
+            VkFramebufferCreateInfo framebufferInfo{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+            framebufferInfo.renderPass = renderPass;
+            framebufferInfo.width = 1;
+            framebufferInfo.height = 1;
+            framebufferInfo.layers = 1;
+            VkFramebuffer framebuffer = VK_NULL_HANDLE;
+            Check(context.Function<PFN_vkCreateFramebuffer>("vkCreateFramebuffer")(context.device, &framebufferInfo, nullptr, &framebuffer), "vkCreateFramebuffer");
+            const auto commands = coalescing.Commands();
+            VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+            begin.renderPass = renderPass;
+            begin.framebuffer = framebuffer;
+            begin.renderArea.extent = {1, 1};
+            context.Function<PFN_vkCmdBeginRenderPass>("vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
+            coalescing.LeaveRenderPassOpen(0x5000, Recorder::NoTiming, true);
+            const auto refused = Recorder::GpuTimingRefusedInPass();
+            Require(coalescing.BeginGpuTiming(Class::Fill) == Recorder::NoTiming && Recorder::GpuTimingRefusedInPass() == refused + 1, "a range begun inside a render pass was timed");
+            Require(coalescing.RenderPassOpen(), "a refused range ended the render pass");
+            coalescing.Submit();
+            coalescing.Sync();
+            context.Function<PFN_vkDestroyFramebuffer>("vkDestroyFramebuffer")(context.device, framebuffer, nullptr);
+            context.Function<PFN_vkDestroyRenderPass>("vkDestroyRenderPass")(context.device, renderPass, nullptr);
+        }
     }
     recorder.Activate();
     {

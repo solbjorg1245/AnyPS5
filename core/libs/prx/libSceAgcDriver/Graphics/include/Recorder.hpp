@@ -581,6 +581,13 @@ public:
     // range with Commands(), as before (it records every queued copy-back at every range).
     std::uint32_t BeginGpuTiming(std::uint64_t key);
     static bool GpuTimingFlushes();
+    // Timed ranges per batch (APS5_PROFILE_GPU_RANGES, default 8192, 64..65536; read once): a
+    // batch's ranges past it are dropped and counted ([gputime] "ranges dropped").
+    static std::uint32_t GpuTimingRangeCap();
+    // Ranges a Begin*Timing refused because a render pass was open (every caller takes its
+    // command buffer first, which ends the pass; a range begun inside it would nest in the pass's
+    // draw range). Never reset; [gputime] reports the window's part.
+    static std::uint64_t GpuTimingRefusedInPass();
     // A guest copy's transfer (VulkanDevice::CopyBuffer): keyed by its program address like a
     // dispatch, but nested in its copy class range, so the [gputime] split rows leave it there.
     std::uint32_t BeginTransferTiming(std::uint64_t programAddress);
@@ -673,6 +680,9 @@ public:
         std::uint64_t target = 0;
         // The end stamp was written (EndGpuTiming, or Submit for a range left open).
         bool ended = false;
+        // Ended by Submit, not by its End (a throw between Begin and End): it spans the rest of
+        // the batch, so the digest counts it apart and adds it to no total.
+        bool leftOpen = false;
     };
     // The [gputime] totals since the last report (tests; under the timing mutex).
     static GpuTimingDigest GpuTimingTotals();
@@ -1053,9 +1063,11 @@ public:
     double UnionMs() const { return unionMs; }
     double BatchMs() const { return batchMs; }
     std::uint64_t Batches() const { return batches; }
-    // The report's lines (no newline), given the presents and the ranges dropped at the cap over
-    // the window.
-    std::vector<std::string> Report(std::uint64_t presents, std::uint64_t dropped, std::uint32_t cap) const;
+    // Ranges Submit ended (TimedRange::leftOpen): counted, in no total and not in the union.
+    std::uint64_t LeftOpen() const { return leftOpen; }
+    // The report's lines (no newline), given the presents, the ranges dropped at the cap and the
+    // ranges refused inside a render pass over the window.
+    std::vector<std::string> Report(std::uint64_t presents, std::uint64_t dropped, std::uint32_t cap, std::uint64_t refusedInPass = 0) const;
     void Clear() { *this = GpuTimingDigest{}; }
 
 private:
@@ -1071,6 +1083,7 @@ private:
     double unionMs = 0;
     double batchMs = 0;
     std::uint64_t batches = 0;
+    std::uint64_t leftOpen = 0;
 };
 
 }

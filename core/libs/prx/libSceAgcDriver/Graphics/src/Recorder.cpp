@@ -2376,7 +2376,6 @@ void Recorder::FlushStores() {
 
 namespace {
 
-constexpr std::uint32_t MaxTimedRanges = 512;
 constexpr std::size_t CommandClasses = static_cast<std::size_t>(Recorder::CommandClass::Count);
 constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh", "deferred-flat"};
 // [barriers] counters by class (relaxed: only reported) and the [gputime] totals, which the
@@ -2397,6 +2396,8 @@ std::atomic<std::int64_t> traceBarriersLeft{[] {
 std::atomic<std::uint64_t> timingPresents{0};
 std::atomic<std::uint64_t> presentSerial{0};
 std::atomic<std::uint64_t> timingDropped{0};
+std::atomic<std::uint64_t> timingRefusedInPass{0};
+std::uint64_t timingRefusedReported = 0;
 HostMutex timingMutex;
 GpuTimingDigest timingDigest;
 
@@ -2583,6 +2584,22 @@ bool Recorder::GpuTimingFlushes() {
     return flushes;
 }
 
+std::uint32_t Recorder::GpuTimingRangeCap() {
+    // 512 (the old cap) held at BATCH_CAP 64 (t373: ~80 ranges per batch); uncapped batches hold
+    // several times that. Every profiled pool has this size, so they are recycled like the
+    // unprofiled 2-query ones (release).
+    static const std::uint32_t cap = [] {
+        const char* text = std::getenv("APS5_PROFILE_GPU_RANGES");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+        return value == 0 ? 8192u : static_cast<std::uint32_t>(std::clamp<unsigned long long>(value, 64, 65536));
+    }();
+    return cap;
+}
+
+std::uint64_t Recorder::GpuTimingRefusedInPass() {
+    return timingRefusedInPass.load(std::memory_order_relaxed);
+}
+
 std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
     return startGpuTiming(key, TimingKind::Program);
 }
@@ -2595,8 +2612,18 @@ std::uint32_t Recorder::startGpuTiming(std::uint64_t key, TimingKind kind) {
     if (!GpuTimingEnabled()) return NoTiming;
     // The old form: Commands() records the queued copy-backs (every one under coalescing, so a
     // profiled run hid coalescing's gain) and clears the barrier-merge state at every range.
-    if (GpuTimingFlushes()) Commands();
-    else ensureOpen();
+    if (GpuTimingFlushes()) {
+        Commands();
+    } else {
+        ensureOpen();
+        // Every caller takes its command buffer first, which ends an open pass. A range begun
+        // inside one would nest in the pass's draw range (counted twice in the rows) and, with no
+        // pool yet, reset the pool inside the pass: not timed, counted.
+        if (open->renderPass.open) {
+            timingRefusedInPass.fetch_add(1, std::memory_order_relaxed);
+            return NoTiming;
+        }
+    }
     return beginTiming(key, kind);
 }
 
@@ -2604,9 +2631,10 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key, TimingKind kind) {
     const bool full = GpuTimingEnabled();
     if (!full && !(key == BatchTimingKey && DrawProfiled())) return NoTiming;
     const auto commands = open->commands;
-    const std::uint32_t queryCount = full ? MaxTimedRanges * 2 : 2;
+    const std::uint32_t queryCount = full ? GpuTimingRangeCap() * 2 : 2;
     if (open->queries == VK_NULL_HANDLE) {
-        if (!full && !sparePools.empty()) {
+        // Every pool of the process has queryCount queries (both switches are read once).
+        if (!sparePools.empty()) {
             open->queries = sparePools.back();
             sparePools.pop_back();
         } else {
@@ -2770,7 +2798,10 @@ void Recorder::readGpuTiming(Batch& batch) {
     if (now - lastReport < std::chrono::seconds(10)) return;
     lastReport = now;
     const auto presents = timingPresents.exchange(0, std::memory_order_relaxed);
-    for (const auto& line : timingDigest.Report(presents, timingDropped.exchange(0, std::memory_order_relaxed), MaxTimedRanges)) std::fprintf(stderr, "%s\n", line.c_str());
+    const auto refused = timingRefusedInPass.load(std::memory_order_relaxed);
+    const auto refusedNow = refused - timingRefusedReported;
+    timingRefusedReported = refused;
+    for (const auto& line : timingDigest.Report(presents, timingDropped.exchange(0, std::memory_order_relaxed), GpuTimingRangeCap(), refusedNow)) std::fprintf(stderr, "%s\n", line.c_str());
     timingDigest.Clear();
     lock.unlock();
     reportBarriers();
@@ -2817,6 +2848,12 @@ void GpuTimingDigest::AddBatch(std::span<const Recorder::TimedRange> ranges, dou
     const auto firstClass = Recorder::ClassKey(CommandClass::DispatchLeading);
     for (const auto& range : ranges) {
         const double ms = range.end > range.begin ? static_cast<double>(range.end - range.begin) * period / 1e6 : 0.0;
+        if (range.leftOpen) {
+            // Ended by Submit: its span is not its work. In no total and not in the union (its
+            // work stays in "untimed").
+            ++leftOpen;
+            continue;
+        }
         auto& queue = queues[range.queue];
         if (range.kind == Kind::Batch) {
             batchMs += ms;
@@ -2881,14 +2918,14 @@ void GpuTimingDigest::AddClass(CommandClass which, double nanoseconds, std::uint
     queueTotals.timedMs += nanoseconds / 1e6;
 }
 
-std::vector<std::string> GpuTimingDigest::Report(std::uint64_t presents, std::uint64_t dropped, std::uint32_t cap) const {
+std::vector<std::string> GpuTimingDigest::Report(std::uint64_t presents, std::uint64_t dropped, std::uint32_t cap, std::uint64_t refusedInPass) const {
     using Count = unsigned long long;
     std::vector<std::string> lines;
     const double per = presents != 0 ? 1.0 / static_cast<double>(presents) : 0.0;
     const auto mib = [](std::uint64_t bytes) { return static_cast<double>(bytes) / 1048576.0; };
     // 1. Programs and classes (the first field stays the program sum).
     std::string line;
-    appendFormat(line, "[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program (MiB bound in place read/written, L address-based):", programMs, Count(batches), batchMs, classMs, unionMs, batchMs - unionMs, Count(presents), Count(dropped), cap);
+    appendFormat(line, "[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap; %llu left open, ended at submit and not counted; %llu refused inside a render pass); by program (MiB bound in place read/written, L address-based):", programMs, Count(batches), batchMs, classMs, unionMs, batchMs - unionMs, Count(presents), Count(dropped), cap, Count(leftOpen), Count(refusedInPass));
     std::vector<std::pair<std::uint64_t, const Totals*>> hot;
     hot.reserve(programs.size());
     for (const auto& [key, totals] : programs) hot.emplace_back(key, &totals);
@@ -2955,7 +2992,7 @@ std::vector<std::string> GpuTimingDigest::Report(std::uint64_t presents, std::ui
     for (const auto& row : rows) rowsMs += row.totals.ms;
     const double busy = batchMs > 0 ? batchMs : 1.0;
     line.clear();
-    appendFormat(line, "[gputime] row busy: %.2f ms per present (batch spans, x%.1f batches, %llu presents); the rows sum to %.2f (ranges nested in others %.2f)", batchMs * per, static_cast<double>(batches) * per, Count(presents), rowsMs * per, (rowsMs - batchMs) * per);
+    appendFormat(line, "[gputime] row busy: %.2f ms per present (batch spans, x%.1f batches, %llu presents); the rows sum to %.2f (ranges nested in others %.2f); untimed holds the work of x%.1f ranges dropped at the %u cap and x%.1f left open", batchMs * per, static_cast<double>(batches) * per, Count(presents), rowsMs * per, (rowsMs - batchMs) * per, static_cast<double>(dropped) * per, cap, static_cast<double>(leftOpen) * per);
     lines.push_back(std::move(line));
     for (const auto& row : rows) {
         line.clear();
@@ -3661,8 +3698,11 @@ void Recorder::Submit() {
     // A range begun and never ended (a throw between its Begin and End) is ended here: the reap
     // waits for every query of the batch (vkGetQueryPoolResults with WAIT_BIT), and an unwritten
     // one would hold it forever.
+    // Its span runs to here, not to its end, so the digest counts it apart (TimedRange::leftOpen).
     for (std::uint32_t index = 0; index < open->timed.size(); ++index) {
-        if (index != open->batchTiming && !open->timed[index].ended) EndGpuTiming(index);
+        if (index == open->batchTiming || open->timed[index].ended) continue;
+        open->timed[index].leftOpen = true;
+        EndGpuTiming(index);
     }
     EndGpuTiming(open->batchTiming);
     if (!GpuTimingEnabled()) reportBarriers();
@@ -4227,7 +4267,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
 
 void Recorder::release(Batch& batch) noexcept {
     if (batch.queries != VK_NULL_HANDLE) {
-        if (!GpuTimingEnabled() && sparePools.size() < 64) {
+        if (sparePools.size() < 64) {
             try {
                 sparePools.push_back(batch.queries);
                 batch.queries = VK_NULL_HANDLE;
