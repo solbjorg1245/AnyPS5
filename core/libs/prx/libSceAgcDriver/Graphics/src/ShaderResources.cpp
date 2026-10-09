@@ -4402,7 +4402,26 @@ bool SkipWriteBack() {
 }
 }
 
+void ShaderResources::noteFrameTrace() {
+    std::string text;
+    char item[128];
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        if (!storageWritten[index] || storageTextures[index] == nullptr) continue;
+        const auto& written = storageTextures[index]->Descriptor();
+        std::snprintf(item, sizeof(item), " w=0x%llx/%ux%u/f%u/m%u", static_cast<unsigned long long>(written.baseAddress), written.width, written.height, written.format, index < storageMips.size() ? storageMips[index] : 0u);
+        text += item;
+    }
+    for (const auto& [begin, end] : guestMemory.Writes()) {
+        std::snprintf(item, sizeof(item), " wb=0x%llx+0x%llx", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
+        text += item;
+    }
+    // The bound resources (textures with their surfaces, storage images, buffers).
+    AgcDriver::FrameTrace::NoteWrites(text + " |" + Describe());
+}
+
 void ShaderResources::WriteBack() {
+    // A synchronous draw publishes no pending writes (MarkGpuWrites): its note is taken here.
+    if (AgcDriver::FrameTrace::Noting()) noteFrameTrace();
     WriteBackBuffers();
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
@@ -4456,22 +4475,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     part(timing.marksWritesMs);
     guestMemory.MarkDirectWrites();
     part(timing.marksDirectMs);
-    if (AgcDriver::FrameTrace::Active()) {
-        std::string text;
-        char item[96];
-        for (std::size_t index = 0; index < storageTextures.size(); ++index) {
-            if (!storageWritten[index] || storageTextures[index] == nullptr) continue;
-            const auto& written = storageTextures[index]->Descriptor();
-            std::snprintf(item, sizeof(item), " w=0x%llx/%ux%u/f%u", static_cast<unsigned long long>(written.baseAddress), written.width, written.height, written.format);
-            text += item;
-        }
-        for (const auto& [begin, end] : guestMemory.Writes()) {
-            std::snprintf(item, sizeof(item), " wb=0x%llx+0x%llx", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
-            text += item;
-        }
-        // The bound resources (textures with their surfaces, storage images, buffers).
-        AgcDriver::FrameTrace::NoteWrites(text + " |" + Describe());
-    }
+    if (AgcDriver::FrameTrace::Noting()) noteFrameTrace();
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();
     // Recorded uses only (dispatches and recorded draws): a synchronous draw writes back in

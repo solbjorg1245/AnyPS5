@@ -67,6 +67,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/DeviceAccess.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Diagnostics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/FrameTrace.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/PassDump.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DataHitVerification.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/Dispatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/FastDispatch.cpp
@@ -151,6 +152,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GuestTextureResource.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GuestSamplerResource.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureFormat.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TexelStats.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DccMetadata.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureTiling.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureDetiler.cpp
@@ -462,6 +464,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         tests/GuestAllocations.cpp
         tests/LiveStack.cpp
         tests/TextureFormat.cpp
+        tests/TexelStats.cpp
         tests/TextureTiling.cpp
         tests/ImageMemoryPool.cpp
         tests/GuestTextureResource.cpp
@@ -486,6 +489,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/GuestTextureResource.cpp
         Graphics/src/GuestSamplerResource.cpp
         Graphics/src/TextureFormat.cpp
+        Graphics/src/TexelStats.cpp
         Graphics/src/DccMetadata.cpp
         Graphics/src/TextureTiling.cpp
         Graphics/src/TextureDetiler.cpp
@@ -691,6 +695,7 @@ if(AGC_BUILD_VISUAL_TEST)
             Graphics/src/GuestTextureResource.cpp
             Graphics/src/GuestSamplerResource.cpp
             Graphics/src/TextureFormat.cpp
+            Graphics/src/TexelStats.cpp
             Graphics/src/DccMetadata.cpp
             Graphics/src/TextureTiling.cpp
             Graphics/src/TextureDetiler.cpp

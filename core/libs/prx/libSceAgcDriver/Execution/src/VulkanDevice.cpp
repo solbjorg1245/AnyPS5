@@ -2051,6 +2051,14 @@ void VulkanDevice::CaptureImages(const std::string& prefix, std::span<const std:
     std::fprintf(stderr, "[capture] %s: %zu storage image files, %zu depth surface files and %zu buffers\n", prefix.c_str(), images, depths, buffers);
 }
 
+std::size_t VulkanDevice::ReadBackImage(std::uint64_t address, std::uint32_t level, std::uint32_t firstLayer, std::uint32_t layers, const std::function<void(const Graphics::ImageReadback&)>& consume) {
+    return Graphics::StorageTexture::ReadBack(graphicsContext(), address, level, firstLayer, layers, consume);
+}
+
+std::size_t VulkanDevice::ReadBackDepth(std::uint64_t address, std::uint32_t slice, const std::function<void(const Graphics::ImageReadback&)>& consume) {
+    return Graphics::ReadBackDepthSurface(graphicsContext(), address, slice, consume);
+}
+
 void VulkanDevice::CaptureTargets() {
     static const char* directory = std::getenv("APS5_CAPTURE_DIR");
     if (directory == nullptr) return;

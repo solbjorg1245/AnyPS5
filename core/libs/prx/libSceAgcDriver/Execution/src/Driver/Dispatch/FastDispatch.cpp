@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastRead.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/PassDump.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -140,7 +141,7 @@ bool Driver::fastDispatch(const Submission& submission, const ShaderSnapshot& sn
         // APS5_FAST_DISPATCH_VERIFY: the words the walk serves without their final value, for the
         // verify below.
         const FastServedLogScope servedLog(fastDispatchVerify());
-        if (debugMode()) declined = Decline::Debug;
+        if (debugMode() || PassDump::FrameActive()) declined = Decline::Debug;
         else if (localDevice == nullptr) declined = Decline::NoDevice;
         // Without the pending-block table the reader could not see recorded GPU writes.
         else if (!Graphics::Recorder::PendingBlocksTracked()) declined = Decline::Untracked;

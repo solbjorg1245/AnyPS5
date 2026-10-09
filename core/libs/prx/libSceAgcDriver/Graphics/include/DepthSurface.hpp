@@ -3,8 +3,10 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TexelStats.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -37,6 +39,10 @@ void NoteDepthMetadataClear(std::uint64_t begin, std::uint64_t end);
 // <prefix>depth_<address>_<width>x<height>_l<slice>.raw and <prefix>stencil_... (u32 width, height,
 // VkFormat, then the texels). The GPU must be idle. Returns the number of files written.
 std::size_t DumpDepthSurfaces(const Context& context, const std::string& prefix, std::span<const std::uint64_t> addresses = {});
+// Debug aid (APS5_PASS_DUMP, see Execution/include/Driver/PassDump.hpp): reads back the depth plane
+// (D16_UNORM or D32_SFLOAT) of array slice `slice` of every depth surface whose depth is at
+// `address`, each handed to `consume`. The GPU must be idle. Returns the number of surfaces read.
+std::size_t ReadBackDepthSurface(const Context& context, std::uint64_t address, std::uint32_t slice, const std::function<void(const ImageReadback&)>& consume);
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components);
 // Whether DepthSurfaceTexture would answer a lookup of `resource` with `texture` again (the newest
 // surface covering it is not overwritten and still hands the texture out), with the lookup's side
