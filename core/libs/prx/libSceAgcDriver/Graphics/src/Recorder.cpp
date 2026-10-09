@@ -67,6 +67,8 @@ bool DrawProfiled() {
 }
 
 std::uint64_t syncCounts[5] = {};
+// What BoundKeptBytes did (Recorder::KeptBoundTotals), under the GpuMutex like syncCounts.
+Recorder::KeptBoundCounts keptBound;
 // Fence wait time by sync source (APS5_PROFILE_DRAW), and the source CountSync announced for the
 // Sync/SyncThrough that follows it on this thread.
 double syncWaitedMs[5] = {};
@@ -122,6 +124,13 @@ void CountSiteWait(double ms) {
     ++entry.batches;
     entry.waitedMs += ms;
 }
+
+// Restores the thread's active sync-site entry on every exit path (a Check throw on a lost device
+// included), so the next sync on the thread is not attributed to this one's site.
+struct RestoreSyncSite {
+    std::size_t site;
+    ~RestoreSyncSite() { activeSyncSite = site; }
+};
 
 // The sites by wait, longest first, as "source@+offset syncs/batches/wait" (offsets symbolize with
 // nm against the driver's image like the [guestmem] callers; +0x0 is the overflow entry).
@@ -3435,16 +3444,47 @@ void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
     open->keptBytes += bytes;
 }
 
+std::size_t Recorder::KeptBytesBudget() {
+    static const std::size_t budget = [] {
+        if (std::getenv("APS5_NO_KEPT_BYTES_BOUND") != nullptr) return std::size_t{0};
+        const char* text = std::getenv("APS5_KEPT_BYTES_MIB");
+        if (text == nullptr || *text == '\0') return std::size_t{512} << 20u;
+        // At most 1 TiB, so neither the shift nor the doubled in-flight bound can overflow.
+        return static_cast<std::size_t>(std::min<unsigned long long>(std::strtoull(text, nullptr, 10), 1ull << 20u)) << 20u;
+    }();
+    return budget;
+}
+
+Recorder::KeptBoundCounts Recorder::KeptBoundTotals() {
+    return keptBound;
+}
+
 void Recorder::BoundKeptBytes() {
-    static const bool bounded = std::getenv("APS5_NO_KEPT_BYTES_BOUND") == nullptr;
-    if (!bounded || !GuestMemory::GpuMutex().HeldByThisThread()) return;
-    if (open != nullptr && open->keptBytes >= KeptBytesBudget) Submit();
-    if (DeferredBytes() != 0 && inFlightKeptBytes + DeferredBytes() > 2 * KeptBytesBudget) DestroyDeferred(TakeDeferred(), false);
-    while (!inFlight.empty() && inFlightKeptBytes > 2 * KeptBytesBudget) {
+    const auto budget = KeptBytesBudget();
+    if (budget == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return;
+    if (open != nullptr && open->keptBytes >= budget) {
+        ++keptBound.submits;
+        Submit();
+    }
+    if (DeferredBytes() != 0 && inFlightKeptBytes + DeferredBytes() > 2 * budget) {
+        ++keptBound.deferredFlushes;
+        DestroyDeferred(TakeDeferred(), false);
+    }
+    if (inFlight.empty() || inFlightKeptBytes <= 2 * budget) return;
+    // An "other" sync charged to the texture lookup that called this, so the [recorder] source and
+    // site tables carry the bound's waits (finish adds their time; one still unsignaled is also a
+    // [lock] locked GPU wait), and the kept-bytes line counts them apart.
+    ++syncCounts[4];
+    ++keptBound.waits;
+    const RestoreSyncSite restoreSite{BeginSyncSite(4, __builtin_return_address(0))};
+    const auto start = std::chrono::steady_clock::now();
+    while (!inFlight.empty() && inFlightKeptBytes > 2 * budget) {
         auto batch = std::move(inFlight.front());
         inFlight.pop_front();
+        ++keptBound.waitedBatches;
         finish(std::move(batch), true, 4, true);
     }
+    keptBound.waitedMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
 namespace {
@@ -4137,6 +4177,8 @@ void Recorder::Submit() {
     }
     inFlight.push_back(std::move(batch));
     inFlightKeptBytes += inFlight.back()->keptBytes;
+    keptBound.peakInFlight = std::max(keptBound.peakInFlight, inFlightKeptBytes);
+    keptBound.peakBatch = std::max(keptBound.peakBatch, inFlight.back()->keptBytes);
     if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
 }
 
@@ -4156,13 +4198,6 @@ struct UnlockedWaiter {
     ~UnlockedWaiter() { count.fetch_sub(1, std::memory_order_acq_rel); }
     UnlockedWaiter(const UnlockedWaiter&) = delete;
     UnlockedWaiter& operator=(const UnlockedWaiter&) = delete;
-};
-
-// Restores the thread's active sync-site entry on every exit path (a Check throw on a lost device
-// included), so the next sync on the thread is not attributed to this one's site.
-struct RestoreSyncSite {
-    std::size_t site;
-    ~RestoreSyncSite() { activeSyncSite = site; }
 };
 
 // The timeline wait itself, on handles copied out of the recorder: the caller holds no mutex, and
@@ -4562,6 +4597,10 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                     std::fprintf(stderr, "[recorder] %llu syncs waited %.1f s for the GPU in total (sources, count/wait: idle %llu/%.1fs, pending write %llu/%.1fs, recorded store %llu/%.1fs, address-based %llu/%.1fs, other %llu/%.1fs); hook %llu calls, %llu locked; %llu targeted syncs left %llu batches in flight; snapshot %llu rebuilds (%llu incremental) %.0f ms, %llu notes covered; %llu unlocked timeline waits %.1f s; %llu submissions, %zu label entries, %llu completion labels pending; fence waits by thread (count/wait):%s; top sync sites (source@caller syncs/batches/wait):%s; under holds (cumulative): %llu completions ran %.0f ms (kept objects released %.0f ms), pending-write syncs from completions: %llu skipped, %llu waited %.0f ms; %llu reaps (%llu with work) retired %llu batches in %.0f ms; hook waits unlocked %llu / %.0f ms GPU (pending write %llu / %.0f ms, recorded store %llu / %.0f ms) + %.0f ms relock (%llu found the recorder torn down), locked %llu; deferred releases: on the release thread %llu batches (%llu objects) in %.0f ms, inline %llu batches (%llu objects) in %.0f ms (%llu batches over the queue bound of %zu), queue max %llu batches, %llu pending\n",static_cast<unsigned long long>(waits), waitedMs / 1000, static_cast<unsigned long long>(syncCounts[0]), syncWaitedMs[0] / 1000, static_cast<unsigned long long>(syncCounts[1]), syncWaitedMs[1] / 1000, static_cast<unsigned long long>(syncCounts[2]), syncWaitedMs[2] / 1000, static_cast<unsigned long long>(syncCounts[3]), syncWaitedMs[3] / 1000, static_cast<unsigned long long>(syncCounts[4]), syncWaitedMs[4] / 1000, static_cast<unsigned long long>(hookCalls.load()), static_cast<unsigned long long>(hookLocks.load()), static_cast<unsigned long long>(targetedSyncs.load()), static_cast<unsigned long long>(batchesLeftInFlight.load()), static_cast<unsigned long long>(snapshotRebuilds), static_cast<unsigned long long>(snapshotIncremental), snapshotRebuildMs, static_cast<unsigned long long>(snapshotCovered), static_cast<unsigned long long>(unlockedWaits.load()), unlockedWaitedUs.load() / 1e6, static_cast<unsigned long long>(recorder.submissions), recorder.PendingLabels(), static_cast<unsigned long long>(completionLabels.load()), ThreadSyncReport().c_str(), SyncSiteReport().c_str(), static_cast<unsigned long long>(h.completions), h.completionMs, h.keptReleaseMs, static_cast<unsigned long long>(h.completionSyncsSkipped), static_cast<unsigned long long>(h.completionSyncsWaited), h.completionSyncWaitMs, static_cast<unsigned long long>(h.reaps), static_cast<unsigned long long>(h.reapsWithWork), static_cast<unsigned long long>(h.reapBatches), h.reapMs, static_cast<unsigned long long>(h.hookUnlockedWaits), h.hookUnlockedWaitMs, static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[1]), h.hookUnlockedWaitMsBySource[1], static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[2]), h.hookUnlockedWaitMsBySource[2], h.hookRelockMs, static_cast<unsigned long long>(h.hookUnlockedTornDown), static_cast<unsigned long long>(h.hookLockedWaits), static_cast<unsigned long long>(threadReleases.load()), static_cast<unsigned long long>(threadObjects.load()), threadReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineReleases.load()), static_cast<unsigned long long>(inlineObjects.load()), inlineReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineOverBound.load()), ReleaseQueueBound(), static_cast<unsigned long long>(releaseQueueMax.load()), static_cast<unsigned long long>(deferredPending.load()));
                     std::fprintf(stderr, "[recorder] completion label stores: %llu run, %llu skipped (no CPU write-back overlapped them); %llu counted pending at a write-back; %llu write-backs over a tracked label; %llu write-back completions pending\n", static_cast<unsigned long long>(completionStoresRun.load()), static_cast<unsigned long long>(completionStoresSkipped.load()), static_cast<unsigned long long>(completionLabelsCountedLate.load()), static_cast<unsigned long long>(writeBacksOverLabels.load()), static_cast<unsigned long long>(writeBackCompletions.load()));
                     std::fprintf(stderr, "[recorder] submits %llu, vkQueueSubmit mean %.1f us, max %.1f us\n", static_cast<unsigned long long>(submitCount), submitCount != 0 ? submitUs / static_cast<double>(submitCount) : 0.0, submitMaxUs);
+                    if (const auto budget = Recorder::KeptBytesBudget(); budget != 0) {
+                        const auto& kept = keptBound;
+                        std::fprintf(stderr, "[recorder] kept-bytes bound (budget %zu MiB, %zu MiB in flight now): %llu open batches submitted, %llu waits for %llu batches %.1f ms, %llu early deferred releases; peaks: %.1f MiB kept in flight, %.1f MiB in one batch\n", budget >> 20u, recorder.InFlightKeptBytes() >> 20u, static_cast<unsigned long long>(kept.submits), static_cast<unsigned long long>(kept.waits), static_cast<unsigned long long>(kept.waitedBatches), kept.waitedMs, static_cast<unsigned long long>(kept.deferredFlushes), kept.peakInFlight / 1048576.0, kept.peakBatch / 1048576.0);
+                    }
                     const auto reads = Recorder::ReadCounts();
                     std::fprintf(stderr, "[recorder] in-place reads: %llu noted, %llu queries, hits by reader: dispatch element %llu, gpu copy %llu, address-based %llu, indirect %llu, storage upload %llu, copy source %llu; %llu hits on signaled batches ignored; read sets: %llu referenced, %llu repeat notes skipped (%llu ranges)\n", static_cast<unsigned long long>(reads.noted), static_cast<unsigned long long>(reads.queries), static_cast<unsigned long long>(reads.hits[0]), static_cast<unsigned long long>(reads.hits[1]), static_cast<unsigned long long>(reads.hits[2]), static_cast<unsigned long long>(reads.hits[3]), static_cast<unsigned long long>(reads.hits[4]), static_cast<unsigned long long>(reads.hits[5]), static_cast<unsigned long long>(reads.staleIgnored), static_cast<unsigned long long>(reads.setsNoted), static_cast<unsigned long long>(reads.setNotesSkipped), static_cast<unsigned long long>(reads.setRangesSkipped));
                 }

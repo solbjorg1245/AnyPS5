@@ -283,13 +283,26 @@ public:
     // thread and waits for every release in progress before the device goes. `bytes` is what the
     // object holds in device buffers, counted for BoundKeptBytes (0: not counted).
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
-    static constexpr std::size_t KeptBytesBudget = std::size_t{512} << 20u;
+    // The kept bytes an open batch may reach before BoundKeptBytes submits it: APS5_KEPT_BYTES_MIB
+    // (default 512; 0 turns the bound off, as APS5_NO_KEPT_BYTES_BOUND=1 does). Read once.
+    static std::size_t KeptBytesBudget();
     // Called before each sampled or storage texture lookup, under a hold: submits the open batch
-    // once it keeps KeptBytesBudget, and while the batches in flight (plus this thread's deferred
+    // once it keeps KeptBytesBudget(), and while the batches in flight (plus this thread's deferred
     // releases) keep more than twice that, destroys the deferred ones and waits for the oldest in
-    // flight, releasing its objects at once. APS5_NO_KEPT_BYTES_BOUND=1: no bound, as before.
+    // flight, releasing its objects at once. With no budget it does nothing, as before.
     void BoundKeptBytes();
     std::size_t InFlightKeptBytes() const { return inFlightKeptBytes; }
+    // What BoundKeptBytes did so far, over every recorder (kept under the GpuMutex): the open
+    // batches it submitted, its waits (an "other" sync each, for one or more of the oldest batches)
+    // with the batches and time waited, the deferred releases it destroyed early, and the peaks of
+    // kept bytes in flight and in one batch at a submit. The [recorder] kept-bytes line prints them
+    // every 10 s with APS5_PROFILE_DRAW.
+    struct KeptBoundCounts {
+        std::uint64_t submits = 0, waits = 0, waitedBatches = 0, deferredFlushes = 0;
+        double waitedMs = 0;
+        std::size_t peakInFlight = 0, peakBatch = 0;
+    };
+    static KeptBoundCounts KeptBoundTotals();
     enum class SnapshotUse : std::uint8_t { Storage, Vertex, Index16, Index32 };
     static constexpr std::size_t DrawSnapshotBudget = std::size_t{256} << 20u;
     static constexpr std::size_t DrawSnapshotEntries = 1024;

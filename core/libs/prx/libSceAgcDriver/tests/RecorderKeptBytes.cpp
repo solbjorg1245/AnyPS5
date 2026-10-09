@@ -24,7 +24,8 @@ void Expect(bool condition, const std::string& what) {
     ++failures;
 }
 
-constexpr std::size_t Budget = Recorder::KeptBytesBudget;
+// APS5_KEPT_BYTES_MIB sets it (the checks hold for any budget); 0 skips them.
+const std::size_t Budget = Recorder::KeptBytesBudget();
 
 struct MockDevice {
     std::uintptr_t next = 1;
@@ -145,6 +146,7 @@ void InFlightWithinTwiceTheBudget() {
     mock = MockDevice{};
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
     Recorder recorder(mockContext());
+    const auto before = Recorder::KeptBoundTotals();
     std::vector<std::weak_ptr<int>> batches;
     for (int batch = 0; batch < 6; ++batch) {
         auto object = std::make_shared<int>(batch);
@@ -157,6 +159,9 @@ void InFlightWithinTwiceTheBudget() {
     Expect(recorder.Submissions() == 6, "six budget batches made " + std::to_string(recorder.Submissions()) + " submissions");
     Expect(recorder.InFlightBatches() == 2 && recorder.InFlightKeptBytes() == 2 * Budget, "the newest two batches are not the ones in flight");
     Expect(mock.fenceWaits == 4, "the recorder waited for " + std::to_string(mock.fenceWaits) + " batches, not the four oldest");
+    const auto after = Recorder::KeptBoundTotals();
+    Expect(after.submits - before.submits == 6 && after.waits - before.waits == 4 && after.waitedBatches - before.waitedBatches == 4, "the bound counted " + std::to_string(after.submits - before.submits) + " submits and " + std::to_string(after.waits - before.waits) + " waits for " + std::to_string(after.waitedBatches - before.waitedBatches) + " batches, not 6, 4 and 4");
+    Expect(after.peakInFlight >= 3 * Budget && after.peakBatch >= Budget, "the bound's peaks missed three budgets in flight or one budget in a batch");
     for (std::size_t batch = 0; batch < batches.size(); ++batch) {
         const bool released = batches[batch].expired();
         Expect(released == (batch < 4), "batch " + std::to_string(batch) + (released ? " released its kept objects while in flight" : " still holds its kept objects under the GPU mutex after the wait for it"));
@@ -185,9 +190,12 @@ void CountFollowsEveryPath() {
     mock = MockDevice{};
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
     Recorder recorder(mockContext());
+    const auto before = Recorder::KeptBoundTotals();
     recorder.Keep(std::make_shared<int>(0), 3 * Budget);
     recorder.BoundKeptBytes();
     Expect(recorder.Submissions() == 1 && recorder.InFlightBatches() == 0 && recorder.InFlightKeptBytes() == 0, "a batch keeping three budgets was not submitted, waited for and released");
+    const auto after = Recorder::KeptBoundTotals();
+    Expect(after.submits - before.submits == 1 && after.waits - before.waits == 1 && after.waitedBatches - before.waitedBatches == 1, "one oversized batch was not counted as one submit and one wait for one batch");
     recorder.Keep(std::make_shared<int>(1), Budget);
     recorder.Submit();
     Expect(recorder.InFlightKeptBytes() == Budget, "a plain Submit did not count the batch's kept bytes in flight");
@@ -198,9 +206,9 @@ void CountFollowsEveryPath() {
 }
 
 int main() {
-    // APS5_NO_KEPT_BYTES_BOUND=1 turns the bound off: nothing here applies.
-    if (std::getenv("APS5_NO_KEPT_BYTES_BOUND") != nullptr) {
-        std::printf("recorder kept bytes tests skipped (APS5_NO_KEPT_BYTES_BOUND)\n");
+    // APS5_NO_KEPT_BYTES_BOUND=1 or APS5_KEPT_BYTES_MIB=0 turns the bound off: nothing here applies.
+    if (Budget == 0) {
+        std::printf("recorder kept bytes tests skipped (no kept-bytes budget)\n");
         return 0;
     }
     try {
