@@ -60,6 +60,13 @@ bool HasPrefix(const std::string& path, const std::string& prefix) {
 
 std::filesystem::path ResolveHostPath(std::filesystem::path root, const std::filesystem::path& relative) {
     const auto direct = root / relative;
+#ifdef _WIN32
+    // Windows' own lookup already ignores case (NTFS and FAT; only a folder made case-sensitive per
+    // directory differs), so every name the scan below could match, the host opens directly: there
+    // the fallback would only add an existence check per resolution and a directory scan per missing
+    // name, all under the callers' path locks. Mount prefixes still fold (SameName/HasPrefix).
+    return direct;
+#else
     if (!CaseFold()) return direct;
     std::error_code error;
     if (std::filesystem::exists(direct, error)) return direct;
@@ -81,6 +88,7 @@ std::filesystem::path ResolveHostPath(std::filesystem::path root, const std::fil
         root = !error && matched ? *matched : candidate;
     }
     return root;
+#endif
 }
 
 std::optional<std::filesystem::path> ResolveAlias(const std::string& guestPath) {
