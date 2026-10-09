@@ -647,6 +647,8 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             }
 
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            PoisonPooled(context, commands, *tiled, PoisonSite::TextureUpload);
+            PoisonPooled(context, commands, *linear, PoisonSite::TextureUpload);
             CopyBuffer(context, commands, staging->Handle(), 0, tiled->Handle(), 0, guestBytes);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
@@ -677,6 +679,15 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             toTransferDst.image = image;
             toTransferDst.subresourceRange = {aspect, 0, descriptor.mipCount, 0, geometry.imageLayers};
             context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearReadBarrier, 1, &toTransferDst);
+            // APS5_POISON_POOL: the image's memory (a reused range of a pooled block, or its own)
+            // shows magenta (4.0 in float formats) wherever the copy below does not reach.
+            if (PoisonPool() && aspect == VK_IMAGE_ASPECT_COLOR_BIT && !IsBlockCompressed(descriptor.format)) {
+                const VkClearColorValue poison{{4.0f, 0.0f, 4.0f, 1.0f}};
+                const VkImageSubresourceRange whole{aspect, 0, descriptor.mipCount, 0, geometry.imageLayers};
+                context.Resolved(&DeviceFunctions::cmdClearColorImage, "vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &poison, 1, &whole);
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+                NoteImagePoison(allocationBytes, owned->allocation.pooled);
+            }
 
             std::vector<VkBufferImageCopy> regions;
             regions.reserve(static_cast<std::size_t>(arrayLayers) * mips.size());
@@ -1859,6 +1870,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             batch = std::make_unique<CommandBatch>(context);
             commands = batch->Handle();
         }
+        PoisonPooled(context, commands, *linear, PoisonSite::StorageUpload);
         const auto importOffset = descriptor.baseAddress - import->base;
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
@@ -1909,6 +1921,8 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             CommandBatch batch(context);
             const auto commands = batch.Handle();
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            PoisonPooled(context, commands, tiled, PoisonSite::StorageUpload);
+            PoisonPooled(context, commands, linear, PoisonSite::StorageUpload);
             CopyBuffer(context, commands, staging.Handle(), 0, tiled.Handle(), 0, original.size());
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
@@ -2105,6 +2119,7 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
         batch = std::make_unique<CommandBatch>(context);
         commands = batch->Handle();
     }
+    PoisonPooled(context, commands, *linear, PoisonSite::StorageUpload);
     const auto importOffset = descriptor.baseAddress - import.base;
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     std::vector<VkBufferImageCopy> regions;
@@ -2298,6 +2313,8 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
                 scratchSeeds.push_back({importOffset + windows[i].tiledBegin, scratchPositions[i], windows[i].tiledEnd - windows[i].tiledBegin});
             }
         }
+        PoisonPooled(context, commands, *linear, PoisonSite::WriteBack);
+        PoisonPooled(context, commands, *tiledScratch, PoisonSite::WriteBack);
         InitRetileScratch(context, commands, recorder, storageFormat, *tiledScratch, import.buffer, scratchSeeds);
     }
     std::vector<VkBufferImageCopy> regions;
@@ -3857,6 +3874,8 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             if (SeedRetileScratch() == ScratchSeed::Import) {
                 for (const auto& [from, to] : keep) scratchSeeds.push_back({importOffset + (from - descriptor.baseAddress), from - descriptor.baseAddress, to - from});
             }
+            PoisonPooled(context, commands, *linear, PoisonSite::WriteBack);
+            PoisonPooled(context, commands, *tiledScratch, PoisonSite::WriteBack);
             InitRetileScratch(context, commands, recorder, storageFormat, *tiledScratch, import->buffer, scratchSeeds);
         }
         const auto regions = CopyRegions(storedLayers);
@@ -3951,6 +3970,8 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     CommandBatch batch(context);
     const auto commands = batch.Handle();
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    PoisonPooled(context, commands, tiled, PoisonSite::WriteBack);
+    PoisonPooled(context, commands, linear, PoisonSite::WriteBack);
     CopyBuffer(context, commands, host.Handle(), 0, tiled.Handle(), 0, original.size());
     VkImageMemoryBarrier toSource{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     toSource.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;

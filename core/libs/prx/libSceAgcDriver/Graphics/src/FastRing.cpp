@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/FastRing.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -130,6 +131,11 @@ std::optional<FastRing::Region> FastRing::Allocate(VkDeviceSize bytes, std::uint
     allocations.fetch_add(1, std::memory_order_relaxed);
     allocatedBytes.fetch_add(bytes, std::memory_order_relaxed);
     if (wrap) wraps.fetch_add(1, std::memory_order_relaxed);
+    // APS5_POISON_POOL: the region's leftovers (an earlier batch's words) become the poison word.
+    if (PoisonPool()) {
+        FillPoolPoison({mapping + start, static_cast<std::size_t>(bytes)}, PoolPoisonWord());
+        NoteRingPoison(bytes);
+    }
     return Region{buffer, start, bytes, mapping + start};
 }
 

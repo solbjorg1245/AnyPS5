@@ -3903,6 +3903,9 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
         }
         if (!sameShadow) {
+            // APS5_POISON_POOL: a new shadow's bytes the copy does not reach (its size class, an
+            // unrefreshed baseline) hold the poison.
+            PoisonPooled(context, commands, *region->buffer, PoisonSite::Staging);
             CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, copyBytes);
             // From the import (or its snapshot): the baseline takes the same bytes after the pass.
             if (!chained && region->deviceLocal && region->baselineDelta != 0) refreshBaselines.push_back(region);
@@ -4718,6 +4721,7 @@ void GuestBufferMemory::recordResidentReads(Recorder& recorder, std::span<Region
         std::uint64_t copied = 0;
         for (auto* region : stale) {
             const auto bytes = region->end - region->begin;
+            PoisonPooled(context, commands, *region->resident->buffer, PoisonSite::Resident);
             CopyBuffer(context, commands, region->copySource, region->begin - region->copySourceBase, region->resident->buffer->Handle(), 0, bytes);
             recorder.NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
             recorder.Keep(region->resident->buffer);
