@@ -505,7 +505,7 @@ void reportResultMemo() {
     // The legacy float rules (Recompiler.hpp): instructions translated under each since start.
     std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions; legacy float sites (totals): mad_legacy %llu%s, mullit %llu%s, clamp NaN %llu%s\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions),
         static_cast<unsigned long long>(LegacyFloatSites(LegacyFloatSite::MadLegacy)), LegacyMadRule() ? "" : " (off: APS5_NO_LEGACY_MAD_RULE)", static_cast<unsigned long long>(LegacyFloatSites(LegacyFloatSite::Mullit)), MullitRule() ? "" : " (off: APS5_NO_MULLIT_RULE)",
-        static_cast<unsigned long long>(LegacyFloatSites(LegacyFloatSite::ClampNan)), ClampNanRule() ? "" : " (off: APS5_NO_CLAMP_NAN_RULE)");
+        static_cast<unsigned long long>(LegacyFloatSites(LegacyFloatSite::ClampNan)), ClampNanRule() == ClampNan::Zero ? " (APS5_CLAMP_NAN=zero)" : ClampNanRule() == ClampNan::Keep ? " (APS5_CLAMP_NAN=keep)" : " (off: FClamp alone)");
 }
 
 // Everything materializeResult reads besides the variant: the snapshot (the descriptor words, the

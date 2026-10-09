@@ -258,12 +258,13 @@ IrF32 TranslationContext::applyF32ResultModifiers(const RdnaOperand& operand, Ir
     if (operand.clamp) {
         const IrF32 unclamped = value;
         value = IrF32(ir.Emit(IrOpcode::FPSaturate32, IrType::F32, {&value.Value()}));
-        // NaN clamps to 0 as on the hardware (DX10_CLAMP); FClamp leaves it undefined
-        // (APS5_NO_CLAMP_NAN_RULE=1: FClamp alone, as before).
-        if (ClampNanRule()) {
+        // FClamp leaves a NaN undefined. APS5_CLAMP_NAN=zero clamps it to 0 (DX10_CLAMP on the
+        // hardware), =keep passes it through (DX10_CLAMP clear); unset keeps FClamp alone.
+        const ClampNan mode = ClampNanRule();
+        if (mode != ClampNan::Driver) {
             CountLegacyFloatSite(LegacyFloatSite::ClampNan);
             const IrU1 nan(ir.UGreaterThan(ir.BitwiseAnd(ir.BitCastU32(unclamped.Value()), ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)));
-            value = selectF32(nan, IrF32(ir.ConstantF32(0.0f)), value);
+            value = selectF32(nan, mode == ClampNan::Zero ? IrF32(ir.ConstantF32(0.0f)) : unclamped, value);
         }
     }
     return value;

@@ -11,7 +11,8 @@
 #include <vector>
 
 // The DX9 ("legacy") float rules (Recompiler.hpp): v_mad_legacy_f32 gives c for 0 * Inf + c and
-// 0 * NaN + c, the clamp output modifier turns NaN into 0, and v_mul_legacy_f32 stays as it was.
+// 0 * NaN + c, and v_mul_legacy_f32 stays as it was. The clamp of a NaN product is checked only
+// under APS5_CLAMP_NAN=zero (0) or keep (NaN): by default FClamp leaves it to the driver.
 
 namespace {
 
@@ -71,7 +72,14 @@ bool IsNan32(std::uint32_t bits) {
 }
 
 // Any NaN matches a NaN; the clamp of a negative or -0 product may give either zero.
-bool Matches(std::uint32_t column, std::uint32_t actual, std::uint32_t expected) {
+bool Matches(std::uint32_t column, std::uint32_t actual, std::uint32_t expected, bool nanProduct) {
+    if (column == 1u && nanProduct) {
+        switch (ShaderRecompiler::ClampNanRule()) {
+            case ShaderRecompiler::ClampNan::Driver: return true;
+            case ShaderRecompiler::ClampNan::Keep: return IsNan32(actual);
+            case ShaderRecompiler::ClampNan::Zero: break;
+        }
+    }
     if (actual == expected) return true;
     if (IsNan32(actual) && IsNan32(expected)) return true;
     return column == 1u && expected == 0u && actual == 0x80000000u;
@@ -108,10 +116,12 @@ void Run(AgcDriver::VulkanDevice& device, std::uint32_t count) {
 void Check(std::uint32_t count) {
     for (std::uint32_t lane = 0; lane < count; ++lane) {
         const auto& vector = Vectors[lane];
+        const bool nanProduct = IsNan32(vector.a) || IsNan32(vector.b) || ((vector.a & 0x7fffffffu) == 0u && (vector.b & 0x7fffffffu) == 0x7f800000u) ||
+            ((vector.b & 0x7fffffffu) == 0u && (vector.a & 0x7fffffffu) == 0x7f800000u);
         for (std::uint32_t column = 0; column < Names.size(); ++column) {
             const auto expected = vector.expected[column];
             const auto actual = Output[lane * Results + column];
-            Require(Matches(column, actual, expected), std::string("legacy float: vector ") + std::to_string(lane) + " (" + Hex(vector.a) + ", " + Hex(vector.b) + ", " + Hex(vector.c) + ") " + Names[column] + " is " + Hex(actual) + ", expected " + Hex(expected));
+            Require(Matches(column, actual, expected, nanProduct), std::string("legacy float: vector ") + std::to_string(lane) + " (" + Hex(vector.a) + ", " + Hex(vector.b) + ", " + Hex(vector.c) + ") " + Names[column] + " is " + Hex(actual) + ", expected " + Hex(expected));
         }
     }
 }
@@ -120,8 +130,8 @@ void Check(std::uint32_t count) {
 
 int main() {
     try {
-        if (!ShaderRecompiler::LegacyMadRule() || !ShaderRecompiler::ClampNanRule()) {
-            std::puts("legacy float tests skipped (APS5_NO_LEGACY_MAD_RULE or APS5_NO_CLAMP_NAN_RULE set)");
+        if (!ShaderRecompiler::LegacyMadRule()) {
+            std::puts("legacy float tests skipped (APS5_NO_LEGACY_MAD_RULE set)");
             return 0;
         }
         const auto device = OpenVulkanTestDevice();

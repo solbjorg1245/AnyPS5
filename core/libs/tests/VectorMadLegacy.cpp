@@ -1,5 +1,6 @@
 #include "Translation/TranslationContext.hpp"
 #include "RdnaDecoder/RdnaVectorOpDecoder.hpp"
+#include "Recompiler.hpp"
 #include <array>
 #include <stdexcept>
 
@@ -46,11 +47,19 @@ static void CheckMullit() {
     IrValue* select = Translate(program, 0x150u << 16u, RdnaOpcode::VMullitF32, IrOpcode::SelectF32);
     Require(select != nullptr && select->Argument(2)->Opcode() == IrOpcode::FPMul32);
 }
-// The clamp output modifier turns NaN into 0 (ClampNanRule, default on): v_mul_f32 ... clamp.
+// The clamp output modifier (v_mul_f32 ... clamp): FClamp alone by default; APS5_CLAMP_NAN=zero or
+// keep selects 0 or the unclamped value for a NaN.
 static void CheckClampNan() {
     IrProgram program;
     IrValue* select = Translate(program, (0x108u << 16u) | (1u << 15u), RdnaOpcode::VMulF32, IrOpcode::SelectF32);
+    if (ClampNanRule() == ClampNan::Driver) {
+        Require(select == nullptr);
+        IrProgram plain;
+        Require(Translate(plain, (0x108u << 16u) | (1u << 15u), RdnaOpcode::VMulF32, IrOpcode::FPSaturate32) != nullptr);
+        return;
+    }
     Require(select != nullptr && select->Argument(0)->Opcode() == IrOpcode::UGreaterThan32 && select->Argument(2)->Opcode() == IrOpcode::FPSaturate32);
+    Require(ClampNanRule() == ClampNan::Zero ? select->Argument(1)->Opcode() != IrOpcode::FPMul32 : select->Argument(1)->Opcode() == IrOpcode::FPMul32);
 }
 int main() {
     Check(0x140u, RdnaOpcode::VMadLegacyF32, IrOpcode::FPFma32);

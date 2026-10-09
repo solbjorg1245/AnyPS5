@@ -122,9 +122,16 @@ bool MullitRule() {
     return enabled;
 }
 
-bool ClampNanRule() {
-    static const bool enabled = std::getenv("APS5_NO_CLAMP_NAN_RULE") == nullptr;
-    return enabled;
+ClampNan ClampNanRule() {
+    static const ClampNan mode = [] {
+        const char* text = std::getenv("APS5_CLAMP_NAN");
+        if (text == nullptr) return ClampNan::Driver;
+        if (std::strcmp(text, "zero") == 0) return ClampNan::Zero;
+        if (std::strcmp(text, "keep") == 0) return ClampNan::Keep;
+        std::fprintf(stderr, "[recompile] APS5_CLAMP_NAN=%s is neither zero nor keep: the clamp stays FClamp alone\n", text);
+        return ClampNan::Driver;
+    }();
+    return mode;
 }
 
 namespace {
