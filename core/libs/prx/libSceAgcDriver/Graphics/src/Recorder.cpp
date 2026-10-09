@@ -2,6 +2,7 @@
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/CopyBackDiff_spv.h"
@@ -1231,6 +1232,21 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
         residentBuffers = false;
         static std::once_flag warned;
         std::call_once(warned, [] { std::fprintf(stderr, "[gpu] APS5_RESIDENT_BUFFERS ignored: a CPU Vulkan device writes host imports through page protection\n"); });
+    }
+    // Resident read-only copies (KeepsResidentReads): plain GPU copies, independent of the
+    // copy-back switches above.
+    const char* residentReadsSwitch = std::getenv("APS5_RESIDENT_READS");
+    residentReads.enabled = residentReadsSwitch != nullptr && *residentReadsSwitch != '\0' && std::strcmp(residentReadsSwitch, "0") != 0;
+    if (residentReads.enabled) {
+        const auto kib = [](const char* name, std::uint64_t fallback) {
+            const char* value = std::getenv(name);
+            return (value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : fallback) << 10u;
+        };
+        const char* verifyReads = std::getenv("APS5_RESIDENT_READS_VERIFY");
+        residentReads.verifyEvery = verifyReads != nullptr && *verifyReads != '\0' ? static_cast<std::uint32_t>(std::strtoul(verifyReads, nullptr, 10)) : 0;
+        residentReads.limitBytes = kib("APS5_RESIDENT_READS_MIB", 1024) << 10u;
+        residentReads.minBytes = kib("APS5_RESIDENT_READS_MIN_KIB", 4);
+        residentReads.maxBytes = kib("APS5_RESIDENT_READS_MAX_KIB", 16384);
     }
     if (residentBuffers) {
         coalesceCopyBacks = true;
@@ -3438,6 +3454,9 @@ void Recorder::OnComplete(std::function<void()> action) {
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, WriteKind kind) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
+    // Resident read-only copies over the range are stale from here on (GuestBufferMemory.cpp,
+    // "Resident reads"): every GPU write into guest memory is noted here.
+    if (ResidentReadsLive()) NoteResidentReadsWrite(address, address + bytes);
     ensureOpen();
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
@@ -3470,6 +3489,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // An in-flight batch: its range joins the snapshot at once (the completion that stores it runs
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
+    if (ResidentReadsLive()) NoteResidentReadsWrite(address, address + bytes);
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
     markPendingBlocks(address, address + bytes, batch.serial);

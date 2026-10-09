@@ -2680,6 +2680,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     outerMark(3);
     if (auto* recorder = Recorder::Active(); recorder != nullptr) {
         try {
+            // Resident read-only copies (APS5_RESIDENT_READS): each one stale since the last use
+            // is refreshed from its import, into the buffer the set names, ahead of the work; a
+            // copy demoted since the build fails the proof first (the rebuild binds it in place).
+            if (!guestMemory.RecordResidentReads(*recorder)) return finish(fast, false);
             guestMemory.RecordStagingCopies(*recorder);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[resources] staging copies of a reused build failed: %s\n", error.what());
@@ -3845,6 +3849,9 @@ ShaderResources::DeferredMemo& ShaderResources::DeferredMemoFor(std::size_t allo
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
+    // An address-based use may store through its BDA table anywhere the table allows: the resident
+    // read-only copies over those ranges are refreshed at their next use, after this one.
+    if (usesBda && bdaStores) guestMemory.NoteAddressWriter();
     if (_set == VK_NULL_HANDLE) return;
     if (CheckStaleImports()) {
         for (const auto buffer : boundBuffers) {

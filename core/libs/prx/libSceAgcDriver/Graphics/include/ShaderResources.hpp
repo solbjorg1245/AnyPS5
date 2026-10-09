@@ -525,6 +525,9 @@ private:
     GuestBufferMemory guestMemory;
     std::unique_ptr<BdaResources> bda;
     bool usesBda = false;
+    // An address-based program that may store through its BDA table (prepareAddressBindings): its
+    // uses stale the resident read-only copies over the table's writable ranges (Bind).
+    bool bdaStores = false;
     bool usesFaultBuffer = false;
     VkDescriptorSetLayout _layout = VK_NULL_HANDLE;
     // Whether the layout is this object's own (no cache) and destroyed with it.
