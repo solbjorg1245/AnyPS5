@@ -37,6 +37,10 @@ bool StorageFormatAvailable(const Context& context, std::uint32_t guestFormat);
 // Whether a storage image of the guest format takes DCC clear `keys` as a GPU clear (see
 // StorageTexture::upload); false for integer formats and non-clear keys.
 bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, DccKeys keys);
+// The 32-bit word APS5_POISON_RETILE_SCRATCH fills a GPU-direct write-back's tiled scratch with,
+// for an image of `format`: magenta at 1.0 for UNORM formats and at 4.0 for float ones where a
+// repeated word can hold it, 4.0 in every channel for 32-bit float formats, all ones otherwise.
+std::uint32_t RetileScratchPoisonWord(VkFormat format);
 
 // A sampled texture's own VkImage with its memory, shared with the recorder while a recorded upload
 // still writes it (see the snapshot constructor), so the texture may go before the batch completes.
