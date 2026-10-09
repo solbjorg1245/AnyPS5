@@ -46,6 +46,20 @@ add_custom_command(
         VERBATIM
 )
 
+# Narrow copy-backs' compare pass (Recorder::NarrowsCopyBacks): buffer device addresses only.
+set(agcCopyBackDiffShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/CopyBackDiff.comp)
+set(agcCopyBackDiffShaderSpv ${agcTextureDetileGeneratedDir}/CopyBackDiff.spv)
+set(agcCopyBackDiffShaderHeader ${agcTextureDetileGeneratedDir}/CopyBackDiff_spv.h)
+add_custom_command(
+        OUTPUT "${agcCopyBackDiffShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcCopyBackDiffShaderSpv}" "${agcCopyBackDiffShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcCopyBackDiffShaderSpv} -DOUTPUT=${agcCopyBackDiffShaderHeader}
+        -DSYMBOL=COPY_BACK_DIFF_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcCopyBackDiffShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
@@ -143,6 +157,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
+        ${agcCopyBackDiffShaderHeader}
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Event.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Query.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Resource/src/Lifecycle.cpp
@@ -441,6 +456,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/Recorder.cpp
         Graphics/src/ShaderInputState.cpp
         ${agcTextureDetileShaderHeader}
+        ${agcCopyBackDiffShaderHeader}
         Execution/src/GuestMemory.cpp
         Execution/src/ShaderMemory.cpp
         Execution/src/Pm4.cpp
@@ -529,6 +545,18 @@ if(BUILD_TESTING)
         endif()
         if(WIN32)
             set_tests_properties(${agcTestName} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    # Narrow copy-backs again under APS5_PROFILE_GPU (timing ranges record queued copies, the
+    # compare pass among them, at every range), with APS5_NARROW_VERIFY=1 and with
+    # APS5_RESIDENT_BUFFERS=1.
+    foreach(agcNarrowVariant IN ITEMS profile-gpu verify resident)
+        string(REPLACE "-" "_" agcNarrowVariantName "${agcNarrowVariant}")
+        add_test(NAME agc_driver_narrow_copy_back_${agcNarrowVariantName} COMMAND agc_driver_narrow_copy_back_tests --${agcNarrowVariant})
+        set_tests_properties(agc_driver_narrow_copy_back_${agcNarrowVariantName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 LABELS gpu)
+        if(WIN32)
+            set_tests_properties(agc_driver_narrow_copy_back_${agcNarrowVariantName} PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()

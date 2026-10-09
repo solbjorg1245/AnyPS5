@@ -221,6 +221,14 @@ public:
     // copied blocks) are timed by AcquireRegistered on the calling thread; the caller adds the
     // snapshot compares it made after it (ShaderResources::prepareAddressBindings).
     static void CountAddressBuild(double snapshotsUs);
+    // Narrow copy-backs' baselines (APS5_NARROW_COPY_BACKS; counted under APS5_PROFILE_DRAW), totals
+    // since start: refreshed at a copy-in from the import, inherited along the staging chain (and
+    // of those untrusted), copy-backs recorded narrow and whole, and trust lost to a claim broken
+    // since the chain (Recorder::ClaimBreaks).
+    struct NarrowTrustStatistics {
+        std::uint64_t refreshed = 0, inherited = 0, inheritedUntrusted = 0, narrow = 0, whole = 0, claimBroken = 0;
+    };
+    static NarrowTrustStatistics NarrowTrustCounts();
     // A guest range bound through a descriptor. Both read live guest memory at upload and bind the
     // same way (a storage buffer); AddWritable also notes the range in Writes(), so it gets the
     // write-back's reference copy, a write-back, the recorder's pending-write note and the
@@ -384,6 +392,22 @@ private:
         // The device refused the shadow (memory or allocations exhausted): the region takes the
         // path it would take without staging, in both upload stages.
         bool unstaged = false;
+        // Narrow copy-backs (Recorder::NarrowsCopyBacks): a staging shadow made with the switch on
+        // keeps a baseline of its range `baselineDelta` bytes behind its first byte (0: none), which
+        // stands for what the import holds of the range: refreshed from the shadow after every
+        // copy-in from the import, copied along with a chained shadow, and kept so by every copy-back
+        // (the compare pass, or a whole copy that mirrors its bytes into it). `baselineTrusted` while
+        // it does (a chained shadow passes its trust on); `baselineInherited` when it came with a
+        // chained shadow of another buffer whose copies this use claimed at `claimBreaks`
+        // (Recorder::ClaimBreaks): a claimed copy recorded meanwhile updated that buffer's baseline,
+        // not this one's, so the copy-back then copies whole and the trust is gone until the next
+        // copy-in from the import. `copySourceAddress`: the import's device address of
+        // `copySourceBase` (0: unknown, copied whole).
+        VkDeviceSize baselineDelta = 0;
+        bool baselineTrusted = false;
+        bool baselineInherited = false;
+        std::uint64_t claimBreaks = 0;
+        VkDeviceAddress copySourceAddress = 0;
         // A descriptor crossing back-to-back imported ranges of the address space (see spannable):
         // it overlaps the space's base ranges, so it stays out of the BDA table (the base imports
         // serve those addresses) and binds one span import over the same host pages.
@@ -422,6 +446,9 @@ private:
     // Gives a region a buffer of its own with its bytes (guest memory for host-backed and writable
     // ranges, plus the write-back's reference copy for a range a descriptor writes; else its snapshot).
     void copyRegion(Region& region, bool addressable);
+    // A staged region's device-local shadow (null when the device refuses it), with a baseline
+    // behind its bytes when the active recorder narrows copy-backs (Region::baselineDelta).
+    std::shared_ptr<Buffer> stagingShadow(Region& region, bool addressable) const;
     // Whether a region inside a host import that cannot be bound in place is copied by the GPU
     // instead of the CPU (see Region::gpuCopy): live guest bytes, not sparse, at most the size
     // APS5_GPU_COPY_MAX_KIB allows, and APS5_CPU_COPIES unset.

@@ -476,10 +476,12 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
         Recorder::CountBarriers(CommandClass::DispatchLeading);
         recorder.EndGpuTiming(leadTiming);
     }
+    // Ahead of the binds: BeginGpuTiming may record queued copy-backs, whose narrow compare pass
+    // binds a compute pipeline of its own (see VulkanDevice::recordDispatch).
+    const auto gpuTiming = recorder.BeginGpuTiming(call.programAddress != 0 ? call.programAddress : shader.variantId);
     context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, call.pipeline);
     PushDescriptors(context, commands, VK_PIPELINE_BIND_POINT_COMPUTE, layout, scratch.writes);
     if (layout.pushStages != 0) context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout.pipeline, VK_SHADER_STAGE_COMPUTE_BIT, 0, PipelinePushConstantBytes, pushBytes.data());
-    const auto gpuTiming = recorder.BeginGpuTiming(call.programAddress != 0 ? call.programAddress : shader.variantId);
     RecordCheckpoint(commands, 'C', call.programAddress, shader.variantId, indirect ? ~std::uint64_t{0} : (static_cast<std::uint64_t>(call.x) << 42u) | (static_cast<std::uint64_t>(call.y) << 21u) | call.z);
     if (indirect) context.Resolved(&DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentBuffer, argumentOffset);
     else context.Resolved(&DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, call.x, call.y, call.z);

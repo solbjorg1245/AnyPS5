@@ -2044,6 +2044,21 @@ VkMemoryPropertyFlags copyBufferProperties(bool deviceLocal) {
     return deviceLocal ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 }
 
+// Narrow copy-backs (Recorder::NarrowsCopyBacks, APS5_NARROW_COPY_BACKS=1): the baseline doubles a
+// shadow's device memory, so regions above APS5_NARROW_COPY_BACK_MAX_KIB (default 2048; the hot
+// append buffers are ~285-360 KiB) keep whole copy-backs. The baseline starts at the shadow's size
+// rounded up to 256 bytes; a region off a dword boundary (the pass moves dwords) has none.
+std::uint64_t narrowCopyBackMax() {
+    static const std::uint64_t bytes = kibSetting("APS5_NARROW_COPY_BACK_MAX_KIB", 2048);
+    return bytes;
+}
+
+VkDeviceSize narrowBaselineDelta(std::uint64_t begin, std::uint64_t bytes) {
+    const auto* recorder = Recorder::Active();
+    if (recorder == nullptr || !recorder->NarrowsCopyBacks() || begin % 4 != 0 || bytes == 0 || bytes > narrowCopyBackMax()) return 0;
+    return (bytes + 255) & ~static_cast<VkDeviceSize>(255);
+}
+
 // [gputime] classes (APS5_PROFILE_GPU) of a build's GPU copies, barriers included: the copy-ins
 // of its regions and their copy-backs (staged or host shadows alike).
 constexpr auto StagingCopyInKey = Recorder::CommandClass::StagingIn;
@@ -2079,6 +2094,17 @@ struct CopyStats {
     std::atomic<std::uint64_t> chainedInPlace{0};
     // Regions of uses whose regions all stayed in their shadows: no copy pass recorded.
     std::atomic<std::uint64_t> inPlacePasses{0};
+    // Narrow copy-backs: baselines refreshed after a copy-in from the import (and their bytes),
+    // chained shadows whose baseline came along (trusted or not), copy-backs of a region with a
+    // baseline recorded narrow, and those recorded whole (untrusted: never refreshed, inherited
+    // without trust, or a claim broken since the chain).
+    std::atomic<std::uint64_t> baselinesRefreshed{0};
+    std::atomic<std::uint64_t> baselineRefreshBytes{0};
+    std::atomic<std::uint64_t> baselinesInherited{0};
+    std::atomic<std::uint64_t> baselinesInheritedUntrusted{0};
+    std::atomic<std::uint64_t> narrowCopyBacks{0};
+    std::atomic<std::uint64_t> wholeCopyBacks{0};
+    std::atomic<std::uint64_t> claimBroken{0};
     std::atomic<std::int64_t> lastStagingReport{0};
 };
 
@@ -2220,7 +2246,25 @@ void reportStaging() {
         deferral = text;
         last = counts;
     }
-    std::fprintf(stderr, "[buffers] staging chain (10 s): %llu copy-ins from the previous staging shadow (%.0f MiB off PCIe), %llu of them in the same shadow (no copy; %llu in uses that recorded no copy pass); %llu deferred copy-backs (%.0f MiB) taken over by the next use%s\n", static_cast<unsigned long long>(chained - lastChained), (chainedBytes - lastChainedBytes) / 1048576.0, static_cast<unsigned long long>(chainedInPlace - lastChainedInPlace), static_cast<unsigned long long>(inPlacePasses - lastInPlacePasses), static_cast<unsigned long long>(takenOver - lastTakenOver), (takenOverBytes - lastTakenOverBytes) / 1048576.0, deferral.c_str());
+    // Narrow copy-backs (APS5_NARROW_COPY_BACKS): baselines refreshed, inherited, copy-backs.
+    std::string narrow;
+    {
+        static std::uint64_t lastRefreshed = 0, lastRefreshBytes = 0, lastInherited = 0, lastUntrusted = 0, lastNarrow = 0, lastWhole = 0, lastBroken = 0;
+        const auto refreshed = stats.baselinesRefreshed.load(), refreshBytes = stats.baselineRefreshBytes.load(), inherited = stats.baselinesInherited.load(), untrusted = stats.baselinesInheritedUntrusted.load(), narrowed = stats.narrowCopyBacks.load(), whole = stats.wholeCopyBacks.load(), broken = stats.claimBroken.load();
+        if (refreshed != lastRefreshed || narrowed != lastNarrow || whole != lastWhole) {
+            char text[256];
+            std::snprintf(text, sizeof(text), "; narrow: %llu baselines refreshed (%.0f MiB), %llu inherited (%llu untrusted), %llu copy-backs narrow, %llu whole (%llu after a broken claim)", static_cast<unsigned long long>(refreshed - lastRefreshed), (refreshBytes - lastRefreshBytes) / 1048576.0, static_cast<unsigned long long>(inherited - lastInherited), static_cast<unsigned long long>(untrusted - lastUntrusted), static_cast<unsigned long long>(narrowed - lastNarrow), static_cast<unsigned long long>(whole - lastWhole), static_cast<unsigned long long>(broken - lastBroken));
+            narrow = text;
+        }
+        lastRefreshed = refreshed;
+        lastRefreshBytes = refreshBytes;
+        lastInherited = inherited;
+        lastUntrusted = untrusted;
+        lastNarrow = narrowed;
+        lastWhole = whole;
+        lastBroken = broken;
+    }
+    std::fprintf(stderr, "[buffers] staging chain (10 s): %llu copy-ins from the previous staging shadow (%.0f MiB off PCIe), %llu of them in the same shadow (no copy; %llu in uses that recorded no copy pass); %llu deferred copy-backs (%.0f MiB) taken over by the next use%s%s\n", static_cast<unsigned long long>(chained - lastChained), (chainedBytes - lastChainedBytes) / 1048576.0, static_cast<unsigned long long>(chainedInPlace - lastChainedInPlace), static_cast<unsigned long long>(inPlacePasses - lastInPlacePasses), static_cast<unsigned long long>(takenOver - lastTakenOver), (takenOverBytes - lastTakenOverBytes) / 1048576.0, deferral.c_str(), narrow.c_str());
     lastTakenOver = takenOver;
     lastTakenOverBytes = takenOverBytes;
     lastChained = chained;
@@ -2248,6 +2292,10 @@ struct StagedShadow {
     const Recorder* recorder = nullptr;
     std::shared_ptr<Buffer> buffer;
     std::uint64_t generation = 0;
+    // Narrow copy-backs: the shadow's baseline (Region::baselineDelta, 0: none) and whether it
+    // stood for the import when the shadow was registered.
+    VkDeviceSize baselineDelta = 0;
+    bool baselineTrusted = false;
 };
 
 struct StagedShadows {
@@ -2287,16 +2335,20 @@ bool stagingChainEnabled() {
 // the caller collected the range's writes first.
 // Either way the range's entry and every entry held by `target` leave the registry: the copy-in
 // and the work after it change `target`, and the use registers again after its copy-back.
-std::shared_ptr<Buffer> takeStagedShadow(const Recorder* recorder, std::uint64_t begin, std::uint64_t end, const Buffer* target) {
+std::shared_ptr<Buffer> takeStagedShadow(const Recorder* recorder, std::uint64_t begin, std::uint64_t end, const Buffer* target, VkDeviceSize* baselineDelta = nullptr, bool* baselineTrusted = nullptr) {
     auto& shadows = stagedShadows();
     std::shared_ptr<Buffer> source;
     std::uint64_t generation = 0;
+    if (baselineDelta != nullptr) *baselineDelta = 0;
+    if (baselineTrusted != nullptr) *baselineTrusted = false;
     {
         std::lock_guard lock(shadows.mutex);
         const auto found = shadows.entries.find({begin, end});
         if (found != shadows.entries.end() && found->second.recorder == recorder) {
             source = found->second.buffer;
             generation = found->second.generation;
+            if (baselineDelta != nullptr) *baselineDelta = found->second.baselineDelta;
+            if (baselineTrusted != nullptr) *baselineTrusted = found->second.baselineTrusted;
         }
         if (shadowIndexEnabled()) {
             if (found != shadows.entries.end()) {
@@ -2314,11 +2366,14 @@ std::shared_ptr<Buffer> takeStagedShadow(const Recorder* recorder, std::uint64_t
             }
         }
     }
-    if (source == nullptr) return nullptr;
-    return GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(end - begin), generation) ? source : nullptr;
+    if (source != nullptr && GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(end - begin), generation)) return source;
+    // No shadow to chain from: no baseline either.
+    if (baselineDelta != nullptr) *baselineDelta = 0;
+    if (baselineTrusted != nullptr) *baselineTrusted = false;
+    return nullptr;
 }
 
-void registerStagedShadow(const Recorder* recorder, std::uint64_t begin, std::uint64_t end, std::shared_ptr<Buffer> buffer, std::uint64_t generation) {
+void registerStagedShadow(const Recorder* recorder, std::uint64_t begin, std::uint64_t end, std::shared_ptr<Buffer> buffer, std::uint64_t generation, VkDeviceSize baselineDelta = 0, bool baselineTrusted = false) {
     auto& shadows = stagedShadows();
     std::lock_guard lock(shadows.mutex);
     // A few hundred ranges in practice; a runaway set starts over.
@@ -2327,20 +2382,32 @@ void registerStagedShadow(const Recorder* recorder, std::uint64_t begin, std::ui
         shadows.byBuffer.clear();
     }
     if (!shadowIndexEnabled()) {
-        shadows.entries[{begin, end}] = StagedShadow{recorder, std::move(buffer), generation};
+        shadows.entries[{begin, end}] = StagedShadow{recorder, std::move(buffer), generation, baselineDelta, baselineTrusted};
         return;
     }
     const std::pair<std::uint64_t, std::uint64_t> key{begin, end};
     auto& entry = shadows.entries[key];
     if (entry.buffer != nullptr) unindexShadow(shadows, entry.buffer.get(), key);
     shadows.byBuffer.emplace(buffer.get(), key);
-    entry = StagedShadow{recorder, std::move(buffer), generation};
+    entry = StagedShadow{recorder, std::move(buffer), generation, baselineDelta, baselineTrusted};
 }
 
 }
 
 void ShutdownGuestBufferWorkers() {
     RefreshPool::Shutdown();
+}
+
+GuestBufferMemory::NarrowTrustStatistics GuestBufferMemory::NarrowTrustCounts() {
+    const auto& stats = Copies();
+    NarrowTrustStatistics counts;
+    counts.refreshed = stats.baselinesRefreshed.load(std::memory_order_relaxed);
+    counts.inherited = stats.baselinesInherited.load(std::memory_order_relaxed);
+    counts.inheritedUntrusted = stats.baselinesInheritedUntrusted.load(std::memory_order_relaxed);
+    counts.narrow = stats.narrowCopyBacks.load(std::memory_order_relaxed);
+    counts.whole = stats.wholeCopyBacks.load(std::memory_order_relaxed);
+    counts.claimBroken = stats.claimBroken.load(std::memory_order_relaxed);
+    return counts;
 }
 
 GuestBufferMemory::~GuestBufferMemory() {
@@ -2511,7 +2578,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             const bool misaligned = (region.begin - entry->base) % context.limits.minStorageBufferOffsetAlignment != 0;
             if (staged) {
                 const auto allocateStart = std::chrono::steady_clock::now();
-                region.buffer = stagingBuffer(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable));
+                region.buffer = stagingShadow(region, addressable);
                 if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
                 if (region.buffer == nullptr) {
                     // No shadow to be had: in place when aligned, else the host copy below.
@@ -2654,6 +2721,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 // region in place (Descriptor prefers `direct`), and a kept buffer would count as copied.
                 region.buffer.reset();
                 region.deviceLocal = false;
+                region.baselineDelta = 0;
             } else if (entry != nullptr && recorder != nullptr && (staged || gpuCopyEligible(region))) {
                 // Misaligned in the import (or staged): the GPU copies the sub-range out of it. The
                 // handle and base are taken now, under the import lock: a reconcile by the flush
@@ -2663,6 +2731,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 region.deviceLocal = staged;
                 region.copySource = entry->buffer;
                 region.copySourceBase = entry->base;
+                region.copySourceAddress = entry->address;
             }
         }
         if (region.direct != nullptr) {
@@ -2692,6 +2761,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // region falls back to a host buffer of its own.
             region.buffer.reset();
             region.deviceLocal = false;
+            region.baselineDelta = 0;
         }
         const auto copyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         copyRegion(region, addressable);
@@ -2797,16 +2867,33 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     if (profile) readUs.fetch_add(microsecondsSince(readStart), std::memory_order_relaxed);
 }
 
+std::shared_ptr<Buffer> GuestBufferMemory::stagingShadow(Region& region, bool addressable) const {
+    const auto bytes = region.end - region.begin;
+    region.baselineDelta = 0;
+    region.baselineTrusted = false;
+    region.baselineInherited = false;
+    // Narrow copy-backs: the baseline behind the bytes, device-addressed for the compare pass; a
+    // device that refuses the larger shadow gets the plain one.
+    if (const auto delta = narrowBaselineDelta(region.begin, bytes); delta != 0) {
+        if (auto shadow = stagingBuffer(context, static_cast<std::size_t>(delta + bytes), gpuCopyUsage(addressable) | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)) {
+            region.baselineDelta = delta;
+            return shadow;
+        }
+    }
+    return stagingBuffer(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable));
+}
+
 // A region's copy buffer not made by UploadPrepare (the registry was stale then): made here,
 // under the lock. Or no shadow to be had: a host copy serves the region instead, aligned or not.
 void GuestBufferMemory::allocateRegionBuffer(Region& region, bool addressable) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto bytes = region.end - region.begin;
     const auto allocateStart = std::chrono::steady_clock::now();
-    if (region.deviceLocal) region.buffer = stagingBuffer(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable));
+    if (region.deviceLocal) region.buffer = stagingShadow(region, addressable);
     if (region.buffer == nullptr) {
         region.deviceLocal = false;
         region.unstaged = true;
+        region.baselineDelta = 0;
         region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable), copyBufferProperties(false));
     }
     if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
@@ -2834,6 +2921,16 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     if (deferring) recorder->ReleaseClaims();
     std::vector<std::shared_ptr<Buffer>> chainShadows(copies.size());
     std::vector<std::uint8_t> chainDecided(copies.size(), 0);
+    // Narrow copy-backs: the registered shadow's baseline and its trust (takeStagedShadow).
+    std::vector<VkDeviceSize> chainDeltas(copies.size(), 0);
+    std::vector<std::uint8_t> chainTrusted(copies.size(), 0);
+    const auto takeShadow = [&](std::size_t index) {
+        auto* region = copies[index];
+        bool trusted = false;
+        auto shadow = takeStagedShadow(recorder, region->begin, region->end, region->buffer.get(), &chainDeltas[index], &trusted);
+        chainTrusted[index] = trusted ? 1 : 0;
+        return shadow;
+    };
     for (std::size_t index = 0; index < copies.size(); ++index) {
         auto* region = copies[index];
         const auto bytes = region->end - region->begin;
@@ -2845,7 +2942,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         chainDecided[index] = 1;
         GuestMemory::CollectWrites(region->begin, static_cast<std::size_t>(bytes));
         region->chainGeneration = GuestMemory::TrackerGeneration();
-        chainShadows[index] = takeStagedShadow(recorder, region->begin, region->end, region->buffer.get());
+        chainShadows[index] = takeShadow(index);
         static const bool noClaims = std::getenv("APS5_NO_COPY_BACK_CLAIMS") != nullptr;
         if (deferring && !noClaims && chainShadows[index] != nullptr) {
             recorder->ClaimDeferredCopies(chainShadows[index].get());
@@ -2880,7 +2977,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             if (!chainDecided[index]) {
                 GuestMemory::CollectWrites(region->begin, static_cast<std::size_t>(region->end - region->begin));
                 region->chainGeneration = GuestMemory::TrackerGeneration();
-                chainShadows[index] = takeStagedShadow(recorder, region->begin, region->end, region->buffer.get());
+                chainShadows[index] = takeShadow(index);
                 chainDecided[index] = 1;
             }
             inPlace[index] = chainShadows[index] != nullptr && chainShadows[index] == region->buffer;
@@ -2889,6 +2986,8 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         if (allInPlace) {
             for (std::size_t index = 0; index < copies.size(); ++index) {
                 auto* region = copies[index];
+                // The same buffer: its baseline as registered (Region::baselineDelta stands).
+                region->baselineTrusted = chainTrusted[index] != 0 && chainDeltas[index] == region->baselineDelta;
                 recorder->Keep(region->buffer);
                 region->snapshot.clear();
                 traceStaged(region->begin, region->end, region->atomic);
@@ -2921,6 +3020,10 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         }
     }
     const auto commands = recorder->CommandsKeepingCopyBacks();
+    // Narrow copy-backs: claimed copies recorded from here on (before this build's copy-backs take
+    // them over) would update their own shadow's baseline after the chain copies below took it.
+    const auto claimBreaks = recorder->ClaimBreaks();
+    std::vector<Region*> refreshBaselines;
     const auto timing = recorder->BeginGpuTiming(StagingCopyInKey);
     if (Recorder::BarrierValidate()) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
@@ -2961,11 +3064,15 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         }
         // Staging chain: the previous use's shadow of this exact range instead of the import.
         bool sameShadow = false;
+        // Narrow copy-backs: copied from another shadow (not the import), and the bytes the copy
+        // moves (a chained shadow's baseline comes along in the same copy).
+        bool chained = false;
+        auto copyBytes = bytes;
         if (region->deviceLocal && stagingChainEnabled()) {
             if (!chainDecided[index]) {
                 GuestMemory::CollectWrites(region->begin, static_cast<std::size_t>(bytes));
                 region->chainGeneration = GuestMemory::TrackerGeneration();
-                chainShadows[index] = takeStagedShadow(recorder, region->begin, region->end, region->buffer.get());
+                chainShadows[index] = takeShadow(index);
             }
             if (auto shadow = std::move(chainShadows[index])) {
                 sameShadow = shadow == region->buffer;
@@ -2973,6 +3080,23 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                     copySource = shadow->Handle();
                     copyOffset = 0;
                     recorder->Keep(shadow);
+                    chained = true;
+                }
+                if (region->baselineDelta != 0) {
+                    // Narrow copy-backs: the same buffer keeps its baseline; another buffer of the
+                    // range passes its baseline on with its bytes (one copy over both) and its
+                    // trust, unless it has none.
+                    const bool carried = chainDeltas[index] == region->baselineDelta;
+                    region->baselineTrusted = carried && chainTrusted[index] != 0;
+                    if (!sameShadow) {
+                        region->baselineInherited = true;
+                        region->claimBreaks = claimBreaks;
+                        if (carried) copyBytes = region->baselineDelta + bytes;
+                        if (profile) {
+                            Copies().baselinesInherited.fetch_add(1, std::memory_order_relaxed);
+                            if (!region->baselineTrusted) Copies().baselinesInheritedUntrusted.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
                 }
                 if (profile) {
                     Copies().chained.fetch_add(1, std::memory_order_relaxed);
@@ -2981,7 +3105,11 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 }
             }
         }
-        if (!sameShadow) CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
+        if (!sameShadow) {
+            CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, copyBytes);
+            // From the import (or its snapshot): the baseline takes the same bytes after the pass.
+            if (!chained && region->deviceLocal && region->baselineDelta != 0) refreshBaselines.push_back(region);
+        }
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -3019,6 +3147,23 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     }
     if (stagedAny && traceStagingEnabled()) noteStagedBuild(recorder, copies);
     if (stagedAny) reportStaging();
+    // Narrow copy-backs: a shadow copied in from its import holds what the import holds, so its
+    // baseline takes its bytes (a device-local copy after the copy-in, instead of a second read
+    // over PCIe).
+    if (!refreshBaselines.empty()) {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+        for (auto* region : refreshBaselines) {
+            const auto bytes = region->end - region->begin;
+            CopyBuffer(context, commands, region->buffer->Handle(), 0, region->buffer->Handle(), region->baselineDelta, bytes);
+            region->baselineTrusted = true;
+            region->baselineInherited = false;
+            if (profile) {
+                Copies().baselinesRefreshed.fetch_add(1, std::memory_order_relaxed);
+                Copies().baselineRefreshBytes.fetch_add(bytes, std::memory_order_relaxed);
+            }
+        }
+    }
     // The copied bytes are visible to the shaders bound to the buffers, which may also store into
     // them. Every stage: dispatches and draws share this path, and draws run mesh, task and
     // tessellation shaders too (the batch's own barriers around dispatches are as wide).
@@ -3049,6 +3194,8 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     auto timing = Recorder::NoTiming;
     std::uint64_t copiedBytes = 0;
     std::vector<Recorder::DeferredCopy> deferred;
+    // Narrow copy-backs recorded at once (no deferral): the recorder's pass, after the plain one.
+    std::vector<Recorder::DeferredCopy> narrowNow;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     for (auto& region : regions) {
         if (!region.gpuCopy || region.copiedBack) continue;
@@ -3084,9 +3231,37 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 ranges.resize(kept + 1);
             }
         }
+        // Narrow copy-backs: a shadow whose baseline stands for the import copies back only the
+        // dwords its use changed. One inherited from a shadow whose claimed copies were recorded
+        // after the chain copy (Recorder::ClaimBreaks) does not, whether or not this use copies
+        // anything back (the shadow is registered for the next use either way); a whole copy
+        // leaves the baseline behind (trusted again at the next copy-in from the import).
+        bool narrow = false;
+        if (region.deviceLocal && region.baselineDelta != 0) {
+            if (region.baselineTrusted && region.baselineInherited && recorder.ClaimBreaks() != region.claimBreaks) {
+                region.baselineTrusted = false;
+                if (profile) Copies().claimBroken.fetch_add(1, std::memory_order_relaxed);
+            }
+            // The claimed copies are this copy-back's now (TakeClaimedCopies above): nothing records
+            // them from the other shadow any more.
+            region.baselineInherited = false;
+            if (!ranges.empty()) {
+                narrow = region.baselineTrusted && recorder.NarrowsCopyBacks() && region.copySourceAddress != 0;
+                if (!narrow) region.baselineTrusted = false;
+                if (profile) (narrow ? Copies().narrowCopyBacks : Copies().wholeCopyBacks).fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         for (const auto& [from, to] : ranges) {
+            Recorder::DeferredCopy copy{region.buffer, region.buffer.get(), region.buffer->Handle(), region.copySource, from - region.begin, from - region.copySourceBase, to - from, from};
+            if (narrow) {
+                copy.sourceAddress = region.buffer->DeviceAddress();
+                copy.destinationAddress = region.copySourceAddress;
+                copy.baselineOffset = region.baselineDelta;
+            }
             if (defer) {
-                deferred.push_back({region.buffer, region.buffer.get(), region.buffer->Handle(), region.copySource, from - region.begin, from - region.copySourceBase, to - from, from});
+                deferred.push_back(std::move(copy));
+            } else if (narrow) {
+                narrowNow.push_back(std::move(copy));
             } else {
                 if (!recording) {
                     commands = recorder.Commands();
@@ -3120,7 +3295,13 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         }
         return;
     }
-    if (!recording) return;
+    if (!recording) {
+        if (!narrowNow.empty()) {
+            if (Recorder::BarrierValidate()) recorder.NoteAccess(Recorder::CommandClass::StagingOut, Recorder::Access{{}, merged, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
+            recorder.RecordCopyBacksNow(std::move(narrowNow));
+        }
+        return;
+    }
     if (Recorder::BarrierValidate()) recorder.NoteAccess(Recorder::CommandClass::StagingOut, Recorder::Access{{}, merged, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     // As a GPU label store or fill: visible to everything recorded after (shaders, transfers, an
     // indirect dispatch's arguments) and to the host once the batch completed; the caller's
@@ -3130,6 +3311,8 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
     recorder.MarkCovered(copiedAccess);
     recorder.EndGpuTiming(timing, copiedBytes);
+    // Other regions than the plain copies': their own pass after those.
+    if (!narrowNow.empty()) recorder.RecordCopyBacksNow(std::move(narrowNow));
 }
 
 VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const {
@@ -3244,7 +3427,7 @@ void GuestBufferMemory::MarkDirectWrites() const {
         const bool overlapped = std::any_of(regions.begin(), regions.end(), [&](const Region& other) { return &other != &region && other.begin < region.end && region.begin < other.end && WritesOverlap(std::max(other.begin, region.begin), static_cast<std::size_t>(std::min(other.end, region.end) - std::max(other.begin, region.begin))); });
         if (overlapped) continue;
         if (generation == 0) generation = GuestMemory::TrackerGeneration();
-        registerStagedShadow(recorder, region.begin, region.end, region.buffer, generation);
+        registerStagedShadow(recorder, region.begin, region.end, region.buffer, generation, region.baselineDelta, region.baselineTrusted);
     }
 }
 

@@ -113,6 +113,9 @@ struct Context {
     bool depthClamp = false;
     // Nonzero when VK_EXT_external_memory_host is enabled: the required host pointer alignment.
     VkDeviceSize hostImportAlignment = 0;
+    // A CPU implementation (lavapipe): its "device" reaches host imports with CPU loads and stores,
+    // which host page protection stops (resident buffers' guards would fault its own copies).
+    bool softwareDevice = false;
     RenderCache* renderCache = nullptr;
     DrawQueue* drawQueue = nullptr;
     GraphicsPipelineCache* graphicsPipelines = nullptr;
