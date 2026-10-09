@@ -3851,7 +3851,7 @@ ShaderResources::DeferredMemo& ShaderResources::DeferredMemoFor(std::size_t allo
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
     // An address-based use may store through its BDA table anywhere the table allows: the resident
     // read-only copies over those ranges are refreshed at their next use, after this one.
-    if (usesBda && bdaStores) guestMemory.NoteAddressWriter();
+    if (usesBda && bdaStores) guestMemory.NoteAddressWriter(Recorder::Active());
     if (_set == VK_NULL_HANDLE) return;
     if (CheckStaleImports()) {
         for (const auto buffer : boundBuffers) {

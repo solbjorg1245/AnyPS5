@@ -44,6 +44,8 @@ constexpr std::size_t PendingBlockSlots = std::size_t{1} << 18;
 std::atomic<bool> pendingBlocksOn{false};
 std::atomic<std::atomic<std::uint64_t>*> pendingBlockTable{nullptr};
 std::atomic<std::uint64_t> completedBlockSerial{0};
+// Some recorder was made with APS5_RESIDENT_READS (Recorder::ResidentReadsConfigured).
+std::atomic<bool> residentReadsConfigured{false};
 
 void trackPendingBlocksFromEnvironment() {
     static const bool tracked = [] {
@@ -1238,6 +1240,7 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
     const char* residentReadsSwitch = std::getenv("APS5_RESIDENT_READS");
     residentReads.enabled = residentReadsSwitch != nullptr && *residentReadsSwitch != '\0' && std::strcmp(residentReadsSwitch, "0") != 0;
     if (residentReads.enabled) {
+        residentReadsConfigured.store(true, std::memory_order_relaxed);
         const auto kib = [](const char* name, std::uint64_t fallback) {
             const char* value = std::getenv(name);
             return (value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : fallback) << 10u;
@@ -1539,6 +1542,10 @@ bool Recorder::BlockPending(std::uint64_t address) {
 
 std::uint64_t Recorder::CompletedSerial() {
     return completedBlockSerial.load(std::memory_order_acquire);
+}
+
+bool Recorder::ResidentReadsConfigured() {
+    return residentReadsConfigured.load(std::memory_order_relaxed);
 }
 
 void Recorder::markPendingBlocks(std::uint64_t address, std::uint64_t end, std::uint64_t serial) const {
@@ -4566,6 +4573,17 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
     }
     if (profile) holdCounters.completions += batch->completions.size();
     noteBlocksFinished(batch->serial);
+    if (ResidentReadsLive() && batch->serial != 0) {
+        // Resident read-only copies: the address-based uses recorded into this batch and every
+        // earlier one stored their pages as stamps (the completions above), so their writer
+        // notes go. A batch whose completions still run (a nested sync from one) holds back the
+        // later ones' notes until a later finish.
+        auto finished = batch->serial;
+        for (const auto* other : finishing) {
+            if (other->serial != 0 && other->serial < finished) finished = other->serial - 1;
+        }
+        if (finished != 0) NoteResidentReadsFinished(id, finished);
+    }
     const auto keptStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // Deferred only from inside a hold: the unlock that releases the list is this thread's own, and
     // a caller finishing batches without the mutex (a test) might never make one.

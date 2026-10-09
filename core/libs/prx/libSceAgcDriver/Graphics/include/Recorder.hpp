@@ -201,6 +201,12 @@ public:
     };
     bool KeepsResidentReads() const { return residentReads.enabled; }
     const ResidentReadSettings& ResidentReads() const { return residentReads; }
+    // Whether any recorder was made with APS5_RESIDENT_READS (one relaxed load): what only the
+    // resident reads use (an address space's writable ranges, a program's BDA store scan) is
+    // prepared only then.
+    static bool ResidentReadsConfigured();
+    // This recorder's identity (never reused, unlike its address).
+    std::uint64_t Id() const { return id; }
     std::uint64_t ResidentCopyBytes() const;
     static bool ResolveResidentFault(std::uintptr_t address);
     // ResolveResidentFault's work on the calling thread, under the GPU mutex it takes. The fault

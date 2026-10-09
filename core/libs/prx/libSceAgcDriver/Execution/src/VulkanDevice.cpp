@@ -624,6 +624,11 @@ struct VulkanDevice::State {
             resourceCache.Clear();
             Graphics::ClearCachedTextures(device);
             Graphics::ClearImageMirrors(device);
+            // Resident read-only copies (device-local buffers of this device's pool): their holders
+            // went with the recorder and the cache above, so the cache's references are the last.
+            if (Graphics::ResidentReadsLive()) {
+                if (const auto left = Graphics::ClearResidentReads(); left != 0) std::fprintf(stderr, "[resident-reads] %zu copies still held at the device teardown\n", left);
+            }
             patternBuffers.clear();
             fastRing.reset();
             fastLayouts.reset();
@@ -3529,6 +3534,10 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     auto& resources = *record.resources;
     const auto arguments = record.arguments;
     const auto* argumentImport = record.argumentImport;
+    // Resident read-only copies (APS5_RESIDENT_READS): checked at the build or proof; a sync since
+    // (decideIndirect's CPU path) may have reaped completions storing into a range, so they are
+    // checked again into the open batch. Nothing without resident regions or a submit since.
+    resources.RecheckResidentReads(recorder);
     // The record phase split (APS5_PROFILE_DRAW, rows "record: ..." of the [dispatch] totals):
     // opening the batch, the keeps, the data refresh, the barriers with the bind and the dispatch
     // itself, the pending-write notes and marks (MarkGpuWrites), and the completion registration.

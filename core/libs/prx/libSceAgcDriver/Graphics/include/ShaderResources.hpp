@@ -69,6 +69,11 @@ StorageImageElement ResolveStorageImage(const Context& context, const ShaderReco
 // Defined in Texture.cpp beside the pending-results registry, for the fast Revalidate below: whether
 // a storage image other than `except` has results pending in [address, address + bytes).
 bool PendingStorageOverlaps(std::uint64_t address, std::size_t bytes, const StorageTexture* except);
+// Resident read-only copies (GuestBufferMemory.cpp "Resident reads"): whether a SPIR-V module may
+// store through a physical storage buffer pointer (a BDA store), by its instructions alone: an
+// OpStore, OpCopyMemory or atomic whose pointer is typed PhysicalStorageBuffer, or comes from an
+// instruction the scan does not type. Independent of debug names (an inlined lookup keeps it).
+bool SpirvMayStoreThroughBda(std::span<const std::uint32_t> words);
 
 // Per-device descriptor objects shared by ShaderResources builds: set layouts by their binding list
 // (immutable; kept until the device is torn down, which Vulkan allows even for pipeline layouts made
@@ -208,6 +213,9 @@ public:
     void WriteBackBuffers();
     // Whether WriteBackBuffers has anything the CPU must see (copied written buffers, BDA faults).
     bool NeedsCompletion() const { return bda != nullptr || guestMemory.HasCopiedWrites(); }
+    // Resident read-only copies: the dispatch is about to be recorded; a batch submitted since the
+    // build's or proof's check makes it check them again (GuestBufferMemory::RecheckResidentReads).
+    void RecheckResidentReads(Recorder& recorder) { guestMemory.RecheckResidentReads(recorder); }
     // Whether a written buffer was copied (its results reach guest memory by the CPU write-back).
     bool HasCopiedWrites() const { return guestMemory.HasCopiedWrites(); }
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
