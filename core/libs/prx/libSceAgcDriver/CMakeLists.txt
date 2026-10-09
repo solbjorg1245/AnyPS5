@@ -532,10 +532,11 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
-    # The shader-memory tests again with the fast walk's in-place build off (APS5_NO_WALK_REUSE=1,
-    # latched once per process): TryMaterialize's fresh-object form.
+    # The shader-memory tests again with the fast walk's in-place build and PopulateVariant's memo
+    # off (APS5_NO_WALK_REUSE=1, APS5_NO_VARIANT_MEMO=1, latched once per process): TryMaterialize's
+    # fresh-object form and PopulateVariant's scan and fresh result.
     add_test(NAME agc_shader_memory_no_walk_reuse COMMAND agc_shader_memory_tests)
-    set_tests_properties(agc_shader_memory_no_walk_reuse PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_WALK_REUSE=1" SKIP_RETURN_CODE 77)
+    set_tests_properties(agc_shader_memory_no_walk_reuse PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_WALK_REUSE=1;APS5_NO_VARIANT_MEMO=1" SKIP_RETURN_CODE 77)
     if(WIN32)
         set_tests_properties(agc_shader_memory_no_walk_reuse PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")

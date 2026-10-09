@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include <array>
 #include <memory>
 #include <cstdint>
 #include <optional>
@@ -77,6 +78,55 @@ void SetImportWatch(const Context& context, ImportWatch watch);
 // (alignment and budget permitting), or null. Bytes at `address` are at `address - import->base` in
 // the import's buffer.
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
+
+// A thread's memo of the imports HostImportFor answered it last (docs/design/draw-fastpath.md 2.5,
+// s53-fastdraw-diag step 2c). An entry answers a range inside its import while the registry is as
+// it was when the entry was noted: the same device, the same registry generation
+// (GuestAllocationsGeneration) and the same import epoch (bumped by every retire and by a device
+// change). HostImportFor would then find that very import without reconciling: the imports of one
+// generation are of disjoint registered ranges (an import whose range changed was retired when
+// the generation was reconciled) and none was dropped since. Entries are noted only after a
+// lookup that left the registry reconciled for the device.
+struct HostImportMemo {
+    struct Entry {
+        VkDevice device = VK_NULL_HANDLE;
+        std::uint64_t generation = 0;
+        std::uint64_t epoch = 0;
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        const HostImport* import = nullptr;
+    };
+    static constexpr std::size_t Entries = 4;
+    std::array<Entry, Entries> entries{};
+    std::size_t next = 0;
+    std::uint64_t hits = 0;
+    std::uint64_t misses = 0;
+    // The noted import holding [address, address + bytes) under exactly (device, generation,
+    // epoch), or null.
+    const HostImport* Find(VkDevice device, std::uint64_t generation, std::uint64_t epoch, std::uint64_t address, std::uint64_t bytes) const;
+    // Remembers `import` as found under (device, generation, epoch), over the oldest entry.
+    void Note(VkDevice device, std::uint64_t generation, std::uint64_t epoch, const HostImport& import);
+};
+HostImportMemo& ThreadHostImportMemo();
+// HostImportFor through the calling thread's HostImportMemo: a hit takes no registry mutex. The
+// fast draw's bindings (HostImportResolver) and the fast dispatch's elements and records use it;
+// APS5_NO_IMPORT_MEMO=1 calls HostImportFor.
+const HostImport* HostImportMemoized(const Context& context, std::uint64_t address, std::size_t bytes);
+// While one lives on the calling thread, HostImportForPath answers through HostImportMemoized:
+// DrawFast holds one, so the steps it shares with Draw (the in-place inputs, the indirect records)
+// use the memo there and HostImportFor on the old path.
+class FastImportScope {
+public:
+    FastImportScope();
+    ~FastImportScope();
+    FastImportScope(const FastImportScope&) = delete;
+    FastImportScope& operator=(const FastImportScope&) = delete;
+
+private:
+    bool previous;
+};
+const HostImport* HostImportForPath(const Context& context, std::uint64_t address, std::size_t bytes);
+
 // Whether an existing import covers [address, address + bytes), without reconciling the imports
 // with the registry or making one (HostImportFor may take a registry lease): a hint for choices
 // made outside the device lock (a sampled texture's path, a dispatch's pre-sync); the path taken
@@ -85,7 +135,7 @@ bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t
 // The existing import covering the range, as HostImportCovers finds it (nothing reconciled or
 // made): its buffer and base, copied under the registry lock.
 bool HostImportExisting(const Context& context, std::uint64_t address, std::size_t bytes, VkBuffer& buffer, std::uint64_t& base);
-// The import registry's epoch, bumped by every retire (one lock).
+// The import registry's epoch, bumped by every retire (an atomic load, no lock).
 std::uint64_t HostImportsEpoch();
 // Whether a readable registered allocation contains [address, address + bytes) right now (one
 // registry lease): a storage image whose memory was freed or re-registered has nothing to store to.

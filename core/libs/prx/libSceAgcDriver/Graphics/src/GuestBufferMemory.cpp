@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/HostMutex.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -153,11 +154,20 @@ struct HostImports {
     // Registry generation the imports were last reconciled with.
     std::uint64_t refreshedGeneration = 0;
     // Bumped whenever an import is dropped, so HostImport pointers taken under the lock earlier can be
-    // reused while it is unchanged.
+    // reused while it is unchanged. Changed only through bumpEpoch.
     std::uint64_t epoch = 1;
+    // `epoch` for readers without the mutex (HostImportsEpoch, the import memo): stored under the
+    // mutex right after every bump, so a lock-free load returns an epoch that was current at some
+    // point of the call, as a load under the lock does.
+    std::atomic<std::uint64_t> publishedEpoch{1};
     VkDevice watchDevice = VK_NULL_HANDLE;
     bool unwatchImports = false;
 };
+
+void bumpEpoch(HostImports& state) {
+    ++state.epoch;
+    state.publishedEpoch.store(state.epoch, std::memory_order_release);
+}
 
 HostImports& Imports() {
     static HostImports imports;
@@ -203,7 +213,7 @@ void retireImport(const Context& context, HostImports& state, std::map<std::uint
         if (recorder->KeepsResidentBuffers()) recorder->FlushDeferredWhere([buffer = it->second.buffer](const Recorder::DeferredCopy& copy, bool) { return copy.destination == buffer; }, Recorder::FlushReason::CopyIn);
         if (!recorder->Idle()) recorder->Keep(std::move(holder));
     }
-    ++state.epoch;
+    bumpEpoch(state);
     state.imports.erase(it);
 }
 
@@ -216,7 +226,7 @@ void retireSpan(HostImports& state, const Context& context, std::map<std::uint64
         if (recorder->KeepsResidentBuffers()) recorder->FlushDeferredWhere([buffer = it->second.entry.buffer](const Recorder::DeferredCopy& copy, bool) { return copy.destination == buffer; }, Recorder::FlushReason::CopyIn);
         if (!recorder->Idle()) recorder->Keep(std::move(holder));
     }
-    ++state.epoch;
+    bumpEpoch(state);
     state.spans.erase(it);
 }
 
@@ -455,7 +465,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         state.destroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
         state.freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
         state.refreshedGeneration = 0;
-        ++state.epoch;
+        bumpEpoch(state);
     }
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (generation == state.refreshedGeneration) return;
@@ -1344,10 +1354,10 @@ void SetImportWatch(const Context& context, ImportWatch watch) {
     state.unwatchImports = watch == ImportWatch::Unwatch;
 }
 
-const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
-    if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
-    auto& state = Imports();
-    std::lock_guard lock(state.mutex);
+namespace {
+
+// HostImportFor's lookup under the registry mutex (the range checks done).
+const HostImport* hostImportLocked(const Context& context, HostImports& state, std::uint64_t address, std::size_t bytes) {
     // A hit is only valid while the registry has not changed since the imports were reconciled.
     if (!importsStale(context, state)) {
         if (const auto* entry = findImport(state, address, address + bytes)) return entry;
@@ -1356,6 +1366,78 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     refreshImports(context, state, lease);
     if (const auto* range = containingRange(lease, address, address + bytes)) return importAllocation(context, state, range->address, range->bytes, lease);
     return nullptr;
+}
+
+bool importRangeValid(const Context& context, std::uint64_t address, std::size_t bytes) {
+    return context.hostImportAlignment != 0 && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address;
+}
+
+// APS5_NO_IMPORT_MEMO=1: the fast paths look every range up with HostImportFor (the registry
+// mutex per range), as before.
+bool importMemoEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_IMPORT_MEMO") == nullptr;
+    return enabled;
+}
+
+struct HostImportMemoTag {};
+struct FastImportScopeTag {};
+
+}
+
+const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (!importRangeValid(context, address, bytes)) return nullptr;
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    return hostImportLocked(context, state, address, bytes);
+}
+
+const HostImport* HostImportMemo::Find(VkDevice device, std::uint64_t generation, std::uint64_t epoch, std::uint64_t address, std::uint64_t bytes) const {
+    for (const auto& entry : entries) {
+        if (entry.import == nullptr || entry.device != device || entry.generation != generation || entry.epoch != epoch) continue;
+        if (address >= entry.begin && bytes <= entry.end - entry.begin && address - entry.begin <= entry.end - entry.begin - bytes) return entry.import;
+    }
+    return nullptr;
+}
+
+void HostImportMemo::Note(VkDevice device, std::uint64_t generation, std::uint64_t epoch, const HostImport& import) {
+    entries[next] = {device, generation, epoch, import.base, import.base + import.bytes, &import};
+    next = (next + 1) % Entries;
+}
+
+HostImportMemo& ThreadHostImportMemo() {
+    return HostThreadLocal<HostImportMemo, HostImportMemoTag>();
+}
+
+const HostImport* HostImportMemoized(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (!importMemoEnabled()) return HostImportFor(context, address, bytes);
+    if (!importRangeValid(context, address, bytes)) return nullptr;
+    auto& state = Imports();
+    auto& memo = ThreadHostImportMemo();
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto epoch = state.publishedEpoch.load(std::memory_order_acquire);
+    if (const auto* import = memo.Find(context.device, generation, epoch, address, bytes)) {
+        ++memo.hits;
+        return import;
+    }
+    ++memo.misses;
+    std::lock_guard lock(state.mutex);
+    const auto* import = hostImportLocked(context, state, address, bytes);
+    // Noted only for a reconciled registry of this device: an entry answers while the generation
+    // and the epoch stay what they were, i.e. while this lookup would find the same import.
+    if (import != nullptr && !importsStale(context, state)) memo.Note(context.device, state.refreshedGeneration, state.epoch, *import);
+    return import;
+}
+
+FastImportScope::FastImportScope() : previous(HostThreadLocal<bool, FastImportScopeTag>()) {
+    HostThreadLocal<bool, FastImportScopeTag>() = true;
+}
+
+FastImportScope::~FastImportScope() {
+    HostThreadLocal<bool, FastImportScopeTag>() = previous;
+}
+
+const HostImport* HostImportForPath(const Context& context, std::uint64_t address, std::size_t bytes) {
+    return HostThreadLocal<bool, FastImportScopeTag>() ? HostImportMemoized(context, address, bytes) : HostImportFor(context, address, bytes);
 }
 
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes) {
@@ -1385,9 +1467,7 @@ bool HostImportExisting(const Context& context, std::uint64_t address, std::size
 }
 
 std::uint64_t HostImportsEpoch() {
-    auto& state = Imports();
-    std::lock_guard lock(state.mutex);
-    return state.epoch;
+    return Imports().publishedEpoch.load(std::memory_order_acquire);
 }
 
 GuestBufferMemory::GuestBufferMemory(const Context& context) : context(context) {}

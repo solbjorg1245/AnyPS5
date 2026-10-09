@@ -1,6 +1,8 @@
 #include "Recompiler.hpp"
 #include "prx/libc/include/HostMutex.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -381,6 +383,26 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     return result;
 }
 
+// materializeResult into a caller's result (the fast paths' per-thread one, PopulateVariant): the
+// same content, but the vectors keep their storage. The variant's fields come by copy assignment
+// (a vector's existing storage is reused), its empty bindings and push constants aside; then
+// PopulateInto rewrites those in place.
+struct PopulateScratchTag {};
+
+void materializeResultInto(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, RecompileResult& result) {
+    auto bindings = std::move(result.bindings);
+    auto pushConstants = std::move(result.pushConstants);
+    result = variant.result;
+    result.bindings = std::move(bindings);
+    result.pushConstants = std::move(pushConstants);
+    auto& shaderData = HostThreadLocal<std::vector<std::uint32_t>, PopulateScratchTag>();
+    DescriptorBindingBuilder{}.PopulateInto(variant.bindings.layout, variant.info.info, variant.info.stage, variant.info.userDataBase, snapshot, partialThreads(request), result.bindings, result.pushConstants, shaderData);
+    for (auto& attribute : result.vertexAttributes) {
+        if (!request.context.vertex || attribute.location >= request.context.vertex->resourcesNum) throw std::runtime_error("Shader cache: invalid vertex attribute metadata");
+        attribute.resource = request.context.vertex->resources[attribute.location];
+    }
+}
+
 bool sameLayout(const BindingLayout& left, const BindingLayout& right) {
     return left.descriptorSet == right.descriptorSet && left.firstBinding == right.firstBinding && left.pushConstantOffsetBytes == right.pushConstantOffsetBytes && left.pushConstantSizeBytes == right.pushConstantSizeBytes;
 }
@@ -759,8 +781,76 @@ WalkStatus WalkResources(const SourceHandle& handle, std::span<const std::uint32
     return WalkStatus::Walked;
 }
 
+namespace {
+
+// APS5_NO_VARIANT_MEMO=1: PopulateVariant scans the source's variants under its mutex on every
+// call and returns a freshly copied result, as before (the A/B for the memo and the in-place
+// populate below).
+bool variantMemo() {
+    static const bool enabled = std::getenv("APS5_NO_VARIANT_MEMO") == nullptr;
+    return enabled;
+}
+
+// PopulateVariant's per-thread memo (s53-fastdraw-diag step 2b): the variants this thread's fast
+// walks selected last, by source. A source's variant list only grows, under its mutex, and
+// findOrCompileVariant searches it before it compiles, so at most one variant matches a (layout,
+// specialization) pair and a match found once is the one the scan finds for good: a hit needs no
+// lock and no scan. The entry holds the source, so its address cannot be reused for another one
+// while the entry lives; a specialization the source does not hold is never remembered (a later
+// compile must be found).
+struct VariantMemo {
+    struct Entry {
+        std::shared_ptr<SourceEntry> source;
+        std::shared_ptr<const CompiledVariant> variant;
+    };
+    static constexpr std::size_t Entries = 8;
+    std::array<Entry, Entries> entries{};
+    std::size_t next = 0;
+    VariantMemoCounts counts;
+};
+struct VariantMemoTag {};
+
+}
+
+VariantMemoCounts ThreadVariantMemoCounts() {
+    return HostThreadLocal<VariantMemo, VariantMemoTag>().counts;
+}
+
 bool PopulateVariant(const SourceHandle& handle, const RecompileRequest& request, const ResourceSnapshot& snapshot, const ResourceSpecialization& specialization, RecompileResult& result) {
     if (handle.source == nullptr) return false;
+    if (variantMemo()) {
+        auto& memo = HostThreadLocal<VariantMemo, VariantMemoTag>();
+        const CompiledVariant* found = nullptr;
+        for (const auto& entry : memo.entries) {
+            if (entry.source.get() == handle.source.get() && entry.variant != nullptr && sameLayout(entry.variant->layout, request.layout) && entry.variant->specialization == specialization) {
+                found = entry.variant.get();
+                break;
+            }
+        }
+        if (found != nullptr) {
+            ++memo.counts.hits;
+        } else {
+            std::shared_ptr<const CompiledVariant> variant;
+            {
+                std::lock_guard lock(handle.source->mutex);
+                for (const auto& candidate : handle.source->variants) {
+                    if (sameLayout(candidate->layout, request.layout) && candidate->specialization == specialization) {
+                        variant = candidate;
+                        break;
+                    }
+                }
+            }
+            ++memo.counts.misses;
+            if (variant == nullptr) return false;
+            found = variant.get();
+            memo.entries[memo.next] = {handle.source, std::move(variant)};
+            memo.next = (memo.next + 1) % VariantMemo::Entries;
+        }
+        // The memo entry holds the variant past this call (a later miss replaces it only after
+        // this call returned).
+        materializeResultInto(*found, request, snapshot, result);
+        return true;
+    }
     std::shared_ptr<const CompiledVariant> variant;
     {
         std::lock_guard lock(handle.source->mutex);

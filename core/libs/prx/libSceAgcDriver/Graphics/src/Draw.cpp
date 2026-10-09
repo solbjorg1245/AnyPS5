@@ -826,7 +826,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         // range is noted as a pending read of the batch so no CPU copy lands on it early. Copying
         // an indirect draw's whole descriptor ranges (~100 MiB of indices) was 4-5 GiB per 10 s.
         if (inPlace && InPlaceInputs()) {
-            if (const auto* import = HostImportFor(context, address, bytes); import != nullptr) {
+            if (const auto* import = HostImportForPath(context, address, bytes); import != nullptr) {
                 copy.import = import;
                 copy.importOffset = address - import->base;
                 return copy;
@@ -1808,7 +1808,7 @@ IndirectDrawPath indirectPathFor(const Context& context, Recorder* recorder, std
     const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
     if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
     if (std::any_of(DrawCopiedWriters()->begin(), DrawCopiedWriters()->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
-    if ((import = HostImportFor(context, address, bytes)) == nullptr) return IndirectDrawPath::NotImported;
+    if ((import = HostImportForPath(context, address, bytes)) == nullptr) return IndirectDrawPath::NotImported;
     return IndirectDrawPath::Gpu;
 }
 
@@ -2391,6 +2391,9 @@ FastDrawOutcome DrawFast(const Context& context, const State& state, const Pm4::
     if (state.stages.mesh || state.stages.tessellation || state.rectList) return decline(FastDecline::Shape);
     DrawOutcome outcome;
     DrawTimer timer(false);
+    // The inputs and records this draw shares with Draw find their imports through the thread's
+    // memo (HostImportForPath); the bindings' resolver uses it too (HostImportResolver).
+    const FastImportScope importScope;
     ScratchLease<DrawInputScratch> inputScratch;
     ScratchLease<FastBindings> bindings;
     ScratchLease<FastDrawScratch> scratch;

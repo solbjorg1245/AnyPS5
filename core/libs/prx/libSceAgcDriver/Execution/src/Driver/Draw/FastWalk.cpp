@@ -67,16 +67,27 @@ struct WalkScratch {
     ShaderRecompiler::RecompileResult walked;
     ShaderRecompiler::ShaderVertexStageInfo vertex{};
     std::vector<FetchPlanEntry> plans;
+    // The plan the last lookup found, tried first (consecutive draws mostly share their vertex
+    // program).
+    std::size_t lastPlan = 0;
 };
 struct WalkScratchTag {};
 
+// At most one entry matches a program: an entry is added only when none matches, and one that
+// stopped matching (its snapshot expired) never matches again. So the last lookup's entry, when it
+// still matches, is the one the scan finds.
 const Graphics::VertexFetchPlan& fetchPlanFor(WalkScratch& scratch, const DrawProgram& program) {
-    for (const auto& entry : scratch.plans) {
-        if (entry.raw == program.snapshot.get() && entry.codeOffset == program.codeOffset && !entry.snapshot.expired()) return entry.plan;
+    const auto matches = [&](const FetchPlanEntry& entry) { return entry.raw == program.snapshot.get() && entry.codeOffset == program.codeOffset && !entry.snapshot.expired(); };
+    if (scratch.lastPlan < scratch.plans.size() && matches(scratch.plans[scratch.lastPlan])) return scratch.plans[scratch.lastPlan].plan;
+    for (std::size_t index = 0; index < scratch.plans.size(); ++index) {
+        if (!matches(scratch.plans[index])) continue;
+        scratch.lastPlan = index;
+        return scratch.plans[index].plan;
     }
     constexpr std::size_t Entries = 256;
     if (scratch.plans.size() >= Entries) scratch.plans.erase(scratch.plans.begin());
     scratch.plans.push_back({program.snapshot.get(), program.snapshot, program.codeOffset, Graphics::DecodeVertexFetchPlan(program.binary.header, program.binary.headerAddress)});
+    scratch.lastPlan = scratch.plans.size() - 1;
     return scratch.plans.back().plan;
 }
 

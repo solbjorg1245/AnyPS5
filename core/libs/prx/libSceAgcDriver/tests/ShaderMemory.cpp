@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
+#include "Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -303,6 +304,206 @@ void verifyQuietDeclines(const ShaderRecompiler::RecompileRequest& request, cons
         refused = std::string_view(error.what()).find("requires an express-only runtime") != std::string_view::npos;
     }
     require(refused && reader.reads == 0, "TryMaterialize accepted a runtime that is not express-only");
+}
+
+// Every field of two results, cacheHit aside (PopulateVariant against the old path's result).
+bool sameResult(const ShaderRecompiler::RecompileResult& left, const ShaderRecompiler::RecompileResult& right) {
+    if (!(left.spirv == right.spirv) || left.pushConstants != right.pushConstants || left.memoryOffsetDword != right.memoryOffsetDword || left.bdaAbiVersion != right.bdaAbiVersion || left.variantId != right.variantId) return false;
+    if (left.vertexOffsetSgpr != right.vertexOffsetSgpr || left.instanceOffsetSgpr != right.instanceOffsetSgpr || left.vertexOffsetShared != right.vertexOffsetShared || left.instanceOffsetShared != right.instanceOffsetShared || left.vertexOffsetConflict != right.vertexOffsetConflict || left.instanceOffsetConflict != right.instanceOffsetConflict) return false;
+    if (left.parameterExports != right.parameterExports || left.bindings.size() != right.bindings.size() || left.vertexAttributes.size() != right.vertexAttributes.size() || left.fragmentParameters.size() != right.fragmentParameters.size()) return false;
+    for (std::size_t i = 0; i < left.bindings.size(); ++i) {
+        const auto& a = left.bindings[i];
+        const auto& b = right.bindings[i];
+        if (a.kind != b.kind || a.role != b.role || a.descriptorSet != b.descriptorSet || a.binding != b.binding || a.count != b.count || a.guestDescriptor != b.guestDescriptor || a.readOnly != b.readOnly || a.imageShape != b.imageShape) return false;
+        if (a.samplerDepthCompare != b.samplerDepthCompare || a.imageWritten != b.imageWritten || a.imageDepthCompare != b.imageDepthCompare || a.bufferAtomic != b.bufferAtomic || a.bufferWritten != b.bufferWritten || a.deferredWords != b.deferredWords) return false;
+    }
+    for (std::size_t i = 0; i < left.vertexAttributes.size(); ++i) {
+        const auto& a = left.vertexAttributes[i];
+        const auto& b = right.vertexAttributes[i];
+        if (a.location != b.location || a.components != b.components || a.resource.fields != b.resource.fields || a.fetchIndex != b.fetchIndex) return false;
+    }
+    for (std::size_t i = 0; i < left.fragmentParameters.size(); ++i) {
+        const auto& a = left.fragmentParameters[i];
+        const auto& b = right.fragmentParameters[i];
+        if (a.location != b.location || a.sourceLocation != b.sourceLocation || a.flat != b.flat || a.perVertex != b.perVertex || a.custom != b.custom) return false;
+    }
+    return true;
+}
+
+// A result as another draw's populate may leave the fast path's per-thread one: `bindings`
+// bindings full of foreign words and flags, foreign push constants, attributes and parameters.
+void dirtyResult(ShaderRecompiler::RecompileResult& result, std::size_t bindings) {
+    using namespace ShaderRecompiler;
+    result.bindings.resize(bindings);
+    for (auto& binding : result.bindings) {
+        binding.kind = DescriptorKind::SampledImage;
+        binding.role = DescriptorRole::GuestSamplers;
+        binding.descriptorSet = 9;
+        binding.binding = 9;
+        binding.count = 9;
+        binding.guestDescriptor.assign(13, 0xdeadbeefu);
+        binding.readOnly = true;
+        binding.imageShape = DescriptorImageShape::Image3D;
+        binding.samplerDepthCompare.assign(3, true);
+        binding.imageWritten.assign(2, true);
+        binding.imageDepthCompare.assign(2, true);
+        binding.bufferAtomic.assign(5, true);
+        binding.bufferWritten.assign(5, true);
+        binding.deferredWords.assign(2, {1u, 0x20000u});
+    }
+    result.pushConstants.assign(200, std::byte{0x5a});
+    result.vertexAttributes.assign(3, VertexAttribute{1, 2, {}, 3});
+    result.parameterExports.assign(4, 7u);
+    result.fragmentParameters.assign(2, FragmentParameter{1, 2, true, true, true});
+    result.memoryOffsetDword = 77;
+    result.bdaAbiVersion = 5;
+    result.vertexOffsetSgpr = 3;
+    result.instanceOffsetSgpr = 4;
+    result.vertexOffsetShared = true;
+    result.instanceOffsetConflict = true;
+    result.variantId = 12345;
+    result.cacheHit = true;
+}
+
+// DescriptorBindingBuilder::PopulateInto, the in-place populate behind PopulateVariant: over the
+// vectors another populate left (more bindings than the layout's, full of foreign words and flags,
+// then fewer; foreign push constants and shader-data scratch), every binding role (guest buffers,
+// a sampled and a storage image, samplers with the point-filter patch, the flattened SRT with a
+// deferred word, the shader data) comes out exactly as Populate makes it, and so do the push
+// constants of a push-data layout.
+void verifyPopulateInto() {
+    using namespace ShaderRecompiler;
+    const auto value = [](std::uint32_t words, std::uint32_t base) {
+        DescriptorValue result;
+        result.dwordCount = words;
+        for (std::uint32_t i = 0; i < words; ++i) result.dwords[i] = base + i;
+        return result;
+    };
+    IrBindingLayout layout;
+    layout.memoryOffsetDword = 2;
+    layout.memoryOffsetCount = 4;
+    layout.userDataRegisters = {8, 9};
+    layout.descriptors = {
+        {DescriptorBindingKind::Buffers, {0, 1}},
+        {static_cast<DescriptorBindingKind>(FirstImageBinding), {0}},
+        {static_cast<DescriptorBindingKind>(FirstStorageImageBinding), {1}},
+        {DescriptorBindingKind::Samplers, {0, 1}},
+        {DescriptorBindingKind::FlattenedSrt, {}},
+        {DescriptorBindingKind::ShaderData, {}},
+    };
+    ShaderInfo info;
+    info.buffers.resize(2);
+    info.buffers[1].written = true;
+    info.images.resize(2);
+    info.images[0].dimension = RdnaImageDimension::Dim2D;
+    info.images[0].depthCompare = true;
+    info.images[1].dimension = RdnaImageDimension::Dim2DArray;
+    info.images[1].written = true;
+    info.samplers.resize(2);
+    info.samplers[0].forcePointFiltering = true;
+    info.samplers[1].depthCompare = true;
+    ResourceSnapshot snapshot;
+    snapshot.buffers = {value(4, 0x100), value(4, 0x200)};
+    snapshot.images = {value(8, 0x300), value(8, 0x400)};
+    snapshot.samplers = {value(4, 0x500), value(4, 0x600)};
+    snapshot.samplers[0].dwords[2] = 0x0ff00000u | (1u << 26u);
+    snapshot.flattenedSrt = {1, 2, 3};
+    snapshot.deferredFlat = {{1u, 0x1234u}};
+    snapshot.userData = {0xau, 0xbu};
+    const std::array<std::uint32_t, 3> threads{};
+    const auto check = [&](const IrBindingLayout& checked, std::size_t dirtyBindings, RecompileResult& reused, const char* message) {
+        BindingAllocationResult fresh;
+        fresh.layout = checked;
+        DescriptorBindingBuilder{}.Populate(fresh, info, IrShaderStage::Pixel, 8, snapshot, threads);
+        require(fresh.bindings.size() == checked.descriptors.size(), "PopulateInto check: Populate made the wrong number of bindings");
+        dirtyResult(reused, dirtyBindings);
+        std::vector<std::uint32_t> shaderData(7, 0xffffffffu);
+        DescriptorBindingBuilder{}.PopulateInto(checked, info, IrShaderStage::Pixel, 8, snapshot, threads, reused.bindings, reused.pushConstants, shaderData);
+        RecompileResult expected = reused;
+        expected.bindings = fresh.bindings;
+        expected.pushConstants = fresh.pushConstants;
+        require(sameResult(reused, expected), message);
+    };
+    RecompileResult reused;
+    check(layout, layout.descriptors.size() + 3, reused, "PopulateInto over more dirty bindings differs from Populate");
+    check(layout, 2, reused, "PopulateInto over fewer dirty bindings differs from Populate");
+    // Push data: no ShaderData binding, the words go to the push constants.
+    auto pushLayout = layout;
+    pushLayout.pushDataStartDword = 0;
+    pushLayout.descriptors.pop_back();
+    check(pushLayout, pushLayout.descriptors.size(), reused, "PopulateInto's push-data layout differs from Populate");
+    require(!reused.pushConstants.empty(), "PopulateInto check: the push-data layout made no push constants");
+    require(reused.bindings[0].deferredWords.empty() && reused.bindings[4].deferredWords == snapshot.deferredFlat, "PopulateInto check: deferred words outside the flattened SRT");
+}
+
+// PopulateVariant's per-thread memo and in-place result (s53-fast-cost-b, the fast paths' step 2b):
+// - a result left dirty by other draws (more bindings than the variant's, then fewer) is rewritten
+//   to exactly the old path's result;
+// - the same walk again is a memo hit;
+// - a walked specialization the source never compiled (the state moved on) is no hit and leaves
+//   the result alone: the memo answers only what the scan of the source's variants finds;
+// - a variant compiled later (another layout) is found once compiled and remembered beside the
+//   first one, and both are hits after;
+// - another source with the same specialization is not answered by the first source's entry.
+// APS5_NO_VARIANT_MEMO=1 (the second ctest) checks the same results without the counts.
+void verifyVariantMemo(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::RecompileResult& compiled) {
+    using namespace ShaderRecompiler;
+    const bool memo = std::getenv("APS5_NO_VARIANT_MEMO") == nullptr;
+    const auto handle = ResolveSource(request);
+    require(handle != nullptr, "variant memo: the cached request has no source handle");
+    const SrtMemoryReader live = +[](void*, std::uint64_t address, std::uint32_t* value) {
+        std::memcpy(value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), sizeof(*value));
+        return true;
+    };
+    SrtRuntime runtime;
+    runtime.readMemory = live;
+    runtime.readSpecializationMemory = live;
+    runtime.expressRead = live;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    require(WalkResources(*handle, request.context.userData, request.shader.codeAddress, runtime, snapshot, specialization) == WalkStatus::Walked, "variant memo: the walk declined");
+
+    // (1) In place over dirty results, then a hit.
+    RecompileResult result;
+    dirtyResult(result, compiled.bindings.size() + 3);
+    require(PopulateVariant(*handle, request, snapshot, specialization, result), "variant memo: the walk's specialization selected no variant");
+    require(sameResult(result, compiled), "variant memo: a result populated over a dirty one differs from the compiled result");
+    const auto first = ThreadVariantMemoCounts();
+    dirtyResult(result, 1);
+    require(PopulateVariant(*handle, request, snapshot, specialization, result) && sameResult(result, compiled), "variant memo: a result populated over a smaller dirty one differs from the compiled result");
+    const auto second = ThreadVariantMemoCounts();
+    require(!memo || (second.hits == first.hits + 1 && second.misses == first.misses), "variant memo: the same walk again was not a memo hit");
+    require(memo || (second.hits == 0 && second.misses == 0), "variant memo: APS5_NO_VARIANT_MEMO=1 still used the memo");
+
+    // (2) A specialization the source never compiled.
+    auto changed = specialization;
+    changed.buffers.push_back({});
+    const auto kept = result;
+    require(!PopulateVariant(*handle, request, snapshot, changed, result), "variant memo: a specialization never compiled selected a variant");
+    require(sameResult(result, kept), "variant memo: a declined populate changed the result");
+    const auto third = ThreadVariantMemoCounts();
+    require(!memo || (third.hits == second.hits && third.misses == second.misses + 1), "variant memo: a specialization never compiled was answered by the memo");
+
+    // (3) A variant compiled later, then both remembered.
+    auto later = request;
+    later.layout.pushConstantSizeBytes = 96;
+    require(!PopulateVariant(*handle, later, snapshot, specialization, result), "variant memo: a layout never compiled selected a variant");
+    const auto laterCompiled = Recompile(later);
+    require(laterCompiled.variantId != compiled.variantId, "variant memo: the second layout reused the first variant");
+    require(PopulateVariant(*handle, later, snapshot, specialization, result) && sameResult(result, laterCompiled), "variant memo: the variant compiled later was not found or differs from its compiled result");
+    const auto fourth = ThreadVariantMemoCounts();
+    require(PopulateVariant(*handle, later, snapshot, specialization, result) && result.variantId == laterCompiled.variantId, "variant memo: the later variant's repeat selected another variant");
+    require(PopulateVariant(*handle, request, snapshot, specialization, result) && sameResult(result, compiled), "variant memo: the first variant was lost to the later one");
+    const auto fifth = ThreadVariantMemoCounts();
+    require(!memo || (fifth.hits == fourth.hits + 2 && fifth.misses == fourth.misses), "variant memo: the two remembered variants were not both hits");
+
+    // (4) Another source (another target) with the same walk.
+    auto otherTarget = request;
+    otherTarget.target.subgroupSize = 32;
+    const auto otherHandle = ResolveSource(otherTarget);
+    require(otherHandle != nullptr && otherHandle->source != handle->source, "variant memo: another target shares the source entry");
+    require(!PopulateVariant(*otherHandle, otherTarget, snapshot, specialization, result), "variant memo: another source's walk was answered by the first source's variant");
+    require(sameResult(result, compiled), "variant memo: another source's declined populate changed the result");
 }
 
 // The fast walk (WalkResources, docs/design/draw-fastpath.md F2) with a direct reader of live
@@ -1457,6 +1658,7 @@ int main() {
         verifyWaveUniformValues();
         verifyTwoLaneUniformValues();
         verifyFlatTsharpFeedbackCopy();
+        verifyPopulateInto();
 #if ANYPS5_ENABLE_SPIRV_TOOLS
         const std::vector<std::uint32_t> minimalSpirv{
             0x07230203u, 0x00010000u, 0u, 5u, 0u,
@@ -1523,6 +1725,7 @@ int main() {
         require(cached.cacheHit, "unchanged shader did not hit the cache");
         verifyResult(first, cached);
         verifyWalkResources(request, *capture, first);
+        verifyVariantMemo(request, first);
         auto relocated = request;
         relocated.shader.codeAddress += 0x1000;
         require(Recompile(relocated).cacheHit, "shader relocation caused recompilation");

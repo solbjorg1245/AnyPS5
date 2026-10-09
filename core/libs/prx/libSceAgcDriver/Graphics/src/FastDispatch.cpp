@@ -261,7 +261,7 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
                     const bool compareEnable = binding.samplerDepthCompare.at(element);
                     std::shared_ptr<Sampler> sampler;
                     if (context.samplerCache != nullptr && !noSamplerCache) {
-                        sampler = context.samplerCache->Get(context, words, compareEnable);
+                        sampler = context.samplerCache->GetMemoized(context, words, compareEnable);
                     } else {
                         auto resource = DecodeSamplerResource(words);
                         resource.compareEnable = compareEnable;
@@ -318,7 +318,7 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
     // the recorded dispatch.
     recorder.Keep(call.pipelineObjects);
     for (const auto& element : scratch.elements) {
-        const auto* import = HostImportFor(context, element.address, static_cast<std::size_t>(element.bytes));
+        const auto* import = HostImportMemoized(context, element.address, static_cast<std::size_t>(element.bytes));
         if (import == nullptr) return Decline::NoImport;
         const auto offset = element.address - import->base;
         const auto adjustment = static_cast<std::uint32_t>(offset % alignment);
@@ -346,7 +346,7 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
     VkBuffer argumentBuffer = VK_NULL_HANDLE;
     VkDeviceSize argumentOffset = 0;
     if (call.arguments != 0) {
-        const auto* import = HostImportFor(context, call.arguments, 12);
+        const auto* import = HostImportMemoized(context, call.arguments, 12);
         if (import == nullptr) return Decline::IndirectCpu;
         argumentBuffer = import->buffer;
         argumentOffset = call.arguments - import->base;

@@ -60,8 +60,18 @@ enum class WalkStatus : std::uint8_t { Walked, NoSource, IncompletePlan, NoProgr
 // The result Recompile(request, capture) gives for a capture with `snapshot` and `specialization`
 // when `handle`'s source already holds that variant (the request's layout, the specialization):
 // its bindings, push constants and vertex attributes populated over the snapshot, without
-// compiling (false: no such variant).
+// compiling (false: no such variant). The variant comes from a per-thread memo of the last few the
+// thread selected (no source mutex, no scan of the source's variants) and `result` is written in
+// place, its vectors keeping their storage (the fast paths pass a per-thread result);
+// APS5_NO_VARIANT_MEMO=1 scans under the mutex and assigns a fresh result, as before. A throw
+// leaves `result` unspecified.
 [[nodiscard]] bool PopulateVariant(const SourceHandle& handle, const RecompileRequest& request, const ResourceSnapshot& snapshot, const ResourceSpecialization& specialization, RecompileResult& result);
+// The calling thread's PopulateVariant memo lookups so far (tests).
+struct VariantMemoCounts {
+    std::uint64_t hits = 0;
+    std::uint64_t misses = 0;
+};
+[[nodiscard]] VariantMemoCounts ThreadVariantMemoCounts();
 
 }
 

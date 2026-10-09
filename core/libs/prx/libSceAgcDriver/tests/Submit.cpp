@@ -4,6 +4,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastRead.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastDispatch.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/KeyedMemo.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
@@ -632,6 +636,126 @@ void testFastReader() {
     }
 }
 
+// The fast draw's import memo (HostImportMemo, s53-fast-cost-b step 2c): an entry answers a range
+// inside its import only under the device, registry generation and import epoch it was noted
+// under; a retire (the epoch), a registry change (the generation) or another device makes it miss,
+// and a fifth import replaces the oldest of four.
+void testHostImportMemo() {
+    using namespace AgcDriver::Graphics;
+    const auto device = reinterpret_cast<VkDevice>(std::uintptr_t{0x1000});
+    const auto otherDevice = reinterpret_cast<VkDevice>(std::uintptr_t{0x2000});
+    const HostImport import{0x10000, 0x10000, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+    HostImportMemo memo;
+    check(memo.Find(device, 5, 7, 0x10000, 4) == nullptr, "import memo: an empty memo answered");
+    memo.Note(device, 5, 7, import);
+    check(memo.Find(device, 5, 7, 0x10000, 0x100) == &import, "import memo: the range at the import's base missed");
+    check(memo.Find(device, 5, 7, 0x1ff00, 0x100) == &import, "import memo: the range ending at the import's end missed");
+    check(memo.Find(device, 5, 7, 0x10000, 0x10000) == &import, "import memo: the whole import missed");
+    check(memo.Find(device, 5, 7, 0x1ff00, 0x101) == nullptr, "import memo: a range past the import's end was answered");
+    check(memo.Find(device, 5, 7, 0xff00, 0x200) == nullptr, "import memo: a range before the import's base was answered");
+    check(memo.Find(device, 5, 7, std::numeric_limits<std::uint64_t>::max() - 1, 4) == nullptr, "import memo: a range wrapping the address space was answered");
+    check(memo.Find(device, 5, 8, 0x10000, 0x100) == nullptr, "import memo: an entry answered after an import retired (epoch changed)");
+    check(memo.Find(device, 6, 7, 0x10000, 0x100) == nullptr, "import memo: an entry answered after the registry changed (generation changed)");
+    check(memo.Find(otherDevice, 5, 7, 0x10000, 0x100) == nullptr, "import memo: an entry answered for another device");
+    // Four more imports noted: the first is replaced.
+    std::array<HostImport, 4> others{};
+    for (std::size_t i = 0; i < others.size(); ++i) {
+        others[i] = {0x100000 * (i + 1), 0x1000, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+        memo.Note(device, 5, 7, others[i]);
+    }
+    check(memo.Find(device, 5, 7, 0x10000, 0x100) == nullptr, "import memo: the oldest entry was not replaced");
+    for (const auto& other : others) check(memo.Find(device, 5, 7, other.base, 4) == &other, "import memo: a noted import was lost");
+    // No import at all without host imports (as HostImportFor).
+    Context context{};
+    check(HostImportMemoized(context, 0x10000, 4) == nullptr && HostImportForPath(context, 0x10000, 4) == nullptr, "import memo: a context without host imports was answered");
+}
+
+// The fast pipeline lookup (s53-fast-cost-b step 2d): the key is the store's bytes, built into a
+// reused vector; a state field or a stage's variant changes it (a memoized pipeline of the old key
+// is not answered), and no variant id leaves it empty (a private pipeline). The memo (KeyedMemo)
+// answers the noted key only while the store dropped nothing since (its removal count), for the
+// same live device instance and while the object lives; a ninth key replaces the oldest of eight.
+void testFastPipelineMemo() {
+    using namespace AgcDriver::Graphics;
+    Context context{};
+    context.device = reinterpret_cast<VkDevice>(std::uintptr_t{0x1000});
+    State state{};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.cullMode = VK_CULL_MODE_NONE;
+    state.blends.resize(1);
+    VertexInputLayout input;
+    input.bindings.push_back({0, 16, VK_VERTEX_INPUT_RATE_VERTEX});
+    input.attributes.push_back({0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0});
+    ShaderRecompiler::RecompileResult vertex;
+    ShaderRecompiler::RecompileResult fragment;
+    vertex.variantId = 5;
+    fragment.variantId = 6;
+    const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    const std::array<std::uint32_t, 4> layoutKey{0, 7, 1, 1};
+    std::vector<std::byte> key;
+    FastPipelineKey(context, state, input, 3, layoutKey, shaders, VK_IMAGE_LAYOUT_GENERAL, key);
+    check(!key.empty(), "fast pipeline key: the key is empty");
+    const auto noted = key;
+    std::vector<std::byte> again(500, std::byte{0x77});
+    FastPipelineKey(context, state, input, 3, layoutKey, shaders, VK_IMAGE_LAYOUT_GENERAL, again);
+    check(again == noted, "fast pipeline key: a key built into a used vector differs");
+
+    // The memo over that key.
+    auto pool = std::make_shared<int>(1);
+    auto pipeline = std::make_shared<int>(42);
+    KeyedMemo<int, 8> memo;
+    memo.Note(noted, KeyHash(noted), 3, pool.get(), pool, pipeline);
+    check(memo.Find(noted, KeyHash(noted), 3, pool.get()) == pipeline, "fast pipeline memo: the noted key missed");
+    // A state change: another key.
+    state.cullMode = VK_CULL_MODE_BACK_BIT;
+    FastPipelineKey(context, state, input, 3, layoutKey, shaders, VK_IMAGE_LAYOUT_GENERAL, key);
+    check(key != noted && memo.Find(key, KeyHash(key), 3, pool.get()) == nullptr, "fast pipeline memo: a state change was answered by the old pipeline");
+    state.cullMode = VK_CULL_MODE_NONE;
+    // A stage's variant: another key.
+    fragment.variantId = 9;
+    FastPipelineKey(context, state, input, 3, layoutKey, shaders, VK_IMAGE_LAYOUT_GENERAL, key);
+    check(key != noted && memo.Find(key, KeyHash(key), 3, pool.get()) == nullptr, "fast pipeline memo: a new fragment variant was answered by the old pipeline");
+    // Another push layout: another key.
+    fragment.variantId = 6;
+    FastPipelineKey(context, state, input, 4, layoutKey, shaders, VK_IMAGE_LAYOUT_GENERAL, key);
+    check(key != noted, "fast pipeline key: the push layout is not in the key");
+    // No variant id: empty (the store's private pipeline, never memoized).
+    vertex.variantId = 0;
+    FastPipelineKey(context, state, input, 3, layoutKey, shaders, VK_IMAGE_LAYOUT_GENERAL, key);
+    check(key.empty(), "fast pipeline key: a stage without a variant id has a key");
+    vertex.variantId = 5;
+    // Equal hashes are not enough: the bytes are compared.
+    auto forged = noted;
+    forged.back() ^= std::byte{1};
+    check(memo.Find(forged, KeyHash(noted), 3, pool.get()) == nullptr, "fast pipeline memo: a key with the noted hash but other bytes was answered");
+    // The store dropped a pipeline since (pipeline change): no entry answers.
+    check(memo.Find(noted, KeyHash(noted), 4, pool.get()) == nullptr, "fast pipeline memo: an entry answered after the store removed one");
+    // Another device instance, or the noted one gone.
+    auto otherPool = std::make_shared<int>(2);
+    check(memo.Find(noted, KeyHash(noted), 3, otherPool.get()) == nullptr, "fast pipeline memo: an entry answered for another device instance");
+    const auto* poolAddress = pool.get();
+    pool.reset();
+    check(memo.Find(noted, KeyHash(noted), 3, poolAddress) == nullptr, "fast pipeline memo: an entry answered after its device instance died");
+    // The pipeline gone: no entry answers.
+    auto livePool = std::make_shared<int>(3);
+    memo.Note(noted, KeyHash(noted), 3, livePool.get(), livePool, pipeline);
+    check(memo.Find(noted, KeyHash(noted), 3, livePool.get()) == pipeline, "fast pipeline memo: a re-noted key missed");
+    std::weak_ptr<int> watched = pipeline;
+    pipeline.reset();
+    check(watched.expired() && memo.Find(noted, KeyHash(noted), 3, livePool.get()) == nullptr, "fast pipeline memo: the memo kept a pipeline alive or answered a dead one");
+    // Eight more keys: the oldest goes.
+    KeyedMemo<int, 8> ring;
+    std::vector<std::shared_ptr<int>> values;
+    std::vector<std::vector<std::byte>> keys;
+    for (int i = 0; i < 9; ++i) {
+        keys.push_back(std::vector<std::byte>(16, static_cast<std::byte>(i)));
+        values.push_back(std::make_shared<int>(i));
+        ring.Note(keys.back(), KeyHash(keys.back()), 0, nullptr, {}, values.back());
+    }
+    check(ring.Find(keys[0], KeyHash(keys[0]), 0, nullptr) == nullptr, "fast pipeline memo: the oldest of nine keys was kept");
+    for (int i = 1; i < 9; ++i) check(ring.Find(keys[i], KeyHash(keys[i]), 0, nullptr) == values[i], "fast pipeline memo: a recent key was lost");
+}
+
 }
 
 int main() {
@@ -651,6 +775,8 @@ int main() {
         testFastCensus();
         testFastDispatchVerify();
         testFastReader();
+        testHostImportMemo();
+        testFastPipelineMemo();
         LibcRunShutdown_nid_postfix();
         std::puts("AGC driver submit tests passed");
         return 0;

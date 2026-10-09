@@ -410,6 +410,30 @@ std::shared_ptr<const DrawDecode> Driver::fastDrawDecode(const QueueState& queue
     return decode;
 }
 
+const DrawDecode& Driver::fastDrawDecodeInto(const QueueState& queue, const Submission& submission, DrawDecode& scratch, std::shared_ptr<const DrawDecode>& held) {
+    static const bool reuse = std::getenv("APS5_NO_DECODE_REUSE") == nullptr;
+    if (!reuse) {
+        held = fastDrawDecode(queue, submission);
+        return *held;
+    }
+    auto& entry = fastStateEntry(queue, submission);
+    std::shared_ptr<const FastStateEntry::Decode> memo;
+    {
+        auto& shared = fastStateMemo();
+        std::lock_guard lock(shared.mutex);
+        memo = entry.decode;
+    }
+    if (memo == nullptr) {
+        held = fastDrawDecode(queue, submission);
+        return *held;
+    }
+    // fastDrawDecode's copy of the template, by copy assignment.
+    scratch = *memo->decode;
+    refillUserData(queue, memo->slots, scratch.programs);
+    if (profileDraw()) bump(fastStateCounters().decodes);
+    return scratch;
+}
+
 void Driver::reportFastState() {
     auto& counters = fastStateCounters();
     const auto take = [](std::atomic<std::uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); };
