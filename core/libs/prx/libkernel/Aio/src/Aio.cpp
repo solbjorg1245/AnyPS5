@@ -112,8 +112,9 @@ int SubmitCommands(KernelAioRwRequest* req, std::int32_t size, bool write, std::
     const std::int32_t queue = AllocateId();
     bool aborted = false;
     for (std::int32_t i = 0; i < size; ++i) {
-        // A guarded page (resident buffers) lands first: the write would fail there, not fault.
-        if (write) GuestWriteWatch::GuestPageGuardTouch_nid_postfix(reinterpret_cast<std::uintptr_t>(req[i].buf), req[i].nbyte);
+        // A guarded page (resident buffers) lands first, and none is taken until the write is
+        // done: the write would fail there, not fault.
+        const GuestWriteWatch::PageGuardHold hold(write ? req[i].buf : nullptr, req[i].nbyte);
         const std::int64_t done = write
             ? NativePwrite(req[i].fd, req[i].buf, req[i].nbyte, req[i].offset)
             : NativePread(req[i].fd, req[i].buf, req[i].nbyte, req[i].offset);

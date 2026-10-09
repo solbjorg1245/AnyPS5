@@ -535,6 +535,8 @@ std::atomic<std::uint64_t> copyBacksDeferred{0}, copyBackBytesDeferred{0}, copyB
 // made (back-to-back copies of one shadow joined) and the bytes compared, spans copied whole, the
 // compare dispatches, and the dwords the passes stored (counted under profiling only).
 std::atomic<std::uint64_t> copyBacksNarrow{0}, copyBackNarrowSpans{0}, copyBackBytesNarrow{0}, copyBacksNarrowWhole{0}, copyBackNarrowDispatches{0}, copyBackNarrowStoredWords{0};
+// APS5_NARROW_VERIFY: dwords the compare passes found stale (import != shadow == baseline).
+std::atomic<std::uint64_t> copyBackNarrowStaleWords{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Recorder::FlushReason::Count)> copyBackFlushes{};
 // Resident buffers (Recorder::KeepsResidentBuffers): counters (relaxed, on the [barriers] line),
 // the bytes kept resident at the last decision, and the live guards by sequence, which the fault
@@ -1219,6 +1221,8 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
     // own merged ranges); not with the old deferral alone, whose queued copies may overlap.
     const char* narrow = std::getenv("APS5_NARROW_COPY_BACKS");
     narrowCopyBacks = narrow != nullptr && *narrow != '\0' && std::strcmp(narrow, "0") != 0;
+    const char* verify = std::getenv("APS5_NARROW_VERIFY");
+    narrowVerify = verify != nullptr && *verify != '\0' && std::strcmp(verify, "0") != 0;
     if (residentBuffers) {
         coalesceCopyBacks = true;
         residentGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
@@ -1715,6 +1719,7 @@ Recorder::CopyBackStatistics Recorder::CopyBackCounts() {
     counts.narrowWhole = copyBacksNarrowWhole.load(std::memory_order_relaxed);
     counts.narrowDispatches = copyBackNarrowDispatches.load(std::memory_order_relaxed);
     counts.narrowStoredBytes = copyBackNarrowStoredWords.load(std::memory_order_relaxed) * 4u;
+    counts.narrowStale = copyBackNarrowStaleWords.load(std::memory_order_relaxed);
     return counts;
 }
 
@@ -2087,16 +2092,21 @@ std::uint64_t Recorder::recordCopyCommands(VkCommandBuffer commands, std::vector
 
 namespace {
 // CopyBackDiff.comp's push constants: the shadow's, the baseline's and the import's addresses of
-// the first dword, the stored-dword counter's (profiling), the dword count and whether to count.
+// the first dword, the counters' (Recorder::narrowStored), the dword count, the flags (count
+// stored dwords, verify) and the guest address of the first dword (verify's description).
 struct NarrowPush {
     VkDeviceAddress shadow;
     VkDeviceAddress baseline;
     VkDeviceAddress target;
     VkDeviceAddress stored;
     std::uint32_t words;
-    std::uint32_t count;
+    std::uint32_t flags;
+    std::uint32_t guestLow;
+    std::uint32_t guestHigh;
 };
-static_assert(sizeof(NarrowPush) == 40, "CopyBackDiff.comp's push constants are 40 bytes");
+static_assert(sizeof(NarrowPush) == 48, "CopyBackDiff.comp's push constants are 48 bytes");
+constexpr std::uint32_t NarrowCount = 1;
+constexpr std::uint32_t NarrowVerify = 2;
 constexpr std::uint32_t NarrowGroupSize = 256;
 constexpr std::uint32_t NarrowMaxGroups = 4096;
 // One compare dispatch moves at most this many dwords (a span past it is split).
@@ -2105,6 +2115,12 @@ constexpr VkDeviceSize NarrowMaxWords = VkDeviceSize{1} << 30u;
 bool narrowCounted() {
     static const bool counted = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_GPU") != nullptr;
     return counted;
+}
+
+// APS5_NARROW_VERIFY as the digest reads it (each recorder reads it when made).
+bool narrowVerifyRequested() {
+    const char* value = std::getenv("APS5_NARROW_VERIFY");
+    return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
 }
 }
 
@@ -2127,13 +2143,22 @@ std::vector<Recorder::DeferredCopy> Recorder::NarrowSpans(std::vector<DeferredCo
     return spans;
 }
 
-void Recorder::noteNarrowStored() {
+void Recorder::noteNarrowStored(bool complete) {
     if (narrowStored == nullptr) return;
-    // Written by the compare passes of completed batches (coherent host memory); a pass still
-    // running is counted at a later look.
-    const auto now = *reinterpret_cast<const volatile std::uint32_t*>(narrowStored->Bytes().data());
+    // Written by the compare passes of completed batches (coherent memory); a pass still running
+    // is counted at a later look.
+    const auto* words = reinterpret_cast<const volatile std::uint32_t*>(narrowStored->Bytes().data());
+    const std::uint32_t now = words[0];
     copyBackNarrowStoredWords.fetch_add(static_cast<std::uint32_t>(now - narrowStoredSeen), std::memory_order_relaxed);
     narrowStoredSeen = now;
+    const std::uint32_t stale = words[1];
+    copyBackNarrowStaleWords.fetch_add(static_cast<std::uint32_t>(stale - narrowStaleSeen), std::memory_order_relaxed);
+    narrowStaleSeen = stale;
+    if (complete && stale != 0 && !narrowStaleDescribed) {
+        narrowStaleDescribed = true;
+        const auto guest = ((static_cast<std::uint64_t>(words[4]) << 32u) | words[3]) + static_cast<std::uint64_t>(words[2]) * 4u;
+        std::fprintf(stderr, "[gpu] narrow verify: first stale dword at guest 0x%llx: the import held 0x%08x, the shadow and its baseline 0x%08x (stored)\n", static_cast<unsigned long long>(guest), static_cast<unsigned>(words[5]), static_cast<unsigned>(words[6]));
+    }
 }
 
 std::uint64_t Recorder::recordNarrowCopies(VkCommandBuffer commands, const std::vector<DeferredCopy>& copies) {
@@ -2176,7 +2201,9 @@ std::uint64_t Recorder::recordNarrowCopies(VkCommandBuffer commands, const std::
                 bound = true;
             }
             const auto at = head + done * 4u;
-            const NarrowPush push{source + at, source + item.baselineOffset + at, destination + at, narrowStored != nullptr ? narrowStored->DeviceAddress() : 0, static_cast<std::uint32_t>(count), narrowStored != nullptr ? 1u : 0u};
+            const auto guest = item.address + at;
+            const std::uint32_t flags = narrowStored == nullptr ? 0u : (narrowCounted() ? NarrowCount : 0u) | (narrowVerify ? NarrowVerify : 0u);
+            const NarrowPush push{source + at, source + item.baselineOffset + at, destination + at, narrowStored != nullptr ? narrowStored->DeviceAddress() : 0, static_cast<std::uint32_t>(count), flags, static_cast<std::uint32_t>(guest), static_cast<std::uint32_t>(guest >> 32u)};
             context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, narrowLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
             const auto groups = static_cast<std::uint32_t>(std::min<VkDeviceSize>((count + NarrowGroupSize - 1) / NarrowGroupSize, NarrowMaxGroups));
             context.Resolved(&DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, groups, 1, 1);
@@ -2212,15 +2239,25 @@ bool Recorder::ensureNarrowPipeline() {
         Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &narrowPipeline), "vkCreateComputePipelines narrow copy-back");
         context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
         module = VK_NULL_HANDLE;
-        // Profiling: the stored-dword counter the passes add to (none: they count nothing).
-        if (narrowCounted()) {
+        // Profiling and APS5_NARROW_VERIFY: the counters the passes add to (none: they count
+        // nothing and verify nothing). Device-local where the device maps such memory for the
+        // host, so a workgroup's atomic stays off PCIe (in host memory it would slow the very
+        // pass a timing run measures); host memory otherwise.
+        if (narrowCounted() || narrowVerify) {
+            constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+            constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
             try {
-                narrowStored = std::make_shared<Buffer>(context, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                try {
+                    narrowStored = std::make_shared<Buffer>(context, 256, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | host);
+                } catch (const std::exception&) {
+                    narrowStored = std::make_shared<Buffer>(context, 256, usage, host);
+                }
                 std::memset(narrowStored->Bytes().data(), 0, narrowStored->Bytes().size());
                 narrowStoredSeen = 0;
+                narrowStaleSeen = 0;
             } catch (const std::exception& error) {
                 narrowStored.reset();
-                std::fprintf(stderr, "[gpu] narrow copy-backs: no stored-byte counter (%s)\n", error.what());
+                std::fprintf(stderr, "[gpu] narrow copy-backs: no counters (%s): stored bytes not counted%s\n", error.what(), narrowVerify ? ", APS5_NARROW_VERIFY off" : "");
             }
         }
         return true;
@@ -2691,6 +2728,8 @@ void reportBarriers() {
             std::fprintf(stderr, "; copy-back passes %llu by reason:%s, %llu copies (%.0f MiB) recorded", static_cast<unsigned long long>(counts.passes - last.passes), reasons.c_str(), static_cast<unsigned long long>(counts.recorded - last.recorded), (counts.recordedBytes - last.recordedBytes) / 1048576.0);
         }
         if (counts.narrow != 0) std::fprintf(stderr, "; narrow copy-backs %llu in %llu spans, %.0f MiB compared in %llu dispatches, %.1f MiB stored, %llu spans copied whole", static_cast<unsigned long long>(counts.narrow - last.narrow), static_cast<unsigned long long>(counts.narrowSpans - last.narrowSpans), (counts.narrowBytes - last.narrowBytes) / 1048576.0, static_cast<unsigned long long>(counts.narrowDispatches - last.narrowDispatches), (counts.narrowStoredBytes - last.narrowStoredBytes) / 1048576.0, static_cast<unsigned long long>(counts.narrowWhole - last.narrowWhole));
+        // APS5_NARROW_VERIFY: must stay 0 (a CPU store racing a running dispatch can count).
+        if (counts.narrow != 0 && narrowVerifyRequested()) std::fprintf(stderr, ", verify: %llu stale dwords (%llu since start)", static_cast<unsigned long long>(counts.narrowStale - last.narrowStale), static_cast<unsigned long long>(counts.narrowStale));
         last = counts;
     }
     // Resident buffers (APS5_RESIDENT_BUFFERS): copies kept past a Submit or label, those recorded
@@ -3769,8 +3808,9 @@ void Recorder::Sync() {
         finish(std::move(batch), true, source);
     }
     activeSyncSite = previousSite;
-    // Every compare pass completed: its stored dwords count now (profiling; nothing otherwise).
-    noteNarrowStored();
+    // Every compare pass completed: its stored (and stale) dwords count now (profiling, verify;
+    // nothing otherwise).
+    noteNarrowStored(true);
 }
 
 void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked) {

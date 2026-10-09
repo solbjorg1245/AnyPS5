@@ -3628,12 +3628,15 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recorder.EndGpuTiming(timing);
         ++d.preBarriersRecorded;
     }
+    // The program's range begins ahead of its binds: BeginGpuTiming may record queued copy-backs
+    // (Commands()), whose narrow compare pass binds a compute pipeline and push constants of its
+    // own (APS5_NARROW_COPY_BACKS), which would replace the program's between bind and dispatch.
+    const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
     context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
     resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
     if (record.pushStages != 0) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::PipelinePushConstantBytes, record.pushBytes->data());
     }
-    const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
     Graphics::RecordCheckpoint(commands, 'C', record.programAddress, record.shader != nullptr && record.shader->program != nullptr ? record.shader->program->variantId : 0, argumentImport != nullptr ? ~std::uint64_t{0} : (static_cast<std::uint64_t>(record.x) << 42u) | (static_cast<std::uint64_t>(record.y) << 21u) | record.z);
     if (argumentImport != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentImport->buffer, arguments - argumentImport->base);
     else context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, record.x, record.y, record.z);

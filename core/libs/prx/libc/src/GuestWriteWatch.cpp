@@ -277,11 +277,37 @@ public:
     void Install(bool (*resolve)(std::uintptr_t)) {
         _resolve.store(resolve, std::memory_order_release);
         std::call_once(_installed, &PageGuard::installHandler);
+        _holding.store(true, std::memory_order_release);
     }
+
+    // A hold over [begin, end) (GuestPageGuardHold): Protect refuses ranges over it from here on,
+    // and the guards already over it are resolved. Taken under the lock Protect holds, so a guard
+    // being made now is either published before (and resolved here) or refused.
+    std::uint64_t Hold(std::uintptr_t begin, std::uintptr_t end) {
+        if (!_holding.load(std::memory_order_acquire) || end <= begin) return 0;
+        std::uint64_t id = 0;
+        {
+            std::unique_lock lock(_lock);
+            id = ++_nextHold;
+            _holds.emplace(id, std::make_pair(begin, end));
+        }
+        Touch(begin, end);
+        return id;
+    }
+
+    void Unhold(std::uint64_t id) {
+        std::unique_lock lock(_lock);
+        _holds.erase(id);
+    }
+
+    bool Holding() const { return _holding.load(std::memory_order_acquire); }
 
     std::uint64_t Protect(std::uintptr_t begin, std::uintptr_t end) {
         if (begin % PageBytes != 0 || end % PageBytes != 0 || end <= begin) return 0;
         std::unique_lock lock(_lock);
+        for (const auto& [id, range] : _holds) {
+            if (range.first < end && begin < range.second) return refuse(begin, end, Refusal::Held);
+        }
         // A range of shared views (Windows) is guarded through the mappings' own bookkeeping
         // (APS5_GUARD_SHARED_VIEWS=1; refused without it, as before), plain memory through its
         // protection; a range of both is refused.
@@ -382,14 +408,14 @@ public:
     }
 
     // Why Protect refused, by reason (GuestPageGuardRefusalName's order).
-    enum class Refusal : std::size_t { SharedView, Mixed, Aliased, HostWrite, Pinned, ViewProtection, PrivateState, ProtectFailed, Count };
+    enum class Refusal : std::size_t { SharedView, Mixed, Aliased, HostWrite, Pinned, ViewProtection, PrivateState, ProtectFailed, Held, Count };
 
     void Refusals(std::uint64_t* counts, std::size_t count) const {
         for (std::size_t i = 0; i < count; ++i) counts[i] = i < _refusals.size() ? _refusals[i].load(std::memory_order_relaxed) : 0;
     }
 
     static const char* RefusalName(std::size_t index) {
-        static constexpr std::array<const char*, static_cast<std::size_t>(Refusal::Count)> names{"shared view", "view and plain memory", "aliased view", "host write", "pinned", "view protection", "not plain read-write", "protect failed"};
+        static constexpr std::array<const char*, static_cast<std::size_t>(Refusal::Count)> names{"shared view", "view and plain memory", "aliased view", "host write", "pinned", "view protection", "not plain read-write", "protect failed", "held"};
         return index < names.size() ? names[index] : nullptr;
     }
 
@@ -399,8 +425,12 @@ private:
     // A fault no guard holds that raced a release: the page was guarded when the access faulted and
     // another thread's resolve released it before this handler looked. The access runs again, a
     // bounded number of times per release (a later genuine fault there is passed on).
+    // Also a fault on a guard being made: Protect makes the pages no-access before it publishes the
+    // guard (Covers saw none yet); the lock waited for it, so the access runs again and faults on
+    // the published guard.
     bool raced(std::uintptr_t address, int write) {
         std::shared_lock lock(_lock);
+        if (covering(address) != 0) return true;
         for (auto& slot : _released) {
             if (slot.begin <= address && address < slot.end) return slot.retries.fetch_add(1, std::memory_order_relaxed) < 64 && (!slot.view || allowedNow(address, write));
         }
@@ -585,6 +615,10 @@ private:
 
     std::shared_mutex _lock;
     std::map<std::uint64_t, std::pair<std::uintptr_t, std::uintptr_t>> _entries;
+    // The live holds (Hold), and whether holds are taken at all (from the first Install on).
+    std::map<std::uint64_t, std::pair<std::uintptr_t, std::uintptr_t>> _holds;
+    std::uint64_t _nextHold = 0;
+    std::atomic<bool> _holding{false};
     // The live guards made over shared views (released through WindowsMappings::Unguard).
     std::vector<std::uint64_t> _viewEntries;
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Refusal::Count)> _refusals{};
@@ -672,6 +706,19 @@ void GuestPageGuardRelease_nid_postfix(std::uint64_t id) {
 
 void GuestPageGuardTouch_nid_postfix(std::uintptr_t address, std::size_t bytes) {
     if (bytes != 0) PageGuard::Get().Touch(address, address + bytes);
+}
+
+std::uint64_t GuestPageGuardHold_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    if (bytes == 0 || address + bytes < address) return 0;
+    return PageGuard::Get().Hold(address, address + bytes);
+}
+
+void GuestPageGuardUnhold_nid_postfix(std::uint64_t hold) {
+    if (hold != 0) PageGuard::Get().Unhold(hold);
+}
+
+bool GuestPageGuardHolding_nid_postfix() {
+    return PageGuard::Get().Holding();
 }
 
 bool GuestPageGuardCovers_nid_postfix(std::uintptr_t address) {

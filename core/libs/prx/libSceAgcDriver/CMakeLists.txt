@@ -548,6 +548,18 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    # Narrow copy-backs again under APS5_PROFILE_GPU (timing ranges record queued copies, the
+    # compare pass among them, at every range), with APS5_NARROW_VERIFY=1 and with
+    # APS5_RESIDENT_BUFFERS=1.
+    foreach(agcNarrowVariant IN ITEMS profile-gpu verify resident)
+        string(REPLACE "-" "_" agcNarrowVariantName "${agcNarrowVariant}")
+        add_test(NAME agc_driver_narrow_copy_back_${agcNarrowVariantName} COMMAND agc_driver_narrow_copy_back_tests --${agcNarrowVariant})
+        set_tests_properties(agc_driver_narrow_copy_back_${agcNarrowVariantName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 LABELS gpu)
+        if(WIN32)
+            set_tests_properties(agc_driver_narrow_copy_back_${agcNarrowVariantName} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     # The shader-memory tests again with the fast walk's in-place build off (APS5_NO_WALK_REUSE=1,
     # latched once per process): TryMaterialize's fresh-object form.
     add_test(NAME agc_shader_memory_no_walk_reuse COMMAND agc_shader_memory_tests)

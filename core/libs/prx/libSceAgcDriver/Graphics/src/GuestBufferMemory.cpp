@@ -2356,6 +2356,18 @@ void ShutdownGuestBufferWorkers() {
     RefreshPool::Shutdown();
 }
 
+GuestBufferMemory::NarrowTrustStatistics GuestBufferMemory::NarrowTrustCounts() {
+    const auto& stats = Copies();
+    NarrowTrustStatistics counts;
+    counts.refreshed = stats.baselinesRefreshed.load(std::memory_order_relaxed);
+    counts.inherited = stats.baselinesInherited.load(std::memory_order_relaxed);
+    counts.inheritedUntrusted = stats.baselinesInheritedUntrusted.load(std::memory_order_relaxed);
+    counts.narrow = stats.narrowCopyBacks.load(std::memory_order_relaxed);
+    counts.whole = stats.wholeCopyBacks.load(std::memory_order_relaxed);
+    counts.claimBroken = stats.claimBroken.load(std::memory_order_relaxed);
+    return counts;
+}
+
 GuestBufferMemory::~GuestBufferMemory() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;

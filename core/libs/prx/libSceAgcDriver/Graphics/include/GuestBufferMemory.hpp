@@ -210,6 +210,14 @@ public:
     // copied blocks) are timed by AcquireRegistered on the calling thread; the caller adds the
     // snapshot compares it made after it (ShaderResources::prepareAddressBindings).
     static void CountAddressBuild(double snapshotsUs);
+    // Narrow copy-backs' baselines (APS5_NARROW_COPY_BACKS; counted under APS5_PROFILE_DRAW), totals
+    // since start: refreshed at a copy-in from the import, inherited along the staging chain (and
+    // of those untrusted), copy-backs recorded narrow and whole, and trust lost to a claim broken
+    // since the chain (Recorder::ClaimBreaks).
+    struct NarrowTrustStatistics {
+        std::uint64_t refreshed = 0, inherited = 0, inheritedUntrusted = 0, narrow = 0, whole = 0, claimBroken = 0;
+    };
+    static NarrowTrustStatistics NarrowTrustCounts();
     // A guest range bound through a descriptor. Both read live guest memory at upload and bind the
     // same way (a storage buffer); AddWritable also notes the range in Writes(), so it gets the
     // write-back's reference copy, a write-back, the recorder's pending-write note and the

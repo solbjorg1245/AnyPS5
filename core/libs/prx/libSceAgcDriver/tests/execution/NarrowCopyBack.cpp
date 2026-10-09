@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -30,10 +31,23 @@
 // - the same with a Submit between X and Y (X's copy-back lands, its baseline with it; Y's
 //   restore differs from the inherited baseline and is stored);
 // - Z reads and writes B three times in one batch (the same build's shadow in place);
+// - X writes B, the batch completes, the CPU stores into B, X writes B again: the CPU store
+//   refuses the staging chain, so the second use copies in from the import and refreshes its
+//   baseline (an inherited one would equal what X stores again, and its copy-back would leave the
+//   CPU's words in the import);
+// - first of all, F reads and writes a fresh range three times in one batch: its first use copies
+//   in from the import (a trusted baseline), so the second use, chained in place, claims a narrow
+//   copy-back that is still queued when its dispatch is recorded (under APS5_PROFILE_GPU, run with
+//   --profile-gpu, the program's timing range records it: that must happen ahead of the program's
+//   binds, or the guest dispatch runs the compare pass instead);
 // - W writes the first quarter of a V# larger than APS5_NARROW_COPY_BACK_MAX_KIB (4 here): its
 //   shadow has no baseline, so its copy-back falls back to the whole written range, as before.
 // With APS5_PROFILE_DRAW=1 the passes count the dwords they stored: at most one in four of those
-// compared (the kernel changes one dword of every four), and some.
+// compared (the kernel changes one dword of every four), and some. Arguments: --profile-gpu sets
+// APS5_PROFILE_GPU=1 (timing ranges flush queued copies at every range, which also breaks claims:
+// fewer copies narrow), --verify sets APS5_NARROW_VERIFY=1 (no dword may be found stale),
+// --resident sets APS5_RESIDENT_BUFFERS=1 (copies kept guarded past a Submit land when the CPU
+// reads the results: the landing keeps the baseline equal to the import).
 
 namespace {
 
@@ -123,21 +137,30 @@ bool Run(AgcDriver::VulkanDevice& device) {
     auto* source = words;
     auto* output = words + 0x1000 / 4;
     auto* restore = words + 0x2000 / 4;
+    auto* fresh = words + 0x3000 / 4;
     auto* wide = words + 0x4000 / 4;
     std::fill(output, output + Words, Untouched);
     std::fill(wide, wide + WideWords, Untouched);
+    std::fill(fresh, fresh + Words, Untouched);
     for (std::uint32_t tid = 0; tid < Threads; ++tid) {
         source[tid * Stride] = tid * 3u + 5u;
         output[tid * Stride] = Original(tid);
         restore[tid * Stride] = Original(tid) - 1u;
+        fresh[tid * Stride] = Original(tid);
     }
     const auto x = Compile(device, source, output);
     const auto y = Compile(device, restore, output);
     const auto z = Compile(device, output, output);
     const auto w = Compile(device, source, wide, WideWords);
+    const auto f = Compile(device, fresh, fresh);
     const auto program = reinterpret_cast<std::uintptr_t>(IncrementCode.data());
 
     std::lock_guard gpu(GuestMemory::GpuMutex());
+    // A fresh range in place, three times in one batch (the second and third uses claim the
+    // previous use's queued narrow copy-back).
+    for (int run = 0; run < 3; ++run) device.Dispatch(f, 1, 1, 1, {}, program);
+    device.WaitIdle();
+    CheckOutput(fresh, 3, "three uses of a fresh range in place");
     const auto before = Graphics::Recorder::CopyBackCounts();
     // X's copy-back taken over by Y in the same batch.
     device.Dispatch(x, 1, 1, 1, {}, program);
@@ -156,6 +179,15 @@ bool Run(AgcDriver::VulkanDevice& device) {
     for (int run = 0; run < 3; ++run) device.Dispatch(z, 1, 1, 1, {}, program);
     device.WaitIdle();
     CheckOutput(output, 3, "three read-modify-write uses of one shadow");
+    // A CPU store between two uses breaks the chain: the second copies in from the import.
+    device.Dispatch(x, 1, 1, 1, {}, program);
+    device.WaitIdle();
+    for (std::uint32_t tid = 0; tid < Threads; ++tid) output[tid * Stride] = 0x77777777u ^ tid;
+    device.Dispatch(x, 1, 1, 1, {}, program);
+    device.WaitIdle();
+    for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+        Require(output[tid * Stride] == source[tid * Stride] + 1u, "a use after a CPU store: thread " + std::to_string(tid) + " left " + std::to_string(output[tid * Stride]) + ", expected " + std::to_string(source[tid * Stride] + 1u));
+    }
     const auto beforeWide = Graphics::Recorder::CopyBackCounts();
     // Over the baseline cap: whole copy-backs, twice in one batch (the second takes the first over).
     device.Dispatch(w, 1, 1, 1, {}, program);
@@ -177,19 +209,40 @@ bool Run(AgcDriver::VulkanDevice& device) {
         return false;
     }
     Require(beforeWide.narrow > before.narrow, "staged copy-backs were not recorded narrow");
-    Require(after.narrow == beforeWide.narrow && after.recorded > beforeWide.recorded, "a region over the baseline cap was not copied back whole");
+    // Resident buffers (--resident) keep the copy guarded past the Submit; the CPU's read of the
+    // results above landed it through a fault instead of a recorded pass.
+    const bool resident = std::getenv("APS5_RESIDENT_BUFFERS") != nullptr;
+    Require(after.narrow == beforeWide.narrow && (resident || after.recorded > beforeWide.recorded), "a region over the baseline cap was not copied back whole (narrow " + std::to_string(beforeWide.narrow) + " -> " + std::to_string(after.narrow) + ", recorded " + std::to_string(beforeWide.recorded) + " -> " + std::to_string(after.recorded) + ")");
     // Only changed dwords crossed: at most one in four of those compared, and some.
     const auto compared = beforeWide.narrowBytes - before.narrowBytes;
     const auto stored = beforeWide.narrowStoredBytes - before.narrowStoredBytes;
     Require(stored != 0 && stored * 4 <= compared, "narrow copy-backs stored " + std::to_string(stored) + " of " + std::to_string(compared) + " bytes compared");
+    // APS5_NARROW_VERIFY (--verify): no baseline was stale.
+    Require(after.narrowStale == 0, "APS5_NARROW_VERIFY found " + std::to_string(after.narrowStale) + " stale dwords");
+    // Under APS5_PROFILE_GPU (--profile-gpu) every timing range records the queued copies, claimed
+    // ones too: a baseline inherited from a shadow whose claimed copy was recorded since loses its
+    // trust (Recorder::ClaimBreaks), and the results above are still exact.
+    const auto trust = Graphics::GuestBufferMemory::NarrowTrustCounts();
+    if (std::getenv("APS5_PROFILE_GPU") != nullptr) Require(trust.claimBroken != 0, "no inherited baseline lost its trust to a claim break under APS5_PROFILE_GPU");
+    std::printf("baselines: %llu refreshed, %llu inherited (%llu untrusted), %llu copy-backs narrow, %llu whole, %llu claims broken\n", static_cast<unsigned long long>(trust.refreshed), static_cast<unsigned long long>(trust.inherited), static_cast<unsigned long long>(trust.inheritedUntrusted), static_cast<unsigned long long>(trust.narrow), static_cast<unsigned long long>(trust.whole), static_cast<unsigned long long>(trust.claimBroken));
     std::printf("%llu copy-backs deferred, %llu recorded (%llu narrow in %llu spans, %llu with a baseline copied whole) in %llu passes; %llu bytes compared, %llu stored\n", static_cast<unsigned long long>(after.deferred - before.deferred), static_cast<unsigned long long>(after.recorded - before.recorded), static_cast<unsigned long long>(after.narrow - before.narrow), static_cast<unsigned long long>(after.narrowSpans - before.narrowSpans), static_cast<unsigned long long>(after.narrowWhole - before.narrowWhole), static_cast<unsigned long long>(after.passes - before.passes), static_cast<unsigned long long>(compared), static_cast<unsigned long long>(stored));
     return true;
 }
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        for (int i = 1; i < argc; ++i) {
+            const std::string argument = argv[i];
+            const char* name = argument == "--profile-gpu" ? "APS5_PROFILE_GPU" : argument == "--verify" ? "APS5_NARROW_VERIFY" : argument == "--resident" ? "APS5_RESIDENT_BUFFERS" : nullptr;
+            Require(name != nullptr, "unknown argument " + argument + " (--profile-gpu, --verify, --resident)");
+#ifdef _WIN32
+            _putenv_s(name, "1");
+#else
+            setenv(name, "1", 1);
+#endif
+        }
 #ifdef _WIN32
         _putenv("APS5_COALESCE_COPY_BACKS=1");
         _putenv("APS5_NARROW_COPY_BACKS=1");

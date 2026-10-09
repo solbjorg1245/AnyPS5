@@ -2874,6 +2874,49 @@ void narrowCopyBackTests(const Device& device, Recorder& recorder) {
             if (landed[at] != wantJoined(at)) throw std::runtime_error("a joined narrow copy-back stored the wrong byte at offset " + std::to_string(at) + ": " + std::to_string(landed[at]) + ", expected " + std::to_string(wantJoined(at)));
         }
     }
+    // APS5_NARROW_VERIFY=1: a dword the shadow left equal to its baseline is read back from the
+    // import; one the import holds otherwise (a stale baseline: a narrow pass alone would leave
+    // it) is stored as a whole copy would store it and counted. Every seventh dword differs from
+    // its baseline (stored as always), every fifth is stale in the import.
+    {
+        setSwitch("APS5_COALESCE_COPY_BACKS", "1");
+        setSwitch("APS5_NARROW_COPY_BACKS", "1");
+        setSwitch("APS5_NARROW_VERIFY", "1");
+        Recorder verifying(context);
+        setSwitch("APS5_COALESCE_COPY_BACKS", "");
+        setSwitch("APS5_NARROW_COPY_BACKS", "");
+        setSwitch("APS5_NARROW_VERIFY", "");
+        verifying.Activate();
+        constexpr std::size_t span = 4096;
+        const auto usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        auto shadow = std::make_shared<Buffer>(context, 2 * span, usage);
+        const auto shadowByte = [](std::size_t at) { return static_cast<unsigned char>(at * 13 + 3); };
+        const auto changed = [](std::size_t at) { return (at / 4) % 7 == 0; };
+        const auto stale = [](std::size_t at) { return (at / 4) % 5 == 0; };
+        auto* guest = static_cast<unsigned char*>(block);
+        std::size_t staleWords = 0;
+        for (std::size_t at = 0; at < span; ++at) {
+            shadow->Bytes()[at] = std::byte{shadowByte(at)};
+            shadow->Bytes()[span + at] = std::byte{changed(at) ? static_cast<unsigned char>(~shadowByte(at)) : shadowByte(at)};
+            guest[at] = stale(at) ? static_cast<unsigned char>(~shadowByte(at)) : shadowByte(at);
+            if (at % 4 == 0 && stale(at) && !changed(at)) ++staleWords;
+        }
+        Recorder::DeferredCopy copy{shadow, shadow.get(), shadow->Handle(), import->buffer, 0, address - import->base, span, address};
+        copy.sourceAddress = shadow->DeviceAddress();
+        copy.destinationAddress = import->address;
+        copy.baselineOffset = span;
+        const auto before = Recorder::CopyBackCounts();
+        verifying.DeferCopies({copy});
+        static_cast<void>(verifying.Commands());
+        verifying.Submit();
+        verifying.Sync();
+        const auto after = Recorder::CopyBackCounts();
+        for (std::size_t at = 0; at < span; ++at) {
+            if (guest[at] != shadowByte(at)) throw std::runtime_error("APS5_NARROW_VERIFY left a stale byte in the import at offset " + std::to_string(at) + ": " + std::to_string(guest[at]) + ", expected " + std::to_string(shadowByte(at)));
+            if (std::to_integer<unsigned char>(shadow->Bytes()[span + at]) != shadowByte(at)) throw std::runtime_error("APS5_NARROW_VERIFY left a wrong baseline byte at offset " + std::to_string(at));
+        }
+        Require(after.narrowStale - before.narrowStale == staleWords, "APS5_NARROW_VERIFY counted " + std::to_string(after.narrowStale - before.narrowStale) + " stale dwords, expected " + std::to_string(staleWords));
+    }
     recorder.Activate();
     {
         GuestAllocations::Mutation mutation;
@@ -2934,6 +2977,21 @@ void pageGuardTests() {
     GuestWriteWatch::GuestPageGuardTouch_nid_postfix(base + 2 * page + 100, 8);
     Require(guardTestFaults.load() == 3 && !GuestWriteWatch::GuestPageGuardCovers_nid_postfix(base + page), "touching a guarded page did not resolve its guard");
     block[page] = 1;
+    // A hold (a mapping change, host I/O: GuestPageGuardHold) resolves the guards over its range
+    // and refuses new ones there until it ends; a range beside it is still guarded.
+    guardTestIds[0] = GuestWriteWatch::GuestPageGuardProtect_nid_postfix(base, base + page);
+    Require(guardTestIds[0] != 0, "a guard over a released page was refused");
+    {
+        const GuestWriteWatch::PageGuardHold hold(block + 100, 8);
+        Require(guardTestFaults.load() == 4 && !GuestWriteWatch::GuestPageGuardCovers_nid_postfix(base), "a hold did not resolve the guard over its range");
+        Require(GuestWriteWatch::GuestPageGuardProtect_nid_postfix(base, base + page) == 0, "a guard over a held range was taken");
+        const auto beside = GuestWriteWatch::GuestPageGuardProtect_nid_postfix(base + page, base + 2 * page);
+        Require(beside != 0, "a guard beside a held range was refused");
+        GuestWriteWatch::GuestPageGuardRelease_nid_postfix(beside);
+    }
+    guardTestIds[0] = GuestWriteWatch::GuestPageGuardProtect_nid_postfix(base, base + page);
+    Require(guardTestIds[0] != 0, "a guard over a range no longer held was refused");
+    GuestWriteWatch::GuestPageGuardRelease_nid_postfix(guardTestIds[0]);
     GuestWriteWatch::GuestPageGuardInstall_nid_postfix(nullptr);
 #ifdef _WIN32
     VirtualFree(block, 0, MEM_RELEASE);

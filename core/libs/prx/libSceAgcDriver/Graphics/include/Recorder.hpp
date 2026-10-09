@@ -223,6 +223,8 @@ public:
         // pass on the device), compare dispatches, and the bytes the passes stored (counted only
         // under APS5_PROFILE_DRAW or APS5_PROFILE_GPU; passes of batches still running count later).
         std::uint64_t narrow = 0, narrowSpans = 0, narrowBytes = 0, narrowWhole = 0, narrowDispatches = 0, narrowStoredBytes = 0;
+        // APS5_NARROW_VERIFY: dwords whose import differed from a shadow equal to its baseline.
+        std::uint64_t narrowStale = 0;
     };
     static CopyBackStatistics CopyBackCounts();
     void DeferCopies(std::vector<DeferredCopy> copies);
@@ -875,18 +877,31 @@ private:
     // The compare pass's pipeline, made on first use; false (and narrow copies copy whole from then
     // on) when the device cannot make it.
     bool ensureNarrowPipeline();
-    // Adds the dwords the compare passes stored since the last look to the statistics (profiling).
-    void noteNarrowStored();
+    // Adds the dwords the compare passes stored, and the stale dwords APS5_NARROW_VERIFY found,
+    // since the last look to the statistics; `complete` (every pass recorded so far completed)
+    // also describes the first stale dword once.
+    void noteNarrowStored(bool complete = false);
     // Waits for the fence of the in-flight batch `serial` (left in flight).
     void waitBatch(std::uint64_t serial);
     bool narrowCopyBacks = false;
+    // APS5_NARROW_VERIFY=1 (with narrow copy-backs): the compare pass also reads the import where
+    // the shadow equals its baseline, counts each dword the import holds otherwise (a stale
+    // baseline: narrow would have lost that store) and stores the shadow's value there, as a whole
+    // copy would have (the [barriers] digest's "verify: N stale dwords", the first described once).
+    bool narrowVerify = false;
     std::atomic<bool> narrowFailed{false};
     std::uint64_t claimBreaks = 0;
     VkPipelineLayout narrowLayout = VK_NULL_HANDLE;
     VkPipeline narrowPipeline = VK_NULL_HANDLE;
-    // The compare passes' stored-dword counter (host-visible; profiling only) and its last value.
+    // The compare passes' counters (profiling or APS5_NARROW_VERIFY): word 0 the dwords stored,
+    // word 1 the stale dwords verify found, words 2-6 the first of those (dword index in its span,
+    // the span's guest address low and high, the import's and the shadow's value). Device-local
+    // and host-visible where the device has such memory (the atomics stay off PCIe), else host
+    // memory. With the last values seen.
     std::shared_ptr<Buffer> narrowStored;
     std::uint32_t narrowStoredSeen = 0;
+    std::uint32_t narrowStaleSeen = 0;
+    bool narrowStaleDescribed = false;
     // Commands() with the queued copy-backs recorded first unless `keepCopyBacks`.
     VkCommandBuffer commandsFor(VkAccessFlags* coveredAccess, bool keepCopyBacks);
     bool coalesceCopyBacks = false;

@@ -279,8 +279,9 @@ int64_t APS5_VABI pwrite_nid_disambig1_nid_postfix(int d, const void* buf, size_
     if (offset < 0) {
         APS5_INVALID_ARG_EX;
     }
-    // A guarded page (resident buffers) lands first: the write would fail there, not fault.
-    GuestWriteWatch::GuestPageGuardTouch_nid_postfix(reinterpret_cast<std::uintptr_t>(buf), nbytes);
+    // A guarded page (resident buffers) lands first, and none is taken until the write is done: the
+    // write would fail there, not fault.
+    const GuestWriteWatch::PageGuardHold hold(buf, nbytes);
     auto n = NativePwrite(d, buf, nbytes, offset);
     if (n < 0) {
         throw std::runtime_error(std::string(__func__) + ": pwrite failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
@@ -435,7 +436,7 @@ int64_t APS5_VABI sceKernelPread(int d, void* buf, size_t nbytes, int64_t offset
 int64_t APS5_VABI sceKernelPwrite(int d, const void* buf, size_t nbytes, int64_t offset) {
     if (buf == nullptr && nbytes != 0) return SceErrorFromErrno(GUEST_EFAULT);
     if (offset < 0) return SceErrorFromErrno(GUEST_EINVAL);
-    GuestWriteWatch::GuestPageGuardTouch_nid_postfix(reinterpret_cast<std::uintptr_t>(buf), nbytes);
+    const GuestWriteWatch::PageGuardHold hold(buf, nbytes);
     const auto result = NativePwrite(d, buf, nbytes, offset);
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }

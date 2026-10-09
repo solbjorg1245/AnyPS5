@@ -679,6 +679,35 @@ void ClearFixedRange(GuestAllocations::Mutation& mutation, void* addr, size_t le
     RecordProtection(addr, len, -1);
 }
 
+// Resident buffers' page guards (GuestPageGuard*, APS5_RESIDENT_BUFFERS) over a range whose mapping
+// changes land first, and none is taken there until the change is done (the holds' lifetime): an
+// unmap or a fixed remap would drop a guarded view without landing its bytes, and a new view of
+// physical pages another guest address maps (`physStart`) would read them past a guard held there.
+// Before the registry mutation (the resolver may wait for GPU work that leases the registry). No
+// holds while no guard was ever installed.
+std::vector<GuestWriteWatch::PageGuardHold> HoldGuards(void* addr, size_t len, int64_t physStart = -1) {
+    std::vector<GuestWriteWatch::PageGuardHold> holds;
+    if (!GuestWriteWatch::GuestPageGuardHolding_nid_postfix()) return holds;
+    if (addr != nullptr) holds.emplace_back(addr, len);
+    if (physStart >= 0) {
+        std::vector<std::pair<std::uintptr_t, std::size_t>> aliases;
+        {
+            std::lock_guard lock(g_directLock);
+            const auto first = static_cast<std::uint64_t>(physStart);
+            const auto last = first + len;
+            for (const auto& [base, mapping] : g_directMappings) {
+                const auto mappingLast = mapping.phys + (mapping.end - base);
+                if (mapping.phys >= last || mappingLast <= first) continue;
+                const auto from = std::max(first, mapping.phys);
+                const auto to = std::min(last, mappingLast);
+                aliases.emplace_back(base + (from - mapping.phys), static_cast<std::size_t>(to - from));
+            }
+        }
+        for (const auto& [address, bytes] : aliases) holds.emplace_back(reinterpret_cast<const void*>(address), bytes);
+    }
+    return holds;
+}
+
 }
 
 int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
@@ -687,6 +716,7 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
     if (physStart < 0 || (static_cast<std::uint64_t>(physStart) & (PS5_PAGE_SIZE - 1)) != 0 || static_cast<std::uint64_t>(physStart) >= DIRECT_MEMORY_SIZE || len > DIRECT_MEMORY_SIZE - static_cast<std::uint64_t>(physStart)) {
         return SCE_KERNEL_ERROR_EINVAL;
     }
+    const auto holds = HoldGuards((flags & GuestMapFixedFlag) != 0 ? *addr : nullptr, len, physStart);
     GuestAllocations::Mutation mutation;
     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags, physStart)) {
         RecordProtection(*addr, len, prot);
@@ -713,6 +743,7 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
 int DoMapAnon(void** addr, size_t len, int prot, int flags) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
+    const auto holds = HoldGuards((flags & GuestMapFixedFlag) != 0 ? *addr : nullptr, len);
     GuestAllocations::Mutation mutation;
     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags)) {
         RecordProtection(*addr, len, prot);
@@ -743,11 +774,12 @@ int DoMprotect(const void* addr, size_t len, int prot) {
     const auto bytes = static_cast<std::size_t>(end - first);
     const auto* pointer = reinterpret_cast<const void*>(first);
     const auto nativeProtection = LinuxProtFromSce(prot);
-    // Resident buffers' guarded pages (GuestPageGuard*, APS5_RESIDENT_BUFFERS) land first: the
-    // protection change below would lift a guard without landing its bytes. Before the registry
-    // mutation (the resolver may wait for GPU work that leases the registry). One atomic load while
-    // no guard is live.
-    GuestWriteWatch::GuestPageGuardTouch_nid_postfix(first, bytes);
+    // Resident buffers' guarded pages (GuestPageGuard*, APS5_RESIDENT_BUFFERS) land first, and none
+    // is taken there until the change is done: the protection change below (the Windows shim's
+    // VirtualProtect over every committed region) would lift a guard without landing its bytes.
+    // Before the registry mutation (the resolver may wait for GPU work that leases the registry).
+    // Nothing while no guard was ever installed.
+    const GuestWriteWatch::PageGuardHold hold(pointer, bytes);
     GuestAllocations::Mutation mutation;
 #ifdef _WIN32
     MEMORY_BASIC_INFORMATION memory{};
@@ -769,6 +801,7 @@ int DoMprotect(const void* addr, size_t len, int prot) {
 int DoMunmap(void* addr, size_t len) {
     Trace("unmap %p+0x%zx", addr, len);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0 || !addr) return SCE_KERNEL_ERROR_EINVAL;
+    const auto holds = HoldGuards(addr, len);
     GuestAllocations::Mutation mutation;
     mutation.Unmap(addr, len, ReleasePiece);
     RecordProtection(addr, len, -1);
@@ -778,6 +811,7 @@ int DoMunmap(void* addr, size_t len) {
 int DoReserveVirtual(void** addr, size_t len, int flags, size_t alignment) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
+    const auto holds = HoldGuards((flags & GuestMapFixedFlag) != 0 ? *addr : nullptr, len);
     GuestAllocations::Mutation mutation;
     const bool fixed = *addr != nullptr && (flags & GuestMapFixedFlag) != 0;
     if (fixed) ClearFixedRange(mutation, *addr, len, flags);

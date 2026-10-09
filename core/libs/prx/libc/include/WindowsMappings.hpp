@@ -331,6 +331,8 @@ public:
             auto& view = views.at(base);
             const auto parts = partsWithin(base, begin, end) & static_cast<std::uint8_t>(~view.guarded);
             if (parts != 0 && !protectParts(base, parts, PAGE_NOACCESS)) {
+                // This page's runs that did turn no-access, and the pages before it.
+                protectParts(base, parts, view.armed ? armedProtection(view.protection) : view.protection);
                 for (const auto& [undone, mask] : done) {
                     auto& other = views.at(undone);
                     other.guarded = static_cast<std::uint8_t>(other.guarded & ~mask);

@@ -30,6 +30,15 @@ bool GuestPageGuardCovers_nid_postfix(std::uintptr_t address);
 // guest memory (GuestArena::HostWrite, the kernel's writes) fails on a guarded page instead of
 // faulting. One atomic load while no guard is live.
 void GuestPageGuardTouch_nid_postfix(std::uintptr_t address, std::size_t bytes);
+// Touch with a hold: until GuestPageGuardUnhold(the id returned; 0 for nothing held), Protect
+// refuses ranges over [address, address + bytes) (counted as 'held'), so no guard is live there
+// while the holder changes the range's mapping or protection, or host I/O reads or writes it (a
+// Touch alone leaves a window in which the GPU thread may take a guard again). Nothing is held
+// (0) before the first Install.
+std::uint64_t GuestPageGuardHold_nid_postfix(std::uintptr_t address, std::size_t bytes);
+void GuestPageGuardUnhold_nid_postfix(std::uint64_t hold);
+// Whether holds are taken (an Install happened): callers may skip gathering ranges to hold.
+bool GuestPageGuardHolding_nid_postfix();
 // Totals since start: faults on guarded pages and those that left a guard to release by force;
 // the live guards.
 void GuestPageGuardCounts_nid_postfix(std::uint64_t* faults, std::uint64_t* forced, std::uint64_t* guards);
@@ -43,6 +52,22 @@ void GuestPageGuardRefusals_nid_postfix(std::uint64_t* counts, std::size_t count
 const char* GuestPageGuardRefusalName_nid_postfix(std::size_t index);
 
 }
+
+// A GuestPageGuardHold for the object's lifetime.
+class PageGuardHold {
+public:
+    PageGuardHold(const void* address, std::size_t bytes) : hold(address != nullptr && bytes != 0 ? GuestPageGuardHold_nid_postfix(reinterpret_cast<std::uintptr_t>(address), bytes) : 0) {}
+    PageGuardHold(PageGuardHold&& other) noexcept : hold(other.hold) { other.hold = 0; }
+    PageGuardHold(const PageGuardHold&) = delete;
+    PageGuardHold& operator=(const PageGuardHold&) = delete;
+    PageGuardHold& operator=(PageGuardHold&&) = delete;
+    ~PageGuardHold() {
+        if (hold != 0) GuestPageGuardUnhold_nid_postfix(hold);
+    }
+
+private:
+    std::uint64_t hold;
+};
 
 }
 

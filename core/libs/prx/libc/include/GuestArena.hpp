@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBC_INCLUDE_GUESTARENA_HPP
 #define CORE_LIBS_PRX_LIBC_INCLUDE_GUESTARENA_HPP
 
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include <cstddef>
 #include <cstdint>
 
@@ -45,9 +46,12 @@ void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 
 }
 
+// A host write into guest memory (file reads): resident buffers' guards over the range land first
+// and none is taken there until the write ended (`hold`), since the host's write fails on a guarded
+// page instead of faulting.
 class HostWrite {
 public:
-    HostWrite(void* pointer, std::size_t bytes) : pointer(pointer), bytes(bytes), open(GuestArenaBeginHostWrite_nid_postfix(pointer, bytes)) {}
+    HostWrite(void* pointer, std::size_t bytes) : hold(pointer, bytes), pointer(pointer), bytes(bytes), open(GuestArenaBeginHostWrite_nid_postfix(pointer, bytes)) {}
     ~HostWrite() {
         if (open) GuestArenaEndHostWrite_nid_postfix(pointer, bytes);
     }
@@ -56,6 +60,7 @@ public:
     bool Open() const { return open; }
 
 private:
+    GuestWriteWatch::PageGuardHold hold;
     void* pointer;
     std::size_t bytes;
     bool open;
