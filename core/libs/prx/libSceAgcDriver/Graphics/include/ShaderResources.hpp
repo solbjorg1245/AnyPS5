@@ -108,17 +108,21 @@ public:
     Stats Counters() const;
     // A set that lives for the recorder's open batch alone (ShaderResources::ForkData): taken from
     // a pool that belongs to that batch, which the batch keeps and which is reset whole and reused
-    // once the batch completed (no set is freed one by one; the chain pools above are untouched).
-    // A null set when `sizes` exceed what one such pool holds (the caller takes its old path).
+    // once the batch completed (no set is freed one by one; the chain pools above are untouched;
+    // past TransientIdlePools reset pools waiting, a returned pool is destroyed). A null set when
+    // `sizes` exceed what one such pool holds, or when the device cannot make a pool or a set (out
+    // of host or device memory): the caller takes its old path, it never throws for those.
     // Called by the recording thread under GuestMemory::GpuMutex.
     VkDescriptorSet AllocateTransient(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, Recorder& recorder);
     // APS5_PROFILE_DRAW counters of AllocateTransient: sets made, pools created, pools reset for
-    // reuse after their batch, sets refused (needs over one pool).
+    // reuse after their batch, sets refused (needs over one pool, or a pool or set the device could
+    // not make), pools destroyed on their return (more than a few reset ones waiting).
     struct TransientStats {
         std::uint64_t sets = 0;
         std::uint64_t pools = 0;
         std::uint64_t resets = 0;
         std::uint64_t refused = 0;
+        std::uint64_t destroyed = 0;
     };
     TransientStats TransientCounters() const;
 
@@ -273,6 +277,10 @@ public:
     std::vector<BoundBinding> BoundDescriptors() const;
     // Debug aid: each bound guest resource with the fraction of sampled bytes that are nonzero.
     std::string Describe() const;
+    // Debug aid for a dispatch bound to a ForkData set (Forked, Reused): the words its data
+    // bindings read, patched as the ring holds them (Describe shows this object's buffers, which a
+    // fork leaves alone), as " forked data[...]" per data binding.
+    std::string DescribeForkedWords(const CompiledShader& shader) const;
 
     // Reuse across dispatches of identical content (see the resource cache in VulkanDevice): the
     // key is everything a compute build consumes from its compiled shader (variant, and per binding
@@ -308,15 +316,30 @@ public:
     // descriptor cache or set), RingFull (no room in the ring: regions free as their batches are
     // released), NoSet (a set over one transient pool), Unsupported (deferred flat words, more than
     // MaxForkedBindings differing data bindings, a data buffer of another size).
-    enum class ForkOutcome : std::uint8_t { Forked, Same, NoRing, RingFull, NoSet, Unsupported, Count };
+    // Two outcomes keep a template that settles on new words from forking on every hit (the old
+    // path refreshed once, then its hits had the same words):
+    // - Reused (APS5_TEMPLATE_REFRESH_REUSE, default on with the ring): every data word equals the
+    //   last fork's, made in the recorder's open batch, and no RefreshData, adoption or rebase
+    //   touched this object since: bind that fork's set again (`set`); nothing is made.
+    // - Adopted (APS5_TEMPLATE_REFRESH_ADOPT, default on with the ring): this object is idle (its
+    //   last recorded use, NoteRecorded, is in a batch that finished: serial <= Submissions() -
+    //   InFlightBatches() of the same recorder): the differing words, patched, are written into
+    //   its host-coherent data buffers by the CPU (visible at the batch's submit, read by no
+    //   unfinished batch), its words and DataWordsHash become the shader's, as after RefreshData;
+    //   bind this object's set. Nothing is recorded.
+    enum class ForkOutcome : std::uint8_t { Forked, Reused, Adopted, Same, NoRing, RingFull, NoSet, Unsupported, Count };
     static constexpr std::size_t MaxForkedBindings = 4;
     struct DataFork {
         ForkOutcome outcome = ForkOutcome::Same;
         VkDescriptorSet set = VK_NULL_HANDLE;
-        // The words placed in the ring.
+        // The words placed in the ring (Forked) or written into this object's buffers (Adopted).
         std::uint64_t bytes = 0;
     };
-    DataFork ForkData(const CompiledShader& shader, Recorder& recorder) const;
+    DataFork ForkData(const CompiledShader& shader, Recorder& recorder);
+    // The recorder's open batch binds this object's set or a fork of it (VulkanDevice::
+    // recordDispatch, after ForkData; every use of a compute template is recorded there): ForkData
+    // adopts words only once that batch finished. Under GuestMemory::GpuMutex.
+    void NoteRecorded(const Recorder& recorder);
     // Walks the write watch over every image surface of a completed object (no device lock: the
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces() const;
@@ -434,6 +457,10 @@ private:
         std::uint32_t adjustment;
     };
     void writeDataWords(VkCommandBuffer commands, std::size_t allocation, std::span<const std::uint32_t> words) const;
+    // The data patches of `allocation` (a data buffer) applied to `bytes`, its words: each patch's
+    // byte below bytes.size() takes the patch's adjustment. The one patch rule of writeDataWords,
+    // ForkData and PrepareDrawBindings.
+    void patchDataWords(std::size_t allocation, std::span<std::byte> bytes) const;
 
     struct Binding {
         VkDescriptorSetLayoutBinding layout;
@@ -619,6 +646,19 @@ private:
     void rehashDataWords();
     std::vector<std::pair<std::uint32_t, std::uint32_t>> pushPatches;
     std::vector<DataPatch> dataPatches;
+    // ForkData's state (APS5_TEMPLATE_REFRESH_RING), under GuestMemory::GpuMutex: the batch that
+    // last recorded a use of this object (NoteRecorded: its recorder and serial; none, never
+    // adopt), and the last fork (its recorder, batch serial, set and every data binding's words in
+    // binding order; a null set: none), dropped by RefreshData, an adoption and rebaseLease.
+    const Recorder* recordedBy = nullptr;
+    std::uint64_t recordedSerial = 0;
+    struct ForkMemo {
+        const Recorder* recorder = nullptr;
+        std::uint64_t serial = 0;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        std::vector<std::uint32_t> words;
+    };
+    ForkMemo lastFork;
     BuildTiming timing;
     // Build state carried from stage A to stage B: the bindings in plan order, the image bindings
     // still to look up (index into `bindings`; the DescriptorBinding lives in the compiled shader),

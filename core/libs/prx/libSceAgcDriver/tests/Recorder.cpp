@@ -3716,11 +3716,70 @@ void fastRingReclaimTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 }
 
+// tests/shaders/DataSlot.comp (results[words[1]] = words[0]) on a template's set layout, and its
+// dispatch as recordDispatch records one: everything earlier visible to the dispatch (a refresh's
+// transfer included), its stores to everything after; the template's use is noted as
+// recordDispatch notes it (ShaderResources::NoteRecorded, which ForkData's adoption reads).
+class DataSlotPipeline {
+public:
+    DataSlotPipeline(const Context& context, VkDescriptorSetLayout setLayout) : context(context) {
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.setLayoutCount = 1;
+        layoutInfo.pSetLayouts = &setLayout;
+        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &pipelineLayout), "vkCreatePipelineLayout");
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = sizeof(DATA_SLOT_SPV);
+        moduleInfo.pCode = DATA_SLOT_SPV;
+        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main", nullptr};
+        pipelineInfo.layout = pipelineLayout;
+        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateComputePipelines");
+    }
+    ~DataSlotPipeline() {
+        context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
+        context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, pipelineLayout, nullptr);
+    }
+    DataSlotPipeline(const DataSlotPipeline&) = delete;
+    DataSlotPipeline& operator=(const DataSlotPipeline&) = delete;
+
+    // Binds `set` (a ForkData set) or, when null, the template's own.
+    void Dispatch(Recorder& recorder, ShaderResources& resources, VkDescriptorSet set) const {
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        if (set != VK_NULL_HANDLE) resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, set);
+        else resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout);
+        context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, 1, 1, 1);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+        resources.NoteRecorded(recorder);
+    }
+
+private:
+    Context context;
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+};
+
+// The words a template's data binding holds (BoundDescriptors: the buffer's bytes).
+template <std::size_t Count>
+std::array<std::uint32_t, Count> HeldWords(const ShaderResources& resources, std::size_t binding) {
+    const auto bound = resources.BoundDescriptors();
+    Require(binding < bound.size() && bound[binding].elements.size() == 1 && bound[binding].elements[0].data.size() >= Count * sizeof(std::uint32_t), "the template's data binding has no host bytes");
+    std::array<std::uint32_t, Count> words{};
+    std::memcpy(words.data(), bound[binding].elements[0].data.data(), sizeof(words));
+    return words;
+}
+
 // The template refresh through the ring (APS5_TEMPLATE_REFRESH_RING, ShaderResources::ForkData) on
-// a real device, with tests/shaders/DataSlot.comp (results[words[1]] = words[0]; binding 0 the
-// template's flattened-SRT words, binding 1 a second data buffer the results land in): forks and
-// in-stream refreshes (RefreshData) interleaved in one batch each read their own words while the
-// template's buffer keeps its words (and DataWordsHash) through a fork; equal words fork nothing;
+// a real device, with tests/shaders/DataSlot.comp (binding 0 the template's flattened-SRT words,
+// binding 1 a second data buffer the results land in): forks and in-stream refreshes (RefreshData)
+// interleaved in one batch each read their own words while the template's buffer keeps its words
+// (and DataWordsHash) through a fork; equal words fork nothing; the batch's last fork's words bind
+// that fork again (Reused) until an in-stream refresh drops it; a template whose last use finished
+// takes the words into its own buffer on the CPU (Adopted), one used in the open batch forks;
 // without a ring nothing is made; a full ring refuses; a batch needing more sets than one transient
 // pool takes another, and a pool is reset and reused once its batch completed.
 void templateRefreshRingTests(const Device& device, Recorder& recorder) {
@@ -3752,112 +3811,228 @@ void templateRefreshRingTests(const Device& device, Recorder& recorder) {
     const auto firstProgram = withWords(42, 1);
     const auto secondProgram = withWords(9, 2);
     const auto thirdProgram = withWords(5, 3);
+    const auto fourthProgram = withWords(11, 4);
     const CompiledShader original{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     const CompiledShader first{ShaderRecompiler::ShaderStage::Compute, &firstProgram, 0};
     const CompiledShader second{ShaderRecompiler::ShaderStage::Compute, &secondProgram, 0};
     const CompiledShader third{ShaderRecompiler::ShaderStage::Compute, &thirdProgram, 0};
-    // Without a ring (or a descriptor cache) nothing is made: the caller refreshes in-stream.
+    const CompiledShader fourth{ShaderRecompiler::ShaderStage::Compute, &fourthProgram, 0};
+    // Without a ring (or a descriptor cache) nothing is made: the caller refreshes in-stream. A
+    // template no batch recorded (no NoteRecorded) never adopts.
     {
         ShaderResources plain(device.GetContext(), original);
         const auto fork = plain.ForkData(first, recorder);
         Require(fork.outcome == Outcome::NoRing && fork.set == VK_NULL_HANDLE, "a fork without a ring made a set");
         Require(plain.ForkData(original, recorder).outcome == Outcome::Same, "the template's own words did not compare equal");
     }
-    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
-    VkShaderModule module = VK_NULL_HANDLE;
-    VkPipeline pipeline = VK_NULL_HANDLE;
     {
         ShaderResources resources(context, original);
-        const auto setLayout = resources.Layout();
-        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layoutInfo.setLayoutCount = 1;
-        layoutInfo.pSetLayouts = &setLayout;
-        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &pipelineLayout), "vkCreatePipelineLayout");
-        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        moduleInfo.codeSize = sizeof(DATA_SLOT_SPV);
-        moduleInfo.pCode = DATA_SLOT_SPV;
-        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule");
-        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main", nullptr};
-        pipelineInfo.layout = pipelineLayout;
-        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateComputePipelines");
-        // As recordDispatch: everything earlier visible to the dispatch (the refresh's transfer
-        // included), its stores to everything after.
-        const auto dispatch = [&](VkDescriptorSet set) {
-            const auto commands = recorder.Commands();
-            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-            context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-            if (set != VK_NULL_HANDLE) resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, set);
-            else resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout);
-            context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, 1, 1, 1);
-            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
-        };
+        const DataSlotPipeline slots(context, resources.Layout());
+        const auto dispatch = [&](VkDescriptorSet set) { slots.Dispatch(recorder, resources, set); };
         const auto builtHash = resources.DataWordsHash();
         // 1. The template's own words: nothing differs, its set is bound.
         auto fork = resources.ForkData(original, recorder);
         Require(fork.outcome == Outcome::Same && fork.set == VK_NULL_HANDLE, "the template's own words forked");
         dispatch(VK_NULL_HANDLE);
-        // 2-3. Two forks: each binds its own copy, the template keeps its words.
+        // 2-3. Two forks: each binds its own copy, the template keeps its words. The first one's
+        // words again in the batch bind its set again and make nothing.
         fork = resources.ForkData(first, recorder);
         Require(fork.outcome == Outcome::Forked && fork.set != VK_NULL_HANDLE && fork.bytes == 2 * sizeof(std::uint32_t), "the first fork was not made");
         dispatch(fork.set);
+        const auto setsMade = cache->TransientCounters().sets;
+        const auto again = resources.ForkData(first, recorder);
+        Require(again.outcome == Outcome::Reused && again.set == fork.set && cache->TransientCounters().sets == setsMade, "the batch's last fork's words did not bind its set again");
+        dispatch(again.set);
         const auto secondFork = resources.ForkData(second, recorder);
         Require(secondFork.outcome == Outcome::Forked && secondFork.set != VK_NULL_HANDLE && secondFork.set != fork.set, "the second fork was not a set of its own");
         dispatch(secondFork.set);
         Require(resources.DataWordsHash() == builtHash && !resources.DataWordsDiffer(original) && resources.DataWordsDiffer(first), "a fork changed the template's words");
-        // 4. An in-stream refresh after the forks, in the same batch: the forks keep their words.
+        // 4. An in-stream refresh after the forks, in the same batch: the forks keep their words,
+        // and the last fork is not bound again (its copied bindings read the refreshed buffers).
         Require(resources.RefreshData(recorder.Commands(), third, &recorder), "the in-stream refresh recorded nothing");
         dispatch(VK_NULL_HANDLE);
+        const auto afterRefresh = resources.ForkData(second, recorder);
+        Require(afterRefresh.outcome == Outcome::Forked && afterRefresh.set != secondFork.set, "an in-stream refresh did not drop the batch's last fork");
+        dispatch(afterRefresh.set);
         // 5. Back to the built words through the ring: the template holds the refreshed ones now.
         Require(resources.ForkData(third, recorder).outcome == Outcome::Same, "the refreshed words forked");
         fork = resources.ForkData(original, recorder);
         Require(fork.outcome == Outcome::Forked, "a fork back to the built words was not made");
         dispatch(fork.set);
-        Require(cache->TransientCounters().pools == 1 && cache->TransientCounters().sets == 3, "the batch's forks did not share one transient pool");
+        Require(cache->TransientCounters().pools == 1 && cache->TransientCounters().sets == 4, "the batch's forks did not share one transient pool");
         const auto serial = recorder.Submissions() + 1;
         recorder.Submit();
         Require(recorder.Submissions() == serial, "the forks' batch was not submitted");
         device.WaitQueue();
         recorder.Sync();
-        const auto bound = resources.BoundDescriptors();
-        Require(bound.size() == 2 && bound[0].elements.size() == 1 && bound[1].elements.size() == 1, "the template's bindings are not its two data buffers");
-        std::array<std::uint32_t, 4> landed{};
-        std::memcpy(landed.data(), bound[1].elements[0].data.data(), sizeof(landed));
-        Require(landed == std::array<std::uint32_t, 4>{7, 42, 9, 5}, "a dispatch did not read its own words: results " + std::to_string(landed[0]) + " " + std::to_string(landed[1]) + " " + std::to_string(landed[2]) + " " + std::to_string(landed[3]));
-        std::array<std::uint32_t, 2> held{};
-        std::memcpy(held.data(), bound[0].elements[0].data.data(), sizeof(held));
-        Require(held == std::array<std::uint32_t, 2>{5, 3} && !resources.DataWordsDiffer(third), "the template's buffer does not hold the in-stream refresh's words");
+        const auto landed = HeldWords<5>(resources, 1);
+        Require(landed[0] == 7 && landed[1] == 42 && landed[2] == 9 && landed[3] == 5, "a dispatch did not read its own words: results " + std::to_string(landed[0]) + " " + std::to_string(landed[1]) + " " + std::to_string(landed[2]) + " " + std::to_string(landed[3]));
+        Require(HeldWords<2>(resources, 0) == std::array<std::uint32_t, 2>{5, 3} && !resources.DataWordsDiffer(third), "the template's buffer does not hold the in-stream refresh's words");
+        // 6. The template's last use finished: the words go into its own buffer on the CPU, its own
+        // set is bound, nothing is made or recorded for them.
+        const auto setsBefore = cache->TransientCounters().sets;
+        const auto adopted = resources.ForkData(fourth, recorder);
+        Require(adopted.outcome == Outcome::Adopted && adopted.set == VK_NULL_HANDLE && adopted.bytes == 2 * sizeof(std::uint32_t) && cache->TransientCounters().sets == setsBefore, "an idle template did not adopt the words");
+        Require(HeldWords<2>(resources, 0) == std::array<std::uint32_t, 2>{11, 4} && !resources.DataWordsDiffer(fourth) && resources.DataWordsHash() == ShaderResources::DataWordsHash(fourth), "the adopted words are not the template's");
+        dispatch(VK_NULL_HANDLE);
         // The batch's pool goes back once the batch's keeps are released (after this thread's
-        // unlock, on the release thread); the next batch's fork takes it again.
+        // unlock, on the release thread); the next fork takes it again. The template is used in the
+        // open batch now: it forks, it does not adopt.
         GpuMutex().unlock();
         for (int wait = 0; wait < 400 && cache->TransientCounters().resets == 0; ++wait) std::this_thread::sleep_for(std::chrono::milliseconds(5));
         GpuMutex().lock();
         Require(cache->TransientCounters().resets == 1, "the transient pool was not reset after its batch completed");
         Require(resources.ForkData(first, recorder).outcome == Outcome::Forked && cache->TransientCounters().pools == 1, "the next batch's fork did not reuse the reset pool");
-        // More forks in one batch than one pool holds: another pool, every fork served.
-        for (int index = 0; index < 300; ++index) Require(resources.ForkData(index % 2 == 0 ? first : second, recorder).set != VK_NULL_HANDLE, "a fork past one pool's sets was not made");
+        // More forks in one batch than one pool holds (alternating words, so none is the last
+        // fork's): another pool, every fork served.
+        for (int index = 0; index < 300; ++index) {
+            const auto made = resources.ForkData(index % 2 == 0 ? second : first, recorder);
+            Require(made.outcome == Outcome::Forked && made.set != VK_NULL_HANDLE, "a fork past one pool's sets was not made");
+        }
         // A driver may serve sets past maxSets (the spec lets the allocation fail there, it need not):
         // then the one pool held them all.
         Require(cache->TransientCounters().pools <= 2 && cache->TransientCounters().refused == 0, "a batch past one pool's sets did not take a second pool");
         recorder.Submit();
         device.WaitQueue();
         recorder.Sync();
-        // A full ring refuses (the caller then refreshes in-stream).
+        Require(HeldWords<5>(resources, 1)[4] == 11, "the dispatch after the adoption did not read the adopted words");
+        // A full ring refuses (the caller then refreshes in-stream). Alternating words: a repeat of
+        // the last fork's would bind it again and take no ring space.
         auto small = context;
         FastRing tiny(context, 256);
         small.fastRing = &tiny;
         ShaderResources squeezed(small, original);
         auto outcome = Outcome::Forked;
-        for (int index = 0; index < 512 && outcome == Outcome::Forked; ++index) outcome = squeezed.ForkData(first, recorder).outcome;
+        for (int index = 0; index < 512 && outcome == Outcome::Forked; ++index) outcome = squeezed.ForkData(index % 2 == 0 ? first : second, recorder).outcome;
         Require(outcome == Outcome::RingFull, "a fork into a full ring was not refused as ring full");
         recorder.Submit();
         device.WaitQueue();
         recorder.Sync();
     }
-    context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
-    context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
-    context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, pipelineLayout, nullptr);
     // The cache goes before the batches that keep its pools are released: their returns find it gone.
+    cache.reset();
+    ring.reset();
+}
+
+// The data patch through the template refresh (s53-gpu2-tmpl review, equivalence finding 2): a
+// read-only V# (element 1) 4 bytes past the aligned start of the region it shares with element 0,
+// in a shader without push constants, puts its adjustment into byte memoryOffsetDword * 4 + 1 of
+// the shader data (here bits 8-15 of words[0], DataSlot.comp's value). A fork (the ring's copy), an
+// in-stream refresh (RefreshData) and an adoption (the template's buffer, by the CPU) must each give
+// the dispatch the patched word, results[slot] = value | adjustment << 8, and the [dispatch-io]
+// fork words show it.
+void templateRefreshPatchTests(const Device& device, Recorder& recorder) {
+    using Outcome = ShaderResources::ForkOutcome;
+    auto context = device.GetContext();
+    const auto alignment = context.limits.minStorageBufferOffsetAlignment;
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: the template refresh's data patch not tested\n";
+        return;
+    }
+    if (alignment < 8 || alignment > 256) {
+        std::cout << "storage buffer offset alignment " << alignment << ": the template refresh's data patch not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the data patch block");
+    std::memset(block, 0x5a, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the test block refused: the template refresh's data patch not tested\n";
+        return;
+    }
+    recorder.Sync();
+    auto cache = std::make_unique<DescriptorCache>(context);
+    auto ring = std::make_unique<FastRing>(context, 1u << 20u);
+    context.descriptorCache = cache.get();
+    context.fastRing = ring.get();
+    const auto outer = address + 4096;
+    const auto element = outer + 4;
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding words;
+    words.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    words.role = ShaderRecompiler::DescriptorRole::ShaderData;
+    words.descriptorSet = 0;
+    words.binding = 0;
+    words.count = 1;
+    words.guestDescriptor = {0x110000, 1};
+    auto results = words;
+    results.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+    results.binding = 1;
+    results.guestDescriptor.assign(8, 0u);
+    ShaderRecompiler::DescriptorBinding guest;
+    guest.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    guest.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    guest.descriptorSet = 0;
+    guest.binding = 2;
+    guest.count = 2;
+    guest.guestDescriptor = {static_cast<std::uint32_t>(outer), static_cast<std::uint32_t>(outer >> 32u) & 0xffffu, 64u, 0x31000000u, static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, 16u, 0x31000000u};
+    guest.bufferWritten = {false, false};
+    program.bindings = {words, results, guest};
+    program.memoryOffsetDword = 0;
+    const auto withWords = [&](std::uint32_t value, std::uint32_t slot) {
+        auto copy = program;
+        copy.bindings[0].guestDescriptor = {value, slot};
+        return copy;
+    };
+    const auto forkedProgram = withWords(0x220000, 2);
+    const auto refreshedProgram = withWords(0x330000, 3);
+    const auto adoptedProgram = withWords(0x440000, 4);
+    const CompiledShader original{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    const CompiledShader forked{ShaderRecompiler::ShaderStage::Compute, &forkedProgram, 0};
+    const CompiledShader refreshed{ShaderRecompiler::ShaderStage::Compute, &refreshedProgram, 0};
+    const CompiledShader adopted{ShaderRecompiler::ShaderStage::Compute, &adoptedProgram, 0};
+    {
+        ShaderResources resources(context, original);
+        const auto adjustment = (HeldWords<1>(resources, 0)[0] >> 8u) & 0xffu;
+        if (adjustment == 0) {
+            // Element 1 was not bound off an aligned offset (its region copied from its own start).
+            std::cout << "no data patch in the built template: the template refresh's data patch not tested\n";
+        } else {
+            Require(adjustment == 4, "the data patch is not the V#'s distance from its aligned offset");
+            const DataSlotPipeline slots(context, resources.Layout());
+            slots.Dispatch(recorder, resources, VK_NULL_HANDLE);
+            const auto fork = resources.ForkData(forked, recorder);
+            Require(fork.outcome == Outcome::Forked, "the patched template did not fork");
+            Require(resources.DescribeForkedWords(forked).find("00220400 00000002") != std::string::npos, "the fork's trace words are not the patched words: " + resources.DescribeForkedWords(forked));
+            slots.Dispatch(recorder, resources, fork.set);
+            Require(resources.RefreshData(recorder.Commands(), refreshed, &recorder), "the patched template's refresh recorded nothing");
+            slots.Dispatch(recorder, resources, VK_NULL_HANDLE);
+            recorder.Submit();
+            device.WaitQueue();
+            recorder.Sync();
+            const auto made = resources.ForkData(adopted, recorder);
+            Require(made.outcome == Outcome::Adopted, "the idle patched template did not adopt");
+            Require(HeldWords<2>(resources, 0) == std::array<std::uint32_t, 2>{0x440400, 4}, "the adopted words are not patched");
+            slots.Dispatch(recorder, resources, VK_NULL_HANDLE);
+            recorder.Submit();
+            device.WaitQueue();
+            recorder.Sync();
+            const auto landed = HeldWords<5>(resources, 1);
+            Require(landed[1] == 0x110400 && landed[2] == 0x220400 && landed[3] == 0x330400 && landed[4] == 0x440400, "a dispatch did not read its patched words: results " + std::to_string(landed[1]) + " " + std::to_string(landed[2]) + " " + std::to_string(landed[3]) + " " + std::to_string(landed[4]));
+            std::cout << "template refresh data patch (adjustment " << adjustment << "): the build, a fork, an in-stream refresh and an adoption read the patched word\n";
+        }
+    }
     cache.reset();
     ring.reset();
 }
@@ -4258,6 +4433,7 @@ int main() {
         residentBufferTests(device, recorder);
         fastRingReclaimTests(device, recorder);
         templateRefreshRingTests(device, recorder);
+        templateRefreshPatchTests(device, recorder);
         std::cout << "Recorder read tracking and label tests passed\n";
         return 0;
     } catch (const std::exception& error) {

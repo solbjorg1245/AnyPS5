@@ -23,9 +23,13 @@
 // (a flattened-SRT word, so the constant is data, not code) to each thread's word of one buffer, in
 // place. Dispatched with +1 (the template is built with these words), +5 (the same variant with the
 // addend's data word patched, as the driver's data-only hits do), +1, +5, +5 in one batch:
-// the +5 hits differ from the template's words and bind a copy of its set whose data binding reads
-// the ring (no vkCmdUpdateBuffer, no leading barrier for it), the +1 hits bind the template's own
-// set. Each element must end up 17 higher, and three of the hits must have gone through the ring.
+// the first +5 hit differs from the template's words and binds a copy of its set whose data binding
+// reads the ring (no vkCmdUpdateBuffer, no leading barrier for it), the later +5 hits bind that copy
+// again (the batch's last fork had their words), the +1 hit binds the template's own set. Each
+// element must end up 17 higher. Then, after the batch finished, +5 +5 +1 +1 in a second batch: the
+// idle template takes the +5 words into its own buffer on the CPU (adopted), the second +5 has the
+// template's words, the +1 hit forks (the template is used in the open batch), the last +1 binds that
+// fork again: 12 higher again.
 
 namespace {
 
@@ -139,13 +143,26 @@ int Run(AgcDriver::VulkanDevice& device) {
     const auto refreshed = after.refreshed - before.refreshed;
     const auto throughRing = after.throughRing - before.throughRing;
     const auto same = after.sameWords - before.sameWords;
-    std::printf("template hits: %llu refreshed (%llu through the ring), %llu with the template's words\n", static_cast<unsigned long long>(refreshed), static_cast<unsigned long long>(throughRing), static_cast<unsigned long long>(same));
+    const auto reused = after.reused - before.reused;
+    std::printf("template hits: %llu refreshed (%llu through the ring), %llu with the template's or the last fork's words (%llu bound that fork again)\n", static_cast<unsigned long long>(refreshed), static_cast<unsigned long long>(throughRing), static_cast<unsigned long long>(same), static_cast<unsigned long long>(reused));
     if (refreshed + same == 0) {
         // No host imports (or no texture caches): the buffer is copied, so no build is a template.
         std::printf("skipped, no dispatch was a template hit\n");
         return VulkanTestSkipped;
     }
-    Require(refreshed == 3 && throughRing == 3 && same == 1, "the +5 hits did not all refresh through the ring");
+    Require(refreshed == 1 && throughRing == 1 && same == 3 && reused == 2, "the first +5 hit did not fork, or the later ones did not bind its fork again");
+    // The second batch: the template's last use finished.
+    for (const auto* shader : {&five, &five, &one, &one}) device.Dispatch(*shader, 1, 1, 1, {}, program);
+    device.WaitIdle();
+    const auto last = VulkanDevice::TemplateRefreshes();
+    for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+        const auto expected = initial[tid * Stride] + 29u;
+        const auto actual = buffer[tid * Stride];
+        Require(actual == expected, "thread " + std::to_string(tid) + " is " + std::to_string(actual) + ", expected " + std::to_string(expected) + " (then +5 +5 +1 +1)");
+    }
+    const auto adopted = last.adopted - after.adopted;
+    std::printf("second batch: %llu refreshed (%llu through the ring, %llu adopted), %llu with the template's or the last fork's words (%llu bound that fork again)\n", static_cast<unsigned long long>(last.refreshed - after.refreshed), static_cast<unsigned long long>(last.throughRing - after.throughRing), static_cast<unsigned long long>(adopted), static_cast<unsigned long long>(last.sameWords - after.sameWords), static_cast<unsigned long long>(last.reused - after.reused));
+    Require(adopted == 1 && last.refreshed - after.refreshed == 2 && last.throughRing - after.throughRing == 1 && last.sameWords - after.sameWords == 2 && last.reused - after.reused == 1, "the idle template did not adopt the +5 words, or the +1 hits did not fork once");
     return 0;
 }
 

@@ -1134,22 +1134,27 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     // The fast path's push layouts, and its data ring only when APS5_FAST_DRAW or APS5_FAST_DISPATCH
     // can use it, or the template refresh through the ring (APS5_TEMPLATE_REFRESH_RING, which needs
     // no push descriptors): the ring costs APS5_FAST_RING_MIB of host memory, and the commit charge
-    // has no room to spare.
-    bool wantsRing = TemplateRefreshRing();
+    // has no room to spare. For the template refresh alone (about 0.6 MiB of words per present,
+    // regions freed as their batches are released) the ring is TemplateRingMiB unless
+    // APS5_FAST_RING_MIB says otherwise.
+    bool fastWantsRing = false;
     if (state->pushDescriptors) {
         state->fastLayouts = std::make_unique<Graphics::FastLayouts>(graphicsContext());
         const char* fastDraw = std::getenv("APS5_FAST_DRAW");
         if (fastDraw == nullptr || std::strcmp(fastDraw, "0") == 0) fastDraw = std::getenv("APS5_FAST_DISPATCH");
-        wantsRing = wantsRing || (fastDraw != nullptr && std::strcmp(fastDraw, "0") != 0);
+        fastWantsRing = fastDraw != nullptr && std::strcmp(fastDraw, "0") != 0;
     }
+    const bool wantsRing = fastWantsRing || TemplateRefreshRing();
+    constexpr VkDeviceSize TemplateRingMiB = 8;
+    const auto ringBytes = fastWantsRing || std::getenv("APS5_FAST_RING_MIB") != nullptr ? Graphics::FastRing::ConfiguredBytes() : TemplateRingMiB << 20u;
     // A ring the device cannot allocate (APS5_FAST_RING_MIB above a heap or allocation limit)
     // leaves the fast path without one, which then declines every draw (and the template refresh
     // takes RefreshData), instead of failing the device.
-    if (wantsRing && Graphics::FastRing::ConfiguredBytes() != 0) {
+    if (wantsRing && ringBytes != 0) {
         try {
-            state->fastRing = std::make_unique<Graphics::FastRing>(graphicsContext(), Graphics::FastRing::ConfiguredBytes());
+            state->fastRing = std::make_unique<Graphics::FastRing>(graphicsContext(), ringBytes);
         } catch (const std::exception& error) {
-            std::fprintf(stderr, "[fastpath] no data ring of %llu MiB: %s\n", static_cast<unsigned long long>(Graphics::FastRing::ConfiguredBytes() >> 20u), error.what());
+            std::fprintf(stderr, "[fastpath] no data ring of %llu MiB: %s\n", static_cast<unsigned long long>(ringBytes >> 20u), error.what());
         }
     }
     state->recorder = std::make_unique<Graphics::Recorder>(graphicsContext(), state->timelineSemaphores);
@@ -2881,8 +2886,10 @@ struct DispatchCounters {
     std::uint64_t cacheHits = 0, cacheMisses = 0, cacheInvalidated = 0, templateRefreshed = 0, templateSameWords = 0;
     double templateRevalidateMs = 0;
     // APS5_TEMPLATE_REFRESH_RING: the refreshes made through the ring (ShaderResources::ForkData),
-    // the words they placed there, and ForkData's outcomes (Forked and Same included).
-    std::uint64_t templateForked = 0, templateForkBytes = 0;
+    // the words they placed there, the hits that bound the batch's last fork again (counted as
+    // same words), the refreshes written into an idle template's buffers by the CPU (counted as
+    // refreshed) and their words, and ForkData's outcomes.
+    std::uint64_t templateForked = 0, templateForkBytes = 0, templateReused = 0, templateAdopted = 0, templateAdoptBytes = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(Graphics::ShaderResources::ForkOutcome::Count)> templateForkOutcomes{};
     std::uint64_t procLookups = 0, preBarriersRecorded = 0, preBarriersSkipped = 0;
     std::chrono::steady_clock::time_point cacheReport = std::chrono::steady_clock::now();
@@ -3089,6 +3096,9 @@ struct RecordedDispatch {
     DispatchTimer* timer;
     // Whether the data refresh recorded anything.
     bool refreshed = false;
+    // Whether the dispatch bound a ForkData set (Forked or Reused) in place of the template's: the
+    // [dispatch-io] trace then lists the words it read (ShaderResources::DescribeForkedWords).
+    bool forked = false;
 };
 
 VkDevice VulkanDevice::Device() const {
@@ -3111,7 +3121,7 @@ bool VulkanDevice::TemplateDataRefresh() {
 
 VulkanDevice::TemplateRefreshCounts VulkanDevice::TemplateRefreshes() {
     const auto& d = Dispatches();
-    return {d.templateRefreshed, d.templateForked, d.templateSameWords};
+    return {d.templateRefreshed, d.templateForked, d.templateSameWords, d.templateReused, d.templateAdopted};
 }
 
 void VulkanDevice::NoteRecipe(RecipeEvent event, bool indirect) {
@@ -3617,25 +3627,33 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         // recipe compares the two 64-bit hashes first: equal hashes mean the buffers hold the words.
         const bool differs = record.dataRefresh == RecordedDispatch::DataRefresh::Words || resources.DataWordsHash() != record.dataWordsHash;
         // Through the ring: no transfer is recorded, so `covered` stays and the leading barrier is
-        // elided as for a hit with the same words; any other outcome than Forked or Same leaves the
-        // refresh to RefreshData below.
+        // elided as for a hit with the same words; any other outcome than Forked, Reused, Adopted or
+        // Same leaves the refresh to RefreshData below. Reused (the batch's last fork had these
+        // words) binds that fork's set and counts as same words, as the old path's hit after its
+        // refresh; Adopted wrote the words into the idle template's buffers on the CPU (host writes
+        // before the batch's submit) and binds its own set, a refresh with nothing recorded.
         using ForkOutcome = Graphics::ShaderResources::ForkOutcome;
         auto forkOutcome = ForkOutcome::Count;
         if (differs && TemplateRefreshRing()) {
             const auto fork = resources.ForkData(*record.shader, recorder);
             forkOutcome = fork.outcome;
             ++d.templateForkOutcomes[static_cast<std::size_t>(fork.outcome)];
+            if (fork.outcome == ForkOutcome::Forked || fork.outcome == ForkOutcome::Reused) forkedSet = fork.set;
             if (fork.outcome == ForkOutcome::Forked) {
-                forkedSet = fork.set;
                 ++d.templateForked;
                 d.templateForkBytes += fork.bytes;
+            } else if (fork.outcome == ForkOutcome::Reused) {
+                ++d.templateReused;
+            } else if (fork.outcome == ForkOutcome::Adopted) {
+                ++d.templateAdopted;
+                d.templateAdoptBytes += fork.bytes;
             }
         }
-        if (forkOutcome == ForkOutcome::Forked) {
+        if (forkOutcome == ForkOutcome::Forked || forkOutcome == ForkOutcome::Adopted) {
             ++d.templateRefreshed;
             d.templateRevalidateMs += record.revalidateMs;
             record.refreshed = true;
-        } else if (forkOutcome == ForkOutcome::Same) {
+        } else if (forkOutcome == ForkOutcome::Same || forkOutcome == ForkOutcome::Reused) {
             ++d.templateSameWords;
         } else if (differs && resources.RefreshData(commands, *record.shader, &recorder)) {
             covered = 0;
@@ -3647,6 +3665,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         }
         recordStep(PhaseRecordDataRefresh);
     }
+    // ForkData adopts words into this template only once the batch recording this use finished.
+    if (TemplateRefreshRing()) resources.NoteRecorded(recorder);
+    record.forked = forkedSet != VK_NULL_HANDLE;
     using CommandClass = Graphics::Recorder::CommandClass;
     if (Graphics::Recorder::BarrierValidate()) {
         if (argumentImport != nullptr) {
@@ -3956,7 +3977,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             using ForkOutcome = Graphics::ShaderResources::ForkOutcome;
             const auto outcome = [&](ForkOutcome which) { return static_cast<unsigned long long>(d.templateForkOutcomes[static_cast<std::size_t>(which)]); };
             const auto transient = state->descriptorCache != nullptr ? state->descriptorCache->TransientCounters() : Graphics::DescriptorCache::TransientStats{};
-            std::fprintf(stderr, "[rescache] template refresh ring: %llu of the refreshes through the ring (%.2f MiB of words); ForkData outcomes: forked %llu, same words %llu, then RefreshData: no ring %llu, ring full %llu, no set %llu, unsupported %llu; transient sets %llu from %llu pools (%llu resets), %llu refused\n", static_cast<unsigned long long>(d.templateForked), static_cast<double>(d.templateForkBytes) / 1048576.0, outcome(ForkOutcome::Forked), outcome(ForkOutcome::Same), outcome(ForkOutcome::NoRing), outcome(ForkOutcome::RingFull), outcome(ForkOutcome::NoSet), outcome(ForkOutcome::Unsupported), static_cast<unsigned long long>(transient.sets), static_cast<unsigned long long>(transient.pools), static_cast<unsigned long long>(transient.resets), static_cast<unsigned long long>(transient.refused));
+            std::fprintf(stderr, "[rescache] template refresh ring: %llu of the refreshes through the ring (%.2f MiB of words), %llu adopted by an idle template (%.2f MiB); ForkData outcomes: forked %llu, reused the batch's last fork %llu, adopted %llu, same words %llu, then RefreshData: no ring %llu, ring full %llu, no set %llu, unsupported %llu; transient sets %llu from %llu pools (%llu resets, %llu destroyed), %llu refused\n", static_cast<unsigned long long>(d.templateForked), static_cast<double>(d.templateForkBytes) / 1048576.0, static_cast<unsigned long long>(d.templateAdopted), static_cast<double>(d.templateAdoptBytes) / 1048576.0, outcome(ForkOutcome::Forked), outcome(ForkOutcome::Reused), outcome(ForkOutcome::Adopted), outcome(ForkOutcome::Same), outcome(ForkOutcome::NoRing), outcome(ForkOutcome::RingFull), outcome(ForkOutcome::NoSet), outcome(ForkOutcome::Unsupported), static_cast<unsigned long long>(transient.sets), static_cast<unsigned long long>(transient.pools), static_cast<unsigned long long>(transient.resets), static_cast<unsigned long long>(transient.destroyed), static_cast<unsigned long long>(transient.refused));
         }
         std::fprintf(stderr, "[vk] deviceProc lookups inside the device call: %llu (%.2f per dispatch); pre-dispatch barriers recorded %llu, skipped %llu\n", static_cast<unsigned long long>(d.procLookups), d.profiledDispatches != 0 ? static_cast<double>(d.procLookups) / static_cast<double>(d.profiledDispatches) : 0.0, static_cast<unsigned long long>(d.preBarriersRecorded), static_cast<unsigned long long>(d.preBarriersSkipped));
         reportRecipes();
@@ -4051,7 +4072,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         // finishes the recorder up to that batch's serial. Prints the [address-sync] leases line.
         Graphics::CountLeaseOutcome(false, recorder.Submissions() + 1);
     }
-    if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, resources->Describe().c_str());
+    if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s%s\n", groupsText, resources->Describe().c_str(), record.forked ? resources->DescribeForkedWords(*record.shader).c_str() : "");
     WatchMemory(programAddress);
     // The recipe for the caller's dispatch-cache variant (design_cpu_final M4, rule R3): only an
     // object the resource cache serves under this content key (reusable: no lease, no copied
@@ -4189,7 +4210,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
         state->recorder->Sync();
         timer.phase(PhaseSync);
     }
-    if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, hit->resources->Describe().c_str());
+    if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s%s\n", groupsText, hit->resources->Describe().c_str(), record.forked ? hit->resources->DescribeForkedWords(*record.shader).c_str() : "");
     WatchMemory(programAddress);
     timer.finish(lookupsBefore, groupsText, indirect);
     if (profile) reportRecipes();

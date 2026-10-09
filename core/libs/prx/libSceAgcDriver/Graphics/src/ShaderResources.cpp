@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ScratchLease.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastLayouts.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastRing.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastDraw.hpp"
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -2933,6 +2934,9 @@ namespace {
 // What one transient pool holds (AllocateTransient); a set needing more of any type is refused.
 constexpr std::uint32_t TransientPoolSets = 256;
 constexpr std::array<VkDescriptorPoolSize, 4> TransientPoolSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2048}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 512}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024}}};
+// The reset pools kept for the next batches: a returned pool past these is destroyed, so the pools
+// shrink back after a burst of batches in flight.
+constexpr std::size_t TransientIdlePools = 8;
 }
 
 // The transient pools: every pool made (destroyed with the cache), the reset ones ready for the next
@@ -2942,6 +2946,7 @@ struct DescriptorCache::TransientPools {
     std::mutex mutex;
     VkDevice device = VK_NULL_HANDLE;
     PFN_vkResetDescriptorPool reset = nullptr;
+    PFN_vkDestroyDescriptorPool destroy = nullptr;
     std::vector<VkDescriptorPool> all;
     std::vector<VkDescriptorPool> free;
     bool alive = true;
@@ -2949,10 +2954,12 @@ struct DescriptorCache::TransientPools {
     std::atomic<std::uint64_t> pools{0};
     std::atomic<std::uint64_t> resets{0};
     std::atomic<std::uint64_t> refused{0};
+    std::atomic<std::uint64_t> destroyed{0};
 };
 
 // Kept by the batch a transient pool served: its release (the batch completed, so no set of the pool
-// is in use) resets the pool and hands it back.
+// is in use) resets the pool and hands it back, or destroys it when TransientIdlePools reset pools
+// already wait.
 struct DescriptorCache::TransientReturn {
     TransientReturn(std::shared_ptr<TransientPools> owner, VkDescriptorPool handle) : pools(std::move(owner)), pool(handle) {}
     TransientReturn(const TransientReturn&) = delete;
@@ -2960,6 +2967,12 @@ struct DescriptorCache::TransientReturn {
     ~TransientReturn() {
         std::lock_guard lock(pools->mutex);
         if (!pools->alive) return;
+        if (pools->free.size() >= TransientIdlePools) {
+            pools->destroy(pools->device, pool, nullptr);
+            pools->all.erase(std::remove(pools->all.begin(), pools->all.end(), pool), pools->all.end());
+            pools->destroyed.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         static_cast<void>(pools->reset(pools->device, pool, 0));
         pools->free.push_back(pool);
         pools->resets.fetch_add(1, std::memory_order_relaxed);
@@ -3060,6 +3073,7 @@ VkDescriptorSet DescriptorCache::AllocateTransient(VkDescriptorSetLayout layout,
         transient = std::make_shared<TransientPools>();
         transient->device = context.device;
         transient->reset = context.Function<PFN_vkResetDescriptorPool>("vkResetDescriptorPool");
+        transient->destroy = destroyPool;
     }
     for (const auto& size : sizes) {
         const auto capacity = std::find_if(TransientPoolSizes.begin(), TransientPoolSizes.end(), [&](const auto& item) { return item.type == size.type; });
@@ -3091,14 +3105,20 @@ VkDescriptorSet DescriptorCache::AllocateTransient(VkDescriptorSetLayout layout,
                 poolInfo.maxSets = TransientPoolSets;
                 poolInfo.poolSizeCount = static_cast<std::uint32_t>(TransientPoolSizes.size());
                 poolInfo.pPoolSizes = TransientPoolSizes.data();
-                Check(context.Function<PFN_vkCreateDescriptorPool>("vkCreateDescriptorPool")(context.device, &poolInfo, nullptr, &pool), "vkCreateDescriptorPool transient");
+                // A pool the device cannot make (out of host or device memory) refuses the set: the
+                // caller then refreshes in-stream (RefreshData) instead of losing the dispatch.
+                if (context.Function<PFN_vkCreateDescriptorPool>("vkCreateDescriptorPool")(context.device, &poolInfo, nullptr, &pool) != VK_SUCCESS) {
+                    transient->refused.fetch_add(1, std::memory_order_relaxed);
+                    return VK_NULL_HANDLE;
+                }
                 std::lock_guard lock(transient->mutex);
                 transient->all.push_back(pool);
                 transient->pools.fetch_add(1, std::memory_order_relaxed);
             }
             transientPool = pool;
             transientSerial = serial;
-            // Outside the lock: keeping may release finished batches, whose returns take it.
+            // Keep only appends to the open batch's kept list (nothing is released here); the
+            // return takes the pools' lock when that batch is released, on the release thread.
             recorder.Keep(std::make_shared<TransientReturn>(transient, pool));
         }
         allocation.descriptorPool = transientPool;
@@ -3108,9 +3128,10 @@ VkDescriptorSet DescriptorCache::AllocateTransient(VkDescriptorSetLayout layout,
             transient->sets.fetch_add(1, std::memory_order_relaxed);
             return set;
         }
-        if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL) Check(result, "vkAllocateDescriptorSets transient");
-        // Full: the batch keeps it; the next attempt takes another.
+        // Full: the batch keeps it; the next attempt takes another. Any other error (out of host or
+        // device memory) refuses the set as well: the caller refreshes in-stream.
         transientPool = VK_NULL_HANDLE;
+        if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL) break;
     }
     transient->refused.fetch_add(1, std::memory_order_relaxed);
     return VK_NULL_HANDLE;
@@ -3118,7 +3139,7 @@ VkDescriptorSet DescriptorCache::AllocateTransient(VkDescriptorSetLayout layout,
 
 DescriptorCache::TransientStats DescriptorCache::TransientCounters() const {
     if (transient == nullptr) return {};
-    return {transient->sets.load(std::memory_order_relaxed), transient->pools.load(std::memory_order_relaxed), transient->resets.load(std::memory_order_relaxed), transient->refused.load(std::memory_order_relaxed)};
+    return {transient->sets.load(std::memory_order_relaxed), transient->pools.load(std::memory_order_relaxed), transient->resets.load(std::memory_order_relaxed), transient->refused.load(std::memory_order_relaxed), transient->destroyed.load(std::memory_order_relaxed)};
 }
 
 std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic) {
@@ -3282,7 +3303,12 @@ bool ShaderResources::RefreshData(VkCommandBuffer commands, const CompiledShader
         recorded = true;
     }
     if (timing != Recorder::NoTiming) recorder->EndGpuTiming(timing, refreshedBytes);
-    if (recorded) rehashDataWords();
+    if (recorded) {
+        rehashDataWords();
+        // A fork made before reads this object's buffers for its equal bindings: its set no longer
+        // stands for its words (ForkData's Reused).
+        lastFork.set = VK_NULL_HANDLE;
+    }
     return recorded;
 }
 
@@ -3294,14 +3320,67 @@ void ShaderResources::writeDataWords(VkCommandBuffer commands, std::size_t alloc
         return;
     }
     std::vector<std::uint32_t> patched(words.begin(), words.end());
-    auto* bytes = reinterpret_cast<std::byte*>(patched.data());
-    for (const auto& patch : dataPatches) {
-        if (patch.allocation == allocation && patch.byte < size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
-    }
+    patchDataWords(allocation, std::as_writable_bytes(std::span(patched)));
     context.Resolved(&DeviceFunctions::cmdUpdateBuffer, "vkCmdUpdateBuffer")(commands, buffer.Handle(), 0, size, patched.data());
 }
 
-ShaderResources::DataFork ShaderResources::ForkData(const CompiledShader& shader, Recorder& recorder) const {
+void ShaderResources::patchDataWords(std::size_t allocation, std::span<std::byte> bytes) const {
+    for (const auto& patch : dataPatches) {
+        if (patch.allocation == allocation && patch.byte < bytes.size()) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
+    }
+}
+
+namespace {
+
+// ForkData's two ways to avoid a fork (APS5_TEMPLATE_REFRESH_RING only; each on unless set to 0):
+// bind the open batch's last fork again when the words are its words, and write the words into an
+// idle template's own buffers.
+bool TemplateRefreshReuse() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_TEMPLATE_REFRESH_REUSE");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool TemplateRefreshAdopt() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_TEMPLATE_REFRESH_ADOPT");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+}
+
+void ShaderResources::NoteRecorded(const Recorder& recorder) {
+    recordedBy = &recorder;
+    recordedSerial = recorder.Submissions() + 1;
+}
+
+std::string ShaderResources::DescribeForkedWords(const CompiledShader& shader) const {
+    std::string text;
+    if (shader.program == nullptr || shader.program->bindings.size() != bindings.size()) return text;
+    for (std::size_t index = 0; index < bindings.size(); ++index) {
+        const auto& binding = shader.program->bindings[index];
+        if (!DataRole(binding.role) || bindings[index].allocations.size() != 1) continue;
+        std::vector<std::uint32_t> words(binding.guestDescriptor.begin(), binding.guestDescriptor.end());
+        patchDataWords(bindings[index].allocations.front(), std::as_writable_bytes(std::span(words)));
+        char line[32];
+        std::snprintf(line, sizeof(line), " forked data+0x%zx", words.size() * sizeof(std::uint32_t));
+        text += line;
+        if (words.size() * sizeof(std::uint32_t) > 0x200) continue;
+        text += " [";
+        for (std::size_t i = 0; i < words.size(); ++i) {
+            std::snprintf(line, sizeof(line), "%s%08x", i == 0 ? "" : " ", words[i]);
+            text += line;
+        }
+        text += "]";
+    }
+    return text;
+}
+
+ShaderResources::DataFork ShaderResources::ForkData(const CompiledShader& shader, Recorder& recorder) {
     Require(shader.program != nullptr, "missing compiled shader");
     const auto& program = *shader.program;
     Require(program.bindings.size() == bindings.size(), "template bindings disagree with the shader");
@@ -3324,6 +3403,52 @@ ShaderResources::DataFork ShaderResources::ForkData(const CompiledShader& shader
         differing[count++] = index;
     }
     if (count == 0) return fork;
+    const auto serial = recorder.Submissions() + 1;
+    // Reused: the open batch's last fork read these very words. Its set and ring regions live as
+    // long as that batch; its copied bindings read this object's buffers, which nothing rewrote
+    // since (RefreshData, an adoption and rebaseLease drop the memo).
+    if (TemplateRefreshReuse() && lastFork.set != VK_NULL_HANDLE && lastFork.recorder == &recorder && lastFork.serial == serial) {
+        std::size_t at = 0;
+        bool same = true;
+        for (const auto& binding : program.bindings) {
+            if (!DataRole(binding.role)) continue;
+            const auto& words = binding.guestDescriptor;
+            same = lastFork.words.size() - at >= words.size() && std::equal(words.begin(), words.end(), lastFork.words.begin() + static_cast<std::ptrdiff_t>(at));
+            if (!same) break;
+            at += words.size();
+        }
+        if (same && at == lastFork.words.size()) {
+            fork.outcome = ForkOutcome::Reused;
+            fork.set = lastFork.set;
+            return fork;
+        }
+    }
+    // Adopted: no batch that is not known finished recorded a use of this object (NoteRecorded;
+    // batches leave the in-flight list in serial order once their fence signalled, so every serial
+    // up to Submissions() - InFlightBatches() finished), so no GPU work reads or writes its data
+    // buffers: the CPU writes the words into them (host-coherent, made visible to the batch by its
+    // submit) as RefreshData would have recorded them, and the hit binds this object's own set.
+    if (TemplateRefreshAdopt() && recordedBy == &recorder && recordedSerial != 0 && recordedSerial + recorder.InFlightBatches() <= recorder.Submissions()) {
+        bool mapped = true;
+        for (std::size_t i = 0; i < count && mapped; ++i) mapped = allocations[bindings[differing[i]].allocations.front()].buffer->Mapped();
+        if (mapped) {
+            for (std::size_t i = 0; i < count; ++i) {
+                const auto index = differing[i];
+                const auto allocationIndex = bindings[index].allocations.front();
+                auto& allocation = allocations[allocationIndex];
+                const auto& words = program.bindings[index].guestDescriptor;
+                const auto bytes = allocation.buffer->Bytes().first(words.size() * sizeof(std::uint32_t));
+                std::memcpy(bytes.data(), words.data(), bytes.size());
+                patchDataWords(allocationIndex, bytes);
+                allocation.dataWords.assign(words.begin(), words.end());
+                fork.bytes += bytes.size();
+            }
+            rehashDataWords();
+            lastFork.set = VK_NULL_HANDLE;
+            fork.outcome = ForkOutcome::Adopted;
+            return fork;
+        }
+    }
     if (context.fastRing == nullptr || context.descriptorCache == nullptr || _set == VK_NULL_HANDLE) {
         fork.outcome = ForkOutcome::NoRing;
         return fork;
@@ -3331,19 +3456,19 @@ ShaderResources::DataFork ShaderResources::ForkData(const CompiledShader& shader
     // The ring regions, tagged with the open batch's serial (FastDispatch's rule). A full ring is
     // not reclaimed here (that reaps, running completions in the middle of this record): the
     // regions of released batches free themselves (their retirements), and until then the caller
-    // refreshes with RefreshData.
+    // refreshes with RefreshData. The batch's release completes the serial, which frees the
+    // regions (also those of a partial allocation, or when no set follows): the batch hold keeps
+    // one retirement per batch (FastBatchHold, shared with the fast draws of the device's one
+    // ring), not one per fork.
     auto& ring = *context.fastRing;
+    FastBatchHold(context, recorder);
     std::array<std::optional<FastRing::Region>, MaxForkedBindings> regions;
-    const auto serial = recorder.Submissions() + 1;
     bool full = false;
     for (std::size_t i = 0; i < count && !full; ++i) {
         regions[i] = ring.Allocate(allocations[bindings[differing[i]].allocations.front()].size, serial);
         full = !regions[i].has_value();
     }
-    // The batch's release completes the serial, which frees the regions (also those of a partial
-    // allocation, or when no set follows).
-    recorder.Keep(ring.Retirement(serial));
-    if (full || recorder.Submissions() + 1 != serial) {
+    if (full) {
         fork.outcome = ForkOutcome::RingFull;
         return fork;
     }
@@ -3389,9 +3514,7 @@ ShaderResources::DataFork ShaderResources::ForkData(const CompiledShader& shader
         const auto& region = *regions[i];
         const auto size = words.size() * sizeof(std::uint32_t);
         std::memcpy(region.data, words.data(), size);
-        for (const auto& patch : dataPatches) {
-            if (patch.allocation == allocationIndex && patch.byte < size) region.data[patch.byte] = static_cast<std::byte>(patch.adjustment);
-        }
+        patchDataWords(allocationIndex, std::span<std::byte>(region.data, size));
         infos[i] = {region.buffer, region.offset, size};
         auto& write = writes[i];
         write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -3405,6 +3528,15 @@ ShaderResources::DataFork ShaderResources::ForkData(const CompiledShader& shader
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(count), writes.data(), static_cast<std::uint32_t>(copies.size()), copies.data());
     fork.outcome = ForkOutcome::Forked;
     fork.set = set;
+    if (TemplateRefreshReuse()) {
+        lastFork.recorder = &recorder;
+        lastFork.serial = serial;
+        lastFork.set = set;
+        lastFork.words.clear();
+        for (const auto& binding : program.bindings) {
+            if (DataRole(binding.role)) lastFork.words.insert(lastFork.words.end(), binding.guestDescriptor.begin(), binding.guestDescriptor.end());
+        }
+    }
     return fork;
 }
 
@@ -3952,9 +4084,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             auto buffer = std::make_shared<Buffer>(context, item.size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             auto* bytes = buffer->Bytes().data();
             std::memcpy(bytes, words.data(), item.size);
-            for (const auto& patch : dataPatches) {
-                if (patch.allocation == index && patch.byte < item.size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
-            }
+            patchDataWords(index, std::span<std::byte>(bytes, item.size));
             select(index, {buffer->Handle(), 0, buffer->Bytes().size()});
             ++result->dataCopies;
             result->snapshots.push_back({0, std::move(buffer), index});
@@ -4275,6 +4405,8 @@ bool ShaderResources::rebaseLease(std::span<const CompiledShader> shaders, bool&
     Require(writes.size() == moves.size(), "a rebased guest buffer is not in the template's set");
     // The template is idle (its previous use completed), so its set is not in use by the GPU.
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    // A fork copied the set as it was (ForkData's Reused binds no fork made before this).
+    lastFork.set = VK_NULL_HANDLE;
     for (const auto& move : moves) {
         auto& item = allocations[move.index];
         item.address = move.address;
