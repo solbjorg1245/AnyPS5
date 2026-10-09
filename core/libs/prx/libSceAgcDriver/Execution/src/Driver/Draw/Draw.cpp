@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastWalk.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/PassDump.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -111,7 +112,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const bool lockedPrepare = lockedPrepareAlways || retry.level >= 2;
     // APS5_FAST_DRAW (FastDraw.cpp): the fast path takes the draw, or declines it to the path below.
     if (FastDrawEnabled()) {
-        if (const auto verdict = fastDraw(queue, submission, drawParameters, rejected, traceIndirect, retry.level != 0 || lockedPrepare, ShaderRecompiler::DebugProbeActive() || dumpTarget != 0 || dumpSlot1 != 0, phaseTiming)) return *verdict == DrawVerdict::Drawn ? drawn() : *verdict;
+        if (const auto verdict = fastDraw(queue, submission, drawParameters, rejected, traceIndirect, retry.level != 0 || lockedPrepare, ShaderRecompiler::DebugProbeActive() || dumpTarget != 0 || dumpSlot1 != 0 || PassDump::FrameActive(), phaseTiming)) return *verdict == DrawVerdict::Drawn ? drawn() : *verdict;
     }
     // A comparison the fast path armed for this draw (APS5_FAST_DRAW_VERIFY) ends with it.
     const FastDrawVerifyScope verifyScope;

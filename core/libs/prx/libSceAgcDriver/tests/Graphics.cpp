@@ -2145,6 +2145,7 @@ int main() {
         RunColorTargetLayoutTests();
         RunLiveStackAccessTests();
         RunTextureFormatTests();
+        RunTexelStatsTests();
         RunTextureTilingTests();
         RunImageMemoryPoolTests();
         RunGuestTextureResourceTests();

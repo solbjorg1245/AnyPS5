@@ -469,6 +469,43 @@ std::size_t DumpDepthSurfaces(const Context& context, const std::string& prefix,
     return written;
 }
 
+std::size_t ReadBackDepthSurface(const Context& context, std::uint64_t address, std::uint32_t slice, const std::function<void(const ImageReadback&)>& consume) {
+    std::lock_guard lock(surfacesMutex());
+    const auto matches = [&](const std::unique_ptr<DepthSurface>& surface) { return surface->context.device == context.device && address != 0 && surface->target.address == address && slice < surface->layers; };
+    const auto aliases = static_cast<std::uint32_t>(std::count_if(surfaces().begin(), surfaces().end(), matches));
+    std::size_t read = 0;
+    for (const auto& surface : surfaces()) {
+        if (!matches(surface)) continue;
+        const auto& target = surface->target;
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const std::uint32_t texelBytes = d16 ? 2u : 4u;
+        Buffer buffer(context, static_cast<std::size_t>(target.extent.width) * target.extent.height * texelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, slice, 1};
+        region.imageExtent = {target.extent.width, target.extent.height, 1};
+        CommandBatch batch(context);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(batch.Handle(), surface->image, VK_IMAGE_LAYOUT_GENERAL, buffer.Handle(), 1, &region);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+        ImageReadback readback;
+        readback.address = address;
+        readback.guestBytes = static_cast<std::uint64_t>(target.extent.width) * target.extent.height * texelBytes;
+        readback.format = d16 ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT;
+        readback.width = target.extent.width;
+        readback.height = target.extent.height;
+        readback.firstLayer = slice;
+        readback.rowTexels = target.extent.width;
+        readback.texelBytes = texelBytes;
+        readback.alias = static_cast<std::uint32_t>(read);
+        readback.aliases = aliases;
+        readback.bytes = buffer.Bytes();
+        consume(readback);
+        ++read;
+    }
+    return read;
+}
+
 std::uint64_t DepthSurfaceSerial() {
     return depthSerial().load(std::memory_order_acquire);
 }

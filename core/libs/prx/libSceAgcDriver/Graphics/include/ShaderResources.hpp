@@ -449,6 +449,10 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> PresyncSurfaces() const;
 
 private:
+    // The FrameTrace note of this use (FrameTrace::NoteWrites): the written storage images
+    // (" w=0x<address>/<width>x<height>/f<format>/m<mip>"), the written buffer ranges
+    // (" wb=0x<address>+0x<bytes>"), then " |" and Describe().
+    void noteFrameTrace();
     struct DescribedRange {
         const char* kind;
         std::uint64_t address;

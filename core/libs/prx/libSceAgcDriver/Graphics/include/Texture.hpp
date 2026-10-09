@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageMemoryPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TexelStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -13,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -287,6 +289,11 @@ public:
     // <prefix><address>_<width>x<height>_a<layers>_l<layer>.raw (u32 row pitch in texels, u32 height,
     // u32 VkFormat, then the rows). The GPU must be idle. Returns the number of files written.
     static std::size_t DumpLive(const Context& context, const std::string& prefix, std::span<const std::uint64_t> addresses = {});
+    // Debug aid (APS5_PASS_DUMP, see Execution/include/Driver/PassDump.hpp): reads back mip `level` of
+    // layers [firstLayer, firstLayer + layerCount) (clamped to the image, and to 256 MiB) of every
+    // live, unreleased image at `address`, each handed to `consume`. The GPU must be idle. Returns
+    // the number of images read.
+    static std::size_t ReadBack(const Context& context, std::uint64_t address, std::uint32_t level, std::uint32_t firstLayer, std::uint32_t layerCount, const std::function<void(const ImageReadback&)>& consume);
     // Debug aid (APS5_CAPTURE_DIR, see VulkanDevice::CaptureTargets): sets every live image at
     // `address` to zero on the device (all mips and layers). The GPU must be idle. Returns the number
     // of images cleared.

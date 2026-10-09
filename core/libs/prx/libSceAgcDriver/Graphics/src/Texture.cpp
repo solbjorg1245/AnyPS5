@@ -2499,6 +2499,62 @@ std::size_t StorageTexture::DumpLive(const Context& context, const std::string& 
     return written;
 }
 
+std::size_t StorageTexture::ReadBack(const Context& context, std::uint64_t address, std::uint32_t level, std::uint32_t firstLayer, std::uint32_t layerCount, const std::function<void(const ImageReadback&)>& consume) {
+    constexpr std::uint64_t MaxBytes = 256ull << 20u;
+    std::vector<std::shared_ptr<StorageTexture>> textures;
+    {
+        auto& live = Live();
+        std::lock_guard lock(live.mutex);
+        for (auto* texture : live.textures) {
+            if (texture->released || texture->descriptor.baseAddress != address) continue;
+            if (auto owner = texture->weak_from_this().lock()) textures.push_back(std::move(owner));
+        }
+    }
+    std::size_t read = 0;
+    for (std::size_t alias = 0; alias < textures.size(); ++alias) {
+        const auto& texture = textures[alias];
+        const auto& descriptor = texture->descriptor;
+        if (texture->image == VK_NULL_HANDLE || level >= descriptor.mipCount || firstLayer >= texture->arrayLayers || IsBlockCompressed(descriptor.format)) continue;
+        const auto all = texture->CopyRegions();
+        // CopyRegions lists every mip of a layer before the next layer.
+        const auto first = all.at(static_cast<std::size_t>(firstLayer) * descriptor.mipCount + level);
+        const auto texelBytes = TexelBytes(texture->storageFormat) != 0 ? TexelBytes(texture->storageFormat) : BytesPerElement(descriptor.format);
+        const std::uint64_t layerBytes = static_cast<std::uint64_t>(first.bufferRowLength) * first.imageExtent.height * texelBytes;
+        if (layerBytes == 0) continue;
+        const auto layers = std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(std::min<std::uint64_t>({layerCount, texture->arrayLayers - firstLayer, MaxBytes / layerBytes})));
+        std::vector<VkBufferImageCopy> regions;
+        for (std::uint32_t index = 0; index < layers; ++index) {
+            auto region = all.at(static_cast<std::size_t>(firstLayer + index) * descriptor.mipCount + level);
+            region.bufferOffset = index * layerBytes;
+            regions.push_back(region);
+        }
+        Buffer buffer(context, static_cast<std::size_t>(layerBytes * layers), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        CommandBatch batch(context);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(batch.Handle(), texture->image, VK_IMAGE_LAYOUT_GENERAL, buffer.Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+        ImageReadback readback;
+        readback.address = address;
+        readback.guestBytes = texture->GuestBytes();
+        readback.format = texture->storageFormat;
+        readback.guestFormat = descriptor.format;
+        readback.width = first.imageExtent.width;
+        readback.height = first.imageExtent.height;
+        readback.level = level;
+        readback.firstLayer = firstLayer;
+        readback.layers = layers;
+        readback.rowTexels = first.bufferRowLength;
+        readback.texelBytes = texelBytes;
+        readback.alias = static_cast<std::uint32_t>(alias);
+        readback.aliases = static_cast<std::uint32_t>(textures.size());
+        readback.bytes = buffer.Bytes();
+        consume(readback);
+        ++read;
+    }
+    return read;
+}
+
 std::size_t StorageTexture::DebugClear(const Context& context, std::uint64_t address) {
     std::vector<std::shared_ptr<StorageTexture>> textures;
     {

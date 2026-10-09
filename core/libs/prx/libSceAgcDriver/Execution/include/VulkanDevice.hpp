@@ -19,6 +19,7 @@ namespace AgcDriver {
 
 namespace Graphics {
 class StorageTexture;
+struct ImageReadback;
 }
 
 // Stage A of a dispatch's resource build (see VulkanDevice::PrepareDispatch); opaque to callers.
@@ -199,6 +200,11 @@ public:
     // Drains the device (the caller holds GuestMemory::GpuMutex) and saves the live images and depth
     // surfaces at `addresses` (every one when empty) under `prefix`.
     void CaptureImages(const std::string& prefix, std::span<const std::uint64_t> addresses);
+    // Debug aid (APS5_PASS_DUMP, see Driver/PassDump.hpp): StorageTexture::ReadBack and
+    // ReadBackDepthSurface on this device. The caller holds GuestMemory::GpuMutex and has drained
+    // the device (WaitIdle).
+    std::size_t ReadBackImage(std::uint64_t address, std::uint32_t level, std::uint32_t firstLayer, std::uint32_t layers, const std::function<void(const Graphics::ImageReadback&)>& consume);
+    std::size_t ReadBackDepth(std::uint64_t address, std::uint32_t slice, const std::function<void(const Graphics::ImageReadback&)>& consume);
     double FinishPresent();
     void QueuePresent();
     // At the flip packet (under the mutex): the recorder's submissions so far and, under
