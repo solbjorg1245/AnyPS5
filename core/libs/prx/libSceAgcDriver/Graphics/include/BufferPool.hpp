@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libc/include/HostMutex.hpp"
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -68,11 +69,12 @@ public:
     // Counted as evictions.
     VkDeviceSize ReleaseDevice() noexcept;
     // Video memory guard (VideoMemory, APS5_VRAM_GUARD): destroys the device tier's least recently
-    // used retained slots until `bytes` are freed or `floor` bytes are left, and retains no more
-    // than what is left (at least `floor`) until RestoreDeviceLimit. Returns the bytes freed.
-    VkDeviceSize TrimDevice(VkDeviceSize bytes, VkDeviceSize floor) noexcept;
-    void RestoreDeviceLimit() noexcept;
-    // The device tier's retained bytes and its current limit (tests, the [bufferpool] line).
+    // used retained slots that came back at least `idle` ago (the working set, taken again sooner,
+    // stays) until `bytes` are freed or `floor` bytes are left. The tier's limit is left as it is:
+    // capping it made the working set's slots miss and be allocated again (allocate/free churn).
+    // Returns the bytes freed.
+    VkDeviceSize TrimDevice(VkDeviceSize bytes, VkDeviceSize floor, std::chrono::milliseconds idle) noexcept;
+    // The device tier's retained bytes and its limit (tests).
     VkDeviceSize DeviceRetainedBytes();
     VkDeviceSize DeviceLimit();
     // AllocateDeviceMemory's outcomes since the start (the [bufferpool] line): allocations refused
@@ -87,6 +89,9 @@ private:
     struct Slot {
         BufferAllocation allocation;
         std::uint64_t lastUse;
+        // When it came back (the device tier with the video memory guard on: TrimDevice's idle
+        // time; the epoch of the clock otherwise, so idle).
+        std::chrono::steady_clock::time_point returned {};
     };
     // Retained slots are grouped by what a Take must match (capacity, usage, memory properties),
     // each group oldest first: a Take is a map lookup instead of a scan of every slot (with
@@ -113,6 +118,8 @@ private:
     // releasing the mutex, so builds taking buffers on other threads do not wait behind the
     // Vulkan destroy calls. Nothing changes when the vector cannot grow.
     void evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted);
+    // The group holding the tier's least recently used slot (at its front); the tier is not empty.
+    std::map<SlotKey, std::deque<Slot>>::iterator oldestGroup(Tier& tier);
     // The retained-slot bound of each tier (APS5_BUFFER_POOL_SLOTS, default `defaultSlots`), read once.
     static std::size_t MaxSlots();
     VkDevice device;

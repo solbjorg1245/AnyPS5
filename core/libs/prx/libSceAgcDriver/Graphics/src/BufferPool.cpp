@@ -80,46 +80,61 @@ BufferPool::Tier& BufferPool::tierFor(std::size_t capacity, VkMemoryPropertyFlag
 std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto capacity = Capacity(bytes);
-    std::lock_guard lock(mutex);
-    ++clock;
-    if (profile) {
-        static auto lastReport = std::chrono::steady_clock::now();
-        const auto now = std::chrono::steady_clock::now();
-        if (now - lastReport > std::chrono::seconds(10)) {
-            lastReport = now;
-            std::fprintf(stderr, "[bufferpool] small: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB); large: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB)%s; device: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB of %llu); out of video memory: %llu allocations refused, %llu releases (%.0f MiB), %llu made after one; video memory guard: trimmed %llu (%.0f MiB), recycled %llu (%.0f MiB), device limit %.0f MiB\n", static_cast<unsigned long long>(smallTier.hits), static_cast<unsigned long long>(smallTier.misses), static_cast<unsigned long long>(smallTier.evictions), smallTier.slots, smallTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(largeTier.hits), static_cast<unsigned long long>(largeTier.misses), static_cast<unsigned long long>(largeTier.evictions), largeTier.slots, largeTier.retainedBytes / 1048576.0, sharedTiers() ? " (shared)" : "", static_cast<unsigned long long>(deviceTier.hits), static_cast<unsigned long long>(deviceTier.misses), static_cast<unsigned long long>(deviceTier.evictions), deviceTier.slots, deviceTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(deviceTier.budget >> 20u), static_cast<unsigned long long>(outOfMemoryCounters().refused.load(std::memory_order_relaxed)), static_cast<unsigned long long>(outOfMemoryCounters().reclaims.load(std::memory_order_relaxed)), outOfMemoryCounters().reclaimedBytes.load(std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(outOfMemoryCounters().madeAfter.load(std::memory_order_relaxed)), static_cast<unsigned long long>(guardTrimmed), guardTrimmedBytes / 1048576.0, static_cast<unsigned long long>(guardRecycled), guardRecycledBytes / 1048576.0, deviceTier.budget / 1048576.0);
+    std::optional<BufferAllocation> result;
+    // Device-tier slots from before the video memory guard's last recycle met here: destroyed after
+    // the mutex is released, as evictions are.
+    std::vector<BufferAllocation> stale;
+    {
+        std::lock_guard lock(mutex);
+        ++clock;
+        if (profile) {
+            static auto lastReport = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastReport > std::chrono::seconds(10)) {
+                lastReport = now;
+                std::fprintf(stderr, "[bufferpool] small: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB); large: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB)%s; device: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB of %llu); out of video memory: %llu allocations refused, %llu releases (%.0f MiB), %llu made after one; video memory guard: trimmed %llu (%.0f MiB), recycled %llu (%.0f MiB)\n", static_cast<unsigned long long>(smallTier.hits), static_cast<unsigned long long>(smallTier.misses), static_cast<unsigned long long>(smallTier.evictions), smallTier.slots, smallTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(largeTier.hits), static_cast<unsigned long long>(largeTier.misses), static_cast<unsigned long long>(largeTier.evictions), largeTier.slots, largeTier.retainedBytes / 1048576.0, sharedTiers() ? " (shared)" : "", static_cast<unsigned long long>(deviceTier.hits), static_cast<unsigned long long>(deviceTier.misses), static_cast<unsigned long long>(deviceTier.evictions), deviceTier.slots, deviceTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(deviceTier.budget >> 20u), static_cast<unsigned long long>(outOfMemoryCounters().refused.load(std::memory_order_relaxed)), static_cast<unsigned long long>(outOfMemoryCounters().reclaims.load(std::memory_order_relaxed)), outOfMemoryCounters().reclaimedBytes.load(std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(outOfMemoryCounters().madeAfter.load(std::memory_order_relaxed)), static_cast<unsigned long long>(guardTrimmed), guardTrimmedBytes / 1048576.0, static_cast<unsigned long long>(guardRecycled), guardRecycledBytes / 1048576.0);
+            }
         }
+        auto& tier = tierFor(capacity, properties);
+        const bool recycling = &tier == &deviceTier && VideoMemory::GuardEnabled();
+        const auto epoch = recycling ? VideoMemory::Epoch() : 0;
+        const SlotKey key{capacity, usage, properties};
+        while (!result) {
+            const auto found = tier.free.find(key);
+            if (found == tier.free.end()) break;
+            // The most recently retained slot: the likeliest to be warm.
+            const auto slot = found->second.back().allocation;
+            const bool old = recycling && slot.epoch < epoch;
+            // Before anything changes: a throw here leaves the slot retained.
+            if (old) stale.push_back(slot);
+            found->second.pop_back();
+            if (found->second.empty()) tier.free.erase(found);
+            tier.retainedBytes -= slot.allocationBytes;
+            --tier.slots;
+            if (!old) {
+                result = slot;
+                break;
+            }
+            // Made before the last recycle (possibly paged out to system memory during the
+            // pressure episode before it): not handed out; the next one of the key may be newer.
+            ++guardRecycled;
+            guardRecycledBytes += slot.allocationBytes;
+            ++tier.evictions;
+        }
+        if (result) ++tier.hits;
+        else ++tier.misses;
     }
-    auto& tier = tierFor(capacity, properties);
-    const auto found = tier.free.find(SlotKey{capacity, usage, properties});
-    if (found == tier.free.end()) {
-        ++tier.misses;
-        return std::nullopt;
-    }
-    // The most recently retained slot: the likeliest to be warm.
-    auto result = found->second.back().allocation;
-    found->second.pop_back();
-    if (found->second.empty()) tier.free.erase(found);
-    tier.retainedBytes -= result.allocationBytes;
-    --tier.slots;
-    if (&tier == &deviceTier && result.epoch < VideoMemory::Epoch() && VideoMemory::GuardEnabled()) {
-        // Made before the last video memory pressure episode ended (possibly paged out to system
-        // memory during it): destroyed, and the caller makes a new one. Under the mutex: rare (a
-        // recycle drops every retained slot at once; this catches one retained in between).
-        ++guardRecycled;
-        guardRecycledBytes += result.allocationBytes;
-        ++tier.evictions;
-        ++tier.misses;
-        destroy(result);
-        return std::nullopt;
-    }
-    ++tier.hits;
+    for (const auto& gone : stale) destroy(gone);
     return result;
 }
 
-void BufferPool::evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted) {
+std::map<BufferPool::SlotKey, std::deque<BufferPool::Slot>>::iterator BufferPool::oldestGroup(Tier& tier) {
     // Each group is oldest first, so the tier's oldest slot is the oldest group front.
-    const auto oldest = std::min_element(tier.free.begin(), tier.free.end(), [](const auto& left, const auto& right) { return left.second.front().lastUse < right.second.front().lastUse; });
+    return std::min_element(tier.free.begin(), tier.free.end(), [](const auto& left, const auto& right) { return left.second.front().lastUse < right.second.front().lastUse; });
+}
+
+void BufferPool::evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted) {
+    const auto oldest = oldestGroup(tier);
     // First: a throw here leaves the slot retained and counted.
     evicted.push_back(oldest->second.front().allocation);
     tier.retainedBytes -= oldest->second.front().allocation.allocationBytes;
@@ -157,7 +172,7 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
         } else {
             const auto maxSlots = MaxSlots();
             while (!tier.free.empty() && (tier.retainedBytes + allocation.allocationBytes > tier.budget || tier.slots >= maxSlots)) evictOldest(tier, evicted);
-            tier.free[SlotKey{allocation.bytes, allocation.usage, allocation.properties}].push_back({allocation, ++clock});
+            tier.free[SlotKey{allocation.bytes, allocation.usage, allocation.properties}].push_back({allocation, ++clock, &tier == &deviceTier && VideoMemory::GuardEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}});
             ++tier.slots;
             tier.retainedBytes += allocation.allocationBytes;
         }
@@ -192,29 +207,26 @@ VkDeviceSize BufferPool::ReleaseDevice() noexcept {
     return bytes;
 }
 
-VkDeviceSize BufferPool::TrimDevice(VkDeviceSize bytes, VkDeviceSize floor) noexcept {
+VkDeviceSize BufferPool::TrimDevice(VkDeviceSize bytes, VkDeviceSize floor, std::chrono::milliseconds idle) noexcept {
     std::vector<BufferAllocation> evicted;
     VkDeviceSize freed = 0;
     try {
+        const auto cutoff = std::chrono::steady_clock::now() - idle;
         std::lock_guard lock(mutex);
         while (!deviceTier.free.empty() && freed < bytes && deviceTier.retainedBytes > floor) {
+            // Least recently used first; one that came back within `idle` is in use, and so is
+            // every newer one.
+            if (oldestGroup(deviceTier)->second.front().returned > cutoff) break;
             const auto before = deviceTier.retainedBytes;
             evictOldest(deviceTier, evicted);
             freed += before - deviceTier.retainedBytes;
         }
-        // Retains no more than what is left until the pressure ends (RestoreDeviceLimit).
-        deviceTier.budget = std::min(DeviceBudget(), std::max(floor, deviceTier.retainedBytes));
         guardTrimmed += evicted.size();
         guardTrimmedBytes += freed;
     } catch (...) {
     }
     for (const auto& gone : evicted) destroy(gone);
     return freed;
-}
-
-void BufferPool::RestoreDeviceLimit() noexcept {
-    std::lock_guard lock(mutex);
-    deviceTier.budget = DeviceBudget();
 }
 
 VkDeviceSize BufferPool::DeviceRetainedBytes() {

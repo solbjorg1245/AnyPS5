@@ -68,7 +68,7 @@ Buffer::~Buffer() {
 }
 
 void Buffer::release() noexcept {
-    if (ready && cache) {
+    if (ready && cache && !discard.load(std::memory_order_relaxed)) {
         cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, epoch, memoryType});
         return;
     }
@@ -122,8 +122,10 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         epoch = VideoMemory::Epoch();
         memoryType = allocation.memoryTypeIndex;
-        madeUnderPressure = VideoMemory::UnderPressure();
+        // Also the allocation whose own refusal started the episode (AllocateDeviceMemory).
+        const bool pressuredBefore = VideoMemory::UnderPressure();
         Check(AllocateDeviceMemory(context, allocation, &memory), "vkAllocateMemory device buffer");
+        madeUnderPressure = pressuredBefore || VideoMemory::UnderPressure();
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory device");
     } catch (...) {
         release();
