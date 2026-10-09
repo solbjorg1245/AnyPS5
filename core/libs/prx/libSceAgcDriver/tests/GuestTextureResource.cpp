@@ -236,6 +236,49 @@ void RunGuestTextureResourceTests() {
     badMsaa.msaaDepth = true;
     rejectFields(badMsaa, "MSAA");
 
+    // APS5_ARRAY_PITCH (unset here: DecodeTextureResource rejects as above). Demon's Souls' 2D
+    // array whose words 4-7 were rewritten (a tagged pointer, 0x400, 0x5204: array pitch 5, base
+    // array past the last slice): the intact words 4-7 of the same words 0-3 repair it, nothing
+    // else does.
+    Fields layered = base;
+    layered.typeRaw = 13;
+    layered.depth = 63;
+    layered.maxMip = 9;
+    layered.perfMod = 7;
+    const auto intactWords = pack(layered);
+    Require(!TextureUpperHalfRejected(intactWords), "an intact 2D array T# was taken for rewritten words 4-7");
+    auto rewritten = intactWords;
+    rewritten[4] = 0xdea06ab0u;
+    rewritten[5] = 0x00500005u;
+    rewritten[6] = 0x00000400u;
+    rewritten[7] = 0x00005204u;
+    Require(TextureUpperHalfRejected(rewritten), "a 2D array T# with rewritten words 4-7 was not rejected");
+    reject([&] { DecodeTextureResource(rewritten); }, "nonzero array pitch");
+    std::array<std::uint32_t, 8> repaired{};
+    Require(!RepairTextureUpperHalf(rewritten, nullptr, repaired), "a 2D array was repaired without an intact copy");
+    const std::array<std::uint32_t, 4> intactUpper{intactWords[4], intactWords[5], intactWords[6], intactWords[7]};
+    Require(RepairTextureUpperHalf(rewritten, &intactUpper, repaired) && repaired == intactWords, "the intact words 4-7 were not restored");
+    const auto restored = DecodeTextureResource(repaired);
+    Require(restored.dimension == TextureDimension::k2DArray && restored.depthOrLastArray == 63 && restored.baseArray == 0 && restored.mipCount == 10, "the repaired 2D array decoded wrongly");
+    Require(!RepairTextureUpperHalf(pack(badPitch), &intactUpper, repaired), "a 2D T# (no layers) was repaired");
+    // A 3D T#'s ARRAY_PITCH bit 0 is the view bit: from slice 0 at level 0 it names the whole volume.
+    Fields volume = base;
+    volume.typeRaw = 10;
+    volume.depth = 15;
+    volume.arrayPitch = 1;
+    rejectFields(volume, "nonzero array pitch");
+    Require(RepairTextureUpperHalf(pack(volume), nullptr, repaired), "a 3D view bit was not read");
+    const auto wholeVolume = DecodeTextureResource(repaired);
+    Require(wholeVolume.dimension == TextureDimension::k3D && wholeVolume.depthOrLastArray == 15 && wholeVolume.baseArray == 0, "the 3D view decoded wrongly");
+    Fields volumeLevel = volume;
+    volumeLevel.baseLevel = 1;
+    volumeLevel.lastLevel = 1;
+    volumeLevel.maxMip = 1;
+    Require(!RepairTextureUpperHalf(pack(volumeLevel), nullptr, repaired), "a 3D view from level 1 was read as the whole volume");
+    Fields volumePitch = volume;
+    volumePitch.arrayPitch = 2;
+    Require(!RepairTextureUpperHalf(pack(volumePitch), nullptr, repaired), "a 3D T# with reserved array pitch bits was repaired");
+
     Fields blockSize = base;
     blockSize.maxUncompBlkSize = 1;
     blockSize.maxCompBlkSize = 1;
