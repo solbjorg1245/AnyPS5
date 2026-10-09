@@ -2783,13 +2783,13 @@ void StorageTexture::FlushAllPending(const char* reason) {
     static_cast<void>(FlushPending(0, std::numeric_limits<std::size_t>::max(), nullptr, reason));
 }
 
-std::shared_ptr<StorageTexture> StorageTexture::FindPending(std::uint64_t address, std::uint64_t bytes) {
+std::shared_ptr<StorageTexture> StorageTexture::FindPending(std::uint64_t address, std::uint64_t bytes, std::optional<std::uint32_t> swizzleSlice) {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
     for (auto* texture : pending.textures) {
         // Containment, not equality: a descriptor of a chain's first mips (its own guestBytes are
         // shorter) is served by the chain's image; CanCopyFrom then checks the geometry.
-        if (texture->descriptor.baseAddress == address && texture->guestBytes >= bytes) return texture->weak_from_this().lock();
+        if (texture->descriptor.baseAddress == address && texture->guestBytes >= bytes && (!swizzleSlice || texture->descriptor.swizzleSlice == *swizzleSlice)) return texture->weak_from_this().lock();
     }
     return nullptr;
 }
@@ -3484,12 +3484,12 @@ void StorageTexture::WriteBack() {
     flushReason = previous;
 }
 
-std::shared_ptr<StorageTexture> StorageTexture::FindLive(std::uint64_t address, std::uint64_t bytes) {
+std::shared_ptr<StorageTexture> StorageTexture::FindLive(std::uint64_t address, std::uint64_t bytes, std::optional<std::uint32_t> swizzleSlice) {
     auto& live = Live();
     std::lock_guard lock(live.mutex);
     for (auto it = live.textures.rbegin(); it != live.textures.rend(); ++it) {
         auto* texture = *it;
-        if (texture->released || !texture->Cached() || texture->descriptor.baseAddress != address || texture->guestBytes != bytes) continue;
+        if (texture->released || !texture->Cached() || texture->descriptor.baseAddress != address || texture->guestBytes != bytes || (swizzleSlice && texture->descriptor.swizzleSlice != *swizzleSlice)) continue;
         return texture->weak_from_this().lock();
     }
     return nullptr;

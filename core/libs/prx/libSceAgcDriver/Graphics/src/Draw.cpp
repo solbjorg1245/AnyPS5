@@ -1943,7 +1943,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         const auto& color = binding.color;
         binding.gpuTiling = color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr;
         APS5_LOG_OUT_DEBUG("Creating color target %zu address=0x%llx bytes=%llu extent=%ux%u", index, static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(color.bytes), color.extent.width, color.extent.height);
-        const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+        const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes, FixR0bEnabled() ? color.slice : 0u);
         constexpr VkBufferUsageFlags copies = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         timer.phase(PhaseSetup);
         // Debug aid: APS5_NO_RESIDENT_TARGETS=1 copies every target in and out again.
@@ -2747,7 +2747,7 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
         }
         if (resident != nullptr) {
             const char* refusal = nullptr;
-            const bool current = keys == DccKeys::ClearRegister ? clearToTexel(*resident, texel, color.elementBytes, refusal) : StorageTexture::FindPending(color.address, color.bytes) == resident || resident->UploadedKeys() == keys;
+            const bool current = keys == DccKeys::ClearRegister ? clearToTexel(*resident, texel, color.elementBytes, refusal) : StorageTexture::FindPending(color.address, color.bytes, FixR0bEnabled() ? color.slice : 0u) == resident || resident->UploadedKeys() == keys;
             if (current) {
                 resident->MarkDirty();
                 MarkDccUncompressed(context, color.dccAddress, color.bytes);
