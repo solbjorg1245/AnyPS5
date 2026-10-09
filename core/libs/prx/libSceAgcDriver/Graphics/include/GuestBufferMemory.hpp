@@ -7,6 +7,7 @@
 #include <memory>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -77,6 +78,14 @@ void SetImportWatch(const Context& context, ImportWatch watch);
 // (alignment and budget permitting), or null. Bytes at `address` are at `address - import->base` in
 // the import's buffer.
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
+// HostImportFor of each [begin, end) of `ranges` in order, under one hold of the import registry's
+// lock (each lookup makes HostImportFor's steps; no other thread's lookup, reconcile or retire comes
+// between two of them). `visit(user, index, import)` receives what HostImportFor would return for
+// range `index` and returns whether to go on: no range after the one it stops at is looked up (or
+// imported). The visitor runs under the registry's lock, so it must not take it (no HostImport*
+// call) and should be short.
+using HostImportVisitor = bool (*)(void* user, std::size_t index, const HostImport* import);
+void HostImportsFor(const Context& context, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, HostImportVisitor visit, void* user);
 // Whether an existing import covers [address, address + bytes), without reconciling the imports
 // with the registry or making one (HostImportFor may take a registry lease): a hint for choices
 // made outside the device lock (a sampled texture's path, a dispatch's pre-sync); the path taken

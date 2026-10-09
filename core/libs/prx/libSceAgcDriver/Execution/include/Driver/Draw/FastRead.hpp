@@ -7,8 +7,10 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace ShaderRecompiler {
@@ -33,6 +35,10 @@ inline constexpr std::array<const char*, static_cast<std::size_t>(WalkDecline::C
 enum class WalkMismatch : std::uint8_t { Specialization, Variant, Layout, Buffer, Image, Sampler, Flat, Data, Other, Push, Vertex, Deferred, Count };
 inline constexpr std::array<const char*, static_cast<std::size_t>(WalkMismatch::Count)> WalkMismatchNames{"specialization", "variant", "layout", "buffer", "image", "sampler", "flat", "data", "other binding", "push", "vertex", "deferred"};
 
+// Whether FastSrtRead tests a word in a pending 64 KiB block against the exact pending-write
+// ranges (the default) or declines on the block alone (APS5_FAST_PENDING_BLOCKS=1, the F2 rule).
+bool FastPendingExact();
+
 // The direct reader's state for one walk: the registered regions the old path's ShaderMemory
 // serves first (a draw's programs, or a dispatch's code and header), the page last found readable,
 // and why a read declined.
@@ -45,15 +51,36 @@ struct FastReader {
     std::optional<WalkDecline> declined;
     // The labels earlier packets of this thread's command buffer queued and nobody wrote yet.
     const std::vector<DeferredLabel>* labels = &deferredLabels().labels;
+    // The exact test behind the pending-block prefilter (FastSrtRead); false declines on the block
+    // alone (FastPendingExact). The pending-write snapshot (Recorder::PendingWriteSnapshot) last
+    // loaded and the publish generation it was loaded at: reloaded when the generation moved, as
+    // the old capture's PendingView reloads. The reads in a pending block the exact test let through.
+    bool exactPending = FastPendingExact();
+    bool snapshotLoaded = false;
+    std::uint64_t snapshotGeneration = 0;
+    std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> snapshot;
+    std::uint64_t pendingPassed = 0;
 };
 
-// FastSrtRead (design section 2.3), an SrtRuntime reader over a FastReader: the null page reads
-// zero; a read in a pending block (Recorder::BlockPending), over a queued label of this thread
-// (noted or still deferred: the old path captures again after recording one over its reads), in a
-// page not mapped, or in a page the flush hook would first store storage-image results or publish
-// unit shadows into (the old capture's page read runs it) declines; otherwise a plain load of the
-// live word (guest addresses are host pointers). No page copy, no flush hook, no snapshot.
+// FastSrtRead (design section 2.3), an SrtRuntime reader over a FastReader. The null page reads
+// zero. A read overlapping a pending GPU write declines: Recorder::BlockPending is the prefilter,
+// then the exact ranges of the pending-write snapshot decide, which is the old capture's raw-read
+// rule (classifyPendingWrite: no overlap, a raw read); APS5_FAST_PENDING_BLOCKS=1 declines on the
+// block alone. A read over a queued label of this thread (noted or still deferred: the old path
+// captures again after recording one over its reads), in a page not mapped, or in a page the flush
+// hook would first store storage-image results or publish unit shadows into (the old capture's
+// page read runs it) declines too. Otherwise a plain load of the live word (guest addresses are
+// host pointers). No page copy, no flush hook.
 bool FastSrtRead(void* context, std::uint64_t address, std::uint32_t* value);
+
+// APS5_PROFILE_DRAW: the reads of every fast walk (F2, F3b, F5) that met a pending block, and those
+// of them the exact test let through, counted since the process started (a reporter prints the
+// difference to its own last values). Zero without the profile.
+struct FastPendingReads {
+    std::uint64_t inBlocks = 0;
+    std::uint64_t readPast = 0;
+};
+FastPendingReads FastPendingReadTotals();
 
 // The decline of a walk that ended with `status` (a read the reader declined names its reason).
 WalkDecline WalkDeclineOf(ShaderRecompiler::WalkStatus status, const FastReader& reader);

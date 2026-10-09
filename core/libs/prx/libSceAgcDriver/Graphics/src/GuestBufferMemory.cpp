@@ -1344,10 +1344,10 @@ void SetImportWatch(const Context& context, ImportWatch watch) {
     state.unwatchImports = watch == ImportWatch::Unwatch;
 }
 
-const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
-    if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
-    auto& state = Imports();
-    std::lock_guard lock(state.mutex);
+namespace {
+
+// HostImportFor's lookup, under the registry's lock (the caller holds it).
+const HostImport* hostImportLocked(const Context& context, HostImports& state, std::uint64_t address, std::size_t bytes) {
     // A hit is only valid while the registry has not changed since the imports were reconciled.
     if (!importsStale(context, state)) {
         if (const auto* entry = findImport(state, address, address + bytes)) return entry;
@@ -1356,6 +1356,31 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     refreshImports(context, state, lease);
     if (const auto* range = containingRange(lease, address, address + bytes)) return importAllocation(context, state, range->address, range->bytes, lease);
     return nullptr;
+}
+
+bool importRangeInvalid(const Context& context, std::uint64_t address, std::size_t bytes) {
+    return context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address;
+}
+
+}
+
+const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (importRangeInvalid(context, address, bytes)) return nullptr;
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    return hostImportLocked(context, state, address, bytes);
+}
+
+void HostImportsFor(const Context& context, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, HostImportVisitor visit, void* user) {
+    if (ranges.empty()) return;
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    for (std::size_t index = 0; index < ranges.size(); ++index) {
+        const auto [begin, end] = ranges[index];
+        const auto bytes = end > begin ? static_cast<std::size_t>(end - begin) : std::size_t{0};
+        const auto* import = importRangeInvalid(context, begin, bytes) ? nullptr : hostImportLocked(context, state, begin, bytes);
+        if (!visit(user, index, import)) return;
+    }
 }
 
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes) {

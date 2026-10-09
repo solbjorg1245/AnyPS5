@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
 #include <algorithm>
@@ -17,6 +18,7 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <optional>
 #include <utility>
 
 namespace AgcDriver::Graphics {
@@ -67,6 +69,24 @@ std::uint64_t nanosecondsSince(std::chrono::steady_clock::time_point started) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
 }
 
+bool resolveProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profiled;
+}
+
+// The resolve's split (FastDispatchTiming): each add charges the time since the previous one to a
+// part. No clock is read without APS5_PROFILE_DRAW.
+struct ResolveLaps {
+    bool on = resolveProfiled();
+    std::chrono::steady_clock::time_point at = on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    void add(std::uint64_t& part) {
+        if (!on) return;
+        const auto now = std::chrono::steady_clock::now();
+        part += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - at).count());
+        at = now;
+    }
+};
+
 bool overlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t begin, std::uint64_t end) {
     return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return begin < range.second && range.first < end; });
 }
@@ -107,6 +127,14 @@ std::optional<Decline> checkBufferElement(const Context& context, const ShaderRe
     return std::nullopt;
 }
 
+}
+
+bool FastDispatchBatchedElements() {
+    static const bool batched = [] {
+        const char* value = std::getenv("APS5_FAST_DISPATCH_PER_ELEMENT");
+        return value == nullptr || std::strcmp(value, "0") == 0;
+    }();
+    return batched;
 }
 
 std::optional<FastDispatchDecline> FastComputeLayoutKey(const ShaderRecompiler::RecompileResult& shader, std::vector<std::uint32_t>& key) {
@@ -196,6 +224,9 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
     // Undecodable sampled elements bound as null: counted ([draws] "driver decode") only once the
     // dispatch is recorded, since a declined one is resolved and counted again by the old path.
     std::uint32_t nullBound = 0;
+    // Per dispatch (FastDispatchBatchedElements) or per element (APS5_FAST_DISPATCH_PER_ELEMENT=1).
+    const bool batched = FastDispatchBatchedElements();
+    ResolveLaps laps;
     // 1. What needs no import: V# decode and checks, the storage results over in-place ranges
     // flushed (UploadFinish's rule), the image and sampler lookups (they may record uploads and wait
     // for recorded work, so they come before the ring region and the imports).
@@ -205,6 +236,7 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
             VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             write.dstBinding = binding.binding;
             write.descriptorCount = binding.count;
+            std::uint64_t* part = &timing.buffersNs;
             if (binding.role == Role::GuestBuffers) {
                 if (binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) return Decline::Invalid;
                 write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -217,10 +249,13 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
                         scratch.buffers.push_back({context.emptyBuffer, 0, EmptyBufferBytes});
                         continue;
                     }
-                    if (!GuestMemory::DescribeCommitted(resolved.address, static_cast<std::size_t>(resolved.bytes)).whole) return Decline::Sparse;
+                    // CommittedWhole is DescribeCommitted's `whole` without the ranges' allocation.
+                    const bool whole = batched ? GuestMemory::CommittedWhole(resolved.address, static_cast<std::size_t>(resolved.bytes)) : GuestMemory::DescribeCommitted(resolved.address, static_cast<std::size_t>(resolved.bytes)).whole;
+                    if (!whole) return Decline::Sparse;
                     resolved.info = scratch.buffers.size();
                     scratch.elements.push_back(resolved);
                     scratch.buffers.push_back({});
+                    // One range per element, in the elements' order (step 3 pairs them by index).
                     scratch.reads.emplace_back(resolved.address, resolved.address + resolved.bytes);
                     if (resolved.written) scratch.written.emplace_back(resolved.address, resolved.address + resolved.bytes);
                 }
@@ -232,6 +267,7 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
                 scratch.data.push_back({scratch.buffers.size(), index, binding.role == Role::ShaderData});
                 scratch.buffers.push_back({});
             } else if (binding.role == Role::GuestImages && binding.kind == Kind::SampledImage) {
+                part = &timing.imagesNs;
                 write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
                 write.pImageInfo = scratch.images.data() + scratch.images.size();
                 for (std::uint32_t element = 0; element < binding.count; ++element) {
@@ -241,6 +277,7 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
                     scratch.keep.push_back(std::move(texture));
                 }
             } else if (binding.role == Role::GuestImages && binding.kind == Kind::StorageImage) {
+                part = &timing.imagesNs;
                 write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
                 write.pImageInfo = scratch.images.data() + scratch.images.size();
                 scratch.storage.clear();
@@ -253,6 +290,7 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
                 }
             } else if (binding.role == Role::GuestSamplers) {
                 if (binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u || binding.samplerDepthCompare.size() != binding.count) return Decline::Invalid;
+                part = &timing.samplersNs;
                 write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
                 write.pImageInfo = scratch.images.data() + scratch.images.size();
                 static const bool noSamplerCache = std::getenv("APS5_NO_SAMPLER_CACHE") != nullptr;
@@ -274,8 +312,24 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
                 return Decline::Role;
             }
             scratch.writes.push_back(write);
+            laps.add(*part);
         }
-        for (const auto& element : scratch.elements) StorageTexture::FlushPending(element.address, static_cast<std::size_t>(element.bytes), nullptr, "imported buffer region");
+        // Batched: one scan of each registry for every in-place range. FlushPending of a range lists
+        // only images in the pending registry that overlap it (AnyPendingOverlaps finds those and
+        // the ones being flushed, a superset), and with none it only publishes the unit shadows
+        // over the range when AnyShadowedOverlaps finds one (PublishShadowsOnly). So when neither
+        // scan finds anything, every element's FlushPending would store and publish nothing, and
+        // nothing is done; otherwise every element takes it, in order, as before. The shadow
+        // registry changes only under GuestMemory::GpuMutex, which this thread holds.
+        timing.elements = static_cast<std::uint32_t>(scratch.elements.size());
+        if (!scratch.elements.empty()) {
+            if (!batched || StorageTexture::AnyPendingOverlaps(scratch.reads) || AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>>(scratch.reads))) {
+                for (const auto& element : scratch.elements) StorageTexture::FlushPending(element.address, static_cast<std::size_t>(element.bytes), nullptr, "imported buffer region");
+            } else {
+                timing.flushSkipped = true;
+            }
+        }
+        laps.add(timing.flushNs);
     } catch (const std::exception&) {
         // The old path's build throws the same and reports it (a skipped dispatch).
         return Decline::Image;
@@ -313,12 +367,14 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
         // The batch's release completes the serial, which frees its regions.
         recorder.Keep(ring.Retirement(serial));
     }
+    laps.add(timing.ringNs);
     // 3. The imports, with the batch open: an import a reconcile retires meanwhile goes to the batch
     // (retireImport keeps nothing while the recorder is idle), so every handle taken here outlives
     // the recorded dispatch.
     recorder.Keep(call.pipelineObjects);
-    for (const auto& element : scratch.elements) {
-        const auto* import = HostImportFor(context, element.address, static_cast<std::size_t>(element.bytes));
+    // One element's binding from its import (HostImportFor's answer), or its decline. Local work
+    // only: it runs under the import registry's lock when batched.
+    const auto bindElement = [&](const BufferElement& element, const HostImport* import) -> std::optional<Decline> {
         if (import == nullptr) return Decline::NoImport;
         const auto offset = element.address - import->base;
         const auto adjustment = static_cast<std::uint32_t>(offset % alignment);
@@ -331,6 +387,27 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
             else scratch.dataPatches.emplace_back(element.adjustmentByte, adjustment);
         }
         scratch.buffers[element.info] = {import->buffer, offset - adjustment, element.bytes + adjustment};
+        return std::nullopt;
+    };
+    if (batched) {
+        // The element loop below under one hold of the registry's lock: the same lookups in the same
+        // order, stopping at the same element (HostImportsFor), with no other thread's lookup,
+        // reconcile or retire between two of them.
+        struct Visit {
+            const decltype(bindElement)& bind;
+            const std::vector<BufferElement>& elements;
+            std::optional<Decline> decline;
+        } visit{bindElement, scratch.elements, std::nullopt};
+        HostImportsFor(context, scratch.reads, [](void* user, std::size_t index, const HostImport* import) {
+            auto& state = *static_cast<Visit*>(user);
+            state.decline = state.bind(state.elements[index], import);
+            return !state.decline.has_value();
+        }, &visit);
+        if (visit.decline) return visit.decline;
+    } else {
+        for (const auto& element : scratch.elements) {
+            if (const auto decline = bindElement(element, HostImportFor(context, element.address, static_cast<std::size_t>(element.bytes)))) return decline;
+        }
     }
     if (!scratch.dataPatches.empty()) {
         const auto data = std::find_if(scratch.data.begin(), scratch.data.end(), [](const DataBinding& binding) { return binding.shaderData; });
@@ -352,6 +429,7 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
         argumentOffset = call.arguments - import->base;
     }
     const bool indirect = argumentBuffer != VK_NULL_HANDLE;
+    laps.add(timing.importsNs);
     timing.resolveNs = nanosecondsSince(resolveStart);
     // 4. The record, as VulkanDevice::recordDispatch: queued stores and copy-backs over the ranges
     // first, then the barriers around the dispatch.

@@ -139,6 +139,10 @@ void Run(AgcDriver::VulkanDevice& device) {
         return;
     }
     Require(!result && timing.recorded, std::string("the fast dispatch declined: ") + (result ? Graphics::FastDispatchDeclineNames[static_cast<std::size_t>(*result)] : ""));
+    // Its two V#s bound in place; with no storage result or unit shadow anywhere, the one scan per
+    // dispatch spared both elements their FlushPending (per element under APS5_FAST_DISPATCH_PER_ELEMENT=1).
+    Require(timing.elements == 2, "the fast dispatch did not bind its two V#s in place");
+    Require(timing.flushSkipped == Graphics::FastDispatchBatchedElements(), "the per-dispatch scan did not spare the elements their flush (or ran per element)");
     timing = {};
     const auto declined = device.FastDispatch(unregistered, 1, 1, 1, 0, program, timing);
     Require(declined == Decline::NoImport && !timing.recorded, std::string("a V# outside the registered allocations: ") + (declined ? Graphics::FastDispatchDeclineNames[static_cast<std::size_t>(*declined)] : "taken"));

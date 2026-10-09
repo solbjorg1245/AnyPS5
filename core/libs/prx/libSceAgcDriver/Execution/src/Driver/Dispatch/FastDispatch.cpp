@@ -35,10 +35,14 @@ constexpr auto MismatchCount = static_cast<std::size_t>(WalkMismatch::Count);
 // call), the whole calls of declined ones (what they spent before the old path took over), the
 // elements they bound in place with an offset adjustment (no verify covers those), the declines by
 // reason and the walk's own by reason, and the verify compare's results (a binding the old capture
-// left words of to the GPU is the "deferred" mismatch kind).
+// left words of to the GPU is the "deferred" mismatch kind). Taken dispatches also split their
+// resolve (FastDispatchTiming) and count their in-place elements and the dispatches whose one
+// registry scan let every element skip FlushPending; the walks' reads in pending blocks the exact
+// ranges let through ("pendingPassed").
 struct Counters {
     std::uint64_t dispatches = 0, taken = 0, takenIndirect = 0, leadSkipped = 0, ringFull = 0, adjusted = 0;
     std::uint64_t walkNs = 0, variantNs = 0, verifyNs = 0, prepareNs = 0, lockNs = 0, resolveNs = 0, recordNs = 0, totalNs = 0, declinedNs = 0;
+    std::uint64_t buffersNs = 0, imagesNs = 0, samplersNs = 0, flushNs = 0, ringNs = 0, importsNs = 0, elements = 0, flushSkipped = 0, pendingPassed = 0;
     std::array<std::uint64_t, DeclineCount> declines{};
     std::array<std::uint64_t, WalkDeclineCount> walkDeclines{};
     std::uint64_t verified = 0, verifyMismatched = 0, feedbackOnly = 0, flatFeedback = 0;
@@ -96,7 +100,12 @@ void report(const Counters& total) {
         std::snprintf(item, sizeof(item), "%s%s %llu", kind == 0 ? "" : ", ", WalkMismatchNames[kind], count(total.mismatches[kind]));
         kinds += item;
     }
-    std::fprintf(stderr, "[fastpath] dispatches (10 s): %llu seen, %llu taken (%.1f%%, %llu indirect); us per taken: walk %.2f, variant %.2f, verify %.2f, prepare %.2f, lock wait %.2f, resolve %.2f, record %.2f, total %.2f; declined dispatches spent %.1f ms before declining; lead barriers skipped %llu, ring full %llu, adjusted in place %llu; declines: %s; walk declines: %s; verify: %llu compared, %llu mismatched (%s), T# feedback-only %llu, flat T# copies feedback-only %llu\n", count(total.dispatches), count(total.taken), 100.0 * static_cast<double>(total.taken) / static_cast<double>(total.dispatches != 0 ? total.dispatches : 1), count(total.takenIndirect), perTaken(total.walkNs), perTaken(total.variantNs), perTaken(total.verifyNs), perTaken(total.prepareNs), perTaken(total.lockNs), perTaken(total.resolveNs), perTaken(total.recordNs), perTaken(total.totalNs), static_cast<double>(total.declinedNs) / 1e6, count(total.leadSkipped), count(total.ringFull), count(total.adjusted), declines.c_str(), walks.c_str(), count(total.verified), count(total.verifyMismatched), kinds.c_str(), count(total.feedbackOnly), count(total.flatFeedback));
+    // The reads of every fast walk that met a pending block (FastSrtRead) since the last line
+    // (report runs under countersMutex).
+    static FastPendingReads lastPending;
+    const auto pending = FastPendingReadTotals();
+    std::fprintf(stderr, "[fastpath] dispatches (10 s): %llu seen, %llu taken (%.1f%%, %llu indirect); us per taken: walk %.2f, variant %.2f, verify %.2f, prepare %.2f, lock wait %.2f, resolve %.2f, record %.2f, total %.2f; declined dispatches spent %.1f ms before declining; lead barriers skipped %llu, ring full %llu, adjusted in place %llu; declines: %s; walk declines: %s; verify: %llu compared, %llu mismatched (%s), T# feedback-only %llu, flat T# copies feedback-only %llu; resolve us per taken: buffers %.2f, images %.2f, samplers %.2f, flush %.2f, ring %.2f, imports %.2f; %.1f in-place elements per taken, flush skipped by one scan %llu (%s); dispatch walk reads read past a pending block %llu; pending-block reads (all fast walks) %llu, read past by the exact ranges %llu%s\n", count(total.dispatches), count(total.taken), 100.0 * static_cast<double>(total.taken) / static_cast<double>(total.dispatches != 0 ? total.dispatches : 1), count(total.takenIndirect), perTaken(total.walkNs), perTaken(total.variantNs), perTaken(total.verifyNs), perTaken(total.prepareNs), perTaken(total.lockNs), perTaken(total.resolveNs), perTaken(total.recordNs), perTaken(total.totalNs), static_cast<double>(total.declinedNs) / 1e6, count(total.leadSkipped), count(total.ringFull), count(total.adjusted), declines.c_str(), walks.c_str(), count(total.verified), count(total.verifyMismatched), kinds.c_str(), count(total.feedbackOnly), count(total.flatFeedback), perTaken(total.buffersNs), perTaken(total.imagesNs), perTaken(total.samplersNs), perTaken(total.flushNs), perTaken(total.ringNs), perTaken(total.importsNs), static_cast<double>(total.elements) / taken, count(total.flushSkipped), Graphics::FastDispatchBatchedElements() ? "per dispatch" : "APS5_FAST_DISPATCH_PER_ELEMENT", count(total.pendingPassed), count(pending.inBlocks - lastPending.inBlocks), count(pending.readPast - lastPending.readPast), FastPendingExact() ? "" : " (APS5_FAST_PENDING_BLOCKS: blocks only)");
+    lastPending = pending;
 }
 
 }
@@ -154,6 +163,7 @@ bool Driver::fastDispatch(const Submission& submission, const ShaderSnapshot& sn
             runtime.expressRead = &FastSrtRead;
             const auto status = ShaderRecompiler::WalkResources(*handle, request.context.userData, address, runtime, scratch.snapshot, scratch.specialization);
             local.walkNs = nanosecondsSince(lap);
+            local.pendingPassed = reader.pendingPassed;
             if (status != ShaderRecompiler::WalkStatus::Walked) {
                 declined = Decline::Walk;
                 walkDecline = WalkDeclineOf(status, reader);
@@ -238,6 +248,14 @@ bool Driver::fastDispatch(const Submission& submission, const ShaderSnapshot& sn
         local.totalNs = nanosecondsSince(started);
         local.leadSkipped = timing.leadSkipped ? 1 : 0;
         local.adjusted = timing.adjusted;
+        local.buffersNs = timing.buffersNs;
+        local.imagesNs = timing.imagesNs;
+        local.samplersNs = timing.samplersNs;
+        local.flushNs = timing.flushNs;
+        local.ringNs = timing.ringNs;
+        local.importsNs = timing.importsNs;
+        local.elements = timing.elements;
+        local.flushSkipped = timing.flushSkipped ? 1 : 0;
     } else {
         local.walkNs = local.variantNs = local.verifyNs = local.prepareNs = local.lockNs = 0;
         local.declinedNs = nanosecondsSince(started);
@@ -264,6 +282,15 @@ bool Driver::fastDispatch(const Submission& submission, const ShaderSnapshot& sn
     total.recordNs += local.recordNs;
     total.totalNs += local.totalNs;
     total.declinedNs += local.declinedNs;
+    total.buffersNs += local.buffersNs;
+    total.imagesNs += local.imagesNs;
+    total.samplersNs += local.samplersNs;
+    total.flushNs += local.flushNs;
+    total.ringNs += local.ringNs;
+    total.importsNs += local.importsNs;
+    total.elements += local.elements;
+    total.flushSkipped += local.flushSkipped;
+    total.pendingPassed += local.pendingPassed;
     for (std::size_t reason = 0; reason < DeclineCount; ++reason) total.declines[reason] += local.declines[reason];
     for (std::size_t reason = 0; reason < WalkDeclineCount; ++reason) total.walkDeclines[reason] += local.walkDeclines[reason];
     total.verified += local.verified;

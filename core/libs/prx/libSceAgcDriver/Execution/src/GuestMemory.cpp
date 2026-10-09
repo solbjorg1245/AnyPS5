@@ -679,6 +679,21 @@ Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writ
     return result;
 }
 
+bool CommittedWhole(std::uint64_t address, std::size_t bytes, bool writable) {
+    require(bytes <= std::numeric_limits<std::uint64_t>::max() - address, "address range overflow");
+    const TimedAccess timed(CounterVerify, bytes);
+    // The runs tile [address, address + bytes) in order, so DescribeCommitted's merged ranges are
+    // the one whole range exactly when every run is accessible. Every run is walked, as there (its
+    // page queries are stored the same way).
+    bool whole = true;
+    const bool queried = describePages(static_cast<std::uintptr_t>(address), bytes, [&](const PageRun& run) {
+        if (!run.readable || (writable && !run.writable)) whole = false;
+        return true;
+    });
+    require(queried, "cannot query guest memory");
+    return whole;
+}
+
 std::vector<std::pair<std::uint64_t, std::uint64_t>> CommittedRanges(std::uint64_t address, std::size_t bytes, bool writable) {
     return DescribeCommitted(address, bytes, writable).ranges;
 }

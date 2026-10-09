@@ -115,7 +115,12 @@ void report(const FastDrawCounters& total) {
         std::snprintf(item, sizeof(item), "%s%s %llu (%.1f us each)", declines.empty() ? "" : ", ", Graphics::FastDeclineName(static_cast<FastDecline>(reason)), count(total.declines[reason]), total.declineUs[reason] / static_cast<double>(total.declines[reason]));
         declines += item;
     }
-    std::fprintf(stderr, "[fastpath] draws (10 s): %llu offered, %llu taken (%.1f%%; %llu indirect, %llu continued a pass); us per taken draw: %s = %.2f; %.1f allocations per taken draw; declined draws spent %.1f ms before declining; declines: %s\n", count(total.offered), count(total.taken), total.offered != 0 ? 100.0 * static_cast<double>(total.taken) / static_cast<double>(total.offered) : 0.0, count(total.indirect), count(total.continued), parts.c_str(), total.takenUs / taken, static_cast<double>(total.allocations) / taken, total.declinedUs / 1000.0, declines.empty() ? "none" : declines.c_str());
+    // The reads of every fast walk that met a pending block, and those of them the exact ranges let
+    // through (FastSrtRead), since the last line (report runs under the totals' mutex).
+    static FastPendingReads lastPending;
+    const auto pending = FastPendingReadTotals();
+    std::fprintf(stderr, "[fastpath] draws (10 s): %llu offered, %llu taken (%.1f%%; %llu indirect, %llu continued a pass); us per taken draw: %s = %.2f; %.1f allocations per taken draw; declined draws spent %.1f ms before declining; declines: %s; pending-block reads (all fast walks) %llu, read past by the exact ranges %llu%s\n", count(total.offered), count(total.taken), total.offered != 0 ? 100.0 * static_cast<double>(total.taken) / static_cast<double>(total.offered) : 0.0, count(total.indirect), count(total.continued), parts.c_str(), total.takenUs / taken, static_cast<double>(total.allocations) / taken, total.declinedUs / 1000.0, declines.empty() ? "none" : declines.c_str(), count(pending.inBlocks - lastPending.inBlocks), count(pending.readPast - lastPending.readPast), FastPendingExact() ? "" : " (APS5_FAST_PENDING_BLOCKS: blocks only)");
+    lastPending = pending;
     if (FastDrawVerifyEvery() == 0) return;
     const auto bindings = Graphics::TakeFastVerifyCounts();
     std::string kinds;
