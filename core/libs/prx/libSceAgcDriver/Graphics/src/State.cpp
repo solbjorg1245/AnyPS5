@@ -630,8 +630,9 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     Require((info & 0x8000u) != 0 || number == 7 || number == 4 || number == 5, "unclamped normalized color is unsupported");
     // CB_COLOR_VIEW SLICE_START (bits 0-12) renders into one slice of an array surface. Its slices are
     // whole 2D surfaces one after the other, so the draw targets the 2D surface of that slice
-    // (Demon's Souls writes four slices of one R32 array through four MRT slots). SLICE_MAX (bits
-    // 13-25) above SLICE_START would be layered rendering, which is unsupported.
+    // (Demon's Souls writes four slices of one R32 array through four MRT slots). The slice index
+    // still enters the XOR swizzle of that surface, so it is kept (ColorTarget::slice). SLICE_MAX
+    // (bits 13-25) above SLICE_START would be layered rendering, which is unsupported.
     const auto view = read(cx, 0x31b + stride);
     const auto slice = view & 0x1fffu;
     Require(((view >> 13u) & 0x1fffu) == slice, "layered color rendering over several array slices is unsupported");
@@ -665,6 +666,7 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     Require(slice == 0 || maxMip == 0, "slices of mipmapped color arrays are unsupported");
     color.surfaceAddress = ((static_cast<std::uint64_t>(high) << 40u) | (static_cast<std::uint64_t>(read(cx, 0x318 + stride)) << 8u)) + static_cast<std::uint64_t>(slice) * colorLayout.Bytes();
     color.address = color.surfaceAddress + mipOffset;
+    color.slice = slice;
     color.bytes = colorLayout.Bytes();
     GuestMemory::CheckRange(reinterpret_cast<const void*>(color.address), color.bytes, colorLayout.Alignment(), true);
     color.format = decoded.format;

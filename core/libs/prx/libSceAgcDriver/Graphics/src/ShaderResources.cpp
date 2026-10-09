@@ -829,10 +829,11 @@ void evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::i
 }
 
 // Storage images are shared by every descriptor of one surface (address, extent, layers, format, tile
-// mode): the image holds the whole mip chain, and render targets in the same memory attach to it.
+// mode): the image holds the whole mip chain, and render targets in the same memory attach to it. A
+// color array slice's surface (swizzleSlice) is tiled apart from a 2D surface at the same address.
 std::array<std::uint32_t, 8> SurfaceKey(const Context& context, const GuestTextureResource& resource) {
     // Guest formats that store in the same Vulkan format share the image (views carry the difference).
-    return {static_cast<std::uint32_t>(resource.baseAddress), static_cast<std::uint32_t>(resource.baseAddress >> 32u), resource.width, resource.height, (resource.depthOrLastArray << 16u) | (resource.mipCount & 0xffffu), (static_cast<std::uint32_t>(resource.tileMode) << 12u) | (static_cast<std::uint32_t>(resource.dimension) << 20u), resource.baseArray, static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format))};
+    return {static_cast<std::uint32_t>(resource.baseAddress), static_cast<std::uint32_t>(resource.baseAddress >> 32u), resource.width, resource.height, (resource.depthOrLastArray << 16u) | (resource.mipCount & 0xffffu), (static_cast<std::uint32_t>(resource.tileMode) << 12u) | (static_cast<std::uint32_t>(resource.dimension) << 20u), resource.baseArray | (resource.swizzleSlice << 16u), static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format))};
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).

@@ -31,6 +31,8 @@ namespace {
 using AgcDriver::Graphics::Require;
 
 alignas(256) std::array<std::byte, 1024> colorMemory{};
+// Two slices of the 64x4 R32 target: CB_COLOR_VIEW SLICE_START 1 renders into the second.
+alignas(256) std::array<std::byte, 2048> colorArrayMemory{};
 
 AgcDriver::QueueState makeState() {
     AgcDriver::QueueState queue;
@@ -510,6 +512,17 @@ void DepthStencilTests() {
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "mip exceeds");
     queue.context[0x31b] = 1u << 13u;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "layered color rendering");
+    // A slice view targets the slice's own 2D surface and keeps the slice index, which the slice's
+    // XOR swizzle takes (SurfaceForTarget: GuestTextureResource::swizzleSlice).
+    const auto arrayBase = reinterpret_cast<std::uintptr_t>(colorArrayMemory.data());
+    queue.context[0x318] = static_cast<std::uint32_t>(arrayBase >> 8u);
+    queue.context[0x390] = static_cast<std::uint32_t>(arrayBase >> 40u);
+    queue.context[0x31b] = 1u | (1u << 13u);
+    state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.color.slice == 1 && state.color.address == arrayBase + 1024u && state.color.surfaceAddress == arrayBase + 1024u && state.color.bytes == 1024u, "CB_COLOR_VIEW SLICE_START did not select the slice's surface");
+    queue.context[0x31b] = 0;
+    state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.color.slice == 0 && state.color.address == arrayBase, "slice 0 of a color array changed");
 }
 
 alignas(256) std::array<std::uint8_t, 4> dccKeys{};

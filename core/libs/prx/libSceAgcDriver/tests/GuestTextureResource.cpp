@@ -327,4 +327,12 @@ void RunGuestTextureResourceTests() {
     Require(!MatchesGuestDimension(Shape::Image3D, TextureDimension::k2D), "3D shape must never match a guest dimension");
     Require(!MatchesGuestDimension(Shape::Image3D, TextureDimension::k2DArray), "3D shape must never match a guest dimension");
     Require(!MatchesGuestDimension(Shape::Image3D, TextureDimension::kCube), "3D shape must never match a guest dimension");
+
+    // The swizzle slice of a layer: the layer of an array, offset by the slice a color array slice
+    // view's 2D surface stands for.
+    GuestTextureResource sliceView{};
+    sliceView.dimension = TextureDimension::k2D;
+    Require(SwizzleSlice(sliceView, 0) == 0 && SwizzleSlice(sliceView, 3) == 3, "a surface without a slice view must swizzle its layers by index");
+    sliceView.swizzleSlice = 2;
+    Require(SwizzleSlice(sliceView, 0) == 2 && SwizzleSlice(sliceView, 1) == 3, "a color slice view must swizzle with its slice index");
 }
