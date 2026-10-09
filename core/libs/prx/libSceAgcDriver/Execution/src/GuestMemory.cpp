@@ -98,6 +98,10 @@ std::atomic<std::uint64_t> forgetCalls{0};
 // See ForgetSerial: odd while a ForgetPages call stores its page states.
 std::atomic<std::uint64_t> forgetSerial{0};
 std::atomic<std::uint64_t> forgetBytes{0};
+// Page queries that found a resident buffer's page guard (GuardedPageQueries).
+std::atomic<std::uint64_t> guardedPageQueries{0};
+// APS5_GUARD_PAGES_AS_HOLES (GuardedPagesAsHoles): -1 until read from the environment.
+std::atomic<int> guardedPagesAsHoles{-1};
 std::atomic<std::uint64_t> collectMemoHits{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
@@ -548,6 +552,37 @@ int ProcMapsQueryFd() {
 }
 #endif
 
+// A no-access run at `cursor` (up to `limit`) that a resident buffer's page guard holds
+// (GuestPageGuard*, APS5_RESIDENT_BUFFERS): the guest still has those pages mapped as before the
+// guard (an access faults into the resolver, which lands the GPU's bytes first), so the page queries
+// answer for them what they answered before (a shared view's own protection; read-write for plain
+// memory, the only kind a guard takes) instead of a hole. As holes the driver read them as zeros
+// (sparse regions, ReadCommitted), left them out of write-backs (WriteChangedCommitted), compared
+// them as unmapped and threw on them (CheckRange) while their guard stood (t419). `*end`: where the
+// guarded run stops. False whenever no guard was ever installed (every switch off); then `*end` is
+// where the unguarded run stops: the first page a guard holds after `cursor` (a no-access run the
+// guest made and a guarded one after it share one host region), or `limit`.
+bool guardedRun(std::uintptr_t cursor, std::uintptr_t limit, std::uintptr_t* end) {
+    *end = limit;
+    if (!GuestWriteWatch::GuestPageGuardHolding_nid_postfix() || GuardedPagesAsHoles()) return false;
+    if (!GuestWriteWatch::GuestPageGuardHeldRun_nid_postfix(cursor, limit, end)) {
+        if (*end <= cursor || *end > limit) *end = limit;
+        return false;
+    }
+    if (*end <= cursor) {
+        *end = limit;
+        return false;
+    }
+    guardedPageQueries.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+// A no-access answer no guard explains may be stale when a guard gave pages their protection back
+// since the serial was read, before the host was asked (GuestPageGuardSerial): asked again then.
+bool guardsChangedSince(std::uint64_t serial) {
+    return (serial & 1u) != 0 || GuestWriteWatch::GuestPageGuardSerial_nid_postfix() != serial;
+}
+
 // Calls `emit` with consecutive runs of uniform accessibility covering [address, address + bytes) in
 // order, stopping early when it returns false. Returns false when the address space cannot be queried.
 template <class Emit>
@@ -556,6 +591,19 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
     pages.initialize();
     const auto end = address + bytes;
     auto cursor = address;
+    // A no-access answer no guard explains is asked again (a few times at most per page) when a
+    // guard gave pages their protection back between the query and the guards' answer.
+    // APS5_GUARD_PAGES_AS_HOLES=1 (the A/B against t419) takes none of this: the answers before the fix.
+    const bool guarding = GuestWriteWatch::GuestPageGuardHolding_nid_postfix() && !GuardedPagesAsHoles();
+    std::uintptr_t requeriedAt = 0;
+    unsigned requeries = 0;
+    const auto queryAgain = [&] {
+        if (requeriedAt != cursor) {
+            requeriedAt = cursor;
+            requeries = 0;
+        }
+        return requeries++ < 3;
+    };
     while (cursor < end) {
         if (const auto* span = pages.spanOf(cursor)) {
             const auto value = span->load(cursor);
@@ -574,6 +622,7 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
         // before it invalidates, so a generation change across the query and the store below means
         // the stored pages may describe the old state and are forgotten again.
         const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        const auto guardSerial = guarding ? GuestWriteWatch::GuestPageGuardSerial_nid_postfix() : 0;
         if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory)) return false;
         // Debug aid: APS5_TRACE_QUERY prints every 16th page query with its cost.
         static const bool traceQuery = std::getenv("APS5_TRACE_QUERY") != nullptr;
@@ -584,13 +633,30 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
                 std::fprintf(stderr, "[query] 0x%llx range 0x%zx: base 0x%llx size 0x%llx state 0x%lx protect 0x%lx type 0x%lx %.0f us gen %llu from +0x%llx\n", static_cast<unsigned long long>(cursor), bytes, reinterpret_cast<unsigned long long>(memory.BaseAddress), static_cast<unsigned long long>(memory.RegionSize), memory.State, memory.Protect, memory.Type, us, static_cast<unsigned long long>(GuestAllocations::GuestAllocationsGeneration_nid_postfix()), ModuleOffset(__builtin_return_address(0)));
             }
         }
-        const auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
+        auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
         if (memory.RegionSize > std::numeric_limits<std::uintptr_t>::max() - base || base + memory.RegionSize <= cursor) return false;
-        const auto regionEnd = base + memory.RegionSize;
+        auto regionEnd = base + memory.RegionSize;
         std::uint32_t logicalProtection = memory.Protect;
-        GuestArena::GuestArenaProtection_nid_postfix(cursor, &logicalProtection);
+        const bool view = GuestArena::GuestArenaProtection_nid_postfix(cursor, &logicalProtection);
+        bool committed = memory.State == MEM_COMMIT && (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
+        if (!committed && memory.State == MEM_COMMIT && (memory.Protect & 0xffu) == PAGE_NOACCESS && guarding) {
+            std::uintptr_t guardedEnd = 0;
+            if (guardedRun(cursor, regionEnd, &guardedEnd)) {
+                // Only the guarded run, from the cursor's page (the region may begin with pages the
+                // guest itself made no-access).
+                committed = true;
+                base = cursor & ~(PageBytes - 1);
+                regionEnd = guardedEnd;
+                if (!view) logicalProtection = PAGE_READWRITE;
+            } else if (guardsChangedSince(guardSerial) && queryAgain()) {
+                continue;
+            } else {
+                // The guest's own no-access pages: the run stops where a guarded one begins in the
+                // same region, which the next query answers as guarded.
+                regionEnd = guardedEnd;
+            }
+        }
         const auto protection = logicalProtection & 0xffu;
-        const bool committed = memory.State == MEM_COMMIT && (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
         const bool readable = committed && readableProtection(protection);
         const bool writable = readable && writableProtection(protection);
         for (PageSpan* span : {&pages.arena, &pages.image}) {
@@ -605,6 +671,7 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
         if (!emit(PageRun{cursor, next, readable, writable})) return true;
         cursor = next;
 #else
+        const auto guardSerial = guarding ? GuestWriteWatch::GuestPageGuardSerial_nid_postfix() : 0;
         if (const int fd = ProcMapsQueryFd(); fd >= 0) {
             procmap_query query{};
             query.size = sizeof(query);
@@ -619,12 +686,15 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
                     continue;
                 }
                 const bool readable = (query.vma_flags & PROCMAP_QUERY_VMA_READABLE) != 0;
-                const auto next = std::min<std::uintptr_t>(end, query.vma_end);
-                if (!emit(PageRun{cursor, next, readable, readable && (query.vma_flags & PROCMAP_QUERY_VMA_WRITABLE) != 0})) return true;
-                cursor = next;
-                continue;
-            }
-            if (errno == ENOENT) {
+                // A no-access mapping while resident-buffer guards stand goes to the listing below,
+                // which tells a guarded run from the guest's own no-access pages (guardedRun).
+                if (readable || !guarding) {
+                    const auto next = std::min<std::uintptr_t>(end, query.vma_end);
+                    if (!emit(PageRun{cursor, next, readable, readable && (query.vma_flags & PROCMAP_QUERY_VMA_WRITABLE) != 0})) return true;
+                    cursor = next;
+                    continue;
+                }
+            } else if (errno == ENOENT) {
                 static_cast<void>(emit(PageRun{cursor, end, false, false}));
                 return true;
             }
@@ -648,8 +718,26 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
                 found = true;
                 break;
             }
-            const auto next = std::min(end, last);
-            if (!emit(PageRun{cursor, next, permissions[0] == 'r', permissions[0] == 'r' && permissions[1] == 'w'})) return true;
+            auto next = std::min(end, last);
+            bool readable = permissions[0] == 'r';
+            bool writable = readable && permissions[1] == 'w';
+            // A run a resident buffer's guard holds (PROT_NONE over read-write memory: see
+            // guardedRun) is mapped read-write to the guest.
+            std::uintptr_t guardedEnd = 0;
+            if (!readable && guarding && guardedRun(cursor, next, &guardedEnd)) {
+                readable = writable = true;
+                next = guardedEnd;
+            } else if (!readable && guarding && guardsChangedSince(guardSerial) && queryAgain()) {
+                // The guards' answer came after this listing and a guard gave pages back since:
+                // list again.
+                found = true;
+                break;
+            } else if (!readable && guarding) {
+                // The guest's own no-access pages stop where a guarded run begins (one mapping
+                // line may hold both).
+                next = guardedEnd;
+            }
+            if (!emit(PageRun{cursor, next, readable, writable})) return true;
             cursor = next;
             found = true;
             break;
@@ -732,6 +820,26 @@ void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, b
 bool Accessible(const void* pointer, std::size_t bytes, bool writable) {
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     return address != 0 && bytes <= std::numeric_limits<std::uintptr_t>::max() - address && verify(address, bytes, writable).empty();
+}
+
+bool GuardedPagesAsHoles() {
+    // Read from the environment once (each guarded or no-access query asks); a test sets it.
+    auto value = guardedPagesAsHoles.load(std::memory_order_relaxed);
+    if (value < 0) {
+        const char* text = std::getenv("APS5_GUARD_PAGES_AS_HOLES");
+        int read = text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0 ? 1 : 0;
+        if (!guardedPagesAsHoles.compare_exchange_strong(value, read, std::memory_order_relaxed)) read = value;
+        value = read;
+    }
+    return value != 0;
+}
+
+void SetGuardedPagesAsHoles(bool holes) {
+    guardedPagesAsHoles.store(holes ? 1 : 0, std::memory_order_relaxed);
+}
+
+std::uint64_t GuardedPageQueries() {
+    return guardedPageQueries.load(std::memory_order_relaxed);
 }
 
 std::uint64_t ForgetSerial() {
@@ -1327,6 +1435,19 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
         }
         return tracker.generation;
     };
+    // Resident buffers (APS5_RESIDENT_BUFFERS): a store into a page a guard holds faults into the
+    // resolver, which a thread without the GPU mutex waits for while it takes that mutex, whose
+    // holder may be waiting for the tracker mutex this store holds (CollectWrites, Submit): all
+    // three would hang. So the guards over the range are resolved before the tracker is taken; a
+    // thread without the GPU mutex (only its holder makes guards) also holds the range until the
+    // store is done, so none is made there meanwhile. Nothing before the first guard's Install.
+    const auto storeGuards = [&] {
+        if (!GuestWriteWatch::GuestPageGuardHolding_nid_postfix() || bytes > std::numeric_limits<std::uint64_t>::max() - address) return GuestWriteWatch::PageGuardHold(nullptr, 0);
+        if (!GpuMutex().HeldByThisThread()) return GuestWriteWatch::PageGuardHold(reinterpret_cast<const void*>(address), bytes);
+        GuestWriteWatch::GuestPageGuardTouch_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
+        return GuestWriteWatch::PageGuardHold(nullptr, 0);
+    };
+    const auto hold = storeGuards();
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();

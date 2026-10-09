@@ -162,6 +162,57 @@ class Recorder;
 // work using the import is recorded) the imports are left as they are.
 std::uint64_t HostImportSerial(const Context& context, std::uint64_t address, std::size_t bytes, bool reconcile);
 
+// Resident read-only copies (Recorder::KeepsResidentReads, APS5_RESIDENT_READS=1; see
+// GuestBufferMemory.cpp "Resident reads"). A copy stands for its range while nothing wrote the
+// range since its last refresh: no CPU store (write watch, CollectWrites/UnchangedSince; a failed
+// collect counts as one), no driver or GPU write stamped (MarkWritten), no GPU write the recorder
+// noted (every shader write, fill, copy/DMA, label, texture store, shadow publish and DCC key
+// store: the hook below) and no address-based use still in flight that may store through its BDA
+// table over it (the writer list; once its batch finished, its stores are stamped).
+struct ResidentCopy;
+struct ResidentReadStatistics {
+    // Uses of a resident region; served by the copy as it stood, or after a refresh by reason
+    // (`refreshUnwatched`: the range's write-watch collect failed, so a CPU store may be unseen).
+    std::uint64_t uses = 0, hits = 0;
+    std::uint64_t refreshFirst = 0, refreshStamp = 0, refreshNoted = 0, refreshImport = 0, refreshWriter = 0, refreshUnwatched = 0;
+    std::uint64_t refreshedBytes = 0, servedBytes = 0;
+    // Copies made, evicted from the cache (a holder keeps using its own), refused by the device or
+    // the cap, regions left in place (demoted ranges whose copies were refreshed far more often
+    // than used as they stood); noted GPU writes and address-based uses that staled a copy.
+    std::uint64_t made = 0, madeBytes = 0, evicted = 0, refused = 0, demoted = 0, inPlace = 0;
+    std::uint64_t notedStale = 0, notedVisited = 0, writerUses = 0, rebuiltDemoted = 0;
+    // Checks made again because the batch changed between a build's check and its dispatch's
+    // record (a sync in between, RecheckResidentReads), and the refreshes they recorded.
+    std::uint64_t rechecks = 0, recheckRefreshes = 0;
+    // APS5_RESIDENT_READS_VERIFY: uses compared on completion, and those whose copy differed
+    // from the import.
+    std::uint64_t verified = 0, mismatched = 0;
+    // The cache now: copies and their allocated bytes (BufferPool::Capacity); the bytes of every
+    // live copy (cached, or evicted and still held by a build); address-based writers in flight.
+    std::uint64_t entries = 0, bytes = 0, liveBytes = 0, writers = 0;
+};
+ResidentReadStatistics ResidentReadCounts();
+// Whether any resident copy was made (one relaxed load): the recorder's write notes call
+// NoteResidentReadsWrite only then.
+bool ResidentReadsLive();
+// A GPU write over [begin, end) the recorder noted: every cached copy over it is stale.
+void NoteResidentReadsWrite(std::uint64_t begin, std::uint64_t end);
+// An address-based use, recorded by `recorder` into its open batch (serial Submissions() + 1),
+// that may store anywhere in `ranges` (sorted, disjoint [begin, end); null: anywhere). Its stores
+// are stamped only when that batch's completions ran (BdaResources::CheckFault), so until then a
+// copy over the ranges is refreshed at its next use (after it, in queue order); the note is
+// dropped when the batch finished (NoteResidentReadsFinished). Kept by reference: the same list
+// of the same recorder again updates its entry.
+void NoteResidentReadsAddressWriter(std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> ranges, const Recorder* recorder);
+// Recorder::finish: every batch of recorder `recorderId` up to `serial` finished, completions
+// included, so the address-based writers recorded into them are stamped.
+void NoteResidentReadsFinished(std::uint64_t recorderId, std::uint64_t serial);
+// Drops every cached copy (a holder keeps its own): tests, and the device teardown. Returns the
+// copies still alive (held by builds).
+std::size_t ClearResidentReads();
+// Tests: the resident checks take every write-watch collect as failed.
+void ResidentReadsFailCollectForTests(bool fail);
+
 // The import table's identity (the fast Revalidate): serials proved under one identity stand
 // while the table still has it, i.e. the same device, the same epoch (bumped by every retire)
 // and the registry generation it was reconciled with, which must still be the live one.
@@ -290,6 +341,24 @@ public:
     // were confirmed unchanged): the previous use's copy-back left the shadow behind, and the next
     // RecordCopyBacks copies it back again. Nothing to do without staged regions.
     void RecordStagingCopies(Recorder& recorder);
+    // Resident read-only copies (Recorder::KeepsResidentReads): checks every region this upload
+    // binds from a resident copy for another use (ShaderResources::Revalidate, after the imports
+    // were confirmed unchanged, under GuestMemory::GpuMutex) and records the refresh of each stale
+    // one from its import into the open batch, ahead of the work. Nothing without such regions.
+    // False (nothing recorded) when a copy it binds was demoted since: the caller rebuilds, and
+    // the new build binds that range in place.
+    bool RecordResidentReads(Recorder& recorder);
+    // The work is about to be recorded (VulkanDevice::recordDispatch): when `recorder` submitted
+    // since the last check (a sync between the build or proof and the record, as an indirect
+    // dispatch's CPU path makes, whose completions may have stored into a range), every resident
+    // region is checked again and a stale copy refreshed into the open batch. Nothing otherwise.
+    void RecheckResidentReads(Recorder& recorder);
+    // An address-based use is about to be recorded by `recorder` (ShaderResources::Bind): the
+    // ranges its BDA table lets it store to stale the resident copies over them while it is in
+    // flight (NoteResidentReadsAddressWriter). The list is built once per build.
+    void NoteAddressWriter(const Recorder* recorder) const;
+    // Whether the region owning `address` is bound from a resident read-only copy.
+    bool ServedResident(std::uint64_t address) const;
     void AddSnapshot(const GuestMemorySnapshot& snapshot);
     // Upload is the two stages below back to back. UploadPrepare needs no device lock: it merges the
     // regions, binds the image mirrors and host imports that already serve them (an import pointer is
@@ -454,6 +523,12 @@ private:
         // it overlaps the space's base ranges, so it stays out of the BDA table (the base imports
         // serve those addresses) and binds one span import over the same host pages.
         bool span = false;
+        // Resident reads (Recorder::KeepsResidentReads): the device-local copy Descriptor binds in
+        // the import's place (`direct` stays the import: the copy's source, and the identity the
+        // region is reused under), the import's serial when it was taken, and its VkBuffer and
+        // base in `copySource`/`copySourceBase`.
+        std::shared_ptr<ResidentCopy> resident {};
+        std::uint64_t residentSerial = 0;
     };
 
     // How [begin, end) lies against the space's base regions.
@@ -503,6 +578,13 @@ private:
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
     void recordGpuCopies(std::span<Region* const> copies, bool addressable);
+    // Resident reads: whether a region UploadFinish binds in place from `entry` may take a
+    // resident copy instead (switch on, a dispatch build (AllowDeviceStaging) not address-based,
+    // no descriptor of the build writes it, a watched non-span import, within the size window; the
+    // caller checked the alignment and the write watch), and the check-and-refresh of the given
+    // resident regions (RecordResidentReads).
+    bool residentEligible(const Region& region, const HostImport& entry, bool addressable, const Recorder* recorder) const;
+    void recordResidentReads(Recorder& recorder, std::span<Region* const> resident, bool recheck = false);
     void allocateRegionBuffer(Region& region, bool addressable);
     void takeHeapReferences();
     Context context;
@@ -518,6 +600,16 @@ private:
     // Whether `regions` is in ascending address order (true right after AcquireRegistered, whose
     // regions follow the registry's order), so AddSnapshot can search instead of scanning.
     bool regionsSorted = false;
+    // Some region is bound from a resident read-only copy (RecordResidentReads has work), and the
+    // recorder and its submission count at the last check (RecheckResidentReads).
+    bool residentRegions = false;
+    const Recorder* residentCheckedBy = nullptr;
+    std::uint64_t residentCheckedAt = 0;
+    // NoteAddressWriter's list for this build (the space's writable ranges, merged with the
+    // build's own when it has any), made at its first use after an upload, for the space it held.
+    mutable std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> addressWriterRanges;
+    mutable const AddressSpace* addressWriterSpace = nullptr;
+    mutable bool addressWriterKnown = false;
     // Some region of `regions` is a span (Region::span): owner() prefers the span holding an address
     // over the base range that starts later, so a view or write-back crossing base ranges finds it.
     bool spansHeld = false;

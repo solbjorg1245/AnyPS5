@@ -183,6 +183,30 @@ public:
     // landed is not recorded again (the CPU may write the bytes after it). A guard stays until the
     // batch recording its copy completed.
     bool KeepsResidentBuffers() const { return residentBuffers; }
+    // Resident read-only copies (APS5_RESIDENT_READS=1, read when the recorder is made; docs/design/
+    // resident-memory.md S3, GuestBufferMemory.cpp "Resident reads"): a dispatch build binds an
+    // element range it only reads, inside a host import, from a device-local copy instead of the
+    // import over PCIe; the copy is refreshed from the import (recorded into the open batch) only
+    // when guest memory changed under it. The settings: APS5_RESIDENT_READS_MIB (cap of the cached
+    // copies, default 1024), APS5_RESIDENT_READS_MIN_KIB / APS5_RESIDENT_READS_MAX_KIB (the region
+    // sizes taken, default 4 / 16384) and APS5_RESIDENT_READS_VERIFY=N (every Nth use served
+    // without a refresh, 1: each one, also copies the import and the copy to the host; they are
+    // compared when the batch completed).
+    struct ResidentReadSettings {
+        bool enabled = false;
+        std::uint32_t verifyEvery = 0;
+        std::uint64_t limitBytes = 0;
+        std::uint64_t minBytes = 0;
+        std::uint64_t maxBytes = 0;
+    };
+    bool KeepsResidentReads() const { return residentReads.enabled; }
+    const ResidentReadSettings& ResidentReads() const { return residentReads; }
+    // Whether any recorder was made with APS5_RESIDENT_READS (one relaxed load): what only the
+    // resident reads use (an address space's writable ranges, a program's BDA store scan) is
+    // prepared only then.
+    static bool ResidentReadsConfigured();
+    // This recorder's identity (never reused, unlike its address).
+    std::uint64_t Id() const { return id; }
     std::uint64_t ResidentCopyBytes() const;
     static bool ResolveResidentFault(std::uintptr_t address);
     // ResolveResidentFault's work on the calling thread, under the GPU mutex it takes. The fault
@@ -198,6 +222,9 @@ public:
         // copied again (a copy from the guard's shadow after that batch could undo the newer copy
         // the build that took the shadow over recorded there).
         std::uint64_t waitedLanding = 0;
+        // Copies recorded at a decision because a forced release took their guard; nanoseconds
+        // faulting threads spent resolving, and the part spent landing.
+        std::uint64_t unguarded = 0, faultNanos = 0, landNanos = 0;
     };
     static ResidentStatistics ResidentCounts();
     // Commands() that leaves the queued copy-backs alone under coalescing (the caller recorded
@@ -1002,6 +1029,7 @@ private:
     // Copies `copies` in order (later ones win) after everything submitted, and waits.
     void landResident(const std::vector<DeferredCopy>& copies);
     bool residentBuffers = false;
+    ResidentReadSettings residentReads;
     std::uint64_t residentGeneration = 0;
     std::uint64_t passSerials = 0;
     std::vector<DeferredCopy> deferredCopies;

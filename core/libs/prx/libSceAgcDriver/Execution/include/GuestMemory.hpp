@@ -203,6 +203,14 @@ void FlushGpuWrites(std::uint64_t address, std::size_t bytes);
 // value before consulting the page states and reading directly, and the same value after, knows
 // the states it consulted were current and no page it read changed its mapping meanwhile.
 std::uint64_t ForgetSerial();
+// Page queries (Accessible, DescribeCommitted, CheckRange, ...) that found pages a resident buffer's
+// page guard holds and answered them as the guest maps them (APS5_RESIDENT_BUFFERS; total since start).
+std::uint64_t GuardedPageQueries();
+// Debug aid, APS5_GUARD_PAGES_AS_HOLES=1: the answers before the fix (t419): guarded pages read as
+// unmapped (holes) by the page queries, and an import over one is refused for good. For an A/B only.
+// Read from the environment at the first use; SetGuardedPagesAsHoles (tests) overrides it.
+bool GuardedPagesAsHoles();
+void SetGuardedPagesAsHoles(bool holes);
 
 // Attribution of guest memory accesses (the [hooksync] line in Recorder.cpp and the read-site
 // counts of the [guestmem] line, APS5_PROFILE_DRAW): a sync the flush hook makes for an access has

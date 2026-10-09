@@ -22,6 +22,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "ResidentPresent.hpp"
 #include "SampleLod_spv.h"
+#include "DataSlot_spv.h"
 #include <SDL_loadso.h>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -34,6 +35,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -3819,6 +3821,327 @@ void fastRingReclaimTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 }
 
+// tests/shaders/DataSlot.comp (results[words[1]] = words[0]) on a template's set layout, and its
+// dispatch as recordDispatch records one: everything earlier visible to the dispatch (a refresh's
+// transfer included), its stores to everything after; the template's use is noted as
+// recordDispatch notes it (ShaderResources::NoteRecorded, which ForkData's adoption reads).
+class DataSlotPipeline {
+public:
+    DataSlotPipeline(const Context& context, VkDescriptorSetLayout setLayout) : context(context) {
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.setLayoutCount = 1;
+        layoutInfo.pSetLayouts = &setLayout;
+        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &pipelineLayout), "vkCreatePipelineLayout");
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = sizeof(DATA_SLOT_SPV);
+        moduleInfo.pCode = DATA_SLOT_SPV;
+        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main", nullptr};
+        pipelineInfo.layout = pipelineLayout;
+        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateComputePipelines");
+    }
+    ~DataSlotPipeline() {
+        context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
+        context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, pipelineLayout, nullptr);
+    }
+    DataSlotPipeline(const DataSlotPipeline&) = delete;
+    DataSlotPipeline& operator=(const DataSlotPipeline&) = delete;
+
+    // Binds `set` (a ForkData set) or, when null, the template's own.
+    void Dispatch(Recorder& recorder, ShaderResources& resources, VkDescriptorSet set) const {
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        if (set != VK_NULL_HANDLE) resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, set);
+        else resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout);
+        context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, 1, 1, 1);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+        resources.NoteRecorded(recorder);
+    }
+
+private:
+    Context context;
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+};
+
+// The words a template's data binding holds (BoundDescriptors: the buffer's bytes).
+template <std::size_t Count>
+std::array<std::uint32_t, Count> HeldWords(const ShaderResources& resources, std::size_t binding) {
+    const auto bound = resources.BoundDescriptors();
+    Require(binding < bound.size() && bound[binding].elements.size() == 1 && bound[binding].elements[0].data.size() >= Count * sizeof(std::uint32_t), "the template's data binding has no host bytes");
+    std::array<std::uint32_t, Count> words{};
+    std::memcpy(words.data(), bound[binding].elements[0].data.data(), sizeof(words));
+    return words;
+}
+
+// The template refresh through the ring (APS5_TEMPLATE_REFRESH_RING, ShaderResources::ForkData) on
+// a real device, with tests/shaders/DataSlot.comp (binding 0 the template's flattened-SRT words,
+// binding 1 a second data buffer the results land in): forks and in-stream refreshes (RefreshData)
+// interleaved in one batch each read their own words while the template's buffer keeps its words
+// (and DataWordsHash) through a fork; equal words fork nothing; the batch's last fork's words bind
+// that fork again (Reused) until an in-stream refresh drops it; a template whose last use finished
+// takes the words into its own buffer on the CPU (Adopted), one used in the open batch forks;
+// without a ring nothing is made; a full ring refuses; a batch needing more sets than one transient
+// pool takes another, and a pool is reset and reused once its batch completed.
+void templateRefreshRingTests(const Device& device, Recorder& recorder) {
+    using Outcome = ShaderResources::ForkOutcome;
+    recorder.Sync();
+    auto context = device.GetContext();
+    auto cache = std::make_unique<DescriptorCache>(context);
+    auto ring = std::make_unique<FastRing>(context, 1u << 20u);
+    context.descriptorCache = cache.get();
+    context.fastRing = ring.get();
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding words;
+    words.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    words.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+    words.descriptorSet = 0;
+    words.binding = 0;
+    words.count = 1;
+    words.guestDescriptor = {7, 0};
+    auto results = words;
+    results.role = ShaderRecompiler::DescriptorRole::ShaderData;
+    results.binding = 1;
+    results.guestDescriptor.assign(8, 0u);
+    program.bindings = {words, results};
+    const auto withWords = [&](std::uint32_t value, std::uint32_t slot) {
+        auto copy = program;
+        copy.bindings[0].guestDescriptor = {value, slot};
+        return copy;
+    };
+    const auto firstProgram = withWords(42, 1);
+    const auto secondProgram = withWords(9, 2);
+    const auto thirdProgram = withWords(5, 3);
+    const auto fourthProgram = withWords(11, 4);
+    const CompiledShader original{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    const CompiledShader first{ShaderRecompiler::ShaderStage::Compute, &firstProgram, 0};
+    const CompiledShader second{ShaderRecompiler::ShaderStage::Compute, &secondProgram, 0};
+    const CompiledShader third{ShaderRecompiler::ShaderStage::Compute, &thirdProgram, 0};
+    const CompiledShader fourth{ShaderRecompiler::ShaderStage::Compute, &fourthProgram, 0};
+    // Without a ring (or a descriptor cache) nothing is made: the caller refreshes in-stream. A
+    // template no batch recorded (no NoteRecorded) never adopts.
+    {
+        ShaderResources plain(device.GetContext(), original);
+        const auto fork = plain.ForkData(first, recorder);
+        Require(fork.outcome == Outcome::NoRing && fork.set == VK_NULL_HANDLE, "a fork without a ring made a set");
+        Require(plain.ForkData(original, recorder).outcome == Outcome::Same, "the template's own words did not compare equal");
+    }
+    {
+        ShaderResources resources(context, original);
+        const DataSlotPipeline slots(context, resources.Layout());
+        const auto dispatch = [&](VkDescriptorSet set) { slots.Dispatch(recorder, resources, set); };
+        const auto builtHash = resources.DataWordsHash();
+        // 1. The template's own words: nothing differs, its set is bound.
+        auto fork = resources.ForkData(original, recorder);
+        Require(fork.outcome == Outcome::Same && fork.set == VK_NULL_HANDLE, "the template's own words forked");
+        dispatch(VK_NULL_HANDLE);
+        // 2-3. Two forks: each binds its own copy, the template keeps its words. The first one's
+        // words again in the batch bind its set again and make nothing.
+        fork = resources.ForkData(first, recorder);
+        Require(fork.outcome == Outcome::Forked && fork.set != VK_NULL_HANDLE && fork.bytes == 2 * sizeof(std::uint32_t), "the first fork was not made");
+        dispatch(fork.set);
+        const auto setsMade = cache->TransientCounters().sets;
+        const auto again = resources.ForkData(first, recorder);
+        Require(again.outcome == Outcome::Reused && again.set == fork.set && cache->TransientCounters().sets == setsMade, "the batch's last fork's words did not bind its set again");
+        dispatch(again.set);
+        const auto secondFork = resources.ForkData(second, recorder);
+        Require(secondFork.outcome == Outcome::Forked && secondFork.set != VK_NULL_HANDLE && secondFork.set != fork.set, "the second fork was not a set of its own");
+        dispatch(secondFork.set);
+        Require(resources.DataWordsHash() == builtHash && !resources.DataWordsDiffer(original) && resources.DataWordsDiffer(first), "a fork changed the template's words");
+        // 4. An in-stream refresh after the forks, in the same batch: the forks keep their words,
+        // and the last fork is not bound again (its copied bindings read the refreshed buffers).
+        Require(resources.RefreshData(recorder.Commands(), third, &recorder), "the in-stream refresh recorded nothing");
+        dispatch(VK_NULL_HANDLE);
+        const auto afterRefresh = resources.ForkData(second, recorder);
+        Require(afterRefresh.outcome == Outcome::Forked && afterRefresh.set != secondFork.set, "an in-stream refresh did not drop the batch's last fork");
+        dispatch(afterRefresh.set);
+        // 5. Back to the built words through the ring: the template holds the refreshed ones now.
+        Require(resources.ForkData(third, recorder).outcome == Outcome::Same, "the refreshed words forked");
+        fork = resources.ForkData(original, recorder);
+        Require(fork.outcome == Outcome::Forked, "a fork back to the built words was not made");
+        dispatch(fork.set);
+        Require(cache->TransientCounters().pools == 1 && cache->TransientCounters().sets == 4, "the batch's forks did not share one transient pool");
+        const auto serial = recorder.Submissions() + 1;
+        recorder.Submit();
+        Require(recorder.Submissions() == serial, "the forks' batch was not submitted");
+        device.WaitQueue();
+        recorder.Sync();
+        const auto landed = HeldWords<5>(resources, 1);
+        Require(landed[0] == 7 && landed[1] == 42 && landed[2] == 9 && landed[3] == 5, "a dispatch did not read its own words: results " + std::to_string(landed[0]) + " " + std::to_string(landed[1]) + " " + std::to_string(landed[2]) + " " + std::to_string(landed[3]));
+        Require(HeldWords<2>(resources, 0) == std::array<std::uint32_t, 2>{5, 3} && !resources.DataWordsDiffer(third), "the template's buffer does not hold the in-stream refresh's words");
+        // 6. The template's last use finished: the words go into its own buffer on the CPU, its own
+        // set is bound, nothing is made or recorded for them.
+        const auto setsBefore = cache->TransientCounters().sets;
+        const auto adopted = resources.ForkData(fourth, recorder);
+        Require(adopted.outcome == Outcome::Adopted && adopted.set == VK_NULL_HANDLE && adopted.bytes == 2 * sizeof(std::uint32_t) && cache->TransientCounters().sets == setsBefore, "an idle template did not adopt the words");
+        Require(HeldWords<2>(resources, 0) == std::array<std::uint32_t, 2>{11, 4} && !resources.DataWordsDiffer(fourth) && resources.DataWordsHash() == ShaderResources::DataWordsHash(fourth), "the adopted words are not the template's");
+        dispatch(VK_NULL_HANDLE);
+        // The batch's pool goes back once the batch's keeps are released (after this thread's
+        // unlock, on the release thread); the next fork takes it again. The template is used in the
+        // open batch now: it forks, it does not adopt.
+        GpuMutex().unlock();
+        for (int wait = 0; wait < 400 && cache->TransientCounters().resets == 0; ++wait) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        GpuMutex().lock();
+        Require(cache->TransientCounters().resets == 1, "the transient pool was not reset after its batch completed");
+        Require(resources.ForkData(first, recorder).outcome == Outcome::Forked && cache->TransientCounters().pools == 1, "the next batch's fork did not reuse the reset pool");
+        // More forks in one batch than one pool holds (alternating words, so none is the last
+        // fork's): another pool, every fork served.
+        for (int index = 0; index < 300; ++index) {
+            const auto made = resources.ForkData(index % 2 == 0 ? second : first, recorder);
+            Require(made.outcome == Outcome::Forked && made.set != VK_NULL_HANDLE, "a fork past one pool's sets was not made");
+        }
+        // A driver may serve sets past maxSets (the spec lets the allocation fail there, it need not):
+        // then the one pool held them all.
+        Require(cache->TransientCounters().pools <= 2 && cache->TransientCounters().refused == 0, "a batch past one pool's sets did not take a second pool");
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        Require(HeldWords<5>(resources, 1)[4] == 11, "the dispatch after the adoption did not read the adopted words");
+        // A full ring refuses (the caller then refreshes in-stream). Alternating words: a repeat of
+        // the last fork's would bind it again and take no ring space.
+        auto small = context;
+        FastRing tiny(context, 256);
+        small.fastRing = &tiny;
+        ShaderResources squeezed(small, original);
+        auto outcome = Outcome::Forked;
+        for (int index = 0; index < 512 && outcome == Outcome::Forked; ++index) outcome = squeezed.ForkData(index % 2 == 0 ? first : second, recorder).outcome;
+        Require(outcome == Outcome::RingFull, "a fork into a full ring was not refused as ring full");
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    }
+    // The cache goes before the batches that keep its pools are released: their returns find it gone.
+    cache.reset();
+    ring.reset();
+}
+
+// The data patch through the template refresh (s53-gpu2-tmpl review, equivalence finding 2): a
+// read-only V# (element 1) 4 bytes past the aligned start of the region it shares with element 0,
+// in a shader without push constants, puts its adjustment into byte memoryOffsetDword * 4 + 1 of
+// the shader data (here bits 8-15 of words[0], DataSlot.comp's value). A fork (the ring's copy), an
+// in-stream refresh (RefreshData) and an adoption (the template's buffer, by the CPU) must each give
+// the dispatch the patched word, results[slot] = value | adjustment << 8, and the [dispatch-io]
+// fork words show it.
+void templateRefreshPatchTests(const Device& device, Recorder& recorder) {
+    using Outcome = ShaderResources::ForkOutcome;
+    auto context = device.GetContext();
+    const auto alignment = context.limits.minStorageBufferOffsetAlignment;
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: the template refresh's data patch not tested\n";
+        return;
+    }
+    if (alignment < 8 || alignment > 256) {
+        std::cout << "storage buffer offset alignment " << alignment << ": the template refresh's data patch not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the data patch block");
+    std::memset(block, 0x5a, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the test block refused: the template refresh's data patch not tested\n";
+        return;
+    }
+    recorder.Sync();
+    auto cache = std::make_unique<DescriptorCache>(context);
+    auto ring = std::make_unique<FastRing>(context, 1u << 20u);
+    context.descriptorCache = cache.get();
+    context.fastRing = ring.get();
+    const auto outer = address + 4096;
+    const auto element = outer + 4;
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding words;
+    words.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    words.role = ShaderRecompiler::DescriptorRole::ShaderData;
+    words.descriptorSet = 0;
+    words.binding = 0;
+    words.count = 1;
+    words.guestDescriptor = {0x110000, 1};
+    auto results = words;
+    results.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+    results.binding = 1;
+    results.guestDescriptor.assign(8, 0u);
+    ShaderRecompiler::DescriptorBinding guest;
+    guest.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    guest.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    guest.descriptorSet = 0;
+    guest.binding = 2;
+    guest.count = 2;
+    guest.guestDescriptor = {static_cast<std::uint32_t>(outer), static_cast<std::uint32_t>(outer >> 32u) & 0xffffu, 64u, 0x31000000u, static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, 16u, 0x31000000u};
+    guest.bufferWritten = {false, false};
+    program.bindings = {words, results, guest};
+    program.memoryOffsetDword = 0;
+    const auto withWords = [&](std::uint32_t value, std::uint32_t slot) {
+        auto copy = program;
+        copy.bindings[0].guestDescriptor = {value, slot};
+        return copy;
+    };
+    const auto forkedProgram = withWords(0x220000, 2);
+    const auto refreshedProgram = withWords(0x330000, 3);
+    const auto adoptedProgram = withWords(0x440000, 4);
+    const CompiledShader original{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    const CompiledShader forked{ShaderRecompiler::ShaderStage::Compute, &forkedProgram, 0};
+    const CompiledShader refreshed{ShaderRecompiler::ShaderStage::Compute, &refreshedProgram, 0};
+    const CompiledShader adopted{ShaderRecompiler::ShaderStage::Compute, &adoptedProgram, 0};
+    {
+        ShaderResources resources(context, original);
+        const auto adjustment = (HeldWords<1>(resources, 0)[0] >> 8u) & 0xffu;
+        if (adjustment == 0) {
+            // Element 1 was not bound off an aligned offset (its region copied from its own start).
+            std::cout << "no data patch in the built template: the template refresh's data patch not tested\n";
+        } else {
+            Require(adjustment == 4, "the data patch is not the V#'s distance from its aligned offset");
+            const DataSlotPipeline slots(context, resources.Layout());
+            slots.Dispatch(recorder, resources, VK_NULL_HANDLE);
+            const auto fork = resources.ForkData(forked, recorder);
+            Require(fork.outcome == Outcome::Forked, "the patched template did not fork");
+            Require(resources.DescribeForkedWords(forked).find("00220400 00000002") != std::string::npos, "the fork's trace words are not the patched words: " + resources.DescribeForkedWords(forked));
+            slots.Dispatch(recorder, resources, fork.set);
+            Require(resources.RefreshData(recorder.Commands(), refreshed, &recorder), "the patched template's refresh recorded nothing");
+            slots.Dispatch(recorder, resources, VK_NULL_HANDLE);
+            recorder.Submit();
+            device.WaitQueue();
+            recorder.Sync();
+            const auto made = resources.ForkData(adopted, recorder);
+            Require(made.outcome == Outcome::Adopted, "the idle patched template did not adopt");
+            Require(HeldWords<2>(resources, 0) == std::array<std::uint32_t, 2>{0x440400, 4}, "the adopted words are not patched");
+            slots.Dispatch(recorder, resources, VK_NULL_HANDLE);
+            recorder.Submit();
+            device.WaitQueue();
+            recorder.Sync();
+            const auto landed = HeldWords<5>(resources, 1);
+            Require(landed[1] == 0x110400 && landed[2] == 0x220400 && landed[3] == 0x330400 && landed[4] == 0x440400, "a dispatch did not read its patched words: results " + std::to_string(landed[1]) + " " + std::to_string(landed[2]) + " " + std::to_string(landed[3]) + " " + std::to_string(landed[4]));
+            std::cout << "template refresh data patch (adjustment " << adjustment << "): the build, a fork, an in-stream refresh and an adoption read the patched word\n";
+        }
+    }
+    cache.reset();
+    ring.reset();
+}
+
 // Resident buffers (APS5_RESIDENT_BUFFERS=1): the whole pages of a copy-back stay resident past
 // Submit (the partial ones land with it), a CPU read of one lands its bytes, a write after that
 // survives, a command records a resident copy, and a label store over one records it first.
@@ -3864,15 +4187,21 @@ void residentBufferTests(const Device& device, Recorder& recorder) {
         auto source = std::make_shared<Buffer>(context, sourceBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         const auto sourceByte = [](std::size_t at) { return static_cast<unsigned char>(at * 7 + 3); };
         for (std::size_t at = 0; at < sourceBytes; ++at) source->Bytes()[at] = std::byte{sourceByte(at)};
-        const auto copyOf = [&](std::uint64_t at, std::uint64_t count) {
-            return std::vector<Recorder::DeferredCopy>{Recorder::DeferredCopy{source, source.get(), source->Handle(), import->buffer, at, address + at - import->base, count, address + at}};
+        // `target`: the range's import (a new one after the range is registered again, below).
+        const HostImport* target = import;
+        const auto copyFrom = [&](std::uint64_t from, std::uint64_t at, std::uint64_t count) {
+            return std::vector<Recorder::DeferredCopy>{Recorder::DeferredCopy{source, source.get(), source->Handle(), target->buffer, from, address + at - target->base, count, address + at}};
         };
+        const auto copyOf = [&](std::uint64_t at, std::uint64_t count) { return copyFrom(at, at, count); };
         const volatile unsigned char* landed = static_cast<const unsigned char*>(block);
         const auto before = Recorder::ResidentCounts();
         // [100, 12388): pages 1 and 2 stay resident, [100, 4096) and [12288, 12388) land at Submit.
         resident.DeferCopies(copyOf(100, 12288));
         resident.Submit();
         Require(resident.HasDeferredCopies() && resident.ResidentCopyBytes() == 8192, "Submit did not keep the whole pages of a copy-back resident");
+        // Guarded, the pages are still mapped to the guest: the page queries (each asks the host here,
+        // the block is outside the arena's page-state cache) must not read them as holes.
+        Require(AgcDriver::GuestMemory::Accessible(static_cast<char*>(block) + 4096, 8192, true) && AgcDriver::GuestMemory::DescribeCommitted(address, bytes, true).whole, "a page a resident copy's guard holds read as inaccessible");
         resident.Sync();
         Require(landed[100] == sourceByte(100) && landed[4095] == sourceByte(4095) && landed[12387] == sourceByte(12387) && landed[12388] == 0 && landed[99] == 0, "the partial pages of a resident copy did not land with its batch");
         Require(landed[5000] == sourceByte(5000) && landed[9000] == sourceByte(9000), "a read of a resident page did not land its bytes");
@@ -3906,6 +4235,125 @@ void residentBufferTests(const Device& device, Recorder& recorder) {
         Require(landed[28680] == 0xA1 && landed[28683] == 0xD4 && landed[28679] == sourceByte(28679) && landed[28684] == sourceByte(28684), "a label store over a resident copy did not land after it");
         const auto counts = Recorder::ResidentCounts();
         Require(counts.made - before.made == 3 && counts.madeBytes - before.madeBytes == 8192 + 8192 + 4096 && counts.skipped - before.skipped == 1 && counts.recorded - before.recorded == 2, "resident buffer counters are off");
+        constexpr std::size_t page = 4096;
+        // A no-access page the guest made and guarded pages after it in one host region (one
+        // VirtualQuery region, one /proc/self/maps line): the queries tell them apart, the guest's
+        // page a hole, the guarded ones mapped (before, a query from the guest's page read all of
+        // them as holes).
+        {
+#ifdef _WIN32
+            auto* pages = static_cast<unsigned char*>(VirtualAlloc(nullptr, 3 * page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            DWORD previous = 0;
+            const bool hidden = pages != nullptr && VirtualProtect(pages, page, PAGE_NOACCESS, &previous) != 0;
+#else
+            void* mapped = mmap(nullptr, 3 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            auto* pages = static_cast<unsigned char*>(mapped == MAP_FAILED ? nullptr : mapped);
+            const bool hidden = pages != nullptr && mprotect(pages, page, PROT_NONE) == 0;
+#endif
+            Require(hidden, "cannot make the guest-no-access test page");
+            const auto first = reinterpret_cast<std::uintptr_t>(pages);
+            const auto id = GuestWriteWatch::GuestPageGuardProtect_nid_postfix(first + page, first + 3 * page);
+            Require(id != 0, "a guard beside a no-access page was refused");
+            const auto ranges = AgcDriver::GuestMemory::CommittedRanges(first, 3 * page, true);
+            GuestWriteWatch::GuestPageGuardRelease_nid_postfix(id);
+            Require(ranges.size() == 1 && ranges[0].first == first + page && ranges[0].second == first + 3 * page, "guarded pages after a no-access page the guest made read as holes (or the guest's page as mapped)");
+#ifdef _WIN32
+            VirtualFree(pages, 0, MEM_RELEASE);
+#else
+            munmap(pages, 3 * page);
+#endif
+        }
+        // An owner fault (a thread holding the GPU mutex: this one) on a guard made at a label of the
+        // open batch is given up (forced: the batch cannot be submitted under its recording thread)
+        // and the guard is released by force. The copy, unguarded now, is recorded at the next
+        // decision, so it lands with this batch (before, Submit kept it resident without a guard:
+        // a read after the batch's labels landed saw the import's old bytes, and its late recording
+        // could undo a CPU write).
+        {
+            const auto forcedBefore = Recorder::ResidentCounts();
+            resident.DeferCopies(copyOf(24576, page));
+            const std::array<std::byte, 4> unrelated{std::byte{0x11}, std::byte{0x22}, std::byte{0x33}, std::byte{0x44}};
+            resident.RecordStore(import->buffer, address + 10 * page - import->base, unrelated, address + 10 * page);
+            resident.FlushStores();
+            Require(resident.ResidentCopyBytes() == page, "a copy-back was not kept resident at a label");
+            static_cast<void>(landed[24576 + 5]);
+            Require(Recorder::ResidentCounts().forced - forcedBefore.forced == 1, "an owner fault on a guard of the open batch was not given up");
+            resident.Submit();
+            Require(resident.ResidentCopyBytes() == 0 && Recorder::ResidentCounts().unguarded - forcedBefore.unguarded == 1, "a resident copy whose guard was released by force was kept past Submit");
+            resident.Sync();
+            Require(landed[24576 + 5] == sourceByte(24576 + 5) && landed[24576 + page - 1] == sourceByte(24576 + page - 1) && landed[10 * page] == 0x11, "a resident copy whose guard was released by force did not land with its batch");
+        }
+        // A driver store from a thread without the GPU mutex (a queue worker's CPU-executed
+        // WRITE_DATA) into a resident page, while the mutex's holder (this thread) waits for the
+        // write tracker: the store resolves the guard before it takes the tracker (before, it faulted
+        // under the tracker; the resolver waited for the GPU mutex, its holder for the tracker: all
+        // hung). The stored bytes land after the GPU's.
+        {
+            resident.DeferCopies(copyFrom(0, 9 * page, page));
+            resident.Submit();
+            Require(resident.ResidentCopyBytes() == page, "a copy-back was not kept resident for the store test");
+            Require(GpuMutex().DepthOnThisThread() == 1, "the resident store test expects one hold of the GPU mutex");
+            const std::array<std::byte, 4> word{std::byte{0x5A}, std::byte{0x6B}, std::byte{0x7C}, std::byte{0x8D}};
+            std::atomic<bool> stored{false};
+            std::thread writer([&] {
+                AgcDriver::GuestMemory::Write(address + 9 * page + 64, word, 4);
+                stored.store(true);
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            std::atomic<bool> collected{false};
+            std::thread watchdog([&] {
+                for (int waited = 0; waited < 300 && !collected.load(); ++waited) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if (!collected.load()) {
+                    std::cerr << "a driver store into a resident page held the write tracker while its guard waited for the GPU mutex (deadlock)\n";
+                    std::_Exit(3);
+                }
+            });
+            static_cast<void>(AgcDriver::GuestMemory::CollectWritesUncached(address + 9 * page, page));
+            collected.store(true);
+            watchdog.join();
+            const bool early = stored.load();
+            GpuMutex().unlock();
+            writer.join();
+            GpuMutex().lock();
+            Require(!early, "a driver store into a resident page did not wait for its guard's landing");
+            Require(landed[9 * page + 64] == 0x5A && landed[9 * page + 67] == 0x8D && landed[9 * page + 63] == sourceByte(63) && landed[9 * page + 68] == sourceByte(68) && landed[10 * page - 1] == sourceByte(page - 1), "a driver store into a resident page did not land after the GPU's bytes");
+        }
+        // A new import of the range (registered again) while a guard holds one of its plain pages:
+        // none for now (Windows: a plain page is pinned through the guest address), but not refused
+        // for good: made once no guard holds part of it. The resident copy into the retired import
+        // still lands.
+        {
+            resident.DeferCopies(copyFrom(page, 11 * page, page));
+            resident.Submit();
+            Require(resident.ResidentCopyBytes() == page, "a copy-back was not kept resident for the import test");
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Add(block, bytes, true, true);
+            }
+#ifdef _WIN32
+            Require(HostImportFor(context, address, bytes) == nullptr, "a plain range was imported over a guarded page");
+            Require(HostImportFor(context, address, bytes) == nullptr, "a plain range was imported over a page a guard still holds");
+#else
+            static_cast<void>(HostImportFor(context, address, bytes));
+#endif
+            resident.Submit();
+            resident.Sync();
+            Require(landed[11 * page + 9] == sourceByte(page + 9) && landed[12 * page - 1] == sourceByte(2 * page - 1), "a resident copy into a retired plain import did not land");
+            target = HostImportFor(context, address, bytes);
+            Require(target != nullptr, "the import of a plain range was refused for good after a guard held one of its pages");
+            Require(HostImportFor(context, address, bytes) == target, "the import made after the guard went did not stay");
+            // The new import changed the mapping generation: the first decision after it records
+            // the copy into the new import instead of keeping it.
+            resident.DeferCopies(copyFrom(2 * page, 13 * page, page));
+            resident.Submit();
+            Require(resident.ResidentCopyBytes() == 0, "a copy-back queued after a mapping change was kept resident");
+            resident.Sync();
+            Require(landed[13 * page + 5] == sourceByte(2 * page + 5), "a copy-back into the new plain import did not land");
+        }
         // A resident copy still queued when its recorder goes lands with the teardown.
         resident.DeferCopies(copyOf(12288, 4096));
         resident.Submit();
@@ -3920,6 +4368,379 @@ void residentBufferTests(const Device& device, Recorder& recorder) {
     HostImportFor(context, address, bytes);
 }
 
+// Resident read-only copies (APS5_RESIDENT_READS=1, GuestBufferMemory.cpp "Resident reads"): a
+// dispatch build's element it only reads, inside a watched host import, binds a device-local copy
+// (not the import, and not among the in-place reads) holding the guest bytes; another build of the
+// range takes the copy as it stands; and every kind of write over the range makes the next use
+// refresh it from the import first: a CPU store (write watch), a GPU write the recorder notes (a
+// fill into the import, noted only), a queued label store (landed before the refresh copies), an
+// address-based use whose BDA table may store over the range while its batch is in flight (once
+// it finished, only its stamped stores count), a failed write-watch collect, a batch submitted
+// between the check and the record (RecheckResidentReads), and a changed import. Writes elsewhere
+// leave it standing; a reused build refreshes into the buffer its descriptor names; a written
+// element, a refused copy and a recorder without the switch bind in place; a range refreshed at
+// most uses is demoted to in place; APS5_RESIDENT_READS_VERIFY compares a standing copy with its
+// import and catches a write that escaped every tracker; no copy outlives its builds and the cache.
+void residentReadTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: resident reads not tested\n";
+        return;
+    }
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t bytes = 4 * unit;
+    void* block = AllocateWatched(bytes, unit);
+    if (block == nullptr) {
+        std::cout << "no write watching: resident reads not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* guest = static_cast<volatile unsigned char*>(block);
+    for (std::size_t at = 0; at < bytes; ++at) guest[at] = static_cast<unsigned char>(at * 11 + 7);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            ClearResidentReads();
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{context, block, address};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || import->unwatched || !AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "host import of the resident read block refused or unwatched: resident reads not tested\n";
+        return;
+    }
+    const auto build = [&](std::size_t at, std::size_t count, bool written) {
+        auto memory = std::make_unique<GuestBufferMemory>(context);
+        memory->AllowDeviceStaging();
+        if (written) memory->AddWritable(address + at, count);
+        else memory->AddReadable(address + at, count);
+        memory->UploadPrepare(false);
+        memory->UploadFinish(false);
+        return memory;
+    };
+    const auto fill = [&](Recorder& target, std::size_t at, std::uint32_t value) {
+        const auto commands = target.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, import->buffer, address + at - import->base, 16, value);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    };
+    // What the build binds for [at, at + count), copied to the host after everything recorded.
+    const auto bound = [&](Recorder& target, const GuestBufferMemory& memory, std::size_t at, std::size_t count) {
+        std::uint32_t adjustment = 0;
+        const auto info = memory.Descriptor(address + at, count, adjustment);
+        auto readback = std::make_shared<Buffer>(context, count, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = target.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, commands, info.buffer, info.offset + adjustment, readback->Handle(), 0, count);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        target.Keep(readback);
+        target.Submit();
+        target.Sync();
+        const auto copied = readback->Bytes();
+        for (std::size_t index = 0; index < count; ++index) {
+            if (std::to_integer<unsigned char>(copied[index]) != guest[at + index]) throw std::runtime_error("(r) the bound copy of the range differs from guest memory at offset " + std::to_string(at + index));
+        }
+    };
+    const auto bufferOf = [&](const GuestBufferMemory& memory, std::size_t at, std::size_t count) {
+        std::uint32_t adjustment = 0;
+        return memory.Descriptor(address + at, count, adjustment).buffer;
+    };
+    constexpr std::size_t at = unit + 4096;
+    constexpr std::size_t span = 8192;
+    // Without the switch: in place.
+    {
+        auto plain = build(at, span, false);
+        Require(plain->ServedInPlace(address + at) && !plain->ServedResident(address + at) && bufferOf(*plain, at, span) == import->buffer, "(r) a recorder without APS5_RESIDENT_READS bound a resident copy");
+        recorder.Sync();
+    }
+    setSwitch("APS5_RESIDENT_READS", "1");
+    setSwitch("APS5_RESIDENT_READS_MIN_KIB", "0");
+    Recorder resident(context);
+    setSwitch("APS5_RESIDENT_READS_MIB", "0");
+    Recorder refusing(context);
+    setSwitch("APS5_RESIDENT_READS_MIB", "");
+    setSwitch("APS5_RESIDENT_READS_VERIFY", "1");
+    Recorder verifying(context);
+    setSwitch("APS5_RESIDENT_READS_VERIFY", "");
+    setSwitch("APS5_RESIDENT_READS", "");
+    setSwitch("APS5_RESIDENT_READS_MIN_KIB", "");
+    Require(resident.KeepsResidentReads() && resident.ResidentReads().verifyEvery == 0 && verifying.ResidentReads().verifyEvery == 1 && refusing.ResidentReads().limitBytes == 0 && !recorder.KeepsResidentReads(), "APS5_RESIDENT_READS did not set up the recorders");
+    resident.Activate();
+    auto counts = ResidentReadCounts();
+    const auto expect = [&](std::uint64_t ResidentReadStatistics::*field, std::uint64_t delta, const char* what) {
+        const auto now = ResidentReadCounts();
+        if (now.*field - counts.*field != delta) throw std::runtime_error(std::string("(r) ") + what + ": counted " + std::to_string(now.*field - counts.*field) + ", expected " + std::to_string(delta));
+    };
+    // The first build makes the copy and fills it.
+    auto first = build(at, span, false);
+    Require(first->ServedResident(address + at) && !first->ServedInPlace(address + at) && first->InPlaceReads().empty(), "(r) a read-only element was not bound from a resident copy");
+    const auto copyBuffer = bufferOf(*first, at, span);
+    Require(copyBuffer != import->buffer, "(r) the resident copy is the import");
+    Require(first->DirectRegions().has_value() && first->DirectRegions()->size() == 1, "(r) a resident region is not keyed by its import for reuse");
+    expect(&ResidentReadStatistics::made, 1, "copies made");
+    expect(&ResidentReadStatistics::refreshFirst, 1, "first refreshes");
+    bound(resident, *first, at, span);
+    counts = ResidentReadCounts();
+    // Unchanged: the next build takes the copy as it stands.
+    auto second = build(at, span, false);
+    Require(bufferOf(*second, at, span) == copyBuffer, "(r) a second build of the range made another copy");
+    expect(&ResidentReadStatistics::hits, 1, "uses as they stood");
+    expect(&ResidentReadStatistics::made, 0, "copies made by a reuse");
+    // A CPU store into the range: refreshed.
+    counts = ResidentReadCounts();
+    guest[at + 100] = 0xEE;
+    auto third = build(at, span, false);
+    expect(&ResidentReadStatistics::refreshStamp, 1, "refreshes after a CPU store");
+    bound(resident, *third, at, span);
+    // A CPU store in another block and a noted GPU write elsewhere: standing.
+    counts = ResidentReadCounts();
+    guest[3 * unit + 5] = static_cast<unsigned char>(guest[3 * unit + 5] ^ 1u);
+    resident.NotePendingWrite(address + 3 * unit + 64, 16, Recorder::WriteKind::Fill);
+    auto fourth = build(at, span, false);
+    expect(&ResidentReadStatistics::hits, 1, "uses as they stood after writes elsewhere");
+    resident.Sync();
+    // A GPU write the recorder notes (here a fill noted only, no stamp): refreshed after it.
+    counts = ResidentReadCounts();
+    fill(resident, at + 256, 0xA5A5A5A5u);
+    resident.NotePendingWrite(address + at + 256, 16, Recorder::WriteKind::Fill);
+    auto fifth = build(at, span, false);
+    expect(&ResidentReadStatistics::refreshNoted, 1, "refreshes after a noted GPU write");
+    bound(resident, *fifth, at, span);
+    Require(guest[at + 256] == 0xA5 && guest[at + 271] == 0xA5, "(r) the noted fill did not land");
+    // A queued label store over the range: it lands before the refresh copies the range.
+    counts = ResidentReadCounts();
+    const std::array<std::byte, 4> label{std::byte{0x11}, std::byte{0x22}, std::byte{0x33}, std::byte{0x44}};
+    resident.RecordStore(import->buffer, address + at + 512 - import->base, label, address + at + 512);
+    resident.NotePendingWrite(address + at + 512, 4, Recorder::WriteKind::Label);
+    auto sixth = build(at, span, false);
+    expect(&ResidentReadStatistics::refreshNoted, 1, "refreshes after a label store");
+    Require(!resident.QueuedStoreOverlaps(address + at + 512, 4), "(r) a refresh left a queued label store over its range");
+    bound(resident, *sixth, at, span);
+    Require(guest[at + 512] == 0x11 && guest[at + 515] == 0x44, "(r) the label did not land");
+    // An address-based use whose table may store over the range (here its store is a fill neither
+    // noted nor stamped, as a BDA store until its batch completed): refreshed; one elsewhere: standing.
+    counts = ResidentReadCounts();
+    fill(resident, at + 1024, 0x5A5A5A5Au);
+    NoteResidentReadsAddressWriter(std::make_shared<const std::vector<std::pair<std::uint64_t, std::uint64_t>>>(std::vector<std::pair<std::uint64_t, std::uint64_t>>{{address, address + 64}, {address + at + 1024, address + at + 1040}}), &resident);
+    auto seventh = build(at, span, false);
+    expect(&ResidentReadStatistics::refreshWriter, 1, "refreshes after an address-based writer");
+    bound(resident, *seventh, at, span);
+    counts = ResidentReadCounts();
+    NoteResidentReadsAddressWriter(std::make_shared<const std::vector<std::pair<std::uint64_t, std::uint64_t>>>(std::vector<std::pair<std::uint64_t, std::uint64_t>>{{address + 3 * unit, address + 4 * unit}}), &resident);
+    auto eighth = build(at, span, false);
+    expect(&ResidentReadStatistics::hits, 1, "uses as they stood after an address-based writer elsewhere");
+    // A reused build (Revalidate): a CPU store, then its own copy refreshed in place.
+    counts = ResidentReadCounts();
+    guest[at + 2000] = 0x77;
+    Require(first->RecordResidentReads(resident), "(r) a reused build's copy was taken as demoted");
+    expect(&ResidentReadStatistics::refreshStamp, 1, "refreshes of a reused build");
+    Require(bufferOf(*first, at, span) == copyBuffer, "(r) a reused build's copy moved");
+    bound(resident, *first, at, span);
+    counts = ResidentReadCounts();
+    Require(first->RecordResidentReads(resident), "(r) a reused build's copy was taken as demoted");
+    expect(&ResidentReadStatistics::hits, 1, "reused builds' uses as they stood");
+    // An address-based writer's note lasts while its batch is in flight: once the batch finished,
+    // its stores are stamps (BdaResources::CheckFault marks the pages each use stored to). One
+    // that stored elsewhere leaves the copy standing; one that stored over the range refreshes it
+    // as a stamp, not as a writer.
+    resident.Sync();
+    Require(ResidentReadCounts().writers == 0, "(r) address-based writer notes outlived their batches");
+    counts = ResidentReadCounts();
+    const auto overRange = std::make_shared<const std::vector<std::pair<std::uint64_t, std::uint64_t>>>(std::vector<std::pair<std::uint64_t, std::uint64_t>>{{address, address + bytes}});
+    RecordMemoryBarrier(context, resident.Commands(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    NoteResidentReadsAddressWriter(overRange, &resident);
+    NoteResidentReadsAddressWriter(overRange, &resident);
+    Require(ResidentReadCounts().writers == 1, "(r) an address-based writer in flight was not listed once");
+    resident.Submit();
+    resident.Sync();
+    Require(ResidentReadCounts().writers == 0, "(r) an address-based writer's note outlived its batch");
+    auto ninth = build(at, span, false);
+    expect(&ResidentReadStatistics::hits, 1, "uses as they stood after a finished address-based writer that stored elsewhere");
+    counts = ResidentReadCounts();
+    fill(resident, at + 1536, 0x3C3C3C3Cu);
+    NoteResidentReadsAddressWriter(overRange, &resident);
+    const auto storedPage = (address + at + 1536) & ~std::uint64_t{4095};
+    resident.OnComplete([storedPage] { AgcDriver::GuestMemory::MarkWritten(storedPage, 4096); });
+    resident.Submit();
+    resident.Sync();
+    auto tenth = build(at, span, false);
+    expect(&ResidentReadStatistics::refreshStamp, 1, "refreshes after a finished address-based writer that stored over the range");
+    expect(&ResidentReadStatistics::refreshWriter, 0, "writer refreshes after the writer's batch finished");
+    bound(resident, *tenth, at, span);
+    // A failed write-watch collect over the range (its dirty bits may be gone without stamps):
+    // refreshed.
+    counts = ResidentReadCounts();
+    ResidentReadsFailCollectForTests(true);
+    std::unique_ptr<GuestBufferMemory> eleventh;
+    try {
+        eleventh = build(at, span, false);
+    } catch (...) {
+        ResidentReadsFailCollectForTests(false);
+        throw;
+    }
+    ResidentReadsFailCollectForTests(false);
+    expect(&ResidentReadStatistics::refreshUnwatched, 1, "refreshes after a failed collect");
+    bound(resident, *eleventh, at, span);
+    // A batch submitted between a build's check and its record, whose completion stored into the
+    // range: the record checks again and refreshes into the open batch; with no submit since, the
+    // record checks nothing.
+    counts = ResidentReadCounts();
+    auto twelfth = build(at, span, false);
+    expect(&ResidentReadStatistics::hits, 1, "uses as they stood before a recheck");
+    twelfth->RecheckResidentReads(resident);
+    expect(&ResidentReadStatistics::rechecks, 0, "rechecks with no submit since the check");
+    const auto completionStore = at + 3000;
+    resident.OnComplete([guest, completionStore] { guest[completionStore] = 0x5D; });
+    resident.Submit();
+    resident.Sync();
+    Require(guest[at + 3000] == 0x5D, "(r) the completion store did not land");
+    twelfth->RecheckResidentReads(resident);
+    expect(&ResidentReadStatistics::rechecks, 1, "rechecks after a submit");
+    expect(&ResidentReadStatistics::recheckRefreshes, 1, "refreshes of a recheck after a completion store");
+    expect(&ResidentReadStatistics::refreshStamp, 1, "the recheck's refresh reason");
+    expect(&ResidentReadStatistics::uses, 1, "uses counted by a recheck");
+    bound(resident, *twelfth, at, span);
+    // A written element, and a copy the cap refuses: in place.
+    {
+        auto written = build(2 * unit, 4096, true);
+        Require(written->ServedInPlace(address + 2 * unit) && !written->ServedResident(address + 2 * unit), "(r) a written element was bound from a resident copy");
+        resident.Sync();
+        refusing.Activate();
+        counts = ResidentReadCounts();
+        auto refused = build(2 * unit + 8192, 4096, false);
+        Require(refused->ServedInPlace(address + 2 * unit + 8192), "(r) a copy over the cap was bound");
+        expect(&ResidentReadStatistics::refused, 1, "refused copies");
+        refusing.Sync();
+        resident.Activate();
+    }
+    // Refreshed at every use: demoted, the next build binds in place.
+    counts = ResidentReadCounts();
+    constexpr std::size_t churn = 2 * unit + 16384;
+    std::unique_ptr<GuestBufferMemory> churned;
+    for (int round = 0; round < 8; ++round) {
+        guest[churn + static_cast<std::size_t>(round)] = static_cast<unsigned char>(round);
+        churned = build(churn, 4096, false);
+        Require(churned->ServedResident(address + churn), "(r) a churning range was not bound from its copy before its demotion");
+        resident.Sync();
+    }
+    expect(&ResidentReadStatistics::demoted, 1, "demoted ranges");
+    // A reused build holding the demoted copy fails its proof (the rebuild binds in place).
+    Require(!churned->RecordResidentReads(resident), "(r) a reused build over a demoted copy was not rebuilt");
+    expect(&ResidentReadStatistics::rebuiltDemoted, 1, "reused builds rebuilt over a demoted copy");
+    churned.reset();
+    {
+        auto demoted = build(churn, 4096, false);
+        Require(demoted->ServedInPlace(address + churn), "(r) a demoted range was bound from a copy");
+    }
+    // Verify: a standing copy compares equal; a write no tracker saw is caught.
+    resident.Sync();
+    verifying.Activate();
+    counts = ResidentReadCounts();
+    {
+        auto checked = build(at, span, false);
+        verifying.Submit();
+        verifying.Sync();
+        expect(&ResidentReadStatistics::verified, 1, "verified uses");
+        expect(&ResidentReadStatistics::mismatched, 0, "mismatched uses of a current copy");
+        counts = ResidentReadCounts();
+        fill(verifying, at + 4096, 0xC3C3C3C3u);
+        auto escaped = build(at, span, false);
+        verifying.Submit();
+        verifying.Sync();
+        expect(&ResidentReadStatistics::mismatched, 1, "mismatched uses after an untracked write");
+        // Tracked from here on: the next use refreshes.
+        verifying.NotePendingWrite(address + at + 4096, 16, Recorder::WriteKind::Fill);
+        counts = ResidentReadCounts();
+        auto refreshed = build(at, span, false);
+        expect(&ResidentReadStatistics::refreshNoted, 1, "refreshes after the noted write");
+        bound(verifying, *refreshed, at, span);
+    }
+    resident.Activate();
+    // A changed import (the range registered again): refreshed from the new import.
+    resident.Sync();
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    import = HostImportFor(context, address, bytes);
+    Require(import != nullptr, "(r) the block was not imported again");
+    counts = ResidentReadCounts();
+    auto remapped = build(at, span, false);
+    Require(remapped->ServedResident(address + at), "(r) the range was not bound from its copy after the import changed");
+    expect(&ResidentReadStatistics::refreshImport, 1, "refreshes after a changed import");
+    bound(resident, *remapped, at, span);
+    std::cout << "resident read tests passed\n";
+    resident.Sync();
+    remapped.reset();
+    first.reset();
+    second.reset();
+    third.reset();
+    fourth.reset();
+    fifth.reset();
+    sixth.reset();
+    seventh.reset();
+    eighth.reset();
+    ninth.reset();
+    tenth.reset();
+    eleventh.reset();
+    twelfth.reset();
+    // Nothing holds a copy now: dropping the cache's references frees them all (the device
+    // teardown's ClearResidentReads).
+    const auto left = ClearResidentReads();
+    const auto after = ResidentReadCounts();
+    if (left != 0 || after.liveBytes != 0 || after.entries != 0 || after.bytes != 0) throw std::runtime_error("(r) resident copies outlived their builds and the cache: " + std::to_string(left) + " live, " + std::to_string(after.liveBytes) + " live bytes");
+    recorder.Activate();
+}
+
+// SpirvMayStoreThroughBda: a store or atomic through a physical storage buffer pointer counts,
+// whatever the names; loads through one and stores to other storage classes do not; a store
+// through a pointer the scan cannot type counts.
+void bdaStoreScanTests() {
+    constexpr std::uint32_t uint32 = 1, uint64 = 2, pointer = 3, zero = 4, seven = 5, voidType = 6, functionType = 7, function = 8, label = 9, address = 10, loaded = 11, scope = 12, semantics = 13, added = 14;
+    const auto op = [](std::uint32_t opcode, std::uint32_t words) { return (words << 16u) | opcode; };
+    // body: the instructions inside the function, after `address` was made from pointer type `storage`.
+    const auto module = [&](std::uint32_t storage, bool fromVariable, std::initializer_list<std::uint32_t> body) {
+        std::vector<std::uint32_t> words{0x07230203u, 0x00010500u, 0, 32, 0};
+        words.insert(words.end(), {op(17, 2), 5347});  // OpCapability PhysicalStorageBufferAddresses
+        words.insert(words.end(), {op(21, 4), uint32, 32, 0, op(21, 4), uint64, 64, 0});
+        words.insert(words.end(), {op(32, 4), pointer, storage, uint32});
+        words.insert(words.end(), {op(43, 5), uint64, zero, 0, 0, op(43, 4), uint32, seven, 7, op(43, 4), uint32, scope, 1, op(43, 4), uint32, semantics, 0});
+        words.insert(words.end(), {op(19, 2), voidType, op(33, 3), functionType, voidType, op(54, 5), voidType, function, 0, functionType, op(248, 2), label});
+        if (fromVariable) words.insert(words.end(), {op(59, 4), pointer, address, storage});
+        else words.insert(words.end(), {op(120, 4), pointer, address, zero});
+        words.insert(words.end(), body);
+        words.insert(words.end(), {op(253, 1), op(56, 1)});
+        return words;
+    };
+    constexpr std::uint32_t PhysicalStorageBuffer = 5349, FunctionStorage = 7;
+    Require(SpirvMayStoreThroughBda(module(PhysicalStorageBuffer, false, {op(62, 5), address, seven, 2, 4})), "(s) a store through a physical pointer was not seen");
+    Require(SpirvMayStoreThroughBda(module(PhysicalStorageBuffer, false, {op(234, 7), uint32, added, address, scope, semantics, seven})), "(s) an atomic through a physical pointer was not seen");
+    Require(!SpirvMayStoreThroughBda(module(PhysicalStorageBuffer, false, {op(61, 6), uint32, loaded, address, 2, 4})), "(s) a load through a physical pointer counted as a store");
+    Require(!SpirvMayStoreThroughBda(module(FunctionStorage, true, {op(62, 3), address, seven})), "(s) a store to a function variable counted as a BDA store");
+    Require(SpirvMayStoreThroughBda(module(FunctionStorage, true, {op(62, 3), 31, seven})), "(s) a store through an untyped pointer did not count");
+    Require(SpirvMayStoreThroughBda(std::vector<std::uint32_t>{0x07230203u}), "(s) a truncated module did not count as storing");
+    std::cout << "BDA store scan tests passed\n";
+}
+
 // Sets (or, for an empty value, removes) an environment variable.
 void setEnvironment(const char* name, const char* value) {
 #ifdef _WIN32
@@ -3927,6 +4748,152 @@ void setEnvironment(const char* name, const char* value) {
 #else
     if (*value != '\0') setenv(name, value, 1);
     else unsetenv(name);
+#endif
+}
+
+// Resident buffers over a shared view, the title's case (Windows, APS5_RESIDENT_BUFFERS=1 with
+// APS5_GUARD_SHARED_VIEWS=1): the guest's GPU memory is a shared section mapped at a guest address,
+// and its host import is a second, read-write mapping of the same pages (the alias, WindowsMappings::
+// MapAlias). A resident copy's guard makes the guest's view of its pages no-access and leaves the
+// alias alone, so the GPU's import still reads and writes them. To the guest the pages stay mapped:
+// the driver's page queries (Accessible, DescribeCommitted, ReadCommitted: the page-state cache
+// forgotten, as after any mapping change) and a new import of the range must see them so, and a read
+// lands the GPU's bytes, visible through both mappings. t419: the queries read guarded pages as
+// holes (zeros, skipped write-backs) and refused their imports for good.
+void residentSharedViewTests(const Device& device, Recorder& recorder) {
+#ifdef _WIN32
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0 || !AgcDriver::GuestMemory::WriteWatched()) {
+        std::cout << "host imports or the write-watched arena unavailable: resident shared views not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 65536;
+    constexpr std::size_t page = 4096;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, static_cast<DWORD>(bytes), nullptr);
+    Require(section != nullptr, "cannot create the resident shared view test section");
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    Require(block != nullptr, "cannot reserve the resident shared view test range");
+    GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    auto* guest = static_cast<volatile unsigned char*>(block);
+    for (std::size_t at = 0; at < bytes; ++at) guest[at] = 0;
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr) {
+        std::cout << "host import of the resident shared view test range refused: resident shared views not tested\n";
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+        }
+        GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        CloseHandle(section);
+        return;
+    }
+    Require(import->alias != nullptr, "a shared view was imported without its read-write alias");
+    setSwitch("APS5_GUARD_SHARED_VIEWS", "1");
+    {
+        setEnvironment("APS5_RESIDENT_BUFFERS", "1");
+        Recorder resident(context);
+        setEnvironment("APS5_RESIDENT_BUFFERS", "");
+        resident.Activate();
+        constexpr std::size_t sourceBytes = 65536;
+        auto source = std::make_shared<Buffer>(context, sourceBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        const auto sourceByte = [](std::size_t at) { return static_cast<unsigned char>(at * 7 + 3); };
+        for (std::size_t at = 0; at < sourceBytes; ++at) source->Bytes()[at] = std::byte{sourceByte(at)};
+        const auto copyInto = [&](const HostImport* into, std::uint64_t at, std::uint64_t count) {
+            return std::vector<Recorder::DeferredCopy>{Recorder::DeferredCopy{source, source.get(), source->Handle(), into->buffer, at, address + at - into->base, count, address + at}};
+        };
+        auto* guarded = static_cast<char*>(block) + page;
+        // The page states are known (cached) before the guard, as the title's are.
+        Require(AgcDriver::GuestMemory::Accessible(block, bytes, true), "the shared view test range is not accessible");
+        // [100, 12388): pages 1 and 2 stay resident under a guard of the view, the rest land at Submit.
+        resident.DeferCopies(copyInto(import, 100, 12288));
+        resident.Submit();
+        Require(resident.ResidentCopyBytes() == 2 * page, "Submit did not keep the whole pages of a shared view's copy-back resident (guard refused)");
+        resident.Sync();
+        const auto* alias = static_cast<const volatile unsigned char*>(import->alias);
+        Require(guest[100] == sourceByte(100) && guest[12387] == sourceByte(12387) && alias[100] == sourceByte(100), "the partial pages of a shared view's resident copy did not land with its batch");
+        Require(alias[page + 904] == 0, "the alias held a resident copy's bytes before anything landed them");
+        // A mapping change elsewhere makes the page states be asked again: guarded, they are what the
+        // guest maps (read-write), not holes.
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address, bytes);
+        // The answers before the fix (debug aid APS5_GUARD_PAGES_AS_HOLES=1): holes (t419).
+        AgcDriver::GuestMemory::SetGuardedPagesAsHoles(true);
+        const bool holes = !AgcDriver::GuestMemory::Accessible(guarded, 2 * page, true) && !AgcDriver::GuestMemory::DescribeCommitted(address, bytes, true).whole;
+        AgcDriver::GuestMemory::SetGuardedPagesAsHoles(false);
+        Require(holes, "APS5_GUARD_PAGES_AS_HOLES=1 did not read the guarded pages as holes");
+        const auto queriesBefore = AgcDriver::GuestMemory::GuardedPageQueries();
+        Require(AgcDriver::GuestMemory::Accessible(guarded, 2 * page, true), "a guarded page of a shared view read as inaccessible");
+        Require(AgcDriver::GuestMemory::GuardedPageQueries() > queriesBefore, "the guarded page query was not counted");
+        Require(AgcDriver::GuestMemory::DescribeCommitted(address, bytes, true).whole && AgcDriver::GuestMemory::CommittedWhole(address, bytes), "a shared view range with a guarded page read as sparse");
+        // A read through the queries lands the bytes (it faults into the resolver) instead of zeros.
+        std::vector<std::byte> read(2 * page);
+        AgcDriver::GuestMemory::ReadCommitted(address + page, read);
+        Require(read[904] == std::byte{sourceByte(page + 904)} && read[2 * page - 1] == std::byte{sourceByte(3 * page - 1)}, "a committed read of a guarded shared view page did not land the GPU's bytes");
+        Require(alias[page + 904] == sourceByte(page + 904), "the landed bytes are not seen through the import's alias");
+        // A write after the landing survives the next command, through both mappings.
+        guest[page + 7] = 0xEE;
+        static_cast<void>(resident.Commands());
+        resident.Submit();
+        resident.Sync();
+        Require(guest[page + 7] == 0xEE && alias[page + 7] == 0xEE, "a resident copy a read landed was recorded again over a later CPU write");
+        // The first decision with a copy queued after a mapping change records it (an import it
+        // stores into may retire), so nothing stays resident then; the bytes land with that batch.
+        const auto settle = [&](const HostImport* into, std::uint64_t at) {
+            resident.DeferCopies(copyInto(into, at, page));
+            resident.Submit();
+            Require(resident.ResidentCopyBytes() == 0, "a copy-back queued after a mapping change was kept resident");
+            resident.Sync();
+            Require(guest[at + 5] == sourceByte(at + 5), "a copy-back recorded after a mapping change did not land");
+        };
+        settle(import, 12 * page);
+        // A new import of the range (its registration changed) while a guard holds pages of it: the
+        // alias import is made (before, it was refused for good), and the copy into the retired
+        // import still lands.
+        resident.DeferCopies(copyInto(import, 4 * page, 2 * page));
+        resident.Submit();
+        Require(resident.ResidentCopyBytes() == 2 * page, "a page-aligned copy-back of a shared view was not kept resident");
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+        }
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(block, bytes, true, true);
+        }
+        const auto* renewed = HostImportFor(context, address, bytes);
+        Require(renewed != nullptr && renewed->alias != nullptr, "the import of a shared view with a guarded page was refused");
+        resident.Submit();
+        resident.Sync();
+        Require(HostImportFor(context, address, bytes) == renewed, "the import made over a guarded page did not stay");
+        for (std::size_t at = 4 * page; at < 6 * page; at += 509) {
+            if (guest[at] != sourceByte(at)) throw std::runtime_error("a resident copy into a retired shared view import stored the wrong byte at offset " + std::to_string(at));
+        }
+        settle(renewed, 13 * page);
+        // Recorded into the new import by a command: the bytes land through its alias.
+        resident.DeferCopies(copyInto(renewed, 8 * page, 2 * page));
+        resident.Submit();
+        Require(resident.ResidentCopyBytes() == 2 * page, "a copy-back into the new import was not kept resident");
+        static_cast<void>(resident.Commands());
+        resident.Submit();
+        resident.Sync();
+        const auto* renewedAlias = static_cast<const volatile unsigned char*>(renewed->alias);
+        Require(guest[8 * page + 11] == sourceByte(8 * page + 11) && renewedAlias[10 * page - 1] == sourceByte(10 * page - 1), "a resident copy recorded into a shared view's import did not land");
+    }
+    setSwitch("APS5_GUARD_SHARED_VIEWS", "");
+    recorder.Activate();
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+    CloseHandle(section);
 #endif
 }
 
@@ -4214,7 +5181,12 @@ int main() {
         pageGuardTests();
         sharedViewGuardTests();
         residentBufferTests(device, recorder);
+        residentSharedViewTests(device, recorder);
+        residentReadTests(device, recorder);
+        bdaStoreScanTests();
         fastRingReclaimTests(device, recorder);
+        templateRefreshRingTests(device, recorder);
+        templateRefreshPatchTests(device, recorder);
         std::cout << "Recorder read tracking and label tests passed\n";
         return 0;
     } catch (const std::exception& error) {
