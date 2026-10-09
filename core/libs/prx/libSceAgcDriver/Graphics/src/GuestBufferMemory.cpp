@@ -3350,15 +3350,17 @@ void checkResidentWrite(const Context& context, Recorder& recorder, ResidentWrit
     auto& counts = residentWrites().counts;
     const auto bytes = static_cast<std::size_t>(range.end - range.begin);
     // The collect walks R's pages (~28k per 112 MiB) once per collect epoch; later ones hit the memo.
+    // A failed walk (0: an uncommitted or no-access page) may have reset dirty pages without
+    // stamping them: D is not trusted then (counted as stamped), as a resident read-only copy is not.
     const auto collectStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    GuestMemory::CollectWrites(range.begin, bytes);
+    const bool collected = GuestMemory::CollectWrites(range.begin, bytes) != 0;
     if (profile) {
         ++counts.collects;
         counts.collectUs += microsecondsSince(collectStart);
     }
     auto reason = range.refresh;
     if (reason == RefreshNone && range.notes != range.notesSeen) reason = RefreshNoted;
-    if (reason == RefreshNone && !GuestMemory::UnchangedSince(range.begin, bytes, range.synced)) reason = RefreshStamp;
+    if (reason == RefreshNone && (!collected || !GuestMemory::UnchangedSince(range.begin, bytes, range.synced))) reason = RefreshStamp;
     if (reason == RefreshNone) {
         const auto every = recorder.ResidentWrites().verifyEvery;
         if (every != 0 && ++range.checks % every == 0 && !recorder.ResidentLandQueued(&range)) verifyResidentWrite(context, recorder, range);
@@ -3453,9 +3455,10 @@ bool GuestBufferMemory::noteResidentCandidates(Recorder& recorder) {
     const auto& settings = recorder.ResidentWrites();
     bool promoted = false;
     for (const auto& region : regions) {
-        // In place in a watched import (UploadFinish took its identity), written, too large to stage.
+        // In place in a watched import (UploadFinish took its identity), written, too large to stage,
+        // not inside a live range (bound to its D, or in place beside a straddler: no candidate).
         const auto bytes = region.end - region.begin;
-        if (region.direct == nullptr || region.residentWrite != nullptr || region.sparse || region.mirror != nullptr) continue;
+        if (region.direct == nullptr || region.residentWrite != nullptr || region.sparse || region.mirror != nullptr || residentWriteOver(region.begin, region.end, true) != nullptr) continue;
         if (!WritesOverlap(region.begin, static_cast<std::size_t>(bytes)) || writtenSizeReason(bytes, region.atomic) != InPlaceWriteCensus::Reason::TooLarge) continue;
         // 64 KiB aligned where its import holds that much around it, else the region itself.
         auto begin = region.begin & ~std::uint64_t{0xFFFF};
@@ -3900,7 +3903,9 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     std::vector<Region*> residentWanted;
     const bool residentReads = recorder != nullptr && recorder->KeepsResidentReads() && stagingAllowed && !addressable && GuestMemory::WriteWatched();
     // Resident written ranges (Recorder::KeepsResidentWrites): likewise; a region inside a live
-    // range is not staged (it binds the range's device copy), unless atomic (staged as before).
+    // range is not staged (it binds the range's device copy), unless atomic or misaligned in its
+    // import (staged as before: it cannot bind the copy, and a GPU copy keeping UploadPrepare's
+    // shadow as a plain buffer would copy back whole and leave the build unreusable).
     const bool residentWritesOn = recorder != nullptr && recorder->KeepsResidentWrites() && stagingAllowed && !addressable && GuestMemory::WriteWatched();
     // One clock pair around the loop (an address-based build has ~1200 regions): the [buffers]
     // 'import lookup' is the loop less the mirror refreshes and the CPU copies, timed apart.
@@ -3942,7 +3947,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             }
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
-            const bool staged = recorder != nullptr && stagingEligible(region, addressable) && !(residentWritesOn && !region.atomic && residentWriteOver(region.begin, region.end, true) != nullptr);
+            const bool staged = recorder != nullptr && stagingEligible(region, addressable) && !(residentWritesOn && !region.atomic && entry != nullptr && (region.begin - entry->base) % context.limits.minStorageBufferOffsetAlignment == 0 && residentWriteOver(region.begin, region.end, true) != nullptr);
             if (entry != nullptr && !staged && (region.begin - entry->base) % context.limits.minStorageBufferOffsetAlignment == 0) {
                 region.direct = entry;
                 // Resident written ranges: the import's identity, taken now under its lock (none for
