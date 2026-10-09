@@ -429,7 +429,8 @@ public:
     // Whether LookupLabelValue(dword, 4, 0) has a value for any dword of [address & ~3, address +
     // bytes): one table lock and a range scan of the tracked dwords instead of a lookup per dword
     // (the fast reader's known-value range, Driver::fastPendingWord). The same answer: every
-    // tracked dword in the range is looked up as LookupLabelValue looks it up.
+    // tracked dword in the range is looked up as LookupLabelValue looks it up, without counting a
+    // queued label's hit as a same-queue wait hit.
     static bool LabelValueIn(std::uint64_t address, std::size_t bytes);
     // A label a queue worker decoded but has not recorded yet (Driver.cpp DeferredLabels): it
     // enters the table with no batch, and only a lookup made on the noting thread (a WAIT_REG_MEM
@@ -895,8 +896,10 @@ private:
     HostMutex writtenBackMutex;
     std::deque<std::array<std::uint64_t, 3>> writtenBack;
     std::uint64_t writtenBackSequence = 0;
-    // PendingLabel without the table mutex (the caller holds it, or the GPU mutex).
-    std::optional<LabelHit> lookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) const;
+    // PendingLabel without the table mutex (the caller holds it, or the GPU mutex). `countHits`:
+    // a hit on a queued label counts as a same-queue wait hit ([labels] line); LabelValueIn's
+    // range scan, which is no wait, passes false.
+    std::optional<LabelHit> lookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal, bool countHits = true) const;
     // Whether the in-flight batch with that serial has not signaled its fence (false when it is
     // not in flight any more): what makes a wait for it a real GPU wait (ThreadHookWaits).
     bool unsignaled(std::uint64_t serial) const;

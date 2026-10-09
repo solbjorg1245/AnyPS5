@@ -363,7 +363,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (profile) phaseLap = std::chrono::steady_clock::now();
     }
     // APS5_FAST_DRAW_VERIFY: the results bound above against the fast path's for this draw.
-    if (FastDrawVerifyPending()) VerifyFastDrawStages(programResults, (drawHit || hits.partial) && (hits.data || hits.partial || relocating != nullptr));
+    if (FastDrawVerifyPending()) VerifyFastDrawStages(programResults, (drawHit || hits.partial) && (hits.data || hits.partial || relocating != nullptr), memory);
 
     cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, hits, fresh, drawKey, registerKey, decode, phaseTiming, relocating);
     // APS5_FAST_CENSUS: what the fast path would decline on, committed when the packet ends (F0).

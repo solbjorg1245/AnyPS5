@@ -244,6 +244,9 @@ void Driver::fastPendingWord(std::uint64_t address, const PendingView& view, Fas
     std::uint32_t word = 0;
     answer = FastPendingAnswer{};
     writers.last = nullptr;
+    // Before the classification: a label or store noted after this load moves it (and a label
+    // noted before it is in the table LabelValueIn reads, which noteLabelOn fills before the bump).
+    answer.writes = Graphics::Recorder::WriteGeneration();
     // queryPendingWrite for 4 bytes: its page-query rule (a queued label under a 4096-byte query)
     // does not apply to a word, its retry rule does.
     answer.policy = Get().classifyPendingWrite(address, sizeof(word), reason, view, std::as_writable_bytes(std::span(&word, 1)), &writers);
@@ -254,9 +257,13 @@ void Driver::fastPendingWord(std::uint64_t address, const PendingView& view, Fas
     // pending snapshot (the overlap and the writer's neighbours; the caller compares its publish
     // generation), the writer being the newest over its whole range (the memo held; `writers` is
     // the push count it held at, which the caller compares) and no label in the range
-    // (classifyPendingWrite asks per dword, this one range query covers them all; a label recorded
-    // later publishes, so the generation moves). The CPU side (knownValueCurrent) is the
-    // writer's: collected once per epoch for the whole range, as for the old capture's queries.
+    // (classifyPendingWrite asks per dword, this one range query covers them all). A label or
+    // store noted later inside the range does not publish when the snapshot already covers it, so
+    // the caller compares `writes` (the recorder's write notes) as well. The CPU side
+    // (knownValueCurrent) is the writer's, checked once per range and walk as the old validation
+    // checks it once per region: a store stamped over the range without a write note (a CPU store
+    // another thread collects, a completion's write-back before its batch's snapshot is
+    // republished) can fall between two words of one walk, as between a region's check and its use.
     const auto* memo = writers.last;
     if (memo == nullptr || !memo->wholeRange || memo->writer.value == nullptr || memo->writer.begin > address || address + sizeof(word) > memo->writer.end) return;
     if (memo->writer.value->size() != memo->writer.end - memo->writer.begin) return;

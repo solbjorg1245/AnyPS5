@@ -99,11 +99,13 @@ bool queuedLabelWord(const FastReader& reader, std::uint64_t address, std::optio
 // (Driver::fastPendingWord, queryPendingWrite's answer for the 4 bytes over the reader's
 // snapshot). The answers that read without the flush hook serve; the rest decline "pending block",
 // where the capture would wait for the writer. Words inside the last KnownValue range the query
-// named reuse its answer while the snapshot generation and the writer push count hold (the
-// validation's per-region classification, over a whole range of one writer).
+// named reuse its answer while the snapshot generation, the writer push count and the recorder's
+// write generation hold (the validation's per-region classification, over a whole range of one
+// writer; the write generation moves with a label or store noted inside a range the snapshot
+// already covers, which publishes nothing).
 bool serveKnown(FastReader& reader, std::uint64_t address, std::uint32_t* value) {
     using Policy = ShaderMemory::PendingWrite;
-    if (reader.knownBytes != nullptr && reader.knownBegin <= address && address + sizeof(*value) <= reader.knownEnd && reader.knownGeneration == reader.snapshotGeneration && reader.knownWriters == WrittenBufferPushes().load(std::memory_order_acquire)) {
+    if (reader.knownBytes != nullptr && reader.knownBegin <= address && address + sizeof(*value) <= reader.knownEnd && reader.knownGeneration == reader.snapshotGeneration && reader.knownWriters == WrittenBufferPushes().load(std::memory_order_acquire) && reader.knownWrites == Graphics::Recorder::WriteGeneration()) {
         std::memcpy(value, reader.knownBytes->data() + (address - reader.knownBegin), sizeof(*value));
         ++reader.servedKnown;
         logServed(address, *value, FastServedSource::Known);
@@ -136,11 +138,13 @@ bool serveKnown(FastReader& reader, std::uint64_t address, std::uint32_t* value)
                 reader.knownBytes = std::move(answer.rangeBytes);
                 reader.knownGeneration = reader.snapshotGeneration;
                 reader.knownWriters = answer.writers;
+                reader.knownWrites = answer.writes;
             }
             return true;
         case Policy::RawExpected: {
             // Read raw while the word still holds what the evidence saw last; another value is the
             // capture's hook read (it waits, and tells the evidence the word changed).
+            if (!reader.knownEvidence) break;
             const auto word = live();
             if (word != answer.word) break;
             *value = word;
@@ -149,6 +153,7 @@ bool serveKnown(FastReader& reader, std::uint64_t address, std::uint32_t* value)
             return true;
         }
         case Policy::Raw:
+            if (!reader.knownEvidence) break;
             *value = live();
             ++reader.servedEvidence;
             logServed(address, *value, FastServedSource::Evidence);
@@ -272,6 +277,14 @@ bool FastKnownValues() {
     return enabled;
 }
 
+bool FastKnownEvidence() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_FAST_KNOWN_EVIDENCE");
+        return FastKnownValues() && (value == nullptr || std::strcmp(value, "0") != 0);
+    }();
+    return enabled;
+}
+
 bool FastKnownLabels() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_FAST_KNOWN_LABELS");
@@ -339,8 +352,11 @@ std::uint64_t CompareServedWords(std::span<const FastServedWord> words, std::spa
 
 std::string FastPendingServedText(const FastPendingReads& reads) {
     const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
-    char text[192];
-    std::snprintf(text, sizeof(text), "; pending words served from known values %llu, on write evidence %llu; queued-label words served %llu%s", count(reads.known), count(reads.evidence), count(reads.labels), !FastKnownValues() ? " (APS5_FAST_KNOWN_VALUES=0)" : !FastKnownLabels() ? " (APS5_FAST_KNOWN_LABELS=0)" : "");
+    std::string switches;
+    if (!FastKnownValues()) switches = " (APS5_FAST_KNOWN_VALUES=0)";
+    else if (!FastKnownEvidence() || !FastKnownLabels()) switches = std::string(" (") + (!FastKnownEvidence() ? "APS5_FAST_KNOWN_EVIDENCE=0" : "") + (!FastKnownEvidence() && !FastKnownLabels() ? ", " : "") + (!FastKnownLabels() ? "APS5_FAST_KNOWN_LABELS=0" : "") + ")";
+    char text[256];
+    std::snprintf(text, sizeof(text), "; pending words served from known values %llu, on write evidence %llu; queued-label words served %llu%s", count(reads.known), count(reads.evidence), count(reads.labels), switches.c_str());
     return text;
 }
 

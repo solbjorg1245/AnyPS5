@@ -49,6 +49,9 @@ struct VerifyStash {
     bool compared = false;
     std::size_t stages = 0;
     std::array<ShaderRecompiler::RecompileResult, 2> results;
+    // The words the draw's walks served without their final value (FastServedWords), checked once
+    // the old path captured the draw (VerifyFastDrawStages).
+    std::vector<FastServedWord> served;
 };
 struct VerifyStashTag {};
 
@@ -69,7 +72,12 @@ struct FastDrawCounters {
     // [0]: plain old results, [1]: results the old path bound by a heuristic.
     std::array<std::uint64_t, 2> verifyMismatched{};
     std::array<std::uint64_t, VerifyKinds> verifyKinds{};
-    // The verified draws' served words (CheckServedWords): compared, unreadable, differing by source.
+    // The verified draws' served words: against the old path's reads of the same addresses
+    // (CompareServedWords: compared, differing, not read by it; a difference is the draw's "served
+    // word" kind), and against memory once their pending writes landed (CheckServedWords:
+    // compared, unreadable, differing by source; counted apart, since the old path at the same
+    // point serves an evidence word's stale value the same way).
+    std::uint64_t verifyServedCompared = 0, verifyServedDiffering = 0, verifyServedUnread = 0;
     FastServedCheck verifyServed;
     // The F3b walks' reads (vertex fetch and stage walks, taken and declined draws) that met a
     // pending block, and those the exact ranges let through.
@@ -132,7 +140,7 @@ void report(const FastDrawCounters& total) {
         kinds += item;
     }
     const auto& served = total.verifyServed;
-    std::fprintf(stderr, "[fastpath] draw verify (10 s, every %u): %llu draws compared (%llu stages; %llu armed draws the old path left uncompared), mismatched stages %llu, after heuristic hits %llu; by kind: %s, vertex attributes %llu; bindings: %llu compared, %llu matched, %llu declined by the fast path, mismatches: layout %llu, buffer %llu, data %llu, image %llu, sampler %llu, push %llu; buffers the old path copied %llu; served words against memory once their pending writes landed: %llu compared (%llu unreadable), differing: known value %llu, write evidence %llu, queued label %llu\n", FastDrawVerifyEvery(), count(total.verifyDraws), count(total.verifyStages), count(total.verifyNotCompared), count(total.verifyMismatched[0]), count(total.verifyMismatched[1]), kinds.c_str(), count(total.verifyVertex), count(bindings.compared), count(bindings.matched), count(bindings.declined), count(bindings.layout), count(bindings.buffer), count(bindings.data), count(bindings.image), count(bindings.sampler), count(bindings.push), count(bindings.copied), count(served.compared), count(served.unreadable), count(served.mismatched[0]), count(served.mismatched[1]), count(served.mismatched[2]));
+    std::fprintf(stderr, "[fastpath] draw verify (10 s, every %u): %llu draws compared (%llu stages; %llu armed draws the old path left uncompared), mismatched stages %llu, after heuristic hits %llu; by kind: %s, vertex attributes %llu; bindings: %llu compared, %llu matched, %llu declined by the fast path, mismatches: layout %llu, buffer %llu, data %llu, image %llu, sampler %llu, push %llu; buffers the old path copied %llu; served words: %llu compared with the old path's reads (%llu differ, %llu it did not read), %llu with memory once their pending writes landed (%llu unreadable; differing: known value %llu, write evidence %llu, queued label %llu)\n", FastDrawVerifyEvery(), count(total.verifyDraws), count(total.verifyStages), count(total.verifyNotCompared), count(total.verifyMismatched[0]), count(total.verifyMismatched[1]), kinds.c_str(), count(total.verifyVertex), count(bindings.compared), count(bindings.matched), count(bindings.declined), count(bindings.layout), count(bindings.buffer), count(bindings.data), count(bindings.image), count(bindings.sampler), count(bindings.push), count(bindings.copied), count(total.verifyServedCompared), count(total.verifyServedDiffering), count(total.verifyServedUnread), count(served.compared), count(served.unreadable), count(served.mismatched[0]), count(served.mismatched[1]), count(served.mismatched[2]));
 }
 
 void commit(const FastDrawCounters& local) {
@@ -162,6 +170,9 @@ void commit(const FastDrawCounters& local) {
     total.verifyVertex += local.verifyVertex;
     for (std::size_t column = 0; column < 2; ++column) total.verifyMismatched[column] += local.verifyMismatched[column];
     for (std::size_t kind = 0; kind < VerifyKinds; ++kind) total.verifyKinds[kind] += local.verifyKinds[kind];
+    total.verifyServedCompared += local.verifyServedCompared;
+    total.verifyServedDiffering += local.verifyServedDiffering;
+    total.verifyServedUnread += local.verifyServedUnread;
     total.verifyServed.compared += local.verifyServed.compared;
     total.verifyServed.unreadable += local.verifyServed.unreadable;
     for (std::size_t source = 0; source < total.verifyServed.mismatched.size(); ++source) total.verifyServed.mismatched[source] += local.verifyServed.mismatched[source];
@@ -213,7 +224,7 @@ bool FastDrawVerifyPending() {
     return stash.armed && !stash.compared;
 }
 
-void VerifyFastDrawStages(std::span<const ShaderRecompiler::RecompileResult* const> old, bool heuristic) {
+void VerifyFastDrawStages(std::span<const ShaderRecompiler::RecompileResult* const> old, bool heuristic, std::span<const ShaderRecompiler::MemoryRegion> regions) {
     auto& stash = HostThreadLocal<VerifyStash, VerifyStashTag>();
     if (!stash.armed || stash.compared) return;
     stash.compared = true;
@@ -240,6 +251,19 @@ void VerifyFastDrawStages(std::span<const ShaderRecompiler::RecompileResult* con
         static std::atomic<std::uint32_t> printed{0};
         if (printed.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[fastpath] draw verify: stage %zu%s differs from the old path's result: kinds 0x%x%s; variant old %llu, fast %llu\n", i, heuristic ? " after a heuristic hit" : "", kinds, attributes ? "" : ", vertex attributes", static_cast<unsigned long long>(i < old.size() && old[i] != nullptr ? old[i]->variantId : 0), static_cast<unsigned long long>(stash.results[i].variantId));
     }
+    // The served words (known values, write evidence, queued labels): against the old path's own
+    // reads of them (its regions; a difference is the "served word" kind), then, now that the old
+    // path captured the draw, against the bytes memory holds once the writes pending over them
+    // landed (each read through the flush hook, as the old capture's Sync read). The second
+    // waits, which is why it runs after the capture: before it, the capture would have read the
+    // landed words instead of serving them as at the fast walk's point.
+    if (!stash.served.empty()) {
+        local.verifyServedCompared = stash.served.size();
+        local.verifyServedDiffering = CompareServedWords(stash.served, regions, local.verifyServedUnread);
+        if (local.verifyServedDiffering != 0) ++local.verifyKinds[static_cast<std::size_t>(WalkMismatch::Served)];
+        CheckServedWords(stash.served, "draw verify", local.verifyServed);
+        stash.served.clear();
+    }
     commit(local);
 }
 
@@ -250,6 +274,9 @@ FastDrawVerifyScope::~FastDrawVerifyScope() {
     const bool compared = stash.compared;
     stash.armed = false;
     stash.compared = false;
+    // Not checked when the old path did not compare: it may have recorded the draw, whose own
+    // writes the landed check would wait for.
+    stash.served.clear();
     // An armed comparison Graphics::Draw did not reach (a recipe, a rejection, a CPU-side path).
     Graphics::ThreadFastVerifyArmed() = false;
     if (compared) return;
@@ -410,17 +437,10 @@ std::optional<DrawVerdict> Driver::fastDraw(QueueState& queue, const Submission&
             stash.compared = false;
             stash.stages = count;
             for (std::size_t i = 0; i < count; ++i) stash.results[i] = scratch.results[i];
-            // The served words (known values, write evidence, queued labels) against the bytes
-            // memory holds once the writes pending over them landed (each read through the flush
-            // hook, as the old capture's Sync read); the stage results are compared once the old
-            // path drew the draw (VerifyFastDrawStages). A difference counts as the draw's
-            // "served word" kind.
-            if (const auto& served = FastServedWords().words; !served.empty()) {
-                FastServedCheck check;
-                CheckServedWords(served, "draw verify", check);
-                local.verifyServed = check;
-                if (check.Mismatched() != 0) ++local.verifyKinds[static_cast<std::size_t>(WalkMismatch::Served)];
-            }
+            // The served words (known values, write evidence, queued labels), checked with the
+            // stage results once the old path captured the draw (VerifyFastDrawStages).
+            const auto& served = FastServedWords().words;
+            stash.served.assign(served.begin(), served.end());
             Graphics::ThreadFastVerifyArmed() = true;
             return declined(FastDecline::Verify);
         }

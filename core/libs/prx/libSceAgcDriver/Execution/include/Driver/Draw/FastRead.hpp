@@ -51,7 +51,19 @@ bool FastPendingExact();
 // value the write evidence saw last, Raw the live word. Every answer the capture reads through the
 // flush hook instead (Sync, the verify policies, RawExpected with another value) declines
 // "pending block", as before.
+//
+// Accepted difference (s53-known-values-fix, review F2): the old draw capture runs one stage
+// capture in writeEvidenceSampleEvery() (16) sampled (SampledReadScope), and a sampled capture's
+// pure-flat-slot query (deferPureLeaf, no known span, so no RawExpected) gets Sync and leaves an
+// evidence word to the GPU copy behind its writer. The fast reader is not sampled: it serves such
+// a word as the 15 unsampled captures do (RawExpected, the live word). Declining under a fast-side
+// sample would not restore the rate (the old capture after the decline draws its own sample from
+// the shared counter); APS5_FAST_KNOWN_EVIDENCE=0 declines every evidence word instead.
 bool FastKnownValues();
+// Write-evidence words (APS5_FAST_KNOWN_EVIDENCE, on unless "0"; only with FastKnownValues):
+// RawExpected and Raw serve the live word; off, they decline "pending block" and only known values
+// and queued labels are served (the A/B that isolates the evidence heuristic).
+bool FastKnownEvidence();
 // And a word this thread's deferred labels write (APS5_FAST_KNOWN_LABELS, on unless "0"; only with
 // FastKnownValues): the bytes of the last such label in queue order when it covers the whole word,
 // which is what the old capture reads there (its flush hook records the labels, then waits for
@@ -133,13 +145,16 @@ struct FastReader {
     // Known-value serving (FastKnownValues, FastKnownLabels) and the query it classifies with.
     bool knownValues = FastKnownValues();
     bool knownLabels = FastKnownLabels();
+    bool knownEvidence = FastKnownEvidence();
     FastPendingQuery pendingQuery = InstalledFastPendingQuery();
     // The KnownValue range the last answer named (FastPendingAnswer): its words are served from its
-    // bytes while the snapshot generation and the writer push count it was classified at hold.
+    // bytes while the snapshot generation, the writer push count and the recorder's write
+    // generation it was classified at hold.
     std::uint64_t knownBegin = 0;
     std::uint64_t knownEnd = 0;
     std::uint64_t knownGeneration = 0;
     std::uint64_t knownWriters = 0;
+    std::uint64_t knownWrites = 0;
     std::shared_ptr<const std::vector<std::byte>> knownBytes;
     // Words served without their final value (counted with the pending reads by each report line).
     std::uint64_t servedKnown = 0;

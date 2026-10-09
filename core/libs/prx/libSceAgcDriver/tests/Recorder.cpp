@@ -391,7 +391,7 @@ void fastReaderPendingTests(Recorder& recorder) {
 // The classification both readers of fastReaderKnownValueTests ask (the driver's
 // classifyPendingWrite stands behind both in the game): per word, the answer and its value; a
 // page query is word-wise when an answered word lies in it. The fast reader's form can name a
-// KnownValue range (FastPendingAnswer) taken at the current writer push count.
+// KnownValue range (FastPendingAnswer) taken at the current writer push count and write generation.
 struct FakeAnswer {
     AgcDriver::ShaderMemory::PendingWrite policy;
     std::uint32_t word;
@@ -433,6 +433,7 @@ void fakeFastQuery(std::uint64_t address, const AgcDriver::DriverDetail::Pending
     answer.rangeEnd = fakeRange.end;
     answer.rangeBytes = fakeRange.bytes;
     answer.writers = AgcDriver::DriverDetail::WrittenBufferPushes().load();
+    answer.writes = Recorder::WriteGeneration();
 }
 
 // Known-value serving in the fast reader (FastSrtRead with APS5_FAST_KNOWN_VALUES, s53-known-values):
@@ -446,8 +447,10 @@ void fakeFastQuery(std::uint64_t address, const AgcDriver::DriverDetail::Pending
 // capture reads through the flush hook (Sync: deferred or waited; RawExpected with another value:
 // waited) the fast walk declines "pending block". A word changed after it was served: within a
 // walk the served range answers while nothing the classification sees moved; a new writer (the
-// push count), a new pending range (the publish generation) or another live word (RawExpected)
-// re-serves or declines. Recorder::LabelValueIn answers as LookupLabelValue per dword.
+// push count), a new pending range (the publish generation), a label noted inside a range the
+// snapshot already covers (the write generation; nothing is published) or another live word
+// (RawExpected) re-serves or declines. Evidence words decline with APS5_FAST_KNOWN_EVIDENCE=0.
+// Recorder::LabelValueIn answers as LookupLabelValue per dword, without counting wait hits.
 void fastReaderKnownValueTests(Recorder& recorder) {
     using namespace ShaderRecompiler;
     using AgcDriver::DriverDetail::DeferredLabel;
@@ -502,6 +505,7 @@ void fastReaderKnownValueTests(Recorder& recorder) {
         last.exactPending = true;
         last.knownValues = true;
         last.knownLabels = true;
+        last.knownEvidence = true;
         last.pendingQuery = &fakeFastQuery;
         last.labels = &labels;
         SrtRuntime runtime;
@@ -571,6 +575,7 @@ void fastReaderKnownValueTests(Recorder& recorder) {
     reader.exactPending = true;
     reader.knownValues = true;
     reader.knownLabels = true;
+    reader.knownEvidence = true;
     reader.pendingQuery = &fakeFastQuery;
     reader.labels = &none;
     const auto read = [&](std::uint32_t& value) {
@@ -602,12 +607,40 @@ void fastReaderKnownValueTests(Recorder& recorder) {
     fakeAnswers = {{payload, {Policy::Sync, 0}}};
     recorder.NotePendingWrite(payload + 0x40, 4);
     Require(!read(value) && reader.declined == WalkDecline::Pending, "known values: a word the old capture now waits for was served from the walk's range");
+    // A label noted inside the served range (another queue's EOP or WRITE_DATA into a pending
+    // copy's destination): the snapshot already covers it, so nothing is published and no writer
+    // is pushed, but the old capture's next classification finds the label (Sync). The write
+    // generation moves: classified again, declined.
+    fakeAnswers = {{payload, {Policy::KnownValue, Known}}};
+    fakeRange = rangeOf(Known);
+    Require(read(value) && value == Known, "known values: a known word was not served again");
+    fakeAnswers = {{payload, {Policy::Sync, 0}}};
+    queries = fakeFastQueries;
+    const auto published = Recorder::PublishGeneration();
+    const auto writes = Recorder::WriteGeneration();
+    const auto pushes = WrittenBufferPushes().load();
+    std::array<std::byte, 4> labelBytes{};
+    std::memcpy(labelBytes.data(), &Live, sizeof(Live));
+    recorder.NoteLabel(payload, labelBytes, 6, 0);
+    Require(Recorder::PublishGeneration() == published && WrittenBufferPushes().load() == pushes && Recorder::WriteGeneration() != writes, "known values: the covered label note was published or noted no write");
+    Require(!read(value) && reader.declined == WalkDecline::Pending && fakeFastQueries == queries + 1, "known values: a word under a label noted inside the served range was served from the range");
     // An evidence word: served while memory holds the expected value, declined once it changed.
     fakeAnswers = {{payload, {Policy::RawExpected, Live}}};
     Require(read(value) && value == Live, "known values: an evidence word holding its value was not served");
     word(payload) = Live ^ 0x10u;
     Require(!read(value) && reader.declined == WalkDecline::Pending, "known values: an evidence word that changed after it was served was served again");
     word(payload) = Live;
+    // Evidence words switched off (APS5_FAST_KNOWN_EVIDENCE=0): RawExpected and Raw decline,
+    // known values are still served.
+    reader.knownEvidence = false;
+    for (const auto policy : {Policy::RawExpected, Policy::Raw}) {
+        fakeAnswers = {{payload, {policy, Live}}};
+        Require(!read(value) && reader.declined == WalkDecline::Pending, "known values: an evidence word was served with evidence serving off");
+    }
+    fakeAnswers = {{payload, {Policy::KnownValue, Known}}};
+    fakeRange = {};
+    Require(read(value) && value == Known, "known values: a known word declined with evidence serving off");
+    reader.knownEvidence = true;
     // Switched off (APS5_FAST_KNOWN_VALUES=0) or without a query: declines as before.
     fakeAnswers = {{payload, {Policy::KnownValue, Known}}};
     reader.knownValues = false;
@@ -630,7 +663,11 @@ void fastReaderKnownValueTests(Recorder& recorder) {
         for (auto dword = (base + begin) & ~std::uint64_t{3}; dword < base + begin + size; dword += 4) any = any || Recorder::LookupLabelValue(dword, 4, 0).has_value();
         Require(Recorder::LabelValueIn(base + begin, size) == any, "known values: LabelValueIn differs from LookupLabelValue over the range's dwords");
     }
+    // Its scan is no wait: this thread's queued label is not a same-queue wait hit ([labels] line).
+    const auto hits = Recorder::StoreCounts().queuedHits;
     Require(Recorder::LabelValueIn(base + 0x1000, 4) && Recorder::LabelValueIn(base + 0x1100, 4) && !Recorder::LabelValueIn(base + 0x1004, 0xc), "known values: LabelValueIn missed a label or found one where there is none");
+    Require(Recorder::StoreCounts().queuedHits == hits, "known values: LabelValueIn counted a same-queue wait hit");
+    Require(Recorder::LookupLabelValue(base + 0x1100, 4, 0).has_value() && Recorder::StoreCounts().queuedHits == hits + 1, "known values: LookupLabelValue no longer counts a same-queue wait hit");
     Recorder::ForgetQueuedLabels();
     recorder.Sync();
     Recorder::TrackPendingBlocks(false);

@@ -1380,7 +1380,7 @@ bool Recorder::LabelValueIn(std::uint64_t address, std::size_t bytes) {
     for (const auto* table : {&owner.labels, &owner.queuedLabels}) {
         for (auto it = table->lower_bound(first); it != table->end() && it->first < limit; ++it) {
             if (it->first % 4 != 0) continue;
-            if (owner.lookupLabel(it->first, 4, 0, nullptr).has_value()) return true;
+            if (owner.lookupLabel(it->first, 4, 0, nullptr, false).has_value()) return true;
         }
     }
     return false;
@@ -3240,7 +3240,7 @@ bool Recorder::PendingLabelIn(std::uint64_t address, std::size_t bytes) const {
     return false;
 }
 
-std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) const {
+std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal, bool countHits) const {
     if (refusal != nullptr) *refusal = LabelRefusal::None;
     if ((labels.empty() && queuedLabels.empty()) || (bytes != 4 && bytes != 8) || address % 4 != 0) return std::nullopt;
     LabelHit hit{0, 0, 0, false, std::numeric_limits<std::uint64_t>::max()};
@@ -3286,7 +3286,7 @@ std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, s
         }
     }
     if (!hit.late) hit.generation = 0;
-    if (queued) queuedLabelHits.fetch_add(1, std::memory_order_relaxed);
+    if (queued && countHits) queuedLabelHits.fetch_add(1, std::memory_order_relaxed);
     return hit;
 }
 

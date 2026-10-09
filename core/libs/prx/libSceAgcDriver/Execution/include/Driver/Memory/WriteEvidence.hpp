@@ -115,8 +115,10 @@ struct NewestWriterMemos {
 // bytes) and the value it serves with: the known word for KnownValue, the value the write evidence
 // saw last for RawExpected. A KnownValue answer from a writer whose known bytes cover a range no
 // newer writer and no label overlaps also names that range and its bytes: every word inside it
-// gets the same answer while the pending snapshot (its publish generation) and the writer ring
-// (its push count, `writers`) are unchanged.
+// gets the same answer while the pending snapshot (its publish generation), the writer ring (its
+// push count, `writers`) and the recorder's write notes (Recorder::WriteGeneration, `writes`,
+// loaded before the classification) are unchanged. The write notes cover a label or store noted
+// inside a range the snapshot already holds, which publishes nothing (Recorder::noteWrite).
 struct FastPendingAnswer {
     ShaderMemory::PendingWrite policy = ShaderMemory::PendingWrite::Sync;
     std::uint32_t word = 0;
@@ -124,6 +126,7 @@ struct FastPendingAnswer {
     std::uint64_t rangeEnd = 0;
     std::shared_ptr<const std::vector<std::byte>> rangeBytes;
     std::uint64_t writers = 0;
+    std::uint64_t writes = 0;
 };
 using FastPendingQuery = void (*)(std::uint64_t address, const PendingView& view, FastPendingAnswer& answer);
 

@@ -203,9 +203,11 @@ bool Driver::fastDispatch(const Submission& submission, const ShaderSnapshot& sn
             std::uint64_t deferredSkipped = 0;
             auto kinds = CompareWalkedResults(*old, scratch.walked, first, local.feedbackOnly, local.flatFeedback, deferredSkipped, true);
             // The words the walk served without their final value (known values, write evidence,
-            // queued labels) against the capture's own reads of them, and on every 16th dispatch
-            // with any (each waits for the writes pending over its words) against the bytes memory
-            // holds once those writes landed. Either difference is the "served word" kind.
+            // queued labels) against the capture's own reads of them: a difference is the "served
+            // word" kind. On every 16th dispatch with any (each waits for the writes pending over
+            // its words), also against the bytes memory holds once those writes landed: counted
+            // apart by source, not a kind, since the capture at the same point serves an evidence
+            // word's stale value the same way.
             if (const auto& served = FastServedWords().words; !served.empty()) {
                 local.servedCompared += served.size();
                 const auto differing = CompareServedWords(served, regions, local.servedUnread);
@@ -216,7 +218,7 @@ bool Driver::fastDispatch(const Submission& submission, const ShaderSnapshot& sn
                 local.servedFinal.compared += check.compared;
                 local.servedFinal.unreadable += check.unreadable;
                 for (std::size_t source = 0; source < check.mismatched.size(); ++source) local.servedFinal.mismatched[source] += check.mismatched[source];
-                if (differing != 0 || check.Mismatched() != 0) {
+                if (differing != 0) {
                     if (kinds == 0) first = {WalkMismatch::Served, 0, 0, 0, 0};
                     kinds |= 1u << static_cast<unsigned>(WalkMismatch::Served);
                 }
