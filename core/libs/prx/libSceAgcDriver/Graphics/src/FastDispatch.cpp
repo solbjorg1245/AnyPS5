@@ -400,6 +400,8 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
     if (indirect) context.Resolved(&DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentBuffer, argumentOffset);
     else context.Resolved(&DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, call.x, call.y, call.z);
     recorder.EndGpuTiming(gpuTiming);
+    // APS5_PROFILE_GPU: everything a fast dispatch binds is in place (its [gputime] MiB read/written).
+    if (gpuTiming != Recorder::NoTiming) recorder.NoteInPlace(gpuTiming, Recorder::InPlaceUseOf(scratch.reads, scratch.written));
     const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
     constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);

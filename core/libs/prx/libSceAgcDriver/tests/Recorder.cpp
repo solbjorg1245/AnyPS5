@@ -2902,13 +2902,193 @@ void residentBufferTests(const Device& device, Recorder& recorder) {
     HostImportFor(context, address, bytes);
 }
 
+bool lineHas(const std::vector<std::string>& lines, const std::string& prefix, const std::string& part) {
+    return std::any_of(lines.begin(), lines.end(), [&](const std::string& line) { return line.rfind(prefix, 0) == 0 && line.find(part) != std::string::npos; });
+}
+
+// The [gputime] digest (APS5_PROFILE_GPU) on synthetic ranges: the in-place byte counts, the
+// program, class, queue and pass totals, the rows and the union, without a device.
+void gpuTimingDigestTests() {
+    using Ranges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    constexpr std::uint64_t MiB = 1048576;
+    const Ranges reads{{0x1000, 0x3000}, {0x2000, 0x4000}, {0x8000, 0x9000}};
+    const Ranges writes{{0x3800, 0x8800}};
+    const Ranges inputs{{0x0, 0x100}, {0x80, 0x200}};
+    auto use = Recorder::InPlaceUseOf(reads, writes, inputs);
+    Require(use.read == 0x4000 && use.written == 0x1000 && use.inputs == 0x200 && !use.leased, "InPlaceUseOf: wrong union or written bytes");
+    use = Recorder::InPlaceUseOf(reads, writes, inputs, true);
+    Require(use.read == 0 && use.written == 0 && use.inputs == 0x200 && use.leased, "InPlaceUseOf: an address-based build kept its reads");
+    using Kind = Recorder::TimingKind;
+    using Class = Recorder::CommandClass;
+    const auto range = [](std::uint64_t key, Kind kind, std::uint32_t queue, std::uint64_t begin, std::uint64_t end) {
+        Recorder::TimedRange timed;
+        timed.key = key;
+        timed.kind = kind;
+        timed.queue = queue;
+        timed.begin = begin;
+        timed.end = end;
+        return timed;
+    };
+    std::vector<Recorder::TimedRange> ranges;
+    ranges.push_back(range(Recorder::BatchTimingKey, Kind::Batch, 0, 0, 10000));
+    ranges.push_back(range(Recorder::ClassKey(Class::DispatchLeading), Kind::Class, 0, 0, 100));
+    auto program = range(0x248994d00, Kind::Program, 0, 100, 2100);
+    program.inPlaceRead = MiB;
+    program.inPlaceWritten = MiB / 2;
+    ranges.push_back(program);
+    auto copyBack = range(Recorder::ClassKey(Class::StagingOut), Kind::Class, 0, 2100, 5100);
+    copyBack.bytes = 2 * MiB;
+    ranges.push_back(copyBack);
+    ranges.push_back(range(Recorder::ClassKey(Class::Copy), Kind::Class, 1, 5100, 6100));
+    auto transfer = range(0x1234000, Kind::Transfer, 1, 5200, 6000);
+    transfer.bytes = 4096;
+    ranges.push_back(transfer);
+    auto pass = range(Recorder::ClassKey(Class::Draw), Kind::Class, 1, 6100, 9100);
+    pass.target = 0x50000;
+    pass.draws = 3;
+    pass.inPlaceInputs = MiB;
+    pass.inPlaceRead = 2 * MiB;
+    ranges.push_back(pass);
+    GpuTimingDigest digest;
+    // One tick is a microsecond: 1000 ticks are a millisecond.
+    digest.AddBatch(ranges, 1000.0);
+    digest.AddClass(Class::PresentBlit, 700000.0, 4096, 0xffffffffu);
+    const auto approx = [](double value, double want) { return std::abs(value - want) < 1e-6; };
+    Require(digest.Batches() == 1 && approx(digest.BatchMs(), 10) && approx(digest.DispatchMs(), 2) && approx(digest.ProgramMs(), 2.8) && approx(digest.ClassMs(), 7.8) && approx(digest.UnionMs(), 9.1), "digest: wrong sums");
+    Require(digest.Dispatches().count == 1 && digest.Dispatches().read == MiB && digest.Dispatches().written == MiB / 2, "digest: wrong dispatch in-place bytes");
+    Require(digest.Transfers().count == 1 && approx(digest.Transfers().ms, 0.8) && digest.Programs().count(0x1234000) == 1 && digest.Programs().count(0x248994d00) == 1, "digest: wrong program keys");
+    Require(digest.Class(Class::StagingOut).bytes == 2 * MiB && approx(digest.Class(Class::StagingOut).ms, 3), "digest: wrong copy-back class");
+    const auto& queues = digest.Queues();
+    Require(queues.count(0) == 1 && queues.count(1) == 1 && queues.count(0xffffffffu) == 1, "digest: missing queues");
+    Require(approx(queues.at(0).timedMs, 5.1) && approx(queues.at(0).programMs, 2) && approx(queues.at(0).classMs, 3.1) && approx(queues.at(0).batchMs, 10) && queues.at(0).batches == 1, "digest: wrong queue 0 split");
+    Require(approx(queues.at(1).timedMs, 4) && approx(queues.at(1).programMs, 0) && approx(queues.at(1).classMs, 4) && queues.at(1).ranges == 3, "digest: wrong queue 1 split (a transfer counted as a dispatch?)");
+    Require(digest.Passes().count(0x50000) == 1 && digest.Passes().at(0x50000).draws == 3 && digest.Passes().at(0x50000).inputs == MiB && approx(digest.Passes().at(0x50000).ms, 3), "digest: wrong draw pass");
+    const auto lines = digest.Report(2, 0, 512);
+    Require(lines.size() == 15, "digest: wrong report line count");
+    Require(lines.front().rfind("[gputime] 3 ms of GPU time in 1 batches", 0) == 0 && lines.front().find(" 0x248994d00 x1 2ms r1.0/w0.5MiB") != std::string::npos, "digest: wrong program line");
+    Require(lineHas(lines, "[gputime] row busy:", "5.00 ms per present") && lineHas(lines, "[gputime] row programs:", "1.00 ms per present (20.0% of busy)"), "digest: wrong busy or programs row");
+    Require(lineHas(lines, "[gputime] row copy-back:", "1.50 ms per present (30.0% of busy), x0.5, 1.00 MiB"), "digest: wrong copy-back row");
+    Require(lineHas(lines, "[gputime] row barriers:", "0.05 ms per present") && lineHas(lines, "[gputime] row guest-transfers:", "0.50 ms per present") && lineHas(lines, "[gputime] row untimed:", "0.45 ms per present"), "digest: wrong barrier, guest or untimed row");
+    Require(lineHas(lines, "[gputime] row present-blit:", "0.35 ms per present"), "digest: wrong present-blit row");
+    Require(lineHas(lines, "[gputime] by queue", "0x0 timed 2.55") && lineHas(lines, "[gputime] by queue", "0x1 timed 2.00") && lineHas(lines, "[gputime] by queue", "untagged timed 0.35"), "digest: wrong queue line");
+    Require(lineHas(lines, "[gputime] draw passes by target", "0x50000 1.50ms x0.5 1.5d 0.5/1.0MiB"), "digest: wrong draw pass line");
+    digest.Clear();
+    Require(digest.Batches() == 0 && digest.Programs().empty() && digest.Queues().empty() && digest.Passes().empty() && digest.Class(Class::StagingOut).count == 0, "digest: Clear left totals");
+    std::cout << "gpu timing digest checked\n";
+}
+
+// APS5_PROFILE_GPU=1 runs (the timing switch is read once): a timed range leaves the queued
+// copy-backs queued and the barrier-merge state as it was, and the ranges reach the digest with
+// their queue tag, in-place bytes, pass target and kind.
+void gpuTimingRecorderTests(const Device& device, Recorder& recorder) {
+    if (!Recorder::GpuTimingEnabled()) {
+        std::cout << "gpu timing off: recorded ranges not tested (run with APS5_PROFILE_GPU=1)\n";
+        return;
+    }
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: gpu timing under coalescing not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the gpu timing test block");
+    std::memset(block, 0, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr) {
+        std::cout << "host import of the gpu timing test block refused: gpu timing under coalescing not tested\n";
+        return;
+    }
+    {
+        _putenv_s("APS5_COALESCE_COPY_BACKS", "1");
+        Recorder coalescing(context);
+        _putenv_s("APS5_COALESCE_COPY_BACKS", "");
+        Require(coalescing.CoalescesCopyBacks(), "APS5_COALESCE_COPY_BACKS=1 did not turn coalescing on");
+        coalescing.Activate();
+        auto source = std::make_shared<Buffer>(context, 4096, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        for (std::size_t at = 0; at < 4096; ++at) source->Bytes()[at] = std::byte{static_cast<unsigned char>(at * 5 + 3)};
+        using Class = Recorder::CommandClass;
+        using Reason = Recorder::FlushReason;
+        const auto before = Recorder::CopyBackCounts();
+        coalescing.DeferCopies({Recorder::DeferredCopy{source, source.get(), source->Handle(), import->buffer, 0, address - import->base, 1024, address}});
+        static_cast<void>(coalescing.CommandsKeepingCopyBacks());
+        // A staging copy-in's range (GuestBufferMemory::recordGpuCopies times its pass this way).
+        const auto stagingIn = coalescing.BeginGpuTiming(Class::StagingIn);
+        Require(stagingIn != Recorder::NoTiming, "a timed range was not begun");
+        Require(coalescing.HasDeferredCopies() && coalescing.DeferredCopyBytes() == 1024, "a timed range recorded the queued copy-backs");
+        coalescing.EndGpuTiming(stagingIn, 64);
+        // A program range on queue 7 with its in-place bytes.
+        const auto tag = AgcDriver::GuestMemory::GpuLockThreadTag();
+        AgcDriver::GuestMemory::TagGpuLockThread(7);
+        const auto program = coalescing.BeginGpuTiming(0xabc000);
+        AgcDriver::GuestMemory::TagGpuLockThread(tag);
+        const std::vector<std::pair<std::uint64_t, std::uint64_t>> reads{{0x10000, 0x18000}}, written{{0x14000, 0x20000}};
+        coalescing.NoteInPlace(program, Recorder::InPlaceUseOf(reads, written));
+        coalescing.EndGpuTiming(program);
+        // The barrier-merge state survives a range begun after the command that set it.
+        constexpr VkAccessFlags marked = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        coalescing.MarkCovered(marked);
+        const auto fill = coalescing.BeginGpuTiming(Class::Fill);
+        VkAccessFlags covered = 0;
+        static_cast<void>(coalescing.CommandsKeepingCopyBacks(&covered));
+        Require(covered == marked, "a timed range cleared the barrier-merge state");
+        coalescing.EndGpuTiming(fill);
+        // A pass of two draws, named by its first draw's target; a copy's transfer.
+        const auto pass = coalescing.BeginGpuTiming(Class::Draw);
+        Recorder::InPlaceUse drawUse;
+        drawUse.inputs = 4096;
+        coalescing.NoteDrawInPass(pass, 0x70000, drawUse);
+        coalescing.NoteDrawInPass(pass, 0x80000, drawUse);
+        coalescing.EndGpuTiming(pass);
+        const auto transfer = coalescing.BeginTransferTiming(0xdef000);
+        coalescing.EndGpuTiming(transfer, 256);
+        Require(coalescing.HasDeferredCopies(), "the timed ranges recorded the queued copy-back");
+        // A range left open (a throw between Begin and End): Submit ends it, or the reap would
+        // wait for its query forever.
+        static_cast<void>(coalescing.BeginGpuTiming(Class::DccClear));
+        coalescing.Submit();
+        coalescing.Sync();
+        const auto counts = Recorder::CopyBackCounts();
+        const auto flushes = [&](Reason reason) { return counts.flushes[static_cast<std::size_t>(reason)] - before.flushes[static_cast<std::size_t>(reason)]; };
+        Require(flushes(Reason::Command) == 0 && flushes(Reason::Submit) == 1 && counts.passes - before.passes == 1, "profiling changed the copy-back passes");
+        Require(static_cast<const volatile unsigned char*>(block)[100] == static_cast<unsigned char>(100 * 5 + 3), "the queued copy-back did not land at Submit");
+        const auto totals = Recorder::GpuTimingTotals();
+        Require(totals.Batches() >= 1 && totals.BatchMs() > 0, "the batch range was not read");
+        Require(totals.Class(Class::StagingIn).count >= 1 && totals.Class(Class::StagingIn).bytes >= 64, "the staging-in range was not read");
+        Require(totals.Programs().count(0xabc000) == 1 && totals.Programs().at(0xabc000).read == 0x8000 && totals.Programs().at(0xabc000).written == 0x4000, "the program range lost its in-place bytes");
+        Require(totals.Queues().count(7) == 1 && totals.Queues().at(7).ranges >= 1, "the program range lost its queue tag");
+        Require(totals.Passes().count(0x70000) == 1 && totals.Passes().at(0x70000).draws == 2 && totals.Passes().at(0x70000).inputs == 8192, "the draw pass lost its target or draws");
+        Require(totals.Transfers().count >= 1 && totals.Programs().count(0xdef000) == 1, "the transfer range was not read as a transfer");
+        Require(totals.Class(Class::DccClear).count >= 1, "the range left open was not ended at Submit");
+    }
+    recorder.Activate();
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    std::cout << "gpu timing under coalescing checked\n";
+}
+
 int main() {
     try {
+        gpuTimingDigestTests();
         Device device;
         std::lock_guard gpu(GpuMutex());
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        // First: the 10 s [gputime] report clears the totals it reads.
+        gpuTimingRecorderTests(device, recorder);
         readTrackingTests(device, recorder);
         writeSettledTests(device, recorder);
         pendingBlockTests(device, recorder);
