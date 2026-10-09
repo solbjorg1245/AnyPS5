@@ -1,8 +1,9 @@
-// Video-memory budget (Graphics::VramBudget, port/reports/s53-gpu3-vram.md): the accounting by
-// class, the target and the pressure it derives, the order the reclaimers run in, the refusals of
-// allocations with a fallback, and a scripted area load against a simulated 2 GiB heap that
-// completes without a refused allocation while the budget is on (and refuses with it off, the
-// t421-t424 failure). Pure arithmetic: no Vulkan device.
+// Video-memory budget (Graphics::VramBudget, port/reports/s53-gpu3-vram.md, -fix.md): the
+// accounting by class, the target and the pressure it derives, the order the reclaimers run in and
+// their spacing, the epochs and the safe-point spacing, the refusals of allocations with a
+// fallback, and a scripted area load against a simulated 2 GiB heap that completes without a
+// refused allocation while the budget is on (and refuses with it off, the t421-t424 failure). Pure
+// arithmetic: no Vulkan device.
 #include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
 #include <algorithm>
 #include <cstdint>
@@ -92,10 +93,16 @@ void targetTests() {
     // Never below min(heap / 4, 1 GiB), whatever another process took.
     budget.Report(512 * Mib, 400 * Mib);
     Require(budget.Target() == Gib, "target: a tiny reported budget went below the floor");
-    // The override is the target.
+    // The override is the target, and it stands for a smaller card: the headroom (and the slack
+    // that counts as room, half of it) is that card's, not the 16 GiB heap's.
     budget.SetTargetOverride(2 * Gib);
     Require(budget.Target() == 2 * Gib, "target: APS5_VRAM_BUDGET_MIB is not the target");
+    budget.SetTargetOverride(7680 * Mib);
+    Require(budget.Headroom() == 480 * Mib && budget.SlackRoom() == 240 * Mib, "target: the headroom of an overridden target is not the override's sixteenth");
+    budget.SetTargetOverride(4096 * Mib);
+    Require(budget.Headroom() == 256 * Mib, "target: the headroom of a 4 GiB override is not 256 MiB");
     budget.SetTargetOverride(0);
+    Require(budget.Headroom() == Gib, "target: without the override the headroom is not the heap's again");
     budget.SetHeadroom(64 * Mib);
     budget.Report(14 * Gib, 3 * Gib);
     Require(budget.Target() == 14 * Gib - 64 * Mib, "target: APS5_VRAM_HEADROOM_MIB is not the headroom");
@@ -118,6 +125,17 @@ void usedTests() {
     Require(budget.Used() == 2 * Gib, "used: a free after the report did not count");
     budget.ClearReport();
     Require(budget.Used() == Gib, "used: a cleared report still counts");
+    // Moves between classes (the pool taking and returning, slack becoming textures) never change
+    // the total a report pairs its usage with.
+    budget.Report(15 * Gib, 6 * Gib);
+    budget.Move(VramClass::Buffers, VramClass::Pool, 512 * Mib);
+    budget.Reclass(device, fakeMemory(2), VramClass::Pool);
+    Require(budget.Tracked() == Gib && budget.Used() == 6 * Gib, "used: a move between classes changed the use");
+    budget.Report(15 * Gib, 6 * Gib);
+    Require(budget.Used() == 6 * Gib, "used: a report after a move does not hold its usage");
+    // A move of more than the class holds moves what it holds (the total stays).
+    budget.Move(VramClass::Targets, VramClass::Other, Gib);
+    Require(budget.Tracked() == Gib && budget.Tracked(VramClass::Other) == 0, "used: a move out of an empty class added bytes");
     std::printf("vram used: ok\n");
 }
 
@@ -128,11 +146,12 @@ void excessTests() {
     budget.SetTargetOverride(Gib);
     budget.NoteAllocation(device, fakeMemory(1), VramClass::Buffers, Gib);
     Require(budget.Excess() == 0 && budget.Excess(Mib) == Mib && budget.Over(Mib), "excess: an allocation past the target is not over it");
-    // Slack counts as room up to the headroom (4 GiB heap: 256 MiB), no further.
-    budget.NoteAllocation(device, fakeMemory(2), VramClass::Slack, 200 * Mib);
-    Require(budget.Excess() == 0, "excess: slack within the headroom counts as pressure");
+    // Slack counts as room up to half the headroom (a 1 GiB override: 256 MiB, so 128), no
+    // further: the other half stays free below the limit.
+    budget.NoteAllocation(device, fakeMemory(2), VramClass::Slack, 100 * Mib);
+    Require(budget.Excess() == 0, "excess: slack within the slack room counts as pressure");
     budget.NoteAllocation(device, fakeMemory(3), VramClass::Slack, 200 * Mib);
-    Require(budget.Excess() == 144 * Mib, "excess: slack past the headroom does not count as pressure");
+    Require(budget.Excess() == 172 * Mib, "excess: slack past the slack room does not count as pressure");
     budget.Forget(device, fakeMemory(3));
     budget.Forget(device, fakeMemory(2));
     // Evicted objects whose destruction waits for their batch.
@@ -222,6 +241,87 @@ void reclaimOrderTests() {
     budget.Relieve(VramReclaimLevel::SafePoint);
     Require((calls == std::vector<std::string>{"pool", "shadows", "textures"}), "reclaim: a removed reclaimer was called");
     std::printf("vram reclaim order: ok\n");
+}
+
+// A reclaimer with an interval (the registry walk) is not called again within it even when it
+// freed something; one without is called at every relieve.
+void reclaimIntervalTests() {
+    VramBudget budget(settings());
+    std::uint64_t clock = 1000;
+    budget.SetClock([&] { return clock; });
+    budget.SetHeap(4 * Gib);
+    budget.SetTargetOverride(Gib);
+    budget.Add(VramClass::Targets, Gib + 100 * Mib);
+    int spaced = 0;
+    int every = 0;
+    budget.AddReclaimer("every", VramReclaimLevel::Inline, 0, [&](VkDeviceSize, std::uint64_t& evicted) -> VkDeviceSize {
+        ++every;
+        evicted = 1;
+        return Mib;
+    });
+    budget.AddReclaimer("spaced", VramReclaimLevel::Inline, 10, [&](VkDeviceSize, std::uint64_t& evicted) -> VkDeviceSize {
+        ++spaced;
+        evicted = 1;
+        return Mib;
+    }, 10);
+    budget.Relieve(VramReclaimLevel::Inline);
+    clock += 5;
+    budget.Relieve(VramReclaimLevel::Inline);
+    Require(every == 2 && spaced == 1, "interval: a reclaimer was called within its interval");
+    clock += 5;
+    budget.Relieve(VramReclaimLevel::Inline);
+    Require(every == 3 && spaced == 2, "interval: a reclaimer was not called after its interval");
+    std::printf("vram reclaim interval: ok\n");
+}
+
+// Epochs end at a present 100 ms after the last end, or at any safe point 500 ms after it; an
+// entry is old enough once MinAge epochs passed since its use. A SafePoint relieve away from the
+// present runs at most every 16 ms, and not again in an epoch one fell short in.
+void epochTests() {
+    VramBudget budget(settings());
+    std::uint64_t clock = 1000;
+    budget.SetClock([&] { return clock; });
+    Require(budget.MinAge() == 3 && budget.Epoch() == 1, "epoch: the defaults are not epoch 1 and an age of 3");
+    Require(budget.AdvanceEpoch(true) && budget.Epoch() == 2, "epoch: the first present did not end the epoch");
+    clock += 50;
+    Require(!budget.AdvanceEpoch(true) && budget.Epoch() == 2, "epoch: a present 50 ms after the last end ended the epoch");
+    clock += 50;
+    Require(budget.AdvanceEpoch(true) && budget.Epoch() == 3, "epoch: a present 100 ms after the last end did not end the epoch");
+    clock += 300;
+    Require(!budget.AdvanceEpoch(false) && budget.Epoch() == 3, "epoch: a safe point 300 ms after the last end ended the epoch");
+    clock += 200;
+    Require(budget.AdvanceEpoch(false) && budget.Epoch() == 4, "epoch: a safe point 500 ms after the last end (presents stalled) did not end the epoch");
+    Require(budget.Aged(1) && !budget.Aged(2) && !budget.Aged(4), "epoch: the age of 3 epochs is not judged from the last use");
+    budget.SetMinAge(0);
+    Require(budget.Aged(4), "epoch: with no minimum age an entry used now is not old enough");
+    budget.SetMinAge(3);
+
+    // Safe points.
+    budget.SetHeap(4 * Gib);
+    budget.SetTargetOverride(Gib);
+    budget.Add(VramClass::Targets, Gib + 100 * Mib);
+    Require(budget.SafePointDue(false) && budget.SafePointDue(true), "safe point: the first one is not due");
+    VkDeviceSize available = 200 * Mib;
+    budget.AddReclaimer("textures", VramReclaimLevel::SafePoint, 20, [&](VkDeviceSize want, std::uint64_t& evicted) -> VkDeviceSize {
+        const auto freed = std::min(want, available);
+        available -= freed;
+        evicted = freed != 0 ? 1 : 0;
+        return freed;
+    });
+    // Freed what it had to (no shortfall): spaced 16 ms apart away from the present.
+    budget.Relieve(VramReclaimLevel::SafePoint, 50 * Mib);
+    Require(budget.Shortfalls() == 0, "safe point: a relieve that freed the excess fell short");
+    clock += 10;
+    Require(!budget.SafePointDue(false) && budget.SafePointDue(true), "safe point: one 10 ms after the last is due away from the present");
+    clock += 6;
+    Require(budget.SafePointDue(false), "safe point: one 16 ms after the last is not due");
+    // Short: not again in this epoch, except at the present; due again once the epoch ended.
+    budget.Relieve(VramReclaimLevel::SafePoint, Gib);
+    Require(budget.Shortfalls() == 1, "safe point: a relieve that could not free the excess was no shortfall");
+    clock += 100;
+    Require(!budget.SafePointDue(false) && budget.SafePointDue(true), "safe point: one in the epoch of a shortfall is due away from the present");
+    Require(budget.AdvanceEpoch(true) && budget.SafePointDue(false), "safe point: one after the epoch of a shortfall ended is not due");
+    std::printf("vram epochs and safe points: ok\n");
 }
 
 void admitTests() {
@@ -460,6 +560,8 @@ int main() {
         usedTests();
         excessTests();
         reclaimOrderTests();
+        reclaimIntervalTests();
+        epochTests();
         admitTests();
         smallBudgetTests();
         classScopeTests();

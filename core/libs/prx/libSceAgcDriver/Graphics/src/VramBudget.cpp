@@ -22,10 +22,12 @@ VkDeviceSize mibSetting(const char* name) {
     return value != nullptr ? static_cast<VkDeviceSize>(std::strtoull(value, nullptr, 10)) * Mib : 0;
 }
 
-void subtractClamped(std::atomic<VkDeviceSize>& counter, VkDeviceSize bytes) {
+// Returns what was subtracted (less than `bytes` only when the counter held less).
+VkDeviceSize subtractClamped(std::atomic<VkDeviceSize>& counter, VkDeviceSize bytes) {
     auto current = counter.load(std::memory_order_relaxed);
     while (!counter.compare_exchange_weak(current, current > bytes ? current - bytes : 0, std::memory_order_relaxed)) {
     }
+    return std::min(current, bytes);
 }
 
 void raiseTo(std::atomic<VkDeviceSize>& counter, VkDeviceSize value) {
@@ -60,10 +62,11 @@ VramBudget::Settings VramBudget::Settings::FromEnvironment() {
     settings.enabled = std::getenv("APS5_NO_VRAM_BUDGET") == nullptr;
     settings.target = mibSetting("APS5_VRAM_BUDGET_MIB");
     settings.headroom = mibSetting("APS5_VRAM_HEADROOM_MIB");
+    if (const char* value = std::getenv("APS5_VRAM_MIN_AGE"); value != nullptr && *value != 0) settings.minAge = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
     return settings;
 }
 
-VramBudget::VramBudget(const Settings& settings) : enabled(settings.enabled), targetOverride(settings.target), headroomSetting(settings.headroom), backoffMs(settings.backoffMs) {}
+VramBudget::VramBudget(const Settings& settings) : enabledBySettings(settings.enabled), enabled(settings.enabled), targetOverride(settings.target), headroomSetting(settings.headroom), backoffMs(settings.backoffMs), minAge(settings.minAge) {}
 
 void VramBudget::SetClock(std::function<std::uint64_t()> value) {
     std::lock_guard lock(reclaimersMutex);
@@ -77,7 +80,9 @@ std::uint64_t VramBudget::now() const {
 void VramBudget::Report(VkDeviceSize budget, VkDeviceSize usage) {
     reportedBudget.store(budget, std::memory_order_relaxed);
     reportedUsage.store(usage, std::memory_order_relaxed);
-    trackedAtReport.store(Tracked(), std::memory_order_relaxed);
+    // One store: Used() pairs this usage with the total it was taken against, or the previous
+    // report's pair, never a mix.
+    usageOffset.store(static_cast<std::int64_t>(usage) - static_cast<std::int64_t>(Tracked()), std::memory_order_relaxed);
     reported.store(true, std::memory_order_release);
 }
 
@@ -85,21 +90,25 @@ void VramBudget::ClearReport() {
     reported.store(false, std::memory_order_release);
     reportedBudget.store(0, std::memory_order_relaxed);
     reportedUsage.store(0, std::memory_order_relaxed);
+    usageOffset.store(0, std::memory_order_relaxed);
 }
 
 void VramBudget::Add(VramClass type, VkDeviceSize bytes) {
     tracked[static_cast<std::size_t>(type)].fetch_add(bytes, std::memory_order_relaxed);
+    trackedTotal.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 void VramBudget::Remove(VramClass type, VkDeviceSize bytes) {
-    subtractClamped(tracked[static_cast<std::size_t>(type)], bytes);
+    const auto removed = subtractClamped(tracked[static_cast<std::size_t>(type)], bytes);
+    subtractClamped(trackedTotal, removed);
 }
 
 void VramBudget::Move(VramClass from, VramClass to, VkDeviceSize bytes) {
     if (from == to || bytes == 0) return;
-    // Added first: a concurrent reader may see the bytes twice for an instant, never none.
-    Add(to, bytes);
-    Remove(from, bytes);
+    // The total does not change: a reader of a class may miss the bytes for an instant, a report
+    // never does.
+    const auto moved = subtractClamped(tracked[static_cast<std::size_t>(from)], bytes);
+    tracked[static_cast<std::size_t>(to)].fetch_add(moved, std::memory_order_relaxed);
 }
 
 VkDeviceSize VramBudget::Tracked(VramClass type) const {
@@ -107,9 +116,7 @@ VkDeviceSize VramBudget::Tracked(VramClass type) const {
 }
 
 VkDeviceSize VramBudget::Tracked() const {
-    VkDeviceSize total = 0;
-    for (const auto& value : tracked) total += value.load(std::memory_order_relaxed);
-    return total;
+    return trackedTotal.load(std::memory_order_relaxed);
 }
 
 void VramBudget::NoteAllocation(VkDevice device, VkDeviceMemory memory, VramClass type, VkDeviceSize bytes) {
@@ -158,7 +165,9 @@ std::size_t VramBudget::Allocations() const {
 
 VkDeviceSize VramBudget::Headroom() const {
     if (const auto value = headroomSetting.load(std::memory_order_relaxed); value != 0) return value;
-    const auto size = Heap();
+    // An override stands for a smaller card: its headroom is that card's, not the real heap's.
+    const auto override = targetOverride.load(std::memory_order_relaxed);
+    const auto size = override != 0 ? override : Heap();
     return std::clamp<VkDeviceSize>(size / 16, 256 * Mib, 1024 * Mib);
 }
 
@@ -180,7 +189,7 @@ VkDeviceSize VramBudget::Used() const {
     const auto own = Tracked();
     if (!Reported()) return own;
     // The driver's figure at the last report, moved by what the accounting saw since.
-    const auto base = static_cast<std::int64_t>(ReportedUsage()) + static_cast<std::int64_t>(own) - static_cast<std::int64_t>(trackedAtReport.load(std::memory_order_relaxed));
+    const auto base = static_cast<std::int64_t>(own) + usageOffset.load(std::memory_order_relaxed);
     return base > 0 ? static_cast<VkDeviceSize>(base) : 0;
 }
 
@@ -197,14 +206,14 @@ VkDeviceSize VramBudget::Excess(VkDeviceSize extra) const {
     const auto target = Target();
     if (target == ~VkDeviceSize{0}) return 0;
     const auto used = Used();
-    // Slack serves the next pooled textures, but not buffers or dedicated images: at most the
-    // headroom of it counts as room, so used memory stays within the target plus the headroom.
-    const auto relief = Pending() + std::min(Tracked(VramClass::Slack), Headroom());
+    // Slack serves the next pooled textures, but not buffers or dedicated images: at most half the
+    // headroom of it counts as room, so used memory stays half the headroom below the limit.
+    const auto relief = Pending() + std::min(Tracked(VramClass::Slack), SlackRoom());
     const auto pressure = (used > relief ? used - relief : 0) + extra;
     return pressure > target ? pressure - target : 0;
 }
 
-std::uint64_t VramBudget::AddReclaimer(const char* name, VramReclaimLevel level, int order, ReclaimFunction reclaim) {
+std::uint64_t VramBudget::AddReclaimer(const char* name, VramReclaimLevel level, int order, ReclaimFunction reclaim, std::uint32_t intervalMs) {
     std::lock_guard lock(reclaimersMutex);
     Reclaimer entry;
     const auto id = nextReclaimerId++;
@@ -212,6 +221,7 @@ std::uint64_t VramBudget::AddReclaimer(const char* name, VramReclaimLevel level,
     entry.name = name;
     entry.level = level;
     entry.order = order;
+    entry.intervalMs = intervalMs;
     entry.reclaim = std::move(reclaim);
     const auto at = std::upper_bound(reclaimers.begin(), reclaimers.end(), order, [](int value, const Reclaimer& other) { return value < other.order; });
     reclaimers.insert(at, std::move(entry));
@@ -238,6 +248,10 @@ VkDeviceSize VramBudget::Relieve(VramReclaimLevel level, VkDeviceSize extra) {
     {
         std::lock_guard lock(reclaimersMutex);
         const auto at = now();
+        if (level == VramReclaimLevel::SafePoint) {
+            lastSafePointAt.store(at, std::memory_order_relaxed);
+            safePointRan.store(true, std::memory_order_relaxed);
+        }
         const auto backoff = backoffMs.load(std::memory_order_relaxed);
         for (auto& entry : reclaimers) {
             if (static_cast<int>(entry.level) > static_cast<int>(level) || at < entry.retryAt) continue;
@@ -254,7 +268,7 @@ VkDeviceSize VramBudget::Relieve(VramReclaimLevel level, VkDeviceSize extra) {
             entry.bytes += got;
             entry.windowEvicted += evicted;
             entry.windowBytes += got;
-            if (got == 0) entry.retryAt = at + backoff;
+            entry.retryAt = at + (got == 0 ? backoff : entry.intervalMs);
             freed += got;
             if (freed >= excess) break;
         }
@@ -262,8 +276,25 @@ VkDeviceSize VramBudget::Relieve(VramReclaimLevel level, VkDeviceSize extra) {
     if (freed < excess) {
         shortfalls.fetch_add(1, std::memory_order_relaxed);
         windowShortfalls.fetch_add(1, std::memory_order_relaxed);
+        if (level == VramReclaimLevel::SafePoint) shortEpoch.store(Epoch(), std::memory_order_relaxed);
     }
     return freed;
+}
+
+bool VramBudget::AdvanceEpoch(bool present) {
+    const auto at = now();
+    auto last = epochEndedAt.load(std::memory_order_relaxed);
+    if (at < last + (present ? 100u : 500u)) return false;
+    if (!epochEndedAt.compare_exchange_strong(last, at, std::memory_order_relaxed)) return false;
+    epoch.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool VramBudget::SafePointDue(bool present) const {
+    if (present) return true;
+    if (shortEpoch.load(std::memory_order_relaxed) == Epoch()) return false;
+    if (!safePointRan.load(std::memory_order_relaxed)) return true;
+    return now() >= lastSafePointAt.load(std::memory_order_relaxed) + 16;
 }
 
 bool VramBudget::Admit(VramClass type, VkDeviceSize bytes) {
@@ -463,7 +494,10 @@ void maybeDigest() {
         std::lock_guard lock(state.mutex);
         census = state.census;
     }
-    const auto line = Vram().Digest(true, census ? census() : std::string{});
+    // The census walks the caches: only where the reclaimers act (an observing budget, the
+    // APS5_NO_VRAM_BUDGET=1 control arm, gets no stall from it).
+    auto& budget = Vram();
+    const auto line = budget.Digest(true, !budget.Enabled() ? std::string("; cold: not counted (not enforced)") : census ? census() : std::string{});
     std::fputs(line.c_str(), stderr);
 }
 
@@ -519,7 +553,7 @@ void FreeDeviceMemory(const Context& context, VkDeviceMemory memory) {
     context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
 }
 
-void ConfigureVram(const Context& context, PFN_vkGetPhysicalDeviceMemoryProperties2 query, const std::shared_ptr<BufferPool>& pool, bool unified) {
+void ConfigureVram(const Context& context, PFN_vkGetPhysicalDeviceMemoryProperties2 query, const std::shared_ptr<BufferPool>& pool, bool integrated) {
     auto& budget = Vram();
     auto& state = driverVram();
     std::uint32_t type = 0;
@@ -531,9 +565,17 @@ void ConfigureVram(const Context& context, PFN_vkGetPhysicalDeviceMemoryProperti
     }
     const auto heapIndex = context.memory.memoryTypes[type].heapIndex;
     // A unified-memory device (an APU, the Steam Deck) spills its small DEVICE_LOCAL carve-out into
-    // system memory instead of refusing: every heap is budgeted, against their budgets together.
-    // APS5_VRAM_UNIFIED=1/0 overrides the device type.
-    if (const char* value = std::getenv("APS5_VRAM_UNIFIED"); value != nullptr) unified = std::strcmp(value, "0") != 0;
+    // system memory instead of refusing: every heap is accounted, against their budgets together.
+    // Their usage holds the host imports of guest memory (up to APS5_HOST_IMPORT_MIB) and the
+    // pool's host tiers, which no reclaimer frees, and the policy never ran on such a device: it
+    // only observes there. APS5_VRAM_UNIFIED=1 enforces it over every heap, =0 over the
+    // DEVICE_LOCAL heap alone, on any device.
+    bool unified = integrated;
+    bool enforce = budget.EnabledBySettings();
+    const char* unifiedSetting = std::getenv("APS5_VRAM_UNIFIED");
+    if (unifiedSetting != nullptr && *unifiedSetting != 0) unified = std::strcmp(unifiedSetting, "0") != 0;
+    else if (integrated) enforce = false;
+    budget.SetEnabled(enforce);
     std::uint32_t mask = 1u << heapIndex;
     VkDeviceSize heapBytes = context.memory.memoryHeaps[heapIndex].size;
     if (unified) {
@@ -569,7 +611,8 @@ void ConfigureVram(const Context& context, PFN_vkGetPhysicalDeviceMemoryProperti
     }
     refreshReport(true);
     const auto target = budget.Target();
-    std::fprintf(stderr, "[vram] heaps 0x%x%s: %llu MiB, VK_EXT_memory_budget %s (budget %llu MiB, usage %llu MiB), target %llu MiB, headroom %llu MiB%s\n", mask, unified ? " (unified memory)" : "", asMib(budget.Heap()), query != nullptr ? "on" : "off", asMib(budget.ReportedBudget()), asMib(budget.ReportedUsage()), target == ~VkDeviceSize{0} ? 0ull : asMib(target), asMib(budget.Headroom()), budget.Enabled() ? "" : "; enforcement off (APS5_NO_VRAM_BUDGET=1): accounting only");
+    const char* off = budget.Enabled() ? "" : !budget.EnabledBySettings() ? "; enforcement off (APS5_NO_VRAM_BUDGET=1): accounting only" : "; enforcement off on an integrated GPU (APS5_VRAM_UNIFIED=1 enforces): accounting only";
+    std::fprintf(stderr, "[vram] heaps 0x%x%s: %llu MiB, VK_EXT_memory_budget %s (budget %llu MiB, usage %llu MiB), target %llu MiB, headroom %llu MiB (slack room %llu), min age %u epochs%s\n", mask, unified ? " (unified memory)" : "", asMib(budget.Heap()), query != nullptr ? "on" : "off", asMib(budget.ReportedBudget()), asMib(budget.ReportedUsage()), target == ~VkDeviceSize{0} ? 0ull : asMib(target), asMib(budget.Headroom()), asMib(budget.SlackRoom()), budget.MinAge(), off);
 }
 
 void ReleaseVram(VkDevice device) {
@@ -585,6 +628,8 @@ void ReleaseVram(VkDevice device) {
         state.poolReclaimer = 0;
     }
     state.configuredDevice.store(VK_NULL_HANDLE, std::memory_order_relaxed);
+    // No heap: no target derived from the device that went (an override still holds).
+    Vram().SetHeap(0);
     Vram().ClearReport();
     if (pool != 0) Vram().RemoveReclaimer(pool);
 }
@@ -592,6 +637,15 @@ void ReleaseVram(VkDevice device) {
 void RelieveVram() {
     refreshReport(false);
     auto& budget = Vram();
+    budget.AdvanceEpoch(false);
+    if (budget.Over() && budget.SafePointDue(false)) budget.Relieve(VramReclaimLevel::SafePoint);
+    maybeDigest();
+}
+
+void VramPresent() {
+    refreshReport(false);
+    auto& budget = Vram();
+    budget.AdvanceEpoch(true);
     if (budget.Over()) budget.Relieve(VramReclaimLevel::SafePoint);
     maybeDigest();
 }

@@ -2243,12 +2243,14 @@ CopyStats& Copies() {
 
 // A shadow the device cannot provide (device memory or the allocation count exhausted: every
 // shadow is its own VkDeviceMemory, retained by cached builds) is no error: nullptr, and the
-// region takes the path it would take without staging (Region::unstaged).
-std::shared_ptr<Buffer> stagingBuffer(const Context& context, std::size_t bytes, VkBufferUsageFlags usage) {
+// region takes the path it would take without staging (Region::unstaged). `budgetRefused`: set
+// when the video-memory budget refused it (no allocation was tried).
+std::shared_ptr<Buffer> stagingBuffer(const Context& context, std::size_t bytes, VkBufferUsageFlags usage, bool* budgetRefused = nullptr) {
     // Over the video-memory budget the region binds in place instead (the path a refused shadow
     // takes); APS5_NO_VRAM_BUDGET=1: always admitted.
     if (!AdmitVram(VramClass::Buffers, BufferPool::Capacity(bytes))) {
         Copies().stagingRefused.fetch_add(1, std::memory_order_relaxed);
+        if (budgetRefused != nullptr) *budgetRefused = true;
         return nullptr;
     }
     try {
@@ -2976,12 +2978,35 @@ VramCacheCensus StagedShadowCensus() {
     return stagedShadowCensus();
 }
 
-VkDeviceSize GuestBufferMemory::DeviceBytesHeldAlone() const {
-    VkDeviceSize bytes = 0;
-    for (const auto& region : regions) {
-        if (region.buffer != nullptr && region.buffer.use_count() == 1 && region.buffer->DeviceLocalOnly()) bytes += region.buffer->AllocationBytes();
+void ClearStagedShadows(VkDevice device) {
+    std::vector<std::shared_ptr<Buffer>> released;
+    {
+        auto& shadows = stagedShadows();
+        std::lock_guard lock(shadows.mutex);
+        for (auto it = shadows.entries.begin(); it != shadows.entries.end();) {
+            if (it->second.buffer == nullptr || it->second.buffer->Device() != device) {
+                ++it;
+                continue;
+            }
+            if (shadowIndexEnabled()) unindexShadow(shadows, it->second.buffer.get(), it->first);
+            released.push_back(std::move(it->second.buffer));
+            it = shadows.entries.erase(it);
+        }
     }
-    return bytes;
+    // Released here, after the lock: back to the device's pool while it still lives.
+}
+
+VramHeld GuestBufferMemory::DeviceBytesHeldAlone() const {
+    VramHeld held;
+    for (const auto& region : regions) {
+        if (region.buffer == nullptr || !region.buffer->DeviceLocalOnly()) continue;
+        const auto count = region.buffer.use_count();
+        // One other holder: the staging registry (the "shadows" reclaimer frees it next), a
+        // batch or a queued copy-back (freed when they are done), or another build (not freed).
+        if (count == 1) held.alone += region.buffer->AllocationBytes();
+        else if (count == 2) held.shared += region.buffer->AllocationBytes();
+    }
+    return held;
 }
 
 void ShutdownGuestBufferWorkers() {
@@ -3495,12 +3520,16 @@ std::shared_ptr<Buffer> GuestBufferMemory::stagingShadow(Region& region, bool ad
     region.baselineTrusted = false;
     region.baselineInherited = false;
     // Narrow copy-backs: the baseline behind the bytes, device-addressed for the compare pass; a
-    // device that refuses the larger shadow gets the plain one.
+    // device that refuses the larger shadow gets the plain one. One the video-memory budget
+    // refused is not asked for again smaller: over the target the region binds without a shadow
+    // (one refusal counted per region).
     if (const auto delta = narrowBaselineDelta(region.begin, bytes); delta != 0) {
-        if (auto shadow = stagingBuffer(context, static_cast<std::size_t>(delta + bytes), gpuCopyUsage(addressable) | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)) {
+        bool budgetRefused = false;
+        if (auto shadow = stagingBuffer(context, static_cast<std::size_t>(delta + bytes), gpuCopyUsage(addressable) | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, &budgetRefused)) {
             region.baselineDelta = delta;
             return shadow;
         }
+        if (budgetRefused) return nullptr;
     }
     return stagingBuffer(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable));
 }

@@ -1445,10 +1445,13 @@ void outOfVideoMemoryTests(const Device& device) {
 
 // Video-memory budget (VramBudget) on the device: the pool's device tier is accounted as the
 // "pool" class while retained and trimmed least recently retained first; the resource cache evicts
-// only builds it alone holds, least recently used first; and a run that keeps allocating device
-// buffers into a cache (as the resource cache keeps builds and their shadows) against a simulated
-// 64 MiB heap (the fake allocator above) completes without a refused allocation while the budget's
-// target is 40 MiB, and fails with the budget off (APS5_NO_VRAM_BUDGET=1's behaviour), as t421 did.
+// only builds it alone holds, that hold device-local memory and that were not used for the
+// budget's MinAge epochs, least recently used first; a device buffer a recorded batch keeps is not
+// freed under pressure before that batch completed; no image-pool block is opened over the
+// target; and a run that keeps allocating device buffers into a cache (as the resource cache keeps
+// builds and their shadows) against a simulated 64 MiB heap (the fake allocator above) completes
+// without a refused allocation while the budget's target is 40 MiB, and fails with the budget off
+// (APS5_NO_VRAM_BUDGET=1's behaviour), as t421 did.
 void vramBudgetTests(const Device& device) {
     auto& budget = Vram();
     auto& fake = fakeVideoMemory();
@@ -1463,9 +1466,14 @@ void vramBudgetTests(const Device& device) {
     constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     constexpr VkDeviceSize mib = VkDeviceSize{1} << 20u;
     const bool enabledByEnvironment = budget.Enabled();
+    const auto minAge = budget.MinAge();
     ConfigureVram(context, nullptr, pool);
     budget.SetBackoffMs(0);
     budget.SetHeadroom(mib);
+    budget.SetMinAge(2);
+    // The budget's clock (the epochs) in the test's hands.
+    std::uint64_t clockMs = 1000000;
+    budget.SetClock([&clockMs] { return clockMs; });
     std::uint64_t testReclaimer = 0;
     struct Restore {
         VramBudget& budget;
@@ -1473,6 +1481,7 @@ void vramBudgetTests(const Device& device) {
         const Context& context;
         const std::shared_ptr<BufferPool>& pool;
         bool enabled;
+        std::uint32_t minAge;
         std::uint64_t& reclaimer;
         ~Restore() {
             if (reclaimer != 0) budget.RemoveReclaimer(reclaimer);
@@ -1480,12 +1489,21 @@ void vramBudgetTests(const Device& device) {
             budget.SetTargetOverride(0);
             budget.SetHeadroom(0);
             budget.SetBackoffMs(50);
+            budget.SetMinAge(minAge);
+            budget.SetClock(nullptr);
             ReleaseVram(context.device);
             pool->ReleaseDevice();
             fake.budget = ~VkDeviceSize{0};
         }
-    } restore{budget, fake, context, pool, enabledByEnvironment, testReclaimer};
+    } restore{budget, fake, context, pool, enabledByEnvironment, minAge, testReclaimer};
     budget.SetEnabled(true);
+    // Ends `count` epochs (presents 100 ms apart).
+    const auto endEpochs = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            clockMs += 100;
+            Require(budget.AdvanceEpoch(true), "vram budget: a present 100 ms after the last did not end the epoch");
+        }
+    };
 
     // The pool: released device buffers are "pool" while retained, taken back as "buffers", and
     // TrimDevice gives back the least recently retained first.
@@ -1528,20 +1546,93 @@ void vramBudgetTests(const Device& device) {
         ResourceCache cache;
         std::vector<const ShaderResources*> objects;
         std::shared_ptr<ShaderResources> inFlight;
-        for (std::uint32_t i = 0; i < 4; ++i) {
+        for (std::uint32_t i = 0; i < 5; ++i) {
             auto made = std::make_shared<ShaderResources>(device.GetContext(), shader);
             objects.push_back(made.get());
             if (i == 1) inFlight = made;
+            // 4 holds no device-local memory: evicting it would free nothing.
+            if (i != 4) made->HoldDeviceBytesForTests(mib);
             cache.Insert({100 + i}, std::move(made));
         }
-        // Use order, least recent first: 1 (held by in-flight work), 2, 3, 0.
+        // Everything was used in this epoch: nothing is old enough.
+        std::vector<std::shared_ptr<ShaderResources>> victims;
+        Require(cache.EvictCold(~VkDeviceSize{0}, victims).Total() == 0 && victims.empty() && cache.ColdCensus().cold == 0, "vram budget: builds used in this epoch were evicted");
+        endEpochs(2);
+        // Use order, least recent first: 1 (held by in-flight work), 2, 3, 4 (no device memory),
+        // 0 (touched now, in the new epoch).
         Require(cache.Touch({100}), "vram budget: the touch found no entry");
         const auto census = cache.ColdCensus();
-        Require(census.measured && census.entries == 4 && census.cold == 3, "vram budget: the cache's census does not count the cold builds");
-        std::vector<std::shared_ptr<ShaderResources>> victims;
+        Require(census.measured && census.entries == 5 && census.cold == 2 && census.coldBytes == 2 * mib, "vram budget: the cache's census does not count the old cold builds that hold memory");
+        const auto held = cache.EvictCold(~VkDeviceSize{0}, victims);
+        Require(victims.size() == 2 && victims[0].get() == objects[2] && victims[1].get() == objects[3] && held.alone == 2 * mib, "vram budget: the resource cache did not evict its old cold builds least recently used first");
+        Require(cache.Size() == 3 && cache.Find({101}) == inFlight && cache.Find({104}) != nullptr, "vram budget: a build in-flight work holds, or one that holds no memory, was evicted");
+        // 0 was used two epochs after the others: it ages from there.
+        victims.clear();
+        endEpochs(2);
         cache.EvictCold(~VkDeviceSize{0}, victims);
-        Require(victims.size() == 3 && victims[0].get() == objects[2] && victims[1].get() == objects[3] && victims[2].get() == objects[0], "vram budget: the resource cache did not evict its cold builds least recently used first");
-        Require(cache.Size() == 1 && cache.Find({101}) == inFlight, "vram budget: a build in-flight work holds was evicted");
+        Require(victims.size() == 1 && victims[0].get() == objects[0] && cache.Size() == 2, "vram budget: a build did not age from its last use");
+    }
+
+    // A device buffer recorded work uses and a batch keeps: dropped by its owner while the budget is
+    // over its target (released buffers are destroyed, not retained), its memory stays until the
+    // batch completed, then goes back to the driver (the invariant every staged copy relies on:
+    // GuestBufferMemory keeps region.buffer in the batch at record time).
+    {
+        // A fresh allocation (nothing retained to take), found by its handle.
+        pool->ReleaseDevice();
+        std::map<VkDeviceMemory, VkDeviceSize> before = fake.sizes;
+        auto shadow = std::make_shared<Buffer>(context, 2 * mib, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        for (const auto& [handle, size] : fake.sizes) {
+            if (before.find(handle) == before.end() && size >= 2 * mib) memory = handle;
+        }
+        Require(memory != VK_NULL_HANDLE, "vram budget: the kept buffer's allocation was not seen");
+        {
+            Recorder kept(context);
+            const auto commands = kept.Commands();
+            context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, shadow->Handle(), 0, VK_WHOLE_SIZE, 0x5a5a5a5au);
+            kept.Keep(shadow);
+            budget.SetTargetOverride(1);
+            Require(VramPressure(), "vram budget: a 1-byte target is not over");
+            shadow.reset();
+            Require(fake.sizes.count(memory) == 1, "vram budget: a buffer a recorded batch keeps was freed under pressure before the batch completed");
+            kept.Sync();
+            // The recorder's teardown waits for the release of what its batches kept.
+        }
+        Require(fake.sizes.count(memory) == 0, "vram budget: a released buffer was retained over the target after its batch completed");
+        budget.SetTargetOverride(0);
+    }
+
+    // The image pool opens no 256 MiB block over the target: the image gets memory of its own.
+    if (ImageMemoryPool::Enabled()) {
+        VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        info.imageType = VK_IMAGE_TYPE_2D;
+        info.format = VK_FORMAT_R8G8B8A8_UNORM;
+        info.extent = {64, 64, 1};
+        info.mipLevels = 1;
+        info.arrayLayers = 1;
+        info.samples = VK_SAMPLE_COUNT_1_BIT;
+        info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        const auto create = context.Function<PFN_vkCreateImage>("vkCreateImage");
+        const auto destroy = context.Function<PFN_vkDestroyImage>("vkDestroyImage");
+        const auto place = [&](bool pressure) {
+            ImageMemoryPool images(context);
+            VkImage image = VK_NULL_HANDLE;
+            Require(create(context.device, &info, nullptr, &image) == VK_SUCCESS, "vram budget: vkCreateImage failed");
+            budget.SetTargetOverride(pressure ? 1 : 0);
+            const auto allocation = images.AllocateAndBind(image, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            budget.SetTargetOverride(0);
+            destroy(context.device, image, nullptr);
+            images.Release(allocation);
+            return allocation.pooled;
+        };
+        if (place(false)) {
+            Require(!place(true), "vram budget: the image pool opened a block over the target");
+        } else {
+            std::cout << "vram budget: the device wants this image dedicated: the block gate not tested\n";
+        }
     }
 
     // A run against a simulated 64 MiB heap with a 40 MiB target. Each step allocates a 2 MiB device
@@ -1580,7 +1671,7 @@ void vramBudgetTests(const Device& device) {
         fake.budget = start + 64 * mib;
         budget.SetTargetOverride(budget.Used() + 40 * mib);
         for (int step = 0; step < 60; ++step) {
-            RelieveVram();
+            VramPresent();
             try {
                 auto buffer = std::make_shared<Buffer>(context, 2 * mib, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
                 cache.emplace_back(step, buffer);

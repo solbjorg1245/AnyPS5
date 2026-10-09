@@ -646,6 +646,10 @@ struct VulkanDevice::State {
             if (Graphics::ResidentReadsLive()) {
                 if (const auto left = Graphics::ClearResidentReads(); left != 0) std::fprintf(stderr, "[resident-reads] %zu copies still held at the device teardown\n", left);
             }
+            // The staging-chain registry's shadows of this device go back to its pool before the
+            // pool and the device go (the registry is process-wide; the video-memory budget's
+            // "shadows" reclaimer would otherwise free them on a destroyed device).
+            Graphics::ClearStagedShadows(device);
             patternBuffers.clear();
             fastRing.reset();
             fastLayouts.reset();
@@ -2172,8 +2176,9 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     require(state->extent.width != 0 && state->extent.height != 0, "output window is minimized");
     require(!state->queuePending, "the previous presentation was not queued");
     require(!state->presentSlots.empty(), "device has no presentation slots");
-    // A safe point of the video-memory budget, once per frame (no cache lock is held here).
-    Graphics::RelieveVram();
+    // A safe point of the video-memory budget, once per frame (no cache lock is held here): the
+    // epoch ends and the reclaimers run while over.
+    Graphics::VramPresent();
     // The game path acquired the image before taking GpuMutex (Driver::Present); tests, tools and
     // APS5_SYNC_FLIP=1 acquire here.
     if (!state->imageAcquired && !AcquireImage()) return false;

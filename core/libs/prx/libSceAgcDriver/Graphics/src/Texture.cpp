@@ -299,10 +299,13 @@ ImageMemoryPool::Allocation ImageMemoryPool::AllocateAndBind(VkImage image, VkMe
         allocate.allocationSize = blockBytes;
         allocate.memoryTypeIndex = type;
         VkDeviceMemory memory = VK_NULL_HANDLE;
-        // A failed block (video memory exhausted) falls through to the dedicated path below.
-        if (context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(device, &allocate, nullptr, &memory) == VK_SUCCESS) {
+        // A failed block (video memory exhausted) falls through to the dedicated path below. So
+        // does one the video-memory budget has no room for: a block would put up to its whole size
+        // past the target for one image; the dedicated allocation takes just the image's, after
+        // the budget's inline reclaim (AllocateDeviceMemory).
+        const bool budgeted = VramBudgeted(context, type);
+        if ((!budgeted || !Vram().Over(blockBytes)) && context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(device, &allocate, nullptr, &memory) == VK_SUCCESS) {
             // The whole block is free space (slack) until images are placed in it.
-            const bool budgeted = VramBudgeted(context, type);
             NoteDeviceMemory(context, memory, allocate, VramClass::Slack);
             blocks.push_back(std::make_unique<Block>(Block{memory, type, RangeAllocator(blockBytes), budgeted}));
             if (auto result = place(*blocks.back())) {

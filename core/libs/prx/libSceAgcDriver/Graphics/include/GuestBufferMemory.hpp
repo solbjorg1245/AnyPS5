@@ -219,6 +219,9 @@ VkDeviceSize TrimResidentReads(VkDeviceSize want, std::uint64_t& evicted);
 // own reset. By try_lock.
 VkDeviceSize TrimStagedShadows(VkDeviceSize want, std::uint64_t& evicted);
 VramCacheCensus StagedShadowCensus();
+// The device teardown: drops the staging-chain registry's entries whose shadows belong to
+// `device` (they go back to its pool before the pool and the device go).
+void ClearStagedShadows(VkDevice device);
 // Tests: the resident checks take every write-watch collect as failed.
 void ResidentReadsFailCollectForTests(bool fail);
 
@@ -456,9 +459,10 @@ public:
     // ranges (an address-based build: sorted and merged, immutable, the same list for every build
     // of the space) returned by reference, or null without a space. Nothing once committed.
     std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> InPlaceReadSet(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
-    // The device-local bytes of the regions' buffers nothing but this object holds (staging
-    // shadows; see ShaderResources::DeviceBytesHeldAlone).
-    VkDeviceSize DeviceBytesHeldAlone() const;
+    // The device-local bytes of the regions' staging shadows: alone, those nothing but this
+    // object holds; shared, those one other holder also holds (see
+    // ShaderResources::DeviceBytesHeldAlone).
+    VramHeld DeviceBytesHeldAlone() const;
 
 private:
     struct Region {

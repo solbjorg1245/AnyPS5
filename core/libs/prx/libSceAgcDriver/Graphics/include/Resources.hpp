@@ -64,6 +64,7 @@ public:
     // The bytes its memory allocation holds (the video-memory budget's estimates).
     VkDeviceSize AllocationBytes() const { return allocationBytes; }
     bool DeviceLocalOnly() const { return (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0; }
+    VkDevice Device() const { return context.device; }
     void Invalidate();
 
 private:

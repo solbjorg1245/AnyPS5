@@ -14,8 +14,9 @@ unsigned long long asMib(VkDeviceSize bytes) {
     return static_cast<unsigned long long>((bytes + (VkDeviceSize{1} << 19u)) >> 20u);
 }
 
-// Cold entries of the driver's caches (held by the cache alone) and the device-local bytes they
-// hold alone: what the reclaimers could still free. Busy caches are skipped.
+// Cold entries of the driver's caches (held by the cache alone and, for builds and textures, old
+// enough) and the device-local bytes they hold: what the reclaimers could still free. Busy caches
+// are skipped; builds and textures are counted over their 4096 least recently used entries.
 std::string census() {
     std::string line;
     char text[256];
@@ -44,19 +45,32 @@ void RegisterDriverVramReclaimers() {
     static std::once_flag once;
     std::call_once(once, [] {
         auto& budget = Vram();
-        budget.AddReclaimer("shadows", VramReclaimLevel::Inline, 10, [](VkDeviceSize want, std::uint64_t& evicted) { return TrimStagedShadows(want, evicted); });
-        budget.AddReclaimer("textures", VramReclaimLevel::SafePoint, 20, [](VkDeviceSize want, std::uint64_t& evicted) { return EvictColdTextures(want, evicted); });
+        // The registry walk runs inside allocations: at most every 10 ms.
+        budget.AddReclaimer("shadows", VramReclaimLevel::Inline, 10, [](VkDeviceSize want, std::uint64_t& evicted) { return TrimStagedShadows(want, evicted); }, 10);
+        budget.AddReclaimer("textures", VramReclaimLevel::SafePoint, 20, [](VkDeviceSize want, std::uint64_t& evicted) -> VkDeviceSize {
+            std::vector<std::shared_ptr<void>> victims;
+            VkDeviceSize dedicated = 0;
+            const auto freed = EvictColdTextures(want, victims, dedicated);
+            evicted = victims.size();
+            // Destroyed off this thread once the open batch completed; their own memory is
+            // certain to go (a pooled one's only becomes slack).
+            DisposeVramVictims(std::move(victims), dedicated);
+            return freed;
+        });
         budget.AddReclaimer("builds", VramReclaimLevel::SafePoint, 30, [](VkDeviceSize want, std::uint64_t& evicted) -> VkDeviceSize {
             // A build is revalidated and refreshed under the GPU mutex (a recipe may take a cold one
             // through its weak reference meanwhile): its regions are read only under that mutex.
             if (!GuestMemory::GpuMutex().HeldByThisThread()) return 0;
             std::vector<std::shared_ptr<ShaderResources>> victims;
-            const auto estimate = SharedResourceCache().EvictCold(want, victims);
+            const auto held = SharedResourceCache().EvictCold(want, victims);
             evicted = victims.size();
             std::vector<std::shared_ptr<void>> objects(victims.begin(), victims.end());
             victims.clear();
-            DisposeVramVictims(std::move(objects), estimate);
-            return estimate;
+            // Pending: only what their destruction frees for certain (shadows only they hold).
+            // What they shared (textures, registered shadows) is the other reclaimers' to free
+            // next; it counts as reclaimed so this pass does not evict more builds for it.
+            DisposeVramVictims(std::move(objects), held.alone);
+            return held.Total();
         });
         budget.AddReclaimer("resident", VramReclaimLevel::SafePoint, 40, [](VkDeviceSize want, std::uint64_t& evicted) { return TrimResidentReads(want, evicted); });
         SetVramCensus(&census);
@@ -73,8 +87,10 @@ void DisposeVramVictims(std::vector<std::shared_ptr<void>> victims, VkDeviceSize
             std::vector<std::shared_ptr<void>> objects;
             VkDeviceSize bytes = 0;
             ~Held() {
-                objects.clear();
+                // No longer pending before they go: a buffer they release into the pool sees the
+                // pressure as it is and is destroyed instead of retained while over.
                 Vram().RemovePending(bytes);
+                objects.clear();
             }
         };
         try {
