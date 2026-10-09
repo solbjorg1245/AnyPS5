@@ -120,16 +120,22 @@ RetileCounters& Retiles() {
 // shadow slab), so those bytes reach guest memory as another resource's leftovers (the CPU
 // write-back starts from the guest bytes instead). Debug aid: APS5_POISON_RETILE_SCRATCH=1 fills
 // the scratch with RetileScratchPoisonWord first, so a reader of those bytes shows magenta.
-// Candidate fix: APS5_SEED_RETILE_SCRATCH=1 copies the guest bytes of the stored ranges from the
-// import into the scratch first, as the CPU write-back starts from them; =zero fills it with zeros
-// instead (no import read). Both are counted on the [scratch-init] line.
+// The fix, default on since t443/t444 (the poison showed those bytes on screen: the blob):
+// the guest bytes of the stored ranges are copied from the import into the scratch first, as the
+// CPU write-back starts from them. APS5_SEED_RETILE_SCRATCH=0 or APS5_NO_SEED_RETILE_SCRATCH=1
+// restores the old unseeded scratch; =zero fills it with zeros instead (no import read). Both are
+// counted on the [scratch-init] line.
 enum class ScratchSeed : std::uint8_t { None, Import, Zero };
 
 ScratchSeed SeedRetileScratch() {
     static const ScratchSeed seed = [] {
         const char* value = std::getenv("APS5_SEED_RETILE_SCRATCH");
-        if (value == nullptr) return ScratchSeed::None;
-        return std::strcmp(value, "zero") == 0 ? ScratchSeed::Zero : ScratchSeed::Import;
+        if (value != nullptr && *value != '\0') {
+            if (std::strcmp(value, "zero") == 0) return ScratchSeed::Zero;
+            return std::strcmp(value, "0") == 0 ? ScratchSeed::None : ScratchSeed::Import;
+        }
+        const char* off = std::getenv("APS5_NO_SEED_RETILE_SCRATCH");
+        return off != nullptr && *off != '\0' && std::strcmp(off, "0") != 0 ? ScratchSeed::None : ScratchSeed::Import;
     }();
     return seed;
 }
