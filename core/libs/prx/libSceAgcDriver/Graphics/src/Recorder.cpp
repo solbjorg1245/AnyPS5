@@ -1235,16 +1235,22 @@ const char* Recorder::WriteKindName(WriteKind kind) {
 Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)) {
     trackPendingBlocksFromEnvironment();
     blockSerialBase = (id + 1) << 40u;
-    // Per recorder (not a static): a test makes one with the switch set.
-    const char* coalesce = std::getenv("APS5_COALESCE_COPY_BACKS");
-    coalesceCopyBacks = coalesce != nullptr && *coalesce != '\0' && std::strcmp(coalesce, "0") != 0;
+    // Per recorder (not a static): a test makes one with the switch set. Coalescing and narrow
+    // copy-backs are on by default: APS5_<name>=0 or APS5_NO_<name>=1 turns one off, APS5_<name>=1
+    // forces it on (over the opt-out); unset or empty leaves the default.
+    const auto defaultOn = [](const char* name, const char* optOut) {
+        const char* value = std::getenv(name);
+        if (value != nullptr && *value != '\0') return std::strcmp(value, "0") != 0;
+        const char* off = std::getenv(optOut);
+        return off == nullptr || *off == '\0' || std::strcmp(off, "0") == 0;
+    };
+    coalesceCopyBacks = defaultOn("APS5_COALESCE_COPY_BACKS", "APS5_NO_COALESCE_COPY_BACKS");
     // Resident buffers build on coalescing, which they turn on.
     const char* resident = std::getenv("APS5_RESIDENT_BUFFERS");
     residentBuffers = resident != nullptr && *resident != '\0' && std::strcmp(resident, "0") != 0;
     // Narrow copy-backs: with coalescing (disjoint queued copies) or no deferral at all (each use's
     // own merged ranges); not with the old deferral alone, whose queued copies may overlap.
-    const char* narrow = std::getenv("APS5_NARROW_COPY_BACKS");
-    narrowCopyBacks = narrow != nullptr && *narrow != '\0' && std::strcmp(narrow, "0") != 0;
+    narrowCopyBacks = defaultOn("APS5_NARROW_COPY_BACKS", "APS5_NO_NARROW_COPY_BACKS");
     const char* verify = std::getenv("APS5_NARROW_VERIFY");
     narrowVerify = verify != nullptr && *verify != '\0' && std::strcmp(verify, "0") != 0;
     // A CPU device (lavapipe) lands a kept copy with CPU stores into the guarded pages: the fault

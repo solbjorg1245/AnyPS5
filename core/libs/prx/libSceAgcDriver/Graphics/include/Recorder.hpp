@@ -128,9 +128,9 @@ public:
         VkDeviceSize baselineOffset = 0;
     };
     static bool DeferCopyBacks();
-    // Copy-back coalescing (APS5_COALESCE_COPY_BACKS=1, read when the recorder is made; without it
-    // everything here behaves as above). Copy-backs are deferred, and the queued ones stay queued
-    // past the commands that do not touch their bytes, so only the last copy of a guest byte per
+    // Copy-back coalescing (on by default; APS5_NO_COALESCE_COPY_BACKS=1 or APS5_COALESCE_COPY_BACKS=0
+    // turns it off, read when the recorder is made; without it everything here behaves as above).
+    // Copy-backs are deferred, and the queued ones stay queued past the commands that do not touch their bytes, so only the last copy of a guest byte per
     // epoch (up to the next point that records them) lands: a copy deferred over bytes an earlier
     // queued copy stores drops them from that one (nothing read them in between, or the reader
     // would have recorded it first), so queued copies never overlap and record in any order.
@@ -148,7 +148,8 @@ public:
     // see a label only after the copies recorded ahead of its store.
     bool CoalescesCopyBacks() const { return coalesceCopyBacks; }
     bool DefersCopyBacks() const { return coalesceCopyBacks || DeferCopyBacks(); }
-    // Narrow copy-backs (APS5_NARROW_COPY_BACKS=1, read when the recorder is made; off with the old
+    // Narrow copy-backs (on by default; APS5_NO_NARROW_COPY_BACKS=1 or APS5_NARROW_COPY_BACKS=0 turns
+    // them off, read when the recorder is made; off with the old
     // deferral alone, APS5_DEFER_COPY_BACK without coalescing, whose queued copies may overlap, and
     // on a device without buffer device addresses). A staged region's copy-back copies the whole
     // written element range (a V# the shader may write: ~285-360 KiB per use of the hot append

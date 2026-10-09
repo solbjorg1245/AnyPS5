@@ -3441,6 +3441,33 @@ void narrowCopyBackTests(const Device& device, Recorder& recorder) {
         std::cout << "host imports or buffer device addresses unavailable: narrow copy-backs not tested\n";
         return;
     }
+    // The defaults: coalescing and narrow copy-backs on; APS5_NO_<name>=1 or APS5_<name>=0 turns
+    // each off, APS5_<name>=1 forces it on over the opt-out. The caller's switches are restored.
+    {
+        const auto saved = [](const char* name) {
+            const char* value = std::getenv(name);
+            return std::string(value != nullptr ? value : "");
+        };
+        const std::string coalesce = saved("APS5_COALESCE_COPY_BACKS"), narrow = saved("APS5_NARROW_COPY_BACKS");
+        const std::string noCoalesce = saved("APS5_NO_COALESCE_COPY_BACKS"), noNarrow = saved("APS5_NO_NARROW_COPY_BACKS");
+        const auto made = [&](const char* on, const char* off) {
+            setSwitch("APS5_COALESCE_COPY_BACKS", on);
+            setSwitch("APS5_NARROW_COPY_BACKS", on);
+            setSwitch("APS5_NO_COALESCE_COPY_BACKS", off);
+            setSwitch("APS5_NO_NARROW_COPY_BACKS", off);
+            Recorder made(context);
+            return std::pair{made.CoalescesCopyBacks(), made.NarrowsCopyBacks()};
+        };
+        Require(made("", "") == std::pair{true, true}, "coalescing and narrow copy-backs are not on by default");
+        Require(made("", "1") == std::pair{false, false}, "APS5_NO_*_COPY_BACKS=1 did not turn them off");
+        Require(made("0", "") == std::pair{false, false}, "APS5_*_COPY_BACKS=0 did not turn them off");
+        Require(made("1", "1") == std::pair{true, true}, "APS5_*_COPY_BACKS=1 did not force them on");
+        Require(made("", "0") == std::pair{true, true}, "APS5_NO_*_COPY_BACKS=0 turned them off");
+        setSwitch("APS5_COALESCE_COPY_BACKS", coalesce.c_str());
+        setSwitch("APS5_NARROW_COPY_BACKS", narrow.c_str());
+        setSwitch("APS5_NO_COALESCE_COPY_BACKS", noCoalesce.c_str());
+        setSwitch("APS5_NO_NARROW_COPY_BACKS", noNarrow.c_str());
+    }
     constexpr std::size_t bytes = 65536;
     constexpr unsigned char sentinel = 0x5A;
 #ifdef _WIN32

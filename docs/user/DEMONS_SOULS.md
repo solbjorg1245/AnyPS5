@@ -67,6 +67,10 @@ The launcher sets these unless you already set them yourself:
 Other user settings: `ANYPS5_INPUT_CONFIG` (input file path), `ANYPS5_SHADER_CACHE_DIR` (move the shader
 cache), `ANYPS5_NO_SHADER_CACHE=1` (no disk cache).
 
+Troubleshooting: GPU-to-guest copy-backs are coalesced and narrowed (only changed dwords are written
+back) by default. `APS5_NO_COALESCE_COPY_BACKS=1` and `APS5_NO_NARROW_COPY_BACKS=1` turn these off
+if you see stale or flickering geometry.
+
 ## Controls
 
 Controllers work through SDL: Xbox layout A/B/X/Y = Cross/Circle/Square/Triangle, LB/RB = L1/R1,
