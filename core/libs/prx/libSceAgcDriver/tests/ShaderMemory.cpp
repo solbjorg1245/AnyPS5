@@ -5,8 +5,10 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/ResourceTracker.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
+#include "Optimization/SrtWalker/SrtDescriptorEvaluation.hpp"
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
+#include "Optimization/SrtWalker/WalkProgram.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
@@ -26,13 +28,41 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <typeinfo>
 #include <utility>
 #include <vector>
+
+// APS5_COUNT_CXX_THROWS (CMakeLists.txt: the test links with --wrap=__cxa_throw): every C++ throw
+// of the test's objects and static libraries (the recompiler) passes this wrapper, which counts
+// it per thread. A rethrow (__cxa_rethrow) is not counted. Without it nothing is counted.
+#ifndef APS5_COUNT_CXX_THROWS
+#define APS5_COUNT_CXX_THROWS 0
+#endif
+#if APS5_COUNT_CXX_THROWS
+namespace ShaderMemoryTests {
+thread_local std::uint64_t cxxThrows = 0;
+}
+extern "C" [[noreturn]] void __real___cxa_throw(void* object, std::type_info* type, void (*destructor)(void*));
+extern "C" [[noreturn]] void __wrap___cxa_throw(void* object, std::type_info* type, void (*destructor)(void*)) {
+    ++ShaderMemoryTests::cxxThrows;
+    __real___cxa_throw(object, type, destructor);
+}
+#endif
 
 namespace {
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+// The C++ throws on this thread so far (APS5_COUNT_CXX_THROWS; 0 without it).
+constexpr bool CountsThrows = APS5_COUNT_CXX_THROWS != 0;
+std::uint64_t thrownSoFar() {
+#if APS5_COUNT_CXX_THROWS
+    return ShaderMemoryTests::cxxThrows;
+#else
+    return 0;
+#endif
 }
 
 template<typename TAction>
@@ -55,6 +85,224 @@ void verifyResult(const ShaderRecompiler::RecompileResult& first, const ShaderRe
         const auto& right = second.bindings[index];
         require(left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly, "replayed binding differs");
     }
+}
+
+// A pending block (the driver's FastSrtRead declining a read) at the walk's first and last read:
+// the fast walk declines with ReadDeclined and without a C++ exception (a throw cost about 1.6 ms
+// per declined draw in the game, port/reports/s53-fastdraw-diag.md), with the counters the
+// throwing form kept: the reads up to the declined one and the walk outcome the driver's decline
+// reason follows (ReadBailed). Materialize over the same express-only runtime still throws its
+// message and leaves its outputs as they were; TryMaterialize returns false. A walk into the
+// outputs the declines left half written (the fast path's per-thread scratch, reused in place)
+// then materializes exactly the capture's snapshot and specialization.
+void verifyWalkDeclineWithoutThrow(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::ResourceCapture& capture, const ShaderRecompiler::SourceHandle& handle, std::uint32_t walkReads) {
+    using namespace ShaderRecompiler;
+    struct Reader {
+        std::uint32_t reads = 0;
+        std::uint32_t declineAt = 0;
+    } reader;
+    const SrtMemoryReader pending = +[](void* context, std::uint64_t address, std::uint32_t* value) {
+        auto& self = *static_cast<Reader*>(context);
+        if (++self.reads >= self.declineAt) return false;
+        std::memcpy(value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), sizeof(*value));
+        return true;
+    };
+    SrtRuntime runtime;
+    runtime.userContext = &reader;
+    runtime.readMemory = pending;
+    runtime.readSpecializationMemory = pending;
+    runtime.expressRead = pending;
+    // The runtime WalkResources hands the materializer (Recompiler.cpp), for its two forms.
+    const auto walk = Detail::CompileWalkProgram(*capture.plan);
+    require(walk != nullptr, "the plan compiled no walk program");
+    SrtRuntime fast = runtime;
+    fast.userData = request.context.userData;
+    fast.shaderBase = request.shader.codeAddress;
+    fast.walk = walk.get();
+    fast.expressOnly = true;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    for (const auto declineAt : {1u, walkReads}) {
+        // The throwing form, as WalkResources called it before: the decline is an exception.
+        reader = {0, declineAt};
+        Detail::NoteWalkOutcome(Detail::WalkOutcome::Count);
+        auto kept = capture.snapshot;
+        auto keptSpecialization = capture.specialization;
+        auto before = thrownSoFar();
+        expectFailure([&] { ResourceMaterializer{}.Materialize(*capture.plan, fast, kept, keptSpecialization); }, "SrtWalker::EvaluateRuntimeSources failed to evaluate runtime sources: the express walk did not complete", "Materialize did not throw for a declined read");
+        require(!CountsThrows || thrownSoFar() == before + 1, "the throw counter did not count Materialize's one exception");
+        require(kept.flattenedSrt == capture.snapshot.flattenedSrt && kept.userData == capture.snapshot.userData && keptSpecialization == capture.specialization, "Materialize changed its outputs before it threw");
+        const auto thrownReads = reader.reads;
+        const auto thrownOutcome = Detail::LastWalkOutcome();
+        require(thrownReads == declineAt && thrownOutcome == Detail::WalkOutcome::ReadBailed, "Materialize did not stop at the declined read");
+
+        // The non-throwing form: false, the same reads and outcome, no exception.
+        reader = {0, declineAt};
+        Detail::NoteWalkOutcome(Detail::WalkOutcome::Count);
+        before = thrownSoFar();
+        require(!ResourceMaterializer{}.TryMaterialize(*capture.plan, fast, snapshot, specialization), "TryMaterialize completed a walk whose read was declined");
+        require(thrownSoFar() == before, "TryMaterialize threw for a declined read");
+        require(reader.reads == thrownReads && Detail::LastWalkOutcome() == thrownOutcome, "TryMaterialize's reads or walk outcome differ from Materialize's");
+
+        // The fast walk: ReadDeclined (the driver's "walk: pending block"), no exception.
+        reader = {0, declineAt};
+        before = thrownSoFar();
+        require(WalkResources(handle, request.context.userData, request.shader.codeAddress, runtime, snapshot, specialization) == WalkStatus::ReadDeclined, "a pending block did not decline the fast walk as a declined read");
+        require(thrownSoFar() == before, "the fast walk threw for a pending block");
+        require(reader.reads == thrownReads && Detail::LastWalkOutcome() == thrownOutcome, "the fast walk's reads or walk outcome differ from Materialize's");
+    }
+    // Left-overs a reused scratch could carry reach no later walk.
+    snapshot.flattenedSrt.push_back(0xdeadbeefu);
+    snapshot.deferredFlat.emplace_back(0u, 0x1000u);
+    snapshot.uniformFill.value = 0xdeadbeefu;
+    specialization.boundDescriptors.push_back(99u);
+    reader = {0, ~0u};
+    const auto before = thrownSoFar();
+    require(WalkResources(handle, request.context.userData, request.shader.codeAddress, runtime, snapshot, specialization) == WalkStatus::Walked, "the fast walk declined after declines into the same snapshot");
+    require(thrownSoFar() == before && reader.reads == walkReads, "a completed fast walk threw or read differently");
+    const auto sameValues = [](const std::vector<DescriptorValue>& left, const std::vector<DescriptorValue>& right) {
+        if (left.size() != right.size()) return false;
+        for (std::size_t i = 0; i < left.size(); ++i) {
+            if (left[i].dwordCount != right[i].dwordCount || !std::equal(left[i].dwords.begin(), left[i].dwords.begin() + left[i].dwordCount, right[i].dwords.begin())) return false;
+        }
+        return true;
+    };
+    const auto& captured = capture.snapshot;
+    require(sameValues(snapshot.buffers, captured.buffers) && sameValues(snapshot.images, captured.images) && sameValues(snapshot.samplers, captured.samplers), "a walk into a reused snapshot has other descriptors than the capture");
+    require(snapshot.flattenedSrt == captured.flattenedSrt && snapshot.userData == captured.userData && snapshot.uniformFill == captured.uniformFill && snapshot.deferredFlat.empty(), "a walk into a reused snapshot kept words of an earlier one");
+    require(specialization == capture.specialization && specialization.boundDescriptors == capture.specialization.boundDescriptors, "a walk into a reused specialization differs from the capture's");
+}
+
+// The capture's plan with a uniform fill whose one value is `value` (IrResourcePlan owns its
+// values and does not copy: ExtractPlan's fields are copied, the IR staying the capture plan's).
+ShaderRecompiler::IrResourcePlan withUniformFill(const ShaderRecompiler::IrResourcePlan& from, ShaderRecompiler::IrValue& value) {
+    using namespace ShaderRecompiler;
+    IrResourcePlan plan;
+    plan.stage = from.stage;
+    plan.shaderHash = from.shaderHash;
+    plan.userDataBase = from.userDataBase;
+    plan.userDataCount = from.userDataCount;
+    plan.memoryInfo = from.memoryInfo;
+    plan.descriptorSources = from.descriptorSources;
+    plan.controlFlow = from.controlFlow;
+    plan.materializationSources = from.materializationSources;
+    plan.srtReads = from.srtReads;
+    plan.cleanFlatSlots = from.cleanFlatSlots;
+    plan.pureFlatSlots = from.pureFlatSlots;
+    plan.requiresSpecializationMemory = from.requiresSpecializationMemory;
+    plan.srtPlanComplete = from.srtPlanComplete;
+    plan.resourceTrackingComplete = from.resourceTrackingComplete;
+    plan.info = from.info;
+    plan.uniformFill.fill.kind = UniformFillKind::Buffer;
+    plan.uniformFill.fill.words = 1;
+    plan.uniformFill.values[0] = &value;
+    return plan;
+}
+
+// TryMaterialize's other quiet declines, besides the express walk's declined read: they too
+// return false without a C++ exception, with the walk outcome WalkResources maps to the driver's
+// decline reason, where Materialize throws its message. (1) The uniform fill's evaluation, before
+// the walk (outcome Count: WalkStatus::Failed); a fill that evaluates stores the word it read. (2)
+// An evaluation the express walk does not cover (no express reader: NoProgram). (3) A runtime that
+// is not express-only is misuse (the interpreter's failure is a genuine one): std::logic_error.
+void verifyQuietDeclines(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::ResourceCapture& capture) {
+    using namespace ShaderRecompiler;
+    struct Reader {
+        std::uint32_t reads = 0;
+        std::uint32_t declineAt = 0;
+    } reader;
+    const SrtMemoryReader pending = +[](void* context, std::uint64_t address, std::uint32_t* value) {
+        auto& self = *static_cast<Reader*>(context);
+        if (++self.reads >= self.declineAt) return false;
+        std::memcpy(value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), sizeof(*value));
+        return true;
+    };
+    const auto& capturePlan = *capture.plan;
+    require(!capturePlan.srtReads.empty(), "the capture's plan has no SRT read for a uniform fill to read");
+    // (1) The uniform fill reads the plan's first SRT slot (ReadConst of slot 0) through the
+    // specialization reader.
+    std::vector<std::unique_ptr<IrValue>> values;
+    auto& resource = *values.emplace_back(std::make_unique<IrValue>(IrOpcode::GetSrtResource, IrType::SrtResource, 0x7fff0000u));
+    auto& slot = *values.emplace_back(std::make_unique<IrValue>(IrOpcode::Void, IrType::U32, 0x7fff0001u));
+    slot.SetImmediateU32(0);
+    auto& fillValue = *values.emplace_back(std::make_unique<IrValue>(IrOpcode::ReadConst, IrType::U32, 0x7fff0002u));
+    fillValue.AddArgument(&resource);
+    fillValue.AddArgument(&slot);
+    const auto plan = withUniformFill(capturePlan, fillValue);
+    const auto walk = Detail::CompileWalkProgram(plan);
+    require(walk != nullptr, "the uniform-fill plan compiled no walk program");
+    SrtRuntime fast;
+    fast.userContext = &reader;
+    fast.readMemory = pending;
+    fast.readSpecializationMemory = pending;
+    fast.expressRead = pending;
+    fast.userData = request.context.userData;
+    fast.shaderBase = request.shader.codeAddress;
+    fast.walk = walk.get();
+    fast.expressOnly = true;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    reader = {0, 1};
+    Detail::NoteWalkOutcome(Detail::WalkOutcome::Count);
+    auto before = thrownSoFar();
+    require(!ResourceMaterializer{}.TryMaterialize(plan, fast, snapshot, specialization), "TryMaterialize completed a uniform fill whose read was declined");
+    require(thrownSoFar() == before, "TryMaterialize threw for a declined uniform-fill read");
+    require(reader.reads == 1 && Detail::LastWalkOutcome() == Detail::WalkOutcome::Count, "a declined uniform-fill read did not stop before the walk (outcome Count, the fast walk's Failed)");
+    reader = {0, 1};
+    before = thrownSoFar();
+    {
+        ResourceSnapshot thrownSnapshot;
+        ResourceSpecialization thrownSpecialization;
+        expectFailure([&] { ResourceMaterializer{}.Materialize(plan, fast, thrownSnapshot, thrownSpecialization); }, "SrtWalker::EvaluateUniformValues failed to evaluate a uniform value", "Materialize did not throw for a declined uniform-fill read");
+    }
+    require(!CountsThrows || thrownSoFar() == before + 1, "the throw counter did not count Materialize's uniform-fill exception");
+    require(reader.reads == 1 && Detail::LastWalkOutcome() == Detail::WalkOutcome::Count, "Materialize's declined uniform fill read or reached more than TryMaterialize's");
+    // The fill evaluates: the word it stores is the one the walk reads for slot 0, as Materialize
+    // stores it, and the rest of the materialization is Materialize's.
+    reader = {0, ~0u};
+    before = thrownSoFar();
+    require(ResourceMaterializer{}.TryMaterialize(plan, fast, snapshot, specialization), "TryMaterialize declined a uniform fill it could read");
+    require(thrownSoFar() == before, "TryMaterialize threw for a uniform fill it could read");
+    const auto flatOffset = plan.srtReads[0].flatOffset;
+    require(flatOffset < snapshot.flattenedSrt.size() && snapshot.uniformFill.kind == UniformFillKind::Buffer && snapshot.uniformFill.words == 1 && snapshot.uniformFill.value == snapshot.flattenedSrt[flatOffset], "TryMaterialize's uniform fill is not the word of the slot it reads");
+    ResourceSnapshot expected;
+    ResourceSpecialization expectedSpecialization;
+    reader = {0, ~0u};
+    ResourceMaterializer{}.Materialize(plan, fast, expected, expectedSpecialization);
+    require(snapshot.uniformFill == expected.uniformFill && snapshot.flattenedSrt == expected.flattenedSrt && snapshot.userData == expected.userData && specialization == expectedSpecialization, "TryMaterialize's uniform-fill materialization differs from Materialize's");
+
+    // (2) No express reader: the express walk does not cover the evaluation.
+    const auto captureWalk = Detail::CompileWalkProgram(capturePlan);
+    require(captureWalk != nullptr, "the plan compiled no walk program");
+    auto uncovered = fast;
+    uncovered.walk = captureWalk.get();
+    uncovered.expressRead = nullptr;
+    reader = {0, ~0u};
+    Detail::NoteWalkOutcome(Detail::WalkOutcome::Count);
+    before = thrownSoFar();
+    require(!ResourceMaterializer{}.TryMaterialize(capturePlan, uncovered, snapshot, specialization), "TryMaterialize completed an evaluation the express walk does not cover");
+    require(thrownSoFar() == before, "TryMaterialize threw for an evaluation the express walk does not cover");
+    require(reader.reads == 0 && Detail::LastWalkOutcome() == Detail::WalkOutcome::NoProgram && Detail::RuntimeSourceFailureReason() == "the express walk does not cover this evaluation", "an uncovered evaluation did not decline as NoProgram before any read");
+    before = thrownSoFar();
+    {
+        ResourceSnapshot thrownSnapshot;
+        ResourceSpecialization thrownSpecialization;
+        expectFailure([&] { ResourceMaterializer{}.Materialize(capturePlan, uncovered, thrownSnapshot, thrownSpecialization); }, "SrtWalker::EvaluateRuntimeSources failed to evaluate runtime sources: the express walk does not cover this evaluation", "Materialize did not throw for an evaluation the express walk does not cover");
+    }
+    require(!CountsThrows || thrownSoFar() == before + 1, "the throw counter did not count Materialize's uncovered-evaluation exception");
+
+    // (3) A runtime that may fall back to the interpreter.
+    auto interpreted = fast;
+    interpreted.walk = captureWalk.get();
+    interpreted.expressOnly = false;
+    reader = {0, 1};
+    bool refused = false;
+    try {
+        static_cast<void>(ResourceMaterializer{}.TryMaterialize(capturePlan, interpreted, snapshot, specialization));
+    } catch (const std::logic_error& error) {
+        refused = std::string_view(error.what()).find("requires an express-only runtime") != std::string_view::npos;
+    }
+    require(refused && reader.reads == 0, "TryMaterialize accepted a runtime that is not express-only");
 }
 
 // The fast walk (WalkResources, docs/design/draw-fastpath.md F2) with a direct reader of live
@@ -84,6 +332,7 @@ void verifyWalkResources(const ShaderRecompiler::RecompileRequest& request, cons
     ResourceSpecialization specialization;
     require(WalkResources(*handle, request.context.userData, request.shader.codeAddress, runtime, snapshot, specialization) == WalkStatus::Walked, "the fast walk declined a request the capture walked");
     require(reader.reads != 0, "the fast walk read nothing through its reader");
+    const auto walkReads = reader.reads;
     const auto sameValues = [](const std::vector<DescriptorValue>& left, const std::vector<DescriptorValue>& right) {
         if (left.size() != right.size()) return false;
         for (std::size_t i = 0; i < left.size(); ++i) {
@@ -104,6 +353,8 @@ void verifyWalkResources(const ShaderRecompiler::RecompileRequest& request, cons
     require(!PopulateVariant(*handle, otherLayout, snapshot, specialization, walked), "a layout never compiled selected a variant");
     reader.decline = true;
     require(WalkResources(*handle, request.context.userData, request.shader.codeAddress, runtime, snapshot, specialization) == WalkStatus::ReadDeclined, "a declined read did not decline the fast walk");
+    verifyWalkDeclineWithoutThrow(request, capture, *handle, walkReads);
+    verifyQuietDeclines(request, capture);
 }
 
 void verifyRegisterSources() {

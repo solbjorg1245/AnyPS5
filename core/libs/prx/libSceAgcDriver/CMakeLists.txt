@@ -260,6 +260,12 @@ target_include_directories(agc_shader_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_shader_memory_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_memory_tests)
+# The fast walk's decline must not throw: tests/ShaderMemory.cpp counts every C++ throw of the
+# test's objects and static libraries through a __cxa_throw wrapper (GNU ld and lld --wrap).
+if(MINGW OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(agc_shader_memory_tests PRIVATE -Wl,--wrap=__cxa_throw)
+    target_compile_definitions(agc_shader_memory_tests PRIVATE APS5_COUNT_CXX_THROWS=1)
+endif()
 
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
@@ -526,6 +532,14 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    # The shader-memory tests again with the fast walk's in-place build off (APS5_NO_WALK_REUSE=1,
+    # latched once per process): TryMaterialize's fresh-object form.
+    add_test(NAME agc_shader_memory_no_walk_reuse COMMAND agc_shader_memory_tests)
+    set_tests_properties(agc_shader_memory_no_walk_reuse PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_WALK_REUSE=1" SKIP_RETURN_CODE 77)
+    if(WIN32)
+        set_tests_properties(agc_shader_memory_no_walk_reuse PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 endif()
 
 option(AGC_BUILD_VISUAL_TEST "Enable the standalone AGC SPIR-V visual test" OFF)
