@@ -1,4 +1,5 @@
 #include "Translation/TranslationContext.hpp"
+#include "Recompiler.hpp"
 #include <algorithm>
 #include <array>
 #include <stdexcept>
@@ -255,7 +256,16 @@ IrF32 TranslationContext::applyF32ResultModifiers(const RdnaOperand& operand, Ir
         value = IrF32(ir.Emit(IrOpcode::FPMul32, IrType::F32, {&value.Value(), &ir.ConstantF32(multiplier)}));
     }
     if (operand.clamp) {
+        const IrF32 unclamped = value;
         value = IrF32(ir.Emit(IrOpcode::FPSaturate32, IrType::F32, {&value.Value()}));
+        // FClamp leaves a NaN undefined. APS5_CLAMP_NAN=zero clamps it to 0 (DX10_CLAMP on the
+        // hardware), =keep passes it through (DX10_CLAMP clear); unset keeps FClamp alone.
+        const ClampNan mode = ClampNanRule();
+        if (mode != ClampNan::Driver) {
+            CountLegacyFloatSite(LegacyFloatSite::ClampNan);
+            const IrU1 nan(ir.UGreaterThan(ir.BitwiseAnd(ir.BitCastU32(unclamped.Value()), ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)));
+            value = selectF32(nan, mode == ClampNan::Zero ? IrF32(ir.ConstantF32(0.0f)) : unclamped, value);
+        }
     }
     return value;
 }

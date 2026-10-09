@@ -207,6 +207,22 @@ bool TranslationContext::vMulLegacyF32(const RdnaInstruction& inst, bool accumul
     return true;
 }
 
+// v_mad_legacy_f32 (v_fma_legacy_f32): the DX9 rule of vMulLegacyF32 on the product, so 0 * Inf + c
+// and 0 * NaN + c give c where the plain multiply-add gives NaN. A +-0 multiplicand turns both
+// factors into +0: the product is +0, and the add (`opcode`, fused or not) is the plain one.
+bool TranslationContext::vMadLegacyF32(const RdnaInstruction& inst, IrOpcode opcode) {
+    const IrF32 lhs = readMixF32(sourceAt(inst, 0u));
+    const IrF32 rhs = readMixF32(sourceAt(inst, 1u));
+    const IrF32 addend = readMixF32(sourceAt(inst, 2u));
+    const auto isZero = [&](const IrF32& value) { return IrU1(ir.IEqual(ir.BitwiseAnd(ir.BitCastU32(value.Value()), ir.Constant(0x7fffffffu)), ir.Constant(0u))); };
+    const IrU1 zero(ir.LogicalOr(isZero(lhs).Value(), isZero(rhs).Value()));
+    const IrF32 positiveZero(ir.ConstantF32(0.0f));
+    const IrF32 factor0 = selectF32(zero, positiveZero, lhs);
+    const IrF32 factor1 = selectF32(zero, positiveZero, rhs);
+    writeOperand(inst.destination, &ir.Emit(opcode, IrType::F32, {&factor0.Value(), &factor1.Value(), &addend.Value()}));
+    return true;
+}
+
 void TranslationContext::emitFloat16ClassCompare(const RdnaInstruction& inst, bool cmpx) {
     const IrU32 bits = readF16Bits(sourceAt(inst, 0u));
     const IrU32 mask = readU32(sourceAt(inst, 1u));

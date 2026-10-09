@@ -5,6 +5,7 @@
 #include <mutex>
 #include <cstdio>
 #include <chrono>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -109,6 +110,40 @@ bool RayTracingMiss() {
         return text != nullptr && std::strcmp(text, "miss") == 0;
     }();
     return miss;
+}
+
+bool LegacyMadRule() {
+    static const bool enabled = std::getenv("APS5_NO_LEGACY_MAD_RULE") == nullptr;
+    return enabled;
+}
+
+bool MullitRule() {
+    static const bool enabled = std::getenv("APS5_NO_MULLIT_RULE") == nullptr;
+    return enabled;
+}
+
+ClampNan ClampNanRule() {
+    static const ClampNan mode = [] {
+        const char* text = std::getenv("APS5_CLAMP_NAN");
+        if (text == nullptr) return ClampNan::Driver;
+        if (std::strcmp(text, "zero") == 0) return ClampNan::Zero;
+        if (std::strcmp(text, "keep") == 0) return ClampNan::Keep;
+        std::fprintf(stderr, "[recompile] APS5_CLAMP_NAN=%s is neither zero nor keep: the clamp stays FClamp alone\n", text);
+        return ClampNan::Driver;
+    }();
+    return mode;
+}
+
+namespace {
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(LegacyFloatSite::Count)> g_legacyFloatSites{};
+}
+
+void CountLegacyFloatSite(LegacyFloatSite site) {
+    g_legacyFloatSites[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t LegacyFloatSites(LegacyFloatSite site) {
+    return g_legacyFloatSites[static_cast<std::size_t>(site)].load(std::memory_order_relaxed);
 }
 
 namespace {

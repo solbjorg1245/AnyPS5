@@ -1,5 +1,6 @@
 #include "Translation/VectorInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
+#include "Recompiler.hpp"
 #include <stdexcept>
 
 namespace ShaderRecompiler {
@@ -866,7 +867,13 @@ bool TranslationContext::emitVector(const RdnaInstruction& inst) {
     case RdnaOpcode::VSubrevF32:
         return floatBinary(inst, IrOpcode::FPSub32, true);
     case RdnaOpcode::VMulF32:
+        return floatBinary(inst, IrOpcode::FPMul32, false);
     case RdnaOpcode::VMullitF32:
+        // The DX9 rule of v_mul_legacy_f32 (APS5_NO_MULLIT_RULE=1: the plain multiply, as before).
+        if (MullitRule()) {
+            CountLegacyFloatSite(LegacyFloatSite::Mullit);
+            return vMulLegacyF32(inst, false);
+        }
         return floatBinary(inst, IrOpcode::FPMul32, false);
     case RdnaOpcode::VMinF32:
         return floatBinary(inst, IrOpcode::FPMin32, false);
@@ -876,10 +883,16 @@ bool TranslationContext::emitVector(const RdnaInstruction& inst) {
         return floatBinary(inst, IrOpcode::FPLdexp, false);
     case RdnaOpcode::VMacF32:
         return floatTernary(inst, roundsProductSeparately(inst) ? IrOpcode::FPMad32 : IrOpcode::FPFma32, true, true);
+    case RdnaOpcode::VMadLegacyF32:
+        // The DX9 rule, +-0 * x = +0 for any x (APS5_NO_LEGACY_MAD_RULE=1: the plain multiply-add).
+        if (LegacyMadRule()) {
+            CountLegacyFloatSite(LegacyFloatSite::MadLegacy);
+            return vMadLegacyF32(inst, roundsProductSeparately(inst) ? IrOpcode::FPMad32 : IrOpcode::FPFma32);
+        }
+        return floatTernary(inst, roundsProductSeparately(inst) ? IrOpcode::FPMad32 : IrOpcode::FPFma32, false, true);
     case RdnaOpcode::VMadmkF32:
     case RdnaOpcode::VMadakF32:
     case RdnaOpcode::VMadF32:
-    case RdnaOpcode::VMadLegacyF32:
     case RdnaOpcode::VFmaF32:
         return floatTernary(inst, roundsProductSeparately(inst) ? IrOpcode::FPMad32 : IrOpcode::FPFma32, false, true);
     case RdnaOpcode::VMin3F32:
