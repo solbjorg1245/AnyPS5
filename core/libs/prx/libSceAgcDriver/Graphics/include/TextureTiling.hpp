@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include <array>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -33,6 +34,16 @@ std::array<std::uint32_t, 3> ThickBlockExtent(TextureTileMode tileMode, std::uin
 // (the detiler's blockExtent). A mip's tiled bytes are its blocks in row-major order, blocksPerRow per
 // row (TileMipLayout), except the tail mips, which share one block. Throws for linear tiling.
 std::array<std::uint32_t, 3> ThinBlockLayout(TextureTileMode tileMode, std::uint32_t bytesPerElement);
+// The bytes of a mip a retile of the whole mip (TextureDetiler::Dispatch with retile) writes in full,
+// relative to its tiled offset, sorted and disjoint. The retile writes every element inside the mip's
+// extent: a tile block wholly inside it is written whole (the block's swizzle permutes its elements
+// over its bytes), and of a linear row its first width elements. Edge blocks the extent covers in
+// part, the pitch's blocks past it, linear row padding and tail mips (their shared block has gaps)
+// are left out, and every byte of a thick mip (`thick`: a dispatch writes one depth slice of a block).
+std::vector<std::pair<std::uint64_t, std::uint64_t>> RetileWrittenRanges(TextureTileMode tileMode, std::uint32_t bytesPerElement, const TileMipLayout& mip, bool thick);
+// The parts of the [begin, end) `ranges` outside the [begin, end) `removed`, sorted and merged (either
+// list in any order).
+std::vector<std::pair<std::uint64_t, std::uint64_t>> SubtractByteRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges, std::vector<std::pair<std::uint64_t, std::uint64_t>> removed);
 
 // Single-mip 3D surface. Each depth slice z is detiled from slab z / blockDepth (slabBytes apart) with the
 // swizzle's slice input set to z, into linear slices sliceLinearBytes apart.
