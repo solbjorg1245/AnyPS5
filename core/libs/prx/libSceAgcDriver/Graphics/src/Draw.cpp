@@ -1635,6 +1635,15 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
     });
 }
 
+// APS5_PROFILE_GPU: a recorded draw on its pass's [gputime] range (`passTiming`: the draw's own
+// range, or the open pass's when it continued it), with what it binds in place; the pass is named
+// by its first color target, else its depth target.
+void noteDrawTiming(Recorder& recorder, std::uint32_t passTiming, const State& state, Recorder::GuestRanges reads, Recorder::GuestRanges writes, Recorder::GuestRanges inputs, bool leased) {
+    if (passTiming == Recorder::NoTiming) return;
+    const std::uint64_t target = !state.colors.empty() ? state.colors.front().address : state.depth.has_value() ? state.depth->address : 0;
+    recorder.NoteDrawInPass(passTiming, target, Recorder::InPlaceUseOf(reads, writes, inputs, leased));
+}
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
@@ -1741,6 +1750,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // object's own built ranges are (MarkGpuWrites), which are not this draw's.
     if (drawBindings != nullptr && !drawBindings->inPlaceReads.empty()) recorder->NotePendingReads(drawBindings->inPlaceReads, Recorder::ReadKind::DispatchElement);
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
+    if (Recorder::GpuTimingEnabled()) {
+        auto reads = resources.InPlaceReads();
+        if (drawBindings != nullptr) reads.insert(reads.end(), drawBindings->inPlaceReads.begin(), drawBindings->inPlaceReads.end());
+        noteDrawTiming(*recorder, continued ? recorder->OpenRenderPassTiming() : drawTiming, state, reads, resources.GpuWrites(), inputs.inPlaceRanges, resources.HoldsLease());
+    }
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
     APS5_LOG_CHARS_OUT_DEBUG("Draw recorded");
@@ -2231,6 +2245,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, nullptr, 0);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset);
+    if (recorded && drawTiming != Recorder::NoTiming) noteDrawTiming(*recorder, drawTiming, state, resources->InPlaceReads(), resources->GpuWrites(), inputs.inPlaceRanges, resources->HoldsLease());
     if (args != nullptr) CountIndirectDraw(indirect.path, indirect.readMs, rewritten);
     auto checkRecords = indirectRecordCheck(args != nullptr ? &indirect : nullptr);
     APS5_LOG_CHARS_OUT_DEBUG("Draw recorded");
@@ -2562,6 +2577,7 @@ FastDrawOutcome DrawFast(const Context& context, const State& state, const Pm4::
     if (!inputs.inPlaceRanges.empty()) recorder->NotePendingReads(inputs.inPlaceRanges, Recorder::ReadKind::DrawInput);
     if (!reads.empty()) recorder->NotePendingReads(reads, Recorder::ReadKind::DispatchElement);
     recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset);
+    if (Recorder::GpuTimingEnabled()) noteDrawTiming(*recorder, continued ? recorder->OpenRenderPassTiming() : drawTiming, state, reads, {}, inputs.inPlaceRanges, false);
     if (args != nullptr) CountIndirectDraw(indirect.path, indirect.readMs, false);
     if (auto checkRecords = indirectRecordCheck(args != nullptr ? &indirect : nullptr)) recorder->OnComplete(std::move(checkRecords));
     // A fast draw writes nothing but its attachments: the next draw of the pass may continue it.

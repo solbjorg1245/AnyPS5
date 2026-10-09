@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1983,7 +1984,7 @@ void Recorder::recordDeferredCopies(std::vector<DeferredCopy> copies, FlushReaso
     copyBacksRecorded.fetch_add(copies.size(), std::memory_order_relaxed);
     if (open->renderPass.open) endOpenRenderPass();
     const auto commands = open->commands;
-    const auto timing = beginTiming(ClassKey(CommandClass::StagingOut));
+    const auto timing = beginTiming(ClassKey(CommandClass::StagingOut), TimingKind::Class);
     // The shaders' stores into the shadows (whichever stage made them) precede the copies.
     recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     CountBarriers(CommandClass::StagingOut);
@@ -2103,7 +2104,7 @@ void Recorder::recordKeyStores(bool forWriter) {
     open->keyStores.clear();
     if (stores.empty()) return;
     const auto commands = Commands();
-    const auto timing = beginTiming(ClassKey(CommandClass::DccKeyStore));
+    const auto timing = beginTiming(ClassKey(CommandClass::DccKeyStore), TimingKind::Class);
     // Ordered behind every earlier recorded read or write of the ranges (the title's DCC clear or
     // decompress kernel storing keys through a V#), and visible to the work after and to the host.
     recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
@@ -2135,7 +2136,7 @@ void Recorder::RecordCopies(std::span<const DeferredCopy> copies, CommandClass w
     if (copies.empty()) return;
     // Outside any render pass, in the open batch.
     const auto commands = Commands();
-    const auto timing = beginTiming(ClassKey(which));
+    const auto timing = beginTiming(ClassKey(which), TimingKind::Class);
     // Behind every earlier recorded write of the sources (a shader's stores through a V# bound in
     // place, a transfer, a label), and visible to the work after.
     recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -2192,7 +2193,7 @@ void Recorder::ensureOpen() {
         open = std::move(batch);
         // The whole-batch range: its start stamp waits for the previous batches like any
         // bottom-of-pipe stamp, so it marks when this batch's execution began.
-        if (BatchStampsEnabled()) open->batchTiming = beginTiming(BatchTimingKey);
+        if (BatchStampsEnabled()) open->batchTiming = beginTiming(BatchTimingKey, TimingKind::Batch);
     }
 }
 
@@ -2233,7 +2234,7 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
     // Two transfers to the same bytes have no order of their own within the run.
     const auto overlapsRecorded = [&] { return std::any_of(run.recorded.begin(), run.recorded.end(), [&](const auto& store) { return std::get<0>(store) == buffer && offset < std::get<2>(store) && std::get<1>(store) < end; }); };
     if (!run.open) {
-        run.timing = beginTiming(ClassKey(CommandClass::LabelRun));
+        run.timing = beginTiming(ClassKey(CommandClass::LabelRun), TimingKind::Class);
         run.storedBytes = 0;
         // The run's leading barrier: every earlier write of the range (a shader's, a transfer's, a
         // color attachment's) lands before the stores of the run.
@@ -2308,7 +2309,7 @@ bool Recorder::closeStoreRun(bool atSubmit) {
         if (!open->keyStores.empty()) recordKeyStores(true);
         if (open->renderPass.open) endOpenRenderPass();
         const auto commands = open->commands;
-        run.timing = beginTiming(ClassKey(CommandClass::LabelRun));
+        run.timing = beginTiming(ClassKey(CommandClass::LabelRun), TimingKind::Class);
         if (BarrierValidate()) {
             std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
             for (const auto& store : stores) ranges.emplace_back(store.address, store.address + store.bytes.size());
@@ -2379,7 +2380,6 @@ void Recorder::FlushStores() {
 
 namespace {
 
-constexpr std::uint32_t MaxTimedRanges = 512;
 constexpr std::size_t CommandClasses = static_cast<std::size_t>(Recorder::CommandClass::Count);
 constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh", "deferred-flat"};
 // [barriers] counters by class (relaxed: only reported) and the [gputime] totals, which the
@@ -2400,11 +2400,10 @@ std::atomic<std::int64_t> traceBarriersLeft{[] {
 std::atomic<std::uint64_t> timingPresents{0};
 std::atomic<std::uint64_t> presentSerial{0};
 std::atomic<std::uint64_t> timingDropped{0};
-struct TimingTotals { std::uint64_t count = 0; double ms = 0; std::uint64_t bytes = 0; };
+std::atomic<std::uint64_t> timingRefusedInPass{0};
+std::uint64_t timingRefusedReported = 0;
 HostMutex timingMutex;
-std::map<std::uint64_t, TimingTotals> timingByKey;
-double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
-std::uint64_t timingBatches = 0;
+GpuTimingDigest timingDigest;
 
 bool DrawOrGpuProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr || Recorder::GpuTimingEnabled();
@@ -2574,27 +2573,72 @@ std::uint64_t Recorder::Presents() {
 }
 
 void Recorder::AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_t bytes) {
+    const auto queue = GuestMemory::GpuLockThreadTag();
     std::lock_guard lock(timingMutex);
-    auto& totals = timingByKey[ClassKey(which)];
-    ++totals.count;
-    totals.ms += nanoseconds / 1e6;
-    totals.bytes += bytes;
-    timingClassMs += nanoseconds / 1e6;
+    timingDigest.AddClass(which, nanoseconds, bytes, queue);
+}
+
+GpuTimingDigest Recorder::GpuTimingTotals() {
+    std::lock_guard lock(timingMutex);
+    return timingDigest;
+}
+
+bool Recorder::GpuTimingFlushes() {
+    static const bool flushes = std::getenv("APS5_PROFILE_GPU_FLUSHES") != nullptr;
+    return flushes;
+}
+
+std::uint32_t Recorder::GpuTimingRangeCap() {
+    // 512 (the old cap) held at BATCH_CAP 64 (t373: ~80 ranges per batch); uncapped batches hold
+    // several times that. Every profiled pool has this size, so they are recycled like the
+    // unprofiled 2-query ones (release).
+    static const std::uint32_t cap = [] {
+        const char* text = std::getenv("APS5_PROFILE_GPU_RANGES");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+        return value == 0 ? 8192u : static_cast<std::uint32_t>(std::clamp<unsigned long long>(value, 64, 65536));
+    }();
+    return cap;
+}
+
+std::uint64_t Recorder::GpuTimingRefusedInPass() {
+    return timingRefusedInPass.load(std::memory_order_relaxed);
 }
 
 std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
-    if (!GpuTimingEnabled()) return NoTiming;
-    Commands();
-    return beginTiming(key);
+    return startGpuTiming(key, TimingKind::Program);
 }
 
-std::uint32_t Recorder::beginTiming(std::uint64_t key) {
+std::uint32_t Recorder::BeginTransferTiming(std::uint64_t programAddress) {
+    return startGpuTiming(programAddress, TimingKind::Transfer);
+}
+
+std::uint32_t Recorder::startGpuTiming(std::uint64_t key, TimingKind kind) {
+    if (!GpuTimingEnabled()) return NoTiming;
+    // The old form: Commands() records the queued copy-backs (every one under coalescing, so a
+    // profiled run hid coalescing's gain) and clears the barrier-merge state at every range.
+    if (GpuTimingFlushes()) {
+        Commands();
+    } else {
+        ensureOpen();
+        // Every caller takes its command buffer first, which ends an open pass. A range begun
+        // inside one would nest in the pass's draw range (counted twice in the rows) and, with no
+        // pool yet, reset the pool inside the pass: not timed, counted.
+        if (open->renderPass.open) {
+            timingRefusedInPass.fetch_add(1, std::memory_order_relaxed);
+            return NoTiming;
+        }
+    }
+    return beginTiming(key, kind);
+}
+
+std::uint32_t Recorder::beginTiming(std::uint64_t key, TimingKind kind) {
     const bool full = GpuTimingEnabled();
     if (!full && !(key == BatchTimingKey && DrawProfiled())) return NoTiming;
     const auto commands = open->commands;
-    const std::uint32_t queryCount = full ? MaxTimedRanges * 2 : 2;
+    const std::uint32_t queryCount = full ? GpuTimingRangeCap() * 2 : 2;
     if (open->queries == VK_NULL_HANDLE) {
-        if (!full && !sparePools.empty()) {
+        // Every pool of the process has queryCount queries (both switches are read once).
+        if (!sparePools.empty()) {
             open->queries = sparePools.back();
             sparePools.pop_back();
         } else {
@@ -2608,13 +2652,16 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
         }
         context.Function<PFN_vkCmdResetQueryPool>("vkCmdResetQueryPool")(commands, open->queries, 0, queryCount);
     }
-    if (open->timedKeys.size() >= queryCount / 2) {
+    if (open->timed.size() >= queryCount / 2) {
         timingDropped.fetch_add(1, std::memory_order_relaxed);
         return NoTiming;
     }
-    const auto index = static_cast<std::uint32_t>(open->timedKeys.size());
-    open->timedKeys.push_back(key);
-    open->timedBytes.push_back(0);
+    const auto index = static_cast<std::uint32_t>(open->timed.size());
+    auto& range = open->timed.emplace_back();
+    range.key = key;
+    range.kind = kind;
+    // The queue split ([gputime] by queue): the batch range belongs to the thread that opened it.
+    range.queue = full ? (kind == TimingKind::Batch ? open->queue : GuestMemory::GpuLockThreadTag()) : 0xffffffffu;
     // Both stamps wait for everything before them to complete, so the range is the timed work alone
     // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
@@ -2622,9 +2669,80 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
 }
 
 void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
-    if (index == NoTiming || open == nullptr || open->queries == VK_NULL_HANDLE) return;
-    if (index < open->timedBytes.size()) open->timedBytes[index] += bytes;
+    if (index == NoTiming || open == nullptr || open->queries == VK_NULL_HANDLE || index >= open->timed.size()) return;
+    auto& range = open->timed[index];
+    range.bytes += bytes;
+    // A query is written once per batch (a second stamp into an available query is invalid).
+    if (range.ended) return;
+    range.ended = true;
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(open->commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2 + 1);
+}
+
+namespace {
+// Sorted and merged copy of `ranges` (empty ones dropped).
+std::vector<std::pair<std::uint64_t, std::uint64_t>> mergedRanges(Recorder::GuestRanges ranges) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+    merged.reserve(ranges.size());
+    for (const auto& range : ranges) {
+        if (range.second > range.first) merged.push_back(range);
+    }
+    std::sort(merged.begin(), merged.end());
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < merged.size(); ++i) {
+        if (kept != 0 && merged[i].first <= merged[kept - 1].second) merged[kept - 1].second = std::max(merged[kept - 1].second, merged[i].second);
+        else merged[kept++] = merged[i];
+    }
+    merged.resize(kept);
+    return merged;
+}
+
+std::uint64_t mergedBytes(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& merged) {
+    std::uint64_t bytes = 0;
+    for (const auto& [begin, end] : merged) bytes += end - begin;
+    return bytes;
+}
+}
+
+Recorder::InPlaceUse Recorder::InPlaceUseOf(GuestRanges reads, GuestRanges writes, GuestRanges inputs, bool leased) {
+    InPlaceUse use;
+    use.leased = leased;
+    use.inputs = mergedBytes(mergedRanges(inputs));
+    if (leased) return use;
+    const auto read = mergedRanges(reads);
+    use.read = mergedBytes(read);
+    // Both lists are sorted and disjoint: one sweep finds the written bytes inside the reads.
+    const auto written = mergedRanges(writes);
+    std::size_t at = 0;
+    for (const auto& [begin, end] : written) {
+        while (at < read.size() && read[at].second <= begin) ++at;
+        for (auto other = at; other < read.size() && read[other].first < end; ++other) {
+            const auto from = std::max(begin, read[other].first);
+            const auto to = std::min(end, read[other].second);
+            if (to > from) use.written += to - from;
+        }
+    }
+    return use;
+}
+
+void Recorder::NoteInPlace(std::uint32_t index, const InPlaceUse& use) {
+    if (index == NoTiming || open == nullptr || index >= open->timed.size()) return;
+    auto& range = open->timed[index];
+    range.inPlaceRead += use.read;
+    range.inPlaceWritten += use.written;
+    range.inPlaceInputs += use.inputs;
+    if (use.leased) ++range.leased;
+}
+
+void Recorder::NoteDrawInPass(std::uint32_t index, std::uint64_t target, const InPlaceUse& use) {
+    if (index == NoTiming || open == nullptr || index >= open->timed.size()) return;
+    NoteInPlace(index, use);
+    auto& range = open->timed[index];
+    ++range.draws;
+    if (range.target == 0) range.target = target;
+}
+
+std::uint32_t Recorder::OpenRenderPassTiming() const {
+    return open != nullptr && open->renderPass.open ? open->renderPass.timing : NoTiming;
 }
 
 void Recorder::CountSamples() {
@@ -2656,8 +2774,8 @@ void Recorder::readSamples(Batch& batch) {
 }
 
 void Recorder::readGpuTiming(Batch& batch) {
-    if (batch.queries == VK_NULL_HANDLE || batch.timedKeys.empty()) return;
-    std::vector<std::uint64_t> stamps(batch.timedKeys.size() * 2);
+    if (batch.queries == VK_NULL_HANDLE || batch.timed.empty()) return;
+    std::vector<std::uint64_t> stamps(batch.timed.size() * 2);
     const auto result = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, batch.queries, 0, static_cast<std::uint32_t>(stamps.size()), stamps.size() * sizeof(std::uint64_t), stamps.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
     if (result != VK_SUCCESS) return;
     const auto period = context.limits.timestampPeriod;
@@ -2668,64 +2786,252 @@ void Recorder::readGpuTiming(Batch& batch) {
         }
         return;
     }
+    for (std::size_t i = 0; i < batch.timed.size(); ++i) {
+        batch.timed[i].begin = stamps[i * 2];
+        batch.timed[i].end = stamps[i * 2 + 1];
+    }
+    if (batch.batchTiming < batch.timed.size()) {
+        // The whole batch: apart from the per-program totals it contains.
+        batch.gpuStartNs = static_cast<double>(batch.timed[batch.batchTiming].begin) * period;
+        batch.gpuEndNs = static_cast<double>(batch.timed[batch.batchTiming].end) * period;
+    }
     static auto lastReport = std::chrono::steady_clock::now();
-    // The union of the timed ranges (class ranges nest program ranges: a copy's transfer inside
-    // its class range) against the batch span gives what no range covers.
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> intervals;
-    intervals.reserve(batch.timedKeys.size());
     std::unique_lock lock(timingMutex);
-    for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {
-        const auto ns = static_cast<double>(stamps[i * 2 + 1] - stamps[i * 2]) * period;
-        if (i == batch.batchTiming) {
-            // The whole batch: apart from the per-program totals it contains.
-            batch.gpuStartNs = static_cast<double>(stamps[i * 2]) * period;
-            batch.gpuEndNs = static_cast<double>(stamps[i * 2 + 1]) * period;
-            timingBatchMs += ns / 1e6;
-            continue;
-        }
-        const auto key = batch.timedKeys[i];
-        auto& totals = timingByKey[key];
-        ++totals.count;
-        totals.ms += ns / 1e6;
-        totals.bytes += batch.timedBytes[i];
-        (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? timingClassMs : timingProgramMs) += ns / 1e6;
-        intervals.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
-    }
-    std::sort(intervals.begin(), intervals.end());
-    std::uint64_t coveredTicks = 0, unionEnd = 0;
-    for (const auto& [begin, end] : intervals) {
-        const auto from = std::max(begin, unionEnd);
-        if (end > from) coveredTicks += end - from;
-        unionEnd = std::max(unionEnd, end);
-    }
-    timingUnionMs += static_cast<double>(coveredTicks) * period / 1e6;
-    ++timingBatches;
+    timingDigest.AddBatch(batch.timed, period);
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport < std::chrono::seconds(10)) return;
     lastReport = now;
     const auto presents = timingPresents.exchange(0, std::memory_order_relaxed);
-    const double perPresent = presents != 0 ? 1.0 / static_cast<double>(presents) : 0.0;
-    std::vector<std::pair<std::uint64_t, TimingTotals>> hot;
-    std::string classes;
-    for (const auto& [key, totals] : timingByKey) {
-        if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) {
-            char text[160];
-            std::snprintf(text, sizeof(text), " %s x%llu %.1fms %.1fMiB (per present x%.1f %.2fms %.2fMiB)", CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)], static_cast<unsigned long long>(totals.count), totals.ms, totals.bytes / 1048576.0, static_cast<double>(totals.count) * perPresent, totals.ms * perPresent, totals.bytes / 1048576.0 * perPresent);
-            classes += text;
-        } else {
-            hot.emplace_back(key, totals);
-        }
-    }
-    std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
-    // The first field stays the program sum: the measure scripts match on it.
-    std::fprintf(stderr, "[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
-    for (std::size_t i = 0; i < hot.size() && i < 12; ++i) std::fprintf(stderr, " 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
-    std::fprintf(stderr, "; by class:%s\n", classes.c_str());
-    timingByKey.clear();
-    timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
-    timingBatches = 0;
+    const auto refused = timingRefusedInPass.load(std::memory_order_relaxed);
+    const auto refusedNow = refused - timingRefusedReported;
+    timingRefusedReported = refused;
+    for (const auto& line : timingDigest.Report(presents, timingDropped.exchange(0, std::memory_order_relaxed), GpuTimingRangeCap(), refusedNow)) std::fprintf(stderr, "%s\n", line.c_str());
+    timingDigest.Clear();
     lock.unlock();
     reportBarriers();
+}
+
+namespace {
+void appendFormat(std::string& out, const char* format, ...) {
+    char text[512];
+    va_list arguments;
+    va_start(arguments, format);
+    const int written = std::vsnprintf(text, sizeof(text), format, arguments);
+    va_end(arguments);
+    if (written > 0) out.append(text, std::min<std::size_t>(static_cast<std::size_t>(written), sizeof(text) - 1));
+}
+
+void addTotals(GpuTimingDigest::Totals& totals, const Recorder::TimedRange& range, double ms) {
+    ++totals.count;
+    totals.ms += ms;
+    totals.bytes += range.bytes;
+    totals.read += range.inPlaceRead;
+    totals.written += range.inPlaceWritten;
+    totals.inputs += range.inPlaceInputs;
+    totals.leased += range.leased;
+    totals.draws += range.draws;
+}
+
+const char* queueName(std::uint32_t queue, char (&text)[16]) {
+    if (queue == 0xffffffffu) return "untagged";
+    std::snprintf(text, sizeof(text), "0x%x", queue);
+    return text;
+}
+}
+
+void GpuTimingDigest::AddBatch(std::span<const Recorder::TimedRange> ranges, double period) {
+    using Kind = Recorder::TimingKind;
+    struct Interval {
+        std::uint32_t queue;
+        std::uint64_t begin;
+        std::uint64_t end;
+    };
+    std::vector<Interval> intervals;
+    intervals.reserve(ranges.size());
+    ++batches;
+    const auto firstClass = Recorder::ClassKey(CommandClass::DispatchLeading);
+    for (const auto& range : ranges) {
+        const double ms = range.end > range.begin ? static_cast<double>(range.end - range.begin) * period / 1e6 : 0.0;
+        if (range.leftOpen) {
+            // Ended by Submit: its span is not its work. In no total and not in the union (its
+            // work stays in "untimed").
+            ++leftOpen;
+            continue;
+        }
+        auto& queue = queues[range.queue];
+        if (range.kind == Kind::Batch) {
+            batchMs += ms;
+            queue.batchMs += ms;
+            ++queue.batches;
+            continue;
+        }
+        ++queue.ranges;
+        if (range.kind == Kind::Class && range.key >= firstClass && range.key < firstClass + Classes) {
+            const auto which = static_cast<CommandClass>(range.key - firstClass);
+            addTotals(classes[range.key - firstClass], range, ms);
+            classMs += ms;
+            queue.classMs += ms;
+            // A draw range is a render pass (its first draw to the pass's trailing barrier).
+            if (which == CommandClass::Draw) addTotals(passes[range.target], range, ms);
+        } else {
+            // Programs keyed by guest address: dispatches and the guest copies' transfers (nested
+            // in their copy class range), as the [gputime] line always summed them.
+            addTotals(programs[range.key], range, ms);
+            programMs += ms;
+            if (range.kind == Kind::Transfer) {
+                addTotals(transfers, range, ms);
+            } else {
+                addTotals(dispatches, range, ms);
+                dispatchMs += ms;
+                queue.programMs += ms;
+            }
+        }
+        if (range.end > range.begin) intervals.push_back({range.queue, range.begin, range.end});
+    }
+    // The union of the timed ranges (class ranges nest program ranges: a copy's transfer inside
+    // its class range) against the batch span gives what no range covers; per queue likewise.
+    const auto unionTicks = [](auto first, auto last) {
+        std::uint64_t covered = 0, reached = 0;
+        for (auto at = first; at != last; ++at) {
+            const auto from = std::max(at->begin, reached);
+            if (at->end > from) covered += at->end - from;
+            reached = std::max(reached, at->end);
+        }
+        return covered;
+    };
+    std::sort(intervals.begin(), intervals.end(), [](const Interval& a, const Interval& b) { return a.begin < b.begin; });
+    unionMs += static_cast<double>(unionTicks(intervals.begin(), intervals.end())) * period / 1e6;
+    std::stable_sort(intervals.begin(), intervals.end(), [](const Interval& a, const Interval& b) { return a.queue < b.queue; });
+    for (auto first = intervals.begin(); first != intervals.end();) {
+        auto last = first;
+        while (last != intervals.end() && last->queue == first->queue) ++last;
+        queues[first->queue].timedMs += static_cast<double>(unionTicks(first, last)) * period / 1e6;
+        first = last;
+    }
+}
+
+void GpuTimingDigest::AddClass(CommandClass which, double nanoseconds, std::uint64_t bytes, std::uint32_t queue) {
+    auto& totals = classes[static_cast<std::size_t>(which)];
+    ++totals.count;
+    totals.ms += nanoseconds / 1e6;
+    totals.bytes += bytes;
+    classMs += nanoseconds / 1e6;
+    auto& queueTotals = queues[queue];
+    ++queueTotals.ranges;
+    queueTotals.classMs += nanoseconds / 1e6;
+    queueTotals.timedMs += nanoseconds / 1e6;
+}
+
+std::vector<std::string> GpuTimingDigest::Report(std::uint64_t presents, std::uint64_t dropped, std::uint32_t cap, std::uint64_t refusedInPass) const {
+    using Count = unsigned long long;
+    std::vector<std::string> lines;
+    const double per = presents != 0 ? 1.0 / static_cast<double>(presents) : 0.0;
+    const auto mib = [](std::uint64_t bytes) { return static_cast<double>(bytes) / 1048576.0; };
+    // 1. Programs and classes (the first field stays the program sum).
+    std::string line;
+    appendFormat(line, "[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap; %llu left open, ended at submit and not counted; %llu refused inside a render pass); by program (MiB bound in place read/written, L address-based):", programMs, Count(batches), batchMs, classMs, unionMs, batchMs - unionMs, Count(presents), Count(dropped), cap, Count(leftOpen), Count(refusedInPass));
+    std::vector<std::pair<std::uint64_t, const Totals*>> hot;
+    hot.reserve(programs.size());
+    for (const auto& [key, totals] : programs) hot.emplace_back(key, &totals);
+    std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second->ms > b.second->ms; });
+    for (std::size_t i = 0; i < hot.size() && i < 20; ++i) {
+        const auto& totals = *hot[i].second;
+        appendFormat(line, " 0x%llx x%llu %.0fms", Count(hot[i].first), Count(totals.count), totals.ms);
+        if (totals.read != 0 || totals.written != 0) appendFormat(line, " r%.1f/w%.1fMiB", mib(totals.read), mib(totals.written));
+        if (totals.leased != 0) appendFormat(line, " L%llu", Count(totals.leased));
+    }
+    line += "; by class:";
+    for (std::size_t i = 0; i < Classes; ++i) {
+        const auto& totals = classes[i];
+        if (totals.count == 0) continue;
+        appendFormat(line, " %s x%llu %.1fms %.1fMiB (per present x%.1f %.2fms %.2fMiB)", CommandClassNames[i], Count(totals.count), totals.ms, mib(totals.bytes), static_cast<double>(totals.count) * per, totals.ms * per, mib(totals.bytes) * per);
+    }
+    lines.push_back(std::move(line));
+    // 2. The rows: where the batch spans went, per present.
+    const auto sum = [&](std::initializer_list<CommandClass> which) {
+        Totals total;
+        for (const auto one : which) {
+            const auto& totals = Class(one);
+            total.count += totals.count;
+            total.ms += totals.ms;
+            total.bytes += totals.bytes;
+        }
+        return total;
+    };
+    const auto parts = [&](std::initializer_list<CommandClass> which) {
+        std::string text = " (";
+        bool first = true;
+        for (const auto one : which) {
+            appendFormat(text, "%s%s %.2f", first ? "" : ", ", CommandClassNames[static_cast<std::size_t>(one)], Class(one).ms * per);
+            first = false;
+        }
+        return text + ")";
+    };
+    struct Row {
+        const char* name;
+        Totals totals;
+        std::string detail;
+    };
+    std::vector<Row> rows;
+    {
+        std::string detail;
+        appendFormat(detail, "; bound in place read %.1f MiB, written %.1f MiB; x%.1f address-based", mib(dispatches.read) * per, mib(dispatches.written) * per, static_cast<double>(dispatches.leased) * per);
+        rows.push_back({"programs", dispatches, detail});
+    }
+    {
+        const auto& draws = Class(CommandClass::Draw);
+        std::string detail;
+        appendFormat(detail, " (x = passes); %.1f draws, bound in place inputs %.1f MiB, resources %.1f MiB (written %.1f); x%.1f address-based", static_cast<double>(draws.draws) * per, mib(draws.inputs) * per, mib(draws.read) * per, mib(draws.written) * per, static_cast<double>(draws.leased) * per);
+        rows.push_back({"draws", draws, detail});
+    }
+    rows.push_back({"copy-back", Class(CommandClass::StagingOut), " (staged regions back to their imports)"});
+    rows.push_back({"staging-in", Class(CommandClass::StagingIn), " (imports into staged regions)"});
+    rows.push_back({"detile", Class(CommandClass::StorageUpload), " (storage image uploads)"});
+    rows.push_back({"retile", Class(CommandClass::StorageWriteBack), " (storage image write-backs)"});
+    rows.push_back({"barriers", sum({CommandClass::DispatchLeading, CommandClass::DispatchTrailing, CommandClass::IndirectArguments}), parts({CommandClass::DispatchLeading, CommandClass::DispatchTrailing, CommandClass::IndirectArguments})});
+    rows.push_back({"guest-transfers", sum({CommandClass::Copy, CommandClass::Fill, CommandClass::LabelRun}), parts({CommandClass::Copy, CommandClass::Fill, CommandClass::LabelRun})});
+    rows.push_back({"other-emulator", sum({CommandClass::TemplateDataRefresh, CommandClass::FillClear, CommandClass::DccClear, CommandClass::DccKeyStore, CommandClass::ShadowPublish, CommandClass::DeferredFlat}), parts({CommandClass::TemplateDataRefresh, CommandClass::FillClear, CommandClass::DccClear, CommandClass::DccKeyStore, CommandClass::ShadowPublish, CommandClass::DeferredFlat})});
+    const double untimed = batchMs - unionMs;
+    double rowsMs = untimed;
+    for (const auto& row : rows) rowsMs += row.totals.ms;
+    const double busy = batchMs > 0 ? batchMs : 1.0;
+    line.clear();
+    appendFormat(line, "[gputime] row busy: %.2f ms per present (batch spans, x%.1f batches, %llu presents); the rows sum to %.2f (ranges nested in others %.2f); untimed holds the work of x%.1f ranges dropped at the %u cap and x%.1f left open", batchMs * per, static_cast<double>(batches) * per, Count(presents), rowsMs * per, (rowsMs - batchMs) * per, static_cast<double>(dropped) * per, cap, static_cast<double>(leftOpen) * per);
+    lines.push_back(std::move(line));
+    for (const auto& row : rows) {
+        line.clear();
+        appendFormat(line, "[gputime] row %s: %.2f ms per present (%.1f%% of busy), x%.1f, %.2f MiB", row.name, row.totals.ms * per, 100.0 * row.totals.ms / busy, static_cast<double>(row.totals.count) * per, mib(row.totals.bytes) * per);
+        line += row.detail;
+        lines.push_back(std::move(line));
+    }
+    line.clear();
+    appendFormat(line, "[gputime] row untimed: %.2f ms per present (%.1f%% of busy; batch spans outside every range)", untimed * per, 100.0 * untimed / busy);
+    lines.push_back(std::move(line));
+    line.clear();
+    appendFormat(line, "[gputime] row present-blit: %.2f ms per present, x%.1f (its own submission, outside busy); the guest copies' transfers %.2f ms are inside guest-transfers", Class(CommandClass::PresentBlit).ms * per, static_cast<double>(Class(CommandClass::PresentBlit).count) * per, transfers.ms * per);
+    lines.push_back(std::move(line));
+    // 3. By guest queue: the union of the ranges each queue's threads recorded.
+    line = "[gputime] by queue (ms per present; timed = the union of its ranges):";
+    for (const auto& [queue, totals] : queues) {
+        char name[16];
+        appendFormat(line, " %s timed %.2f (dispatches %.2f, classes %.2f, x%.1f ranges), batches opened %.2f x%.1f;", queueName(queue, name), totals.timedMs * per, totals.programMs * per, totals.classMs * per, static_cast<double>(totals.ranges) * per, totals.batchMs * per, static_cast<double>(totals.batches) * per);
+    }
+    lines.push_back(std::move(line));
+    // 4. Draw passes by target.
+    std::vector<std::pair<std::uint64_t, const Totals*>> targets;
+    targets.reserve(passes.size());
+    for (const auto& [target, totals] : passes) targets.emplace_back(target, &totals);
+    std::sort(targets.begin(), targets.end(), [](const auto& a, const auto& b) { return a.second->ms > b.second->ms; });
+    line.clear();
+    appendFormat(line, "[gputime] draw passes by target (per present; top 16 of %zu; ms, x passes, d draws, MiB bound in place inputs/resources):", targets.size());
+    for (std::size_t i = 0; i < targets.size() && i < 16; ++i) {
+        const auto& totals = *targets[i].second;
+        if (targets[i].first == 0) line += " unnamed";
+        else appendFormat(line, " 0x%llx", Count(targets[i].first));
+        appendFormat(line, " %.2fms x%.1f %.1fd %.1f/%.1fMiB;", totals.ms * per, static_cast<double>(totals.count) * per, static_cast<double>(totals.draws) * per, mib(totals.inputs) * per, mib(totals.read) * per);
+    }
+    lines.push_back(std::move(line));
+    return lines;
 }
 
 bool Recorder::FlipReadCheck() {
@@ -3393,6 +3699,15 @@ void Recorder::Submit() {
         recordBarrier(open->commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
         CountBarriers(CommandClass::Draw);
     }
+    // A range begun and never ended (a throw between its Begin and End) is ended here: the reap
+    // waits for every query of the batch (vkGetQueryPoolResults with WAIT_BIT), and an unwritten
+    // one would hold it forever.
+    // Its span runs to here, not to its end, so the digest counts it apart (TimedRange::leftOpen).
+    for (std::uint32_t index = 0; index < open->timed.size(); ++index) {
+        if (index == open->batchTiming || open->timed[index].ended) continue;
+        open->timed[index].leftOpen = true;
+        EndGpuTiming(index);
+    }
     EndGpuTiming(open->batchTiming);
     if (!GpuTimingEnabled()) reportBarriers();
     if (FlipReadCheck()) {
@@ -3956,7 +4271,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
 
 void Recorder::release(Batch& batch) noexcept {
     if (batch.queries != VK_NULL_HANDLE) {
-        if (!GpuTimingEnabled() && sparePools.size() < 64) {
+        if (sparePools.size() < 64) {
             try {
                 sparePools.push_back(batch.queries);
                 batch.queries = VK_NULL_HANDLE;

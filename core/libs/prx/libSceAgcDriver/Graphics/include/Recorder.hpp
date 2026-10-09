@@ -16,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -23,6 +24,7 @@
 namespace AgcDriver::Graphics {
 
 class Buffer;
+class GpuTimingDigest;
 
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the
 // copies that feed them record into one open batch; Submit sends it to the queue without waiting and
@@ -575,9 +577,48 @@ public:
     static constexpr std::uint32_t NoTiming = 0xffffffffu;
     static bool GpuTimingEnabled();
     static bool BatchStampsEnabled();
+    // A range starts where the caller's next command goes and records nothing but its stamp: the
+    // queued copy-backs stay queued (coalescing) and the barrier-merge state (Commands'
+    // coveredAccess) stays, so profiling leaves the recorded stream as it is without it. Every
+    // caller takes its command buffer first. Debug aid: APS5_PROFILE_GPU_FLUSHES=1 begins every
+    // range with Commands(), as before (it records every queued copy-back at every range).
     std::uint32_t BeginGpuTiming(std::uint64_t key);
+    static bool GpuTimingFlushes();
+    // Timed ranges per batch (APS5_PROFILE_GPU_RANGES, default 8192, 64..65536; read once): a
+    // batch's ranges past it are dropped and counted ([gputime] "ranges dropped").
+    static std::uint32_t GpuTimingRangeCap();
+    // Ranges a Begin*Timing refused because a render pass was open (every caller takes its
+    // command buffer first, which ends the pass; a range begun inside it would nest in the pass's
+    // draw range). Never reset; [gputime] reports the window's part.
+    static std::uint64_t GpuTimingRefusedInPass();
+    // A guest copy's transfer (VulkanDevice::CopyBuffer): keyed by its program address like a
+    // dispatch, but nested in its copy class range, so the [gputime] split rows leave it there.
+    std::uint32_t BeginTransferTiming(std::uint64_t programAddress);
     // `bytes`: what the range moved (a fill's, a copy's), summed per key on the [gputime] line.
     void EndGpuTiming(std::uint32_t index, std::uint64_t bytes = 0);
+    // What a timed program or draw binds in place in the host imports, read over PCIe when it
+    // runs: `read` the bytes of the ranges bound in place, `written` the part of them it may write,
+    // `inputs` a draw's vertex and index ranges read in place; `leased` an address-based build,
+    // whose leased heaps are not counted (its bytes are unknown). Bound bytes, not bytes fetched.
+    struct InPlaceUse {
+        std::uint64_t read = 0;
+        std::uint64_t written = 0;
+        std::uint64_t inputs = 0;
+        bool leased = false;
+    };
+    using GuestRanges = std::span<const std::pair<std::uint64_t, std::uint64_t>>;
+    // The union of `reads` (bytes), the bytes of `writes` inside it, the union of `inputs`;
+    // `leased` drops the reads and writes (an address-based build's include whole heaps).
+    static InPlaceUse InPlaceUseOf(GuestRanges reads, GuestRanges writes, GuestRanges inputs = {}, bool leased = false);
+    // Adds `use` to the open batch's range `index` (a program's: VulkanDevice recordDispatch,
+    // FastDispatch); nothing for NoTiming.
+    void NoteInPlace(std::uint32_t index, const InPlaceUse& use);
+    // A draw recorded into the pass whose draw range is `index` (the draw's own, or the open
+    // pass's when it continued it: OpenRenderPassTiming): counts the draw and its `use`, and names
+    // the pass by `target` (its first color target's guest address, else its depth target's) when
+    // the pass has no name yet. The [gputime] draw-pass line sums passes by target.
+    void NoteDrawInPass(std::uint32_t index, std::uint64_t target, const InPlaceUse& use);
+    std::uint32_t OpenRenderPassTiming() const;
     // The key of the whole-batch range (first to last command; reported as "batch" on the [gputime]
     // line, apart from the per-program totals).
     static constexpr std::uint64_t BatchTimingKey = 0x3;
@@ -589,7 +630,7 @@ public:
     // union of every range of a batch and the batch span differ by what no class times ('untimed').
     enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, DeferredFlat, Count };
     static constexpr std::uint64_t ClassKey(CommandClass which) { return 0x10 + static_cast<std::uint64_t>(which); }
-    std::uint32_t BeginGpuTiming(CommandClass which) { return BeginGpuTiming(ClassKey(which)); }
+    std::uint32_t BeginGpuTiming(CommandClass which) { return startGpuTiming(ClassKey(which), TimingKind::Class); }
     // Records buffer copies into the open batch outside any render pass (an open pass ends),
     // ordered behind every earlier recorded write of their sources and visible to the work after;
     // `which` names the [gputime]/[barriers] class (deferred flat slots: Draw.cpp
@@ -622,6 +663,32 @@ public:
     // A range timed outside the recorder's batches (the presenter's blit, stamped into its own
     // pool and read after its fence): enters the class totals like a recorded one.
     static void AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_t bytes);
+    // A timed range as the [gputime] digest takes it (GpuTimingDigest::AddBatch): its key and
+    // kind, the GpuMutex queue tag of the thread that began it (GuestMemory::GpuLockThreadTag),
+    // its stamps once read (ticks), what it moved (EndGpuTiming) and what it bound in place
+    // (NoteInPlace, NoteDrawInPass: `draws` and the pass `target` for a draw range).
+    enum class TimingKind : std::uint8_t { Program = 0, Transfer, Class, Batch };
+    struct TimedRange {
+        std::uint64_t key = 0;
+        TimingKind kind = TimingKind::Program;
+        std::uint32_t queue = 0xffffffffu;
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t inPlaceRead = 0;
+        std::uint64_t inPlaceWritten = 0;
+        std::uint64_t inPlaceInputs = 0;
+        std::uint32_t leased = 0;
+        std::uint32_t draws = 0;
+        std::uint64_t target = 0;
+        // The end stamp was written (EndGpuTiming, or Submit for a range left open).
+        bool ended = false;
+        // Ended by Submit, not by its End (a throw between Begin and End): it spans the rest of
+        // the batch, so the digest counts it apart and adds it to no total.
+        bool leftOpen = false;
+    };
+    // The [gputime] totals since the last report (tests; under the timing mutex).
+    static GpuTimingDigest GpuTimingTotals();
     // Presentations, so the [gputime] class totals can be given per present.
     static void CountPresent();
     // Presentations so far (never reset): a frame clock for policies that count per frame, such as
@@ -688,8 +755,8 @@ private:
         std::chrono::steady_clock::time_point submittedAt{};
         VkQueryPool queries = VK_NULL_HANDLE;
         VkQueryPool samples = VK_NULL_HANDLE;
-        std::vector<std::uint64_t> timedKeys;
-        std::vector<std::uint64_t> timedBytes;
+        // The batch's timed ranges (BeginGpuTiming), stamps filled in when read.
+        std::vector<TimedRange> timed;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
         std::uint32_t batchTiming = NoTiming;
         double gpuStartNs = 0;
@@ -790,8 +857,10 @@ private:
     void readSamples(Batch& batch);
     bool countingSamples = false;
     // BeginGpuTiming on the open batch without Commands() (RecordStore times its own run, which
-    // Commands() would close).
-    std::uint32_t beginTiming(std::uint64_t key);
+    // Commands() would close); `kind` as the digest takes it.
+    std::uint32_t beginTiming(std::uint64_t key, TimingKind kind);
+    // The public Begin*Timing: the switch, the batch, then beginTiming.
+    std::uint32_t startGpuTiming(std::uint64_t key, TimingKind kind);
     // Vulkan entry points resolved once (constructor): the loader's vkGetDeviceProcAddr is a name
     // lookup per call, paid by every reap, store and submit otherwise. APS5_NO_PROC_TABLE=1 leaves
     // them null and resolves per call as before; vkWaitSemaphoresKHR stays a lazy lookup (timeline
@@ -941,6 +1010,83 @@ private:
     std::map<DrawSnapshotKey, DrawSnapshot> drawSnapshots;
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
+};
+
+// APS5_PROFILE_GPU: the [gputime] totals of the timed ranges between two reports and the report's
+// lines. The recorder adds every finished batch's ranges (AddBatch) and the presenter's blit
+// (AddClass) under its timing mutex, and prints Report every 10 s:
+// - the program and class line (programs keyed by guest address, with the MiB they bind in place);
+// - one "row" line per bucket of GPU time per present, the guest's own work (programs, draws, the
+//   guest's copies, fills and label stores) apart from the emulator's (copy-backs, staging copies,
+//   detile uploads, retile write-backs, the dispatch barrier ranges, the rest), plus "untimed"
+//   (batch spans outside every range): the rows add up to the batch spans ("busy");
+// - the split by guest queue (the GpuMutex tag of the thread that recorded each range);
+// - the draw passes by target address, with their draws and the MiB they bind in place.
+class GpuTimingDigest {
+public:
+    using CommandClass = Recorder::CommandClass;
+    struct Totals {
+        std::uint64_t count = 0;
+        double ms = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t read = 0;
+        std::uint64_t written = 0;
+        std::uint64_t inputs = 0;
+        std::uint64_t leased = 0;
+        std::uint64_t draws = 0;
+    };
+    struct QueueTotals {
+        // The union of the queue's ranges, the program and class ranges summed, its range count;
+        // the spans of the batches its threads opened.
+        double timedMs = 0;
+        double programMs = 0;
+        double classMs = 0;
+        std::uint64_t ranges = 0;
+        double batchMs = 0;
+        std::uint64_t batches = 0;
+    };
+    static constexpr std::size_t Classes = static_cast<std::size_t>(CommandClass::Count);
+    // A finished batch's ranges, their stamps in ticks of `period` nanoseconds.
+    void AddBatch(std::span<const Recorder::TimedRange> ranges, double period);
+    // A range timed outside the batches (the presenter's blit, `queue` its thread's tag).
+    void AddClass(CommandClass which, double nanoseconds, std::uint64_t bytes, std::uint32_t queue);
+    // Programs (dispatches and the guest copies' transfers) by key, classes, draw passes by target.
+    const std::map<std::uint64_t, Totals>& Programs() const { return programs; }
+    const Totals& Class(CommandClass which) const { return classes[static_cast<std::size_t>(which)]; }
+    const std::map<std::uint64_t, Totals>& Passes() const { return passes; }
+    const std::map<std::uint32_t, QueueTotals>& Queues() const { return queues; }
+    // The dispatch program ranges alone, and the guest copies' transfers alone.
+    const Totals& Dispatches() const { return dispatches; }
+    const Totals& Transfers() const { return transfers; }
+    // Sums: program ranges (dispatches and transfers, the [gputime] line's first field), dispatches
+    // alone, classes, the union of every range, the batch spans, and the batches.
+    double ProgramMs() const { return programMs; }
+    double DispatchMs() const { return dispatchMs; }
+    double ClassMs() const { return classMs; }
+    double UnionMs() const { return unionMs; }
+    double BatchMs() const { return batchMs; }
+    std::uint64_t Batches() const { return batches; }
+    // Ranges Submit ended (TimedRange::leftOpen): counted, in no total and not in the union.
+    std::uint64_t LeftOpen() const { return leftOpen; }
+    // The report's lines (no newline), given the presents, the ranges dropped at the cap and the
+    // ranges refused inside a render pass over the window.
+    std::vector<std::string> Report(std::uint64_t presents, std::uint64_t dropped, std::uint32_t cap, std::uint64_t refusedInPass = 0) const;
+    void Clear() { *this = GpuTimingDigest{}; }
+
+private:
+    std::map<std::uint64_t, Totals> programs;
+    std::array<Totals, Classes> classes{};
+    std::map<std::uint64_t, Totals> passes;
+    std::map<std::uint32_t, QueueTotals> queues;
+    Totals dispatches;
+    Totals transfers;
+    double programMs = 0;
+    double dispatchMs = 0;
+    double classMs = 0;
+    double unionMs = 0;
+    double batchMs = 0;
+    std::uint64_t batches = 0;
+    std::uint64_t leftOpen = 0;
 };
 
 }
