@@ -1223,6 +1223,14 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
     narrowCopyBacks = narrow != nullptr && *narrow != '\0' && std::strcmp(narrow, "0") != 0;
     const char* verify = std::getenv("APS5_NARROW_VERIFY");
     narrowVerify = verify != nullptr && *verify != '\0' && std::strcmp(verify, "0") != 0;
+    // A CPU device (lavapipe) lands a kept copy with CPU stores into the guarded pages: the fault
+    // would wait for the very batch that faulted. Resident buffers need a device whose writes into
+    // host imports pass host page protection (a real GPU's DMA).
+    if (residentBuffers && context.softwareDevice) {
+        residentBuffers = false;
+        static std::once_flag warned;
+        std::call_once(warned, [] { std::fprintf(stderr, "[gpu] APS5_RESIDENT_BUFFERS ignored: a CPU Vulkan device writes host imports through page protection\n"); });
+    }
     if (residentBuffers) {
         coalesceCopyBacks = true;
         residentGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();

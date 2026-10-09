@@ -223,7 +223,8 @@ bool Run(AgcDriver::VulkanDevice& device) {
     // ones too: a baseline inherited from a shadow whose claimed copy was recorded since loses its
     // trust (Recorder::ClaimBreaks), and the results above are still exact.
     const auto trust = Graphics::GuestBufferMemory::NarrowTrustCounts();
-    if (std::getenv("APS5_PROFILE_GPU") != nullptr) Require(trust.claimBroken != 0, "no inherited baseline lost its trust to a claim break under APS5_PROFILE_GPU");
+    // (Only where the chain is taken at all: without write tracking every use copies in.)
+    if (std::getenv("APS5_PROFILE_GPU") != nullptr && trust.inherited != 0) Require(trust.claimBroken != 0, "no inherited baseline lost its trust to a claim break under APS5_PROFILE_GPU");
     std::printf("baselines: %llu refreshed, %llu inherited (%llu untrusted), %llu copy-backs narrow, %llu whole, %llu claims broken\n", static_cast<unsigned long long>(trust.refreshed), static_cast<unsigned long long>(trust.inherited), static_cast<unsigned long long>(trust.inheritedUntrusted), static_cast<unsigned long long>(trust.narrow), static_cast<unsigned long long>(trust.whole), static_cast<unsigned long long>(trust.claimBroken));
     std::printf("%llu copy-backs deferred, %llu recorded (%llu narrow in %llu spans, %llu with a baseline copied whole) in %llu passes; %llu bytes compared, %llu stored\n", static_cast<unsigned long long>(after.deferred - before.deferred), static_cast<unsigned long long>(after.recorded - before.recorded), static_cast<unsigned long long>(after.narrow - before.narrow), static_cast<unsigned long long>(after.narrowSpans - before.narrowSpans), static_cast<unsigned long long>(after.narrowWhole - before.narrowWhole), static_cast<unsigned long long>(after.passes - before.passes), static_cast<unsigned long long>(compared), static_cast<unsigned long long>(stored));
     return true;

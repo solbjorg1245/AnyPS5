@@ -2491,6 +2491,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.maxPushDescriptors = state->maxPushDescriptors;
     context.fastLayouts = state->fastLayouts.get();
     context.fastRing = state->fastRing.get();
+    context.softwareDevice = state->properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
     return context;
 }
 
