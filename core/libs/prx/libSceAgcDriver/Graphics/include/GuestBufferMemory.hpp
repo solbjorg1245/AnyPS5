@@ -59,6 +59,8 @@ struct HostImport {
     // A span import (over several adjoining registered ranges): not in the per-range registry, so
     // no serial names it and recipes do not key on it.
     bool span = false;
+    // The memory type it was imported into (~0u: unknown; the [retile] line names it).
+    std::uint32_t memoryType = ~0u;
 };
 
 enum class ImportWatch : std::uint8_t { Watch, Unwatch };
@@ -187,6 +189,10 @@ struct ResidentReadStatistics {
     // APS5_RESIDENT_READS_VERIFY: uses compared on completion, and those whose copy differed
     // from the import.
     std::uint64_t verified = 0, mismatched = 0;
+    // The video memory guard (VideoMemory, APS5_VRAM_GUARD): copies refused for the budget, copies
+    // evicted by its trims (and their bytes), cached copies made before its last recycle and made
+    // anew, and reused builds rebuilt over such a copy.
+    std::uint64_t refusedBudget = 0, trimmed = 0, trimmedBytes = 0, recycled = 0, rebuiltRecycled = 0;
     // The cache now: copies and their allocated bytes (BufferPool::Capacity); the bytes of every
     // live copy (cached, or evicted and still held by a build); address-based writers in flight.
     std::uint64_t entries = 0, bytes = 0, liveBytes = 0, writers = 0;
@@ -212,6 +218,10 @@ void NoteResidentReadsFinished(std::uint64_t recorderId, std::uint64_t serial);
 std::size_t ClearResidentReads();
 // Tests: the resident checks take every write-watch collect as failed.
 void ResidentReadsFailCollectForTests(bool fail);
+// The video memory guard's trim (VideoMemory::SetResidentTrimmer, registered with the first copy):
+// evicts cached copies, least recently used first, until their allocated bytes reach `bytes`;
+// returns the bytes and copies evicted (a holder keeps its own until it is rebuilt).
+std::pair<std::uint64_t, std::uint64_t> TrimResidentReads(std::uint64_t bytes);
 
 // The import table's identity (the fast Revalidate): serials proved under one identity stand
 // while the table still has it, i.e. the same device, the same epoch (bumped by every retire)

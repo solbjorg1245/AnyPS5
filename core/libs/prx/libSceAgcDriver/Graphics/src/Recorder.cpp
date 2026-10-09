@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -2713,7 +2714,7 @@ void Recorder::FlushStores() {
 namespace {
 
 constexpr std::size_t CommandClasses = static_cast<std::size_t>(Recorder::CommandClass::Count);
-constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh", "deferred-flat"};
+constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh", "deferred-flat", "storage-retile", "storage-store"};
 // [barriers] counters by class (relaxed: only reported) and the [gputime] totals, which the
 // presenter's thread adds to without the GPU mutex (AddGpuTiming).
 std::atomic<std::uint64_t> classBarriers[CommandClasses]{};
@@ -3030,6 +3031,13 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key, TimingKind kind) {
     // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
     return index;
+}
+
+std::uint32_t Recorder::ContinueGpuTiming(std::uint32_t index, std::uint64_t bytes, CommandClass next) {
+    if (index == NoTiming) return NoTiming;
+    EndGpuTiming(index, bytes);
+    if (open == nullptr || open->renderPass.open) return NoTiming;
+    return beginTiming(ClassKey(next), TimingKind::Class);
 }
 
 void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
@@ -3351,7 +3359,22 @@ std::vector<std::string> GpuTimingDigest::Report(std::uint64_t presents, std::ui
     rows.push_back({"copy-back", Class(CommandClass::StagingOut), " (staged regions back to their imports)"});
     rows.push_back({"staging-in", Class(CommandClass::StagingIn), " (imports into staged regions)"});
     rows.push_back({"detile", Class(CommandClass::StorageUpload), " (storage image uploads)"});
-    rows.push_back({"retile", Class(CommandClass::StorageWriteBack), " (storage image write-backs)"});
+    {
+        // The write-back's three stages (ContinueGpuTiming); counted once, by its first stage, and
+        // its bytes are the stored ones (the first stage's alone when not split).
+        const auto& read = Class(CommandClass::StorageWriteBack);
+        const auto& retile = Class(CommandClass::StorageRetile);
+        const auto& store = Class(CommandClass::StorageStore);
+        Totals total;
+        total.count = read.count;
+        total.ms = read.ms + retile.ms + store.ms;
+        total.bytes = store.count != 0 ? store.bytes : read.bytes;
+        std::string detail = " (storage image write-backs";
+        if (retile.count != 0 || store.count != 0) appendFormat(detail, ": image->linear %.2f ms %.2f MiB, retile %.2f ms %.2f MiB, store %.2f ms", read.ms * per, mib(read.bytes) * per, retile.ms * per, mib(retile.bytes) * per, store.ms * per);
+        if (read.count != 0) appendFormat(detail, "; %.3f ms and %.2f MiB stored per write-back", total.ms / static_cast<double>(read.count), mib(total.bytes) / static_cast<double>(read.count));
+        detail += ")";
+        rows.push_back({"retile", total, detail});
+    }
     rows.push_back({"barriers", sum({CommandClass::DispatchLeading, CommandClass::DispatchTrailing, CommandClass::IndirectArguments}), parts({CommandClass::DispatchLeading, CommandClass::DispatchTrailing, CommandClass::IndirectArguments})});
     rows.push_back({"guest-transfers", sum({CommandClass::Copy, CommandClass::Fill, CommandClass::LabelRun}), parts({CommandClass::Copy, CommandClass::Fill, CommandClass::LabelRun})});
     rows.push_back({"other-emulator", sum({CommandClass::TemplateDataRefresh, CommandClass::FillClear, CommandClass::DccClear, CommandClass::DccKeyStore, CommandClass::ShadowPublish, CommandClass::DeferredFlat}), parts({CommandClass::TemplateDataRefresh, CommandClass::FillClear, CommandClass::DccClear, CommandClass::DccKeyStore, CommandClass::ShadowPublish, CommandClass::DeferredFlat})});
@@ -4121,6 +4144,9 @@ void Recorder::Submit() {
     }
     inFlight.push_back(std::move(batch));
     if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
+    // The video memory guard's sample and actions (rate-limited; nothing with it and the
+    // profiles off): after the submit, so a trim never touches the batch just recorded.
+    VideoMemory::Poll(context);
 }
 
 std::uint64_t Recorder::SubmitAndEpoch() {

@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -319,6 +320,9 @@ struct VulkanDevice::State {
     // VK_KHR_push_descriptor enabled and its limit (see Graphics::Context).
     bool pushDescriptors = false;
     std::uint32_t maxPushDescriptors = 0;
+    // VK_EXT_memory_budget for the video memory guard (see Graphics::Context).
+    bool memoryBudget = false;
+    PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
     // The device's resolved entry points (Graphics::DeviceFunctions) and the Graphics::Context
     // built once after setup (see graphicsContext); the context's pool reference is dropped before
     // the pool at teardown.
@@ -879,6 +883,17 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     // drops those writes instead of faulting the device.
     const bool imageRobustness = hasExtension(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME);
     if (imageRobustness) deviceExtensions.push_back(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME);
+    // VK_EXT_memory_budget: this process's video memory usage and budget, sampled by the video
+    // memory guard and the [vram] line (Graphics::VideoMemory). Asked for only when either is on.
+    if (Graphics::VideoMemory::Wanted() && hasExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
+        auto query = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(state->instanceProc(state->instance, "vkGetPhysicalDeviceMemoryProperties2"));
+        if (query == nullptr) query = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(state->instanceProc(state->instance, "vkGetPhysicalDeviceMemoryProperties2KHR"));
+        if (query != nullptr) {
+            state->memoryBudget = true;
+            state->memoryProperties2 = query;
+            deviceExtensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+        }
+    }
     // Indirect draws with a GPU-side count (DRAW_INDIRECT_MULTI with count_indirect); a device
     // without it resolves such draws on the CPU.
     state->drawIndirectCount = hasExtension(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
@@ -2519,6 +2534,8 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.fastLayouts = state->fastLayouts.get();
     context.fastRing = state->fastRing.get();
     context.softwareDevice = state->properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+    context.memoryBudget = state->memoryBudget;
+    context.memoryProperties2 = state->memoryProperties2;
     return context;
 }
 

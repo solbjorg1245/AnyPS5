@@ -66,6 +66,8 @@ struct ShadowSlab {
     std::uint64_t lastUse = 0;
     // Destinations handed out for a write-back in progress: such a slab is never evicted.
     std::atomic<std::uint32_t> pins{0};
+    // The memory type it was allocated from (~0u: unknown; the [retile] line names it).
+    std::uint32_t memoryType = ~0u;
 };
 
 // Holds one pin of a slab (ShadowDestination::pin).

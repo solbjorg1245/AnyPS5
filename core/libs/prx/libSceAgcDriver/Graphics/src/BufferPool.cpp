@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -86,7 +87,7 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
         const auto now = std::chrono::steady_clock::now();
         if (now - lastReport > std::chrono::seconds(10)) {
             lastReport = now;
-            std::fprintf(stderr, "[bufferpool] small: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB); large: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB)%s; device: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB of %llu); out of video memory: %llu allocations refused, %llu releases (%.0f MiB), %llu made after one\n", static_cast<unsigned long long>(smallTier.hits), static_cast<unsigned long long>(smallTier.misses), static_cast<unsigned long long>(smallTier.evictions), smallTier.slots, smallTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(largeTier.hits), static_cast<unsigned long long>(largeTier.misses), static_cast<unsigned long long>(largeTier.evictions), largeTier.slots, largeTier.retainedBytes / 1048576.0, sharedTiers() ? " (shared)" : "", static_cast<unsigned long long>(deviceTier.hits), static_cast<unsigned long long>(deviceTier.misses), static_cast<unsigned long long>(deviceTier.evictions), deviceTier.slots, deviceTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(deviceTier.budget >> 20u), static_cast<unsigned long long>(outOfMemoryCounters().refused.load(std::memory_order_relaxed)), static_cast<unsigned long long>(outOfMemoryCounters().reclaims.load(std::memory_order_relaxed)), outOfMemoryCounters().reclaimedBytes.load(std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(outOfMemoryCounters().madeAfter.load(std::memory_order_relaxed)));
+            std::fprintf(stderr, "[bufferpool] small: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB); large: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB)%s; device: %llu hits, %llu misses, %llu evictions, %zu retained (%.0f MiB of %llu); out of video memory: %llu allocations refused, %llu releases (%.0f MiB), %llu made after one; video memory guard: trimmed %llu (%.0f MiB), recycled %llu (%.0f MiB), device limit %.0f MiB\n", static_cast<unsigned long long>(smallTier.hits), static_cast<unsigned long long>(smallTier.misses), static_cast<unsigned long long>(smallTier.evictions), smallTier.slots, smallTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(largeTier.hits), static_cast<unsigned long long>(largeTier.misses), static_cast<unsigned long long>(largeTier.evictions), largeTier.slots, largeTier.retainedBytes / 1048576.0, sharedTiers() ? " (shared)" : "", static_cast<unsigned long long>(deviceTier.hits), static_cast<unsigned long long>(deviceTier.misses), static_cast<unsigned long long>(deviceTier.evictions), deviceTier.slots, deviceTier.retainedBytes / 1048576.0, static_cast<unsigned long long>(deviceTier.budget >> 20u), static_cast<unsigned long long>(outOfMemoryCounters().refused.load(std::memory_order_relaxed)), static_cast<unsigned long long>(outOfMemoryCounters().reclaims.load(std::memory_order_relaxed)), outOfMemoryCounters().reclaimedBytes.load(std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(outOfMemoryCounters().madeAfter.load(std::memory_order_relaxed)), static_cast<unsigned long long>(guardTrimmed), guardTrimmedBytes / 1048576.0, static_cast<unsigned long long>(guardRecycled), guardRecycledBytes / 1048576.0, deviceTier.budget / 1048576.0);
         }
     }
     auto& tier = tierFor(capacity, properties);
@@ -101,6 +102,17 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
     if (found->second.empty()) tier.free.erase(found);
     tier.retainedBytes -= result.allocationBytes;
     --tier.slots;
+    if (&tier == &deviceTier && result.epoch < VideoMemory::Epoch() && VideoMemory::GuardEnabled()) {
+        // Made before the last video memory pressure episode ended (possibly paged out to system
+        // memory during it): destroyed, and the caller makes a new one. Under the mutex: rare (a
+        // recycle drops every retained slot at once; this catches one retained in between).
+        ++guardRecycled;
+        guardRecycledBytes += result.allocationBytes;
+        ++tier.evictions;
+        ++tier.misses;
+        destroy(result);
+        return std::nullopt;
+    }
     ++tier.hits;
     return result;
 }
@@ -135,7 +147,12 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
     try {
         std::lock_guard lock(mutex);
         auto& tier = tierFor(allocation.bytes, allocation.properties);
-        if (allocation.allocationBytes > tier.budget) {
+        if (&tier == &deviceTier && allocation.epoch < VideoMemory::Epoch() && VideoMemory::GuardEnabled()) {
+            // Made before the last video memory pressure episode ended: not reused (see Take).
+            ++guardRecycled;
+            guardRecycledBytes += allocation.allocationBytes;
+            evicted.push_back(allocation);
+        } else if (allocation.allocationBytes > tier.budget) {
             evicted.push_back(allocation);
         } else {
             const auto maxSlots = MaxSlots();
@@ -175,6 +192,41 @@ VkDeviceSize BufferPool::ReleaseDevice() noexcept {
     return bytes;
 }
 
+VkDeviceSize BufferPool::TrimDevice(VkDeviceSize bytes, VkDeviceSize floor) noexcept {
+    std::vector<BufferAllocation> evicted;
+    VkDeviceSize freed = 0;
+    try {
+        std::lock_guard lock(mutex);
+        while (!deviceTier.free.empty() && freed < bytes && deviceTier.retainedBytes > floor) {
+            const auto before = deviceTier.retainedBytes;
+            evictOldest(deviceTier, evicted);
+            freed += before - deviceTier.retainedBytes;
+        }
+        // Retains no more than what is left until the pressure ends (RestoreDeviceLimit).
+        deviceTier.budget = std::min(DeviceBudget(), std::max(floor, deviceTier.retainedBytes));
+        guardTrimmed += evicted.size();
+        guardTrimmedBytes += freed;
+    } catch (...) {
+    }
+    for (const auto& gone : evicted) destroy(gone);
+    return freed;
+}
+
+void BufferPool::RestoreDeviceLimit() noexcept {
+    std::lock_guard lock(mutex);
+    deviceTier.budget = DeviceBudget();
+}
+
+VkDeviceSize BufferPool::DeviceRetainedBytes() {
+    std::lock_guard lock(mutex);
+    return deviceTier.retainedBytes;
+}
+
+VkDeviceSize BufferPool::DeviceLimit() {
+    std::lock_guard lock(mutex);
+    return deviceTier.budget;
+}
+
 BufferPool::OutOfMemoryCounts BufferPool::OutOfMemory() {
     const auto& counters = outOfMemoryCounters();
     return {counters.refused.load(std::memory_order_relaxed), counters.reclaims.load(std::memory_order_relaxed), counters.reclaimedBytes.load(std::memory_order_relaxed), counters.madeAfter.load(std::memory_order_relaxed)};
@@ -182,10 +234,15 @@ BufferPool::OutOfMemoryCounts BufferPool::OutOfMemory() {
 
 VkResult AllocateDeviceMemory(const Context& context, const VkMemoryAllocateInfo& allocation, VkDeviceMemory* memory) {
     const auto allocate = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory");
+    // Device-local allocations made during a video memory pressure episode are counted ([vram]).
+    const bool deviceLocal = allocation.memoryTypeIndex < context.memory.memoryTypeCount && (context.memory.memoryTypes[allocation.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
     auto result = allocate(context.device, &allocation, nullptr, memory);
+    if (result == VK_SUCCESS && deviceLocal) VideoMemory::NoteDeviceAllocation(allocation.allocationSize);
     if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY) return result;
     auto& counters = outOfMemoryCounters();
     counters.refused.fetch_add(1, std::memory_order_relaxed);
+    // A pressure episode for the video memory guard (no action with it off).
+    VideoMemory::NoteOutOfMemory();
     if (!outOfMemoryReclaim()) return result;
     // Nothing released: the same refusal again (each costs milliseconds), so no second try.
     const auto released = GetBufferPool(context)->ReleaseDevice();
@@ -193,7 +250,10 @@ VkResult AllocateDeviceMemory(const Context& context, const VkMemoryAllocateInfo
     counters.reclaims.fetch_add(1, std::memory_order_relaxed);
     counters.reclaimedBytes.fetch_add(released, std::memory_order_relaxed);
     result = allocate(context.device, &allocation, nullptr, memory);
-    if (result == VK_SUCCESS) counters.madeAfter.fetch_add(1, std::memory_order_relaxed);
+    if (result == VK_SUCCESS) {
+        counters.madeAfter.fetch_add(1, std::memory_order_relaxed);
+        if (deviceLocal) VideoMemory::NoteDeviceAllocation(allocation.allocationSize);
+    }
     return result;
 }
 

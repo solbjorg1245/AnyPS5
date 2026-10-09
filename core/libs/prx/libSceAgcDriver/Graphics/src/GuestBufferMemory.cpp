@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
@@ -271,6 +272,7 @@ const char* createImport(const Context& context, HostImport& entry, VkResult& fa
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
     allocation.allocationSize = bytes;
     allocation.memoryTypeIndex = static_cast<std::uint32_t>(std::countr_zero(types));
+    entry.memoryType = allocation.memoryTypeIndex;
     if (const auto result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &entry.memory); result != VK_SUCCESS) return failed("vkAllocateMemory", result);
     if (const auto result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, entry.buffer, entry.memory, 0); result != VK_SUCCESS) return failed("vkBindBufferMemory", result);
     const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, entry.buffer};
@@ -2577,6 +2579,9 @@ struct ResidentCopy {
     std::uint64_t writerEpoch = 0;
     // A GPU write the recorder noted over the range since the last refresh.
     bool written = false;
+    // The video memory guard's epoch when the copy was made (VideoMemory::Epoch): one made before
+    // its last recycle is made anew (acquireResidentCopy) and its holders are rebuilt.
+    std::uint64_t epoch = 0;
     // Demoted (refreshed at most uses): a reused build holding it rebuilds in place.
     bool demoted = false;
     std::uint64_t lastUse = 0;
@@ -2702,8 +2707,14 @@ std::shared_ptr<ResidentCopy> acquireResidentCopy(const Context& context, const 
     }
     const std::pair<std::uint64_t, std::uint64_t> key{begin, end};
     if (const auto found = cache.entries.find(key); found != cache.entries.end()) {
-        found->second->lastUse = ++cache.tick;
-        return found->second;
+        if (found->second->epoch >= VideoMemory::Epoch()) {
+            found->second->lastUse = ++cache.tick;
+            return found->second;
+        }
+        // Made before the video memory guard's last recycle (its memory may have been paged out
+        // to system memory during the pressure episode): made anew below.
+        dropResidentEntry(cache, found, released);
+        ++cache.counts.recycled;
     }
     if (const auto demoted = cache.demoted.find(key); demoted != cache.demoted.end()) {
         if (--demoted->second != 0) {
@@ -2733,6 +2744,12 @@ std::shared_ptr<ResidentCopy> acquireResidentCopy(const Context& context, const 
         ++cache.counts.refused;
         return nullptr;
     }
+    // The video memory guard: no copy during a pressure episode or past the budget's headroom
+    // (always admitted with the guard off).
+    if (!VideoMemory::Admits(charged)) {
+        ++cache.counts.refusedBudget;
+        return nullptr;
+    }
     std::shared_ptr<Buffer> buffer;
     try {
         buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -2747,6 +2764,7 @@ std::shared_ptr<ResidentCopy> acquireResidentCopy(const Context& context, const 
     copy->end = end;
     copy->buffer = std::move(buffer);
     copy->charged = charged;
+    copy->epoch = VideoMemory::Epoch();
     // Its first refresh is recorded after every address-based use noted so far.
     copy->writerEpoch = cache.writerEpoch;
     copy->lastUse = ++cache.tick;
@@ -2757,7 +2775,7 @@ std::shared_ptr<ResidentCopy> acquireResidentCopy(const Context& context, const 
     cache.liveBytes += charged;
     cache.largest = std::max(cache.largest, bytes);
     markResidentGranules(cache, begin, end);
-    residentLive.store(true, std::memory_order_release);
+    if (!residentLive.exchange(true, std::memory_order_acq_rel)) VideoMemory::SetResidentTrimmer(&TrimResidentReads);
     ++cache.counts.made;
     cache.counts.madeBytes += bytes;
     return copy;
@@ -2776,7 +2794,7 @@ void reportResidentReads(ResidentReadCache& cache) {
     const auto& r = cache.reported;
     const auto d = [](std::uint64_t current, std::uint64_t before) { return static_cast<unsigned long long>(current - before); };
     const auto refreshes = (c.refreshFirst + c.refreshStamp + c.refreshNoted + c.refreshImport + c.refreshWriter + c.refreshUnwatched) - (r.refreshFirst + r.refreshStamp + r.refreshNoted + r.refreshImport + r.refreshWriter + r.refreshUnwatched);
-    std::fprintf(stderr, "[resident-reads] (10 s): uses %llu: as they stood %llu, refreshed %llu (first %llu, written since %llu, noted GPU write %llu, import changed %llu, address-based writer %llu, collect failed %llu); %.1f MiB refreshed, %.1f MiB served from copies; copies made %llu (%.1f MiB), evicted %llu, refused %llu, demoted %llu (builds left in place %llu); noted writes staling a copy %llu (copies visited %llu), address-based uses %llu (in flight now %zu), reused builds rebuilt over a demoted copy %llu; rechecked before the record %llu (refreshed %llu); cache %zu copies %.1f MiB, %zu live %.1f MiB; verify: compared %llu, mismatched %llu\n", d(c.uses, r.uses), d(c.hits, r.hits), static_cast<unsigned long long>(refreshes), d(c.refreshFirst, r.refreshFirst), d(c.refreshStamp, r.refreshStamp), d(c.refreshNoted, r.refreshNoted), d(c.refreshImport, r.refreshImport), d(c.refreshWriter, r.refreshWriter), d(c.refreshUnwatched, r.refreshUnwatched), static_cast<double>(c.refreshedBytes - r.refreshedBytes) / 1048576.0, static_cast<double>(c.servedBytes - r.servedBytes) / 1048576.0, d(c.made, r.made), static_cast<double>(c.madeBytes - r.madeBytes) / 1048576.0, d(c.evicted, r.evicted), d(c.refused, r.refused), d(c.demoted, r.demoted), d(c.inPlace, r.inPlace), d(c.notedStale, r.notedStale), d(c.notedVisited, r.notedVisited), d(c.writerUses, r.writerUses), cache.writers.size(), d(c.rebuiltDemoted, r.rebuiltDemoted), d(c.rechecks, r.rechecks), d(c.recheckRefreshes, r.recheckRefreshes), cache.entries.size(), static_cast<double>(cache.bytes) / 1048576.0, cache.live.size(), static_cast<double>(cache.liveBytes) / 1048576.0, d(c.verified, r.verified), d(c.mismatched, r.mismatched));
+    std::fprintf(stderr, "[resident-reads] (10 s): uses %llu: as they stood %llu, refreshed %llu (first %llu, written since %llu, noted GPU write %llu, import changed %llu, address-based writer %llu, collect failed %llu); %.1f MiB refreshed, %.1f MiB served from copies; copies made %llu (%.1f MiB), evicted %llu, refused %llu, demoted %llu (builds left in place %llu); noted writes staling a copy %llu (copies visited %llu), address-based uses %llu (in flight now %zu), reused builds rebuilt over a demoted copy %llu; rechecked before the record %llu (refreshed %llu); cache %zu copies %.1f MiB, %zu live %.1f MiB; verify: compared %llu, mismatched %llu; video memory guard: refused %llu, trimmed %llu (%.1f MiB), recycled %llu, reused builds rebuilt over a recycled copy %llu\n", d(c.uses, r.uses), d(c.hits, r.hits), static_cast<unsigned long long>(refreshes), d(c.refreshFirst, r.refreshFirst), d(c.refreshStamp, r.refreshStamp), d(c.refreshNoted, r.refreshNoted), d(c.refreshImport, r.refreshImport), d(c.refreshWriter, r.refreshWriter), d(c.refreshUnwatched, r.refreshUnwatched), static_cast<double>(c.refreshedBytes - r.refreshedBytes) / 1048576.0, static_cast<double>(c.servedBytes - r.servedBytes) / 1048576.0, d(c.made, r.made), static_cast<double>(c.madeBytes - r.madeBytes) / 1048576.0, d(c.evicted, r.evicted), d(c.refused, r.refused), d(c.demoted, r.demoted), d(c.inPlace, r.inPlace), d(c.notedStale, r.notedStale), d(c.notedVisited, r.notedVisited), d(c.writerUses, r.writerUses), cache.writers.size(), d(c.rebuiltDemoted, r.rebuiltDemoted), d(c.rechecks, r.rechecks), d(c.recheckRefreshes, r.recheckRefreshes), cache.entries.size(), static_cast<double>(cache.bytes) / 1048576.0, cache.live.size(), static_cast<double>(cache.liveBytes) / 1048576.0, d(c.verified, r.verified), d(c.mismatched, r.mismatched), d(c.refusedBudget, r.refusedBudget), d(c.trimmed, r.trimmed), static_cast<double>(c.trimmedBytes - r.trimmedBytes) / 1048576.0, d(c.recycled, r.recycled), d(c.rebuiltRecycled, r.rebuiltRecycled));
     cache.reported = c;
 }
 
@@ -2865,6 +2883,31 @@ void NoteResidentReadsFinished(std::uint64_t recorderId, std::uint64_t serial) {
     auto& cache = residentReadCache();
     std::lock_guard lock(cache.mutex);
     std::erase_if(cache.writers, [&](const ResidentWriter& writer) { return writer.recorder == 0 || (writer.recorder == recorderId && writer.serial <= serial); });
+}
+
+std::pair<std::uint64_t, std::uint64_t> TrimResidentReads(std::uint64_t bytes) {
+    auto& cache = residentReadCache();
+    std::vector<std::shared_ptr<ResidentCopy>> released;
+    std::uint64_t freed = 0, copies = 0;
+    {
+        std::lock_guard lock(cache.mutex);
+        std::vector<std::pair<std::uint64_t, ResidentEntries::iterator>> order;
+        order.reserve(cache.entries.size());
+        for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) order.emplace_back(it->second->lastUse, it);
+        std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (const auto& [lastUse, it] : order) {
+            if (freed >= bytes) break;
+            freed += it->second->charged;
+            ++copies;
+            dropResidentEntry(cache, it, released);
+        }
+        cache.counts.trimmed += copies;
+        cache.counts.trimmedBytes += freed;
+        cache.counts.evicted += copies;
+    }
+    // The last references go (and their buffers back to the pool) without the cache mutex.
+    released.clear();
+    return {freed, copies};
 }
 
 void ResidentReadsFailCollectForTests(bool fail) {
@@ -4291,6 +4334,12 @@ bool GuestBufferMemory::RecordResidentReads(Recorder& recorder) {
         for (const auto* region : resident) {
             if (region->resident->demoted) {
                 ++cache.counts.rebuiltDemoted;
+                return false;
+            }
+            // Made before the video memory guard's last recycle: the build is made again (with a
+            // new copy), so nothing paged out during the episode stays bound.
+            if (region->resident->epoch < VideoMemory::Epoch()) {
+                ++cache.counts.rebuiltRecycled;
                 return false;
             }
         }

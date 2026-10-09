@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastRead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -1439,6 +1440,102 @@ void outOfVideoMemoryTests(const Device& device) {
     Require(refused && fake.tries == triesAgain + 1 && BufferPool::OutOfMemory().reclaims == again.reclaims, "out of video memory: a refusal with nothing retained was tried again");
     made.reset();
     fake.budget = ~VkDeviceSize{0};
+}
+
+// The video memory guard (APS5_VRAM_GUARD, VideoMemory) on the buffer pool's device tier: over the
+// budget it trims the least recently used retained slots and caps what the tier retains; back
+// under it restores the cap, and the recycle drops every slot made before it, retained or
+// returned later; off, nothing changes.
+void videoMemoryGuardTests(const Device& device) {
+    Context context = device.GetContext();
+    context.bufferPool.reset();
+    constexpr std::uint64_t mib = std::uint64_t{1} << 20u;
+    constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    VideoMemorySample fake;
+    fake.valid = true;
+    fake.usage = 0;
+    fake.budget = 256 * mib;
+    const auto sampler = [&fake](const Context&, VideoMemorySample& sample) {
+        sample = fake;
+        return true;
+    };
+    VideoMemory::ConfigureForTests(1, sampler, 0, mib, 2 * mib);
+    VideoMemory::ResetForTests();
+    struct Restore {
+        ~Restore() {
+            VideoMemory::ConfigureForTests(-1, nullptr, 0, 0, 0);
+            VideoMemory::ResetForTests();
+        }
+    } restore;
+    auto pool = GetBufferPool(context);
+    {
+        std::vector<std::unique_ptr<DeviceBuffer>> released;
+        for (int i = 0; i < 4; ++i) released.push_back(std::make_unique<DeviceBuffer>(context, 2 * mib, usage));
+        for (const auto& buffer : released) Require(!buffer->Pooled() && !buffer->MadeUnderPressure() && buffer->Epoch() == VideoMemory::Epoch(), "(v) a new device buffer's origin was not recorded");
+    }
+    const auto retained = pool->DeviceRetainedBytes();
+    Require(retained >= 8 * mib, "(v) the released device buffers were not retained");
+    // Under the budget: nothing happens.
+    VideoMemory::Poll(context);
+    Require(!VideoMemory::UnderPressure() && pool->DeviceRetainedBytes() == retained && VideoMemory::Admits(mib), "(v) the guard acted under the budget");
+    // 3 MiB over (plus the 1 MiB margin): an episode, 4 MiB of retained slots given back, and the
+    // tier keeps no more than what is left.
+    fake.usage = fake.budget + 3 * mib;
+    VideoMemory::Poll(context);
+    Require(VideoMemory::UnderPressure(), "(v) usage over the budget did not start an episode");
+    const auto trimmed = pool->DeviceRetainedBytes();
+    Require(trimmed + 4 * mib <= retained && trimmed >= 2 * mib, "(v) the episode did not trim the pool's retained slots down to the excess (" + std::to_string(retained) + " -> " + std::to_string(trimmed) + ")");
+    Require(pool->DeviceLimit() == trimmed, "(v) the pool's retention was not capped at what was left");
+    {
+        std::vector<std::unique_ptr<DeviceBuffer>> more;
+        for (int i = 0; i < 3; ++i) more.push_back(std::make_unique<DeviceBuffer>(context, 5 * mib, usage));
+        Require(more.front()->MadeUnderPressure() && !more.front()->Pooled(), "(v) a device buffer made during the episode was not marked");
+    }
+    Require(pool->DeviceRetainedBytes() <= trimmed, "(v) the pool retained past its cap during the episode");
+    Require(!VideoMemory::Admits(4096), "(v) a resident copy was admitted during an episode");
+    auto older = std::make_unique<DeviceBuffer>(context, 3 * mib, usage);
+    const auto counts = VideoMemory::Read();
+    Require(counts.episodes == 1 && counts.poolTrimmedBytes >= 4 * mib && counts.pressuredAllocations >= 4, "(v) the episode's trims or allocations were not counted");
+    // Back under (usage + 2 margins below the budget): the episode ends, the cap is restored, and
+    // the recycle advances the epoch and drops what the pool retained.
+    fake.usage = 0;
+    const auto epoch = VideoMemory::Epoch();
+    VideoMemory::Poll(context);
+    Require(!VideoMemory::UnderPressure() && VideoMemory::Epoch() == epoch + 1, "(v) the end of the episode did not recycle");
+    Require(pool->DeviceRetainedBytes() == 0 && pool->DeviceLimit() > trimmed, "(v) the recycle left retained slots or the cap");
+    // A buffer made before the recycle is not retained when it comes back; one made after is.
+    older.reset();
+    Require(pool->DeviceRetainedBytes() == 0, "(v) a buffer made before the recycle was retained");
+    {
+        DeviceBuffer fresh(context, 3 * mib, usage);
+        Require(!fresh.Pooled() && fresh.Epoch() == VideoMemory::Epoch(), "(v) a buffer after the recycle came from before it");
+    }
+    Require(pool->DeviceRetainedBytes() >= 3 * mib, "(v) a buffer made after the recycle was not retained");
+    {
+        DeviceBuffer again(context, 3 * mib, usage);
+        Require(again.Pooled(), "(v) a retained buffer from after the recycle was not reused");
+    }
+    // Headroom: a copy is admitted while usage + copies + 2 margins stay under the budget.
+    fake.usage = fake.budget - 4 * mib;
+    VideoMemory::Poll(context);
+    Require(!VideoMemory::UnderPressure() && VideoMemory::Admits(mib) && !VideoMemory::Admits(2 * mib), "(v) the resident copy headroom is wrong");
+    // A refused allocation starts an episode (no sample needed).
+    VideoMemory::NoteOutOfMemory();
+    Require(VideoMemory::UnderPressure(), "(v) a refused allocation did not start an episode");
+    Require(VideoMemory::Report().rfind("[vram] (10 s) device-local heap: usage ", 0) == 0, "(v) the [vram] line is malformed");
+    // Off: no episode, no trim, and a buffer from before the epoch is retained as before.
+    auto stale = std::make_unique<DeviceBuffer>(context, 7 * mib, usage);
+    VideoMemory::ConfigureForTests(0, sampler, 0, mib, 2 * mib);
+    VideoMemory::ResetForTests();
+    VideoMemory::RecycleNowForTests(context);
+    Require(stale->Epoch() < VideoMemory::Epoch(), "(v) the test's buffer is not from before the epoch");
+    fake.usage = 2 * fake.budget;
+    VideoMemory::Poll(context);
+    Require(!VideoMemory::UnderPressure() && VideoMemory::Admits(fake.budget), "(v) the guard acted while off");
+    const auto before = pool->DeviceRetainedBytes();
+    stale.reset();
+    Require(pool->DeviceRetainedBytes() >= before + 7 * mib, "(v) the pool dropped a buffer with the guard off");
+    std::cout << "video memory guard tests passed\n";
 }
 
 void movedMetadataTests(const Device& device, Recorder& recorder) {
@@ -4688,6 +4785,63 @@ void residentReadTests(const Device& device, Recorder& recorder) {
     Require(remapped->ServedResident(address + at), "(r) the range was not bound from its copy after the import changed");
     expect(&ResidentReadStatistics::refreshImport, 1, "refreshes after a changed import");
     bound(resident, *remapped, at, span);
+    // The video memory guard (APS5_VRAM_GUARD): after a recycle a reused build holding a copy made
+    // before it is rebuilt and the next build makes the copy anew; during a pressure episode the
+    // cache is trimmed and no copy is made (in place); after it, copies are made again.
+    resident.Sync();
+    {
+        VideoMemorySample fake;
+        fake.valid = true;
+        fake.budget = std::uint64_t{1} << 40u;
+        VideoMemory::ConfigureForTests(1, [&fake](const Context&, VideoMemorySample& sample) {
+            sample = fake;
+            return true;
+        }, 0, std::uint64_t{1} << 20u, 0);
+        VideoMemory::ResetForTests();
+        struct Restore {
+            ~Restore() {
+                VideoMemory::ConfigureForTests(-1, nullptr, 0, 0, 0);
+                VideoMemory::ResetForTests();
+            }
+        } restore;
+        VideoMemory::Poll(context);
+        auto held = build(at, span, false);
+        Require(held->ServedResident(address + at), "(v) a copy under the budget was not bound");
+        const auto heldBuffer = bufferOf(*held, at, span);
+        resident.Sync();
+        VideoMemory::RecycleNowForTests(context);
+        counts = ResidentReadCounts();
+        Require(!held->RecordResidentReads(resident), "(v) a reused build over a copy made before the recycle was not rebuilt");
+        expect(&ResidentReadStatistics::rebuiltRecycled, 1, "reused builds rebuilt over a recycled copy");
+        auto remade = build(at, span, false);
+        Require(remade->ServedResident(address + at) && bufferOf(*remade, at, span) != heldBuffer, "(v) the build after the recycle bound the copy made before it");
+        expect(&ResidentReadStatistics::recycled, 1, "cached copies made anew after the recycle");
+        expect(&ResidentReadStatistics::made, 1, "copies made after the recycle");
+        bound(resident, *remade, at, span);
+        held.reset();
+        // Far over the budget: the pool and then the cache are trimmed; a new range stays in place.
+        fake.usage = fake.budget + (std::uint64_t{1} << 38u);
+        counts = ResidentReadCounts();
+        VideoMemory::Poll(context);
+        Require(VideoMemory::UnderPressure(), "(v) the episode did not start");
+        Require(ResidentReadCounts().trimmed > counts.trimmed && ResidentReadCounts().entries == 0, "(v) the episode did not trim the resident copies");
+        counts = ResidentReadCounts();
+        auto pressured = build(3 * unit, 4096, false);
+        Require(pressured->ServedInPlace(address + 3 * unit) && !pressured->ServedResident(address + 3 * unit), "(v) a copy was made during the episode");
+        expect(&ResidentReadStatistics::refusedBudget, 1, "copies refused for the budget");
+        resident.Sync();
+        // Back under: copies are made again (the recycle waits for its 10 s spacing).
+        fake.usage = 0;
+        VideoMemory::Poll(context);
+        Require(!VideoMemory::UnderPressure(), "(v) the episode did not end");
+        counts = ResidentReadCounts();
+        auto after = build(3 * unit, 4096, false);
+        Require(after->ServedResident(address + 3 * unit), "(v) no copy after the episode");
+        bound(resident, *after, 3 * unit, 4096);
+        remade.reset();
+        pressured.reset();
+        after.reset();
+    }
     std::cout << "resident read tests passed\n";
     resident.Sync();
     remapped.reset();
@@ -4979,6 +5133,35 @@ void gpuTimingDigestTests() {
     std::cout << "gpu timing digest checked\n";
 }
 
+// The [gputime] retile row sums the write-back's three stages (ContinueGpuTiming) and counts the
+// write-back once, by its first stage; its bytes are the stored ones.
+void retileRowDigestTests() {
+    using Kind = Recorder::TimingKind;
+    using Class = Recorder::CommandClass;
+    constexpr std::uint64_t MiB = 1048576;
+    const auto range = [](std::uint64_t key, Kind kind, std::uint64_t begin, std::uint64_t end, std::uint64_t bytes) {
+        Recorder::TimedRange timed;
+        timed.key = key;
+        timed.kind = kind;
+        timed.queue = 0;
+        timed.begin = begin;
+        timed.end = end;
+        timed.bytes = bytes;
+        return timed;
+    };
+    std::vector<Recorder::TimedRange> ranges;
+    ranges.push_back(range(Recorder::BatchTimingKey, Kind::Batch, 0, 10000, 0));
+    ranges.push_back(range(Recorder::ClassKey(Class::StorageWriteBack), Kind::Class, 0, 1000, 2 * MiB));
+    ranges.push_back(range(Recorder::ClassKey(Class::StorageRetile), Kind::Class, 1000, 1500, 2 * MiB));
+    ranges.push_back(range(Recorder::ClassKey(Class::StorageStore), Kind::Class, 1500, 4000, MiB));
+    GpuTimingDigest digest;
+    digest.AddBatch(ranges, 1000.0);
+    const auto lines = digest.Report(1, 0, 512, 0);
+    Require(lineHas(lines, "[gputime] row retile:", "4.00 ms per present (40.0% of busy), x1.0, 1.00 MiB (storage image write-backs: image->linear 1.00 ms 2.00 MiB, retile 0.50 ms 2.00 MiB, store 2.50 ms; 4.000 ms and 1.00 MiB stored per write-back)"), "digest: wrong retile row");
+    Require(lines.front().find("storage-retile x1 0.5ms") != std::string::npos && lines.front().find("storage-store x1 2.5ms") != std::string::npos, "digest: the retile stages are missing from the classes");
+    std::cout << "retile row digest checked\n";
+}
+
 // APS5_PROFILE_GPU=1 runs (the timing switch is read once): a timed range leaves the queued
 // copy-backs queued and the barrier-merge state as it was, and the ranges reach the digest with
 // their queue tag, in-place bytes, pass target and kind.
@@ -5128,6 +5311,7 @@ void gpuTimingRecorderTests(const Device& device, Recorder& recorder) {
 int main() {
     try {
         gpuTimingDigestTests();
+        retileRowDigestTests();
         Device device;
         std::lock_guard gpu(GpuMutex());
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
@@ -5160,6 +5344,7 @@ int main() {
         importMemoTests(device);
         samplerMemoTests(device);
         outOfVideoMemoryTests(device);
+        videoMemoryGuardTests(device);
         movedMetadataTests(device, recorder);
         keysFillTests(device, recorder);
         unitShadowTests(device, recorder);

@@ -78,6 +78,9 @@ private:
     VkBufferUsageFlags usage;
     VkMemoryPropertyFlags properties;
     std::shared_ptr<BufferPool> cache;
+    // The video memory guard's epoch at the allocation and its memory type (BufferAllocation).
+    std::uint64_t epoch = 0;
+    std::uint32_t memoryType = ~0u;
 };
 
 // Device-local scratch memory for GPU-side layout conversion. The detiler reads and writes scattered
@@ -91,6 +94,13 @@ public:
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
     VkBuffer Handle() const;
     std::size_t Size() const;
+    // Taken from the buffer pool (else allocated by this constructor), the video memory guard's
+    // epoch when its memory was allocated, whether that happened during a pressure episode, and
+    // the memory type (the [retile] line attributes the write-back scratch with them).
+    bool Pooled() const { return pooled; }
+    std::uint64_t Epoch() const { return epoch; }
+    bool MadeUnderPressure() const { return madeUnderPressure; }
+    std::uint32_t MemoryType() const { return memoryType; }
 
 private:
     void release() noexcept;
@@ -102,6 +112,10 @@ private:
     VkDeviceSize allocationBytes = 0;
     VkBufferUsageFlags usage;
     std::shared_ptr<BufferPool> cache;
+    bool pooled = false;
+    bool madeUnderPressure = false;
+    std::uint64_t epoch = 0;
+    std::uint32_t memoryType = ~0u;
 };
 
 // Records a whole-range buffer copy.
