@@ -15,7 +15,6 @@ std::int64_t APS5_VABI sceKernelRead(int, void*, std::size_t);
 std::int64_t APS5_VABI sceKernelWrite(int, const void*, std::size_t);
 int APS5_VABI sceKernelStat(const char*, FileStat*);
 int APS5_VABI chdir_nid_postfix(const char*);
-int APS5_VABI access_nid_postfix(const char*, int);
 int APS5_VABI rename_nid_postfix(const char*, const char*);
 int APS5_VABI remove_nid_postfix(const char*);
 FileStream* APS5_VABI fopen_nid_postfix(const char*, const char*);
@@ -33,6 +32,8 @@ static void CheckRead(const std::string& path, char expected) {
     Require(sceKernelClose(fd) == 0);
 }
 
+// access() is not exported by this tree's libc (upstream 7789c0a5), so existence is checked with
+// sceKernelStat.
 int main() {
     // APS5_NO_PATH_CASE_FOLD=1 turns the fallback off: nothing here applies.
     if (std::getenv("APS5_NO_PATH_CASE_FOLD") != nullptr) return 0;
@@ -47,7 +48,7 @@ int main() {
     FileStat stat{};
     Require(sceKernelStat(("/" + lower + "/DATA/skyrim.INI").c_str(), &stat) == 0);
     Require(chdir_nid_postfix(lower.c_str()) == 0);
-    Require(access_nid_postfix("DATA/SKYRIM.ini", 4) == 0);
+    Require(sceKernelStat("DATA/SKYRIM.ini", &stat) == 0);
     auto* stream = fopen_nid_postfix("data\\SKYRIM.INI", "rb");
     char value = 0;
     Require(stream && fread_nid_postfix(&value, 1, 1, stream) == 1 && value == 'x');
@@ -65,13 +66,13 @@ int main() {
     Require(sceKernelOpen("data/nested/missing", SCE_KERNEL_O_RDONLY, 0) == static_cast<int>(0x80020002u));
     AddPathAlias_nid_no_patch("case-mount", (directory / "Data").string().c_str());
     CheckRead("/CASE-MOUNT/skyrim.INI", 'x');
-    Require(access_nid_postfix("/case-mount-other/Skyrim.ini", 0) == -1);
+    Require(sceKernelStat("/case-mount-other/Skyrim.ini", &stat) != 0);
     // (Upstream blocks the mount here with BlockPathAlias, which this tree does not have.) Adding
     // the prefix in another case replaces the entry.
     AddPathAlias_nid_no_patch("Case-Mount", (directory / "Data").string().c_str());
     CheckRead("/case-MOUNT/skyrim.INI", 'x');
     RemovePathAlias_nid_no_patch("CASE-mount");
-    Require(access_nid_postfix("/case-mount/skyrim.ini", 0) == -1);
+    Require(sceKernelStat("/case-mount/skyrim.ini", &stat) != 0);
 #ifndef _WIN32
     std::filesystem::create_directory_symlink("Data", directory / "Linked");
     CheckRead("linked/SKYRIM.INI", 'x');

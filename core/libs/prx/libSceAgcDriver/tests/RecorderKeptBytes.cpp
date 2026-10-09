@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <map>
 #include <memory>
@@ -197,6 +198,11 @@ void CountFollowsEveryPath() {
 }
 
 int main() {
+    // APS5_NO_KEPT_BYTES_BOUND=1 turns the bound off: nothing here applies.
+    if (std::getenv("APS5_NO_KEPT_BYTES_BOUND") != nullptr) {
+        std::printf("recorder kept bytes tests skipped (APS5_NO_KEPT_BYTES_BOUND)\n");
+        return 0;
+    }
     try {
         OpenBatchUnderBudget();
         InFlightWithinTwiceTheBudget();
