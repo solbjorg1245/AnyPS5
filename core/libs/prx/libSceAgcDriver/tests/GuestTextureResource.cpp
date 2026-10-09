@@ -236,7 +236,7 @@ void RunGuestTextureResourceTests() {
     badMsaa.msaaDepth = true;
     rejectFields(badMsaa, "MSAA");
 
-    // APS5_ARRAY_PITCH (unset here: DecodeTextureResource rejects as above). Demon's Souls' 2D
+    // APS5_ARRAY_PITCH (off here: main sets APS5_NO_ARRAY_PITCH=1, so DecodeTextureResource rejects as above). Demon's Souls' 2D
     // array whose words 4-7 were rewritten (a tagged pointer, 0x400, 0x5204: array pitch 5, base
     // array past the last slice): the intact words 4-7 of the same words 0-3 repair it, nothing
     // else does.

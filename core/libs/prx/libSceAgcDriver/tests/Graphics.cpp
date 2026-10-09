@@ -2071,8 +2071,12 @@ void fastDrawTests() {
 int main() {
 #ifdef _WIN32
     _putenv_s("APS5_PIN_WAIT_MS", "200");
+    // The texture rejection tests (GuestTextureResource.cpp) check the throws; the R3 repair
+    // of rewritten words 4-7 (default on in the game) is tested there through its functions.
+    _putenv_s("APS5_NO_ARRAY_PITCH", "1");
 #else
     setenv("APS5_PIN_WAIT_MS", "200", 1);
+    setenv("APS5_NO_ARRAY_PITCH", "1", 1);
 #endif
     try {
         {
