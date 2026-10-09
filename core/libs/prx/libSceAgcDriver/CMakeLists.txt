@@ -378,10 +378,25 @@ add_custom_command(
         VERBATIM
 )
 
+# tests/Recorder.cpp templateRefreshRingTests: results[words[1]] = words[0] through two data buffers.
+set(agcDataSlotShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/DataSlot.comp)
+set(agcDataSlotShaderSpv ${agcTestShaderGeneratedRoot}/DataSlot.spv)
+set(agcDataSlotShaderHeader ${agcTestShaderGeneratedRoot}/DataSlot_spv.h)
+add_custom_command(
+        OUTPUT "${agcDataSlotShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTestShaderGeneratedRoot}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcDataSlotShaderSpv}" "${agcDataSlotShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcDataSlotShaderSpv} -DOUTPUT=${agcDataSlotShaderHeader}
+        -DSYMBOL=DATA_SLOT_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcDataSlotShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
         tests/Recorder.cpp
         tests/ResidentPresent.cpp
         ${agcSampleLodShaderHeader}
+        ${agcDataSlotShaderHeader}
 )
 
 target_include_directories(agc_driver_recorder_tests PRIVATE

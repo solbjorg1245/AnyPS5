@@ -106,8 +106,25 @@ public:
         std::uint64_t pools = 0;
     };
     Stats Counters() const;
+    // A set that lives for the recorder's open batch alone (ShaderResources::ForkData): taken from
+    // a pool that belongs to that batch, which the batch keeps and which is reset whole and reused
+    // once the batch completed (no set is freed one by one; the chain pools above are untouched).
+    // A null set when `sizes` exceed what one such pool holds (the caller takes its old path).
+    // Called by the recording thread under GuestMemory::GpuMutex.
+    VkDescriptorSet AllocateTransient(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, Recorder& recorder);
+    // APS5_PROFILE_DRAW counters of AllocateTransient: sets made, pools created, pools reset for
+    // reuse after their batch, sets refused (needs over one pool).
+    struct TransientStats {
+        std::uint64_t sets = 0;
+        std::uint64_t pools = 0;
+        std::uint64_t resets = 0;
+        std::uint64_t refused = 0;
+    };
+    TransientStats TransientCounters() const;
 
 private:
+    struct TransientPools;
+    struct TransientReturn;
     Context context;
     PFN_vkDestroyDescriptorSetLayout destroyLayout;
     PFN_vkDestroyDescriptorPool destroyPool;
@@ -116,6 +133,11 @@ private:
     std::map<std::vector<std::uint32_t>, VkDescriptorSetLayout> layouts;
     std::vector<VkDescriptorPool> pools;
     Stats stats;
+    // AllocateTransient's pools (shared with the batches that keep them) and the open batch's pool
+    // with that batch's serial (Recorder::Submissions() + 1 when it was taken).
+    std::shared_ptr<TransientPools> transient;
+    VkDescriptorPool transientPool = VK_NULL_HANDLE;
+    std::uint64_t transientSerial = 0;
 };
 
 class ShaderResources {
@@ -136,6 +158,8 @@ public:
     ShaderResources& operator=(const ShaderResources&) = delete;
     VkDescriptorSetLayout Layout() const;
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
+    // Binds `set` in place of this object's own: a set of the same layout (ForkData's).
+    void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, VkDescriptorSet set) const;
     struct DrawBindings {
         DrawBindings() = default;
         DrawBindings(const DrawBindings&) = delete;
@@ -269,6 +293,30 @@ public:
     // buffer already holding the words is left alone). Returns whether anything was recorded. With
     // `recorder` the updates are one [gputime] range of class TemplateDataRefresh.
     bool RefreshData(VkCommandBuffer commands, const CompiledShader& shader, Recorder* recorder = nullptr);
+    // The data refresh without a transfer (APS5_TEMPLATE_REFRESH_RING=1, VulkanDevice::
+    // recordDispatch; default off, RefreshData stays the fallback): when the shader's ShaderData /
+    // FlattenedSrt words differ from what this object's data buffers hold, a copy of this object's
+    // set for the recorder's open batch (DescriptorCache::AllocateTransient) whose differing data
+    // bindings read the shader's words (patched like the buffers) from the device's fast ring
+    // (FastRing, written by the CPU now, its region retired with the batch); every other binding is
+    // copied from this object's set (VkCopyDescriptorSet). Nothing is recorded, so the dispatch
+    // needs no transfer before it and no leading barrier for one: RefreshData's vkCmdUpdateBuffer
+    // between two dispatches measured ~6.6 us of GPU time each under copy-back coalescing (t415:
+    // 2.3k per present, 15 ms, for 0.6 MiB). This object keeps its words and DataWordsHash. The
+    // outcome: Forked (bind `set` with Bind(..., set)); Same (nothing differs: bind this object's
+    // set); otherwise nothing was made and the caller refreshes with RefreshData: NoRing (no ring,
+    // descriptor cache or set), RingFull (no room in the ring: regions free as their batches are
+    // released), NoSet (a set over one transient pool), Unsupported (deferred flat words, more than
+    // MaxForkedBindings differing data bindings, a data buffer of another size).
+    enum class ForkOutcome : std::uint8_t { Forked, Same, NoRing, RingFull, NoSet, Unsupported, Count };
+    static constexpr std::size_t MaxForkedBindings = 4;
+    struct DataFork {
+        ForkOutcome outcome = ForkOutcome::Same;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        // The words placed in the ring.
+        std::uint64_t bytes = 0;
+    };
+    DataFork ForkData(const CompiledShader& shader, Recorder& recorder) const;
     // Walks the write watch over every image surface of a completed object (no device lock: the
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces() const;

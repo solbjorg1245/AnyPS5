@@ -2929,11 +2929,58 @@ ResourceCache& SharedResourceCache() {
     return *cache;
 }
 
+namespace {
+// What one transient pool holds (AllocateTransient); a set needing more of any type is refused.
+constexpr std::uint32_t TransientPoolSets = 256;
+constexpr std::array<VkDescriptorPoolSize, 4> TransientPoolSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2048}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 512}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024}}};
+}
+
+// The transient pools: every pool made (destroyed with the cache), the reset ones ready for the next
+// batch, and whether the cache still lives (a batch may be released after it). The batches' returns
+// run on any thread (the recorder's release), the takes on the recording thread.
+struct DescriptorCache::TransientPools {
+    std::mutex mutex;
+    VkDevice device = VK_NULL_HANDLE;
+    PFN_vkResetDescriptorPool reset = nullptr;
+    std::vector<VkDescriptorPool> all;
+    std::vector<VkDescriptorPool> free;
+    bool alive = true;
+    std::atomic<std::uint64_t> sets{0};
+    std::atomic<std::uint64_t> pools{0};
+    std::atomic<std::uint64_t> resets{0};
+    std::atomic<std::uint64_t> refused{0};
+};
+
+// Kept by the batch a transient pool served: its release (the batch completed, so no set of the pool
+// is in use) resets the pool and hands it back.
+struct DescriptorCache::TransientReturn {
+    TransientReturn(std::shared_ptr<TransientPools> owner, VkDescriptorPool handle) : pools(std::move(owner)), pool(handle) {}
+    TransientReturn(const TransientReturn&) = delete;
+    TransientReturn& operator=(const TransientReturn&) = delete;
+    ~TransientReturn() {
+        std::lock_guard lock(pools->mutex);
+        if (!pools->alive) return;
+        static_cast<void>(pools->reset(pools->device, pool, 0));
+        pools->free.push_back(pool);
+        pools->resets.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::shared_ptr<TransientPools> pools;
+    VkDescriptorPool pool;
+};
+
 DescriptorCache::DescriptorCache(const Context& context) : context(context), destroyLayout(context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")), destroyPool(context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")), freeSets(context.Function<PFN_vkFreeDescriptorSets>("vkFreeDescriptorSets")) {}
 
 DescriptorCache::~DescriptorCache() {
     for (const auto pool : pools) destroyPool(context.device, pool, nullptr);
     for (const auto& [key, layout] : layouts) destroyLayout(context.device, layout, nullptr);
+    if (transient != nullptr) {
+        // A batch released after this (it keeps a TransientReturn) finds the pools gone.
+        std::lock_guard lock(transient->mutex);
+        transient->alive = false;
+        for (const auto pool : transient->all) destroyPool(context.device, pool, nullptr);
+        transient->all.clear();
+        transient->free.clear();
+    }
 }
 
 VkDescriptorSetLayout DescriptorCache::Layout(std::span<const std::uint32_t> key, std::span<const VkDescriptorSetLayoutBinding> bindings) {
@@ -3006,6 +3053,72 @@ void DescriptorCache::Free(const SetAllocation& allocation) noexcept {
 DescriptorCache::Stats DescriptorCache::Counters() const {
     std::lock_guard lock(mutex);
     return stats;
+}
+
+VkDescriptorSet DescriptorCache::AllocateTransient(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, Recorder& recorder) {
+    if (transient == nullptr) {
+        transient = std::make_shared<TransientPools>();
+        transient->device = context.device;
+        transient->reset = context.Function<PFN_vkResetDescriptorPool>("vkResetDescriptorPool");
+    }
+    for (const auto& size : sizes) {
+        const auto capacity = std::find_if(TransientPoolSizes.begin(), TransientPoolSizes.end(), [&](const auto& item) { return item.type == size.type; });
+        if (capacity == TransientPoolSizes.end() || size.descriptorCount > capacity->descriptorCount) {
+            transient->refused.fetch_add(1, std::memory_order_relaxed);
+            return VK_NULL_HANDLE;
+        }
+    }
+    // The open batch's serial: the batch the caller records into (nothing between here and its
+    // record submits).
+    const auto serial = recorder.Submissions() + 1;
+    const auto allocate = context.Resolved(&DeviceFunctions::allocateDescriptorSets, "vkAllocateDescriptorSets");
+    VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocation.descriptorSetCount = 1;
+    allocation.pSetLayouts = &layout;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (transientPool == VK_NULL_HANDLE || transientSerial != serial) {
+            // A pool serves one batch: the previous one stays with the batch that keeps it.
+            VkDescriptorPool pool = VK_NULL_HANDLE;
+            {
+                std::lock_guard lock(transient->mutex);
+                if (!transient->free.empty()) {
+                    pool = transient->free.back();
+                    transient->free.pop_back();
+                }
+            }
+            if (pool == VK_NULL_HANDLE) {
+                VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+                poolInfo.maxSets = TransientPoolSets;
+                poolInfo.poolSizeCount = static_cast<std::uint32_t>(TransientPoolSizes.size());
+                poolInfo.pPoolSizes = TransientPoolSizes.data();
+                Check(context.Function<PFN_vkCreateDescriptorPool>("vkCreateDescriptorPool")(context.device, &poolInfo, nullptr, &pool), "vkCreateDescriptorPool transient");
+                std::lock_guard lock(transient->mutex);
+                transient->all.push_back(pool);
+                transient->pools.fetch_add(1, std::memory_order_relaxed);
+            }
+            transientPool = pool;
+            transientSerial = serial;
+            // Outside the lock: keeping may release finished batches, whose returns take it.
+            recorder.Keep(std::make_shared<TransientReturn>(transient, pool));
+        }
+        allocation.descriptorPool = transientPool;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        const auto result = allocate(context.device, &allocation, &set);
+        if (result == VK_SUCCESS) {
+            transient->sets.fetch_add(1, std::memory_order_relaxed);
+            return set;
+        }
+        if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL) Check(result, "vkAllocateDescriptorSets transient");
+        // Full: the batch keeps it; the next attempt takes another.
+        transientPool = VK_NULL_HANDLE;
+    }
+    transient->refused.fetch_add(1, std::memory_order_relaxed);
+    return VK_NULL_HANDLE;
+}
+
+DescriptorCache::TransientStats DescriptorCache::TransientCounters() const {
+    if (transient == nullptr) return {};
+    return {transient->sets.load(std::memory_order_relaxed), transient->pools.load(std::memory_order_relaxed), transient->resets.load(std::memory_order_relaxed), transient->refused.load(std::memory_order_relaxed)};
 }
 
 std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic) {
@@ -3186,6 +3299,113 @@ void ShaderResources::writeDataWords(VkCommandBuffer commands, std::size_t alloc
         if (patch.allocation == allocation && patch.byte < size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
     }
     context.Resolved(&DeviceFunctions::cmdUpdateBuffer, "vkCmdUpdateBuffer")(commands, buffer.Handle(), 0, size, patched.data());
+}
+
+ShaderResources::DataFork ShaderResources::ForkData(const CompiledShader& shader, Recorder& recorder) const {
+    Require(shader.program != nullptr, "missing compiled shader");
+    const auto& program = *shader.program;
+    Require(program.bindings.size() == bindings.size(), "template bindings disagree with the shader");
+    DataFork fork;
+    // The data bindings whose words differ from what this object's buffers hold (RefreshData's
+    // compare, binding by binding).
+    std::array<std::size_t, MaxForkedBindings> differing{};
+    std::size_t count = 0;
+    for (std::size_t index = 0; index < program.bindings.size(); ++index) {
+        const auto& binding = program.bindings[index];
+        if (!DataRole(binding.role)) continue;
+        Require(bindings[index].allocations.size() == 1, "data binding without its buffer");
+        const auto& allocation = allocations[bindings[index].allocations.front()];
+        if (allocation.dataWords.size() == binding.guestDescriptor.size() && std::equal(allocation.dataWords.begin(), allocation.dataWords.end(), binding.guestDescriptor.begin())) continue;
+        const auto size = binding.guestDescriptor.size() * sizeof(std::uint32_t);
+        if (count == differing.size() || !binding.deferredWords.empty() || allocation.buffer == nullptr || allocation.guest || allocation.size != size || bindings[index].layout.descriptorCount != 1) {
+            fork.outcome = ForkOutcome::Unsupported;
+            return fork;
+        }
+        differing[count++] = index;
+    }
+    if (count == 0) return fork;
+    if (context.fastRing == nullptr || context.descriptorCache == nullptr || _set == VK_NULL_HANDLE) {
+        fork.outcome = ForkOutcome::NoRing;
+        return fork;
+    }
+    // The ring regions, tagged with the open batch's serial (FastDispatch's rule). A full ring is
+    // not reclaimed here (that reaps, running completions in the middle of this record): the
+    // regions of released batches free themselves (their retirements), and until then the caller
+    // refreshes with RefreshData.
+    auto& ring = *context.fastRing;
+    std::array<std::optional<FastRing::Region>, MaxForkedBindings> regions;
+    const auto serial = recorder.Submissions() + 1;
+    bool full = false;
+    for (std::size_t i = 0; i < count && !full; ++i) {
+        regions[i] = ring.Allocate(allocations[bindings[differing[i]].allocations.front()].size, serial);
+        full = !regions[i].has_value();
+    }
+    // The batch's release completes the serial, which frees the regions (also those of a partial
+    // allocation, or when no set follows).
+    recorder.Keep(ring.Retirement(serial));
+    if (full || recorder.Submissions() + 1 != serial) {
+        fork.outcome = ForkOutcome::RingFull;
+        return fork;
+    }
+    // The set: sized from this object's layout entries.
+    std::array<VkDescriptorPoolSize, 4> sizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 0}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0}, {VK_DESCRIPTOR_TYPE_SAMPLER, 0}}};
+    for (const auto& binding : bindings) {
+        const auto entry = std::find_if(sizes.begin(), sizes.end(), [&](const auto& size) { return size.type == binding.layout.descriptorType; });
+        if (entry == sizes.end()) {
+            fork.outcome = ForkOutcome::Unsupported;
+            return fork;
+        }
+        entry->descriptorCount += binding.layout.descriptorCount;
+    }
+    const auto used = static_cast<std::size_t>(std::remove_if(sizes.begin(), sizes.end(), [](const auto& size) { return size.descriptorCount == 0; }) - sizes.begin());
+    const auto set = context.descriptorCache->AllocateTransient(_layout, std::span<const VkDescriptorPoolSize>(sizes.data(), used), recorder);
+    if (set == VK_NULL_HANDLE) {
+        fork.outcome = ForkOutcome::NoSet;
+        return fork;
+    }
+    // The words, patched as writeDataWords patches them, and the set: the differing data bindings
+    // written to their regions, every other binding copied from this object's set.
+    std::array<VkDescriptorBufferInfo, MaxForkedBindings> infos{};
+    std::array<VkWriteDescriptorSet, MaxForkedBindings> writes{};
+    thread_local std::vector<VkCopyDescriptorSet> copies;
+    copies.clear();
+    for (std::size_t index = 0; index < bindings.size(); ++index) {
+        const auto& layout = bindings[index].layout;
+        const auto found = std::find(differing.begin(), differing.begin() + static_cast<std::ptrdiff_t>(count), index);
+        if (found == differing.begin() + static_cast<std::ptrdiff_t>(count)) {
+            if (layout.descriptorCount == 0) continue;
+            VkCopyDescriptorSet copy{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
+            copy.srcSet = _set;
+            copy.srcBinding = layout.binding;
+            copy.dstSet = set;
+            copy.dstBinding = layout.binding;
+            copy.descriptorCount = layout.descriptorCount;
+            copies.push_back(copy);
+            continue;
+        }
+        const auto i = static_cast<std::size_t>(found - differing.begin());
+        const auto allocationIndex = bindings[index].allocations.front();
+        const auto& words = program.bindings[index].guestDescriptor;
+        const auto& region = *regions[i];
+        const auto size = words.size() * sizeof(std::uint32_t);
+        std::memcpy(region.data, words.data(), size);
+        for (const auto& patch : dataPatches) {
+            if (patch.allocation == allocationIndex && patch.byte < size) region.data[patch.byte] = static_cast<std::byte>(patch.adjustment);
+        }
+        infos[i] = {region.buffer, region.offset, size};
+        auto& write = writes[i];
+        write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = set;
+        write.dstBinding = layout.binding;
+        write.descriptorCount = 1;
+        write.descriptorType = layout.descriptorType;
+        write.pBufferInfo = &infos[i];
+        fork.bytes += size;
+    }
+    context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(count), writes.data(), static_cast<std::uint32_t>(copies.size()), copies.data());
+    fork.outcome = ForkOutcome::Forked;
+    fork.set = set;
+    return fork;
 }
 
 void ShaderResources::PrecollectSurfaces() const {
@@ -3845,11 +4065,15 @@ ShaderResources::DeferredMemo& ShaderResources::DeferredMemoFor(std::size_t allo
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
-    if (_set == VK_NULL_HANDLE) return;
+    Bind(commands, bindPoint, layout, _set);
+}
+
+void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, VkDescriptorSet set) const {
+    if (set == VK_NULL_HANDLE) return;
     if (CheckStaleImports()) {
         for (const auto buffer : boundBuffers) {
             std::uint64_t base = 0;
-            if (!ReportDestroyedImport(buffer, "a descriptor set bound now", reinterpret_cast<std::uint64_t>(_set), &base)) continue;
+            if (!ReportDestroyedImport(buffer, "a descriptor set bound now", reinterpret_cast<std::uint64_t>(set), &base)) continue;
             static std::atomic<int> details{0};
             if (details.fetch_add(1) < 6) {
                 std::fprintf(stderr, "[stale-import]   object %p: reusable %d, %zu direct regions, %zu bound buffers, %zu allocations, lease %d%s", static_cast<const void*>(this), reusable ? 1 : 0, directRegions.size(), boundBuffers.size(), allocations.size(), HoldsLease() ? 1 : 0, "\n");
@@ -3861,7 +4085,7 @@ void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoi
             break;
         }
     }
-    context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);
+    context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &set, 0, nullptr);
 }
 
 namespace {

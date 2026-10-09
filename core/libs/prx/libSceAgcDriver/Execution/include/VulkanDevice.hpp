@@ -305,6 +305,15 @@ public:
     // Whether compute templates refresh their data buffers with a hit's words instead of keying
     // them (APS5_NO_TEMPLATE_DATA_REFRESH unset); the driver's data-only hits require it.
     static bool TemplateDataRefresh();
+    // The template hits' data refresh outcomes so far (all devices): refreshed (in-stream or through
+    // the ring), of which through the ring (APS5_TEMPLATE_REFRESH_RING, ShaderResources::ForkData),
+    // and the hits whose words were the template's already. For tests and the [rescache] line.
+    struct TemplateRefreshCounts {
+        std::uint64_t refreshed = 0;
+        std::uint64_t throughRing = 0;
+        std::uint64_t sameWords = 0;
+    };
+    static TemplateRefreshCounts TemplateRefreshes();
     // The driver's recipe events for the [recipe] line: a restart after Rebuild, an attach; the
     // rows are the dispatch, indirect and draw kinds. NoteDrawRecipeMiss files a draw hit's
     // pre-check miss made in the driver (no recipe for the matched variants, or a device mismatch).

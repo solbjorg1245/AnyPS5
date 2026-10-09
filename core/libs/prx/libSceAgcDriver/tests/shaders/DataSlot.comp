@@ -1,0 +1,11 @@
+#version 450
+
+// tests/Recorder.cpp templateRefreshRingTests: a dispatch stores its data words' value at their slot
+// (results[words[1]] = words[0]); both buffers are a ShaderResources template's data buffers.
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer Words { uint words[]; };
+layout(set = 0, binding = 1, std430) buffer Results { uint results[]; };
+
+void main() {
+    results[words[1]] = words[0];
+}
