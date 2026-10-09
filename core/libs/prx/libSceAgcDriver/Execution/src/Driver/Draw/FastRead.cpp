@@ -6,6 +6,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -66,6 +68,99 @@ std::uint32_t feedbackBits(std::size_t word) {
     return 0;
 }
 
+std::atomic<FastPendingQuery> installedQuery{nullptr};
+
+void logServed(std::uint64_t address, std::uint32_t value, FastServedSource source) {
+    auto& log = FastServedWords();
+    if (log.enabled) log.words.push_back({address, value, source});
+}
+
+// This thread's queued labels over the word (FastSrtRead): true with `word` empty when there are
+// none, true with the bytes of the last label in queue order when that label covers the whole word
+// (and serving labels is on), false (declines) otherwise. The deferred list is the labels in queue
+// order; the queued ranges (noted from that list) seen without a list entry over the word decline.
+bool queuedLabelWord(const FastReader& reader, std::uint64_t address, std::optional<std::uint32_t>& word) {
+    const DeferredLabel* last = nullptr;
+    if (reader.labels != nullptr) {
+        for (const auto& label : *reader.labels) {
+            if (address < label.address + label.size && label.address < address + sizeof(std::uint32_t)) last = &label;
+        }
+    }
+    if (last == nullptr) return !Graphics::Recorder::QueuedLabelOverlapsThisThreadUncounted(address, sizeof(std::uint32_t));
+    if (!reader.knownValues || !reader.knownLabels || last->address > address || address + sizeof(std::uint32_t) > last->address + last->size || last->size > last->bytes.size()) return false;
+    std::uint32_t value = 0;
+    std::memcpy(&value, last->bytes.data() + (address - last->address), sizeof(value));
+    word = value;
+    return true;
+}
+
+// A word an exact pending range overlaps, after the reader's page checks: the old capture's word
+// read on a word-wise page (ShaderMemory::read) under the same classification
+// (Driver::fastPendingWord, queryPendingWrite's answer for the 4 bytes over the reader's
+// snapshot). The answers that read without the flush hook serve; the rest decline "pending block",
+// where the capture would wait for the writer. Words inside the last KnownValue range the query
+// named reuse its answer while the snapshot generation and the writer push count hold (the
+// validation's per-region classification, over a whole range of one writer).
+bool serveKnown(FastReader& reader, std::uint64_t address, std::uint32_t* value) {
+    using Policy = ShaderMemory::PendingWrite;
+    if (reader.knownBytes != nullptr && reader.knownBegin <= address && address + sizeof(*value) <= reader.knownEnd && reader.knownGeneration == reader.snapshotGeneration && reader.knownWriters == WrittenBufferPushes().load(std::memory_order_acquire)) {
+        std::memcpy(value, reader.knownBytes->data() + (address - reader.knownBegin), sizeof(*value));
+        ++reader.servedKnown;
+        logServed(address, *value, FastServedSource::Known);
+        return true;
+    }
+    PendingView view;
+    view.snapshot = reader.snapshot;
+    view.generation = reader.snapshotGeneration;
+    view.loaded = true;
+    FastPendingAnswer answer;
+    reader.pendingQuery(address, view, answer);
+    const auto live = [&] {
+        std::uint32_t word = 0;
+        std::memcpy(&word, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), sizeof(word));
+        return word;
+    };
+    switch (answer.policy) {
+        case Policy::None:
+            // Nothing pending over the word in the classification's view: the capture's hook read
+            // finds nothing to wait for (the reader's page checks ran).
+            *value = live();
+            return true;
+        case Policy::KnownValue:
+            *value = answer.word;
+            ++reader.servedKnown;
+            logServed(address, *value, FastServedSource::Known);
+            if (answer.rangeBytes != nullptr && answer.rangeBegin <= address && address + sizeof(*value) <= answer.rangeEnd && answer.rangeBytes->size() == answer.rangeEnd - answer.rangeBegin) {
+                reader.knownBegin = answer.rangeBegin;
+                reader.knownEnd = answer.rangeEnd;
+                reader.knownBytes = std::move(answer.rangeBytes);
+                reader.knownGeneration = reader.snapshotGeneration;
+                reader.knownWriters = answer.writers;
+            }
+            return true;
+        case Policy::RawExpected: {
+            // Read raw while the word still holds what the evidence saw last; another value is the
+            // capture's hook read (it waits, and tells the evidence the word changed).
+            const auto word = live();
+            if (word != answer.word) break;
+            *value = word;
+            ++reader.servedEvidence;
+            logServed(address, *value, FastServedSource::Evidence);
+            return true;
+        }
+        case Policy::Raw:
+            *value = live();
+            ++reader.servedEvidence;
+            logServed(address, *value, FastServedSource::Evidence);
+            return true;
+        default:
+            // Sync, VerifyRaw, VerifyKnownValue: the capture reads through the hook.
+            break;
+    }
+    reader.declined = WalkDecline::Pending;
+    return false;
+}
+
 WalkMismatch mismatchOf(ShaderRecompiler::DescriptorRole role) {
     using Role = ShaderRecompiler::DescriptorRole;
     switch (role) {
@@ -110,30 +205,33 @@ bool FastSrtRead(void* context, std::uint64_t address, std::uint32_t* value) {
         return true;
     }
     // The 64 KiB block is the prefilter; a word in a pending block that no pending range overlaps
-    // reads as the old capture reads it (raw).
+    // reads as the old capture reads it (raw). One a range overlaps is served as the capture
+    // serves it (serveKnown, after the checks below) or declines.
+    bool pending = false;
     if (Graphics::Recorder::BlockPending(address)) {
         ++reader.pendingInBlocks;
         if (!reader.exactPending || exactPendingOverlap(reader, address)) {
-            reader.declined = WalkDecline::Pending;
-            return false;
-        }
-        ++reader.pendingPassed;
-    }
-    // The uncounted query: the [labels] line's "capture pages read word-wise over a queued label"
-    // counts the old capture's page queries only (a declined walk's old path counts its own).
-    if (Graphics::Recorder::QueuedLabelOverlapsThisThreadUncounted(address, sizeof(*value))) {
-        reader.declined = WalkDecline::QueuedLabel;
-        return false;
-    }
-    // A deferred label is written only when the packet records its labels: the old path captures
-    // again after recording one over its reads (recordQueuedLabelsAfterCapture).
-    if (reader.labels != nullptr) {
-        for (const auto& label : *reader.labels) {
-            if (address < label.address + label.size && label.address < address + sizeof(*value)) {
-                reader.declined = WalkDecline::QueuedLabel;
+            if (!reader.exactPending || !reader.knownValues || reader.pendingQuery == nullptr) {
+                reader.declined = WalkDecline::Pending;
                 return false;
             }
+            pending = true;
+        } else {
+            ++reader.pendingPassed;
         }
+    }
+    // A label of this thread not recorded yet: the old capture reads its word through the flush
+    // hook, which records the thread's labels (all of them, in queue order) and waits for them, or
+    // the old path captures again after recording one over its reads
+    // (recordQueuedLabelsAfterCapture). Either way the word then holds the last label's bytes,
+    // recorded after every write pending over it (so the label decides a pending word too); the
+    // packet records the labels before its draw or dispatch. Anything short of the last label
+    // covering the word declines. The uncounted query: the [labels] line's "capture pages read
+    // word-wise over a queued label" counts the old capture's page queries only.
+    std::optional<std::uint32_t> labelWord;
+    if (!queuedLabelWord(reader, address, labelWord)) {
+        reader.declined = WalkDecline::QueuedLabel;
+        return false;
     }
     const auto page = address & ~(ReaderPageBytes - 1);
     if (page != reader.page) {
@@ -155,8 +253,95 @@ bool FastSrtRead(void* context, std::uint64_t address, std::uint32_t* value) {
         }
         reader.page = page;
     }
+    if (labelWord) {
+        *value = *labelWord;
+        ++reader.servedLabels;
+        logServed(address, *value, FastServedSource::Label);
+        return true;
+    }
+    if (pending) return serveKnown(reader, address, value);
     std::memcpy(value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), sizeof(*value));
     return true;
+}
+
+bool FastKnownValues() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_FAST_KNOWN_VALUES");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool FastKnownLabels() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_FAST_KNOWN_LABELS");
+        return FastKnownValues() && (value == nullptr || std::strcmp(value, "0") != 0);
+    }();
+    return enabled;
+}
+
+void SetFastPendingQuery(FastPendingQuery query) {
+    installedQuery.store(query, std::memory_order_release);
+}
+
+FastPendingQuery InstalledFastPendingQuery() {
+    return installedQuery.load(std::memory_order_acquire);
+}
+
+FastServedLog& FastServedWords() {
+    static thread_local FastServedLog log;
+    return log;
+}
+
+FastServedLogScope::FastServedLogScope(bool enable) : previous(FastServedWords().enabled) {
+    auto& log = FastServedWords();
+    if (enable) {
+        log.words.clear();
+        log.enabled = true;
+    }
+}
+
+FastServedLogScope::~FastServedLogScope() {
+    FastServedWords().enabled = previous;
+}
+
+void CheckServedWords(std::span<const FastServedWord> words, const char* what, FastServedCheck& check) {
+    static std::atomic<std::uint32_t> printed{0};
+    for (const auto& served : words) {
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(served.address)), sizeof(std::uint32_t))) {
+            ++check.unreadable;
+            continue;
+        }
+        // Through the flush hook: this thread's labels over the word are recorded, the recorded
+        // work writing it is waited for, the storage results over it are stored.
+        std::uint32_t final = 0;
+        GuestMemory::Read(served.address, std::as_writable_bytes(std::span(&final, 1)), alignof(std::uint32_t));
+        ++check.compared;
+        if (final == served.value) continue;
+        ++check.mismatched[static_cast<std::size_t>(served.source)];
+        if (printed.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[fastpath] %s: the word at 0x%llx served from %s as %08x holds %08x once its pending writes landed\n", what, static_cast<unsigned long long>(served.address), FastServedSourceNames[static_cast<std::size_t>(served.source)], served.value, final);
+    }
+}
+
+std::uint64_t CompareServedWords(std::span<const FastServedWord> words, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& unread) {
+    std::uint64_t differing = 0;
+    for (const auto& served : words) {
+        std::uint32_t old = 0;
+        bool boundary = false;
+        if (!readRegion(regions, served.address, &old, boundary)) {
+            ++unread;
+            continue;
+        }
+        if (old != served.value) ++differing;
+    }
+    return differing;
+}
+
+std::string FastPendingServedText(const FastPendingReads& reads) {
+    const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+    char text[192];
+    std::snprintf(text, sizeof(text), "; pending words served from known values %llu, on write evidence %llu; queued-label words served %llu%s", count(reads.known), count(reads.evidence), count(reads.labels), !FastKnownValues() ? " (APS5_FAST_KNOWN_VALUES=0)" : !FastKnownLabels() ? " (APS5_FAST_KNOWN_LABELS=0)" : "");
+    return text;
 }
 
 WalkDecline WalkDeclineOf(ShaderRecompiler::WalkStatus status, const FastReader& reader) {

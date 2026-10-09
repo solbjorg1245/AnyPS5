@@ -234,8 +234,15 @@ private:
     void observeRange(std::uint64_t address, std::span<const std::byte> before);
     static void observePendingWrite(std::uint64_t address, bool unchanged, std::uint32_t value);
     static bool knownValueCurrent(const WrittenBuffer& writer);
-    ShaderMemory::PendingWrite classifyPendingWrite(std::uint64_t address, std::size_t bytes, std::uint64_t ValidateCounters::*& reason, const PendingView& pending, std::span<std::byte> known = {});
+    // `writers`: the newest writer is looked up through these memos (the fast reader's query)
+    // instead of the plain ring scan; the answer is the same.
+    ShaderMemory::PendingWrite classifyPendingWrite(std::uint64_t address, std::size_t bytes, std::uint64_t ValidateCounters::*& reason, const PendingView& pending, std::span<std::byte> known = {}, NewestWriterMemos* writers = nullptr);
     static ShaderMemory::PendingWrite queryPendingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known);
+    // The fast reader's query (FastPendingQuery, installed by the constructor; FastRead.cpp): the
+    // answer queryPendingWrite gives for the 4-byte word at `address`, classified over `view` (the
+    // reader's pending snapshot) with this thread's newest-writer memos, and for a KnownValue
+    // whose writer's range holds as a whole, that range (FastPendingAnswer).
+    static void fastPendingWord(std::uint64_t address, const PendingView& view, FastPendingAnswer& answer);
     template<typename TVisit>
     static void forEachWrittenBuffer(const ShaderRecompiler::RecompileResult& compiled, TVisit&& visit);
     void noteWrittenBuffers(std::uint64_t program, std::uint32_t queue, const ShaderRecompiler::RecompileResult& compiled);
@@ -243,6 +250,7 @@ private:
     void noteDrawWriters(std::span<const Graphics::CompiledShader> stages, std::uint32_t queue);
     std::optional<WrittenBuffer> newestWriterLocked(std::uint64_t begin, std::uint64_t end) const;
     std::optional<WrittenBuffer> newestWriter(std::uint64_t begin, std::uint64_t end);
+    std::optional<WrittenBuffer> newestWriterMemoized(std::uint64_t begin, std::uint64_t end, NewestWriterMemos& memos);
     std::string describeWriters(std::uint64_t begin, std::uint64_t end);
     static std::string describeSelf(const ShaderRecompiler::RecompileResult& compiled, std::uint64_t begin, std::uint64_t end);
     static bool traceBudget();

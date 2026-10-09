@@ -19,7 +19,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <deque>
+#include <initializer_list>
 #include <limits>
+#include <optional>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -636,6 +640,160 @@ void testFastReader() {
     }
 }
 
+// Queued-label words in the fast reader (FastKnownLabels, s53-known-values): a word this thread's
+// deferred labels write is served with what the old path reads there once it recorded them and
+// waited (the labels stored over memory in queue order, so a later label over an earlier one
+// wins); a word the last such label covers only partly declines QueuedLabel, as every label word
+// does with either switch off. A word without a label is the plain load.
+void testFastReaderLabels() {
+    using namespace AgcDriver::DriverDetail;
+    std::vector<std::uint32_t> host(8, 0x11111111u);
+    for (std::size_t i = 0; i < host.size(); ++i) host[i] = 0x11111111u * static_cast<std::uint32_t>(i + 1);
+    const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(host.data()));
+    const auto label = [](std::uint64_t address, std::initializer_list<std::uint32_t> words) {
+        DeferredLabel made{address, words.size() * 4, {}};
+        std::size_t at = 0;
+        for (const auto word : words) {
+            std::memcpy(made.bytes.data() + at, &word, 4);
+            at += 4;
+        }
+        return made;
+    };
+    // Word 0 by one label; words 2-3 by an 8-byte label, then word 2 again by a later one; words 5
+    // and 6 each half covered by a label at word 5 + 2 bytes; word 7 by one label; words 1 and 4
+    // by none.
+    std::vector<DeferredLabel> labels;
+    labels.push_back(label(base, {0xa0a0a0a0u}));
+    labels.push_back(label(base + 8, {0xb0b0b0b0u, 0xc0c0c0c0u}));
+    labels.push_back(label(base + 8, {0xd0d0d0d0u}));
+    labels.push_back(label(base + 22, {0xe0e0e0e0u}));
+    labels.push_back(label(base + 28, {0xf0f0f0f0u}));
+    // The old path's words: the labels recorded over memory in queue order, then read.
+    auto recorded = host;
+    for (const auto& made : labels) std::memcpy(reinterpret_cast<std::byte*>(recorded.data()) + (made.address - base), made.bytes.data(), made.size);
+    const auto readWord = [&](FastReader& reader, std::size_t word, std::uint32_t& value) {
+        reader.labels = &labels;
+        reader.declined.reset();
+        value = 0xdeadbeefu;
+        return FastSrtRead(&reader, base + word * 4, &value);
+    };
+    std::uint32_t value = 0;
+    {
+        FastReader reader{{}, {}};
+        reader.knownValues = true;
+        reader.knownLabels = true;
+        for (std::size_t word = 0; word < host.size(); ++word) {
+            const bool partial = word == 5 || word == 6;
+            const bool served = readWord(reader, word, value);
+            if (partial) {
+                check(!served && reader.declined == WalkDecline::QueuedLabel, "fast reader labels: a word a label covers only partly did not decline");
+                continue;
+            }
+            check(served && !reader.declined, "fast reader labels: a label word or a plain word declined");
+            check(value == recorded[word], "fast reader labels: a served word differs from the old path's word after the labels landed");
+        }
+        check(value == recorded[7] && recorded[7] == 0xf0f0f0f0u && recorded[2] == 0xd0d0d0d0u && recorded[3] == 0xc0c0c0c0u && recorded[4] == host[4], "fast reader labels: the test's label layout is not the one described");
+        check(reader.servedLabels == 4, "fast reader labels: the served label words are not counted");
+    }
+    {
+        FastReader reader{{}, {}};
+        reader.knownValues = true;
+        reader.knownLabels = false;
+        check(!readWord(reader, 0, value) && reader.declined == WalkDecline::QueuedLabel, "fast reader labels: a label word was served with APS5_FAST_KNOWN_LABELS=0");
+        check(readWord(reader, 4, value) && value == host[4], "fast reader labels: a word without a label declined");
+        FastReader off{{}, {}};
+        off.knownValues = false;
+        off.knownLabels = true;
+        check(!readWord(off, 2, value) && off.declined == WalkDecline::QueuedLabel, "fast reader labels: a label word was served with APS5_FAST_KNOWN_VALUES=0");
+    }
+    {
+        // The served-word log (the verify modes'), enabled by its scope only.
+        FastReader reader{{}, {}};
+        reader.knownValues = true;
+        reader.knownLabels = true;
+        {
+            const FastServedLogScope scope(true);
+            check(readWord(reader, 0, value) && readWord(reader, 4, value), "fast reader labels: a logged read declined");
+            const auto& words = FastServedWords().words;
+            check(words.size() == 1 && words[0].address == base && words[0].value == recorded[0] && words[0].source == FastServedSource::Label, "fast reader labels: the served label word was not logged alone");
+        }
+        check(!FastServedWords().enabled, "fast reader labels: the log stayed enabled after its scope");
+        FastServedWords().words.clear();
+        check(readWord(reader, 0, value) && FastServedWords().words.empty(), "fast reader labels: a word was logged without a scope");
+        // The verify's compare with the old capture's reads: the old words (the labels landed)
+        // agree, the live memory (before the record) does not; a word the capture did not read.
+        const std::array<FastServedWord, 2> served{{{base, recorded[0], FastServedSource::Label}, {base + 0x100000, 1, FastServedSource::Known}}};
+        const std::array<ShaderRecompiler::MemoryRegion, 1> landed{{{base, std::as_bytes(std::span(recorded))}}};
+        const std::array<ShaderRecompiler::MemoryRegion, 1> before{{{base, std::as_bytes(std::span(host))}}};
+        std::uint64_t unread = 0;
+        check(CompareServedWords(served, landed, unread) == 0 && unread == 1, "fast reader labels: the served words differ from the old capture's");
+        unread = 0;
+        check(CompareServedWords(served, before, unread) == 1 && unread == 1, "fast reader labels: a served word unlike the old capture's was not counted");
+    }
+}
+
+// The fast reader's newest-writer memo (NewestWriterMemos, Driver::fastPendingWord): over a ring
+// of written buffers that grows, overflows (its oldest entries leave) and gets entries beside,
+// inside and over a remembered writer, every lookup gives the plain scan's answer (the newest entry
+// overlapping the range), and the memo answers a later word of a writer only while no newer entry
+// overlaps that writer's range.
+void testNewestWriterMemo() {
+    using namespace AgcDriver::DriverDetail;
+    constexpr std::size_t Capacity = 64;
+    std::deque<WrittenBuffer> ring;
+    std::uint64_t pushes = 0;
+    const auto push = [&](std::uint64_t begin, std::uint64_t end) {
+        ++pushes;
+        ring.push_back({1, begin, end, pushes, 0, false});
+        while (ring.size() > Capacity) ring.pop_front();
+    };
+    const auto scan = [&](std::uint64_t begin, std::uint64_t end) -> std::optional<WrittenBuffer> {
+        for (auto it = ring.rbegin(); it != ring.rend(); ++it) {
+            if (begin < it->end && it->begin < end) return *it;
+        }
+        return std::nullopt;
+    };
+    const auto same = [](const std::optional<WrittenBuffer>& left, const std::optional<WrittenBuffer>& right) {
+        if (left.has_value() != right.has_value()) return false;
+        return !left || (left->serial == right->serial && left->begin == right->begin && left->end == right->end);
+    };
+    NewestWriterMemos memos;
+    check(!memos.Lookup(ring, pushes, 0x1000, 0x1004) && memos.last == nullptr, "writer memo: an empty ring answered");
+    push(0x1000, 0x1100);
+    check(same(memos.Lookup(ring, pushes, 0x1010, 0x1014), scan(0x1010, 0x1014)) && memos.last != nullptr && memos.last->wholeRange, "writer memo: a lone writer is not remembered for its range");
+    // A newer writer beside it leaves the memo holding (checked at the new push count).
+    push(0x2000, 0x2100);
+    const auto beside = memos.Lookup(ring, pushes, 0x1020, 0x1024);
+    check(same(beside, scan(0x1020, 0x1024)) && beside->serial == 1 && memos.last->wholeRange && memos.last->checked == pushes, "writer memo: a writer beside the remembered one ended the memo");
+    // One inside its range: a word the newer one does not cover still has the old writer as its
+    // newest, but the old writer no longer answers for its whole range.
+    push(0x1080, 0x1090);
+    check(same(memos.Lookup(ring, pushes, 0x1020, 0x1024), scan(0x1020, 0x1024)) && !memos.last->wholeRange, "writer memo: a writer inside the remembered range was missed");
+    check(same(memos.Lookup(ring, pushes, 0x1084, 0x1088), scan(0x1084, 0x1088)) && memos.last->writer.serial == 3, "writer memo: the newer writer inside the range was not the answer");
+    // The writer leaves the ring: no answer for its words.
+    for (std::size_t i = 0; i < Capacity; ++i) push(0x100000 + i * 0x100, 0x100000 + i * 0x100 + 0x80);
+    check(!memos.Lookup(ring, pushes, 0x1010, 0x1014) && !scan(0x1010, 0x1014), "writer memo: a writer that left the ring answered");
+    // Interleaved pushes and lookups over a small space: always the scan's answer.
+    std::uint64_t state = 0x9e3779b97f4a7c15ull;
+    const auto next = [&] {
+        state = state * 6364136223846793005ull + 1442695040888963407ull;
+        return state >> 33u;
+    };
+    std::uint64_t remembered = 0;
+    for (int step = 0; step < 50000; ++step) {
+        const auto r = next();
+        if (r % 4 == 0) {
+            const auto begin = 0x10000 + (next() % 0x400) * 4;
+            push(begin, begin + 4 + (next() % 0x40) * 4);
+            continue;
+        }
+        const auto word = 0x10000 + (next() % 0x480) * 4;
+        check(same(memos.Lookup(ring, pushes, word, word + 4), scan(word, word + 4)), "writer memo: a lookup differs from the plain scan");
+        if (memos.last != nullptr && memos.last->wholeRange) ++remembered;
+    }
+    check(remembered != 0, "writer memo: no interleaved lookup left a writer remembered for its range");
+}
+
 // The fast draw's import memo (HostImportMemo, s53-fast-cost-b step 2c): an entry answers a range
 // inside its import only under the device, registry generation and import epoch it was noted
 // under; a retire (the epoch), a registry change (the generation) or another device makes it miss,
@@ -775,6 +933,8 @@ int main() {
         testFastCensus();
         testFastDispatchVerify();
         testFastReader();
+        testFastReaderLabels();
+        testNewestWriterMemo();
         testHostImportMemo();
         testFastPipelineMemo();
         LibcRunShutdown_nid_postfix();

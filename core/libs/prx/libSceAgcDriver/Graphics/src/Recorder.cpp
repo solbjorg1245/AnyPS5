@@ -1368,6 +1368,24 @@ std::optional<std::uint64_t> Recorder::LookupLabelValue(std::uint64_t address, s
     return hit->value;
 }
 
+bool Recorder::LabelValueIn(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes) return bytes != 0;
+    const auto first = address & ~std::uint64_t{3};
+    const auto limit = address + bytes;
+    std::lock_guard tableLock(labelTableMutex);
+    if (labelTableOwner == nullptr) return false;
+    const auto& owner = *labelTableOwner;
+    // A dword no table tracks has no value; each tracked one is looked up as LookupLabelValue does
+    // (its own queue's queued entry first, then the recorded one, with the same refusals).
+    for (const auto* table : {&owner.labels, &owner.queuedLabels}) {
+        for (auto it = table->lower_bound(first); it != table->end() && it->first < limit; ++it) {
+            if (it->first % 4 != 0) continue;
+            if (owner.lookupLabel(it->first, 4, 0, nullptr).has_value()) return true;
+        }
+    }
+    return false;
+}
+
 bool Recorder::LateTrust() {
     return LateTrustEnabled();
 }

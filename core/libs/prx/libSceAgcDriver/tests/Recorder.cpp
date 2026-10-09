@@ -18,6 +18,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #include "ResidentPresent.hpp"
 #include "SampleLod_spv.h"
 #include <SDL_loadso.h>
@@ -35,7 +36,9 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -382,6 +385,254 @@ void fastReaderPendingTests(Recorder& recorder) {
     Require(Recorder::QueuedLabelOverlapsThisThreadUncounted(base + 0xa00, 4) && !Recorder::QueuedLabelOverlapsThisThreadUncounted(base + 0xa04, 4), "the uncounted queued-label query answers differently");
     Require(Recorder::StoreCounts().queuedPageQueries == pageQueries, "the fast reader's queued-label query counted as a capture page query");
     Recorder::ForgetQueuedLabels();
+    Recorder::TrackPendingBlocks(false);
+}
+
+// The classification both readers of fastReaderKnownValueTests ask (the driver's
+// classifyPendingWrite stands behind both in the game): per word, the answer and its value; a
+// page query is word-wise when an answered word lies in it. The fast reader's form can name a
+// KnownValue range (FastPendingAnswer) taken at the current writer push count.
+struct FakeAnswer {
+    AgcDriver::ShaderMemory::PendingWrite policy;
+    std::uint32_t word;
+};
+std::map<std::uint64_t, FakeAnswer> fakeAnswers;
+struct FakeRange {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::shared_ptr<const std::vector<std::byte>> bytes;
+};
+FakeRange fakeRange;
+std::uint64_t fakeFastQueries = 0;
+
+AgcDriver::ShaderMemory::PendingWrite fakeCaptureQuery(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
+    using Policy = AgcDriver::ShaderMemory::PendingWrite;
+    if (bytes != sizeof(std::uint32_t)) {
+        const auto found = fakeAnswers.lower_bound(address);
+        return found != fakeAnswers.end() && found->first < address + bytes ? Policy::Sync : Policy::None;
+    }
+    const auto found = fakeAnswers.find(address);
+    if (found == fakeAnswers.end()) return Policy::None;
+    if (known.size() == sizeof(std::uint32_t)) std::memcpy(known.data(), &found->second.word, sizeof(std::uint32_t));
+    return found->second.policy;
+}
+
+void fakeFastQuery(std::uint64_t address, const AgcDriver::DriverDetail::PendingView&, AgcDriver::DriverDetail::FastPendingAnswer& answer) {
+    using Policy = AgcDriver::ShaderMemory::PendingWrite;
+    ++fakeFastQueries;
+    answer = {};
+    const auto found = fakeAnswers.find(address);
+    if (found == fakeAnswers.end()) {
+        answer.policy = Policy::None;
+        return;
+    }
+    answer.policy = found->second.policy;
+    answer.word = found->second.word;
+    if (answer.policy != Policy::KnownValue || fakeRange.bytes == nullptr || address < fakeRange.begin || address + sizeof(std::uint32_t) > fakeRange.end) return;
+    answer.rangeBegin = fakeRange.begin;
+    answer.rangeEnd = fakeRange.end;
+    answer.rangeBytes = fakeRange.bytes;
+    answer.writers = AgcDriver::DriverDetail::WrittenBufferPushes().load();
+}
+
+// Known-value serving in the fast reader (FastSrtRead with APS5_FAST_KNOWN_VALUES, s53-known-values):
+// a pending word is served as the old capture serves it. The old capture is ShaderMemory over the
+// same answers, capturing a shader that loads a table pointer from its user data and a payload
+// through it (the payload a pure flat slot); the fast walk is WalkResources over FastSrtRead, the
+// payload's word in an exact pending range of the recorder. A KnownValue (a pending copy's
+// destination whose bytes the driver keeps) gives both the known word; RawExpected the live word
+// while it holds the expected value; a queued label of this thread its bytes, which the old path
+// reads once it recorded the label (stored here by hand, as the record lands it). Where the
+// capture reads through the flush hook (Sync: deferred or waited; RawExpected with another value:
+// waited) the fast walk declines "pending block". A word changed after it was served: within a
+// walk the served range answers while nothing the classification sees moved; a new writer (the
+// push count), a new pending range (the publish generation) or another live word (RawExpected)
+// re-serves or declines. Recorder::LabelValueIn answers as LookupLabelValue per dword.
+void fastReaderKnownValueTests(Recorder& recorder) {
+    using namespace ShaderRecompiler;
+    using AgcDriver::DriverDetail::DeferredLabel;
+    using AgcDriver::DriverDetail::FastReader;
+    using AgcDriver::DriverDetail::FastSrtRead;
+    using AgcDriver::DriverDetail::WalkDecline;
+    using AgcDriver::DriverDetail::WrittenBufferPushes;
+    using Policy = AgcDriver::ShaderMemory::PendingWrite;
+    Recorder::TrackPendingBlocks(true);
+    recorder.Sync();
+    constexpr std::uint64_t Block = 0x10000;
+    std::vector<std::uint32_t> storage(static_cast<std::size_t>(2 * Block / 4));
+    const auto base = (reinterpret_cast<std::uint64_t>(storage.data()) + Block - 1) & ~(Block - 1);
+    const auto word = [](std::uint64_t address) -> std::uint32_t& { return *reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(address)); };
+    const auto table = base + 0x100;
+    const auto payload = base + 0x200;
+    *reinterpret_cast<std::uint64_t*>(static_cast<std::uintptr_t>(table)) = payload;
+    constexpr std::uint32_t Live = 0x3f800000u;
+    word(payload) = Live;
+    // tests/ShaderMemory.cpp's shader: s_load_dwordx2 of the table pointer, s_load_dword of the
+    // payload through it, exported.
+    const std::array<std::uint32_t, 8> code{0xf4040004u, 0xfa000000u, 0xf4000080u, 0xfa000000u, 0x7e000202u, 0xf80008cfu, 0u, 0xbf810000u};
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(table), static_cast<std::uint32_t>(table >> 32u)};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Vertex, 0x10000u, code, 0, {}};
+    request.context.waveSize = 64;
+    request.context.userDataBaseRegister = 8;
+    request.context.userData = userData;
+    request.context.vertex = ShaderVertexStageInfo{};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 64;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+    const auto handle = ResolveSource(request);
+    Require(handle != nullptr, "known values: the test shader has no source handle");
+    const std::vector<DeferredLabel> noLabels;
+    // The old capture's flat SRT and deferred words, over the fake answers.
+    struct Old {
+        std::vector<std::uint32_t> flat;
+        bool deferred = false;
+    };
+    const auto capture = [&] {
+        AgcDriver::ShaderMemory memory({}, &fakeCaptureQuery);
+        const auto captured = memory.Capture(request);
+        return Old{captured->snapshot.flattenedSrt, !captured->snapshot.deferredFlat.empty()};
+    };
+    // The fast walk; the reader is kept for its counters.
+    FastReader last{};
+    const auto walk = [&](const std::vector<DeferredLabel>& labels, std::vector<std::uint32_t>& flat) {
+        last = FastReader{};
+        last.exactPending = true;
+        last.knownValues = true;
+        last.knownLabels = true;
+        last.pendingQuery = &fakeFastQuery;
+        last.labels = &labels;
+        SrtRuntime runtime;
+        runtime.userContext = &last;
+        runtime.readMemory = &FastSrtRead;
+        runtime.readSpecializationMemory = &FastSrtRead;
+        runtime.expressRead = &FastSrtRead;
+        ResourceSnapshot snapshot;
+        ResourceSpecialization specialization;
+        const auto status = WalkResources(*handle, userData, request.shader.codeAddress, runtime, snapshot, specialization);
+        flat = snapshot.flattenedSrt;
+        return status == WalkStatus::Walked;
+    };
+    const auto contains = [](const std::vector<std::uint32_t>& flat, std::uint32_t value) { return std::find(flat.begin(), flat.end(), value) != flat.end(); };
+    std::vector<std::uint32_t> flat;
+
+    // A pending copy's destination with known bytes: both serve the known word, not the live one.
+    constexpr std::uint32_t Known = 0x40490fdbu;
+    fakeAnswers = {{payload, {Policy::KnownValue, Known}}};
+    recorder.NotePendingWrite(payload, 4);
+    auto old = capture();
+    Require(walk(noLabels, flat), "known values: a known pending word declined the fast walk");
+    Require(flat == old.flat && contains(flat, Known) && !contains(flat, Live) && !old.deferred, "known values: the fast walk's known word differs from the old capture's");
+    Require(last.servedKnown == 1 && last.pendingInBlocks >= 1, "known values: the known word was not counted");
+    // RawExpected holding the expected value: both read the live word.
+    fakeAnswers = {{payload, {Policy::RawExpected, Live}}};
+    old = capture();
+    Require(walk(noLabels, flat) && flat == old.flat && contains(flat, Live) && last.servedEvidence == 1, "known values: an evidence word the old capture reads raw differs or declined");
+    // Raw: the live word.
+    fakeAnswers = {{payload, {Policy::Raw, 0}}};
+    old = capture();
+    Require(walk(noLabels, flat) && flat == old.flat && contains(flat, Live) && last.servedEvidence == 1, "known values: a raw-read word differs or declined");
+    // Sync: the capture defers the pure slot to the GPU (or would wait); the fast walk declines.
+    fakeAnswers = {{payload, {Policy::Sync, 0}}};
+    Require(!walk(noLabels, flat) && last.declined == WalkDecline::Pending, "known values: a word the old capture waits for was served");
+    for (const auto policy : {Policy::VerifyKnownValue, Policy::VerifyRaw}) {
+        fakeAnswers = {{payload, {policy, Live}}};
+        Require(!walk(noLabels, flat) && last.declined == WalkDecline::Pending, "known values: a word the old capture verifies through the hook was served");
+    }
+    fakeAnswers = {{payload, {Policy::Sync, 0}}};
+    old = capture();
+    Require(old.deferred, "known values: the old capture did not leave the waited pure word to the GPU");
+    // RawExpected with another value in memory: the capture waits for the writer (the hook syncs
+    // the pending range: the batch is submitted and finishes), the fast walk declines.
+    fakeAnswers = {{payload, {Policy::RawExpected, Live ^ 1u}}};
+    Require(!walk(noLabels, flat) && last.declined == WalkDecline::Pending, "known values: an evidence word that changed was served");
+    old = capture();
+    Require(contains(old.flat, Live) && !old.deferred && !Recorder::BlockPending(payload), "known values: the old capture did not wait for the changed evidence word");
+
+    // A queued label of this thread over the payload: the fast walk serves its bytes; the old path
+    // records the label and waits, then reads them (the record's store done here by hand).
+    constexpr std::uint32_t Labeled = 0x41200000u;
+    std::vector<DeferredLabel> labels{{payload, 4, {}}};
+    std::memcpy(labels[0].bytes.data(), &Labeled, sizeof(Labeled));
+    fakeAnswers.clear();
+    recorder.NotePendingWrite(payload, 4);
+    Require(walk(labels, flat) && contains(flat, Labeled) && last.servedLabels == 1, "known values: a queued label's word was not served with its bytes");
+    recorder.Sync();
+    word(payload) = Labeled;
+    old = capture();
+    Require(flat == old.flat, "known values: the queued label's word differs from the old path's once the label landed");
+    word(payload) = Live;
+
+    // A word changed after it was served. Direct reads of one reader stand for one walk.
+    const std::vector<DeferredLabel> none;
+    FastReader reader{};
+    reader.exactPending = true;
+    reader.knownValues = true;
+    reader.knownLabels = true;
+    reader.pendingQuery = &fakeFastQuery;
+    reader.labels = &none;
+    const auto read = [&](std::uint32_t& value) {
+        reader.declined.reset();
+        value = 0xdeadbeefu;
+        return FastSrtRead(&reader, payload, &value);
+    };
+    std::uint32_t value = 0;
+    constexpr std::uint32_t Newer = 0x40000000u;
+    const auto rangeOf = [&](std::uint32_t known) {
+        auto bytes = std::make_shared<std::vector<std::byte>>(4);
+        std::memcpy(bytes->data(), &known, 4);
+        return FakeRange{payload, payload + 4, std::move(bytes)};
+    };
+    recorder.NotePendingWrite(payload, 4);
+    fakeAnswers = {{payload, {Policy::KnownValue, Known}}};
+    fakeRange = rangeOf(Known);
+    Require(read(value) && value == Known, "known values: a known word was not served");
+    // The classification changes where nothing it reads moved: the walk keeps its answer (one
+    // classification per range and walk, as the old validation's per region).
+    fakeAnswers = {{payload, {Policy::KnownValue, Newer}}};
+    fakeRange = rangeOf(Newer);
+    auto queries = fakeFastQueries;
+    Require(read(value) && value == Known && fakeFastQueries == queries, "known values: a served range was classified again with nothing moved");
+    // A writer noted since (the push count moved): classified again, the new known word served.
+    WrittenBufferPushes().fetch_add(1);
+    Require(read(value) && value == Newer && fakeFastQueries == queries + 1, "known values: a word was not served again after a new writer");
+    // A pending range noted since (the generation moved) and the word now waited for: declines.
+    fakeAnswers = {{payload, {Policy::Sync, 0}}};
+    recorder.NotePendingWrite(payload + 0x40, 4);
+    Require(!read(value) && reader.declined == WalkDecline::Pending, "known values: a word the old capture now waits for was served from the walk's range");
+    // An evidence word: served while memory holds the expected value, declined once it changed.
+    fakeAnswers = {{payload, {Policy::RawExpected, Live}}};
+    Require(read(value) && value == Live, "known values: an evidence word holding its value was not served");
+    word(payload) = Live ^ 0x10u;
+    Require(!read(value) && reader.declined == WalkDecline::Pending, "known values: an evidence word that changed after it was served was served again");
+    word(payload) = Live;
+    // Switched off (APS5_FAST_KNOWN_VALUES=0) or without a query: declines as before.
+    fakeAnswers = {{payload, {Policy::KnownValue, Known}}};
+    reader.knownValues = false;
+    Require(!read(value) && reader.declined == WalkDecline::Pending, "known values: a pending word was served with known values off");
+    reader.knownValues = true;
+    reader.pendingQuery = nullptr;
+    Require(!read(value) && reader.declined == WalkDecline::Pending, "known values: a pending word was served without a query");
+    recorder.Sync();
+    fakeAnswers.clear();
+    fakeRange = {};
+
+    // LabelValueIn: as LookupLabelValue over each dword of the range, for recorded labels, a queued
+    // one of this thread and words without any.
+    std::array<std::byte, 8> bytes{};
+    recorder.NoteLabel(base + 0x1000, std::span(bytes).first(4), 7, 0);
+    recorder.NoteLabel(base + 0x1010, bytes, 8, 0);
+    Recorder::NoteQueuedLabel(base + 0x1100, std::span(bytes).first(4), 9, AgcDriver::GuestMemory::GpuLockThreadTag());
+    for (const auto& [begin, size] : std::initializer_list<std::pair<std::uint64_t, std::size_t>>{{0xff0, 0x10}, {0xffc, 4}, {0x1000, 4}, {0x1002, 4}, {0x1004, 0xc}, {0x1004, 0xd}, {0x1014, 4}, {0x1018, 0x100}, {0x10fc, 4}, {0x1100, 4}, {0x1104, 0x40}, {0x800, 0x1000}}) {
+        bool any = false;
+        for (auto dword = (base + begin) & ~std::uint64_t{3}; dword < base + begin + size; dword += 4) any = any || Recorder::LookupLabelValue(dword, 4, 0).has_value();
+        Require(Recorder::LabelValueIn(base + begin, size) == any, "known values: LabelValueIn differs from LookupLabelValue over the range's dwords");
+    }
+    Require(Recorder::LabelValueIn(base + 0x1000, 4) && Recorder::LabelValueIn(base + 0x1100, 4) && !Recorder::LabelValueIn(base + 0x1004, 0xc), "known values: LabelValueIn missed a label or found one where there is none");
+    Recorder::ForgetQueuedLabels();
+    recorder.Sync();
     Recorder::TrackPendingBlocks(false);
 }
 
@@ -3225,6 +3476,7 @@ int main() {
         writeSettledTests(device, recorder);
         pendingBlockTests(device, recorder);
         fastReaderPendingTests(recorder);
+        fastReaderKnownValueTests(recorder);
         completionCountTests(device, recorder);
         afterRecordedWorkTests(device, recorder);
         batchStampTests(recorder);

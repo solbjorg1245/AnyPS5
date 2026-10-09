@@ -374,6 +374,8 @@ target_include_directories(agc_driver_recorder_tests PRIVATE
         ${agcTestShaderGeneratedRoot}
         ${CMAKE_SOURCE_DIR}/core/shader/recompiler
         ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include
+        # The fast reader's known-value test walks a shader (Optimization/ResourceProgram.hpp).
+        $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
 )
 
 target_link_libraries(agc_driver_recorder_tests PRIVATE

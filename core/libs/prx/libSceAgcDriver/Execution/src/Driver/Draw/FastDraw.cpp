@@ -69,6 +69,8 @@ struct FastDrawCounters {
     // [0]: plain old results, [1]: results the old path bound by a heuristic.
     std::array<std::uint64_t, 2> verifyMismatched{};
     std::array<std::uint64_t, VerifyKinds> verifyKinds{};
+    // The verified draws' served words (CheckServedWords): compared, unreadable, differing by source.
+    FastServedCheck verifyServed;
     // The F3b walks' reads (vertex fetch and stage walks, taken and declined draws) that met a
     // pending block, and those the exact ranges let through.
     FastPendingReads pending;
@@ -120,7 +122,7 @@ void report(const FastDrawCounters& total) {
         std::snprintf(item, sizeof(item), "%s%s %llu (%.1f us each)", declines.empty() ? "" : ", ", Graphics::FastDeclineName(static_cast<FastDecline>(reason)), count(total.declines[reason]), total.declineUs[reason] / static_cast<double>(total.declines[reason]));
         declines += item;
     }
-    std::fprintf(stderr, "[fastpath] draws (10 s): %llu offered, %llu taken (%.1f%%; %llu indirect, %llu continued a pass); us per taken draw: %s = %.2f; %.1f allocations per taken draw; declined draws spent %.1f ms before declining; declines: %s; draw walk reads in pending blocks %llu, read past by the exact ranges %llu%s\n", count(total.offered), count(total.taken), total.offered != 0 ? 100.0 * static_cast<double>(total.taken) / static_cast<double>(total.offered) : 0.0, count(total.indirect), count(total.continued), parts.c_str(), total.takenUs / taken, static_cast<double>(total.allocations) / taken, total.declinedUs / 1000.0, declines.empty() ? "none" : declines.c_str(), count(total.pending.inBlocks), count(total.pending.readPast), FastPendingExact() ? "" : " (APS5_FAST_PENDING_BLOCKS: blocks only)");
+    std::fprintf(stderr, "[fastpath] draws (10 s): %llu offered, %llu taken (%.1f%%; %llu indirect, %llu continued a pass); us per taken draw: %s = %.2f; %.1f allocations per taken draw; declined draws spent %.1f ms before declining; declines: %s; draw walk reads in pending blocks %llu, read past by the exact ranges %llu%s%s\n", count(total.offered), count(total.taken), total.offered != 0 ? 100.0 * static_cast<double>(total.taken) / static_cast<double>(total.offered) : 0.0, count(total.indirect), count(total.continued), parts.c_str(), total.takenUs / taken, static_cast<double>(total.allocations) / taken, total.declinedUs / 1000.0, declines.empty() ? "none" : declines.c_str(), count(total.pending.inBlocks), count(total.pending.readPast), FastPendingExact() ? "" : " (APS5_FAST_PENDING_BLOCKS: blocks only)", FastPendingServedText(total.pending).c_str());
     if (FastDrawVerifyEvery() == 0) return;
     const auto bindings = Graphics::TakeFastVerifyCounts();
     std::string kinds;
@@ -129,7 +131,8 @@ void report(const FastDrawCounters& total) {
         std::snprintf(item, sizeof(item), "%s%s %llu", kind == 0 ? "" : ", ", names[kind], count(total.verifyKinds[kind]));
         kinds += item;
     }
-    std::fprintf(stderr, "[fastpath] draw verify (10 s, every %u): %llu draws compared (%llu stages; %llu armed draws the old path left uncompared), mismatched stages %llu, after heuristic hits %llu; by kind: %s, vertex attributes %llu; bindings: %llu compared, %llu matched, %llu declined by the fast path, mismatches: layout %llu, buffer %llu, data %llu, image %llu, sampler %llu, push %llu; buffers the old path copied %llu\n", FastDrawVerifyEvery(), count(total.verifyDraws), count(total.verifyStages), count(total.verifyNotCompared), count(total.verifyMismatched[0]), count(total.verifyMismatched[1]), kinds.c_str(), count(total.verifyVertex), count(bindings.compared), count(bindings.matched), count(bindings.declined), count(bindings.layout), count(bindings.buffer), count(bindings.data), count(bindings.image), count(bindings.sampler), count(bindings.push), count(bindings.copied));
+    const auto& served = total.verifyServed;
+    std::fprintf(stderr, "[fastpath] draw verify (10 s, every %u): %llu draws compared (%llu stages; %llu armed draws the old path left uncompared), mismatched stages %llu, after heuristic hits %llu; by kind: %s, vertex attributes %llu; bindings: %llu compared, %llu matched, %llu declined by the fast path, mismatches: layout %llu, buffer %llu, data %llu, image %llu, sampler %llu, push %llu; buffers the old path copied %llu; served words against memory once their pending writes landed: %llu compared (%llu unreadable), differing: known value %llu, write evidence %llu, queued label %llu\n", FastDrawVerifyEvery(), count(total.verifyDraws), count(total.verifyStages), count(total.verifyNotCompared), count(total.verifyMismatched[0]), count(total.verifyMismatched[1]), kinds.c_str(), count(total.verifyVertex), count(bindings.compared), count(bindings.matched), count(bindings.declined), count(bindings.layout), count(bindings.buffer), count(bindings.data), count(bindings.image), count(bindings.sampler), count(bindings.push), count(bindings.copied), count(served.compared), count(served.unreadable), count(served.mismatched[0]), count(served.mismatched[1]), count(served.mismatched[2]));
 }
 
 void commit(const FastDrawCounters& local) {
@@ -159,6 +162,9 @@ void commit(const FastDrawCounters& local) {
     total.verifyVertex += local.verifyVertex;
     for (std::size_t column = 0; column < 2; ++column) total.verifyMismatched[column] += local.verifyMismatched[column];
     for (std::size_t kind = 0; kind < VerifyKinds; ++kind) total.verifyKinds[kind] += local.verifyKinds[kind];
+    total.verifyServed.compared += local.verifyServed.compared;
+    total.verifyServed.unreadable += local.verifyServed.unreadable;
+    for (std::size_t source = 0; source < total.verifyServed.mismatched.size(); ++source) total.verifyServed.mismatched[source] += local.verifyServed.mismatched[source];
     if (!profileDraw() || std::chrono::steady_clock::now() - shared.lastReport < std::chrono::seconds(10)) return;
     shared.lastReport = std::chrono::steady_clock::now();
     report(total);
@@ -258,6 +264,9 @@ std::optional<DrawVerdict> Driver::fastDraw(QueueState& queue, const Submission&
     const bool profile = profileDraw();
     FastDrawCounters local;
     local.offered = 1;
+    // APS5_FAST_DRAW_VERIFY: the words this draw's walks serve without their final value, for the
+    // verified draw's check below.
+    const FastServedLogScope servedLog(FastDrawVerifyEvery() != 0);
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto lap = started;
     const auto heap = profile ? HostHeap::ThreadCounters() : HostHeap::Counters{};
@@ -401,6 +410,17 @@ std::optional<DrawVerdict> Driver::fastDraw(QueueState& queue, const Submission&
             stash.compared = false;
             stash.stages = count;
             for (std::size_t i = 0; i < count; ++i) stash.results[i] = scratch.results[i];
+            // The served words (known values, write evidence, queued labels) against the bytes
+            // memory holds once the writes pending over them landed (each read through the flush
+            // hook, as the old capture's Sync read); the stage results are compared once the old
+            // path drew the draw (VerifyFastDrawStages). A difference counts as the draw's
+            // "served word" kind.
+            if (const auto& served = FastServedWords().words; !served.empty()) {
+                FastServedCheck check;
+                CheckServedWords(served, "draw verify", check);
+                local.verifyServed = check;
+                if (check.Mismatched() != 0) ++local.verifyKinds[static_cast<std::size_t>(WalkMismatch::Served)];
+            }
             Graphics::ThreadFastVerifyArmed() = true;
             return declined(FastDecline::Verify);
         }
