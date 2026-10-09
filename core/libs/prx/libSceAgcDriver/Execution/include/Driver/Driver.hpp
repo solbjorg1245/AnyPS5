@@ -132,6 +132,10 @@ private:
     void verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffset, std::uint64_t deviceSerial, ShaderRecompiler::RecompileRequest request, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint64_t address, const DispatchVariant& variant, std::span<const std::uint32_t> liveWords, const ShaderRecompiler::RecompileResult& patched);
     static bool drawEntries();
     static bool verifyDrawEntries();
+    // APS5_DRAW_ENTRY_RUNS_CHECK=1 (DrawLookup.cpp): a stage variant captured with flat words left
+    // to the GPU misses once none of them is under a pending GPU write any more, and the verify
+    // modes count a difference made only of such words apart (DrawCapture.cpp). Off by default.
+    static bool drawEntryRunsCheck();
     static bool registerKeyEnabled();
     static bool verifyDrawRecipe();
     static std::size_t drawCacheEntries();

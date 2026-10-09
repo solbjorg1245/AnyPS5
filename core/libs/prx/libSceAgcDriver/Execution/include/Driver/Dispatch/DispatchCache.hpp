@@ -70,6 +70,10 @@ struct DispatchVariant {
     // compares only such variants, shifted; one whose rule shifts nothing is independent of the
     // pointer and compares in place. A variant without a rule may sit at a dead address.
     bool relocationLearned = false;
+    // Some binding of `compiled` holds deferred flat words (DescriptorBinding::deferredWords):
+    // words the capture left to the GPU, so they lie in no run (set at a draw insert under
+    // APS5_DRAW_ENTRY_RUNS_CHECK, which then checks them on a hit).
+    bool deferredFlat = false;
 
     std::uint32_t pushOffset = 0;
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;

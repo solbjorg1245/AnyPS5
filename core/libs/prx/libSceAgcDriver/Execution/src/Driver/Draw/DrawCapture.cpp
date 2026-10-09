@@ -120,7 +120,8 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
 void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const DrawStageHits& hits, std::vector<std::shared_ptr<DispatchVariant>>& fresh, const DrawKey& drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, DrawRelocation* relocation) {
     if (useDrawEntries && !drawHit && !(drawParameters.indirect && indirectCpu)) {
         phaseTiming.Phase(DrawRowVectors);
-        std::uint64_t unstable = 0, mismatches = 0;
+        std::uint64_t unstable = 0, mismatches = 0, deferredDifferences = 0;
+        const bool runsCheck = drawEntryRunsCheck();
         for (std::size_t i = 0; i < programs.size(); ++i) {
             const auto& stageCapture = stageCaptures[i];
             if (stageCapture.compiled == nullptr) continue;
@@ -130,6 +131,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             variant->forgetSerial = stageCapture.forgetSerial;
             variant->pushOffset = stageCapture.pushOffset;
             if (vertexInfos[i]) variant->vertexInfo = std::make_shared<const ShaderRecompiler::ShaderVertexStageInfo>(*vertexInfos[i]);
+            if (runsCheck) variant->deferredFlat = std::any_of(variant->compiled->bindings.begin(), variant->compiled->bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return !binding.deferredWords.empty(); });
 
             std::vector<ShaderRecompiler::MemoryRegion> regions(stageCapture.regions.begin(), stageCapture.regions.end());
             for (const auto& read : decodeReads[i]) regions.push_back({read.address, std::as_bytes(std::span(read.bytes))});
@@ -205,6 +207,19 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             }
             // A data hit's stage holds the live words and a patched result: both must be what the
             // capture made (APS5_VERIFY_DATA_HITS); the compares look through the don't-care bits.
+            // APS5_DRAW_ENTRY_RUNS_CHECK: stored and fresh captures that differ only by the words
+            // either left to the GPU (deferred flat words, copied per draw) are equal by design;
+            // counted apart (verifyDeferred), neither reported nor counted as a mismatch.
+            const auto onlyDeferred = [&](std::span<const std::uint32_t> storedWords) {
+                if (!runsCheck || matched[i] == nullptr) return false;
+                auto deferred = DeferredFlatAddresses(matched[i]->compiled->bindings);
+                const auto freshDeferred = DeferredFlatAddresses(variant->compiled->bindings);
+                deferred.insert(deferred.end(), freshDeferred.begin(), freshDeferred.end());
+                std::sort(deferred.begin(), deferred.end());
+                if (deferred.empty() || !RunsEqualBesideDeferred(matched[i]->runs, storedWords, variant->runs, variant->words, deferred, matched[i]->ignoredBits)) return false;
+                ++deferredDifferences;
+                return true;
+            };
             const bool dataStage = verifyHit && hits.data && matched[i] != nullptr && i < hits.liveWords.size() && !hits.liveWords[i].empty();
             if (dataStage) {
                 const auto& patched = *hits.results[i];
@@ -309,7 +324,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                     static std::atomic<std::uint64_t> raceReports{0};
                     if (raceReports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] APS5_VERIFY_DATA_HITS: stage %zu (program 0x%llx) of a data hit disagrees with its capture:%s, and its memory changed since the compare (a guest write under the draw)\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), difference.c_str());
                 }
-                if (matched[i]->runs != variant->runs || !WordsEqualIgnoring(hits.liveWords[i], variant->words, matched[i]->ignoredBits)) {
+                if ((matched[i]->runs != variant->runs || !WordsEqualIgnoring(hits.liveWords[i], variant->words, matched[i]->ignoredBits)) && !onlyDeferred(hits.liveWords[i])) {
                     ++mismatches;
                     static std::atomic<std::uint64_t> shapeReports{0};
                     if (shapeReports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] APS5_VERIFY_DATA_HITS: stage %zu (program 0x%llx) of a data hit captured differently with the same result: %zu runs / %zu words matched, %zu / %zu fresh\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), matched[i]->runs.size(), matched[i]->words.size(), variant->runs.size(), variant->words.size());
@@ -317,7 +332,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                 std::lock_guard cacheLock(drawCacheMutex);
                 ++drawEntryCounters.dataVerified;
             }
-            if (verifyHit && !dataStage && matched[i] != nullptr && (matched[i]->runs != variant->runs || !WordsEqualIgnoring(matched[i]->words, variant->words, matched[i]->ignoredBits))) {
+            if (verifyHit && !dataStage && matched[i] != nullptr && (matched[i]->runs != variant->runs || !WordsEqualIgnoring(matched[i]->words, variant->words, matched[i]->ignoredBits)) && !onlyDeferred(matched[i]->words)) {
                 ++mismatches;
                 static std::atomic<std::uint64_t> reports{0};
                 if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: stage %zu (program 0x%llx) of a hit captured differently: %zu runs / %zu words matched, %zu / %zu fresh\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), matched[i]->runs.size(), matched[i]->words.size(), variant->runs.size(), variant->words.size());
@@ -374,10 +389,11 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             }
         }
         insertDrawEntry(drawKey, fresh, registerKey ? decode : nullptr, relocation, &matched);
-        if (unstable != 0 || mismatches != 0) {
+        if (unstable != 0 || mismatches != 0 || deferredDifferences != 0) {
             std::lock_guard cacheLock(drawCacheMutex);
             drawEntryCounters.unstable += unstable;
             drawEntryCounters.verifyMismatches += mismatches;
+            drawEntryCounters.verifyDeferred += deferredDifferences;
         }
         phaseTiming.Phase(DrawRowKeyLookupValidate);
     }
