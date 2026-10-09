@@ -115,6 +115,15 @@ public:
         std::uint64_t address = 0;
         // A resident copy's guard over its host pages (KeepsResidentBuffers); empty otherwise.
         std::shared_ptr<ResidentGuard> guard {};
+        // Narrow copy-backs (NarrowsCopyBacks): the device addresses of the source's and the
+        // destination's first bytes, and the distance from a source byte to its baseline in the
+        // same buffer (0: no baseline, a plain copy). A copy with a baseline stores only the dwords
+        // whose source differs from the baseline, and sets the baseline to them (see
+        // GuestBufferMemory's staging shadows); trimming moves both offsets alike, so the baseline
+        // follows.
+        VkDeviceAddress sourceAddress = 0;
+        VkDeviceAddress destinationAddress = 0;
+        VkDeviceSize baselineOffset = 0;
     };
     static bool DeferCopyBacks();
     // Copy-back coalescing (APS5_COALESCE_COPY_BACKS=1, read when the recorder is made; without it
@@ -137,6 +146,30 @@ public:
     // see a label only after the copies recorded ahead of its store.
     bool CoalescesCopyBacks() const { return coalesceCopyBacks; }
     bool DefersCopyBacks() const { return coalesceCopyBacks || DeferCopyBacks(); }
+    // Narrow copy-backs (APS5_NARROW_COPY_BACKS=1, read when the recorder is made; off with the old
+    // deferral alone, APS5_DEFER_COPY_BACK without coalescing, whose queued copies may overlap, and
+    // on a device without buffer device addresses). A staged region's copy-back copies the whole
+    // written element range (a V# the shader may write: ~285-360 KiB per use of the hot append
+    // kernels, ~680 MiB per present before coalescing, 5.1-5.7 GB per 10 s after it), whatever
+    // part of it the shader stored. With the switch a staging shadow keeps a baseline (what the
+    // import holds of its range) behind its bytes, and its copy-back is a small compute pass that
+    // compares the two on the device and stores over PCIe only the dwords that differ (updating the
+    // baseline), so only the bytes the shader changed cross the bus (under profiling the
+    // [barriers] digest's "narrow copy-backs ... MiB stored"). Unaligned edges, copies without a
+    // usable baseline and a device without the pass copy whole as before (keeping the baseline).
+    // The shadows' side is GuestBufferMemory's (allocation, baseline refresh at copy-in, trust).
+    bool NarrowsCopyBacks() const { return narrowCopyBacks && !narrowFailed.load(std::memory_order_relaxed); }
+    // Bumped whenever queued copies some build claimed are recorded or released before that build
+    // took them over (TakeClaimedCopies): a shadow whose baseline was copied from a claimed
+    // shadow no longer knows what the import holds then (GuestBufferMemory checks it).
+    std::uint64_t ClaimBreaks() const { return claimBreaks; }
+    // Records `copies` now as one pass (lead barrier, plain and narrow copies, trail barrier), as a
+    // flush of deferred copies would: the immediate copy-back of a use whose regions copy narrow.
+    void RecordCopyBacksNow(std::vector<DeferredCopy> copies);
+    // The narrow copies of a pass as compare spans: copies back to back in their shadow and import
+    // with the same baseline join (one compare dispatch instead of one per written range); the
+    // rest stay as they are. Sorted by shadow, import and offset.
+    static std::vector<DeferredCopy> NarrowSpans(std::vector<DeferredCopy> copies);
     // Resident buffers (APS5_RESIDENT_BUFFERS=1, which turns coalescing on; docs/design/
     // resident-memory.md S3): at Submit or a label, the whole host pages of a queued unclaimed
     // copy stay queued past the batch (its partial pages at either end are recorded as before):
@@ -159,6 +192,10 @@ public:
     // the GPU lock, those that found every copy landed already) and given up.
     struct ResidentStatistics {
         std::uint64_t made, madeBytes, recorded, skipped, refused, remapFlushes, faults, underLock, resolved, landed, forced;
+        // Faults on a guard whose copy a submitted batch still running records: waited for, not
+        // copied again (a copy from the guard's shadow after that batch could undo the newer copy
+        // the build that took the shadow over recorded there).
+        std::uint64_t waitedLanding = 0;
     };
     static ResidentStatistics ResidentCounts();
     // Commands() that leaves the queued copy-backs alone under coalescing (the caller recorded
@@ -181,6 +218,11 @@ public:
     struct CopyBackStatistics {
         std::uint64_t deferred, deferredBytes, overwritten, overwrittenBytes, recorded, recordedBytes, passes;
         std::array<std::uint64_t, static_cast<std::size_t>(FlushReason::Count)> flushes;
+        // Narrow copy-backs: copies recorded with a baseline, the spans they made (NarrowSpans),
+        // the bytes compared, spans copied whole (source and import off by bytes modulo 4, no
+        // pass on the device), compare dispatches, and the bytes the passes stored (counted only
+        // under APS5_PROFILE_DRAW or APS5_PROFILE_GPU; passes of batches still running count later).
+        std::uint64_t narrow = 0, narrowSpans = 0, narrowBytes = 0, narrowWhole = 0, narrowDispatches = 0, narrowStoredBytes = 0;
     };
     static CopyBackStatistics CopyBackCounts();
     void DeferCopies(std::vector<DeferredCopy> copies);
@@ -824,6 +866,27 @@ private:
     void flushDeferredCopies(bool claimed = false, FlushReason reason = FlushReason::Command);
     // Records `copies` as one pass (lead barrier, the copies, trail barrier).
     void recordDeferredCopies(std::vector<DeferredCopy> copies, FlushReason reason);
+    // The pass itself into `commands`: barriers, timing, covered access; returns the bytes.
+    std::uint64_t recordCopyPass(VkCommandBuffer commands, std::vector<DeferredCopy> copies);
+    // The copies of a pass between its barriers: plain ones as vkCmdCopyBuffer, narrow ones as
+    // compare dispatches (recordNarrowCopies); returns the bytes.
+    std::uint64_t recordCopyCommands(VkCommandBuffer commands, std::vector<DeferredCopy> copies);
+    std::uint64_t recordNarrowCopies(VkCommandBuffer commands, const std::vector<DeferredCopy>& copies);
+    // The compare pass's pipeline, made on first use; false (and narrow copies copy whole from then
+    // on) when the device cannot make it.
+    bool ensureNarrowPipeline();
+    // Adds the dwords the compare passes stored since the last look to the statistics (profiling).
+    void noteNarrowStored();
+    // Waits for the fence of the in-flight batch `serial` (left in flight).
+    void waitBatch(std::uint64_t serial);
+    bool narrowCopyBacks = false;
+    std::atomic<bool> narrowFailed{false};
+    std::uint64_t claimBreaks = 0;
+    VkPipelineLayout narrowLayout = VK_NULL_HANDLE;
+    VkPipeline narrowPipeline = VK_NULL_HANDLE;
+    // The compare passes' stored-dword counter (host-visible; profiling only) and its last value.
+    std::shared_ptr<Buffer> narrowStored;
+    std::uint32_t narrowStoredSeen = 0;
     // Commands() with the queued copy-backs recorded first unless `keepCopyBacks`.
     VkCommandBuffer commandsFor(VkAccessFlags* coveredAccess, bool keepCopyBacks);
     bool coalesceCopyBacks = false;

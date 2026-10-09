@@ -33,6 +33,14 @@ void GuestPageGuardTouch_nid_postfix(std::uintptr_t address, std::size_t bytes);
 // Totals since start: faults on guarded pages and those that left a guard to release by force;
 // the live guards.
 void GuestPageGuardCounts_nid_postfix(std::uint64_t* faults, std::uint64_t* forced, std::uint64_t* guards);
+// Guards Protect refused since start, by reason (the first `count` reasons; GuestPageGuardRefusalName
+// names reason `index`, null past the last). The first refusal of each reason is described once on
+// stderr ('[page-guard] first guard refused as ...': the host's and the shared mappings' view of
+// the range's first page). Windows: a range of shared views (WindowsMappings) is guarded through the
+// mappings' own bookkeeping only with APS5_GUARD_SHARED_VIEWS=1 (refused as 'shared view' without
+// it); one whose page is mapped at several guest addresses is refused as 'aliased view'.
+void GuestPageGuardRefusals_nid_postfix(std::uint64_t* counts, std::size_t count);
+const char* GuestPageGuardRefusalName_nid_postfix(std::size_t index);
 
 }
 

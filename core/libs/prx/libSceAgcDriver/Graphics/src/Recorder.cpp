@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/shaders/CopyBackDiff_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4Opcodes.hpp"
@@ -530,11 +531,15 @@ std::atomic<std::uint64_t> storeCount{0}, storeRuns{0}, storesJoined{0}, storesR
 std::atomic<std::uint64_t> keyStoreCount{0}, keyStoreRuns{0}, keyStoreRunsForWriter{0}, keyStoresJoined{0};
 // Deferred copy-back counters (Recorder::CopyBackCounts), relaxed likewise.
 std::atomic<std::uint64_t> copyBacksDeferred{0}, copyBackBytesDeferred{0}, copyBacksOverwritten{0}, copyBackBytesOverwritten{0}, copyBacksRecorded{0}, copyBackBytesRecorded{0}, copyBackPasses{0};
+// Narrow copy-backs (Recorder::NarrowsCopyBacks): copies recorded with a baseline, the spans they
+// made (back-to-back copies of one shadow joined) and the bytes compared, spans copied whole, the
+// compare dispatches, and the dwords the passes stored (counted under profiling only).
+std::atomic<std::uint64_t> copyBacksNarrow{0}, copyBackNarrowSpans{0}, copyBackBytesNarrow{0}, copyBacksNarrowWhole{0}, copyBackNarrowDispatches{0}, copyBackNarrowStoredWords{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Recorder::FlushReason::Count)> copyBackFlushes{};
 // Resident buffers (Recorder::KeepsResidentBuffers): counters (relaxed, on the [barriers] line),
 // the bytes kept resident at the last decision, and the live guards by sequence, which the fault
 // path searches (a guard's last holder may be a completed batch, released without the GPU mutex).
-std::atomic<std::uint64_t> residentMade{0}, residentMadeBytes{0}, residentSkipped{0}, residentRefused{0}, residentRemapFlushes{0}, residentFaults{0}, residentUnderLock{0}, residentResolved{0}, residentLanded{0}, residentForced{0};
+std::atomic<std::uint64_t> residentMade{0}, residentMadeBytes{0}, residentSkipped{0}, residentRefused{0}, residentRemapFlushes{0}, residentFaults{0}, residentUnderLock{0}, residentResolved{0}, residentLanded{0}, residentForced{0}, residentWaitedLanding{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Recorder::FlushReason::Count)> residentRecorded{};
 std::atomic<std::uint64_t> residentKeptBytes{0};
 std::atomic<bool> residentUsed{false};
@@ -1210,6 +1215,10 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
     // Resident buffers build on coalescing, which they turn on.
     const char* resident = std::getenv("APS5_RESIDENT_BUFFERS");
     residentBuffers = resident != nullptr && *resident != '\0' && std::strcmp(resident, "0") != 0;
+    // Narrow copy-backs: with coalescing (disjoint queued copies) or no deferral at all (each use's
+    // own merged ranges); not with the old deferral alone, whose queued copies may overlap.
+    const char* narrow = std::getenv("APS5_NARROW_COPY_BACKS");
+    narrowCopyBacks = narrow != nullptr && *narrow != '\0' && std::strcmp(narrow, "0") != 0;
     if (residentBuffers) {
         coalesceCopyBacks = true;
         residentGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
@@ -1217,6 +1226,8 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
         static_cast<void>(ResidentResolverQueue());
         GuestWriteWatch::GuestPageGuardInstall_nid_postfix(&Recorder::ResolveResidentFault);
     }
+    // The compare pass and the shadows' baselines are addressed by buffer device address.
+    if (narrowCopyBacks && ((!coalesceCopyBacks && DeferCopyBacks()) || !context.bufferDeviceAddress)) narrowCopyBacks = false;
     {
         std::lock_guard lock(liveRecordersMutex);
         liveRecorders.push_back(id);
@@ -1308,6 +1319,12 @@ Recorder::~Recorder() {
     // Sync() above waited for every batch, so no submission still signals the timeline.
     if (timeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, timeline, nullptr);
     timeline = VK_NULL_HANDLE;
+    // The narrow copy-backs' compare pass, recorded only into batches Sync() completed.
+    if (narrowPipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, narrowPipeline, nullptr);
+    if (narrowLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, narrowLayout, nullptr);
+    narrowPipeline = VK_NULL_HANDLE;
+    narrowLayout = VK_NULL_HANDLE;
+    narrowStored.reset();
 }
 
 std::optional<std::chrono::steady_clock::time_point> Recorder::PendingLabelSince() {
@@ -1670,7 +1687,9 @@ void Recorder::FlushDeferredWhere(const std::function<bool(const DeferredCopy&, 
     if ((open == nullptr && !residentBuffers) || !HasDeferredCopies()) return;
     std::vector<DeferredCopy> copies;
     moveCopies(deferredCopies, copies, [&](const DeferredCopy& copy) { return selected(copy, false); });
+    const auto unclaimed = copies.size();
     moveCopies(claimedCopies, copies, [&](const DeferredCopy& copy) { return selected(copy, true); });
+    if (copies.size() != unclaimed) ++claimBreaks;
     recordDeferredCopies(std::move(copies), reason);
 }
 
@@ -1690,6 +1709,12 @@ std::uint64_t Recorder::DeferredCopyBytes() const {
 Recorder::CopyBackStatistics Recorder::CopyBackCounts() {
     CopyBackStatistics counts{copyBacksDeferred.load(std::memory_order_relaxed), copyBackBytesDeferred.load(std::memory_order_relaxed), copyBacksOverwritten.load(std::memory_order_relaxed), copyBackBytesOverwritten.load(std::memory_order_relaxed), copyBacksRecorded.load(std::memory_order_relaxed), copyBackBytesRecorded.load(std::memory_order_relaxed), copyBackPasses.load(std::memory_order_relaxed), {}};
     for (std::size_t i = 0; i < counts.flushes.size(); ++i) counts.flushes[i] = copyBackFlushes[i].load(std::memory_order_relaxed);
+    counts.narrow = copyBacksNarrow.load(std::memory_order_relaxed);
+    counts.narrowSpans = copyBackNarrowSpans.load(std::memory_order_relaxed);
+    counts.narrowBytes = copyBackBytesNarrow.load(std::memory_order_relaxed);
+    counts.narrowWhole = copyBacksNarrowWhole.load(std::memory_order_relaxed);
+    counts.narrowDispatches = copyBackNarrowDispatches.load(std::memory_order_relaxed);
+    counts.narrowStoredBytes = copyBackNarrowStoredWords.load(std::memory_order_relaxed) * 4u;
     return counts;
 }
 
@@ -1716,6 +1741,7 @@ std::vector<Recorder::DeferredCopy> Recorder::TakeClaimedCopies(const void* sour
 
 void Recorder::ReleaseClaims() {
     if (claimedCopies.empty()) return;
+    ++claimBreaks;
     deferredCopies.insert(deferredCopies.end(), std::make_move_iterator(claimedCopies.begin()), std::make_move_iterator(claimedCopies.end()));
     claimedCopies.clear();
 }
@@ -1724,6 +1750,7 @@ void Recorder::FlushClaimedOverlapping(std::uint64_t address, std::size_t bytes)
     const auto end = address + bytes;
     const auto overlapping = [&](const DeferredCopy& copy) { return copy.address < end && address < copy.address + copy.bytes; };
     if (std::none_of(claimedCopies.begin(), claimedCopies.end(), overlapping)) return;
+    ++claimBreaks;
     // Back to the unclaimed list (their order among themselves kept), recorded now.
     moveCopies(claimedCopies, deferredCopies, overlapping);
     flushDeferredCopies(false, FlushReason::CopyIn);
@@ -1740,6 +1767,7 @@ void Recorder::keepGuards(std::vector<std::shared_ptr<ResidentGuard>> guards) {
 
 void Recorder::flushKeepingResident(FlushReason reason, const std::function<bool(std::uint64_t, std::uint64_t)>& stored) {
     if (!HasDeferredCopies()) return;
+    if (!claimedCopies.empty()) ++claimBreaks;
     // Claimed copies belong to a build still recording: as before.
     auto recorded = std::move(claimedCopies);
     claimedCopies.clear();
@@ -1825,6 +1853,7 @@ std::uint64_t Recorder::ResidentCopyBytes() const {
 
 Recorder::ResidentStatistics Recorder::ResidentCounts() {
     ResidentStatistics counts{residentMade.load(std::memory_order_relaxed), residentMadeBytes.load(std::memory_order_relaxed), 0, residentSkipped.load(std::memory_order_relaxed), residentRefused.load(std::memory_order_relaxed), residentRemapFlushes.load(std::memory_order_relaxed), residentFaults.load(std::memory_order_relaxed), residentUnderLock.load(std::memory_order_relaxed), residentResolved.load(std::memory_order_relaxed), residentLanded.load(std::memory_order_relaxed), residentForced.load(std::memory_order_relaxed)};
+    counts.waitedLanding = residentWaitedLanding.load(std::memory_order_relaxed);
     for (const auto& recorded : residentRecorded) counts.recorded += recorded.load(std::memory_order_relaxed);
     return counts;
 }
@@ -1890,7 +1919,16 @@ bool Recorder::resolveResident(std::uintptr_t address, bool owner) {
     std::sort(found.begin(), found.end(), [](const Found& left, const Found& right) { return left.sequence < right.sequence; });
     std::vector<DeferredCopy> copies;
     for (const auto& entry : found) {
-        if (entry.landingSerial != 0 && entry.landingSerial <= submissions && !unsignaled(entry.landingSerial)) continue;
+        if (entry.landingSerial != 0 && entry.landingSerial <= submissions) {
+            // Recorded into a submitted batch, which lands it. One still running is waited for, not
+            // copied again: a copy from this guard's shadow after that batch could undo the newer
+            // bytes the build that took the shadow over copied there from a shadow of its own.
+            if (unsignaled(entry.landingSerial)) {
+                waitBatch(entry.landingSerial);
+                residentWaitedLanding.fetch_add(1, std::memory_order_relaxed);
+            }
+            continue;
+        }
         copies.push_back(entry.copy);
     }
     if (copies.empty()) residentLanded.fetch_add(1, std::memory_order_relaxed);
@@ -1930,6 +1968,11 @@ void Recorder::landResident(const std::vector<DeferredCopy>& copies) {
             if (i != 0) recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
             const VkBufferCopy region{copies[i].sourceOffset, copies[i].destinationOffset, copies[i].bytes};
             copy(commands, copies[i].source, copies[i].destination, 1, &region);
+            if (copies[i].baselineOffset != 0) {
+                // Narrow copy-backs: the baseline keeps standing for what the import holds.
+                const VkBufferCopy mirror{copies[i].sourceOffset, copies[i].sourceOffset + copies[i].baselineOffset, copies[i].bytes};
+                copy(commands, copies[i].source, copies[i].source, 1, &mirror);
+            }
         }
         recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
         Check(function(endCommandBuffer, "vkEndCommandBuffer")(commands), "vkEndCommandBuffer resident");
@@ -1951,6 +1994,7 @@ void Recorder::flushDeferredCopies(bool claimed, FlushReason reason) {
     if ((open == nullptr && !residentBuffers) || (deferredCopies.empty() && (!claimed || claimedCopies.empty()))) return;
     auto copies = std::move(deferredCopies);
     deferredCopies.clear();
+    if (claimed && !claimedCopies.empty()) ++claimBreaks;
     if (claimed) {
         copies.insert(copies.end(), std::make_move_iterator(claimedCopies.begin()), std::make_move_iterator(claimedCopies.end()));
         claimedCopies.clear();
@@ -1978,11 +2022,42 @@ void Recorder::recordDeferredCopies(std::vector<DeferredCopy> copies, FlushReaso
     copyBackFlushes[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     copyBacksRecorded.fetch_add(copies.size(), std::memory_order_relaxed);
     if (open->renderPass.open) endOpenRenderPass();
-    const auto commands = open->commands;
+    copyBackBytesRecorded.fetch_add(recordCopyPass(open->commands, std::move(copies)), std::memory_order_relaxed);
+}
+
+void Recorder::RecordCopyBacksNow(std::vector<DeferredCopy> copies) {
+    if (copies.empty()) return;
+    // Commands() records what it must first (queued copies, an open render pass's end).
+    const auto commands = Commands();
+    static_cast<void>(recordCopyPass(commands, std::move(copies)));
+}
+
+std::uint64_t Recorder::recordCopyPass(VkCommandBuffer commands, std::vector<DeferredCopy> copies) {
     const auto timing = beginTiming(ClassKey(CommandClass::StagingOut));
+    // Narrow copies run a compute pass that reads the shadows and baselines and writes the imports
+    // and baselines; their edges and the plain copies are transfers.
+    const bool narrow = std::any_of(copies.begin(), copies.end(), [](const DeferredCopy& copy) { return copy.baselineOffset != 0; });
+    const VkPipelineStageFlags copyStages = VK_PIPELINE_STAGE_TRANSFER_BIT | (narrow ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0u);
+    const VkAccessFlags copyReads = VK_ACCESS_TRANSFER_READ_BIT | (narrow ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : 0u);
     // The shaders' stores into the shadows (whichever stage made them) precede the copies.
-    recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, copyStages, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, copyReads);
     CountBarriers(CommandClass::StagingOut);
+    const auto bytes = recordCopyCommands(commands, std::move(copies));
+    // As a GPU label store or fill: visible to everything recorded after (shaders, transfers, an
+    // indirect dispatch's arguments) and to the host once the batch completed.
+    constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+    recordBarrier(commands, copyStages, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | (narrow ? VK_ACCESS_SHADER_WRITE_BIT : 0u), copiedAccess);
+    CountBarriers(CommandClass::StagingOut);
+    open->coveredAccess = copiedAccess;
+    EndGpuTiming(timing, bytes);
+    return bytes;
+}
+
+std::uint64_t Recorder::recordCopyCommands(VkCommandBuffer commands, std::vector<DeferredCopy> copies) {
+    // The narrow copies apart (none without the switch: the plain ones below are the old pass).
+    const auto narrowFirst = std::stable_partition(copies.begin(), copies.end(), [](const DeferredCopy& copy) { return copy.baselineOffset == 0; });
+    std::vector<DeferredCopy> narrow(std::make_move_iterator(narrowFirst), std::make_move_iterator(copies.end()));
+    copies.erase(narrowFirst, copies.end());
     std::uint64_t bytes = 0;
     if (coalesceCopyBacks) {
         // Disjoint destinations (DeferCopies): one vkCmdCopyBuffer per (source, destination) pair.
@@ -2006,14 +2081,166 @@ void Recorder::recordDeferredCopies(std::vector<DeferredCopy> copies, FlushReaso
             bytes += copy.bytes;
         }
     }
-    copyBackBytesRecorded.fetch_add(bytes, std::memory_order_relaxed);
-    // As a GPU label store or fill: visible to everything recorded after (shaders, transfers, an
-    // indirect dispatch's arguments) and to the host once the batch completed.
-    constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
-    recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, copiedAccess);
-    CountBarriers(CommandClass::StagingOut);
-    open->coveredAccess = copiedAccess;
-    EndGpuTiming(timing, bytes);
+    if (!narrow.empty()) bytes += recordNarrowCopies(commands, narrow);
+    return bytes;
+}
+
+namespace {
+// CopyBackDiff.comp's push constants: the shadow's, the baseline's and the import's addresses of
+// the first dword, the stored-dword counter's (profiling), the dword count and whether to count.
+struct NarrowPush {
+    VkDeviceAddress shadow;
+    VkDeviceAddress baseline;
+    VkDeviceAddress target;
+    VkDeviceAddress stored;
+    std::uint32_t words;
+    std::uint32_t count;
+};
+static_assert(sizeof(NarrowPush) == 40, "CopyBackDiff.comp's push constants are 40 bytes");
+constexpr std::uint32_t NarrowGroupSize = 256;
+constexpr std::uint32_t NarrowMaxGroups = 4096;
+// One compare dispatch moves at most this many dwords (a span past it is split).
+constexpr VkDeviceSize NarrowMaxWords = VkDeviceSize{1} << 30u;
+
+bool narrowCounted() {
+    static const bool counted = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_GPU") != nullptr;
+    return counted;
+}
+}
+
+std::vector<Recorder::DeferredCopy> Recorder::NarrowSpans(std::vector<DeferredCopy> copies) {
+    // Back to back in both buffers (one written range after another of one shadow: two V#s over
+    // adjacent sub-ranges, a copy-back and the copies it took over) with the same baseline.
+    std::sort(copies.begin(), copies.end(), [](const DeferredCopy& left, const DeferredCopy& right) { return std::tie(left.source, left.destination, left.baselineOffset, left.sourceOffset) < std::tie(right.source, right.destination, right.baselineOffset, right.sourceOffset); });
+    std::vector<DeferredCopy> spans;
+    spans.reserve(copies.size());
+    for (auto& copy : copies) {
+        if (!spans.empty()) {
+            auto& last = spans.back();
+            if (last.source == copy.source && last.destination == copy.destination && last.baselineOffset == copy.baselineOffset && last.sourceAddress == copy.sourceAddress && last.destinationAddress == copy.destinationAddress && last.sourceOffset + last.bytes == copy.sourceOffset && last.destinationOffset + last.bytes == copy.destinationOffset && last.address + last.bytes == copy.address) {
+                last.bytes += copy.bytes;
+                continue;
+            }
+        }
+        spans.push_back(std::move(copy));
+    }
+    return spans;
+}
+
+void Recorder::noteNarrowStored() {
+    if (narrowStored == nullptr) return;
+    // Written by the compare passes of completed batches (coherent host memory); a pass still
+    // running is counted at a later look.
+    const auto now = *reinterpret_cast<const volatile std::uint32_t*>(narrowStored->Bytes().data());
+    copyBackNarrowStoredWords.fetch_add(static_cast<std::uint32_t>(now - narrowStoredSeen), std::memory_order_relaxed);
+    narrowStoredSeen = now;
+}
+
+std::uint64_t Recorder::recordNarrowCopies(VkCommandBuffer commands, const std::vector<DeferredCopy>& copies) {
+    const auto copy = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
+    const bool compare = ensureNarrowPipeline();
+    noteNarrowStored();
+    bool bound = false;
+    std::uint64_t bytes = 0;
+    // [at, at + count) of a copy whole, and the same bytes into its baseline: it keeps standing
+    // for what the import holds.
+    const auto whole = [&](const DeferredCopy& item, VkDeviceSize at, VkDeviceSize count) {
+        const VkBufferCopy out{item.sourceOffset + at, item.destinationOffset + at, count};
+        copy(commands, item.source, item.destination, 1, &out);
+        const VkBufferCopy mirror{item.sourceOffset + at, item.sourceOffset + item.baselineOffset + at, count};
+        copy(commands, item.source, item.source, 1, &mirror);
+    };
+    for (const auto& item : copies) bytes += item.bytes;
+    copyBacksNarrow.fetch_add(copies.size(), std::memory_order_relaxed);
+    const auto spans = NarrowSpans(copies);
+    copyBackNarrowSpans.fetch_add(spans.size(), std::memory_order_relaxed);
+    for (const auto& item : spans) {
+        const auto source = item.sourceAddress + item.sourceOffset;
+        const auto destination = item.destinationAddress + item.destinationOffset;
+        // The pass moves whole dwords: source and destination must agree modulo 4.
+        if (!compare || item.sourceAddress == 0 || item.destinationAddress == 0 || ((source ^ destination) & 3u) != 0) {
+            whole(item, 0, item.bytes);
+            copyBacksNarrowWhole.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        const VkDeviceSize head = std::min<VkDeviceSize>((4u - (destination & 3u)) & 3u, item.bytes);
+        const VkDeviceSize words = (item.bytes - head) / 4u;
+        const VkDeviceSize tail = item.bytes - head - words * 4u;
+        // The partial dwords at either end are copied whole (the pass would store bytes outside).
+        if (head != 0) whole(item, 0, head);
+        if (tail != 0) whole(item, item.bytes - tail, tail);
+        for (VkDeviceSize done = 0; done < words;) {
+            const auto count = std::min(words - done, NarrowMaxWords);
+            if (!bound) {
+                context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, narrowPipeline);
+                bound = true;
+            }
+            const auto at = head + done * 4u;
+            const NarrowPush push{source + at, source + item.baselineOffset + at, destination + at, narrowStored != nullptr ? narrowStored->DeviceAddress() : 0, static_cast<std::uint32_t>(count), narrowStored != nullptr ? 1u : 0u};
+            context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, narrowLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            const auto groups = static_cast<std::uint32_t>(std::min<VkDeviceSize>((count + NarrowGroupSize - 1) / NarrowGroupSize, NarrowMaxGroups));
+            context.Resolved(&DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, groups, 1, 1);
+            copyBackNarrowDispatches.fetch_add(1, std::memory_order_relaxed);
+            done += count;
+        }
+        copyBackBytesNarrow.fetch_add(item.bytes, std::memory_order_relaxed);
+    }
+    return bytes;
+}
+
+bool Recorder::ensureNarrowPipeline() {
+    if (narrowPipeline != VK_NULL_HANDLE) return true;
+    if (narrowFailed.load(std::memory_order_relaxed)) return false;
+    VkShaderModule module = VK_NULL_HANDLE;
+    try {
+        Require(context.bufferDeviceAddress, "the device has no buffer device addresses");
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(NarrowPush)};
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &push;
+        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &narrowLayout), "vkCreatePipelineLayout narrow copy-back");
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = sizeof(COPY_BACK_DIFF_SPV);
+        moduleInfo.pCode = COPY_BACK_DIFF_SPV;
+        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule narrow copy-back");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = module;
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.layout = narrowLayout;
+        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &narrowPipeline), "vkCreateComputePipelines narrow copy-back");
+        context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        module = VK_NULL_HANDLE;
+        // Profiling: the stored-dword counter the passes add to (none: they count nothing).
+        if (narrowCounted()) {
+            try {
+                narrowStored = std::make_shared<Buffer>(context, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                std::memset(narrowStored->Bytes().data(), 0, narrowStored->Bytes().size());
+                narrowStoredSeen = 0;
+            } catch (const std::exception& error) {
+                narrowStored.reset();
+                std::fprintf(stderr, "[gpu] narrow copy-backs: no stored-byte counter (%s)\n", error.what());
+            }
+        }
+        return true;
+    } catch (const std::exception& error) {
+        if (module != VK_NULL_HANDLE) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        if (narrowLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, narrowLayout, nullptr);
+        narrowLayout = VK_NULL_HANDLE;
+        narrowPipeline = VK_NULL_HANDLE;
+        narrowFailed.store(true, std::memory_order_relaxed);
+        std::fprintf(stderr, "[gpu] narrow copy-backs unavailable (%s): staged regions copy back whole\n", error.what());
+        return false;
+    }
+}
+
+void Recorder::waitBatch(std::uint64_t serial) {
+    for (const auto& batch : inFlight) {
+        if (batch->serial != serial) continue;
+        Check(function(waitForFences, "vkWaitForFences")(context.device, 1, &batch->fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()), "vkWaitForFences resident landing");
+        return;
+    }
 }
 
 void Recorder::MarkCovered(VkAccessFlags access) {
@@ -2450,15 +2677,20 @@ void reportBarriers() {
     }
     // Deferred copy-backs (APS5_DEFER_COPY_BACK, APS5_COALESCE_COPY_BACKS): the passes that
     // recorded queued copies (two staging-out barriers each) by reason, and the copies recorded.
-    if (const auto counts = Recorder::CopyBackCounts(); counts.deferred != 0) {
+    // Narrow copy-backs (APS5_NARROW_COPY_BACKS, deferred or not): copies with a baseline, the
+    // spans and bytes compared, the bytes stored over PCIe, the spans copied whole.
+    if (const auto counts = Recorder::CopyBackCounts(); counts.deferred != 0 || counts.narrow != 0) {
         static Recorder::CopyBackStatistics last{};
-        std::string reasons;
-        for (std::size_t i = 0; i < counts.flushes.size(); ++i) {
-            char text[48];
-            std::snprintf(text, sizeof(text), " %s %llu", Recorder::FlushReasonName(static_cast<Recorder::FlushReason>(i)), static_cast<unsigned long long>(counts.flushes[i] - last.flushes[i]));
-            reasons += text;
+        if (counts.deferred != 0) {
+            std::string reasons;
+            for (std::size_t i = 0; i < counts.flushes.size(); ++i) {
+                char text[48];
+                std::snprintf(text, sizeof(text), " %s %llu", Recorder::FlushReasonName(static_cast<Recorder::FlushReason>(i)), static_cast<unsigned long long>(counts.flushes[i] - last.flushes[i]));
+                reasons += text;
+            }
+            std::fprintf(stderr, "; copy-back passes %llu by reason:%s, %llu copies (%.0f MiB) recorded", static_cast<unsigned long long>(counts.passes - last.passes), reasons.c_str(), static_cast<unsigned long long>(counts.recorded - last.recorded), (counts.recordedBytes - last.recordedBytes) / 1048576.0);
         }
-        std::fprintf(stderr, "; copy-back passes %llu by reason:%s, %llu copies (%.0f MiB) recorded", static_cast<unsigned long long>(counts.passes - last.passes), reasons.c_str(), static_cast<unsigned long long>(counts.recorded - last.recorded), (counts.recordedBytes - last.recordedBytes) / 1048576.0);
+        if (counts.narrow != 0) std::fprintf(stderr, "; narrow copy-backs %llu in %llu spans, %.0f MiB compared in %llu dispatches, %.1f MiB stored, %llu spans copied whole", static_cast<unsigned long long>(counts.narrow - last.narrow), static_cast<unsigned long long>(counts.narrowSpans - last.narrowSpans), (counts.narrowBytes - last.narrowBytes) / 1048576.0, static_cast<unsigned long long>(counts.narrowDispatches - last.narrowDispatches), (counts.narrowStoredBytes - last.narrowStoredBytes) / 1048576.0, static_cast<unsigned long long>(counts.narrowWhole - last.narrowWhole));
         last = counts;
     }
     // Resident buffers (APS5_RESIDENT_BUFFERS): copies kept past a Submit or label, those recorded
@@ -2478,7 +2710,22 @@ void reportBarriers() {
         }
         std::uint64_t pageFaults = 0, pageForced = 0, guards = 0;
         GuestWriteWatch::GuestPageGuardCounts_nid_postfix(&pageFaults, &pageForced, &guards);
-        std::fprintf(stderr, "; resident copies %llu made (%.1f MiB), %.1f MiB kept in %llu guards, recorded later by reason:%s, %llu dropped after a fault, %llu refused, %llu remap flushes; page faults %llu (%llu resolved, %llu landed already, %llu under the GPU lock, %llu forced)", static_cast<unsigned long long>(counts.made - last.made), (counts.madeBytes - last.madeBytes) / 1048576.0, residentKeptBytes.load(std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(guards), reasons.c_str(), static_cast<unsigned long long>(counts.skipped - last.skipped), static_cast<unsigned long long>(counts.refused - last.refused), static_cast<unsigned long long>(counts.remapFlushes - last.remapFlushes), static_cast<unsigned long long>(pageFaults - lastPageFaults), static_cast<unsigned long long>(counts.resolved - last.resolved), static_cast<unsigned long long>(counts.landed - last.landed), static_cast<unsigned long long>(counts.underLock - last.underLock), static_cast<unsigned long long>(pageForced - lastPageForced));
+        // Why the page guard refused, by reason (the libc side's counts, all recorders).
+        constexpr std::size_t refusalKinds = 16;
+        static std::array<std::uint64_t, refusalKinds> lastRefusals{};
+        std::array<std::uint64_t, refusalKinds> refusals{};
+        GuestWriteWatch::GuestPageGuardRefusals_nid_postfix(refusals.data(), refusals.size());
+        std::string refusedBy;
+        for (std::size_t i = 0; i < refusals.size(); ++i) {
+            const char* name = GuestWriteWatch::GuestPageGuardRefusalName_nid_postfix(i);
+            if (name == nullptr) break;
+            if (refusals[i] == lastRefusals[i]) continue;
+            char text[64];
+            std::snprintf(text, sizeof(text), "%s%s %llu", refusedBy.empty() ? "" : ", ", name, static_cast<unsigned long long>(refusals[i] - lastRefusals[i]));
+            refusedBy += text;
+        }
+        lastRefusals = refusals;
+        std::fprintf(stderr, "; resident copies %llu made (%.1f MiB), %.1f MiB kept in %llu guards, recorded later by reason:%s, %llu dropped after a fault, %llu refused%s%s%s, %llu remap flushes; page faults %llu (%llu resolved, %llu landed already, %llu under the GPU lock, %llu forced, %llu waited for an in-flight landing)", static_cast<unsigned long long>(counts.made - last.made), (counts.madeBytes - last.madeBytes) / 1048576.0, residentKeptBytes.load(std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(guards), reasons.c_str(), static_cast<unsigned long long>(counts.skipped - last.skipped), static_cast<unsigned long long>(counts.refused - last.refused), refusedBy.empty() ? "" : " (", refusedBy.c_str(), refusedBy.empty() ? "" : ")", static_cast<unsigned long long>(counts.remapFlushes - last.remapFlushes), static_cast<unsigned long long>(pageFaults - lastPageFaults), static_cast<unsigned long long>(counts.resolved - last.resolved), static_cast<unsigned long long>(counts.landed - last.landed), static_cast<unsigned long long>(counts.underLock - last.underLock), static_cast<unsigned long long>(pageForced - lastPageForced), static_cast<unsigned long long>(counts.waitedLanding - last.waitedLanding));
         last = counts;
         lastPageFaults = pageFaults;
         lastPageForced = pageForced;
@@ -3522,6 +3769,8 @@ void Recorder::Sync() {
         finish(std::move(batch), true, source);
     }
     activeSyncSite = previousSite;
+    // Every compare pass completed: its stored dwords count now (profiling; nothing otherwise).
+    noteNarrowStored();
 }
 
 void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked) {

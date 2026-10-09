@@ -743,6 +743,11 @@ int DoMprotect(const void* addr, size_t len, int prot) {
     const auto bytes = static_cast<std::size_t>(end - first);
     const auto* pointer = reinterpret_cast<const void*>(first);
     const auto nativeProtection = LinuxProtFromSce(prot);
+    // Resident buffers' guarded pages (GuestPageGuard*, APS5_RESIDENT_BUFFERS) land first: the
+    // protection change below would lift a guard without landing its bytes. Before the registry
+    // mutation (the resolver may wait for GPU work that leases the registry). One atomic load while
+    // no guard is live.
+    GuestWriteWatch::GuestPageGuardTouch_nid_postfix(first, bytes);
     GuestAllocations::Mutation mutation;
 #ifdef _WIN32
     MEMORY_BASIC_INFORMATION memory{};

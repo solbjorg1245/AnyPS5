@@ -2710,6 +2710,178 @@ void coalesceCopyBackTests(const Device& device, Recorder& recorder) {
     HostImportFor(context, address, bytes);
 }
 
+// Sets (or, with an empty value, clears) a switch a recorder or guard reads when it is made.
+void setSwitch(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    if (*value != '\0') setenv(name, value, 1);
+    else unsetenv(name);
+#endif
+}
+
+// Narrow copy-backs (APS5_NARROW_COPY_BACKS=1, here with coalescing): a queued copy with a baseline
+// (Recorder::DeferredCopy::baselineOffset) stores into the import only the dwords whose source
+// differs from the baseline, and sets the baseline to them; the partial dwords at its ends are
+// stored whole and mirrored into the baseline. Adjacent queued copies land in the one pass that
+// records them, each narrow; a later copy over part of a queued one leaves each byte to its last
+// copy and moves the trimmed copy's baseline with its offsets (the dropped bytes' baseline stays
+// as it was); a copy whose source and destination disagree modulo 4 falls back to a whole copy
+// (mirrored), and one without a baseline (an untrusted shadow) copies its whole range as before.
+void narrowCopyBackTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0 || !context.bufferDeviceAddress) {
+        std::cout << "host imports or buffer device addresses unavailable: narrow copy-backs not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 65536;
+    constexpr unsigned char sentinel = 0x5A;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the narrow copy-back test block");
+    std::memset(block, sentinel, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || import->address == 0) {
+        std::cout << "host import of the narrow copy-back test block refused or not addressable: narrow copy-backs not tested\n";
+        return;
+    }
+    {
+        setSwitch("APS5_COALESCE_COPY_BACKS", "1");
+        setSwitch("APS5_NARROW_COPY_BACKS", "1");
+        Recorder narrowing(context);
+        setSwitch("APS5_COALESCE_COPY_BACKS", "");
+        setSwitch("APS5_NARROW_COPY_BACKS", "");
+        Require(narrowing.NarrowsCopyBacks() && narrowing.CoalescesCopyBacks(), "APS5_NARROW_COPY_BACKS=1 did not turn narrow copy-backs on");
+        narrowing.Activate();
+        // Each source buffer: the shadow's bytes in [0, span), its baseline in [span, 2 * span).
+        constexpr std::size_t span = 16384;
+        const auto usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        auto first = std::make_shared<Buffer>(context, 2 * span, usage);
+        auto second = std::make_shared<Buffer>(context, 2 * span, usage);
+        const auto shadowByte = [](unsigned seed, std::size_t at) { return static_cast<unsigned char>(at * 7 + seed); };
+        // Every third dword differs from its baseline: the shader "changed" it.
+        const auto changed = [](std::size_t at) { return (at / 4) % 3 == 0; };
+        for (std::size_t at = 0; at < span; ++at) {
+            first->Bytes()[at] = std::byte{shadowByte(1, at)};
+            first->Bytes()[span + at] = std::byte{changed(at) ? static_cast<unsigned char>(~shadowByte(1, at)) : shadowByte(1, at)};
+            second->Bytes()[at] = std::byte{shadowByte(5, at)};
+            second->Bytes()[span + at] = std::byte{changed(at) ? static_cast<unsigned char>(~shadowByte(5, at)) : shadowByte(5, at)};
+        }
+        // The shadow's byte `source` goes to the block's byte `guest`.
+        const auto copyOf = [&](const std::shared_ptr<Buffer>& buffer, std::uint64_t source, std::uint64_t guest, std::uint64_t count, bool narrow) {
+            Recorder::DeferredCopy copy{buffer, buffer.get(), buffer->Handle(), import->buffer, source, address + guest - import->base, count, address + guest};
+            if (narrow) {
+                copy.sourceAddress = buffer->DeviceAddress();
+                copy.destinationAddress = import->address;
+                copy.baselineOffset = span;
+            }
+            return std::vector<Recorder::DeferredCopy>{copy};
+        };
+        const auto before = Recorder::CopyBackCounts();
+        // Aligned: only the changed dwords.
+        narrowing.DeferCopies(copyOf(first, 0, 0, 4096, true));
+        // Unaligned at both ends: three bytes whole at each.
+        narrowing.DeferCopies(copyOf(first, 4097, 4097, 1034, true));
+        // Adjacent copies of two shadows.
+        narrowing.DeferCopies(copyOf(first, 8192, 8192, 1024, true));
+        narrowing.DeferCopies(copyOf(second, 9216, 9216, 1024, true));
+        // A later copy over the second half of a queued one.
+        narrowing.DeferCopies(copyOf(first, 12288, 12288, 1024, true));
+        narrowing.DeferCopies(copyOf(second, 12800, 12800, 1024, true));
+        Require(narrowing.DeferredCopyBytes() == 4096 + 1034 + 2048 + 512 + 1024, "a narrow copy over a queued one did not trim it");
+        // Source and destination a byte apart modulo 4: whole, mirrored.
+        narrowing.DeferCopies(copyOf(first, 14337, 14336, 512, true));
+        // No baseline: whole, as before.
+        narrowing.DeferCopies(copyOf(second, 15360, 15360, 1024, false));
+        static_cast<void>(narrowing.Commands());
+        Require(!narrowing.HasDeferredCopies(), "Commands() left narrow copies queued");
+        narrowing.Submit();
+        narrowing.Sync();
+        const auto counts = Recorder::CopyBackCounts();
+        Require(counts.passes - before.passes == 1, "the queued narrow and plain copies were not recorded in one pass");
+        // Seven copies with a baseline, none back to back with another of its shadow: seven spans,
+        // six compared (one dispatch each), the misaligned one whole.
+        Require(counts.narrow - before.narrow == 7 && counts.narrowSpans - before.narrowSpans == 7 && counts.narrowBytes - before.narrowBytes == 4096 + 1034 + 1024 + 1024 + 512 + 1024 && counts.narrowWhole - before.narrowWhole == 1 && counts.narrowDispatches - before.narrowDispatches == 6, "narrow copy-back counters are off");
+        const auto* landed = static_cast<const unsigned char*>(block);
+        const auto want = [&](std::size_t at) -> unsigned char {
+            const auto narrow = [&](unsigned seed) { return changed(at) ? shadowByte(seed, at) : sentinel; };
+            if (at < 4096) return narrow(1);
+            if (at >= 4097 && at < 4100) return shadowByte(1, at);
+            if (at >= 4100 && at < 5128) return narrow(1);
+            if (at >= 5128 && at < 5131) return shadowByte(1, at);
+            if (at >= 8192 && at < 9216) return narrow(1);
+            if (at >= 9216 && at < 10240) return narrow(5);
+            if (at >= 12288 && at < 12800) return narrow(1);
+            if (at >= 12800 && at < 13824) return narrow(5);
+            if (at >= 14336 && at < 14848) return shadowByte(1, at + 1);
+            if (at >= 15360 && at < 16384) return shadowByte(5, at);
+            return sentinel;
+        };
+        for (std::size_t at = 0; at < span + 4096; ++at) {
+            if (landed[at] != want(at)) throw std::runtime_error("a narrow copy-back stored the wrong byte at offset " + std::to_string(at) + ": " + std::to_string(landed[at]) + ", expected " + std::to_string(want(at)));
+        }
+        // The baselines now stand for what the import holds where the copies went, and are left
+        // alone elsewhere (the dropped part of the trimmed copy too).
+        const auto baseline = [&](const std::shared_ptr<Buffer>& buffer, unsigned seed, std::size_t at) {
+            const auto was = changed(at) ? static_cast<unsigned char>(~shadowByte(seed, at)) : shadowByte(seed, at);
+            const bool firstUpdated = at < 4096 || (at >= 4097 && at < 5131) || (at >= 8192 && at < 9216) || (at >= 12288 && at < 12800) || (at >= 14337 && at < 14849);
+            const bool secondUpdated = (at >= 9216 && at < 10240) || (at >= 12800 && at < 13824);
+            const bool updated = seed == 1 ? firstUpdated : secondUpdated;
+            return std::to_integer<unsigned char>(buffer->Bytes()[span + at]) == (updated ? shadowByte(seed, at) : was);
+        };
+        for (std::size_t at = 0; at < span; ++at) {
+            if (!baseline(first, 1, at) || !baseline(second, 5, at)) throw std::runtime_error("a narrow copy-back left a wrong baseline byte at offset " + std::to_string(at));
+        }
+        // Written ranges back to back in one shadow and its import (two V#s over adjacent
+        // sub-ranges, a use's range and the range of a copy it took over) join into one compare
+        // span, recorded in one dispatch, whatever order they were queued in; ranges back to back
+        // in the shadow but not in the import stay apart. Each byte still lands as its own copy
+        // would land it.
+        auto third = std::make_shared<Buffer>(context, 2 * span, usage);
+        for (std::size_t at = 0; at < span; ++at) {
+            third->Bytes()[at] = std::byte{shadowByte(9, at)};
+            third->Bytes()[span + at] = std::byte{changed(at) ? static_cast<unsigned char>(~shadowByte(9, at)) : shadowByte(9, at)};
+        }
+        std::memset(block, sentinel, span);
+        const auto joined = Recorder::CopyBackCounts();
+        narrowing.DeferCopies(copyOf(third, 1024, 1024, 1024, true));
+        narrowing.DeferCopies(copyOf(third, 0, 0, 1024, true));
+        narrowing.DeferCopies(copyOf(third, 2048, 2048, 2048, true));
+        // Back to back in the shadow, 4 KiB apart in the import.
+        narrowing.DeferCopies(copyOf(third, 8192, 12288, 512, true));
+        narrowing.DeferCopies(copyOf(third, 8704, 8704, 512, true));
+        static_cast<void>(narrowing.Commands());
+        narrowing.Submit();
+        narrowing.Sync();
+        const auto afterJoin = Recorder::CopyBackCounts();
+        Require(afterJoin.narrow - joined.narrow == 5 && afterJoin.narrowSpans - joined.narrowSpans == 3 && afterJoin.narrowDispatches - joined.narrowDispatches == 3 && afterJoin.narrowWhole == joined.narrowWhole && afterJoin.narrowBytes - joined.narrowBytes == 4096 + 1024, "back-to-back narrow copies of one shadow did not join into one span");
+        const auto wantJoined = [&](std::size_t at) -> unsigned char {
+            const auto narrow = [&](std::size_t from) { return changed(from) ? shadowByte(9, from) : sentinel; };
+            if (at < 4096) return narrow(at);
+            if (at >= 12288 && at < 12800) return changed(at - 4096) ? shadowByte(9, at - 4096) : sentinel;
+            if (at >= 8704 && at < 9216) return narrow(at);
+            return sentinel;
+        };
+        for (std::size_t at = 0; at < span; ++at) {
+            if (landed[at] != wantJoined(at)) throw std::runtime_error("a joined narrow copy-back stored the wrong byte at offset " + std::to_string(at) + ": " + std::to_string(landed[at]) + ", expected " + std::to_string(wantJoined(at)));
+        }
+    }
+    recorder.Activate();
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+}
+
 // The page guards resident buffers use (GuestPageGuard*): a fault runs the resolver, a guard it
 // leaves is released by force, and a page two guards hold stays guarded until both went.
 std::uint64_t guardTestIds[2]{};
@@ -2767,6 +2939,89 @@ void pageGuardTests() {
     VirtualFree(block, 0, MEM_RELEASE);
 #else
     munmap(block, 4 * page);
+#endif
+}
+
+// Page guards over shared views (Windows, WindowsMappings; APS5_GUARD_SHARED_VIEWS=1): refused
+// without the switch, as before. With it a guard holds exactly its 4 KiB parts of a 16 KiB view
+// page; the write tracking's arming (a collect) leaves those parts no-access and arms the others; a
+// read of a guarded part runs the resolver once and the release gives the parts the armed
+// protection, so a store after it faults into the write tracking (not the guard) and is collected;
+// a page mapped at a second guest address is refused as aliased; and a release after the view was
+// mapped again leaves the new mapping's protection alone.
+void sharedViewGuardTests() {
+#ifdef _WIN32
+    if (!AgcDriver::GuestMemory::WriteWatched()) {
+        std::cout << "no write-watched guest arena: shared view guards not tested\n";
+        return;
+    }
+    constexpr std::size_t viewPage = 16384;
+    constexpr std::size_t part = 4096;
+    constexpr std::size_t bytes = 4 * viewPage;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, static_cast<DWORD>(bytes), nullptr);
+    Require(section != nullptr, "cannot create the shared view test section");
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(2 * bytes, 65536);
+    Require(block != nullptr, "cannot reserve the shared view test range");
+    GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    auto* guest = static_cast<volatile unsigned char*>(block);
+    const auto byteAt = [](std::size_t at) { return static_cast<unsigned char>(at % 253); };
+    for (std::size_t at = 0; at < bytes; ++at) guest[at] = byteAt(at);
+    const auto base = reinterpret_cast<std::uintptr_t>(block);
+    const auto protection = [](std::uintptr_t at) {
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) == sizeof(info), "cannot query a shared view test page");
+        return info.Protect;
+    };
+    const auto refusedAs = [](const char* name) {
+        std::array<std::uint64_t, 16> counts{};
+        GuestWriteWatch::GuestPageGuardRefusals_nid_postfix(counts.data(), counts.size());
+        for (std::size_t i = 0; i < counts.size(); ++i) {
+            const char* reason = GuestWriteWatch::GuestPageGuardRefusalName_nid_postfix(i);
+            if (reason == nullptr) break;
+            if (std::strcmp(reason, name) == 0) return counts[i];
+        }
+        throw std::runtime_error(std::string("no page guard refusal named ") + name);
+    };
+    GuestWriteWatch::GuestPageGuardInstall_nid_postfix(&releaseFirstGuard);
+    setSwitch("APS5_GUARD_SHARED_VIEWS", "");
+    const auto sharedBefore = refusedAs("shared view");
+    Require(GuestWriteWatch::GuestPageGuardProtect_nid_postfix(base + part, base + 3 * part) == 0 && refusedAs("shared view") == sharedBefore + 1, "a guard over a shared view was taken without APS5_GUARD_SHARED_VIEWS");
+    setSwitch("APS5_GUARD_SHARED_VIEWS", "1");
+    const auto faults = guardTestFaults.load();
+    guardTestIds[0] = GuestWriteWatch::GuestPageGuardProtect_nid_postfix(base + part, base + 3 * part);
+    Require(guardTestIds[0] != 0, "a guard over two parts of a shared view was refused");
+    Require(protection(base) == PAGE_READWRITE && protection(base + part) == PAGE_NOACCESS && protection(base + 2 * part) == PAGE_NOACCESS && protection(base + 3 * part) == PAGE_READWRITE, "the guard did not hold exactly its parts of the view page");
+    Require(guest[5] == byteAt(5) && guest[3 * part + 5] == byteAt(3 * part + 5) && guardTestFaults.load() == faults, "a part of the view page no guard holds faulted");
+    // The write tracking arms the page: the guarded parts stay no-access, the others turn read-only.
+    std::array<void*, 16> pages{};
+    std::size_t count = pages.size();
+    Require(GuestArena::GuestArenaCollectWrites_nid_postfix(base, viewPage, pages.data(), &count, true), "the shared view test page could not be collected");
+    Require(protection(base) == PAGE_READONLY && protection(base + part) == PAGE_NOACCESS && protection(base + 2 * part) == PAGE_NOACCESS && protection(base + 3 * part) == PAGE_READONLY, "arming the write tracking lifted the guard or skipped the parts no guard holds");
+    // A read of a guarded part lands it once; its release arms the parts read-only.
+    Require(guest[part + 7] == byteAt(part + 7) && guardTestFaults.load() == faults + 1, "a read of a guarded part of a view did not run the resolver once");
+    Require(protection(base + part) == PAGE_READONLY && protection(base + 2 * part) == PAGE_READONLY, "the release did not give the guarded parts the armed protection");
+    count = pages.size();
+    Require(GuestArena::GuestArenaCollectWrites_nid_postfix(base, viewPage, pages.data(), &count, true) && count == 0, "an armed view page nobody wrote reported writes");
+    // A store after the release goes to the write tracking (not the guard) and is collected.
+    guest[part + 9] = 0x42;
+    Require(guest[part + 9] == 0x42 && guardTestFaults.load() == faults + 1 && protection(base + part) == PAGE_READWRITE, "a store after the guard's release did not go through the write tracking");
+    count = pages.size();
+    Require(GuestArena::GuestArenaCollectWrites_nid_postfix(base, viewPage, pages.data(), &count, false) && count != 0, "a store after a guard's release was not collected");
+    // A page of the section mapped at a second guest address: refused as aliased.
+    GuestArena::GuestArenaMap_nid_postfix(static_cast<char*>(block) + bytes, viewPage, section, 0, PAGE_READWRITE);
+    const auto aliasedBefore = refusedAs("aliased view");
+    Require(GuestWriteWatch::GuestPageGuardProtect_nid_postfix(base, base + part) == 0 && refusedAs("aliased view") == aliasedBefore + 1, "a guard over a view page mapped twice was taken");
+    // A view mapped again while guarded keeps its new protection when the guard goes.
+    guardTestIds[1] = GuestWriteWatch::GuestPageGuardProtect_nid_postfix(base + 2 * viewPage, base + 3 * viewPage);
+    Require(guardTestIds[1] != 0 && protection(base + 2 * viewPage) == PAGE_NOACCESS, "a guard over a whole view page was refused");
+    GuestArena::GuestArenaMap_nid_postfix(reinterpret_cast<void*>(base + 2 * viewPage), viewPage, section, 2 * viewPage, PAGE_READONLY);
+    GuestWriteWatch::GuestPageGuardRelease_nid_postfix(guardTestIds[1]);
+    Require(protection(base + 2 * viewPage) == PAGE_READONLY && guest[2 * viewPage + 3] == byteAt(2 * viewPage + 3), "a guard's release changed a view mapped again since");
+    GuestWriteWatch::GuestPageGuardInstall_nid_postfix(nullptr);
+    setSwitch("APS5_GUARD_SHARED_VIEWS", "");
+    GuestArena::GuestArenaReset_nid_postfix(block, 2 * bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(block, 2 * bytes);
+    CloseHandle(section);
 #endif
 }
 
@@ -2945,7 +3200,9 @@ int main() {
         metadataPassTests(device, recorder);
         pendingKeyStoreTests(device, recorder);
         coalesceCopyBackTests(device, recorder);
+        narrowCopyBackTests(device, recorder);
         pageGuardTests();
+        sharedViewGuardTests();
         residentBufferTests(device, recorder);
         fastRingReclaimTests(device, recorder);
         std::cout << "Recorder read tracking and label tests passed\n";

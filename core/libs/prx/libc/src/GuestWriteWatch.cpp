@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <map>
 #include <mutex>
@@ -281,18 +282,27 @@ public:
     std::uint64_t Protect(std::uintptr_t begin, std::uintptr_t end) {
         if (begin % PageBytes != 0 || end % PageBytes != 0 || end <= begin) return 0;
         std::unique_lock lock(_lock);
+        // A range of shared views (Windows) is guarded through the mappings' own bookkeeping
+        // (APS5_GUARD_SHARED_VIEWS=1; refused without it, as before), plain memory through its
+        // protection; a range of both is refused.
+        auto refusal = Refusal::Count;
+        const bool view = viewRange(begin, end, refusal);
+        if (refusal != Refusal::Count) return refuse(begin, end, refusal);
         // Only the pages no guard holds yet change, and only plain read-write ones may.
         const auto gaps = uncovered(begin, end);
-        for (const auto& [from, to] : gaps) {
-            if (!readWrite(from, to)) return 0;
+        if (!view) {
+            for (const auto& [from, to] : gaps) {
+                if (!readWrite(from, to)) return refuse(begin, end, Refusal::PrivateState);
+            }
         }
         for (std::size_t i = 0; i < gaps.size(); ++i) {
-            if (access(gaps[i].first, gaps[i].second, false)) continue;
-            for (std::size_t j = 0; j <= i; ++j) access(gaps[j].first, gaps[j].second, true);
-            return 0;
+            if (access(gaps[i].first, gaps[i].second, false, view)) continue;
+            for (std::size_t j = 0; j <= i; ++j) access(gaps[j].first, gaps[j].second, true, view);
+            return refuse(begin, end, Refusal::ProtectFailed);
         }
         const auto id = ++_next;
         _entries.emplace(id, std::make_pair(begin, end));
+        if (view) _viewEntries.push_back(id);
         _count.store(_entries.size(), std::memory_order_release);
         return id;
     }
@@ -304,11 +314,15 @@ public:
         const auto [begin, end] = found->second;
         _entries.erase(found);
         _count.store(_entries.size(), std::memory_order_release);
-        for (const auto& [from, to] : uncovered(begin, end)) access(from, to, true);
+        const auto viewEntry = std::find(_viewEntries.begin(), _viewEntries.end(), id);
+        const bool view = viewEntry != _viewEntries.end();
+        if (view) _viewEntries.erase(viewEntry);
+        for (const auto& [from, to] : uncovered(begin, end)) access(from, to, true, view);
         // Remembered for a fault that raced this release (see raced).
         auto& slot = _released[_releasedNext++ % _released.size()];
         slot.begin = begin;
         slot.end = end;
+        slot.view = view;
         slot.retries.store(0, std::memory_order_relaxed);
     }
 
@@ -318,9 +332,10 @@ public:
         return covering(address) != 0;
     }
 
-    // A fault at `address`: false when no guard holds it (not this handler's fault).
-    bool Fault(std::uintptr_t address) {
-        if (!Covers(address)) return raced(address);
+    // A fault at `address`: false when no guard holds it (not this handler's fault). `write`: the
+    // access was a store (1), a load (0), or unknown (-1).
+    bool Fault(std::uintptr_t address, int write = -1) {
+        if (!Covers(address)) return raced(address, write);
         _faults.fetch_add(1, std::memory_order_relaxed);
         const auto resolve = _resolve.load(std::memory_order_acquire);
         bool forced = resolve == nullptr || !resolve(address);
@@ -366,18 +381,38 @@ public:
         if (guards != nullptr) *guards = _count.load(std::memory_order_relaxed);
     }
 
+    // Why Protect refused, by reason (GuestPageGuardRefusalName's order).
+    enum class Refusal : std::size_t { SharedView, Mixed, Aliased, HostWrite, Pinned, ViewProtection, PrivateState, ProtectFailed, Count };
+
+    void Refusals(std::uint64_t* counts, std::size_t count) const {
+        for (std::size_t i = 0; i < count; ++i) counts[i] = i < _refusals.size() ? _refusals[i].load(std::memory_order_relaxed) : 0;
+    }
+
+    static const char* RefusalName(std::size_t index) {
+        static constexpr std::array<const char*, static_cast<std::size_t>(Refusal::Count)> names{"shared view", "view and plain memory", "aliased view", "host write", "pinned", "view protection", "not plain read-write", "protect failed"};
+        return index < names.size() ? names[index] : nullptr;
+    }
+
 private:
     PageGuard() = default;
 
     // A fault no guard holds that raced a release: the page was guarded when the access faulted and
     // another thread's resolve released it before this handler looked. The access runs again, a
     // bounded number of times per release (a later genuine fault there is passed on).
-    bool raced(std::uintptr_t address) {
+    bool raced(std::uintptr_t address, int write) {
         std::shared_lock lock(_lock);
         for (auto& slot : _released) {
-            if (slot.begin <= address && address < slot.end) return slot.retries.fetch_add(1, std::memory_order_relaxed) < 64;
+            if (slot.begin <= address && address < slot.end) return slot.retries.fetch_add(1, std::memory_order_relaxed) < 64 && (!slot.view || allowedNow(address, write));
         }
         return false;
+    }
+
+    // A fault refused for one reason is described once (the first of each reason), with what the
+    // host and the shared mappings know of the range's first page.
+    std::uint64_t refuse(std::uintptr_t begin, std::uintptr_t end, Refusal refusal) {
+        const auto index = static_cast<std::size_t>(refusal);
+        if (_refusals[index].fetch_add(1, std::memory_order_relaxed) == 0) describe(begin, end, RefusalName(index));
+        return 0;
     }
 
     std::uint64_t covering(std::uintptr_t address) const {
@@ -404,10 +439,61 @@ private:
     }
 
 #if defined(_WIN32)
+    // APS5_GUARD_SHARED_VIEWS=1: guards over shared views (WindowsMappings), whose write tracking
+    // re-protects whole pages (Collect arms them, HandleWrite opens them), go through the mappings'
+    // guard bookkeeping (WindowsMappings::Guard/Unguard), which keeps the guarded parts no-access
+    // through those re-protections. Without it such ranges are refused, as before (the title's
+    // GPU memory lives in shared views: t388 made no resident copy, ~2k refused per 10 s). Read at
+    // each guard over a view (a test sets it between guards).
+    static bool sharedViewsEnabled() {
+        const char* value = std::getenv("APS5_GUARD_SHARED_VIEWS");
+        return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+    }
+
+    // Whether [begin, end) is guarded as shared views (true) or as plain memory (false); `refusal`
+    // is set when it may be neither.
+    static bool viewRange(std::uintptr_t begin, std::uintptr_t end, Refusal& refusal) {
+        using Fit = GuestArena::WindowsMappings::GuardFit;
+        const auto fit = GuestArena::WindowsMappings::Get().FitGuard(begin, end);
+        if (fit == Fit::Private) return false;
+        if (!sharedViewsEnabled()) {
+            refusal = Refusal::SharedView;
+            return false;
+        }
+        switch (fit) {
+        case Fit::Views: return true;
+        case Fit::Mixed: refusal = Refusal::Mixed; break;
+        case Fit::Aliased: refusal = Refusal::Aliased; break;
+        case Fit::HostWrite: refusal = Refusal::HostWrite; break;
+        case Fit::Pinned: refusal = Refusal::Pinned; break;
+        default: refusal = Refusal::ViewProtection; break;
+        }
+        return false;
+    }
+
+    // A fault no guard holds within a range a shared-view guard released recently runs again only
+    // if the access is allowed now: a store to a view page the release left armed read-only (write
+    // tracking) faults into WindowsMappings::HandleWrite instead of retrying here. (Plain-memory
+    // guards retry as before.)
+    static bool allowedNow(std::uintptr_t address, int write) {
+        if (write < 0) return true;
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT) return false;
+        const auto protection = info.Protect & 0xffu;
+        if (protection == PAGE_NOACCESS) return false;
+        return write == 0 || protection == PAGE_READWRITE || protection == PAGE_EXECUTE_READWRITE || protection == PAGE_WRITECOPY || protection == PAGE_EXECUTE_WRITECOPY;
+    }
+
+    static void describe(std::uintptr_t begin, std::uintptr_t end, const char* reason) {
+        MEMORY_BASIC_INFORMATION info{};
+        const bool queried = VirtualQuery(reinterpret_cast<void*>(begin), &info, sizeof(info)) != 0;
+        char view[256];
+        GuestArena::WindowsMappings::Get().Describe(begin, view, sizeof(view));
+        std::fprintf(stderr, "[page-guard] first guard refused as '%s': 0x%llx+0x%llx, VirtualQuery %s state 0x%lx protect 0x%lx type 0x%lx region 0x%llx; shared view %d: %s\n", reason, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), queried ? "ok" : "failed", queried ? info.State : 0ul, queried ? info.Protect : 0ul, queried ? info.Type : 0ul, queried ? static_cast<unsigned long long>(info.RegionSize) : 0ull, GuestArena::WindowsMappings::Get().HasView(begin, end - begin) ? 1 : 0, view);
+        std::fflush(stderr);
+    }
+
     static bool readWrite(std::uintptr_t begin, std::uintptr_t end) {
-        // Shared views re-protect their pages for write tracking (WindowsMappings::Collect and
-        // HandleWrite), which would lift a guard: refused.
-        if (GuestArena::WindowsMappings::Get().HasView(begin, end - begin)) return false;
         for (auto cursor = begin; cursor < end;) {
             MEMORY_BASIC_INFORMATION info{};
             if (VirtualQuery(reinterpret_cast<void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || info.Protect != PAGE_READWRITE) return false;
@@ -416,9 +502,16 @@ private:
         return true;
     }
 
-    // Region by region (a range may span several views). Back to read-write only where the guard's
-    // no-access still stands: a range mapped again since keeps the protection it was given.
-    static bool access(std::uintptr_t begin, std::uintptr_t end, bool accessible) {
+    // Shared views (`view`): through the mappings' guard bookkeeping. Plain memory region by region:
+    // back to read-write only where the guard's no-access still stands (a range mapped again since
+    // keeps the protection it was given).
+    static bool access(std::uintptr_t begin, std::uintptr_t end, bool accessible, bool view) {
+        if (view) {
+            auto& mappings = GuestArena::WindowsMappings::Get();
+            if (!accessible) return mappings.Guard(begin, end);
+            mappings.Unguard(begin, end);
+            return true;
+        }
         bool changed = true;
         for (auto cursor = begin; cursor < end;) {
             MEMORY_BASIC_INFORMATION info{};
@@ -436,16 +529,24 @@ private:
     static LONG CALLBACK handler(EXCEPTION_POINTERS* exception) {
         const auto* record = exception->ExceptionRecord;
         if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
-        return Get().Fault(static_cast<std::uintptr_t>(record->ExceptionInformation[1])) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+        const auto kind = record->ExceptionInformation[0];
+        return Get().Fault(static_cast<std::uintptr_t>(record->ExceptionInformation[1]), kind == 0 ? 0 : kind == 1 ? 1 : -1) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
     }
 
     // First in line, ahead of the crash reporter's handler.
     static void installHandler() { AddVectoredExceptionHandler(1, &PageGuard::handler); }
 #elif defined(__linux__)
+    static bool viewRange(std::uintptr_t, std::uintptr_t, Refusal&) { return false; }
+    static bool allowedNow(std::uintptr_t, int) { return true; }
+    static void describe(std::uintptr_t begin, std::uintptr_t end, const char* reason) {
+        std::fprintf(stderr, "[page-guard] first guard refused as '%s': 0x%llx+0x%llx\n", reason, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
+        std::fflush(stderr);
+    }
+
     // Not queried: the guarded ranges are the driver's writable imports.
     static bool readWrite(std::uintptr_t, std::uintptr_t) { return true; }
 
-    static bool access(std::uintptr_t begin, std::uintptr_t end, bool accessible) {
+    static bool access(std::uintptr_t begin, std::uintptr_t end, bool accessible, bool) {
         return mprotect(reinterpret_cast<void*>(begin), end - begin, accessible ? PROT_READ | PROT_WRITE : PROT_NONE) == 0;
     }
 
@@ -474,13 +575,19 @@ private:
         sigaction(SIGSEGV, &action, &previousAction());
     }
 #else
+    static bool viewRange(std::uintptr_t, std::uintptr_t, Refusal&) { return false; }
+    static bool allowedNow(std::uintptr_t, int) { return true; }
+    static void describe(std::uintptr_t, std::uintptr_t, const char*) {}
     static bool readWrite(std::uintptr_t, std::uintptr_t) { return false; }
-    static bool access(std::uintptr_t, std::uintptr_t, bool) { return false; }
+    static bool access(std::uintptr_t, std::uintptr_t, bool, bool) { return false; }
     static void installHandler() {}
 #endif
 
     std::shared_mutex _lock;
     std::map<std::uint64_t, std::pair<std::uintptr_t, std::uintptr_t>> _entries;
+    // The live guards made over shared views (released through WindowsMappings::Unguard).
+    std::vector<std::uint64_t> _viewEntries;
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Refusal::Count)> _refusals{};
     std::uint64_t _next = 0;
     std::atomic<std::size_t> _count{0};
     std::atomic<std::uint64_t> _faults{0}, _forced{0};
@@ -489,6 +596,8 @@ private:
     // The last releases, for raced (written under the exclusive lock).
     struct Released {
         std::uintptr_t begin = 0, end = 0;
+        // Released from a shared-view guard (see allowedNow).
+        bool view = false;
         std::atomic<std::uint32_t> retries{0};
     };
     std::array<Released, 64> _released{};
@@ -571,6 +680,14 @@ bool GuestPageGuardCovers_nid_postfix(std::uintptr_t address) {
 
 void GuestPageGuardCounts_nid_postfix(std::uint64_t* faults, std::uint64_t* forced, std::uint64_t* guards) {
     PageGuard::Get().Counts(faults, forced, guards);
+}
+
+void GuestPageGuardRefusals_nid_postfix(std::uint64_t* counts, std::size_t count) {
+    PageGuard::Get().Refusals(counts, count);
+}
+
+const char* GuestPageGuardRefusalName_nid_postfix(std::size_t index) {
+    return PageGuard::RefusalName(index);
 }
 
 }
