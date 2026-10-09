@@ -363,7 +363,22 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     MEMORY_BASIC_INFORMATION refused{};
     for (std::uint64_t cursor = base; cursor < base + bytes;) {
         MEMORY_BASIC_INFORMATION info{};
-        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+        const bool queried = VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) != 0;
+        // Pages a resident buffer's guard holds no-access (APS5_RESIDENT_BUFFERS) are mapped to the
+        // guest all the same. A shared view is imported through its read-write alias, which the
+        // guard leaves alone; a plain page is pinned through the guest address, which the guard
+        // makes no-access, so its import waits for the guard (no import now, nothing remembered).
+        // Before, either was refused for good ('failed' until the range left the registry: CPU
+        // copies of the range from then on).
+        std::uintptr_t guardedEnd = 0;
+        if (queried && info.State == MEM_COMMIT && (info.Protect & 0xffu) == PAGE_NOACCESS && GuestWriteWatch::GuestPageGuardHolding_nid_postfix() && !GuestMemory::GuardedPagesAsHoles() && GuestWriteWatch::GuestPageGuardHeldRun_nid_postfix(static_cast<std::uintptr_t>(cursor), static_cast<std::uintptr_t>(base + bytes), &guardedEnd) && guardedEnd > cursor) {
+            if (info.Type != MEM_MAPPED) return nullptr;
+            writable = false;
+            readOnly = false;
+            cursor = std::min<std::uint64_t>(reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize, guardedEnd);
+            continue;
+        }
+        if (!queried || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
             state.failed.insert(base);
             return nullptr;
         }
@@ -401,7 +416,9 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
 #ifdef _WIN32
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
-        state.failed.insert(base);
+        // A page a resident buffer's guard holds (Linux: PROT_NONE through the guest address) may
+        // be what the driver could not pin: tried again later, not refused for good.
+        if (GuestMemory::GuardedPagesAsHoles() || !GuestWriteWatch::GuestPageGuardHeldWithin_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::uintptr_t>(base + bytes))) state.failed.insert(base);
         std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d); falling back to copies\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result));
 #ifdef _WIN32
         static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;

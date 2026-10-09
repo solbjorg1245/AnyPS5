@@ -2794,6 +2794,12 @@ void reportBarriers() {
         }
         lastRefusals = refusals;
         std::fprintf(stderr, "; resident copies %llu made (%.1f MiB), %.1f MiB kept in %llu guards, recorded later by reason:%s, %llu dropped after a fault, %llu refused%s%s%s, %llu remap flushes; page faults %llu (%llu resolved, %llu landed already, %llu under the GPU lock, %llu forced, %llu waited for an in-flight landing)", static_cast<unsigned long long>(counts.made - last.made), (counts.madeBytes - last.madeBytes) / 1048576.0, residentKeptBytes.load(std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(guards), reasons.c_str(), static_cast<unsigned long long>(counts.skipped - last.skipped), static_cast<unsigned long long>(counts.refused - last.refused), refusedBy.empty() ? "" : " (", refusedBy.c_str(), refusedBy.empty() ? "" : ")", static_cast<unsigned long long>(counts.remapFlushes - last.remapFlushes), static_cast<unsigned long long>(pageFaults - lastPageFaults), static_cast<unsigned long long>(counts.resolved - last.resolved), static_cast<unsigned long long>(counts.landed - last.landed), static_cast<unsigned long long>(counts.underLock - last.underLock), static_cast<unsigned long long>(pageForced - lastPageForced), static_cast<unsigned long long>(counts.waitedLanding - last.waitedLanding));
+        // Page queries that met a guarded page and answered it as the guest maps it (GuestMemory
+        // guardedRun; before, such pages read as holes: zeros, skipped write-backs, refused imports).
+        static std::uint64_t lastGuardedQueries = 0;
+        const auto guardedQueries = GuestMemory::GuardedPageQueries();
+        std::fprintf(stderr, "; page queries over guards %llu", static_cast<unsigned long long>(guardedQueries - lastGuardedQueries));
+        lastGuardedQueries = guardedQueries;
         last = counts;
         lastPageFaults = pageFaults;
         lastPageForced = pageForced;

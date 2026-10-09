@@ -64,6 +64,8 @@ std::atomic<std::uint64_t> forgetCalls{0};
 // See ForgetSerial: odd while a ForgetPages call stores its page states.
 std::atomic<std::uint64_t> forgetSerial{0};
 std::atomic<std::uint64_t> forgetBytes{0};
+// Page queries that found a resident buffer's page guard (GuardedPageQueries).
+std::atomic<std::uint64_t> guardedPageQueries{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
@@ -497,6 +499,21 @@ struct PageRun {
     bool writable;
 };
 
+// A no-access run at `cursor` (up to `limit`) that a resident buffer's page guard holds
+// (GuestPageGuard*, APS5_RESIDENT_BUFFERS): the guest still has those pages mapped as before the
+// guard (an access faults into the resolver, which lands the GPU's bytes first), so the page queries
+// answer for them what they answered before (a shared view's own protection; read-write for plain
+// memory, the only kind a guard takes) instead of a hole. As holes the driver read them as zeros
+// (sparse regions, ReadCommitted), left them out of write-backs (WriteChangedCommitted), compared
+// them as unmapped and threw on them (CheckRange) while their guard stood (t419). `*end`: where the
+// guarded run stops. False whenever no guard was ever installed (every switch off).
+bool guardedRun(std::uintptr_t cursor, std::uintptr_t limit, std::uintptr_t* end) {
+    if (!GuestWriteWatch::GuestPageGuardHolding_nid_postfix() || GuardedPagesAsHoles()) return false;
+    if (!GuestWriteWatch::GuestPageGuardHeldRun_nid_postfix(cursor, limit, end) || *end <= cursor) return false;
+    guardedPageQueries.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 // Calls `emit` with consecutive runs of uniform accessibility covering [address, address + bytes) in
 // order, stopping early when it returns false. Returns false when the address space cannot be queried.
 template <class Emit>
@@ -505,6 +522,9 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
     pages.initialize();
     const auto end = address + bytes;
     auto cursor = address;
+    // A no-access answer no guard explains is asked once more when guards exist: a guard's release
+    // may have restored the page between the query and the guards' answer.
+    std::uintptr_t requeried = 0;
     while (cursor < end) {
         if (const auto* span = pages.spanOf(cursor)) {
             const auto value = span->load(cursor);
@@ -533,13 +553,27 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
                 std::fprintf(stderr, "[query] 0x%llx range 0x%zx: base 0x%llx size 0x%llx state 0x%lx protect 0x%lx type 0x%lx %.0f us gen %llu from +0x%llx\n", static_cast<unsigned long long>(cursor), bytes, reinterpret_cast<unsigned long long>(memory.BaseAddress), static_cast<unsigned long long>(memory.RegionSize), memory.State, memory.Protect, memory.Type, us, static_cast<unsigned long long>(GuestAllocations::GuestAllocationsGeneration_nid_postfix()), ModuleOffset(__builtin_return_address(0)));
             }
         }
-        const auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
+        auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
         if (memory.RegionSize > std::numeric_limits<std::uintptr_t>::max() - base || base + memory.RegionSize <= cursor) return false;
-        const auto regionEnd = base + memory.RegionSize;
+        auto regionEnd = base + memory.RegionSize;
         std::uint32_t logicalProtection = memory.Protect;
-        GuestArena::GuestArenaProtection_nid_postfix(cursor, &logicalProtection);
+        const bool view = GuestArena::GuestArenaProtection_nid_postfix(cursor, &logicalProtection);
+        bool committed = memory.State == MEM_COMMIT && (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
+        if (!committed && memory.State == MEM_COMMIT && (memory.Protect & 0xffu) == PAGE_NOACCESS && GuestWriteWatch::GuestPageGuardHolding_nid_postfix()) {
+            std::uintptr_t guardedEnd = 0;
+            if (guardedRun(cursor, regionEnd, &guardedEnd)) {
+                // Only the guarded run, from the cursor's page (the region may begin with pages the
+                // guest itself made no-access).
+                committed = true;
+                base = cursor & ~(PageBytes - 1);
+                regionEnd = guardedEnd;
+                if (!view) logicalProtection = PAGE_READWRITE;
+            } else if (requeried != cursor) {
+                requeried = cursor;
+                continue;
+            }
+        }
         const auto protection = logicalProtection & 0xffu;
-        const bool committed = memory.State == MEM_COMMIT && (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
         const bool readable = committed && readableProtection(protection);
         const bool writable = readable && writableProtection(protection);
         for (PageSpan* span : {&pages.arena, &pages.image}) {
@@ -573,8 +607,23 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
                 found = true;
                 break;
             }
-            const auto next = std::min(end, last);
-            if (!emit(PageRun{cursor, next, permissions[0] == 'r', permissions[0] == 'r' && permissions[1] == 'w'})) return true;
+            auto next = std::min(end, last);
+            bool readable = permissions[0] == 'r';
+            bool writable = readable && permissions[1] == 'w';
+            // A run a resident buffer's guard holds (PROT_NONE over read-write memory: see
+            // guardedRun) is mapped read-write to the guest.
+            std::uintptr_t guardedEnd = 0;
+            if (!readable && guardedRun(cursor, next, &guardedEnd)) {
+                readable = writable = true;
+                next = guardedEnd;
+            } else if (!readable && GuestWriteWatch::GuestPageGuardHolding_nid_postfix() && requeried != cursor) {
+                // The guards' answer came after this listing: list again once (a release may
+                // have restored the pages).
+                requeried = cursor;
+                found = true;
+                break;
+            }
+            if (!emit(PageRun{cursor, next, readable, writable})) return true;
             cursor = next;
             found = true;
             break;
@@ -657,6 +706,16 @@ void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, b
 bool Accessible(const void* pointer, std::size_t bytes, bool writable) {
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     return address != 0 && bytes <= std::numeric_limits<std::uintptr_t>::max() - address && verify(address, bytes, writable).empty();
+}
+
+bool GuardedPagesAsHoles() {
+    // Read at each use (only pages a guard holds ask, and a test flips it).
+    const char* value = std::getenv("APS5_GUARD_PAGES_AS_HOLES");
+    return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+}
+
+std::uint64_t GuardedPageQueries() {
+    return guardedPageQueries.load(std::memory_order_relaxed);
 }
 
 std::uint64_t ForgetSerial() {

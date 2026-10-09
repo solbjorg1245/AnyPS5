@@ -358,6 +358,33 @@ public:
         return covering(address) != 0;
     }
 
+    // GuestPageGuardHeldRun: under the shared lock whatever `_count` says (a guard being made has
+    // its pages no-access before it is counted; Protect holds the lock meanwhile).
+    bool HeldRun(std::uintptr_t address, std::uintptr_t limit, std::uintptr_t* end) {
+        if (!_holding.load(std::memory_order_acquire)) return false;
+        std::shared_lock lock(_lock);
+        if (covering(address) == 0) return false;
+        // Every guard over the cursor moves it to its end, until none holds the cursor.
+        auto cursor = address;
+        for (bool moved = true; moved && cursor < limit;) {
+            moved = false;
+            for (const auto& [id, range] : _entries) {
+                if (range.first <= cursor && cursor < range.second) {
+                    cursor = range.second;
+                    moved = true;
+                }
+            }
+        }
+        if (end != nullptr) *end = std::min(cursor, limit);
+        return true;
+    }
+
+    bool HeldWithin(std::uintptr_t begin, std::uintptr_t end) {
+        if (!_holding.load(std::memory_order_acquire) || end <= begin) return false;
+        std::shared_lock lock(_lock);
+        return std::any_of(_entries.begin(), _entries.end(), [&](const auto& entry) { return entry.second.first < end && begin < entry.second.second; });
+    }
+
     // A fault at `address`: false when no guard holds it (not this handler's fault). `write`: the
     // access was a store (1), a load (0), or unknown (-1).
     bool Fault(std::uintptr_t address, int write = -1) {
@@ -719,6 +746,14 @@ void GuestPageGuardUnhold_nid_postfix(std::uint64_t hold) {
 
 bool GuestPageGuardHolding_nid_postfix() {
     return PageGuard::Get().Holding();
+}
+
+bool GuestPageGuardHeldRun_nid_postfix(std::uintptr_t address, std::uintptr_t limit, std::uintptr_t* end) {
+    return PageGuard::Get().HeldRun(address, limit, end);
+}
+
+bool GuestPageGuardHeldWithin_nid_postfix(std::uintptr_t begin, std::uintptr_t end) {
+    return PageGuard::Get().HeldWithin(begin, end);
 }
 
 bool GuestPageGuardCovers_nid_postfix(std::uintptr_t address) {

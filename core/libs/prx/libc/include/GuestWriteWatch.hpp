@@ -39,6 +39,17 @@ std::uint64_t GuestPageGuardHold_nid_postfix(std::uintptr_t address, std::size_t
 void GuestPageGuardUnhold_nid_postfix(std::uint64_t hold);
 // Whether holds are taken (an Install happened): callers may skip gathering ranges to hold.
 bool GuestPageGuardHolding_nid_postfix();
+// A page query (VirtualQuery, /proc/self/maps) that finds no access at `address` asks here whether a
+// guard holds the page: the guest still sees it mapped with its own protection (an access faults
+// into the resolver, which lands the bytes first), so it must not be taken for a hole. True when a
+// guard holds the page at `address`, with `*end` the end of the run of guarded pages from it (at
+// most `limit`). Taken under the guards' lock: a guard being made (pages no-access, not yet
+// published) or released (published no longer, protection being restored) is seen whole, so false
+// after a no-access answer means that answer may be stale (a release restored the page since): the
+// caller queries once more. Always false before the first Install.
+bool GuestPageGuardHeldRun_nid_postfix(std::uintptr_t address, std::uintptr_t limit, std::uintptr_t* end);
+// Whether a guard holds any page of [begin, end) (false before the first Install).
+bool GuestPageGuardHeldWithin_nid_postfix(std::uintptr_t begin, std::uintptr_t end);
 // Totals since start: faults on guarded pages and those that left a guard to release by force;
 // the live guards.
 void GuestPageGuardCounts_nid_postfix(std::uint64_t* faults, std::uint64_t* forced, std::uint64_t* guards);
