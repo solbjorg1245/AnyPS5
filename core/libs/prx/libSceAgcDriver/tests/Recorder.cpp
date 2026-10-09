@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastDispatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastRing.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -10,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastRead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -282,6 +284,103 @@ void pendingBlockTests(const Device& device, Recorder& recorder) {
     recorder.NotePendingWrite(base, 4);
     Require(!Recorder::BlockPending(base), "an untracked note marked a block pending");
     recorder.Sync();
+}
+
+// The fast walks' reader over pending writes (FastSrtRead, docs/design/draw-fastpath.md F2, F3b,
+// F5): a word in a pending 64 KiB block declines only when an exact pending range overlaps it (the
+// old capture's raw-read rule), so a word adjacent to a range reads and a word one byte into one
+// declines, over block boundaries too; a range noted after the reader loaded its snapshot is seen
+// (the publish generation moved); a completion label noted on an in-flight batch (noteWriteOn on a
+// submitted batch) declines its word only; a slot collision with no range near the word reads; the
+// block alone declines with the exact test off (APS5_FAST_PENDING_BLOCKS=1); a finished batch's
+// words read without the exact test; a queued label of this thread declines its word without
+// counting as a capture page query ([labels] line).
+void fastReaderPendingTests(Recorder& recorder) {
+    using AgcDriver::DriverDetail::DeferredLabel;
+    using AgcDriver::DriverDetail::FastReader;
+    using AgcDriver::DriverDetail::FastSrtRead;
+    using AgcDriver::DriverDetail::WalkDecline;
+    Recorder::TrackPendingBlocks(true);
+    recorder.Sync();
+    // Live words over four 64 KiB blocks, the first block-aligned; each word holds its offset.
+    constexpr std::uint64_t Block = 0x10000;
+    std::vector<std::uint32_t> storage(static_cast<std::size_t>(5 * Block / 4));
+    const auto base = (reinterpret_cast<std::uint64_t>(storage.data()) + Block - 1) & ~(Block - 1);
+    const auto expected = [&](std::uint64_t address) { return static_cast<std::uint32_t>(address - base) ^ 0x5a5a0000u; };
+    for (std::uint64_t at = base; at < base + 4 * Block; at += 4) *reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(at)) = expected(at);
+    const std::vector<DeferredLabel> noLabels;
+    // Whether the word was served (and then with its live value).
+    const auto read = [&](FastReader& reader, std::uint64_t address) {
+        reader.labels = &noLabels;
+        reader.declined.reset();
+        std::uint32_t value = 0;
+        const bool served = FastSrtRead(&reader, address, &value);
+        if (served && value != expected(address)) throw std::runtime_error("the fast reader served a wrong word");
+        return served;
+    };
+    const auto declinesPending = [&](FastReader& reader, std::uint64_t address) { return !read(reader, address) && reader.declined == WalkDecline::Pending; };
+    FastReader reader{};
+    reader.exactPending = true;
+    // Adjacent: [0x100, 0x200) leaves the words ending at 0x100 and starting at 0x200 readable.
+    recorder.NotePendingWrite(base + 0x100, 0x100);
+    Require(Recorder::BlockPending(base + 0xfc) && Recorder::BlockPending(base + 0x200), "the noted range did not mark its block pending");
+    Require(read(reader, base + 0xfc) && read(reader, base + 0x200), "a word adjacent to a pending range declined");
+    Require(declinesPending(reader, base + 0x100) && declinesPending(reader, base + 0x1fc), "a word inside a pending range was read");
+    Require(reader.pendingPassed == 2 && reader.pendingInBlocks == 4, "the reads in and past a pending block are not counted");
+    // One byte of overlap: a range of one byte at a word's last byte, at a word's first byte, and a
+    // two-byte range over the boundary of two words.
+    recorder.NotePendingWrite(base + 0x303, 1);
+    recorder.NotePendingWrite(base + 0x404, 1);
+    recorder.NotePendingWrite(base + 0x5ff, 2);
+    Require(declinesPending(reader, base + 0x300) && read(reader, base + 0x2fc) && read(reader, base + 0x304), "a word overlapping a one-byte range at its last byte was misjudged");
+    Require(declinesPending(reader, base + 0x404) && read(reader, base + 0x400) && read(reader, base + 0x408), "a word overlapping a one-byte range at its first byte was misjudged");
+    Require(declinesPending(reader, base + 0x5fc) && declinesPending(reader, base + 0x600) && read(reader, base + 0x5f8) && read(reader, base + 0x604), "the words a two-byte range straddles were misjudged");
+    // Spanning blocks: [Block - 2, Block + 2) overlaps the last word of block 0 and the first of
+    // block 1; [Block + 0x8000, 3 * Block + 0x10) covers block 2 whole and ends inside block 3.
+    recorder.NotePendingWrite(base + Block - 2, 4);
+    recorder.NotePendingWrite(base + Block + 0x8000, 2 * Block - 0x8000 + 0x10);
+    Require(declinesPending(reader, base + Block - 4) && declinesPending(reader, base + Block), "the words a range over a block boundary straddles were read");
+    Require(read(reader, base + Block - 8) && read(reader, base + Block + 4), "a word beside a range over a block boundary declined");
+    Require(declinesPending(reader, base + 2 * Block) && declinesPending(reader, base + 2 * Block + 0x8000) && declinesPending(reader, base + 3 * Block + 0xc), "a word inside a range over three blocks was read");
+    Require(read(reader, base + Block + 0x7ffc) && read(reader, base + 3 * Block + 0x10) && read(reader, base + 3 * Block + 0x8000), "a word beside a range over three blocks declined");
+    // A range noted after the reader loaded its snapshot.
+    Require(read(reader, base + 0x800), "a word with no range over it declined");
+    recorder.NotePendingWrite(base + 0x800, 4);
+    Require(declinesPending(reader, base + 0x800) && read(reader, base + 0x804), "a range noted after the reader's snapshot was missed");
+    // A completion label on an in-flight batch: with no open batch, AfterCompletions appends to the
+    // submitted one, and noteWriteOn marks the block and publishes the range there. The completion
+    // stores the word's own value at the finish.
+    Require(read(reader, base + 0x900), "a word with no range over it declined");
+    recorder.Submit();
+    std::array<std::byte, 4> label{};
+    const auto labelValue = expected(base + 0x900);
+    std::memcpy(label.data(), &labelValue, label.size());
+    recorder.AfterCompletions(base + 0x900, label, 1, 0, false);
+    Require(declinesPending(reader, base + 0x900) && read(reader, base + 0x8fc) && read(reader, base + 0x904), "a completion label noted on an in-flight batch was misjudged");
+    // The block alone (APS5_FAST_PENDING_BLOCKS=1).
+    FastReader blocksOnly{};
+    blocksOnly.exactPending = false;
+    Require(declinesPending(blocksOnly, base + 0xfc) && declinesPending(blocksOnly, base + 3 * Block + 0x8000) && blocksOnly.pendingPassed == 0, "the block-only rule read a word in a pending block");
+    recorder.Sync();
+    Require(!Recorder::BlockPending(base) && read(reader, base + 0x100) && read(blocksOnly, base + 0x100), "a finished batch's word declined");
+    // A block 16 GiB away shares the slot: the block reads pending, the word has no range over it.
+    recorder.NotePendingWrite(base + (std::uint64_t{1} << 34u), 4);
+    const auto passed = reader.pendingPassed;
+    Require(Recorder::BlockPending(base) && read(reader, base + 0x100) && reader.pendingPassed == passed + 1, "a slot collision declined a word no range overlaps");
+    Require(declinesPending(blocksOnly, base + 0x100), "the block-only rule read a word in a collided block");
+    recorder.Sync();
+    // A queued label of this thread (NoteQueuedLabel): its word declines, its neighbour reads, and
+    // the reader's query is not counted as the old capture's page query.
+    std::array<std::byte, 4> queued{};
+    const auto queuedValue = expected(base + 0xa00);
+    std::memcpy(queued.data(), &queuedValue, queued.size());
+    Recorder::NoteQueuedLabel(base + 0xa00, queued, 1, AgcDriver::GuestMemory::GpuLockThreadTag());
+    const auto pageQueries = Recorder::StoreCounts().queuedPageQueries;
+    Require(!read(reader, base + 0xa00) && reader.declined == WalkDecline::QueuedLabel && read(reader, base + 0xa04), "a queued label's word was misjudged by the fast reader");
+    Require(Recorder::QueuedLabelOverlapsThisThreadUncounted(base + 0xa00, 4) && !Recorder::QueuedLabelOverlapsThisThreadUncounted(base + 0xa04, 4), "the uncounted queued-label query answers differently");
+    Require(Recorder::StoreCounts().queuedPageQueries == pageQueries, "the fast reader's queued-label query counted as a capture page query");
+    Recorder::ForgetQueuedLabels();
+    Recorder::TrackPendingBlocks(false);
 }
 
 // Completion counting: a write-back completion (OnComplete) is pending until its batch finished;
@@ -752,6 +851,86 @@ void remappedImportTests(const Device& device) {
         mutation.Remove(block);
     }
     HostImportFor(context, address, bytes);
+}
+
+// HostImportsFor (the fast dispatch's imports under one hold of the registry's lock): each range
+// receives what HostImportFor returns for it, in order (null outside every registered allocation),
+// and a visitor that stops leaves the ranges after it unlooked-up, so not imported.
+void batchedImportTests(const Device& device) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: batched imports not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 65536;
+    // The third block is registered later (a registry change).
+    std::array<void*, 3> blocks{};
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        auto& block = blocks[i];
+#ifdef _WIN32
+        block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+        block = std::aligned_alloc(65536, bytes);
+#endif
+        Require(block != nullptr, "cannot allocate a batched import test block");
+        if (i == 2) continue;
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    const auto first = reinterpret_cast<std::uint64_t>(blocks[0]);
+    const auto second = reinterpret_cast<std::uint64_t>(blocks[1]);
+    static std::array<std::uint64_t, 8> outside{};
+    const auto unregistered = reinterpret_cast<std::uint64_t>(outside.data());
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 3> ranges{{{first + 0x100, first + 0x200}, {unregistered, unregistered + 16}, {second + 0x40, second + 0x1000}}};
+    struct Seen {
+        std::size_t stopAt;
+        std::vector<const HostImport*> imports;
+    };
+    const HostImportVisitor visit = [](void* user, std::size_t index, const HostImport* import) {
+        auto& seen = *static_cast<Seen*>(user);
+        seen.imports.push_back(import);
+        return index != seen.stopAt;
+    };
+    Seen stopped{0, {}};
+    HostImportsFor(context, ranges, visit, &stopped);
+    if (stopped.imports.size() == 1 && stopped.imports[0] == nullptr) {
+        std::cout << "host import of the batched import test block refused: batched imports not tested\n";
+        return;
+    }
+    Require(stopped.imports.size() == 1 && stopped.imports[0] != nullptr && stopped.imports[0] == HostImportFor(context, first + 0x100, 0x100), "the first range did not receive HostImportFor's import");
+    Require(!HostImportCovers(context, second + 0x40, 0xfc0), "a range after the visitor stopped was imported");
+    Seen all{ranges.size(), {}};
+    HostImportsFor(context, ranges, visit, &all);
+    Require(all.imports.size() == 3 && all.imports[0] == stopped.imports[0] && all.imports[1] == nullptr && all.imports[2] != nullptr, "the ranges did not receive their imports in order");
+    Require(all.imports[2] == HostImportFor(context, second + 0x40, 0xfc0) && all.imports[2]->base == second, "the last range's import is not HostImportFor's");
+    // Hits only: answered under the one hold, the same imports.
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 2> known{{ranges[0], ranges[2]}};
+    Seen hits{known.size(), {}};
+    HostImportsFor(context, known, visit, &hits);
+    Require(hits.imports.size() == 2 && hits.imports[0] == all.imports[0] && hits.imports[1] == all.imports[2], "ranges an import covers did not receive it");
+    // A registry change since the last reconcile: the first range is no hit under the hold, so
+    // every range takes HostImportFor, which reconciles; the imports of unchanged registrations stay.
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(blocks[2], bytes, true, true);
+    }
+    Seen stale{known.size(), {}};
+    HostImportsFor(context, known, visit, &stale);
+    Require(stale.imports.size() == 2 && stale.imports[0] == all.imports[0] && stale.imports[1] == all.imports[2], "a stale registry changed the ranges' imports");
+    // A miss after a hit: the new registration is imported in order, between the two hits.
+    const auto third = reinterpret_cast<std::uint64_t>(blocks[2]);
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 3> mixed{{ranges[0], {third + 0x10, third + 0x20}, ranges[2]}};
+    Seen created{mixed.size(), {}};
+    HostImportsFor(context, mixed, visit, &created);
+    Require(created.imports.size() == 3 && created.imports[0] == all.imports[0] && created.imports[1] != nullptr && created.imports[1] == HostImportFor(context, third + 0x10, 0x10) && created.imports[2] == all.imports[2], "a miss after a hit did not import the new registration in order");
+    Seen none{0, {}};
+    HostImportsFor(context, std::span<const std::pair<std::uint64_t, std::uint64_t>>{}, visit, &none);
+    Require(none.imports.empty(), "an empty range list was visited");
+    for (auto* block : blocks) {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, first, bytes);
 }
 
 void movedMetadataTests(const Device& device, Recorder& recorder) {
@@ -1404,10 +1583,30 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     retile(*high, unit128, unit, 0x77, false);
     Require(AnyShadowedOverlaps(unit128, unit), "the second slab's unit is not shadowed");
     high.reset();
+    {
+        // RecordFastDispatch's flush of its in-place ranges (FlushFastDispatchRanges): ranges clear
+        // of every fresh unit and storage result skip their FlushPending per dispatch (one scan of
+        // each registry), not per element; with a fresh unit under two of three ranges the scan
+        // hits and every range takes FlushPending, so both units are published (an "imported
+        // buffer region" publishes the whole range). Under the one-slab budget unit 6's slab
+        // evicts the second slab first (unit 128 published).
+        const auto unit6 = unit5 + unit;
+        const auto unit7 = unit6 + unit;
+        retile(*ShadowDestinationFor(context, *import, unit6, unit7), unit6, unit, 0xaa, false);
+        retile(*ShadowDestinationFor(context, *import, unit7, unit7 + unit), unit7, unit, 0xbb, false);
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 2> clear{{{unit3, unit3 + 64}, {unit4 + 64, unit4 + 128}}};
+        Require(FlushFastDispatchRanges(clear, true) && !FlushFastDispatchRanges(clear, false), "ranges clear of every shadow did not skip their flush per dispatch, or skipped it per element");
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 3> hit{{{unit3, unit3 + 64}, {unit6 + 64, unit6 + 128}, {unit7, unit7 + 16}}};
+        Require(AnyShadowedOverlaps(unit6, unit) && AnyShadowedOverlaps(unit7, unit), "units 6 and 7 are not shadowed");
+        Require(!FlushFastDispatchRanges(hit, true), "a range over a fresh unit did not make the ranges take FlushPending");
+        Require(!AnyShadowedOverlaps(unit6, unit) && !AnyShadowedOverlaps(unit7, unit), "a range's fresh unit was not published: not every range took FlushPending");
+        recorder.Sync();
+        Require(words[6 * unit] == 0xaa && words[7 * unit - 1] == 0xaa && words[7 * unit] == 0xbb && words[8 * unit - 1] == 0xbb, "the flushed ranges' units did not reach the import");
+    }
     // Retire through the registry: the block is re-registered as its first five units, so the next
     // lookup reconciles and retires the import; the fresh units still inside a registered range
     // are published into its (kept) buffer, the rest (memory the title took back) are dropped.
-    // Under the one-slab budget unit 5's slab evicts the second one first (unit 128 published).
+    // Under the one-slab budget the second slab was evicted above, by unit 6's (unit 128 published).
     retile(*ShadowDestinationFor(context, *import, unit5, unit5 + unit), unit5, unit, 0x88, false);
     retile(*ShadowDestinationFor(context, *import, address + 2 * unit, unit3), address + 2 * unit, unit, 0x99, false);
     Require(AnyShadowedOverlaps(unit5, unit) && AnyShadowedOverlaps(address + 2 * unit, unit), "units 2 and 5 are not shadowed before the retire");
@@ -2912,6 +3111,7 @@ int main() {
         readTrackingTests(device, recorder);
         writeSettledTests(device, recorder);
         pendingBlockTests(device, recorder);
+        fastReaderPendingTests(recorder);
         completionCountTests(device, recorder);
         afterRecordedWorkTests(device, recorder);
         batchStampTests(recorder);
@@ -2928,6 +3128,7 @@ int main() {
         RunResidentPresentTests(device.GetContext());
         storeRunTests(device, recorder);
         remappedImportTests(device);
+        batchedImportTests(device);
         movedMetadataTests(device, recorder);
         keysFillTests(device, recorder);
         unitShadowTests(device, recorder);

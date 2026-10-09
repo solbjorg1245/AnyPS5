@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -51,15 +53,44 @@ struct FastDispatchCall {
 // resolving the bindings, recording; the guest buffer elements bound in place with a non-zero
 // offset adjustment (the old path binds a copy of those, so verify cannot compare them); whether
 // the leading barrier was elided, whether the ring was full at the first ask. `recorded`: commands
-// went into the batch, so a throw after it must not fall back.
+// went into the batch, so a throw after it must not fall back. Under APS5_PROFILE_DRAW the resolve
+// is split too: the guest buffer elements (V# checks and the committed test) and data bindings,
+// the sampled and storage images, the samplers, the flush of storage results over the in-place
+// ranges, the ring regions, the imports; `elements` counts the in-place elements. `flushSkipped`:
+// one scan found no storage result and no unit shadow over any in-place range, so no element took
+// FlushPending.
 struct FastDispatchTiming {
     std::uint64_t resolveNs = 0;
     std::uint64_t recordNs = 0;
+    std::uint64_t buffersNs = 0;
+    std::uint64_t imagesNs = 0;
+    std::uint64_t samplersNs = 0;
+    std::uint64_t flushNs = 0;
+    std::uint64_t ringNs = 0;
+    std::uint64_t importsNs = 0;
     std::uint32_t adjusted = 0;
+    std::uint32_t elements = 0;
     bool leadSkipped = false;
     bool ringFull = false;
     bool recorded = false;
+    bool flushSkipped = false;
 };
+
+// Whether RecordFastDispatch resolves its in-place elements per dispatch (the default): one scan
+// of the storage-result and unit-shadow registries for all of them (an element then takes
+// FlushPending only when the scan found something) and one hold of the import registry's lock for
+// all their imports (HostImportsFor). APS5_FAST_DISPATCH_PER_ELEMENT=1 makes the per-element
+// calls as before.
+bool FastDispatchBatchedElements();
+
+// RecordFastDispatch's step 1 flush over its in-place element ranges (UploadFinish's rule):
+// StorageTexture::FlushPending of each range in order ("imported buffer region"). Batched, one scan
+// of the storage-result registry (AnyPendingOverlaps: a superset of what FlushPending lists) and one
+// of the unit shadows (AnyShadowedOverlaps: PublishShadowsOnly's test) cover all of them first; when
+// neither finds anything every FlushPending would store and publish nothing, so none is made.
+// Returns whether that scan spared the ranges their FlushPending. Under GuestMemory::GpuMutex (the
+// shadow registry changes only under it).
+bool FlushFastDispatchRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, bool batched);
 
 // The declines of RecordFastDispatch that follow from the walked words and the configuration
 // alone: a V# a build rejects (the adjustment slot a build requires of every element included), a

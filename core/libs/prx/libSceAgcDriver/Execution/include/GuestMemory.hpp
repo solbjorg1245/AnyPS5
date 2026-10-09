@@ -28,6 +28,9 @@ struct Commitment {
     bool whole = false;
 };
 Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writable = false);
+// DescribeCommitted(...).whole without building the ranges (no allocation): the same walk, the
+// same page queries, the same throws.
+bool CommittedWhole(std::uint64_t address, std::size_t bytes, bool writable = false);
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment = 1);
 // Variants for resources in heaps the guest commits on demand (partially resident textures, GPU
 // scratch heaps): uncommitted pages read as zeros, are not compared, and are never stored.

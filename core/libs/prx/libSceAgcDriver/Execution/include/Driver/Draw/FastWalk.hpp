@@ -56,10 +56,11 @@ using FastWalkDecline = WalkDecline;
 // The vertex fetch of a vertex-family stage through the direct reader: the header part memoized per
 // program (DecodeVertexFetchPlan) and the live attribute and V# words, the stage info
 // DecodeVertexStageInfo would build. `programs` are the draw's: their registered regions are read first.
-std::optional<FastWalkDecline> FastResolveVertex(std::span<const DrawProgram> programs, const DrawProgram& program, ShaderRecompiler::ShaderVertexStageInfo& info);
+// `pending` (when given) receives the reader's pending-block reads (FastPendingReads), as below.
+std::optional<FastWalkDecline> FastResolveVertex(std::span<const DrawProgram> programs, const DrawProgram& program, ShaderRecompiler::ShaderVertexStageInfo& info, FastPendingReads* pending = nullptr);
 // The express walk of one stage over its live user words through the direct reader
 // (ShaderRecompiler::WalkResources).
-std::optional<FastWalkDecline> FastWalkStage(std::span<const DrawProgram> programs, const ShaderRecompiler::SourceHandle& handle, const DrawProgram& program, ShaderRecompiler::ResourceSnapshot& snapshot, ShaderRecompiler::ResourceSpecialization& specialization);
+std::optional<FastWalkDecline> FastWalkStage(std::span<const DrawProgram> programs, const ShaderRecompiler::SourceHandle& handle, const DrawProgram& program, ShaderRecompiler::ResourceSnapshot& snapshot, ShaderRecompiler::ResourceSpecialization& specialization, FastPendingReads* pending = nullptr);
 
 }
 

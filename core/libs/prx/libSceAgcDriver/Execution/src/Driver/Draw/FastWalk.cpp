@@ -46,12 +46,23 @@ struct WalkCounters {
     std::array<std::array<std::uint64_t, static_cast<std::size_t>(WalkMismatch::Count)>, 2> mismatches{};
     std::array<std::uint64_t, 2> stagesMismatched{};
     std::uint64_t feedbackOnly = 0, flatFeedback = 0, deferredSkipped = 0, exceptions = 0;
+    // The census walks' reads that met a pending block, and those the exact ranges let through.
+    FastPendingReads pending;
     std::unordered_map<std::uint64_t, ProgramCost> programs;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
 HostMutex countersMutex;
 WalkCounters counters;
+
+// Adds a reader's pending-block reads to the caller's tally (when it keeps one) on every exit.
+struct PendingTally {
+    const FastReader& reader;
+    FastPendingReads* pending;
+    ~PendingTally() {
+        if (pending != nullptr) pending->Add(reader);
+    }
+};
 
 // The memoized header part of the vertex fetch, per registered program.
 struct FetchPlanEntry {
@@ -117,7 +128,7 @@ void report(WalkCounters& total, std::uint32_t every) {
         std::snprintf(item, sizeof(item), "%s0x%llx %llu stages %.1f us each (%.1f ms)", i == 0 ? " " : ", ", static_cast<unsigned long long>(program), count(cost.stages), cost.stages != 0 ? static_cast<double>(cost.ns) / 1000.0 / static_cast<double>(cost.stages) : 0.0, static_cast<double>(cost.ns) / 1e6);
         programs += item;
     }
-    std::fprintf(stderr, "[fastpath] walk (10 s, every %u draws): %llu draws, %llu stages, %llu walked (%.1f%%); walk %.2f us per stage (request and source handle %.2f, walk %.2f, vertex fetch %.2f), %.1f reads and %.2f page queries per stage; compare %.2f us per walked stage (populate %.2f); walk and compare us per stage by packet: direct draws %.2f over %llu stages, indirect draws %.2f over %llu stages; costliest programs:%s; declines: %s; mismatched stages %llu, after heuristic hits %llu; mismatches by kind (plain/heuristic): %s; T# feedback-only differences %llu, flat T# copies differing in feedback bits only %llu, deferred words skipped %llu, exceptions %llu\n", every, count(total.draws), count(total.stages), count(total.walked), 100.0 * static_cast<double>(total.walked) / stages, perStage(total.walkNs), perStage(total.handleNs), perStage(total.materializeNs), perStage(total.vertexNs), static_cast<double>(total.reads) / stages, static_cast<double>(total.queries) / stages, static_cast<double>(total.compareNs) / 1000.0 / walked, static_cast<double>(total.populateNs) / 1000.0 / walked, perKind(0), count(total.kindStages[0]), perKind(1), count(total.kindStages[1]), programs.empty() ? " none" : programs.c_str(), declines.c_str(), count(total.stagesMismatched[0]), count(total.stagesMismatched[1]), kinds.c_str(), count(total.feedbackOnly), count(total.flatFeedback), count(total.deferredSkipped), count(total.exceptions));
+    std::fprintf(stderr, "[fastpath] walk (10 s, every %u draws): %llu draws, %llu stages, %llu walked (%.1f%%); walk %.2f us per stage (request and source handle %.2f, walk %.2f, vertex fetch %.2f), %.1f reads and %.2f page queries per stage; compare %.2f us per walked stage (populate %.2f); walk and compare us per stage by packet: direct draws %.2f over %llu stages, indirect draws %.2f over %llu stages; costliest programs:%s; declines: %s; mismatched stages %llu, after heuristic hits %llu; mismatches by kind (plain/heuristic): %s; T# feedback-only differences %llu, flat T# copies differing in feedback bits only %llu, deferred words skipped %llu, exceptions %llu; pending-block reads %llu, read past by the exact ranges %llu%s\n", every, count(total.draws), count(total.stages), count(total.walked), 100.0 * static_cast<double>(total.walked) / stages, perStage(total.walkNs), perStage(total.handleNs), perStage(total.materializeNs), perStage(total.vertexNs), static_cast<double>(total.reads) / stages, static_cast<double>(total.queries) / stages, static_cast<double>(total.compareNs) / 1000.0 / walked, static_cast<double>(total.populateNs) / 1000.0 / walked, perKind(0), count(total.kindStages[0]), perKind(1), count(total.kindStages[1]), programs.empty() ? " none" : programs.c_str(), declines.c_str(), count(total.stagesMismatched[0]), count(total.stagesMismatched[1]), kinds.c_str(), count(total.feedbackOnly), count(total.flatFeedback), count(total.deferredSkipped), count(total.exceptions), count(total.pending.inBlocks), count(total.pending.readPast), FastPendingExact() ? "" : " (APS5_FAST_PENDING_BLOCKS: blocks only)");
 }
 
 std::uint64_t nanosecondsBetween(std::chrono::steady_clock::time_point started, std::chrono::steady_clock::time_point ended) {
@@ -197,6 +208,7 @@ void ShadowWalkDraw(const FastWalkDraw& draw) {
             local.walkNs += nanosecondsBetween(started, fetched);
             local.reads += reader.reads;
             local.queries += reader.queries;
+            local.pending.Add(reader);
             if (status != WalkStatus::Walked) {
                 ++local.declines[static_cast<std::size_t>(WalkDeclineOf(status, reader))];
                 noteStage(program.binary.codeAddress, nanosecondsBetween(started, fetched));
@@ -266,6 +278,7 @@ void ShadowWalkDraw(const FastWalkDraw& draw) {
     }
     total.reads += local.reads;
     total.queries += local.queries;
+    total.pending.Add(local.pending);
     for (std::size_t reason = 0; reason < total.declines.size(); ++reason) total.declines[reason] += local.declines[reason];
     for (std::size_t column = 0; column < 2; ++column) {
         total.stagesMismatched[column] += local.stagesMismatched[column];
@@ -280,9 +293,10 @@ void ShadowWalkDraw(const FastWalkDraw& draw) {
     total = WalkCounters{};
 }
 
-std::optional<FastWalkDecline> FastResolveVertex(std::span<const DrawProgram> programs, const DrawProgram& program, ShaderRecompiler::ShaderVertexStageInfo& info) {
+std::optional<FastWalkDecline> FastResolveVertex(std::span<const DrawProgram> programs, const DrawProgram& program, ShaderRecompiler::ShaderVertexStageInfo& info, FastPendingReads* pending) {
     auto& scratch = HostThreadLocal<WalkScratch, WalkScratchTag>();
     FastReader reader{programs};
+    const PendingTally tally{reader, pending};
     try {
         if (Graphics::ResolveVertexFetch(fetchPlanFor(scratch, program), program.userData, &FastSrtRead, &reader, info)) return std::nullopt;
     } catch (const std::exception&) {
@@ -291,8 +305,9 @@ std::optional<FastWalkDecline> FastResolveVertex(std::span<const DrawProgram> pr
     return reader.declined.value_or(WalkDecline::Failed);
 }
 
-std::optional<FastWalkDecline> FastWalkStage(std::span<const DrawProgram> programs, const ShaderRecompiler::SourceHandle& handle, const DrawProgram& program, ShaderRecompiler::ResourceSnapshot& snapshot, ShaderRecompiler::ResourceSpecialization& specialization) {
+std::optional<FastWalkDecline> FastWalkStage(std::span<const DrawProgram> programs, const ShaderRecompiler::SourceHandle& handle, const DrawProgram& program, ShaderRecompiler::ResourceSnapshot& snapshot, ShaderRecompiler::ResourceSpecialization& specialization, FastPendingReads* pending) {
     FastReader reader{programs};
+    const PendingTally tally{reader, pending};
     ShaderRecompiler::SrtRuntime runtime;
     runtime.userContext = &reader;
     runtime.readMemory = &FastSrtRead;

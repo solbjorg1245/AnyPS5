@@ -1511,6 +1511,10 @@ bool Recorder::QueuedLabelOverlapsThisThread(std::uint64_t address, std::size_t 
     return true;
 }
 
+bool Recorder::QueuedLabelOverlapsThisThreadUncounted(std::uint64_t address, std::size_t bytes) {
+    return !QueuedLabelRanges().empty() && QueuedLabelOverlaps(address, bytes);
+}
+
 std::shared_ptr<const Recorder::WriteRanges> Recorder::PendingWriteSnapshot() {
     return pendingWrites.load(std::memory_order_acquire);
 }

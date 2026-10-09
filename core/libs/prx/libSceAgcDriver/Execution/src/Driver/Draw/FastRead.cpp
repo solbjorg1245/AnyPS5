@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 namespace AgcDriver::DriverDetail {
@@ -14,6 +15,32 @@ namespace {
 
 constexpr std::uint64_t NullPageBytes = 0x10000;
 constexpr std::uint64_t ReaderPageBytes = 0x1000;
+
+// Whether a pending write overlaps the word at `address` (in a pending block): the exact ranges of
+// the pending-write snapshot, the set the old capture's classifyPendingWrite and the flush hook
+// test. It holds every range noted into the open, in-flight and finishing batches, and every
+// range that marks a pending block is such a note (Recorder::noteWrite, noteWriteOn); a range
+// leaves it when its batch finished, after its completions ran and its blocks cleared (or when the
+// batch's fence failed: its work never lands, and the old path's reads stop waiting for it too).
+// The snapshot the reader holds is reloaded whenever the publish generation moved since it was
+// loaded (the generation moves right after each publish), so a read sees every range published
+// before it. A range whose block mark is visible but whose publish is not yet is a note in
+// progress on the noting thread (which holds GuestMemory::GpuMutex). Into the open batch it is
+// published, fenced and only then submitted, so the word still holds what a read ordered before
+// the note sees. Into an in-flight batch (Recorder::noteWriteOn: a completion label appended to a
+// submitted batch) the GPU may have stored the word already; the old capture's PendingView loads
+// the same snapshot in that window and reads the word raw as well (classifyPendingWrite: no
+// overlap, None), so this read gives what the old path gives. The block test alone was stricter
+// than the old path there.
+bool exactPendingOverlap(FastReader& reader, std::uint64_t address) {
+    const auto generation = Graphics::Recorder::PublishGeneration();
+    if (!reader.snapshotLoaded || generation != reader.snapshotGeneration) {
+        reader.snapshot = Graphics::Recorder::PendingWriteSnapshot();
+        reader.snapshotGeneration = generation;
+        reader.snapshotLoaded = true;
+    }
+    return Graphics::Recorder::SnapshotOverlaps(reader.snapshot.get(), address, sizeof(std::uint32_t));
+}
 
 // The registered region holding the word, served from its bytes as ShaderMemory serves it; false
 // when no region holds it. `boundary`: a region holds the address but not the whole word.
@@ -53,6 +80,14 @@ WalkMismatch mismatchOf(ShaderRecompiler::DescriptorRole role) {
 
 }
 
+bool FastPendingExact() {
+    static const bool exact = [] {
+        const char* value = std::getenv("APS5_FAST_PENDING_BLOCKS");
+        return value == nullptr || std::strcmp(value, "0") == 0;
+    }();
+    return exact;
+}
+
 bool FastSrtRead(void* context, std::uint64_t address, std::uint32_t* value) {
     auto& reader = *static_cast<FastReader*>(context);
     ++reader.reads;
@@ -74,11 +109,19 @@ bool FastSrtRead(void* context, std::uint64_t address, std::uint32_t* value) {
         *value = 0;
         return true;
     }
+    // The 64 KiB block is the prefilter; a word in a pending block that no pending range overlaps
+    // reads as the old capture reads it (raw).
     if (Graphics::Recorder::BlockPending(address)) {
-        reader.declined = WalkDecline::Pending;
-        return false;
+        ++reader.pendingInBlocks;
+        if (!reader.exactPending || exactPendingOverlap(reader, address)) {
+            reader.declined = WalkDecline::Pending;
+            return false;
+        }
+        ++reader.pendingPassed;
     }
-    if (Graphics::Recorder::QueuedLabelOverlapsThisThread(address, sizeof(*value))) {
+    // The uncounted query: the [labels] line's "capture pages read word-wise over a queued label"
+    // counts the old capture's page queries only (a declined walk's old path counts its own).
+    if (Graphics::Recorder::QueuedLabelOverlapsThisThreadUncounted(address, sizeof(*value))) {
         reader.declined = WalkDecline::QueuedLabel;
         return false;
     }
