@@ -1,7 +1,10 @@
 #include "GraphicsTests.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -113,6 +116,69 @@ void RunTextureTilingTests() {
     Require(compressed.size() == 1 && compressed[0].tiledSize == 65536 && compressed[0].linearSize != 0, "block compressed render target layout is wrong");
     Require(ComputeMipLayout(TextureTileMode::RenderTarget64KB, 132, 64, 64, 1).size() == 1, "format 132 render target layout is missing");
     reject([] { ComputeMipLayout(TextureTileMode::RenderTarget64KB, 74, 64, 64, 1); }, "unsupported bytes per element");
+
+    {
+        // The retile's written bytes (the GPU-direct write-back seeds only the rest of the stored
+        // ranges): whole tile blocks inside the extent, row by row; a linear row's elements.
+        using Ranges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+        const auto exact = ComputeElementMipLayout(TextureTileMode::kStandard4KB, 4, 64, 64, 1);
+        Require(RetileWrittenRanges(TextureTileMode::kStandard4KB, 4, exact[0], false) == Ranges{{0, exact[0].tiledSize}}, "a mip of whole tile blocks must be written whole");
+        const auto edges = ComputeElementMipLayout(TextureTileMode::kStandard256B, 4, 20, 17, 1);
+        Require(edges[0].blocksPerRow == 3 && edges[0].tiledSize == 9u * 256u, "standard 256B 20x17 layout changed");
+        Require(RetileWrittenRanges(TextureTileMode::kStandard256B, 4, edges[0], false) == Ranges{{0, 512}, {768, 1280}}, "tile blocks the extent covers in part must be left to the seed");
+        const auto target = ComputeMipLayout(TextureTileMode::RenderTarget64KB, 56, 257, 129, 1);
+        Require(RetileWrittenRanges(TextureTileMode::RenderTarget64KB, 4, target[0], false) == Ranges{{0, 131072}}, "the padded third block column and second block row must be left to the seed");
+        const auto linear = ComputeElementMipLayout(TextureTileMode::kLinear, 4, 4, 2, 1);
+        Require(linear[0].pitchBytes == 256, "linear 4x2 pitch changed");
+        Require(RetileWrittenRanges(TextureTileMode::kLinear, 4, linear[0], false) == Ranges{{0, 16}, {256, 272}}, "linear row padding must be left to the seed");
+        const auto dense = ComputeElementMipLayout(TextureTileMode::kLinear, 4, 64, 3, 1);
+        Require(RetileWrittenRanges(TextureTileMode::kLinear, 4, dense[0], false) == Ranges{{0, 768}}, "unpadded linear rows must merge");
+        const auto chain = ComputeElementMipLayout(TextureTileMode::kStandard64KB, 4, 1024, 1024, 11);
+        Require(RetileWrittenRanges(TextureTileMode::kStandard64KB, 4, chain[0], false) == Ranges{{0, chain[0].tiledSize}}, "a 1024x1024 base level must be written whole");
+        Require(RetileWrittenRanges(TextureTileMode::kStandard64KB, 4, chain[0], true).empty(), "thick mips must be seeded whole");
+        bool tailSeen = false;
+        for (const auto& mip : chain) {
+            const auto written = RetileWrittenRanges(TextureTileMode::kStandard64KB, 4, mip, false);
+            if (mip.tail) {
+                tailSeen = true;
+                Require(written.empty(), "tail mips must be seeded whole");
+            }
+            for (std::size_t index = 0; index < written.size(); ++index) {
+                const auto [begin, end] = written[index];
+                Require(begin < end && end <= mip.tiledSize && begin % 65536 == 0 && end % 65536 == 0, "written ranges must be whole blocks of the mip");
+                Require(index == 0 || written[index - 1].second < begin, "written ranges must be sorted and merged");
+            }
+        }
+        Require(tailSeen, "the 64KB chain must reach the mip tail");
+
+        Require(SubtractByteRanges({{200, 300}, {0, 100}}, {{50, 250}}) == Ranges{{0, 50}, {250, 300}}, "range subtraction must split and sort");
+        Require(SubtractByteRanges({{0, 100}}, {{80, 100}, {0, 40}, {30, 60}}) == Ranges{{60, 80}}, "range subtraction must take overlapping removals in any order");
+        Require(SubtractByteRanges({{0, 10}, {10, 20}}, {}) == Ranges{{0, 20}}, "range subtraction must merge adjacent ranges");
+        Require(SubtractByteRanges({{0, 100}}, {{0, 100}}).empty() && SubtractByteRanges({}, {{0, 100}}).empty(), "range subtraction must drop covered ranges");
+
+        // A block wholly inside the extent is written whole only if its swizzle sends the block's
+        // elements to distinct element slots of the block, whatever the block's position and slice
+        // (the XOR swizzles mix those in).
+        for (const auto& equation : kTextureSwizzleEquations) {
+            if (equation.swizzleMode >= 0x100u) continue;
+            const auto block = ThinBlockLayout(TextureTileMode::kStandard64KB, equation.elementBytes);
+            for (const auto& [blockX, blockY, slice] : std::array<std::array<std::uint32_t, 3>, 2>{{{0u, 0u, 0u}, {3u, 1u, 5u}}}) {
+                std::vector<bool> seen(65536u / equation.elementBytes, false);
+                for (std::uint32_t y = blockY * block[2]; y < (blockY + 1u) * block[2]; ++y) {
+                    for (std::uint32_t x = blockX * block[1]; x < (blockX + 1u) * block[1]; ++x) {
+                        std::uint32_t offset = 0;
+                        for (std::uint32_t bit = 0; bit < 16u; ++bit) {
+                            const auto mask = equation.bits[bit];
+                            const auto selected = (x & (mask & 0xfffu)) ^ ((y << 12) & (mask & 0xfff000u)) ^ ((slice << 24) & (mask & 0xff000000u));
+                            offset |= static_cast<std::uint32_t>(std::popcount(selected) & 1) << bit;
+                        }
+                        Require(offset % equation.elementBytes == 0 && !seen[offset / equation.elementBytes], "a swizzle equation must permute the elements of a block");
+                        seen[offset / equation.elementBytes] = true;
+                    }
+                }
+            }
+        }
+    }
 
     reject([] { ComputeMipLayout(TextureTileMode::kLinear, 1, 0, 4, 1); }, "zero-sized texture");
     reject([] { ComputeMipLayout(TextureTileMode::kLinear, 1, 4, 0, 1); }, "zero-sized texture");

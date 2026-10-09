@@ -101,7 +101,7 @@ std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, sta
 // made or used during a video memory pressure episode, older than the guard's last recycle) and
 // the memory type each kind was allocated from. Relaxed: only reported.
 struct RetileCounters {
-    std::atomic<std::uint64_t> writeBacks{0}, linearBytes{0}, tiledBytes{0}, slabBytes{0}, importBytes{0}, seedBytes{0};
+    std::atomic<std::uint64_t> writeBacks{0}, linearBytes{0}, tiledBytes{0}, slabBytes{0}, importBytes{0}, seedBytes{0}, scratchSeedBytes{0}, scratchSpanBytes{0};
     std::atomic<std::uint64_t> scratchMade{0}, scratchPooled{0}, scratchMadeUnderPressure{0}, usedUnderPressure{0}, scratchOlderEpoch{0};
     std::atomic<std::uint32_t> imageType{~0u}, linearType{~0u}, scratchType{~0u}, slabType{~0u}, importType{~0u};
     // The device's memory types and heaps, copied at the first write-back (the report has no context).
@@ -124,7 +124,8 @@ RetileCounters& Retiles() {
 // the guest bytes of the stored ranges are copied from the import into the scratch first, as the
 // CPU write-back starts from them. APS5_SEED_RETILE_SCRATCH=0 or APS5_NO_SEED_RETILE_SCRATCH=1
 // restores the old unseeded scratch; =zero fills it with zeros instead (no import read). Both are
-// counted on the [scratch-init] line.
+// counted on the [scratch-init] line. The import seed copies only the stored bytes the retile does
+// not write (SeedPaddingOnly).
 enum class ScratchSeed : std::uint8_t { None, Import, Zero };
 
 ScratchSeed SeedRetileScratch() {
@@ -145,6 +146,22 @@ bool PoisonRetileScratch() {
     return poison;
 }
 
+// The import seed copies only the stored bytes outside RetileWrittenRanges of the dispatched mips
+// (edge tile blocks, pitch blocks past the extent, tail blocks, linear row padding, thick mips
+// whole): the retile overwrites the rest, so the bytes copied out are the full seed's, at a
+// fraction of its import reads. Default on; APS5_SEED_PADDING_ONLY=0 or APS5_NO_SEED_PADDING_ONLY=1
+// seeds the whole stored ranges again. With APS5_POISON_RETILE_SCRATCH a byte the split misses
+// shows as magenta.
+bool SeedPaddingOnly() {
+    static const bool only = [] {
+        const char* value = std::getenv("APS5_SEED_PADDING_ONLY");
+        if (value != nullptr && *value != '\0') return std::strcmp(value, "0") != 0;
+        const char* off = std::getenv("APS5_NO_SEED_PADDING_ONLY");
+        return off == nullptr || *off == '\0' || std::strcmp(off, "0") == 0;
+    }();
+    return only;
+}
+
 // The scratch is a transfer destination only while one of them is on (the pool keys by usage).
 VkBufferUsageFlags RetileScratchInitUsage() {
     return PoisonRetileScratch() || SeedRetileScratch() != ScratchSeed::None ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u;
@@ -152,6 +169,8 @@ VkBufferUsageFlags RetileScratchInitUsage() {
 
 struct ScratchInitCounters {
     std::atomic<std::uint64_t> poisoned{0}, poisonedBytes{0}, seeded{0}, seededBytes{0}, zeroed{0}, zeroedBytes{0};
+    // The stored bytes of the seeded write-backs (what a whole seed copies).
+    std::atomic<std::uint64_t> seedSpanBytes{0};
 };
 
 ScratchInitCounters& ScratchInits() {
@@ -160,13 +179,20 @@ ScratchInitCounters& ScratchInits() {
 }
 
 // Records the scratch's first bytes ahead of the retile: the poison over the whole buffer, then the
-// seed (zeros, or the import's bytes at `seeds`: import offset, scratch offset, size). The caller's
-// barrier ahead of the retile orders these transfer writes before its shader writes.
-void InitRetileScratch(const Context& context, VkCommandBuffer commands, Recorder* recorder, VkFormat format, const DeviceBuffer& scratch, VkBuffer import, std::span<const VkBufferCopy> seeds) {
+// seed (zeros, or the import's bytes at `seeds`: import offset, scratch offset, size; `spanBytes`
+// are the stored bytes a whole seed would copy). The caller's barrier ahead of the retile orders
+// these transfer writes before its shader writes.
+void InitRetileScratch(const Context& context, VkCommandBuffer commands, Recorder* recorder, VkFormat format, const DeviceBuffer& scratch, VkBuffer import, std::span<const VkBufferCopy> seeds, std::uint64_t spanBytes) {
     const bool poison = PoisonRetileScratch();
     const auto seed = SeedRetileScratch();
     if (!poison && seed == ScratchSeed::None) return;
     auto& counters = ScratchInits();
+    if (!poison && seed == ScratchSeed::Import && seeds.empty()) {
+        // The retile writes every stored byte (SeedPaddingOnly): no copy, no barrier.
+        counters.seeded.fetch_add(1, std::memory_order_relaxed);
+        counters.seedSpanBytes.fetch_add(spanBytes, std::memory_order_relaxed);
+        return;
+    }
     // The import's bytes (host stores and earlier GPU writes included) precede the seed copies.
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     if (recorder != nullptr) Recorder::CountBarriers(Recorder::CommandClass::StorageWriteBack);
@@ -182,7 +208,10 @@ void InitRetileScratch(const Context& context, VkCommandBuffer commands, Recorde
         counters.poisoned.fetch_add(1, std::memory_order_relaxed);
         counters.poisonedBytes.fetch_add(scratch.Size(), std::memory_order_relaxed);
     }
-    if (seed != ScratchSeed::Import || seeds.empty()) return;
+    if (seed != ScratchSeed::Import) return;
+    counters.seeded.fetch_add(1, std::memory_order_relaxed);
+    counters.seedSpanBytes.fetch_add(spanBytes, std::memory_order_relaxed);
+    if (seeds.empty()) return;
     if (poison) {
         // The seed lands over the poison: write after write on the same bytes.
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -191,12 +220,13 @@ void InitRetileScratch(const Context& context, VkCommandBuffer commands, Recorde
     context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, import, scratch.Handle(), static_cast<std::uint32_t>(seeds.size()), seeds.data());
     std::uint64_t bytes = 0;
     for (const auto& copy : seeds) bytes += copy.size;
-    counters.seeded.fetch_add(1, std::memory_order_relaxed);
     counters.seededBytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
+// The bytes of one write-back's stages; scratchSeed of scratchSpan stored bytes seeded into the
+// tiled scratch from the import (InitRetileScratch).
 struct RetileBytes {
-    std::uint64_t linear = 0, tiled = 0, slab = 0, import = 0, seed = 0;
+    std::uint64_t linear = 0, tiled = 0, slab = 0, import = 0, seed = 0, scratchSeed = 0, scratchSpan = 0;
 };
 
 void noteRetile(const Context& context, const DeviceBuffer& linear, const DeviceBuffer& scratch, std::uint32_t imageType, std::uint32_t slabType, std::uint32_t importType, const RetileBytes& bytes) {
@@ -215,6 +245,8 @@ void noteRetile(const Context& context, const DeviceBuffer& linear, const Device
     c.slabBytes.fetch_add(bytes.slab, std::memory_order_relaxed);
     c.importBytes.fetch_add(bytes.import, std::memory_order_relaxed);
     c.seedBytes.fetch_add(bytes.seed, std::memory_order_relaxed);
+    c.scratchSeedBytes.fetch_add(bytes.scratchSeed, std::memory_order_relaxed);
+    c.scratchSpanBytes.fetch_add(bytes.scratchSpan, std::memory_order_relaxed);
     for (const auto* buffer : {&linear, &scratch}) {
         (buffer->Pooled() ? c.scratchPooled : c.scratchMade).fetch_add(1, std::memory_order_relaxed);
         if (buffer->MadeUnderPressure()) c.scratchMadeUnderPressure.fetch_add(1, std::memory_order_relaxed);
@@ -251,18 +283,19 @@ void reportRetiles() {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return counter.exchange(0, std::memory_order_relaxed); };
     const auto count = take(c.writeBacks);
     const auto linear = take(c.linearBytes), tiled = take(c.tiledBytes), slab = take(c.slabBytes), import = take(c.importBytes), seed = take(c.seedBytes);
+    const auto scratchSeed = take(c.scratchSeedBytes), scratchSpan = take(c.scratchSpanBytes);
     const auto made = take(c.scratchMade), pooled = take(c.scratchPooled), madeUnder = take(c.scratchMadeUnderPressure), usedUnder = take(c.usedUnderPressure), older = take(c.scratchOlderEpoch);
     if (PoisonRetileScratch() || SeedRetileScratch() != ScratchSeed::None) {
         // Cumulative over the 10 s window like the [retile] line, and printed with it.
         auto& s = ScratchInits();
         const auto poisoned = take(s.poisoned), seeded = take(s.seeded), zeroed = take(s.zeroed);
-        const auto poisonedBytes = take(s.poisonedBytes), seededBytes = take(s.seededBytes), zeroedBytes = take(s.zeroedBytes);
-        std::fprintf(stderr, "[scratch-init] (10 s) GPU-direct write-back scratch: %llu poisoned (%.1f MiB filled), %llu seeded from the import (%.1f MiB copied), %llu zero-filled (%.1f MiB)\n", static_cast<unsigned long long>(poisoned), static_cast<double>(poisonedBytes) / 1048576.0, static_cast<unsigned long long>(seeded), static_cast<double>(seededBytes) / 1048576.0, static_cast<unsigned long long>(zeroed), static_cast<double>(zeroedBytes) / 1048576.0);
+        const auto poisonedBytes = take(s.poisonedBytes), seededBytes = take(s.seededBytes), zeroedBytes = take(s.zeroedBytes), seedSpanBytes = take(s.seedSpanBytes);
+        std::fprintf(stderr, "[scratch-init] (10 s) GPU-direct write-back scratch: %llu poisoned (%.1f MiB filled), %llu seeded from the import (%.1f MiB copied of %.1f MiB stored, %s), %llu zero-filled (%.1f MiB)\n", static_cast<unsigned long long>(poisoned), static_cast<double>(poisonedBytes) / 1048576.0, static_cast<unsigned long long>(seeded), static_cast<double>(seededBytes) / 1048576.0, static_cast<double>(seedSpanBytes) / 1048576.0, SeedPaddingOnly() ? "padding only" : "whole ranges", static_cast<unsigned long long>(zeroed), static_cast<double>(zeroedBytes) / 1048576.0);
     }
     if (count == 0) return;
     const auto mib = [](std::uint64_t bytes) { return static_cast<double>(bytes) / 1048576.0; };
     const auto each = [&](std::uint64_t bytes) { return mib(bytes) / static_cast<double>(count); };
-    std::fprintf(stderr, "[retile] (10 s) %llu GPU-direct write-backs, per write-back: image->linear %.2f MiB, retiled %.2f MiB, stored %.2f MiB (unit shadow slabs %.2f, import %.2f), seeds %.2f MiB from the import; scratch buffers: %llu made (%llu during a video memory pressure episode), %llu reused from the pool, %llu older than the last recycle; write-backs during an episode %llu; memory: image %s, linear %s, scratch %s, slabs %s, import %s\n", static_cast<unsigned long long>(count), each(linear), each(tiled), each(slab + import), each(slab), each(import), each(seed), static_cast<unsigned long long>(made), static_cast<unsigned long long>(madeUnder), static_cast<unsigned long long>(pooled), static_cast<unsigned long long>(older), static_cast<unsigned long long>(usedUnder), describeMemoryType(c, c.imageType.load(std::memory_order_relaxed)).c_str(), describeMemoryType(c, c.linearType.load(std::memory_order_relaxed)).c_str(), describeMemoryType(c, c.scratchType.load(std::memory_order_relaxed)).c_str(), describeMemoryType(c, c.slabType.load(std::memory_order_relaxed)).c_str(), describeMemoryType(c, c.importType.load(std::memory_order_relaxed)).c_str());
+    std::fprintf(stderr, "[retile] (10 s) %llu GPU-direct write-backs, per write-back: image->linear %.2f MiB, retiled %.2f MiB, stored %.2f MiB (unit shadow slabs %.2f, import %.2f), seeds %.2f MiB from the import, scratch seeds %.2f of %.2f MiB; scratch buffers: %llu made (%llu during a video memory pressure episode), %llu reused from the pool, %llu older than the last recycle; write-backs during an episode %llu; memory: image %s, linear %s, scratch %s, slabs %s, import %s\n", static_cast<unsigned long long>(count), each(linear), each(tiled), each(slab + import), each(slab), each(import), each(seed), each(scratchSeed), each(scratchSpan), static_cast<unsigned long long>(made), static_cast<unsigned long long>(madeUnder), static_cast<unsigned long long>(pooled), static_cast<unsigned long long>(older), static_cast<unsigned long long>(usedUnder), describeMemoryType(c, c.imageType.load(std::memory_order_relaxed)).c_str(), describeMemoryType(c, c.linearType.load(std::memory_order_relaxed)).c_str(), describeMemoryType(c, c.scratchType.load(std::memory_order_relaxed)).c_str(), describeMemoryType(c, c.slabType.load(std::memory_order_relaxed)).c_str(), describeMemoryType(c, c.importType.load(std::memory_order_relaxed)).c_str());
 }
 
 struct StorageTraffic {
@@ -2302,20 +2335,43 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
             NoteShadowSeed(begin, end);
         }
     }
+    std::uint64_t scratchSeedBytes = 0, scratchSpanBytes = 0;
     {
         // APS5_SEED_RETILE_SCRATCH: each scratch region from the import's bytes of its window (a
-        // shared tail region once); see InitRetileScratch.
+        // shared tail region once); see InitRetileScratch. APS5_SEED_PADDING_ONLY: only the bytes
+        // of the window's range its dispatch does not write (the mip's RetileWrittenRanges, from
+        // the slice's start).
         std::vector<VkBufferCopy> scratchSeeds;
         if (SeedRetileScratch() == ScratchSeed::Import) {
             const auto importOffset = descriptor.baseAddress - import.base;
+            std::vector<std::uint64_t> seededRegions;
+            std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> written(mips.size());
+            std::vector<bool> writtenKnown(mips.size(), false);
             for (std::size_t i = 0; i < windows.size(); ++i) {
-                if (std::any_of(scratchSeeds.begin(), scratchSeeds.end(), [&](const VkBufferCopy& seed) { return seed.dstOffset == scratchPositions[i]; })) continue;
-                scratchSeeds.push_back({importOffset + windows[i].tiledBegin, scratchPositions[i], windows[i].tiledEnd - windows[i].tiledBegin});
+                const auto& window = windows[i];
+                if (std::find(seededRegions.begin(), seededRegions.end(), scratchPositions[i]) != seededRegions.end()) continue;
+                seededRegions.push_back(scratchPositions[i]);
+                scratchSpanBytes += window.tiledEnd - window.tiledBegin;
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> seeded{{window.tiledBegin, window.tiledEnd}};
+                if (SeedPaddingOnly()) {
+                    if (!writtenKnown[window.level]) {
+                        written[window.level] = RetileWrittenRanges(descriptor.tileMode, elementBytes, mips[window.level], geometry.thick);
+                        writtenKnown[window.level] = true;
+                    }
+                    const auto sliceBegin = window.tiledBegin - window.window.tiledBase;
+                    std::vector<std::pair<std::uint64_t, std::uint64_t>> covered;
+                    for (const auto& [begin, end] : written[window.level]) covered.emplace_back(sliceBegin + begin, sliceBegin + end);
+                    seeded = SubtractByteRanges(std::move(seeded), std::move(covered));
+                }
+                for (const auto& [from, to] : seeded) {
+                    scratchSeeds.push_back({importOffset + from, scratchPositions[i] + (from - window.tiledBegin), to - from});
+                    scratchSeedBytes += to - from;
+                }
             }
         }
         PoisonPooled(context, commands, *linear, PoisonSite::WriteBack);
         PoisonPooled(context, commands, *tiledScratch, PoisonSite::WriteBack);
-        InitRetileScratch(context, commands, recorder, storageFormat, *tiledScratch, import.buffer, scratchSeeds);
+        InitRetileScratch(context, commands, recorder, storageFormat, *tiledScratch, import.buffer, scratchSeeds, scratchSpanBytes);
     }
     std::vector<VkBufferImageCopy> regions;
     for (std::size_t i = 0; i < windows.size(); ++i) {
@@ -2345,6 +2401,8 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
         }
         for (const auto& copy : importCopies) moved.import += copy.size;
         for (const auto& seed : seeds) moved.seed += seed.end - seed.begin;
+        moved.scratchSeed = scratchSeedBytes;
+        moved.scratchSpan = scratchSpanBytes;
         noteRetile(context, *linear, *tiledScratch, memoryType, slabPieces.empty() ? ~0u : slabPieces.front().slab->memoryType, importCopies.empty() && seeds.empty() ? ~0u : import.memoryType, moved);
     }
     {
@@ -3868,15 +3926,36 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         toSource.image = image;
         toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
+        std::uint64_t scratchSeedBytes = 0;
         {
             // APS5_SEED_RETILE_SCRATCH: the kept ranges from the import's bytes; see InitRetileScratch.
+            // APS5_SEED_PADDING_ONLY: only their bytes outside the RetileWrittenRanges of the layers
+            // and mips dispatched below (the scratch holds the surface at its guest offsets).
             std::vector<VkBufferCopy> scratchSeeds;
             if (SeedRetileScratch() == ScratchSeed::Import) {
-                for (const auto& [from, to] : keep) scratchSeeds.push_back({importOffset + (from - descriptor.baseAddress), from - descriptor.baseAddress, to - from});
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> seeded;
+                for (const auto& [from, to] : keep) seeded.emplace_back(from - descriptor.baseAddress, to - descriptor.baseAddress);
+                if (SeedPaddingOnly()) {
+                    std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> mipWritten;
+                    for (const auto& mip : mips) mipWritten.push_back(RetileWrittenRanges(descriptor.tileMode, elementBytes, mip, geometry.thick));
+                    std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+                    for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
+                        if (storedLayers != nullptr && !(*storedLayers)[layer]) continue;
+                        for (std::size_t level = 0; level < mips.size(); ++level) {
+                            const auto base = geometry.GuestLayerOffset(layer) + mips[level].tiledOffset;
+                            for (const auto& [begin, end] : mipWritten[level]) written.emplace_back(base + begin, base + end);
+                        }
+                    }
+                    seeded = SubtractByteRanges(std::move(seeded), std::move(written));
+                }
+                for (const auto& [from, to] : seeded) {
+                    scratchSeeds.push_back({importOffset + from, from, to - from});
+                    scratchSeedBytes += to - from;
+                }
             }
             PoisonPooled(context, commands, *linear, PoisonSite::WriteBack);
             PoisonPooled(context, commands, *tiledScratch, PoisonSite::WriteBack);
-            InitRetileScratch(context, commands, recorder, storageFormat, *tiledScratch, import->buffer, scratchSeeds);
+            InitRetileScratch(context, commands, recorder, storageFormat, *tiledScratch, import->buffer, scratchSeeds, storedBytes);
         }
         const auto regions = CopyRegions(storedLayers);
         context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
@@ -3897,6 +3976,8 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             moved.linear = sliceLinearBytes * arrayLayers;
             moved.tiled = guestBytes;
             moved.import = storedBytes;
+            moved.scratchSeed = scratchSeedBytes;
+            moved.scratchSpan = SeedRetileScratch() == ScratchSeed::Import ? storedBytes : 0;
             noteRetile(context, *linear, *tiledScratch, memoryType, ~0u, import->memoryType, moved);
         }
         {

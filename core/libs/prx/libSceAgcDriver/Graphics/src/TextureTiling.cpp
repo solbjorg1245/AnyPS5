@@ -7,6 +7,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -253,6 +255,61 @@ std::array<std::uint32_t, 3> ThickBlockExtent(TextureTileMode tileMode, std::uin
 std::array<std::uint32_t, 3> ThinBlockLayout(TextureTileMode tileMode, std::uint32_t bytesPerElement) {
     const auto block = GetBlockLayout(tileMode, bytesPerElement);
     return {block.blockSize, block.blockWidth, block.blockHeight};
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> RetileWrittenRanges(TextureTileMode tileMode, std::uint32_t bytesPerElement, const TileMipLayout& mip, bool thick) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+    const auto add = [&](std::uint64_t begin, std::uint64_t end) {
+        end = std::min(end, mip.tiledSize);
+        if (begin >= end) return;
+        if (!written.empty() && written.back().second == begin) written.back().second = end;
+        else written.emplace_back(begin, end);
+    };
+    if (thick || mip.tail || mip.width == 0 || mip.height == 0) return written;
+    if (tileMode == TextureTileMode::kLinear) {
+        // TextureDetile.comp's kLinear path: element (x, y) at y * pitchBytes + x * bytesPerElement.
+        const auto rowBytes = static_cast<std::uint64_t>(mip.width) * bytesPerElement;
+        if (rowBytes > mip.pitchBytes) return written;
+        for (std::uint32_t row = 0; row < mip.height; ++row) {
+            const auto begin = static_cast<std::uint64_t>(row) * mip.pitchBytes;
+            add(begin, begin + rowBytes);
+        }
+        return written;
+    }
+    if (!std::has_single_bit(bytesPerElement) || bytesPerElement > 16u) return written;
+    // Block (bx, by) holds bytes [(by * blocksPerRow + bx) * blockSize, + blockSize) of the mip.
+    const auto block = GetBlockLayout(tileMode, bytesPerElement);
+    const auto columns = std::min(mip.width / block.blockWidth, mip.blocksPerRow);
+    const auto rows = mip.height / block.blockHeight;
+    if (columns == 0) return written;
+    for (std::uint32_t row = 0; row < rows; ++row) {
+        const auto begin = static_cast<std::uint64_t>(row) * mip.blocksPerRow * block.blockSize;
+        add(begin, begin + static_cast<std::uint64_t>(columns) * block.blockSize);
+    }
+    return written;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> SubtractByteRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges, std::vector<std::pair<std::uint64_t, std::uint64_t>> removed) {
+    std::sort(ranges.begin(), ranges.end());
+    std::sort(removed.begin(), removed.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> left;
+    const auto keep = [&](std::uint64_t begin, std::uint64_t end) {
+        if (begin >= end) return;
+        if (!left.empty() && left.back().second >= begin) left.back().second = std::max(left.back().second, end);
+        else left.emplace_back(begin, end);
+    };
+    std::size_t next = 0;
+    for (auto [begin, end] : ranges) {
+        // Removed ranges ending before this one cannot touch a later one either (sorted begins).
+        while (next < removed.size() && removed[next].second <= begin) ++next;
+        for (auto at = next; at < removed.size() && removed[at].first < end && begin < end; ++at) {
+            if (removed[at].second <= begin) continue;
+            keep(begin, removed[at].first);
+            begin = std::max(begin, removed[at].second);
+        }
+        keep(begin, end);
+    }
+    return left;
 }
 
 ThickLayout ComputeThickLayout(TextureTileMode tileMode, std::uint32_t format, std::uint32_t width, std::uint32_t height, std::uint32_t depth) {
