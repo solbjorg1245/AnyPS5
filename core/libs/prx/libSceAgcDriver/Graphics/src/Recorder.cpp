@@ -543,6 +543,10 @@ std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Recorder::FlushR
 // the bytes kept resident at the last decision, and the live guards by sequence, which the fault
 // path searches (a guard's last holder may be a completed batch, released without the GPU mutex).
 std::atomic<std::uint64_t> residentMade{0}, residentMadeBytes{0}, residentSkipped{0}, residentRefused{0}, residentRemapFlushes{0}, residentFaults{0}, residentUnderLock{0}, residentResolved{0}, residentLanded{0}, residentForced{0}, residentWaitedLanding{0};
+// Resident copies recorded at a decision because a forced release took their guard; the time
+// faulting threads spent in the resolver (queue and GPU mutex included), and the part of it spent
+// landing (Submit first, waits for running batches, the landing submission and its wait).
+std::atomic<std::uint64_t> residentUnguarded{0}, residentFaultNanos{0}, residentLandNanos{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Recorder::FlushReason::Count)> residentRecorded{};
 std::atomic<std::uint64_t> residentKeptBytes{0};
 std::atomic<bool> residentUsed{false};
@@ -1819,8 +1823,13 @@ void Recorder::flushKeepingResident(FlushReason reason, const std::function<bool
         const auto end = copy.address + copy.bytes;
         if (copy.guard != nullptr) {
             // Resident already: recorded at a changed mapping, under a label store, or once old; one
-            // a fault landed is dropped there (it only held the cap).
-            if (copy.guard->resolved || remapped || stored(copy.address, end) || copy.guard->useSerial + ResidentMaxBatches() <= submissions + 1) {
+            // a fault landed is dropped there (it only held the cap). One whose guard a fault
+            // released by force (the resolver gave up: an owner fault on a guard of the open batch,
+            // or a failure) is recorded too: unguarded, its pages would read the import's old bytes
+            // without a fault once this batch's labels land.
+            const bool unguarded = !copy.guard->resolved && !GuestWriteWatch::GuestPageGuardLive_nid_postfix(copy.guard->id);
+            if (unguarded) residentUnguarded.fetch_add(1, std::memory_order_relaxed);
+            if (copy.guard->resolved || unguarded || remapped || stored(copy.address, end) || copy.guard->useSerial + ResidentMaxBatches() <= submissions + 1) {
                 recorded.push_back(std::move(copy));
             } else {
                 residentBytes += copy.bytes;
@@ -1890,12 +1899,20 @@ std::uint64_t Recorder::ResidentCopyBytes() const {
 Recorder::ResidentStatistics Recorder::ResidentCounts() {
     ResidentStatistics counts{residentMade.load(std::memory_order_relaxed), residentMadeBytes.load(std::memory_order_relaxed), 0, residentSkipped.load(std::memory_order_relaxed), residentRefused.load(std::memory_order_relaxed), residentRemapFlushes.load(std::memory_order_relaxed), residentFaults.load(std::memory_order_relaxed), residentUnderLock.load(std::memory_order_relaxed), residentResolved.load(std::memory_order_relaxed), residentLanded.load(std::memory_order_relaxed), residentForced.load(std::memory_order_relaxed)};
     counts.waitedLanding = residentWaitedLanding.load(std::memory_order_relaxed);
+    counts.unguarded = residentUnguarded.load(std::memory_order_relaxed);
+    counts.faultNanos = residentFaultNanos.load(std::memory_order_relaxed);
+    counts.landNanos = residentLandNanos.load(std::memory_order_relaxed);
     for (const auto& recorded : residentRecorded) counts.recorded += recorded.load(std::memory_order_relaxed);
     return counts;
 }
 
 bool Recorder::ResolveResidentFault(std::uintptr_t address) {
     // From the fault handler, on any thread (the title's too): nothing may escape.
+    const auto start = std::chrono::steady_clock::now();
+    struct Timed {
+        std::chrono::steady_clock::time_point start;
+        ~Timed() { residentFaultNanos.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed); }
+    } timed{start};
     try {
         // A holder of the GPU mutex resolves here (the resolver would wait for the mutex).
         if (GuestMemory::GpuMutex().HeldByThisThread()) return ResolveResidentFaultHere(address);
@@ -1943,14 +1960,15 @@ bool Recorder::resolveResident(std::uintptr_t address, bool owner) {
         }
     }
     // A guard made at a label of the open batch holds bytes its use has not produced yet: the batch
-    // goes first, unless this thread holds the mutex (it may be recording into it): given up.
-    if (std::any_of(found.begin(), found.end(), [&](const Found& entry) { return entry.useSerial > submissions; })) {
-        if (owner || open == nullptr) {
-            residentForced.fetch_add(1, std::memory_order_relaxed);
-            return false;
-        }
-        Submit();
+    // goes first, unless this thread holds the mutex (it may be recording into it): given up (the
+    // forced release leaves the copy queued; the next decision records it, flushKeepingResident).
+    const bool ofOpenBatch = std::any_of(found.begin(), found.end(), [&](const Found& entry) { return entry.useSerial > submissions; });
+    if (ofOpenBatch && (owner || open == nullptr)) {
+        residentForced.fetch_add(1, std::memory_order_relaxed);
+        return false;
     }
+    const auto landStart = std::chrono::steady_clock::now();
+    if (ofOpenBatch) Submit();
     // Oldest first, so a newer guard's bytes win; a copy whose recording batch completed landed.
     std::sort(found.begin(), found.end(), [](const Found& left, const Found& right) { return left.sequence < right.sequence; });
     std::vector<DeferredCopy> copies;
@@ -1969,6 +1987,7 @@ bool Recorder::resolveResident(std::uintptr_t address, bool owner) {
     }
     if (copies.empty()) residentLanded.fetch_add(1, std::memory_order_relaxed);
     else landResident(copies);
+    residentLandNanos.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - landStart).count()), std::memory_order_relaxed);
     {
         std::lock_guard lock(residentMutex);
         for (const auto& entry : found) {
@@ -2794,6 +2813,16 @@ void reportBarriers() {
         }
         lastRefusals = refusals;
         std::fprintf(stderr, "; resident copies %llu made (%.1f MiB), %.1f MiB kept in %llu guards, recorded later by reason:%s, %llu dropped after a fault, %llu refused%s%s%s, %llu remap flushes; page faults %llu (%llu resolved, %llu landed already, %llu under the GPU lock, %llu forced, %llu waited for an in-flight landing)", static_cast<unsigned long long>(counts.made - last.made), (counts.madeBytes - last.madeBytes) / 1048576.0, residentKeptBytes.load(std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(guards), reasons.c_str(), static_cast<unsigned long long>(counts.skipped - last.skipped), static_cast<unsigned long long>(counts.refused - last.refused), refusedBy.empty() ? "" : " (", refusedBy.c_str(), refusedBy.empty() ? "" : ")", static_cast<unsigned long long>(counts.remapFlushes - last.remapFlushes), static_cast<unsigned long long>(pageFaults - lastPageFaults), static_cast<unsigned long long>(counts.resolved - last.resolved), static_cast<unsigned long long>(counts.landed - last.landed), static_cast<unsigned long long>(counts.underLock - last.underLock), static_cast<unsigned long long>(pageForced - lastPageForced), static_cast<unsigned long long>(counts.waitedLanding - last.waitedLanding));
+        // Page queries that met a guarded page and answered it as the guest maps it (GuestMemory
+        // guardedRun; before, such pages read as holes: zeros, skipped write-backs, refused imports).
+        static std::uint64_t lastGuardedQueries = 0;
+        const auto guardedQueries = GuestMemory::GuardedPageQueries();
+        std::fprintf(stderr, "; page queries over guards %llu", static_cast<unsigned long long>(guardedQueries - lastGuardedQueries));
+        lastGuardedQueries = guardedQueries;
+        // Copies whose guard a forced release took (recorded at the next decision; with 'forced'
+        // above, a CPU read saw the import's bytes before the copy landed), and what the faults
+        // cost the threads that took them (each landing waits for every earlier submission).
+        std::fprintf(stderr, "; %llu recorded after a forced release; fault time %.1f ms (%.1f ms landing)", static_cast<unsigned long long>(counts.unguarded - last.unguarded), (counts.faultNanos - last.faultNanos) / 1e6, (counts.landNanos - last.landNanos) / 1e6);
         last = counts;
         lastPageFaults = pageFaults;
         lastPageForced = pageForced;

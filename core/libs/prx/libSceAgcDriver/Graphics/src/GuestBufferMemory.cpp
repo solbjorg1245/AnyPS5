@@ -141,6 +141,10 @@ struct HostImports {
     PFN_vkFreeMemory freeMemory = nullptr;
     std::map<std::uint64_t, HostImport> imports;
     std::set<std::uint64_t> failed;
+    // Resident buffers (APS5_RESIDENT_BUFFERS): bases whose import could not be made while a page
+    // guard held part of the range. Not tried again (no import: CPU copies) while a guard still holds
+    // part of it, tried again once none does; never 'failed' for the guard's sake.
+    std::set<std::uint64_t> guardedMisses;
     // Span imports by base: one import over back-to-back registered ranges that are each imported
     // (`parts`, address and size), for a descriptor that crosses them. They alias the parts' host
     // pages, so writes through either are the same bytes; retired with any part (refreshImports).
@@ -333,6 +337,12 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     }
     const auto alignment = context.hostImportAlignment;
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0 || state.failed.contains(base)) return nullptr;
+    if (!state.guardedMisses.empty()) {
+        if (const auto miss = state.guardedMisses.find(base); miss != state.guardedMisses.end()) {
+            if (GuestWriteWatch::GuestPageGuardHeldWithin_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::uintptr_t>(base + bytes))) return nullptr;
+            state.guardedMisses.erase(miss);
+        }
+    }
     // Pinned imports count against the driver's system memory budget; past it ordinary host
     // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB (default 6 GiB, which covers the
     // registered memory of address-based shaders; past it they copy gigabytes per dispatch).
@@ -361,9 +371,36 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     bool writable = true;
     bool readOnly = true;
     MEMORY_BASIC_INFORMATION refused{};
+    const bool guarding = GuestWriteWatch::GuestPageGuardHolding_nid_postfix() && !GuestMemory::GuardedPagesAsHoles();
+    unsigned requeries = 0;
     for (std::uint64_t cursor = base; cursor < base + bytes;) {
         MEMORY_BASIC_INFORMATION info{};
-        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+        // A no-access page no guard explains is asked again when a guard gave pages back since
+        // (GuestPageGuardSerial: its release may have raced the guards' answer).
+        const auto guardSerial = guarding ? GuestWriteWatch::GuestPageGuardSerial_nid_postfix() : 0;
+        const bool queried = VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) != 0;
+        // Pages a resident buffer's guard holds no-access (APS5_RESIDENT_BUFFERS) are mapped to the
+        // guest all the same. A shared view is imported through its read-write alias, which the
+        // guard leaves alone; a plain page is pinned through the guest address, which the guard
+        // makes no-access, so its import waits for the guard (no import now, nothing remembered).
+        // Before, either was refused for good ('failed' until the range left the registry: CPU
+        // copies of the range from then on).
+        std::uintptr_t guardedEnd = 0;
+        if (queried && guarding && info.State == MEM_COMMIT && (info.Protect & 0xffu) == PAGE_NOACCESS) {
+            if (GuestWriteWatch::GuestPageGuardHeldRun_nid_postfix(static_cast<std::uintptr_t>(cursor), static_cast<std::uintptr_t>(base + bytes), &guardedEnd) && guardedEnd > cursor) {
+                if (info.Type != MEM_MAPPED) {
+                    state.guardedMisses.insert(base);
+                    return nullptr;
+                }
+                writable = false;
+                readOnly = false;
+                cursor = std::min<std::uint64_t>(reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize, guardedEnd);
+                continue;
+            }
+            const auto serial = GuestWriteWatch::GuestPageGuardSerial_nid_postfix();
+            if (((guardSerial & 1u) != 0 || serial != guardSerial) && requeries++ < 3) continue;
+        }
+        if (!queried || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
             state.failed.insert(base);
             return nullptr;
         }
@@ -393,6 +430,10 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     entry.unwatched = state.unwatchImports;
     VkResult result = VK_SUCCESS;
     const char* step = nullptr;
+    // A page a resident buffer's guard holds (Linux: PROT_NONE through the guest address) may be
+    // what the driver could not pin, if a guard held part of the range when the import was tried
+    // (asked before and after it: a release in between is seen too).
+    const bool guardedBefore = !GuestMemory::GuardedPagesAsHoles() && GuestWriteWatch::GuestPageGuardHeldWithin_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::uintptr_t>(base + bytes));
     GuestMemory::ImportWatched(base, bytes, [&] {
         step = createImport(context, entry, result);
         return step == nullptr;
@@ -401,8 +442,11 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
 #ifdef _WIN32
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
-        state.failed.insert(base);
-        std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d); falling back to copies\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result));
+        // Then it is tried again once no guard holds part of it (guardedMisses), not refused for good.
+        const bool guarded = !GuestMemory::GuardedPagesAsHoles() && (guardedBefore || GuestWriteWatch::GuestPageGuardHeldWithin_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::uintptr_t>(base + bytes)));
+        if (guarded) state.guardedMisses.insert(base);
+        else state.failed.insert(base);
+        std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d); falling back to copies%s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result), guarded ? " while a resident buffer's guard holds part of it (tried again once none does)" : "");
 #ifdef _WIN32
         static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
         for (std::uint64_t cursor = base; trace && cursor < base + bytes;) {
@@ -463,6 +507,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         }
         state.imports.clear();
         state.failed.clear();
+        state.guardedMisses.clear();
         state.spans.clear();
         state.spanFailed.clear();
         state.device = context.device;
@@ -487,6 +532,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         it = next;
     }
     for (auto it = state.failed.begin(); it != state.failed.end();) it = leasedRangeAt(lease, *it) != nullptr ? std::next(it) : state.failed.erase(it);
+    for (auto it = state.guardedMisses.begin(); it != state.guardedMisses.end();) it = leasedRangeAt(lease, *it) != nullptr ? std::next(it) : state.guardedMisses.erase(it);
     // A span stays while every part is still registered at its size and imported (the part imports
     // were just reconciled above).
     for (auto it = state.spans.begin(); it != state.spans.end();) {
@@ -567,6 +613,9 @@ const HostImport* importSpan(const Context& context, HostImports& state, std::ui
         if (range.address != cursor) return refuse(0, 0, "the registered ranges do not adjoin");
         if (!range.readable) return refuse(0, 0, "a registered range is not readable");
         const auto* part = importAllocation(context, state, range.address, range.bytes, lease);
+        // A part a resident buffer's guard keeps from its import for now: the span is tried again
+        // later, not refused until the registry changes.
+        if (part == nullptr && state.guardedMisses.contains(range.address)) return nullptr;
         if (part == nullptr) return refuse(0, 0, "a part has no import");
         if (part->alias != nullptr) ++aliased;
         parts.emplace_back(range.address, range.bytes);

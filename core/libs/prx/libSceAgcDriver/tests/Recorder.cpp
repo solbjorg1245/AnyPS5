@@ -4187,15 +4187,21 @@ void residentBufferTests(const Device& device, Recorder& recorder) {
         auto source = std::make_shared<Buffer>(context, sourceBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         const auto sourceByte = [](std::size_t at) { return static_cast<unsigned char>(at * 7 + 3); };
         for (std::size_t at = 0; at < sourceBytes; ++at) source->Bytes()[at] = std::byte{sourceByte(at)};
-        const auto copyOf = [&](std::uint64_t at, std::uint64_t count) {
-            return std::vector<Recorder::DeferredCopy>{Recorder::DeferredCopy{source, source.get(), source->Handle(), import->buffer, at, address + at - import->base, count, address + at}};
+        // `target`: the range's import (a new one after the range is registered again, below).
+        const HostImport* target = import;
+        const auto copyFrom = [&](std::uint64_t from, std::uint64_t at, std::uint64_t count) {
+            return std::vector<Recorder::DeferredCopy>{Recorder::DeferredCopy{source, source.get(), source->Handle(), target->buffer, from, address + at - target->base, count, address + at}};
         };
+        const auto copyOf = [&](std::uint64_t at, std::uint64_t count) { return copyFrom(at, at, count); };
         const volatile unsigned char* landed = static_cast<const unsigned char*>(block);
         const auto before = Recorder::ResidentCounts();
         // [100, 12388): pages 1 and 2 stay resident, [100, 4096) and [12288, 12388) land at Submit.
         resident.DeferCopies(copyOf(100, 12288));
         resident.Submit();
         Require(resident.HasDeferredCopies() && resident.ResidentCopyBytes() == 8192, "Submit did not keep the whole pages of a copy-back resident");
+        // Guarded, the pages are still mapped to the guest: the page queries (each asks the host here,
+        // the block is outside the arena's page-state cache) must not read them as holes.
+        Require(AgcDriver::GuestMemory::Accessible(static_cast<char*>(block) + 4096, 8192, true) && AgcDriver::GuestMemory::DescribeCommitted(address, bytes, true).whole, "a page a resident copy's guard holds read as inaccessible");
         resident.Sync();
         Require(landed[100] == sourceByte(100) && landed[4095] == sourceByte(4095) && landed[12387] == sourceByte(12387) && landed[12388] == 0 && landed[99] == 0, "the partial pages of a resident copy did not land with its batch");
         Require(landed[5000] == sourceByte(5000) && landed[9000] == sourceByte(9000), "a read of a resident page did not land its bytes");
@@ -4229,6 +4235,125 @@ void residentBufferTests(const Device& device, Recorder& recorder) {
         Require(landed[28680] == 0xA1 && landed[28683] == 0xD4 && landed[28679] == sourceByte(28679) && landed[28684] == sourceByte(28684), "a label store over a resident copy did not land after it");
         const auto counts = Recorder::ResidentCounts();
         Require(counts.made - before.made == 3 && counts.madeBytes - before.madeBytes == 8192 + 8192 + 4096 && counts.skipped - before.skipped == 1 && counts.recorded - before.recorded == 2, "resident buffer counters are off");
+        constexpr std::size_t page = 4096;
+        // A no-access page the guest made and guarded pages after it in one host region (one
+        // VirtualQuery region, one /proc/self/maps line): the queries tell them apart, the guest's
+        // page a hole, the guarded ones mapped (before, a query from the guest's page read all of
+        // them as holes).
+        {
+#ifdef _WIN32
+            auto* pages = static_cast<unsigned char*>(VirtualAlloc(nullptr, 3 * page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            DWORD previous = 0;
+            const bool hidden = pages != nullptr && VirtualProtect(pages, page, PAGE_NOACCESS, &previous) != 0;
+#else
+            void* mapped = mmap(nullptr, 3 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            auto* pages = static_cast<unsigned char*>(mapped == MAP_FAILED ? nullptr : mapped);
+            const bool hidden = pages != nullptr && mprotect(pages, page, PROT_NONE) == 0;
+#endif
+            Require(hidden, "cannot make the guest-no-access test page");
+            const auto first = reinterpret_cast<std::uintptr_t>(pages);
+            const auto id = GuestWriteWatch::GuestPageGuardProtect_nid_postfix(first + page, first + 3 * page);
+            Require(id != 0, "a guard beside a no-access page was refused");
+            const auto ranges = AgcDriver::GuestMemory::CommittedRanges(first, 3 * page, true);
+            GuestWriteWatch::GuestPageGuardRelease_nid_postfix(id);
+            Require(ranges.size() == 1 && ranges[0].first == first + page && ranges[0].second == first + 3 * page, "guarded pages after a no-access page the guest made read as holes (or the guest's page as mapped)");
+#ifdef _WIN32
+            VirtualFree(pages, 0, MEM_RELEASE);
+#else
+            munmap(pages, 3 * page);
+#endif
+        }
+        // An owner fault (a thread holding the GPU mutex: this one) on a guard made at a label of the
+        // open batch is given up (forced: the batch cannot be submitted under its recording thread)
+        // and the guard is released by force. The copy, unguarded now, is recorded at the next
+        // decision, so it lands with this batch (before, Submit kept it resident without a guard:
+        // a read after the batch's labels landed saw the import's old bytes, and its late recording
+        // could undo a CPU write).
+        {
+            const auto forcedBefore = Recorder::ResidentCounts();
+            resident.DeferCopies(copyOf(24576, page));
+            const std::array<std::byte, 4> unrelated{std::byte{0x11}, std::byte{0x22}, std::byte{0x33}, std::byte{0x44}};
+            resident.RecordStore(import->buffer, address + 10 * page - import->base, unrelated, address + 10 * page);
+            resident.FlushStores();
+            Require(resident.ResidentCopyBytes() == page, "a copy-back was not kept resident at a label");
+            static_cast<void>(landed[24576 + 5]);
+            Require(Recorder::ResidentCounts().forced - forcedBefore.forced == 1, "an owner fault on a guard of the open batch was not given up");
+            resident.Submit();
+            Require(resident.ResidentCopyBytes() == 0 && Recorder::ResidentCounts().unguarded - forcedBefore.unguarded == 1, "a resident copy whose guard was released by force was kept past Submit");
+            resident.Sync();
+            Require(landed[24576 + 5] == sourceByte(24576 + 5) && landed[24576 + page - 1] == sourceByte(24576 + page - 1) && landed[10 * page] == 0x11, "a resident copy whose guard was released by force did not land with its batch");
+        }
+        // A driver store from a thread without the GPU mutex (a queue worker's CPU-executed
+        // WRITE_DATA) into a resident page, while the mutex's holder (this thread) waits for the
+        // write tracker: the store resolves the guard before it takes the tracker (before, it faulted
+        // under the tracker; the resolver waited for the GPU mutex, its holder for the tracker: all
+        // hung). The stored bytes land after the GPU's.
+        {
+            resident.DeferCopies(copyFrom(0, 9 * page, page));
+            resident.Submit();
+            Require(resident.ResidentCopyBytes() == page, "a copy-back was not kept resident for the store test");
+            Require(GpuMutex().DepthOnThisThread() == 1, "the resident store test expects one hold of the GPU mutex");
+            const std::array<std::byte, 4> word{std::byte{0x5A}, std::byte{0x6B}, std::byte{0x7C}, std::byte{0x8D}};
+            std::atomic<bool> stored{false};
+            std::thread writer([&] {
+                AgcDriver::GuestMemory::Write(address + 9 * page + 64, word, 4);
+                stored.store(true);
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            std::atomic<bool> collected{false};
+            std::thread watchdog([&] {
+                for (int waited = 0; waited < 300 && !collected.load(); ++waited) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if (!collected.load()) {
+                    std::cerr << "a driver store into a resident page held the write tracker while its guard waited for the GPU mutex (deadlock)\n";
+                    std::_Exit(3);
+                }
+            });
+            static_cast<void>(AgcDriver::GuestMemory::CollectWritesUncached(address + 9 * page, page));
+            collected.store(true);
+            watchdog.join();
+            const bool early = stored.load();
+            GpuMutex().unlock();
+            writer.join();
+            GpuMutex().lock();
+            Require(!early, "a driver store into a resident page did not wait for its guard's landing");
+            Require(landed[9 * page + 64] == 0x5A && landed[9 * page + 67] == 0x8D && landed[9 * page + 63] == sourceByte(63) && landed[9 * page + 68] == sourceByte(68) && landed[10 * page - 1] == sourceByte(page - 1), "a driver store into a resident page did not land after the GPU's bytes");
+        }
+        // A new import of the range (registered again) while a guard holds one of its plain pages:
+        // none for now (Windows: a plain page is pinned through the guest address), but not refused
+        // for good: made once no guard holds part of it. The resident copy into the retired import
+        // still lands.
+        {
+            resident.DeferCopies(copyFrom(page, 11 * page, page));
+            resident.Submit();
+            Require(resident.ResidentCopyBytes() == page, "a copy-back was not kept resident for the import test");
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Add(block, bytes, true, true);
+            }
+#ifdef _WIN32
+            Require(HostImportFor(context, address, bytes) == nullptr, "a plain range was imported over a guarded page");
+            Require(HostImportFor(context, address, bytes) == nullptr, "a plain range was imported over a page a guard still holds");
+#else
+            static_cast<void>(HostImportFor(context, address, bytes));
+#endif
+            resident.Submit();
+            resident.Sync();
+            Require(landed[11 * page + 9] == sourceByte(page + 9) && landed[12 * page - 1] == sourceByte(2 * page - 1), "a resident copy into a retired plain import did not land");
+            target = HostImportFor(context, address, bytes);
+            Require(target != nullptr, "the import of a plain range was refused for good after a guard held one of its pages");
+            Require(HostImportFor(context, address, bytes) == target, "the import made after the guard went did not stay");
+            // The new import changed the mapping generation: the first decision after it records
+            // the copy into the new import instead of keeping it.
+            resident.DeferCopies(copyFrom(2 * page, 13 * page, page));
+            resident.Submit();
+            Require(resident.ResidentCopyBytes() == 0, "a copy-back queued after a mapping change was kept resident");
+            resident.Sync();
+            Require(landed[13 * page + 5] == sourceByte(2 * page + 5), "a copy-back into the new plain import did not land");
+        }
         // A resident copy still queued when its recorder goes lands with the teardown.
         resident.DeferCopies(copyOf(12288, 4096));
         resident.Submit();
@@ -4250,6 +4375,152 @@ void setEnvironment(const char* name, const char* value) {
 #else
     if (*value != '\0') setenv(name, value, 1);
     else unsetenv(name);
+#endif
+}
+
+// Resident buffers over a shared view, the title's case (Windows, APS5_RESIDENT_BUFFERS=1 with
+// APS5_GUARD_SHARED_VIEWS=1): the guest's GPU memory is a shared section mapped at a guest address,
+// and its host import is a second, read-write mapping of the same pages (the alias, WindowsMappings::
+// MapAlias). A resident copy's guard makes the guest's view of its pages no-access and leaves the
+// alias alone, so the GPU's import still reads and writes them. To the guest the pages stay mapped:
+// the driver's page queries (Accessible, DescribeCommitted, ReadCommitted: the page-state cache
+// forgotten, as after any mapping change) and a new import of the range must see them so, and a read
+// lands the GPU's bytes, visible through both mappings. t419: the queries read guarded pages as
+// holes (zeros, skipped write-backs) and refused their imports for good.
+void residentSharedViewTests(const Device& device, Recorder& recorder) {
+#ifdef _WIN32
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0 || !AgcDriver::GuestMemory::WriteWatched()) {
+        std::cout << "host imports or the write-watched arena unavailable: resident shared views not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 65536;
+    constexpr std::size_t page = 4096;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, static_cast<DWORD>(bytes), nullptr);
+    Require(section != nullptr, "cannot create the resident shared view test section");
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    Require(block != nullptr, "cannot reserve the resident shared view test range");
+    GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    auto* guest = static_cast<volatile unsigned char*>(block);
+    for (std::size_t at = 0; at < bytes; ++at) guest[at] = 0;
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr) {
+        std::cout << "host import of the resident shared view test range refused: resident shared views not tested\n";
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+        }
+        GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        CloseHandle(section);
+        return;
+    }
+    Require(import->alias != nullptr, "a shared view was imported without its read-write alias");
+    setSwitch("APS5_GUARD_SHARED_VIEWS", "1");
+    {
+        setEnvironment("APS5_RESIDENT_BUFFERS", "1");
+        Recorder resident(context);
+        setEnvironment("APS5_RESIDENT_BUFFERS", "");
+        resident.Activate();
+        constexpr std::size_t sourceBytes = 65536;
+        auto source = std::make_shared<Buffer>(context, sourceBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        const auto sourceByte = [](std::size_t at) { return static_cast<unsigned char>(at * 7 + 3); };
+        for (std::size_t at = 0; at < sourceBytes; ++at) source->Bytes()[at] = std::byte{sourceByte(at)};
+        const auto copyInto = [&](const HostImport* into, std::uint64_t at, std::uint64_t count) {
+            return std::vector<Recorder::DeferredCopy>{Recorder::DeferredCopy{source, source.get(), source->Handle(), into->buffer, at, address + at - into->base, count, address + at}};
+        };
+        auto* guarded = static_cast<char*>(block) + page;
+        // The page states are known (cached) before the guard, as the title's are.
+        Require(AgcDriver::GuestMemory::Accessible(block, bytes, true), "the shared view test range is not accessible");
+        // [100, 12388): pages 1 and 2 stay resident under a guard of the view, the rest land at Submit.
+        resident.DeferCopies(copyInto(import, 100, 12288));
+        resident.Submit();
+        Require(resident.ResidentCopyBytes() == 2 * page, "Submit did not keep the whole pages of a shared view's copy-back resident (guard refused)");
+        resident.Sync();
+        const auto* alias = static_cast<const volatile unsigned char*>(import->alias);
+        Require(guest[100] == sourceByte(100) && guest[12387] == sourceByte(12387) && alias[100] == sourceByte(100), "the partial pages of a shared view's resident copy did not land with its batch");
+        Require(alias[page + 904] == 0, "the alias held a resident copy's bytes before anything landed them");
+        // A mapping change elsewhere makes the page states be asked again: guarded, they are what the
+        // guest maps (read-write), not holes.
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address, bytes);
+        // The answers before the fix (debug aid APS5_GUARD_PAGES_AS_HOLES=1): holes (t419).
+        AgcDriver::GuestMemory::SetGuardedPagesAsHoles(true);
+        const bool holes = !AgcDriver::GuestMemory::Accessible(guarded, 2 * page, true) && !AgcDriver::GuestMemory::DescribeCommitted(address, bytes, true).whole;
+        AgcDriver::GuestMemory::SetGuardedPagesAsHoles(false);
+        Require(holes, "APS5_GUARD_PAGES_AS_HOLES=1 did not read the guarded pages as holes");
+        const auto queriesBefore = AgcDriver::GuestMemory::GuardedPageQueries();
+        Require(AgcDriver::GuestMemory::Accessible(guarded, 2 * page, true), "a guarded page of a shared view read as inaccessible");
+        Require(AgcDriver::GuestMemory::GuardedPageQueries() > queriesBefore, "the guarded page query was not counted");
+        Require(AgcDriver::GuestMemory::DescribeCommitted(address, bytes, true).whole && AgcDriver::GuestMemory::CommittedWhole(address, bytes), "a shared view range with a guarded page read as sparse");
+        // A read through the queries lands the bytes (it faults into the resolver) instead of zeros.
+        std::vector<std::byte> read(2 * page);
+        AgcDriver::GuestMemory::ReadCommitted(address + page, read);
+        Require(read[904] == std::byte{sourceByte(page + 904)} && read[2 * page - 1] == std::byte{sourceByte(3 * page - 1)}, "a committed read of a guarded shared view page did not land the GPU's bytes");
+        Require(alias[page + 904] == sourceByte(page + 904), "the landed bytes are not seen through the import's alias");
+        // A write after the landing survives the next command, through both mappings.
+        guest[page + 7] = 0xEE;
+        static_cast<void>(resident.Commands());
+        resident.Submit();
+        resident.Sync();
+        Require(guest[page + 7] == 0xEE && alias[page + 7] == 0xEE, "a resident copy a read landed was recorded again over a later CPU write");
+        // The first decision with a copy queued after a mapping change records it (an import it
+        // stores into may retire), so nothing stays resident then; the bytes land with that batch.
+        const auto settle = [&](const HostImport* into, std::uint64_t at) {
+            resident.DeferCopies(copyInto(into, at, page));
+            resident.Submit();
+            Require(resident.ResidentCopyBytes() == 0, "a copy-back queued after a mapping change was kept resident");
+            resident.Sync();
+            Require(guest[at + 5] == sourceByte(at + 5), "a copy-back recorded after a mapping change did not land");
+        };
+        settle(import, 12 * page);
+        // A new import of the range (its registration changed) while a guard holds pages of it: the
+        // alias import is made (before, it was refused for good), and the copy into the retired
+        // import still lands.
+        resident.DeferCopies(copyInto(import, 4 * page, 2 * page));
+        resident.Submit();
+        Require(resident.ResidentCopyBytes() == 2 * page, "a page-aligned copy-back of a shared view was not kept resident");
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+        }
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(block, bytes, true, true);
+        }
+        const auto* renewed = HostImportFor(context, address, bytes);
+        Require(renewed != nullptr && renewed->alias != nullptr, "the import of a shared view with a guarded page was refused");
+        resident.Submit();
+        resident.Sync();
+        Require(HostImportFor(context, address, bytes) == renewed, "the import made over a guarded page did not stay");
+        for (std::size_t at = 4 * page; at < 6 * page; at += 509) {
+            if (guest[at] != sourceByte(at)) throw std::runtime_error("a resident copy into a retired shared view import stored the wrong byte at offset " + std::to_string(at));
+        }
+        settle(renewed, 13 * page);
+        // Recorded into the new import by a command: the bytes land through its alias.
+        resident.DeferCopies(copyInto(renewed, 8 * page, 2 * page));
+        resident.Submit();
+        Require(resident.ResidentCopyBytes() == 2 * page, "a copy-back into the new import was not kept resident");
+        static_cast<void>(resident.Commands());
+        resident.Submit();
+        resident.Sync();
+        const auto* renewedAlias = static_cast<const volatile unsigned char*>(renewed->alias);
+        Require(guest[8 * page + 11] == sourceByte(8 * page + 11) && renewedAlias[10 * page - 1] == sourceByte(10 * page - 1), "a resident copy recorded into a shared view's import did not land");
+    }
+    setSwitch("APS5_GUARD_SHARED_VIEWS", "");
+    recorder.Activate();
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+    CloseHandle(section);
 #endif
 }
 
@@ -4537,6 +4808,7 @@ int main() {
         pageGuardTests();
         sharedViewGuardTests();
         residentBufferTests(device, recorder);
+        residentSharedViewTests(device, recorder);
         fastRingReclaimTests(device, recorder);
         templateRefreshRingTests(device, recorder);
         templateRefreshPatchTests(device, recorder);
