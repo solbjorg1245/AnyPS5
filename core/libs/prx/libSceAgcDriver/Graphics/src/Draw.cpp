@@ -814,7 +814,7 @@ bool InPlaceInputs() {
     return inPlace;
 }
 
-DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, bool inPlace) {
+DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, bool inPlace, bool memoizedImport) {
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
     DrawInputCopy copy;
     if (recorder != nullptr && bytes != 0) {
@@ -826,7 +826,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         // range is noted as a pending read of the batch so no CPU copy lands on it early. Copying
         // an indirect draw's whole descriptor ranges (~100 MiB of indices) was 4-5 GiB per 10 s.
         if (inPlace && InPlaceInputs()) {
-            if (const auto* import = HostImportFor(context, address, bytes); import != nullptr) {
+            if (const auto* import = memoizedImport ? HostImportMemoized(context, address, bytes) : HostImportFor(context, address, bytes); import != nullptr) {
                 copy.import = import;
                 copy.importOffset = address - import->base;
                 return copy;
@@ -884,7 +884,9 @@ struct DrawInputs {
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
 // instead of computed. `scratch` is the draw's (DrawInputScratch): the inputs point into it.
-DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, DrawInputScratch& scratch) {
+// `memoizedImports` (DrawFast only): the in-place inputs find their imports through the thread's
+// memo (HostImportMemoized); Draw and DrawWithRecipe call HostImportFor as before.
+DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, DrawInputScratch& scratch, bool memoizedImports = false) {
     DrawInputs inputs;
     scratch.inPlaceRanges.clear();
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
@@ -956,7 +958,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         constexpr std::uint32_t UnscannedIndices = std::numeric_limits<std::uint32_t>::max();
         static const bool scanIndirectIndices = std::getenv("APS5_SCAN_INDIRECT_INDICES") != nullptr;
         const bool scan = args == nullptr || scanIndirectIndices || context.limits.maxDrawIndexedIndexValue < UnscannedIndices;
-        auto copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use, !scan);
+        auto copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use, !scan, memoizedImports);
         std::uint32_t highest = copy.derived;
         if (copy.import != nullptr) {
             ++outcome.inPlaceInputs;
@@ -1033,7 +1035,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     for (const auto& [begin, end] : plan.copies) {
         const auto bytes = static_cast<std::size_t>(end - begin);
         GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
-        auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex, true);
+        auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex, true, memoizedImports);
         if (copy.import != nullptr) {
             ++outcome.inPlaceInputs;
             outcome.inPlaceInputBytes += bytes;
@@ -1809,8 +1811,9 @@ bool RecordDraws() {
 }
 
 // The memory-state decision of an indirect draw's records (Draw, DrawFast): GPU-side from the host
-// import, or why the CPU reads them (see Draw).
-IndirectDrawPath indirectPathFor(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, const HostImport*& import) {
+// import, or why the CPU reads them (see Draw). `memoized` (DrawFast only): the import through the
+// thread's memo (HostImportMemoized) instead of HostImportFor.
+IndirectDrawPath indirectPathFor(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, const HostImport*& import, bool memoized = false) {
     if (StorageTexture::FlushPending(address, bytes, nullptr, "indirect draw arguments")) {
         if (recorder != nullptr) {
             Recorder::CountSync(2);
@@ -1822,7 +1825,7 @@ IndirectDrawPath indirectPathFor(const Context& context, Recorder* recorder, std
     const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
     if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
     if (std::any_of(DrawCopiedWriters()->begin(), DrawCopiedWriters()->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
-    if ((import = HostImportFor(context, address, bytes)) == nullptr) return IndirectDrawPath::NotImported;
+    if ((import = memoized ? HostImportMemoized(context, address, bytes) : HostImportFor(context, address, bytes)) == nullptr) return IndirectDrawPath::NotImported;
     return IndirectDrawPath::Gpu;
 }
 
@@ -2438,7 +2441,9 @@ FastDrawOutcome DrawFast(const Context& context, const State& state, const Pm4::
     // decline, so Draw meets it with its own accounting. Nothing is recorded before the record.
     try {
         if (args != nullptr && (args->RangeBytes() == 0 || args->RangeBytes() > std::numeric_limits<std::size_t>::max() || !gpuIndirectDraws)) return decline(FastDecline::IndirectPath);
-        inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, *inputScratch);
+        // The in-place inputs and the records below find their imports through the thread's memo
+        // (memoizedImports, HostImportMemoized), as the bindings' resolver does (HostImportResolver).
+        inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, *inputScratch, true);
         if (inputs.nothing) {
             result.recorded = true;
             return result;
@@ -2467,10 +2472,10 @@ FastDrawOutcome DrawFast(const Context& context, const State& state, const Pm4::
         // retire imports): only the GPU-side path without a rewrite is fast (the rewrite is
         // recorded outside the pass and needs a scratch copy, F3c).
         if (args != nullptr) {
-            indirect.path = indirectPathFor(context, recorder, args->arguments, static_cast<std::size_t>(args->RangeBytes()), indirect.argumentImport);
+            indirect.path = indirectPathFor(context, recorder, args->arguments, static_cast<std::size_t>(args->RangeBytes()), indirect.argumentImport, true);
             if (indirect.path == IndirectDrawPath::Gpu && args->countIndirect) {
                 if (!context.drawIndirectCount) return decline(FastDecline::IndirectPath);
-                indirect.path = indirectPathFor(context, recorder, args->countAddress, 4, indirect.countImport);
+                indirect.path = indirectPathFor(context, recorder, args->countAddress, 4, indirect.countImport, true);
             }
             if (indirect.path != IndirectDrawPath::Gpu) return decline(FastDecline::IndirectPath);
             if (rewritesRecords(*args)) return decline(FastDecline::Rewrites);

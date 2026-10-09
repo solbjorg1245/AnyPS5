@@ -149,7 +149,7 @@ bool Driver::knownValueCurrent(const WrittenBuffer& writer) {
     return GuestMemory::UnchangedSince(writer.begin, bytes, writer.generation);
 }
 
-ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, std::size_t bytes, std::uint64_t ValidateCounters::*& reason, const PendingView& pending, std::span<std::byte> known) {
+ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, std::size_t bytes, std::uint64_t ValidateCounters::*& reason, const PendingView& pending, std::span<std::byte> known, NewestWriterMemos* writers) {
     using Policy = ShaderMemory::PendingWrite;
     if (!pending.Overlaps(address, bytes)) return Policy::None;
 
@@ -159,7 +159,7 @@ ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, s
     }
     reason = &ValidateCounters::syncedOff;
     if (!writeEvidenceEnabled()) return Policy::Sync;
-    const auto writer = newestWriter(address, address + bytes);
+    const auto writer = writers != nullptr ? newestWriterMemoized(address, address + bytes, *writers) : newestWriter(address, address + bytes);
     if (!writer) {
         reason = &ValidateCounters::syncedNoWriter;
         return Policy::Sync;
@@ -234,6 +234,44 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
     // read; the hook waits for the writer, so the capture holds what the memory will hold.
     if (policy != ShaderMemory::PendingWrite::None && forcedSyncReads()) return ShaderMemory::PendingWrite::Sync;
     return policy;
+}
+
+void Driver::fastPendingWord(std::uint64_t address, const PendingView& view, FastPendingAnswer& answer) {
+    using Policy = ShaderMemory::PendingWrite;
+    // Per thread: a queue worker's walks read one copy's destination draw after draw.
+    thread_local NewestWriterMemos writers;
+    std::uint64_t ValidateCounters::*reason = nullptr;
+    std::uint32_t word = 0;
+    answer = FastPendingAnswer{};
+    writers.last = nullptr;
+    // Before the classification: a label or store noted after this load moves it (and a label
+    // noted before it is in the table LabelValueIn reads, which noteLabelOn fills before the bump).
+    answer.writes = Graphics::Recorder::WriteGeneration();
+    // queryPendingWrite for 4 bytes: its page-query rule (a queued label under a 4096-byte query)
+    // does not apply to a word, its retry rule does.
+    answer.policy = Get().classifyPendingWrite(address, sizeof(word), reason, view, std::as_writable_bytes(std::span(&word, 1)), &writers);
+    if (answer.policy != Policy::None && forcedSyncReads()) answer.policy = Policy::Sync;
+    answer.word = word;
+    if (answer.policy != Policy::KnownValue) return;
+    // Every word inside the writer's range gets this answer while nothing below changes: the
+    // pending snapshot (the overlap and the writer's neighbours; the caller compares its publish
+    // generation), the writer being the newest over its whole range (the memo held; `writers` is
+    // the push count it held at, which the caller compares) and no label in the range
+    // (classifyPendingWrite asks per dword, this one range query covers them all). A label or
+    // store noted later inside the range does not publish when the snapshot already covers it, so
+    // the caller compares `writes` (the recorder's write notes) as well. The CPU side
+    // (knownValueCurrent) is the writer's, checked once per range and walk as the old validation
+    // checks it once per region: a store stamped over the range without a write note (a CPU store
+    // another thread collects, a completion's write-back before its batch's snapshot is
+    // republished) can fall between two words of one walk, as between a region's check and its use.
+    const auto* memo = writers.last;
+    if (memo == nullptr || !memo->wholeRange || memo->writer.value == nullptr || memo->writer.begin > address || address + sizeof(word) > memo->writer.end) return;
+    if (memo->writer.value->size() != memo->writer.end - memo->writer.begin) return;
+    if (Graphics::Recorder::LabelValueIn(memo->writer.begin, static_cast<std::size_t>(memo->writer.end - memo->writer.begin))) return;
+    answer.rangeBegin = memo->writer.begin;
+    answer.rangeEnd = memo->writer.end;
+    answer.rangeBytes = memo->writer.value;
+    answer.writers = memo->checked;
 }
 
 }

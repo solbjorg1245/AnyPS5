@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_PIPELINE_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include <atomic>
 #include <set>
 
 namespace AgcDriver::Graphics {
@@ -52,6 +53,11 @@ public:
     void PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
     // Forgets the Vulkan objects without destroying them: for entries of a device that is already gone.
     void Abandon() noexcept;
+    // The pipeline store's recency stamp (Pipeline.cpp): the store's use clock at the last lookup
+    // that answered this pipeline, by the store or by a thread's memo (CachedFastPipeline, which
+    // takes no lock), so the store evicts the least recently used entry as if every lookup had
+    // reached it.
+    mutable std::atomic<std::uint64_t> storeUse{0};
 
 private:
     struct CachedFramebuffer {
@@ -87,6 +93,11 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
 // layout id, which the pipelines share with the FastLayouts that keeps them.
 struct FastLayout;
 std::shared_ptr<Pipeline> CachedFastPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const FastLayout& layout, std::span<const std::uint32_t> layoutKey, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+// The store key CachedFastPipeline looks the pipeline of push layout `pushLayout` up by, built into
+// `key` (cleared first; empty when a stage has no variant id, which gets a private pipeline). Its
+// per-thread memo (APS5_NO_PIPELINE_MEMO=1: off) answers a key equal to one it noted while the store
+// dropped nothing since, the device instance is the same and the pipeline lives.
+void FastPipelineKey(const Context& context, const State& state, const VertexInputLayout& vertexInput, std::uint32_t pushLayout, std::span<const std::uint32_t> layoutKey, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, std::vector<std::byte>& key);
 // Destroys the cached pipelines of a device; to be called before the device goes away. Without it,
 // entries of a gone device are recognised by their buffer pool (made and reset with the device, so
 // it tells device instances apart when the loader reuses a VkDevice handle) and forgotten unused.

@@ -28,8 +28,10 @@ std::uint32_t FastDrawVerifyEvery();
 // Whether this thread's draw holds a comparison armed by the fast path.
 bool FastDrawVerifyPending();
 // Compares the stages the old path bound (`old`, the draw's program results) with the armed fast
-// results; `heuristic`: the old path bound stored results by a heuristic (counted apart).
-void VerifyFastDrawStages(std::span<const ShaderRecompiler::RecompileResult* const> old, bool heuristic);
+// results; `heuristic`: the old path bound stored results by a heuristic (counted apart). The
+// words the fast walks served without their final value are compared with the old path's reads
+// (`regions`, the draw's captured and matched memory), then with memory once their writes landed.
+void VerifyFastDrawStages(std::span<const ShaderRecompiler::RecompileResult* const> old, bool heuristic, std::span<const ShaderRecompiler::MemoryRegion> regions);
 // Ends the draw's comparison (whatever did not run is counted as not compared): Driver::draw's exit.
 struct FastDrawVerifyScope {
     FastDrawVerifyScope() = default;

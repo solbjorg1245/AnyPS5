@@ -78,16 +78,27 @@ struct WalkScratch {
     ShaderRecompiler::RecompileResult walked;
     ShaderRecompiler::ShaderVertexStageInfo vertex{};
     std::vector<FetchPlanEntry> plans;
+    // The plan the last lookup found, tried first (consecutive draws mostly share their vertex
+    // program).
+    std::size_t lastPlan = 0;
 };
 struct WalkScratchTag {};
 
+// At most one entry matches a program: an entry is added only when none matches, and one that
+// stopped matching (its snapshot expired) never matches again. So the last lookup's entry, when it
+// still matches, is the one the scan finds.
 const Graphics::VertexFetchPlan& fetchPlanFor(WalkScratch& scratch, const DrawProgram& program) {
-    for (const auto& entry : scratch.plans) {
-        if (entry.raw == program.snapshot.get() && entry.codeOffset == program.codeOffset && !entry.snapshot.expired()) return entry.plan;
+    const auto matches = [&](const FetchPlanEntry& entry) { return entry.raw == program.snapshot.get() && entry.codeOffset == program.codeOffset && !entry.snapshot.expired(); };
+    if (scratch.lastPlan < scratch.plans.size() && matches(scratch.plans[scratch.lastPlan])) return scratch.plans[scratch.lastPlan].plan;
+    for (std::size_t index = 0; index < scratch.plans.size(); ++index) {
+        if (!matches(scratch.plans[index])) continue;
+        scratch.lastPlan = index;
+        return scratch.plans[index].plan;
     }
     constexpr std::size_t Entries = 256;
     if (scratch.plans.size() >= Entries) scratch.plans.erase(scratch.plans.begin());
     scratch.plans.push_back({program.snapshot.get(), program.snapshot, program.codeOffset, Graphics::DecodeVertexFetchPlan(program.binary.header, program.binary.headerAddress)});
+    scratch.lastPlan = scratch.plans.size() - 1;
     return scratch.plans.back().plan;
 }
 
@@ -128,7 +139,7 @@ void report(WalkCounters& total, std::uint32_t every) {
         std::snprintf(item, sizeof(item), "%s0x%llx %llu stages %.1f us each (%.1f ms)", i == 0 ? " " : ", ", static_cast<unsigned long long>(program), count(cost.stages), cost.stages != 0 ? static_cast<double>(cost.ns) / 1000.0 / static_cast<double>(cost.stages) : 0.0, static_cast<double>(cost.ns) / 1e6);
         programs += item;
     }
-    std::fprintf(stderr, "[fastpath] walk (10 s, every %u draws): %llu draws, %llu stages, %llu walked (%.1f%%); walk %.2f us per stage (request and source handle %.2f, walk %.2f, vertex fetch %.2f), %.1f reads and %.2f page queries per stage; compare %.2f us per walked stage (populate %.2f); walk and compare us per stage by packet: direct draws %.2f over %llu stages, indirect draws %.2f over %llu stages; costliest programs:%s; declines: %s; mismatched stages %llu, after heuristic hits %llu; mismatches by kind (plain/heuristic): %s; T# feedback-only differences %llu, flat T# copies differing in feedback bits only %llu, deferred words skipped %llu, exceptions %llu; pending-block reads %llu, read past by the exact ranges %llu%s\n", every, count(total.draws), count(total.stages), count(total.walked), 100.0 * static_cast<double>(total.walked) / stages, perStage(total.walkNs), perStage(total.handleNs), perStage(total.materializeNs), perStage(total.vertexNs), static_cast<double>(total.reads) / stages, static_cast<double>(total.queries) / stages, static_cast<double>(total.compareNs) / 1000.0 / walked, static_cast<double>(total.populateNs) / 1000.0 / walked, perKind(0), count(total.kindStages[0]), perKind(1), count(total.kindStages[1]), programs.empty() ? " none" : programs.c_str(), declines.c_str(), count(total.stagesMismatched[0]), count(total.stagesMismatched[1]), kinds.c_str(), count(total.feedbackOnly), count(total.flatFeedback), count(total.deferredSkipped), count(total.exceptions), count(total.pending.inBlocks), count(total.pending.readPast), FastPendingExact() ? "" : " (APS5_FAST_PENDING_BLOCKS: blocks only)");
+    std::fprintf(stderr, "[fastpath] walk (10 s, every %u draws): %llu draws, %llu stages, %llu walked (%.1f%%); walk %.2f us per stage (request and source handle %.2f, walk %.2f, vertex fetch %.2f), %.1f reads and %.2f page queries per stage; compare %.2f us per walked stage (populate %.2f); walk and compare us per stage by packet: direct draws %.2f over %llu stages, indirect draws %.2f over %llu stages; costliest programs:%s; declines: %s; mismatched stages %llu, after heuristic hits %llu; mismatches by kind (plain/heuristic): %s; T# feedback-only differences %llu, flat T# copies differing in feedback bits only %llu, deferred words skipped %llu, exceptions %llu; pending-block reads %llu, read past by the exact ranges %llu%s%s\n", every, count(total.draws), count(total.stages), count(total.walked), 100.0 * static_cast<double>(total.walked) / stages, perStage(total.walkNs), perStage(total.handleNs), perStage(total.materializeNs), perStage(total.vertexNs), static_cast<double>(total.reads) / stages, static_cast<double>(total.queries) / stages, static_cast<double>(total.compareNs) / 1000.0 / walked, static_cast<double>(total.populateNs) / 1000.0 / walked, perKind(0), count(total.kindStages[0]), perKind(1), count(total.kindStages[1]), programs.empty() ? " none" : programs.c_str(), declines.c_str(), count(total.stagesMismatched[0]), count(total.stagesMismatched[1]), kinds.c_str(), count(total.feedbackOnly), count(total.flatFeedback), count(total.deferredSkipped), count(total.exceptions), count(total.pending.inBlocks), count(total.pending.readPast), FastPendingExact() ? "" : " (APS5_FAST_PENDING_BLOCKS: blocks only)", FastPendingServedText(total.pending).c_str());
 }
 
 std::uint64_t nanosecondsBetween(std::chrono::steady_clock::time_point started, std::chrono::steady_clock::time_point ended) {

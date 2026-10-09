@@ -33,7 +33,8 @@ struct DrawInputCopy {
     VkDeviceSize importOffset = 0;
 };
 // `inPlace`: bind the host import instead of copying when one covers the range (APS5_NO_INPLACE_INPUTS=1: never).
-DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, bool inPlace = false);
+// `memoizedImport` (DrawFast): that import through the thread's memo (HostImportMemoized).
+DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, bool inPlace = false, bool memoizedImport = false);
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived);
 
 std::array<std::uint32_t, 4> MeshIndexBufferDescriptor(const Pm4::DrawParameters& draw, std::uint64_t unreadAddress);

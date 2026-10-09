@@ -113,8 +113,8 @@ DescriptorImageShape ImageShapeFor(const std::vector<ImageResource>& images, con
     return *shape;
 }
 
-std::vector<std::uint32_t> GuestBuffersDescriptor(const std::vector<std::uint32_t>& resources, const ResourceSnapshot& snapshot) {
-    std::vector<std::uint32_t> result;
+// The descriptor words of a binding's elements, appended to `result` (empty on entry).
+void GuestBuffersDescriptor(const std::vector<std::uint32_t>& resources, const ResourceSnapshot& snapshot, std::vector<std::uint32_t>& result) {
     result.reserve(resources.size() * 4u);
     for (const std::uint32_t r : resources) {
         if (r >= snapshot.buffers.size()) {
@@ -128,11 +128,9 @@ std::vector<std::uint32_t> GuestBuffersDescriptor(const std::vector<std::uint32_
             result.push_back(value.dwords[dword]);
         }
     }
-    return result;
 }
 
-std::vector<std::uint32_t> GuestImagesDescriptor(const std::vector<std::uint32_t>& resources, const ResourceSnapshot& snapshot) {
-    std::vector<std::uint32_t> result;
+void GuestImagesDescriptor(const std::vector<std::uint32_t>& resources, const ResourceSnapshot& snapshot, std::vector<std::uint32_t>& result) {
     std::uint32_t dwordCount = 0;
     for (std::size_t i = 0; i < resources.size(); i++) {
         const std::uint32_t r = resources[i];
@@ -152,11 +150,9 @@ std::vector<std::uint32_t> GuestImagesDescriptor(const std::vector<std::uint32_t
             result.push_back(value.dwords[dword]);
         }
     }
-    return result;
 }
 
-std::vector<std::uint32_t> GuestSamplersDescriptor(const std::vector<std::uint32_t>& resources, const ResourceSnapshot& snapshot) {
-    std::vector<std::uint32_t> result;
+void GuestSamplersDescriptor(const std::vector<std::uint32_t>& resources, const ResourceSnapshot& snapshot, std::vector<std::uint32_t>& result) {
     std::uint32_t dwordCount = 0;
     for (std::size_t i = 0; i < resources.size(); i++) {
         const std::uint32_t r = resources[i];
@@ -176,11 +172,10 @@ std::vector<std::uint32_t> GuestSamplersDescriptor(const std::vector<std::uint32
             result.push_back(value.dwords[dword]);
         }
     }
-    return result;
 }
 
-std::vector<std::uint32_t> ShaderDataDwordsFor(const IrBindingLayout& layout, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads) {
-    std::vector<std::uint32_t> result(layout.ShaderDataDwords(), 0u);
+void ShaderDataDwordsFor(const IrBindingLayout& layout, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads, std::vector<std::uint32_t>& result) {
+    result.assign(layout.ShaderDataDwords(), 0u);
     for (std::size_t i = 0; i < layout.userDataRegisters.size(); i++) {
         const std::uint32_t reg = layout.userDataRegisters[i];
         if (reg < userDataBase || reg - userDataBase >= snapshot.userData.size()) {
@@ -194,25 +189,49 @@ std::vector<std::uint32_t> ShaderDataDwordsFor(const IrBindingLayout& layout, st
         }
         std::copy(partialThreads.begin(), partialThreads.end(), result.begin() + layout.DispatchThreadLimitDword());
     }
-    return result;
 }
 
+// The binding as a default-constructed one whose vectors keep their storage (a field added to
+// DescriptorBinding later is reset too).
+void resetBinding(DescriptorBinding& binding) {
+    auto guestDescriptor = std::move(binding.guestDescriptor);
+    auto samplerDepthCompare = std::move(binding.samplerDepthCompare);
+    auto imageWritten = std::move(binding.imageWritten);
+    auto imageDepthCompare = std::move(binding.imageDepthCompare);
+    auto bufferAtomic = std::move(binding.bufferAtomic);
+    auto bufferWritten = std::move(binding.bufferWritten);
+    auto deferredWords = std::move(binding.deferredWords);
+    binding = DescriptorBinding{};
+    guestDescriptor.clear();
+    samplerDepthCompare.clear();
+    imageWritten.clear();
+    imageDepthCompare.clear();
+    bufferAtomic.clear();
+    bufferWritten.clear();
+    deferredWords.clear();
+    binding.guestDescriptor = std::move(guestDescriptor);
+    binding.samplerDepthCompare = std::move(samplerDepthCompare);
+    binding.imageWritten = std::move(imageWritten);
+    binding.imageDepthCompare = std::move(imageDepthCompare);
+    binding.bufferAtomic = std::move(bufferAtomic);
+    binding.bufferWritten = std::move(bufferWritten);
+    binding.deferredWords = std::move(deferredWords);
 }
 
-void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, const IrProgram& program, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads) const {
-    Populate(allocation, program.Info(), program.Resources().stage, program.Resources().userDataBase, snapshot, partialThreads);
-}
+// Populate's body: the physical bindings of `layout` over the snapshot into `bindings` (resized to
+// the layout, every element reset first: a reused vector's bindings keep their storage), and the
+// stage's shader-data words into `shaderData`. Populate passes empty vectors and moves them out,
+// PopulateInto the caller's.
+void populateBindings(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads, std::vector<DescriptorBinding>& bindings, std::vector<std::uint32_t>& shaderData) {
+    ShaderDataDwordsFor(layout, userDataBase, snapshot, partialThreads, shaderData);
 
-void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, const ShaderInfo& info, IrShaderStage stage, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads) const {
-    const IrBindingLayout& layout = allocation.layout;
-    const std::vector<std::uint32_t> shaderData = ShaderDataDwordsFor(layout, userDataBase, snapshot, partialThreads);
-
-    std::vector<DescriptorBinding> bindings;
-    bindings.reserve(layout.descriptors.size());
+    bindings.resize(layout.descriptors.size());
     std::size_t writtenHere = 0;
     std::size_t readOnlyHere = 0;
-    for (const IrDescriptorBinding& logical : layout.descriptors) {
-        DescriptorBinding physical;
+    for (std::size_t index = 0; index < layout.descriptors.size(); ++index) {
+        const IrDescriptorBinding& logical = layout.descriptors[index];
+        DescriptorBinding& physical = bindings[index];
+        resetBinding(physical);
         physical.descriptorSet = 0u;
         physical.binding = NativeBinding(stage, logical.kind);
         physical.count = logical.resources.empty() ? 1u : static_cast<std::uint32_t>(logical.resources.size());
@@ -222,7 +241,7 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
 
         switch (physical.role) {
         case DescriptorRole::GuestBuffers:
-            physical.guestDescriptor = GuestBuffersDescriptor(logical.resources, snapshot);
+            GuestBuffersDescriptor(logical.resources, snapshot, physical.guestDescriptor);
             for (const std::uint32_t resource : logical.resources) {
                 const auto& buffer = info.buffers.at(resource);
                 physical.bufferAtomic.push_back(buffer.atomic);
@@ -235,7 +254,7 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
             }
             break;
         case DescriptorRole::GuestImages:
-            physical.guestDescriptor = GuestImagesDescriptor(logical.resources, snapshot);
+            GuestImagesDescriptor(logical.resources, snapshot, physical.guestDescriptor);
             physical.imageShape = ImageShapeFor(info.images, logical.resources);
             for (const std::uint32_t resource : logical.resources) {
                 const auto& image = info.images.at(resource);
@@ -244,7 +263,7 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
             }
             break;
         case DescriptorRole::GuestSamplers:
-            physical.guestDescriptor = GuestSamplersDescriptor(logical.resources, snapshot);
+            GuestSamplersDescriptor(logical.resources, snapshot, physical.guestDescriptor);
             for (std::size_t element = 0; element < logical.resources.size(); ++element) {
                 const auto& sampler = info.samplers.at(logical.resources[element]);
                 physical.samplerDepthCompare.push_back(sampler.depthCompare);
@@ -279,8 +298,6 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
                 fail("DescriptorBindingBuilder::Populate guest descriptor size is not a multiple of the binding count");
             }
         }
-
-        bindings.push_back(std::move(physical));
     }
 
     if (bufferWrittenTraceEnabled()) {
@@ -290,12 +307,36 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
         const auto readOnly = bufferWrittenCounts.readOnly.fetch_add(readOnlyHere) + readOnlyHere;
         std::fprintf(stderr, "[bindings] guest buffer elements: %zu written, %zu read-only (total so far: %llu / %llu)\n", writtenHere, readOnlyHere, written, readOnly);
     }
-    allocation.bindings = std::move(bindings);
-    allocation.pushConstants.clear();
+}
+
+// The push data: the shader-data words when the layout uses push data, else none.
+void fillPushConstants(const IrBindingLayout& layout, const std::vector<std::uint32_t>& shaderData, std::vector<std::byte>& pushConstants) {
+    pushConstants.clear();
     if (layout.UsesPushData()) {
-        allocation.pushConstants.resize(static_cast<std::size_t>(shaderData.size()) * sizeof(std::uint32_t));
-        std::memcpy(allocation.pushConstants.data(), shaderData.data(), allocation.pushConstants.size());
+        pushConstants.resize(static_cast<std::size_t>(shaderData.size()) * sizeof(std::uint32_t));
+        std::memcpy(pushConstants.data(), shaderData.data(), pushConstants.size());
     }
+}
+
+}
+
+void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, const IrProgram& program, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads) const {
+    Populate(allocation, program.Info(), program.Resources().stage, program.Resources().userDataBase, snapshot, partialThreads);
+}
+
+void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, const ShaderInfo& info, IrShaderStage stage, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads) const {
+    const IrBindingLayout& layout = allocation.layout;
+    // Built aside and moved in at the end: a failure leaves `allocation` as it was.
+    std::vector<std::uint32_t> shaderData;
+    std::vector<DescriptorBinding> bindings;
+    populateBindings(layout, info, stage, userDataBase, snapshot, partialThreads, bindings, shaderData);
+    allocation.bindings = std::move(bindings);
+    fillPushConstants(layout, shaderData, allocation.pushConstants);
+}
+
+void DescriptorBindingBuilder::PopulateInto(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads, std::vector<DescriptorBinding>& bindings, std::vector<std::byte>& pushConstants, std::vector<std::uint32_t>& shaderData) const {
+    populateBindings(layout, info, stage, userDataBase, snapshot, partialThreads, bindings, shaderData);
+    fillPushConstants(layout, shaderData, pushConstants);
 }
 
 }

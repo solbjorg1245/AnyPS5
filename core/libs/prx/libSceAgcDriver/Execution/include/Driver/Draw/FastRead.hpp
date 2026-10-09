@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_FASTREAD_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "Recompiler.hpp"
 #include <array>
@@ -10,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -32,12 +34,90 @@ inline constexpr std::array<const char*, static_cast<std::size_t>(WalkDecline::C
 // What differed between the walk's populated variant and the old path's result. `Deferred`: a
 // binding the old capture left words of to the GPU, under CompareWalkedResults' `deferredMismatch`
 // (the reader missed the write pending over them; kept apart from a wrong word of the role).
-enum class WalkMismatch : std::uint8_t { Specialization, Variant, Layout, Buffer, Image, Sampler, Flat, Data, Other, Push, Vertex, Deferred, Count };
-inline constexpr std::array<const char*, static_cast<std::size_t>(WalkMismatch::Count)> WalkMismatchNames{"specialization", "variant", "layout", "buffer", "image", "sampler", "flat", "data", "other binding", "push", "vertex", "deferred"};
+// `Served`: a word the reader served without reading its final value (a known value, write
+// evidence, a queued label) differs from the old capture's word or from the bytes memory holds
+// once the pending writes landed (the verify modes' served-word checks).
+enum class WalkMismatch : std::uint8_t { Specialization, Variant, Layout, Buffer, Image, Sampler, Flat, Data, Other, Push, Vertex, Deferred, Served, Count };
+inline constexpr std::array<const char*, static_cast<std::size_t>(WalkMismatch::Count)> WalkMismatchNames{"specialization", "variant", "layout", "buffer", "image", "sampler", "flat", "data", "other binding", "push", "vertex", "deferred", "served word"};
 
 // Whether FastSrtRead tests a word in a pending 64 KiB block against the exact pending-write
 // ranges (the default) or declines on the block alone (APS5_FAST_PENDING_BLOCKS=1, the F2 rule).
 bool FastPendingExact();
+
+// Known-value serving (APS5_FAST_KNOWN_VALUES, on unless "0"; needs the exact ranges): a word an
+// exact pending range overlaps is served as the old capture serves it (ShaderMemory::read on a
+// word-wise page, under the driver's own classification, Driver::fastPendingWord) instead of
+// declining: KnownValue serves the known word, RawExpected the live word while it still holds the
+// value the write evidence saw last, Raw the live word. Every answer the capture reads through the
+// flush hook instead (Sync, the verify policies, RawExpected with another value) declines
+// "pending block", as before.
+//
+// Accepted difference (s53-known-values-fix, review F2): the old draw capture runs one stage
+// capture in writeEvidenceSampleEvery() (16) sampled (SampledReadScope), and a sampled capture's
+// pure-flat-slot query (deferPureLeaf, no known span, so no RawExpected) gets Sync and leaves an
+// evidence word to the GPU copy behind its writer. The fast reader is not sampled: it serves such
+// a word as the 15 unsampled captures do (RawExpected, the live word). Declining under a fast-side
+// sample would not restore the rate (the old capture after the decline draws its own sample from
+// the shared counter); APS5_FAST_KNOWN_EVIDENCE=0 declines every evidence word instead.
+bool FastKnownValues();
+// Write-evidence words (APS5_FAST_KNOWN_EVIDENCE, on unless "0"; only with FastKnownValues):
+// RawExpected and Raw serve the live word; off, they decline "pending block" and only known values
+// and queued labels are served (the A/B that isolates the evidence heuristic).
+bool FastKnownEvidence();
+// And a word this thread's deferred labels write (APS5_FAST_KNOWN_LABELS, on unless "0"; only with
+// FastKnownValues): the bytes of the last such label in queue order when it covers the whole word,
+// which is what the old capture reads there (its flush hook records the labels, then waits for
+// them). The packet's labels are recorded before its draw or dispatch either way.
+bool FastKnownLabels();
+// The query FastSrtRead classifies pending words with (Driver::fastPendingWord, which the driver's
+// constructor installs). None installed (no driver): every pending word declines as before.
+void SetFastPendingQuery(FastPendingQuery query);
+FastPendingQuery InstalledFastPendingQuery();
+
+// Where a served word's value came from.
+enum class FastServedSource : std::uint8_t { Known, Evidence, Label, Count };
+inline constexpr std::array<const char*, static_cast<std::size_t>(FastServedSource::Count)> FastServedSourceNames{"known value", "write evidence", "queued label"};
+struct FastServedWord {
+    std::uint64_t address;
+    std::uint32_t value;
+    FastServedSource source;
+};
+// This thread's log of the words its readers served (the verify modes enable it around a walk).
+struct FastServedLog {
+    bool enabled = false;
+    std::vector<FastServedWord> words;
+};
+FastServedLog& FastServedWords();
+// Enables this thread's log (cleared) for the scope's lifetime when `enable`, and restores it after.
+class FastServedLogScope {
+public:
+    explicit FastServedLogScope(bool enable);
+    ~FastServedLogScope();
+    FastServedLogScope(const FastServedLogScope&) = delete;
+    FastServedLogScope& operator=(const FastServedLogScope&) = delete;
+
+private:
+    bool previous;
+};
+
+// The served words against the bytes memory holds once the writes pending over them landed: each
+// is read through the flush hook, which records this thread's queued labels over it and waits for
+// the recorded work writing it (the old capture's Sync read). Counted by source; the first
+// differences are printed under `what`.
+struct FastServedCheck {
+    std::uint64_t compared = 0;
+    std::uint64_t unreadable = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(FastServedSource::Count)> mismatched{};
+    std::uint64_t Mismatched() const {
+        std::uint64_t total = 0;
+        for (const auto count : mismatched) total += count;
+        return total;
+    }
+};
+void CheckServedWords(std::span<const FastServedWord> words, const char* what, FastServedCheck& check);
+// The served words against the old capture's own reads of the same addresses (its regions): how
+// many differ; `unread` counts the words the capture did not read.
+std::uint64_t CompareServedWords(std::span<const FastServedWord> words, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& unread);
 
 // The direct reader's state for one walk: the registered regions the old path's ShaderMemory
 // serves first (a draw's programs, or a dispatch's code and header), the page last found readable,
@@ -62,34 +142,67 @@ struct FastReader {
     std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> snapshot;
     std::uint64_t pendingInBlocks = 0;
     std::uint64_t pendingPassed = 0;
+    // Known-value serving (FastKnownValues, FastKnownLabels) and the query it classifies with.
+    bool knownValues = FastKnownValues();
+    bool knownLabels = FastKnownLabels();
+    bool knownEvidence = FastKnownEvidence();
+    FastPendingQuery pendingQuery = InstalledFastPendingQuery();
+    // The KnownValue range the last answer named (FastPendingAnswer): its words are served from its
+    // bytes while the snapshot generation, the writer push count and the recorder's write
+    // generation it was classified at hold.
+    std::uint64_t knownBegin = 0;
+    std::uint64_t knownEnd = 0;
+    std::uint64_t knownGeneration = 0;
+    std::uint64_t knownWriters = 0;
+    std::uint64_t knownWrites = 0;
+    std::shared_ptr<const std::vector<std::byte>> knownBytes;
+    // Words served without their final value (counted with the pending reads by each report line).
+    std::uint64_t servedKnown = 0;
+    std::uint64_t servedEvidence = 0;
+    std::uint64_t servedLabels = 0;
 };
 
 // FastSrtRead (design section 2.3), an SrtRuntime reader over a FastReader. The null page reads
-// zero. A read overlapping a pending GPU write declines: Recorder::BlockPending is the prefilter,
-// then the exact ranges of the pending-write snapshot decide, which is the old capture's raw-read
-// rule (classifyPendingWrite: no overlap, a raw read); APS5_FAST_PENDING_BLOCKS=1 declines on the
-// block alone. A read over a queued label of this thread (noted or still deferred: the old path
-// captures again after recording one over its reads), in a page not mapped, or in a page the flush
-// hook would first store storage-image results or publish unit shadows into (the old capture's
-// page read runs it) declines too. Otherwise a plain load of the live word (guest addresses are
-// host pointers). No page copy, no flush hook.
+// zero. A read a pending GPU write overlaps: Recorder::BlockPending is the prefilter, then the
+// exact ranges of the pending-write snapshot decide, which is the old capture's raw-read rule
+// (classifyPendingWrite: no overlap, a raw read); a word they overlap is served as the old capture
+// serves it, or declines where the capture would wait (FastKnownValues; off, or
+// APS5_FAST_PENDING_BLOCKS=1, which declines on the block alone: every such word declines). A read
+// over a queued label of this thread (noted or still deferred) is served with the last label's
+// bytes (FastKnownLabels) or declines. A read in a page not mapped, or in a page the flush hook
+// would first store storage-image results or publish unit shadows into (the old capture's page
+// read runs it) declines, served words included. Otherwise a plain load of the live word (guest
+// addresses are host pointers). No page copy, no flush hook.
 bool FastSrtRead(void* context, std::uint64_t address, std::uint32_t* value);
 
-// A tally of walks' reads that met a pending block and of those the exact test let through
-// (FastReader::pendingInBlocks, pendingPassed): each report line ([fastpath] walk, draws,
+// A tally of walks' reads that met a pending block, of those the exact test let through
+// (FastReader::pendingInBlocks, pendingPassed) and of the words served without their final value
+// (known values, write evidence, queued labels): each report line ([fastpath] walk, draws,
 // dispatches) sums its own walks' readers, so no read is counted on two lines.
 struct FastPendingReads {
     std::uint64_t inBlocks = 0;
     std::uint64_t readPast = 0;
+    std::uint64_t known = 0;
+    std::uint64_t evidence = 0;
+    std::uint64_t labels = 0;
     void Add(const FastReader& reader) {
         inBlocks += reader.pendingInBlocks;
         readPast += reader.pendingPassed;
+        known += reader.servedKnown;
+        evidence += reader.servedEvidence;
+        labels += reader.servedLabels;
     }
     void Add(const FastPendingReads& other) {
         inBlocks += other.inBlocks;
         readPast += other.readPast;
+        known += other.known;
+        evidence += other.evidence;
+        labels += other.labels;
     }
 };
+// The report lines' tail for a tally ("..., served from known values N, on write evidence N,
+// queued-label words N" and the switches' state).
+std::string FastPendingServedText(const FastPendingReads& reads);
 
 // The decline of a walk that ended with `status` (a read the reader declined names its reason).
 WalkDecline WalkDeclineOf(ShaderRecompiler::WalkStatus status, const FastReader& reader);

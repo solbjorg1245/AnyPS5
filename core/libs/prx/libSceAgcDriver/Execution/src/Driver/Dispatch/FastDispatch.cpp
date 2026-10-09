@@ -48,6 +48,10 @@ struct Counters {
     std::array<std::uint64_t, WalkDeclineCount> walkDeclines{};
     std::uint64_t verified = 0, verifyMismatched = 0, feedbackOnly = 0, flatFeedback = 0;
     std::array<std::uint64_t, MismatchCount> mismatches{};
+    // The verify's served words: compared with the old capture's reads (differing, not read by
+    // it), and the sampled check against memory's final bytes.
+    std::uint64_t servedCompared = 0, servedDiffering = 0, servedUnread = 0;
+    FastServedCheck servedFinal;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
@@ -101,7 +105,7 @@ void report(const Counters& total) {
         std::snprintf(item, sizeof(item), "%s%s %llu", kind == 0 ? "" : ", ", WalkMismatchNames[kind], count(total.mismatches[kind]));
         kinds += item;
     }
-    std::fprintf(stderr, "[fastpath] dispatches (10 s): %llu seen, %llu taken (%.1f%%, %llu indirect); us per taken: walk %.2f, variant %.2f, verify %.2f, prepare %.2f, lock wait %.2f, resolve %.2f, record %.2f, total %.2f; declined dispatches spent %.1f ms before declining; lead barriers skipped %llu, ring full %llu, adjusted in place %llu; declines: %s; walk declines: %s; verify: %llu compared, %llu mismatched (%s), T# feedback-only %llu, flat T# copies feedback-only %llu; resolve us per taken: buffers %.2f, images %.2f, samplers %.2f, flush %.2f, ring %.2f, imports %.2f; %.1f in-place elements per taken, flush skipped by one scan %llu (%s); dispatch walk reads in pending blocks %llu, read past by the exact ranges %llu%s\n", count(total.dispatches), count(total.taken), 100.0 * static_cast<double>(total.taken) / static_cast<double>(total.dispatches != 0 ? total.dispatches : 1), count(total.takenIndirect), perTaken(total.walkNs), perTaken(total.variantNs), perTaken(total.verifyNs), perTaken(total.prepareNs), perTaken(total.lockNs), perTaken(total.resolveNs), perTaken(total.recordNs), perTaken(total.totalNs), static_cast<double>(total.declinedNs) / 1e6, count(total.leadSkipped), count(total.ringFull), count(total.adjusted), declines.c_str(), walks.c_str(), count(total.verified), count(total.verifyMismatched), kinds.c_str(), count(total.feedbackOnly), count(total.flatFeedback), perTaken(total.buffersNs), perTaken(total.imagesNs), perTaken(total.samplersNs), perTaken(total.flushNs), perTaken(total.ringNs), perTaken(total.importsNs), static_cast<double>(total.elements) / taken, count(total.flushSkipped), Graphics::FastDispatchBatchedElements() ? "per dispatch" : "APS5_FAST_DISPATCH_PER_ELEMENT", count(total.pending.inBlocks), count(total.pending.readPast), FastPendingExact() ? "" : " (APS5_FAST_PENDING_BLOCKS: blocks only)");
+    std::fprintf(stderr, "[fastpath] dispatches (10 s): %llu seen, %llu taken (%.1f%%, %llu indirect); us per taken: walk %.2f, variant %.2f, verify %.2f, prepare %.2f, lock wait %.2f, resolve %.2f, record %.2f, total %.2f; declined dispatches spent %.1f ms before declining; lead barriers skipped %llu, ring full %llu, adjusted in place %llu; declines: %s; walk declines: %s; verify: %llu compared, %llu mismatched (%s), T# feedback-only %llu, flat T# copies feedback-only %llu; resolve us per taken: buffers %.2f, images %.2f, samplers %.2f, flush %.2f, ring %.2f, imports %.2f; %.1f in-place elements per taken, flush skipped by one scan %llu (%s); dispatch walk reads in pending blocks %llu, read past by the exact ranges %llu%s%s; verify's served words: %llu compared with the old capture's (%llu differ, %llu it did not read), %llu with memory once their writes landed (%llu unreadable; differing: known value %llu, write evidence %llu, queued label %llu)\n", count(total.dispatches), count(total.taken), 100.0 * static_cast<double>(total.taken) / static_cast<double>(total.dispatches != 0 ? total.dispatches : 1), count(total.takenIndirect), perTaken(total.walkNs), perTaken(total.variantNs), perTaken(total.verifyNs), perTaken(total.prepareNs), perTaken(total.lockNs), perTaken(total.resolveNs), perTaken(total.recordNs), perTaken(total.totalNs), static_cast<double>(total.declinedNs) / 1e6, count(total.leadSkipped), count(total.ringFull), count(total.adjusted), declines.c_str(), walks.c_str(), count(total.verified), count(total.verifyMismatched), kinds.c_str(), count(total.feedbackOnly), count(total.flatFeedback), perTaken(total.buffersNs), perTaken(total.imagesNs), perTaken(total.samplersNs), perTaken(total.flushNs), perTaken(total.ringNs), perTaken(total.importsNs), static_cast<double>(total.elements) / taken, count(total.flushSkipped), Graphics::FastDispatchBatchedElements() ? "per dispatch" : "APS5_FAST_DISPATCH_PER_ELEMENT", count(total.pending.inBlocks), count(total.pending.readPast), FastPendingExact() ? "" : " (APS5_FAST_PENDING_BLOCKS: blocks only)", FastPendingServedText(total.pending).c_str(), count(total.servedCompared), count(total.servedDiffering), count(total.servedUnread), count(total.servedFinal.compared), count(total.servedFinal.unreadable), count(total.servedFinal.mismatched[0]), count(total.servedFinal.mismatched[1]), count(total.servedFinal.mismatched[2]));
 }
 
 }
@@ -133,6 +137,9 @@ bool Driver::fastDispatch(const Submission& submission, const ShaderSnapshot& sn
     Graphics::FastDispatchTiming timing;
     try {
         auto& scratch = HostThreadLocal<Scratch, ScratchTag>();
+        // APS5_FAST_DISPATCH_VERIFY: the words the walk serves without their final value, for the
+        // verify below.
+        const FastServedLogScope servedLog(fastDispatchVerify());
         if (debugMode()) declined = Decline::Debug;
         else if (localDevice == nullptr) declined = Decline::NoDevice;
         // Without the pending-block table the reader could not see recorded GPU writes.
@@ -194,7 +201,28 @@ bool Driver::fastDispatch(const Submission& submission, const ShaderSnapshot& sn
             // "deferred"): the walk bound words whose producer the reader did not see. Nothing is
             // skipped in this mode, so the skip count stays local.
             std::uint64_t deferredSkipped = 0;
-            const auto kinds = CompareWalkedResults(*old, scratch.walked, first, local.feedbackOnly, local.flatFeedback, deferredSkipped, true);
+            auto kinds = CompareWalkedResults(*old, scratch.walked, first, local.feedbackOnly, local.flatFeedback, deferredSkipped, true);
+            // The words the walk served without their final value (known values, write evidence,
+            // queued labels) against the capture's own reads of them: a difference is the "served
+            // word" kind. On every 16th dispatch with any (each waits for the writes pending over
+            // its words), also against the bytes memory holds once those writes landed: counted
+            // apart by source, not a kind, since the capture at the same point serves an evidence
+            // word's stale value the same way.
+            if (const auto& served = FastServedWords().words; !served.empty()) {
+                local.servedCompared += served.size();
+                const auto differing = CompareServedWords(served, regions, local.servedUnread);
+                local.servedDiffering += differing;
+                static std::atomic<std::uint64_t> finalChecks{0};
+                FastServedCheck check;
+                if (finalChecks.fetch_add(1, std::memory_order_relaxed) % 16 == 0) CheckServedWords(served, "dispatch verify", check);
+                local.servedFinal.compared += check.compared;
+                local.servedFinal.unreadable += check.unreadable;
+                for (std::size_t source = 0; source < check.mismatched.size(); ++source) local.servedFinal.mismatched[source] += check.mismatched[source];
+                if (differing != 0) {
+                    if (kinds == 0) first = {WalkMismatch::Served, 0, 0, 0, 0};
+                    kinds |= 1u << static_cast<unsigned>(WalkMismatch::Served);
+                }
+            }
             if (kinds != 0) {
                 ++local.verifyMismatched;
                 for (std::size_t kind = 0; kind < MismatchCount; ++kind) {
@@ -293,6 +321,12 @@ bool Driver::fastDispatch(const Submission& submission, const ShaderSnapshot& sn
     total.verifyMismatched += local.verifyMismatched;
     total.feedbackOnly += local.feedbackOnly;
     total.flatFeedback += local.flatFeedback;
+    total.servedCompared += local.servedCompared;
+    total.servedDiffering += local.servedDiffering;
+    total.servedUnread += local.servedUnread;
+    total.servedFinal.compared += local.servedFinal.compared;
+    total.servedFinal.unreadable += local.servedFinal.unreadable;
+    for (std::size_t source = 0; source < total.servedFinal.mismatched.size(); ++source) total.servedFinal.mismatched[source] += local.servedFinal.mismatched[source];
     for (std::size_t kind = 0; kind < MismatchCount; ++kind) total.mismatches[kind] += local.mismatches[kind];
     if (std::chrono::steady_clock::now() - total.lastReport >= std::chrono::seconds(10)) {
         report(total);
