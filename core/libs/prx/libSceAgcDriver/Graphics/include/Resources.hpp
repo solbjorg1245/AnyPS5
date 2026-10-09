@@ -38,6 +38,14 @@ void RecordCheckpoint(VkCommandBuffer commands, char kind, std::uint64_t first, 
 void RecordDrawCheckpoint(VkCommandBuffer commands, std::uint64_t detail);
 void ReportCheckpoints();
 
+// vkAllocateMemory for the driver's buffers and images. VK_ERROR_OUT_OF_DEVICE_MEMORY (video memory
+// exhausted: t421-t424 met it at the Boletaria load's peak, ~12.8k device buffers in use, and every
+// draw after it failed a texture allocation for ~3-9 ms, one present per 10 s, while the buffer
+// pool kept ~2 GiB of device-local allocations no work used) first releases those
+// (BufferPool::ReleaseDevice) and, when that freed anything, allocates once more. The failure is
+// returned as before when nothing was retained. APS5_NO_OOM_RECLAIM=1 returns it at once (old).
+VkResult AllocateDeviceMemory(const Context& context, const VkMemoryAllocateInfo& allocation, VkDeviceMemory* memory);
+
 class Buffer {
 public:
     Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);

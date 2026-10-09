@@ -570,12 +570,15 @@ if(BUILD_TESTING)
     #   scan and fresh result;
     # - agc_driver_no_memos, agc_driver_fast_dispatch_no_memos: every s53-fast-cost-b memo off (the
     #   import, pipeline, sampler and variant memos, the in-place decode).
+    # - agc_driver_recorder_no_oom_reclaim: an allocation refused for want of video memory fails at
+    #   once, the buffer pool kept (APS5_NO_OOM_RECLAIM=1).
     # Fields: name|target|environment (comma-separated, no list separators inside one entry).
     set(agcFastCostMemosOff "APS5_NO_IMPORT_MEMO=1,APS5_NO_PIPELINE_MEMO=1,APS5_NO_SAMPLER_MEMO=1,APS5_NO_VARIANT_MEMO=1,APS5_NO_DECODE_REUSE=1")
     set(agcSwitchedTests
         "agc_shader_memory_no_walk_reuse|agc_shader_memory_tests|APS5_NO_WALK_REUSE=1"
         "agc_shader_memory_no_variant_memo|agc_shader_memory_tests|APS5_NO_VARIANT_MEMO=1"
-        "agc_driver_no_memos|agc_driver_tests|${agcFastCostMemosOff}")
+        "agc_driver_no_memos|agc_driver_tests|${agcFastCostMemosOff}"
+        "agc_driver_recorder_no_oom_reclaim|agc_driver_recorder_tests|APS5_NO_OOM_RECLAIM=1")
     if(TARGET agc_driver_fast_dispatch_tests)
         list(APPEND agcSwitchedTests "agc_driver_fast_dispatch_no_memos|agc_driver_fast_dispatch_tests|${agcFastCostMemosOff}")
     endif()

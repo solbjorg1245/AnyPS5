@@ -309,7 +309,7 @@ ImageMemoryPool::Allocation ImageMemoryPool::AllocateAndBind(VkImage image, VkMe
     allocate.allocationSize = requirements.size;
     allocate.memoryTypeIndex = type;
     Allocation result{VK_NULL_HANDLE, 0, requirements.size, false};
-    Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(device, &allocate, nullptr, &result.memory), "vkAllocateMemory texture");
+    Check(AllocateDeviceMemory(context, allocate, &result.memory), "vkAllocateMemory texture");
     if (const auto status = bind(device, image, result.memory, 0); status != VK_SUCCESS) {
         context.Function<PFN_vkFreeMemory>("vkFreeMemory")(device, result.memory, nullptr);
         Check(status, "vkBindImageMemory");
@@ -878,7 +878,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory storage texture");
+        Check(AllocateDeviceMemory(context, allocation, &memory), "vkAllocateMemory storage texture");
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory storage");
         uploadReason = "first";
         upload();

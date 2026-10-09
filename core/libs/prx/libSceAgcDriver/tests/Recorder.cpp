@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastDispatch.hpp"
@@ -1332,6 +1333,110 @@ void samplerMemoTests(const Device& device) {
     Require(cache->Instance() != instance, "sampler memo: a new cache has the old one's instance");
     const auto fresh = cache->GetMemoized(context, wordsA, false);
     Require(fresh != a && fresh == cache->Get(context, wordsA, false), "sampler memo: a new cache was answered from the old cache's memo");
+}
+
+// Out of video memory (AllocateDeviceMemory): a device whose allocations past a budget fail with
+// VK_ERROR_OUT_OF_DEVICE_MEMORY, as the GPU's did at the Boletaria load (t421-t424: textures
+// refused for minutes while the buffer pool retained ~2 GiB of released device buffers). A new
+// size must not fail while released buffers hold the memory (the pool releases them and the
+// allocation is made on one more try), and with nothing to release the refusal comes after one
+// try. APS5_NO_OOM_RECLAIM=1: refused at once, the pool kept, as before.
+struct FakeVideoMemory {
+    PFN_vkGetDeviceProcAddr real = nullptr;
+    PFN_vkAllocateMemory allocateMemory = nullptr;
+    PFN_vkFreeMemory freeMemory = nullptr;
+    VkDeviceSize budget = ~VkDeviceSize{0};
+    VkDeviceSize live = 0;
+    std::uint64_t tries = 0;
+    std::map<VkDeviceMemory, VkDeviceSize> sizes;
+};
+
+FakeVideoMemory& fakeVideoMemory() {
+    static FakeVideoMemory memory;
+    return memory;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL fakeAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* callbacks, VkDeviceMemory* memory) {
+    auto& fake = fakeVideoMemory();
+    ++fake.tries;
+    if (info->allocationSize > fake.budget - std::min(fake.budget, fake.live)) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    const auto result = fake.allocateMemory(device, info, callbacks, memory);
+    if (result == VK_SUCCESS) {
+        fake.live += info->allocationSize;
+        fake.sizes[*memory] = info->allocationSize;
+    }
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL fakeFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* callbacks) {
+    auto& fake = fakeVideoMemory();
+    if (const auto found = fake.sizes.find(memory); found != fake.sizes.end()) {
+        fake.live -= found->second;
+        fake.sizes.erase(found);
+    }
+    fake.freeMemory(device, memory, callbacks);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fakeVideoDeviceProc(VkDevice device, const char* name) {
+    if (std::strcmp(name, "vkAllocateMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&fakeAllocateMemory);
+    if (std::strcmp(name, "vkFreeMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&fakeFreeMemory);
+    return fakeVideoMemory().real(device, name);
+}
+
+void outOfVideoMemoryTests(const Device& device) {
+    auto& fake = fakeVideoMemory();
+    // A context of its own whose buffer pool frees through the fake too.
+    Context context = device.GetContext();
+    fake.real = context.deviceProc;
+    fake.allocateMemory = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory");
+    fake.freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
+    context.deviceProc = &fakeVideoDeviceProc;
+    context.functions = nullptr;
+    context.bufferPool.reset();
+    const bool reclaim = std::getenv("APS5_NO_OOM_RECLAIM") == nullptr;
+    constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    constexpr std::size_t mib = std::size_t{1} << 20u;
+    {
+        // Four buffers of 2 MiB, then released: the pool's device tier retains their memory.
+        std::vector<std::unique_ptr<DeviceBuffer>> released;
+        for (int i = 0; i < 4; ++i) released.push_back(std::make_unique<DeviceBuffer>(context, 2 * mib, usage));
+    }
+    Require(fake.live >= 8 * mib, "out of video memory: the released device buffers were not retained");
+    // 1 MiB left: a 3 MiB buffer (no retained one has its size) needs the retained memory.
+    fake.budget = fake.live + mib;
+    const auto before = BufferPool::OutOfMemory();
+    const auto triesBefore = fake.tries;
+    std::unique_ptr<DeviceBuffer> made;
+    std::string error;
+    try {
+        made = std::make_unique<DeviceBuffer>(context, 3 * mib, usage);
+    } catch (const std::exception& thrown) {
+        error = thrown.what();
+    }
+    const auto after = BufferPool::OutOfMemory();
+    Require(after.refused == before.refused + 1, "out of video memory: the refusal was not counted");
+    if (reclaim) {
+        Require(made != nullptr, "out of video memory: an allocation failed while the pool retained released device memory (" + error + ")");
+        Require(after.reclaims == before.reclaims + 1 && after.reclaimedBytes >= before.reclaimedBytes + 8 * mib && after.madeAfter == before.madeAfter + 1, "out of video memory: the release or the allocation after it was not counted");
+        Require(fake.tries == triesBefore + 2, "out of video memory: not exactly one more try after the release");
+    } else {
+        Require(made == nullptr && error.find("vkAllocateMemory device buffer") != std::string::npos, "out of video memory: APS5_NO_OOM_RECLAIM=1 did not fail as before");
+        Require(after.reclaims == before.reclaims && fake.tries == triesBefore + 1, "out of video memory: APS5_NO_OOM_RECLAIM=1 released the pool");
+    }
+    // No room and nothing the pool could release (with the reclaim it was emptied above): refused
+    // after one try.
+    fake.budget = fake.live;
+    const auto again = BufferPool::OutOfMemory();
+    const auto triesAgain = fake.tries;
+    bool refused = false;
+    try {
+        DeviceBuffer extra(context, 5 * mib, usage);
+    } catch (const std::exception&) {
+        refused = true;
+    }
+    Require(refused && fake.tries == triesAgain + 1 && BufferPool::OutOfMemory().reclaims == again.reclaims, "out of video memory: a refusal with nothing retained was tried again");
+    made.reset();
+    fake.budget = ~VkDeviceSize{0};
 }
 
 void movedMetadataTests(const Device& device, Recorder& recorder) {
@@ -4087,6 +4192,7 @@ int main() {
         batchedImportTests(device);
         importMemoTests(device);
         samplerMemoTests(device);
+        outOfVideoMemoryTests(device);
         movedMetadataTests(device, recorder);
         keysFillTests(device, recorder);
         unitShadowTests(device, recorder);

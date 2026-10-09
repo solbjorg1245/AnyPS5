@@ -58,6 +58,17 @@ public:
     static std::size_t Capacity(std::size_t bytes);
     std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     void Put(const BufferAllocation& allocation) noexcept;
+    // Video memory exhausted (AllocateDeviceMemory): destroys every allocation the device tier
+    // retains (all released, so no work uses one) and returns their bytes; 0 when it held none.
+    // Counted as evictions.
+    VkDeviceSize ReleaseDevice() noexcept;
+    // AllocateDeviceMemory's outcomes since the start (the [bufferpool] line): allocations refused
+    // with VK_ERROR_OUT_OF_DEVICE_MEMORY, releases that freed something and their bytes, and the
+    // allocations made on the try after a release.
+    struct OutOfMemoryCounts {
+        std::uint64_t refused = 0, reclaims = 0, reclaimedBytes = 0, madeAfter = 0;
+    };
+    static OutOfMemoryCounts OutOfMemory();
 
 private:
     struct Slot {
