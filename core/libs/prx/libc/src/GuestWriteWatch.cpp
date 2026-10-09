@@ -323,7 +323,10 @@ public:
         }
         for (std::size_t i = 0; i < gaps.size(); ++i) {
             if (access(gaps[i].first, gaps[i].second, false, view)) continue;
+            // The rollback gives pages back their protection, as a release does (see Serial).
+            _serial.fetch_add(1, std::memory_order_acq_rel);
             for (std::size_t j = 0; j <= i; ++j) access(gaps[j].first, gaps[j].second, true, view);
+            _serial.fetch_add(1, std::memory_order_acq_rel);
             return refuse(begin, end, Refusal::ProtectFailed);
         }
         const auto id = ++_next;
@@ -338,12 +341,15 @@ public:
         const auto found = _entries.find(id);
         if (found == _entries.end()) return;
         const auto [begin, end] = found->second;
+        // Odd from the guard's unpublishing until its pages have their protection back (Serial).
+        _serial.fetch_add(1, std::memory_order_acq_rel);
         _entries.erase(found);
         _count.store(_entries.size(), std::memory_order_release);
         const auto viewEntry = std::find(_viewEntries.begin(), _viewEntries.end(), id);
         const bool view = viewEntry != _viewEntries.end();
         if (view) _viewEntries.erase(viewEntry);
         for (const auto& [from, to] : uncovered(begin, end)) access(from, to, true, view);
+        _serial.fetch_add(1, std::memory_order_acq_rel);
         // Remembered for a fault that raced this release (see raced).
         auto& slot = _released[_releasedNext++ % _released.size()];
         slot.begin = begin;
@@ -360,10 +366,19 @@ public:
 
     // GuestPageGuardHeldRun: under the shared lock whatever `_count` says (a guard being made has
     // its pages no-access before it is counted; Protect holds the lock meanwhile).
+    // False: `*end` is the first guarded address in [address, limit), or `limit`.
     bool HeldRun(std::uintptr_t address, std::uintptr_t limit, std::uintptr_t* end) {
+        if (end != nullptr) *end = limit;
         if (!_holding.load(std::memory_order_acquire)) return false;
         std::shared_lock lock(_lock);
-        if (covering(address) == 0) return false;
+        if (covering(address) == 0) {
+            if (end != nullptr) {
+                for (const auto& [id, range] : _entries) {
+                    if (range.first < *end && address < range.second) *end = std::max(address, range.first);
+                }
+            }
+            return false;
+        }
         // Every guard over the cursor moves it to its end, until none holds the cursor.
         auto cursor = address;
         for (bool moved = true; moved && cursor < limit;) {
@@ -385,13 +400,38 @@ public:
         return std::any_of(_entries.begin(), _entries.end(), [&](const auto& entry) { return entry.second.first < end && begin < entry.second.second; });
     }
 
+    std::uint64_t Serial() const { return _serial.load(std::memory_order_acquire); }
+
+    bool Live(std::uint64_t id) {
+        if (id == 0 || _count.load(std::memory_order_acquire) == 0) return false;
+        std::shared_lock lock(_lock);
+        return _entries.contains(id);
+    }
+
     // A fault at `address`: false when no guard holds it (not this handler's fault). `write`: the
     // access was a store (1), a load (0), or unknown (-1).
     bool Fault(std::uintptr_t address, int write = -1) {
         if (!Covers(address)) return raced(address, write);
         _faults.fetch_add(1, std::memory_order_relaxed);
         const auto resolve = _resolve.load(std::memory_order_acquire);
+        // Guards made over the page after the resolver started (another thread decided to keep a
+        // newer copy resident there before this one looked again) are resolved as well, a few
+        // times at most; only a guard the resolver itself left is released by force (a forced
+        // release leaves its copy's bytes unlanded).
+        std::uint64_t newest = 0;
+        {
+            std::shared_lock lock(_lock);
+            newest = _next;
+        }
         bool forced = resolve == nullptr || !resolve(address);
+        for (int again = 0; !forced && again < 4; ++again) {
+            std::shared_lock lock(_lock);
+            const bool newer = std::any_of(_entries.begin(), _entries.end(), [&](const auto& entry) { return entry.first > newest && entry.second.first <= address && address < entry.second.second; });
+            if (!newer) break;
+            newest = _next;
+            lock.unlock();
+            forced = !resolve(address);
+        }
         for (;;) {
             std::uint64_t id = 0;
             {
@@ -651,6 +691,8 @@ private:
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Refusal::Count)> _refusals{};
     std::uint64_t _next = 0;
     std::atomic<std::size_t> _count{0};
+    // See GuestPageGuardSerial: bumped twice (odd in between) around every protection restore.
+    std::atomic<std::uint64_t> _serial{0};
     std::atomic<std::uint64_t> _faults{0}, _forced{0};
     std::atomic<bool (*)(std::uintptr_t)> _resolve{nullptr};
     std::once_flag _installed;
@@ -754,6 +796,14 @@ bool GuestPageGuardHeldRun_nid_postfix(std::uintptr_t address, std::uintptr_t li
 
 bool GuestPageGuardHeldWithin_nid_postfix(std::uintptr_t begin, std::uintptr_t end) {
     return PageGuard::Get().HeldWithin(begin, end);
+}
+
+std::uint64_t GuestPageGuardSerial_nid_postfix() {
+    return PageGuard::Get().Serial();
+}
+
+bool GuestPageGuardLive_nid_postfix(std::uint64_t id) {
+    return PageGuard::Get().Live(id);
 }
 
 bool GuestPageGuardCovers_nid_postfix(std::uintptr_t address) {

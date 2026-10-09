@@ -46,10 +46,21 @@ bool GuestPageGuardHolding_nid_postfix();
 // most `limit`). Taken under the guards' lock: a guard being made (pages no-access, not yet
 // published) or released (published no longer, protection being restored) is seen whole, so false
 // after a no-access answer means that answer may be stale (a release restored the page since): the
-// caller queries once more. Always false before the first Install.
+// caller queries again when GuestPageGuardSerial changed meanwhile. Always false before the first
+// Install. False: `*end` is where the unguarded run from `address` stops, the first page a guard holds
+// in [address, limit) (or `limit`), so a no-access run the guest made and a guarded one after it in
+// one host region are told apart.
 bool GuestPageGuardHeldRun_nid_postfix(std::uintptr_t address, std::uintptr_t limit, std::uintptr_t* end);
 // Whether a guard holds any page of [begin, end) (false before the first Install).
 bool GuestPageGuardHeldWithin_nid_postfix(std::uintptr_t begin, std::uintptr_t end);
+// Changes when a guard gives pages their protection back (a release, a refused guard's rollback),
+// and is odd while one does (under the guards' lock). A page query that read the serial before it
+// asked the host and finds a no-access page no guard holds asks again when the serial is odd or
+// changed: the guard may have been released between the two answers.
+std::uint64_t GuestPageGuardSerial_nid_postfix();
+// Whether guard `id` (GuestPageGuardProtect) still stands: false once released, by its owner or by
+// force (a fault whose resolver left it, GuestPageGuardCounts' 'forced').
+bool GuestPageGuardLive_nid_postfix(std::uint64_t id);
 // Totals since start: faults on guarded pages and those that left a guard to release by force;
 // the live guards.
 void GuestPageGuardCounts_nid_postfix(std::uint64_t* faults, std::uint64_t* forced, std::uint64_t* guards);

@@ -208,7 +208,9 @@ std::uint64_t ForgetSerial();
 std::uint64_t GuardedPageQueries();
 // Debug aid, APS5_GUARD_PAGES_AS_HOLES=1: the answers before the fix (t419): guarded pages read as
 // unmapped (holes) by the page queries, and an import over one is refused for good. For an A/B only.
+// Read from the environment at the first use; SetGuardedPagesAsHoles (tests) overrides it.
 bool GuardedPagesAsHoles();
+void SetGuardedPagesAsHoles(bool holes);
 
 // Attribution of guest memory accesses (the [hooksync] line in Recorder.cpp and the read-site
 // counts of the [guestmem] line, APS5_PROFILE_DRAW): a sync the flush hook makes for an access has

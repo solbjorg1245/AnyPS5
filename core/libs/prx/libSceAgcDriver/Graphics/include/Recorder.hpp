@@ -198,6 +198,9 @@ public:
         // copied again (a copy from the guard's shadow after that batch could undo the newer copy
         // the build that took the shadow over recorded there).
         std::uint64_t waitedLanding = 0;
+        // Copies recorded at a decision because a forced release took their guard; nanoseconds
+        // faulting threads spent resolving, and the part spent landing.
+        std::uint64_t unguarded = 0, faultNanos = 0, landNanos = 0;
     };
     static ResidentStatistics ResidentCounts();
     // Commands() that leaves the queued copy-backs alone under coalescing (the caller recorded
