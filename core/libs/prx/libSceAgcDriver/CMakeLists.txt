@@ -335,6 +335,13 @@ if(BUILD_TESTING)
     endif()
 endif()
 
+# The [inplace-writes] census's aggregator (Graphics/include/InPlaceWriteCensus.hpp): header only, no device.
+add_test_executable(agc_inplace_write_census_tests EXCLUDE_FROM_ALL tests/InPlaceWriteCensus.cpp)
+target_include_directories(agc_inplace_write_census_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_inplace_write_census_tests PRIVATE libc)
+set_target_properties(agc_inplace_write_census_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_inplace_write_census_tests)
+
 add_test_executable(agc_shader_disk_cache_tests EXCLUDE_FROM_ALL tests/ShaderDiskCache.cpp)
 target_include_directories(agc_shader_disk_cache_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_shader_disk_cache_tests PRIVATE shader_recompiler_agc_driver libc)

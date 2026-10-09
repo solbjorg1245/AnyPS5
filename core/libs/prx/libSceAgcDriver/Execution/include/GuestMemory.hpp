@@ -128,6 +128,11 @@ constexpr std::uint8_t BlockUnchanged = 0;
 constexpr std::uint8_t BlockWritten = 1;
 constexpr std::uint8_t BlockMaybeWritten = 2;
 bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu = {});
+// Diagnostics (the [inplace-writes] census), read-only: walks, stamps and bumps nothing. The bytes
+// of [address, address + bytes) in 64 KiB blocks a collect stamped after `generation` (CPU stores
+// some collect saw since; one no collect walked yet is not seen), 0 for a generation of 0; `now`
+// gets the tracker's generation (0 outside the watched arena), a later call's `generation`.
+std::uint64_t CpuStampedBytes(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t& now);
 // Debug aid: the page's mapping (VirtualQuery) and its tracker block's stamps, as one line.
 std::string DescribePage(std::uint64_t address);
 

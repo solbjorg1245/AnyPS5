@@ -1625,6 +1625,25 @@ bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
     return true;
 }
 
+std::uint64_t CpuStampedBytes(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t& now) {
+    now = 0;
+    auto& tracker = Tracker();
+    // Not lockTracker: the census's holds stay out of the [guestmem] tracker counts.
+    const std::lock_guard lock(tracker.mutex);
+    tracker.initialize();
+    if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
+    now = tracker.generation;
+    if (generation == 0) return 0;
+    const auto end = address + bytes;
+    std::uint64_t stamped = 0;
+    for (auto block = tracker.blockOf(address), last = tracker.blockOf(end - 1); block <= last; ++block) {
+        if (tracker.cpuStampOf(block) <= generation) continue;
+        const auto first = tracker.blockBegin(block);
+        stamped += std::min<std::uint64_t>(end, first + WriteBlockBytes) - std::max(address, first);
+    }
+    return stamped;
+}
+
 std::string DescribePage(std::uint64_t address) {
     char text[512];
 #ifdef _WIN32

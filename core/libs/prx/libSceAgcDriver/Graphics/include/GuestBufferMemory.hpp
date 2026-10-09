@@ -152,6 +152,13 @@ bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes);
 // 2.9). A merged region's size can differ from one element's, so this is the element's answer.
 bool DeviceStagingWanted(std::uint64_t bytes, bool atomic);
 
+// The [inplace-writes] census (APS5_PROFILE_DRAW, off with APS5_NO_INPLACE_WRITE_CENSUS=1; see
+// GuestBufferMemory.cpp): whether it is on (one static check), and one written element the fast
+// dispatch bound in place, `program` keying the dispatch as [gputime] does (a build's use notes its
+// regions through GuestBufferMemory::NoteInPlaceWrites).
+bool InPlaceWriteCensusOn();
+void NoteInPlaceWrite(std::uint64_t begin, std::uint64_t end, bool atomic, std::uint64_t program);
+
 // A persistent device copy of one registered range of the main guest image (which cannot be host
 // imported); see GuestBufferMemory.cpp.
 struct ImageMirror;
@@ -423,6 +430,10 @@ public:
     // Reports writes into host-imported memory (made by the GPU in place, or copied back into it by
     // RecordCopyBacks) to the write tracking now.
     void MarkDirectWrites() const;
+    // The [inplace-writes] census of this use, after its marks (VulkanDevice::recordDispatch): each
+    // written region bound in place with why it was not staged, and an address-based build's
+    // storable ranges as one use; `program` keys the dispatch as [gputime] does.
+    void NoteInPlaceWrites(std::uint64_t program) const;
     // Records, into the recorder's open batch, the copy of every written sub-range of a region the
     // GPU copied out of a host import (see Region::gpuCopy) back into the import: what the shader
     // wrote lands in guest memory by the GPU, ordered after the recorded work, so the region needs

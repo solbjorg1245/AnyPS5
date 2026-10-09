@@ -38,6 +38,8 @@ struct BufferElement {
     std::size_t info = 0;
     std::uint32_t adjustmentByte = 0;
     bool written = false;
+    // An atomic element: the [inplace-writes] census tells the atomic cap apart.
+    bool atomic = false;
 };
 
 // A data binding (flattened SRT or shader data words) to place in the ring.
@@ -124,6 +126,7 @@ std::optional<Decline> checkBufferElement(const Context& context, const ShaderRe
     if (element.written && DeviceStagingWanted(bytes, atomic)) return Decline::Staged;
     element.address = address;
     element.bytes = bytes;
+    element.atomic = atomic;
     return std::nullopt;
 }
 
@@ -505,6 +508,15 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
     for (const auto& [begin, end] : scratch.written) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
     if (nullBound != 0) NoteSampledNullBound(nullBound);
     timing.recordNs = nanosecondsSince(recordStart);
+    // APS5_PROFILE_DRAW: the written elements in the [inplace-writes] census, after the timing.
+    if (InPlaceWriteCensusOn()) {
+        try {
+            for (const auto& element : scratch.elements) {
+                if (element.written) NoteInPlaceWrite(element.address, element.address + element.bytes, element.atomic, call.programAddress != 0 ? call.programAddress : shader.variantId);
+            }
+        } catch (...) {
+        }
+    }
     return std::nullopt;
 }
 

@@ -4,6 +4,7 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/InPlaceWriteCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -2356,6 +2357,64 @@ void reportStagedTop() {
     std::fprintf(stderr, "%s (%zu ranges)\n", line.c_str(), top.size());
 }
 
+// The [inplace-writes] census (APS5_PROFILE_DRAW, off with APS5_NO_INPLACE_WRITE_CENSUS=1; see
+// InPlaceWriteCensus.hpp): the written ranges dispatches bind in place instead of staging them,
+// noted per use after its marks (GuestBufferMemory::NoteInPlaceWrites; NoteInPlaceWrite for the
+// fast dispatch's elements), each asking the write tracker, read-only, which CPU stores a collect
+// saw over the range since its previous use. Printed after the staging chain line (reportStaging),
+// so only while something is staged; the first window starts at the first use.
+struct InPlaceWrites {
+    HostMutex mutex;
+    InPlaceWriteCensus census;
+    std::int64_t windowStartMs = 0;
+    // The address space whose storable bytes `spaceBytes` holds (by serial: a space is immutable).
+    std::uint64_t spaceSerial = 0;
+    std::uint64_t spaceBytes = 0;
+};
+
+InPlaceWrites& inPlaceWrites() {
+    static InPlaceWrites state;
+    return state;
+}
+
+std::int64_t steadyMilliseconds() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Why stagingEligible's size rules refused a written range whose flags passed.
+InPlaceWriteCensus::Reason writtenSizeReason(std::uint64_t bytes, bool atomic) {
+    using Reason = InPlaceWriteCensus::Reason;
+    if ((atomic && atomicStagingEnabled() && bytes <= atomicStageMax()) || (writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= writtenShadowMax())) return Reason::Other;
+    if (atomic) return Reason::AtomicCap;
+    if (!writtenShadowEnabled()) return Reason::Other;
+    return bytes > writtenShadowMax() ? Reason::TooLarge : Reason::TooSmall;
+}
+
+// One use, under the census lock. GuestMemory::CpuStampedBytes only reads the tracker's stamps: it
+// walks, stamps and bumps nothing, so the staging chain's and the validations' state stand.
+void noteInPlaceWrite(InPlaceWrites& state, std::uint64_t begin, std::uint64_t end, InPlaceWriteCensus::Reason reason, std::uint64_t program) {
+    if (state.windowStartMs == 0) state.windowStartMs = steadyMilliseconds();
+    state.census.Note(begin, end, reason, program, [&](std::uint64_t previous) {
+        InPlaceWriteCensus::Change change;
+        change.dirtyBytes = GuestMemory::CpuStampedBytes(begin, static_cast<std::size_t>(end - begin), previous, change.generation);
+        return change;
+    });
+}
+
+void reportInPlaceWrites() {
+    if (!InPlaceWriteCensusOn()) return;
+    auto& state = inPlaceWrites();
+    std::string text;
+    {
+        std::lock_guard lock(state.mutex);
+        if (state.windowStartMs == 0) return;
+        const auto nowMs = steadyMilliseconds();
+        text = state.census.Report((nowMs - state.windowStartMs) / 1000.0);
+        state.windowStartMs = nowMs;
+    }
+    std::fprintf(stderr, "%s", text.c_str());
+}
+
 void reportStaging() {
     auto& stats = Copies();
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -2411,6 +2470,7 @@ void reportStaging() {
     lastChainedInPlace = chainedInPlace;
     lastInPlacePasses = inPlacePasses;
     reportStagedTop();
+    reportInPlaceWrites();
 }
 
 // Staging chain. A staged region is copied in from its host import over PCIe before every use
@@ -3116,6 +3176,20 @@ bool DeviceStagingWanted(std::uint64_t bytes, bool atomic) {
     if (!gpuCopiesEnabled()) return false;
     if (atomic && atomicStagingEnabled() && bytes <= atomicStageMax()) return true;
     return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= writtenShadowMax();
+}
+
+bool InPlaceWriteCensusOn() {
+    static const bool on = std::getenv("APS5_PROFILE_DRAW") != nullptr && std::getenv("APS5_NO_INPLACE_WRITE_CENSUS") == nullptr;
+    return on;
+}
+
+void NoteInPlaceWrite(std::uint64_t begin, std::uint64_t end, bool atomic, std::uint64_t program) {
+    if (!InPlaceWriteCensusOn() || end <= begin) return;
+    // A fast dispatch's element lies in an import, committed, in a dispatch that may stage (it
+    // declines what a build would stage): only APS5_CPU_COPIES or the size rules refused it.
+    auto& state = inPlaceWrites();
+    std::lock_guard lock(state.mutex);
+    noteInPlaceWrite(state, begin, end, gpuCopiesEnabled() ? writtenSizeReason(end - begin, atomic) : InPlaceWriteCensus::Reason::NoGpuCopies, program);
 }
 
 bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) const {
@@ -4164,6 +4238,46 @@ void GuestBufferMemory::MarkDirectWrites() const {
         if (overlapped) continue;
         if (generation == 0) generation = GuestMemory::TrackerGeneration();
         registerStagedShadow(recorder, region.begin, region.end, region.buffer, generation, region.baselineDelta, region.baselineTrusted);
+    }
+}
+
+void GuestBufferMemory::NoteInPlaceWrites(std::uint64_t program) const {
+    if (!InPlaceWriteCensusOn() || !uploaded || committed) return;
+    using Reason = InPlaceWriteCensus::Reason;
+    const bool addressable = HoldsLease();
+    // Why a written region bound in place was not staged, in stagingEligible's order.
+    const auto reasonOf = [&](const Region& region) {
+        if (addressable) return Reason::AddressBased;
+        if (!stagingAllowed) return Reason::NotAllowed;
+        if (region.unstaged) return Reason::Unstaged;
+        if (!gpuCopiesEnabled()) return Reason::NoGpuCopies;
+        if (region.sparse) return Reason::Sparse;
+        return region.mirror != nullptr ? Reason::Mirror : writtenSizeReason(region.end - region.begin, region.atomic);
+    };
+    // What a BDA table lets the shader store to (addressRange's Write: in place and writable).
+    const auto storable = [](const Region& region) { return region.direct != nullptr && region.writable && !region.span; };
+    auto& state = inPlaceWrites();
+    std::lock_guard lock(state.mutex);
+    if (state.windowStartMs == 0) state.windowStartMs = steadyMilliseconds();
+    if (addressable) {
+        // One use of every range the build may store to: the space's (its writableRanges' bytes,
+        // summed once per space) and its own that no descriptor writes (the per-build path's leased
+        // ranges). Its written descriptor regions follow one by one.
+        if (space != nullptr && state.spaceSerial != space->serial) {
+            state.spaceSerial = space->serial;
+            state.spaceBytes = 0;
+            for (const auto& region : space->base) state.spaceBytes += storable(region) ? region.end - region.begin : 0;
+        }
+        std::uint64_t bytes = space != nullptr ? state.spaceBytes : 0;
+        for (const auto& region : regions) {
+            if (storable(region) && !WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) bytes += region.end - region.begin;
+        }
+        state.census.NoteSpace(bytes);
+    }
+    for (const auto& region : regions) {
+        // In place: the import itself or an image mirror (a host-cached buffer), not a copy or a shadow.
+        if ((region.direct == nullptr && region.mirror == nullptr) || !WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) continue;
+        noteInPlaceWrite(state, region.begin, region.end, reasonOf(region), program);
     }
 }
 
