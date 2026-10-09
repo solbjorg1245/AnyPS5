@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostMutex.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libc/include/General.hpp"
@@ -92,6 +93,90 @@ std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKep
 // hook for the read site of the last skip; images evictStale dropped (the [hooksync] and [storage] lines).
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
 
+// The [retile] line (APS5_PROFILE_DRAW, every 10 s after [storage]): the GPU-direct write-backs
+// of storage images and what each moved through which memory, so the [gputime] retile row's cost
+// per write-back can be attributed (port/reports/s53-gpu3-retile.md): bytes per stage (image ->
+// linear scratch, retiled into the tiled scratch, stored into unit shadow slabs or the import,
+// seeds read from the import), the scratch buffers (made by the write-back, reused from the pool,
+// made or used during a video memory pressure episode, older than the guard's last recycle) and
+// the memory type each kind was allocated from. Relaxed: only reported.
+struct RetileCounters {
+    std::atomic<std::uint64_t> writeBacks{0}, linearBytes{0}, tiledBytes{0}, slabBytes{0}, importBytes{0}, seedBytes{0};
+    std::atomic<std::uint64_t> scratchMade{0}, scratchPooled{0}, scratchMadeUnderPressure{0}, usedUnderPressure{0}, scratchOlderEpoch{0};
+    std::atomic<std::uint32_t> imageType{~0u}, linearType{~0u}, scratchType{~0u}, slabType{~0u}, importType{~0u};
+    // The device's memory types and heaps, copied at the first write-back (the report has no context).
+    std::atomic<bool> memoryKnown{false};
+    VkPhysicalDeviceMemoryProperties memory{};
+};
+
+RetileCounters& Retiles() {
+    static RetileCounters counters;
+    return counters;
+}
+
+struct RetileBytes {
+    std::uint64_t linear = 0, tiled = 0, slab = 0, import = 0, seed = 0;
+};
+
+void noteRetile(const Context& context, const DeviceBuffer& linear, const DeviceBuffer& scratch, std::uint32_t imageType, std::uint32_t slabType, std::uint32_t importType, const RetileBytes& bytes) {
+    auto& c = Retiles();
+    if (!c.memoryKnown.load(std::memory_order_acquire)) {
+        static HostMutex once;
+        std::lock_guard lock(once);
+        if (!c.memoryKnown.load(std::memory_order_relaxed)) {
+            c.memory = context.memory;
+            c.memoryKnown.store(true, std::memory_order_release);
+        }
+    }
+    c.writeBacks.fetch_add(1, std::memory_order_relaxed);
+    c.linearBytes.fetch_add(bytes.linear, std::memory_order_relaxed);
+    c.tiledBytes.fetch_add(bytes.tiled, std::memory_order_relaxed);
+    c.slabBytes.fetch_add(bytes.slab, std::memory_order_relaxed);
+    c.importBytes.fetch_add(bytes.import, std::memory_order_relaxed);
+    c.seedBytes.fetch_add(bytes.seed, std::memory_order_relaxed);
+    for (const auto* buffer : {&linear, &scratch}) {
+        (buffer->Pooled() ? c.scratchPooled : c.scratchMade).fetch_add(1, std::memory_order_relaxed);
+        if (buffer->MadeUnderPressure()) c.scratchMadeUnderPressure.fetch_add(1, std::memory_order_relaxed);
+        if (buffer->Epoch() < VideoMemory::Epoch()) c.scratchOlderEpoch.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (VideoMemory::UnderPressure()) c.usedUnderPressure.fetch_add(1, std::memory_order_relaxed);
+    const auto keep = [](std::atomic<std::uint32_t>& slot, std::uint32_t type) {
+        if (type != ~0u) slot.store(type, std::memory_order_relaxed);
+    };
+    keep(c.imageType, imageType);
+    keep(c.linearType, linear.MemoryType());
+    keep(c.scratchType, scratch.MemoryType());
+    keep(c.slabType, slabType);
+    keep(c.importType, importType);
+}
+
+std::string describeMemoryType(const RetileCounters& c, std::uint32_t type) {
+    if (type == ~0u || !c.memoryKnown.load(std::memory_order_acquire) || type >= c.memory.memoryTypeCount) return "unknown";
+    const auto& entry = c.memory.memoryTypes[type];
+    std::string flags;
+    if ((entry.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) flags += "D";
+    if ((entry.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) flags += "V";
+    if ((entry.propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0) flags += "C";
+    if ((entry.propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0) flags += "K";
+    if (flags.empty()) flags = "-";
+    const auto& heap = c.memory.memoryHeaps[entry.heapIndex];
+    char text[96];
+    std::snprintf(text, sizeof(text), "type %u %s heap %u (%s, %.0f MiB)", type, flags.c_str(), entry.heapIndex, (heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0 ? "device-local" : "host", static_cast<double>(heap.size) / 1048576.0);
+    return text;
+}
+
+void reportRetiles() {
+    auto& c = Retiles();
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return counter.exchange(0, std::memory_order_relaxed); };
+    const auto count = take(c.writeBacks);
+    const auto linear = take(c.linearBytes), tiled = take(c.tiledBytes), slab = take(c.slabBytes), import = take(c.importBytes), seed = take(c.seedBytes);
+    const auto made = take(c.scratchMade), pooled = take(c.scratchPooled), madeUnder = take(c.scratchMadeUnderPressure), usedUnder = take(c.usedUnderPressure), older = take(c.scratchOlderEpoch);
+    if (count == 0) return;
+    const auto mib = [](std::uint64_t bytes) { return static_cast<double>(bytes) / 1048576.0; };
+    const auto each = [&](std::uint64_t bytes) { return mib(bytes) / static_cast<double>(count); };
+    std::fprintf(stderr, "[retile] (10 s) %llu GPU-direct write-backs, per write-back: image->linear %.2f MiB, retiled %.2f MiB, stored %.2f MiB (unit shadow slabs %.2f, import %.2f), seeds %.2f MiB from the import; scratch buffers: %llu made (%llu during a video memory pressure episode), %llu reused from the pool, %llu older than the last recycle; write-backs during an episode %llu; memory: image %s, linear %s, scratch %s, slabs %s, import %s\n", static_cast<unsigned long long>(count), each(linear), each(tiled), each(slab + import), each(slab), each(import), each(seed), static_cast<unsigned long long>(made), static_cast<unsigned long long>(madeUnder), static_cast<unsigned long long>(pooled), static_cast<unsigned long long>(older), static_cast<unsigned long long>(usedUnder), describeMemoryType(c, c.imageType.load(std::memory_order_relaxed)).c_str(), describeMemoryType(c, c.linearType.load(std::memory_order_relaxed)).c_str(), describeMemoryType(c, c.scratchType.load(std::memory_order_relaxed)).c_str(), describeMemoryType(c, c.slabType.load(std::memory_order_relaxed)).c_str(), describeMemoryType(c, c.importType.load(std::memory_order_relaxed)).c_str());
+}
+
 struct StorageTraffic {
     HostMutex mutex;
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> writeBacks;
@@ -135,6 +220,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
+    reportRetiles();
 }
 
 void countStorageUpload(std::size_t path, std::uint64_t bytes) {
@@ -247,7 +333,12 @@ std::uint64_t ImageMemoryPool::DedicatedImages() { return dedicatedImageCount.lo
 ImageMemoryPool::ImageMemoryPool(const Context& context) : device(context.device), context(context) {}
 
 ImageMemoryPool::~ImageMemoryPool() {
-    for (const auto& block : blocks) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(device, block->memory, nullptr);
+    for (const auto& block : blocks) {
+        // Images still placed in it (none at a clean teardown) go back to its slack, which the
+        // forget then removes whole.
+        if (block->budgeted) Vram().Move(VramClass::Textures, VramClass::Slack, block->ranges.Used());
+        FreeDeviceMemory(context, block->memory);
+    }
 }
 
 ImageMemoryPool::Allocation ImageMemoryPool::AllocateAndBind(VkImage image, VkMemoryPropertyFlags properties) {
@@ -280,6 +371,7 @@ ImageMemoryPool::Allocation ImageMemoryPool::AllocateAndBind(VkImage image, VkMe
                 block.ranges.Free(*offset, requirements.size);
                 return std::nullopt;
             }
+            if (block.budgeted) Vram().Move(VramClass::Slack, VramClass::Textures, requirements.size);
             return Allocation{block.memory, *offset, requirements.size, true};
         };
         for (const auto& block : blocks) {
@@ -293,9 +385,15 @@ ImageMemoryPool::Allocation ImageMemoryPool::AllocateAndBind(VkImage image, VkMe
         allocate.allocationSize = blockBytes;
         allocate.memoryTypeIndex = type;
         VkDeviceMemory memory = VK_NULL_HANDLE;
-        // A failed block (video memory exhausted) falls through to the dedicated path below.
-        if (context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(device, &allocate, nullptr, &memory) == VK_SUCCESS) {
-            blocks.push_back(std::make_unique<Block>(Block{memory, type, RangeAllocator(blockBytes)}));
+        // A failed block (video memory exhausted) falls through to the dedicated path below. So
+        // does one the video-memory budget has no room for: a block would put up to its whole size
+        // past the target for one image; the dedicated allocation takes just the image's, after
+        // the budget's inline reclaim (AllocateDeviceMemory).
+        const bool budgeted = VramBudgeted(context, type);
+        if ((!budgeted || !Vram().Over(blockBytes)) && context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(device, &allocate, nullptr, &memory) == VK_SUCCESS) {
+            // The whole block is free space (slack) until images are placed in it.
+            NoteDeviceMemory(context, memory, allocate, VramClass::Slack);
+            blocks.push_back(std::make_unique<Block>(Block{memory, type, RangeAllocator(blockBytes), budgeted}));
             if (auto result = place(*blocks.back())) {
                 ++pooledImageCount;
                 return *result;
@@ -309,9 +407,9 @@ ImageMemoryPool::Allocation ImageMemoryPool::AllocateAndBind(VkImage image, VkMe
     allocate.allocationSize = requirements.size;
     allocate.memoryTypeIndex = type;
     Allocation result{VK_NULL_HANDLE, 0, requirements.size, false};
-    Check(AllocateDeviceMemory(context, allocate, &result.memory), "vkAllocateMemory texture");
+    Check(AllocateDeviceMemory(context, allocate, &result.memory, VramClass::Textures), "vkAllocateMemory texture");
     if (const auto status = bind(device, image, result.memory, 0); status != VK_SUCCESS) {
-        context.Function<PFN_vkFreeMemory>("vkFreeMemory")(device, result.memory, nullptr);
+        FreeDeviceMemory(context, result.memory);
         Check(status, "vkBindImageMemory");
     }
     ++dedicatedImageCount;
@@ -321,7 +419,7 @@ ImageMemoryPool::Allocation ImageMemoryPool::AllocateAndBind(VkImage image, VkMe
 void ImageMemoryPool::Release(const Allocation& allocation) noexcept {
     if (allocation.memory == VK_NULL_HANDLE) return;
     if (!allocation.pooled) {
-        context.Function<PFN_vkFreeMemory>("vkFreeMemory")(device, allocation.memory, nullptr);
+        FreeDeviceMemory(context, allocation.memory);
         return;
     }
     VkDeviceMemory empty = VK_NULL_HANDLE;
@@ -331,10 +429,12 @@ void ImageMemoryPool::Release(const Allocation& allocation) noexcept {
             auto& block = **it;
             if (block.memory != allocation.memory) continue;
             block.ranges.Free(allocation.offset, allocation.size);
+            if (block.budgeted) Vram().Move(VramClass::Textures, VramClass::Slack, allocation.size);
             if (block.ranges.Empty()) {
                 // Keep one empty block per memory type for reuse; return the rest to the driver.
                 const auto spare = std::count_if(blocks.begin(), blocks.end(), [&](const auto& other) { return other.get() != &block && other->type == block.type && other->ranges.Empty(); });
-                if (spare > 0) {
+                // Over the video-memory budget no empty block is kept.
+                if (spare > 0 || (block.budgeted && VramPressure())) {
                     empty = block.memory;
                     blocks.erase(it);
                 }
@@ -342,7 +442,7 @@ void ImageMemoryPool::Release(const Allocation& allocation) noexcept {
             break;
         }
     }
-    if (empty != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(device, empty, nullptr);
+    if (empty != VK_NULL_HANDLE) FreeDeviceMemory(context, empty);
 }
 
 std::shared_ptr<ImageMemoryPool> GetImageMemoryPool(const Context& context) {
@@ -878,7 +978,8 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        Check(AllocateDeviceMemory(context, allocation, &memory), "vkAllocateMemory storage texture");
+        memoryType = allocation.memoryTypeIndex;
+        Check(AllocateDeviceMemory(context, allocation, &memory, VramClass::Textures), "vkAllocateMemory storage texture");
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory storage");
         uploadReason = "first";
         upload();
@@ -2076,12 +2177,27 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
         }
     }
     context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+    // [gputime] (APS5_PROFILE_GPU): the write-back's stages are timed apart (the barriers between
+    // them already drain the queue, so the stamps add no wait).
+    if (recorder != nullptr) timing = recorder->ContinueGpuTiming(timing, linearTotal, Recorder::CommandClass::StorageRetile);
     const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     const VkMemoryBarrier importReady{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &importReady, 1, &linearRead, 0, nullptr);
     for (std::size_t i = 0; i < windows.size(); ++i) {
         const auto& window = windows[i];
         detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear->Handle(), linearPositions[i], tiledScratch->Handle(), scratchPositions[i], mips[window.level], true, window.layer, false, window.window);
+    }
+    if (recorder != nullptr) timing = recorder->ContinueGpuTiming(timing, scratchTotal, Recorder::CommandClass::StorageStore);
+    if (LookupOutcomes::Profiled()) {
+        RetileBytes moved;
+        moved.linear = linearTotal;
+        moved.tiled = scratchTotal;
+        for (const auto& pieces : slabPieces) {
+            for (const auto& copy : pieces.copies) moved.slab += copy.size;
+        }
+        for (const auto& copy : importCopies) moved.import += copy.size;
+        for (const auto& seed : seeds) moved.seed += seed.end - seed.begin;
+        noteRetile(context, *linear, *tiledScratch, memoryType, slabPieces.empty() ? ~0u : slabPieces.front().slab->memoryType, importCopies.empty() && seeds.empty() ? ~0u : import.memoryType, moved);
     }
     {
         // The retiled scratch (and a seed's slab bytes, which the scratch copies overwrite in
@@ -3606,6 +3722,8 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
         const auto regions = CopyRegions(storedLayers);
         context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+        // [gputime]: the stages timed apart, as writeBackWindows does.
+        if (recorder != nullptr) timing = recorder->ContinueGpuTiming(timing, sliceLinearBytes * arrayLayers, Recorder::CommandClass::StorageRetile);
         const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         const VkMemoryBarrier importReady{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT};
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &importReady, 1, &linearRead, 0, nullptr);
@@ -3614,6 +3732,14 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             for (const auto& mip : mips) {
                 detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, tiledScratch->Handle(), geometry.GuestLayerOffset(layer) + mip.tiledOffset, mip, true, layer, geometry.thick);
             }
+        }
+        if (recorder != nullptr) timing = recorder->ContinueGpuTiming(timing, guestBytes, Recorder::CommandClass::StorageStore);
+        if (LookupOutcomes::Profiled()) {
+            RetileBytes moved;
+            moved.linear = sliceLinearBytes * arrayLayers;
+            moved.tiled = guestBytes;
+            moved.import = storedBytes;
+            noteRetile(context, *linear, *tiledScratch, memoryType, ~0u, import->memoryType, moved);
         }
         {
             const auto scratchDone = WholeBufferBarrier(tiledScratch->Handle(), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -3795,7 +3921,7 @@ void StorageTexture::release() noexcept {
     attachmentViews.clear();
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
-    if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (memory) FreeDeviceMemory(context, memory);
 }
 
 std::uint64_t StorageTexture::GuestBytes() const {

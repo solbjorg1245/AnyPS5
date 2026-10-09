@@ -2,6 +2,8 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RESOURCES_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
+#include <atomic>
+#include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
 #include <span>
 #include <string>
 
@@ -44,7 +46,9 @@ void ReportCheckpoints();
 // pool kept ~2 GiB of device-local allocations no work used) first releases those
 // (BufferPool::ReleaseDevice) and, when that freed anything, allocates once more. The failure is
 // returned as before when nothing was retained. APS5_NO_OOM_RECLAIM=1 returns it at once (old).
-VkResult AllocateDeviceMemory(const Context& context, const VkMemoryAllocateInfo& allocation, VkDeviceMemory* memory);
+// An allocation in the budgeted heap is accounted under `type` (free it with FreeDeviceMemory), and
+// over the video-memory budget the Inline reclaimers run before it (see VramBudget).
+VkResult AllocateDeviceMemory(const Context& context, const VkMemoryAllocateInfo& allocation, VkDeviceMemory* memory, VramClass type = VramClass::Other);
 
 class Buffer {
 public:
@@ -58,7 +62,16 @@ public:
     // shadows of GuestBufferMemory) has no mapping and its bytes move by GPU copies alone.
     std::span<std::byte> Bytes();
     bool Mapped() const { return mapping != nullptr; }
+    // The bytes its memory allocation holds (the video-memory budget's estimates).
+    VkDeviceSize AllocationBytes() const { return allocationBytes; }
+    bool DeviceLocalOnly() const { return (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0; }
+    VkDevice Device() const { return context.device; }
     void Invalidate();
+    // The video memory guard's epoch when its memory was allocated (VideoMemory::Epoch).
+    std::uint64_t Epoch() const { return epoch; }
+    // Destroyed instead of returned to the buffer pool once the last reference goes (the video
+    // memory guard's trim of resident copies: their memory is to be freed, not retained).
+    void DiscardOnRelease() noexcept { discard.store(true, std::memory_order_relaxed); }
 
 private:
     void initializeAddress(VkBufferUsageFlags usage);
@@ -78,6 +91,10 @@ private:
     VkBufferUsageFlags usage;
     VkMemoryPropertyFlags properties;
     std::shared_ptr<BufferPool> cache;
+    // The video memory guard's epoch at the allocation and its memory type (BufferAllocation).
+    std::uint64_t epoch = 0;
+    std::uint32_t memoryType = ~0u;
+    std::atomic<bool> discard{false};
 };
 
 // Device-local scratch memory for GPU-side layout conversion. The detiler reads and writes scattered
@@ -91,6 +108,13 @@ public:
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
     VkBuffer Handle() const;
     std::size_t Size() const;
+    // Taken from the buffer pool (else allocated by this constructor), the video memory guard's
+    // epoch when its memory was allocated, whether that happened during a pressure episode, and
+    // the memory type (the [retile] line attributes the write-back scratch with them).
+    bool Pooled() const { return pooled; }
+    std::uint64_t Epoch() const { return epoch; }
+    bool MadeUnderPressure() const { return madeUnderPressure; }
+    std::uint32_t MemoryType() const { return memoryType; }
 
 private:
     void release() noexcept;
@@ -102,6 +126,10 @@ private:
     VkDeviceSize allocationBytes = 0;
     VkBufferUsageFlags usage;
     std::shared_ptr<BufferPool> cache;
+    bool pooled = false;
+    bool madeUnderPressure = false;
+    std::uint64_t epoch = 0;
+    std::uint32_t memoryType = ~0u;
 };
 
 // Records a whole-range buffer copy.

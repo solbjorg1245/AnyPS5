@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastRead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -39,8 +40,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <initializer_list>
 #include <iostream>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1439,6 +1442,431 @@ void outOfVideoMemoryTests(const Device& device) {
     Require(refused && fake.tries == triesAgain + 1 && BufferPool::OutOfMemory().reclaims == again.reclaims, "out of video memory: a refusal with nothing retained was tried again");
     made.reset();
     fake.budget = ~VkDeviceSize{0};
+}
+
+// The video memory guard (APS5_VRAM_GUARD, VideoMemory) on the buffer pool's device tier: over the
+// budget it trims the least recently used idle slots down to the end threshold and leaves the
+// tier's limit alone; it ends the episode it started (under the end threshold, or in the band with
+// nothing left to free); only a hard episode (over the budget, or a refusal) recycles, dropping
+// every slot made before it, retained or returned later; a stale slot met by a Take is skipped for
+// a newer one; off, nothing changes.
+void videoMemoryGuardTests(const Device& device) {
+    Context context = device.GetContext();
+    context.bufferPool.reset();
+    constexpr std::uint64_t mib = std::uint64_t{1} << 20u;
+    constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    VideoMemorySample fake;
+    fake.valid = true;
+    fake.usage = 0;
+    fake.budget = 256 * mib;
+    const auto sampler = [&fake](const Context&, VideoMemorySample& sample) {
+        sample = fake;
+        return true;
+    };
+    VideoMemory::ConfigureForTests(1, sampler, 0, mib, 2 * mib);
+    VideoMemory::ResetForTests();
+    struct Restore {
+        ~Restore() {
+            VideoMemory::ConfigureForTests(-1, nullptr, 0, 0, 0);
+            VideoMemory::ResetForTests();
+        }
+    } restore;
+    auto pool = GetBufferPool(context);
+    const auto limit = pool->DeviceLimit();
+    {
+        std::vector<std::unique_ptr<DeviceBuffer>> released;
+        for (int i = 0; i < 4; ++i) released.push_back(std::make_unique<DeviceBuffer>(context, 2 * mib, usage));
+        for (const auto& buffer : released) Require(!buffer->Pooled() && !buffer->MadeUnderPressure() && buffer->Epoch() == VideoMemory::Epoch(), "(v) a new device buffer's origin was not recorded");
+    }
+    const auto retained = pool->DeviceRetainedBytes();
+    Require(retained >= 8 * mib, "(v) the released device buffers were not retained");
+    // Under the budget: nothing happens.
+    VideoMemory::Poll(context);
+    Require(!VideoMemory::UnderPressure() && pool->DeviceRetainedBytes() == retained && VideoMemory::Admits(mib), "(v) the guard acted under the budget");
+    // Slots that came back within the idle time are the working set: not trimmed.
+    VideoMemory::ConfigureForTests(1, sampler, 0, mib, 2 * mib, 60000);
+    fake.usage = fake.budget + 3 * mib;
+    VideoMemory::Poll(context);
+    Require(VideoMemory::UnderPressure() && pool->DeviceRetainedBytes() == retained, "(v) the episode trimmed slots that came back within the idle time");
+    // 3 MiB over: down to the end threshold (usage + 2 margins), 5 MiB of idle slots given back,
+    // and the tier's limit stays (no churn of the working set).
+    VideoMemory::ConfigureForTests(1, sampler, 0, mib, 2 * mib, 0);
+    VideoMemory::Poll(context);
+    const auto trimmed = pool->DeviceRetainedBytes();
+    Require(trimmed + 5 * mib <= retained && trimmed >= 2 * mib, "(v) the episode did not trim the pool's idle slots down to the end threshold (" + std::to_string(retained) + " -> " + std::to_string(trimmed) + ")");
+    Require(pool->DeviceLimit() == limit, "(v) the trim changed the pool's limit");
+    {
+        std::vector<std::unique_ptr<DeviceBuffer>> more;
+        for (int i = 0; i < 3; ++i) more.push_back(std::make_unique<DeviceBuffer>(context, 5 * mib, usage));
+        Require(more.front()->MadeUnderPressure() && !more.front()->Pooled(), "(v) a device buffer made during the episode was not marked");
+    }
+    Require(pool->DeviceRetainedBytes() >= trimmed + 15 * mib, "(v) the pool did not retain what came back during the episode");
+    Require(!VideoMemory::Admits(4096), "(v) a resident copy was admitted during an episode");
+    auto older = std::make_unique<DeviceBuffer>(context, 3 * mib, usage);
+    const auto counts = VideoMemory::Read();
+    Require(counts.episodes == 1 && counts.hardEpisodes == 1 && counts.poolTrimmedBytes >= 5 * mib && counts.pressuredAllocations >= 4, "(v) the episode's trims or allocations were not counted");
+    // Back under (usage + 2 margins below the budget): the hard episode ends and the recycle
+    // advances the epoch and drops what the pool retained.
+    fake.usage = 0;
+    const auto epoch = VideoMemory::Epoch();
+    const auto rounds = VideoMemory::Rounds();
+    VideoMemory::Poll(context);
+    Require(!VideoMemory::UnderPressure() && VideoMemory::Epoch() == epoch + 1 && VideoMemory::Rounds() == rounds + 1, "(v) the end of the hard episode did not recycle");
+    Require(pool->DeviceRetainedBytes() == 0, "(v) the recycle left retained slots");
+    // A buffer made before the recycle is not retained when it comes back; one made after is.
+    older.reset();
+    Require(pool->DeviceRetainedBytes() == 0, "(v) a buffer made before the recycle was retained");
+    {
+        DeviceBuffer fresh(context, 3 * mib, usage);
+        Require(!fresh.Pooled() && fresh.Epoch() == VideoMemory::Epoch(), "(v) a buffer after the recycle came from before it");
+    }
+    Require(pool->DeviceRetainedBytes() >= 3 * mib, "(v) a buffer made after the recycle was not retained");
+    {
+        DeviceBuffer again(context, 3 * mib, usage);
+        Require(again.Pooled(), "(v) a retained buffer from after the recycle was not reused");
+    }
+    // A stale slot a Take meets (retained while the guard was off) is destroyed and a newer one of
+    // the same size is served.
+    {
+        auto stale = std::make_unique<DeviceBuffer>(context, 6 * mib, usage);
+        VideoMemory::RecycleNowForTests(context);
+        { DeviceBuffer newer(context, 6 * mib, usage); }
+        VideoMemory::ConfigureForTests(0, sampler, 0, mib, 2 * mib);
+        stale.reset();
+        VideoMemory::ConfigureForTests(1, sampler, 0, mib, 2 * mib);
+        const auto both = pool->DeviceRetainedBytes();
+        DeviceBuffer taken(context, 6 * mib, usage);
+        Require(taken.Pooled() && taken.Epoch() == VideoMemory::Epoch() && pool->DeviceRetainedBytes() + 12 * mib <= both, "(v) a Take did not skip the stale slot for the newer one");
+    }
+    // Headroom: a copy is admitted while usage + copies + 2 margins stay under the budget.
+    fake.usage = fake.budget - 4 * mib;
+    VideoMemory::Poll(context);
+    Require(!VideoMemory::UnderPressure() && VideoMemory::Admits(mib) && !VideoMemory::Admits(2 * mib), "(v) the resident copy headroom is wrong");
+    // A soft episode (within the margin, never over the budget) recycles nothing.
+    VideoMemory::ResetForTests();
+    fake.usage = fake.budget - mib / 2;
+    VideoMemory::Poll(context);
+    Require(VideoMemory::UnderPressure() && VideoMemory::Read().hardEpisodes == 0, "(v) a soft episode did not start, or counted as hard");
+    fake.usage = 0;
+    const auto softEpoch = VideoMemory::Epoch();
+    VideoMemory::Poll(context);
+    Require(!VideoMemory::UnderPressure() && VideoMemory::Epoch() == softEpoch && VideoMemory::Read().recycles == 0, "(v) a soft episode recycled");
+    // The end threshold is reachable by the guard's own trims: usage follows what the pool keeps.
+    pool->ReleaseDevice();
+    {
+        std::vector<std::unique_ptr<DeviceBuffer>> released;
+        for (int i = 0; i < 4; ++i) released.push_back(std::make_unique<DeviceBuffer>(context, 2 * mib, usage));
+    }
+    const auto kept = pool->DeviceRetainedBytes();
+    std::uint64_t game = fake.budget - kept + mib / 2;
+    const auto following = [&](const Context&, VideoMemorySample& sample) {
+        sample = fake;
+        sample.usage = game + pool->DeviceRetainedBytes();
+        return true;
+    };
+    VideoMemory::ConfigureForTests(1, following, 0, mib, 0);
+    VideoMemory::ResetForTests();
+    VideoMemory::Poll(context);
+    Require(VideoMemory::UnderPressure() && pool->DeviceRetainedBytes() + 2 * mib < kept, "(v) the episode did not trim to the end threshold");
+    VideoMemory::Poll(context);
+    Require(!VideoMemory::UnderPressure(), "(v) the guard's own trims did not end its episode (" + std::to_string(game + pool->DeviceRetainedBytes()) + " of " + std::to_string(fake.budget) + ")");
+    // Nothing left to free and usage in the band (the game's own memory): the episode ends.
+    pool->ReleaseDevice();
+    game = fake.budget + mib / 2;
+    VideoMemory::Poll(context);
+    Require(VideoMemory::UnderPressure(), "(v) the band test's episode did not start");
+    game = fake.budget - 3 * mib / 2;
+    VideoMemory::Poll(context);
+    Require(!VideoMemory::UnderPressure() && VideoMemory::Read().exhaustedEnds == 1, "(v) an episode with nothing left to free did not end in the band");
+    // The margin is at most a 16th of the budget (small heaps).
+    Require(VideoMemory::Margin(8 * mib) == mib / 2 && VideoMemory::Margin(fake.budget) == mib, "(v) the margin does not scale with the heap");
+    // A refused allocation starts a hard episode (no sample needed).
+    VideoMemory::NoteOutOfMemory();
+    Require(VideoMemory::UnderPressure() && VideoMemory::Read().hardEpisodes >= 1, "(v) a refused allocation did not start a hard episode");
+    Require(VideoMemory::Report().rfind("[vram] (10 s) device-local heap: usage ", 0) == 0, "(v) the [vram] line is malformed");
+    // Off: no trim, no recycle, copies admitted, and a buffer from before the epoch is retained as
+    // before; episodes are only observed (while sampling for a profile).
+    auto stale = std::make_unique<DeviceBuffer>(context, 7 * mib, usage);
+    VideoMemory::ConfigureForTests(0, sampler, 0, mib, 2 * mib);
+    VideoMemory::ResetForTests();
+    VideoMemory::RecycleNowForTests(context);
+    Require(stale->Epoch() < VideoMemory::Epoch(), "(v) the test's buffer is not from before the epoch");
+    { DeviceBuffer idle(context, 9 * mib, usage); }
+    const auto idleRetained = pool->DeviceRetainedBytes();
+    fake.usage = 2 * fake.budget;
+    const auto offEpoch = VideoMemory::Epoch();
+    VideoMemory::Poll(context);
+    Require(VideoMemory::UnderPressure() == VideoMemory::Reporting() && VideoMemory::Admits(fake.budget) && pool->DeviceRetainedBytes() == idleRetained, "(v) the guard acted while off");
+    fake.usage = 0;
+    VideoMemory::Poll(context);
+    Require(!VideoMemory::UnderPressure() && VideoMemory::Epoch() == offEpoch, "(v) the guard recycled while off");
+    const auto before = pool->DeviceRetainedBytes();
+    stale.reset();
+    Require(pool->DeviceRetainedBytes() >= before + 7 * mib, "(v) the pool dropped a buffer with the guard off");
+    std::cout << "video memory guard tests passed\n";
+}
+
+// Video-memory budget (VramBudget) on the device: the pool's device tier is accounted as the
+// "pool" class while retained and trimmed least recently retained first; the resource cache evicts
+// only builds it alone holds, that hold device-local memory and that were not used for the
+// budget's MinAge epochs, least recently used first; a device buffer a recorded batch keeps is not
+// freed under pressure before that batch completed; no image-pool block is opened over the
+// target; and a run that keeps allocating device buffers into a cache (as the resource cache keeps
+// builds and their shadows) against a simulated 64 MiB heap (the fake allocator above) completes
+// without a refused allocation while the budget's target is 40 MiB, and fails with the budget off
+// (APS5_NO_VRAM_BUDGET=1's behaviour), as t421 did.
+void vramBudgetTests(const Device& device) {
+    auto& budget = Vram();
+    auto& fake = fakeVideoMemory();
+    Context context = device.GetContext();
+    fake.real = context.deviceProc;
+    fake.allocateMemory = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory");
+    fake.freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
+    context.deviceProc = &fakeVideoDeviceProc;
+    context.functions = nullptr;
+    context.bufferPool.reset();
+    const auto pool = GetBufferPool(context);
+    constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    constexpr VkDeviceSize mib = VkDeviceSize{1} << 20u;
+    const bool enabledByEnvironment = budget.Enabled();
+    const auto minAge = budget.MinAge();
+    ConfigureVram(context, nullptr, pool);
+    budget.SetBackoffMs(0);
+    budget.SetHeadroom(mib);
+    budget.SetMinAge(2);
+    // The budget's clock (the epochs) in the test's hands.
+    std::uint64_t clockMs = 1000000;
+    budget.SetClock([&clockMs] { return clockMs; });
+    std::uint64_t testReclaimer = 0;
+    struct Restore {
+        VramBudget& budget;
+        FakeVideoMemory& fake;
+        const Context& context;
+        const std::shared_ptr<BufferPool>& pool;
+        bool enabled;
+        std::uint32_t minAge;
+        std::uint64_t& reclaimer;
+        ~Restore() {
+            if (reclaimer != 0) budget.RemoveReclaimer(reclaimer);
+            budget.SetEnabled(enabled);
+            budget.SetTargetOverride(0);
+            budget.SetHeadroom(0);
+            budget.SetBackoffMs(50);
+            budget.SetMinAge(minAge);
+            budget.SetClock(nullptr);
+            ReleaseVram(context.device);
+            pool->ReleaseDevice();
+            fake.budget = ~VkDeviceSize{0};
+            // The simulated heap's refusals start a video memory guard episode (APS5_VRAM_GUARD):
+            // it would refuse the later tests' resident copies until a sample ended it.
+            VideoMemory::ResetForTests();
+        }
+    } restore{budget, fake, context, pool, enabledByEnvironment, minAge, testReclaimer};
+    budget.SetEnabled(true);
+    // Ends `count` epochs (presents 100 ms apart).
+    const auto endEpochs = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            clockMs += 100;
+            Require(budget.AdvanceEpoch(true), "vram budget: a present 100 ms after the last did not end the epoch");
+        }
+    };
+
+    // The pool: released device buffers are "pool" while retained, taken back as "buffers", and
+    // TrimDevice gives back the least recently retained first.
+    {
+        const auto poolBefore = budget.Tracked(VramClass::Pool);
+        const auto buffersBefore = budget.Tracked(VramClass::Buffers);
+        auto first = std::make_unique<DeviceBuffer>(context, 1 * mib, usage);
+        auto second = std::make_unique<DeviceBuffer>(context, 2 * mib, usage);
+        auto third = std::make_unique<DeviceBuffer>(context, 3 * mib, usage);
+        Require(budget.Tracked(VramClass::Buffers) >= buffersBefore + 6 * mib, "vram budget: device buffers were not accounted as buffers");
+        first.reset();
+        second.reset();
+        third.reset();
+        Require(budget.Tracked(VramClass::Pool) >= poolBefore + 6 * mib && budget.Tracked(VramClass::Buffers) == buffersBefore, "vram budget: retained device buffers were not accounted as the pool");
+        const auto live = fake.live;
+        std::uint64_t evicted = 0;
+        const auto trimmed = pool->TrimDevice(mib + mib / 2, evicted);
+        Require(evicted == 2 && trimmed >= 3 * mib && fake.live <= live - 3 * mib, "vram budget: the pool trim did not give back the two least recently retained buffers");
+        Require(budget.Tracked(VramClass::Pool) >= poolBefore + 3 * mib && budget.Tracked(VramClass::Pool) < poolBefore + 4 * mib, "vram budget: the trim did not leave the pool's accounting at the newest buffer");
+        // The newest (3 MiB) is still retained: taken without an allocation; the 1 MiB was not.
+        const auto tries = fake.tries;
+        DeviceBuffer again(context, 3 * mib, usage);
+        Require(fake.tries == tries && budget.Tracked(VramClass::Pool) == poolBefore, "vram budget: the newest retained buffer was trimmed");
+        DeviceBuffer fresh(context, 1 * mib, usage);
+        Require(fake.tries == tries + 1, "vram budget: the least recently retained buffer was not trimmed");
+    }
+
+    // The resource cache: only builds the cache alone holds go, least recently used first.
+    {
+        ShaderRecompiler::RecompileResult program;
+        ShaderRecompiler::DescriptorBinding binding;
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+        binding.descriptorSet = 0;
+        binding.binding = 0;
+        binding.count = 1;
+        binding.guestDescriptor = {1, 2, 3, 4};
+        program.bindings.push_back(binding);
+        const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        ResourceCache cache;
+        std::vector<const ShaderResources*> objects;
+        std::shared_ptr<ShaderResources> inFlight;
+        for (std::uint32_t i = 0; i < 5; ++i) {
+            auto made = std::make_shared<ShaderResources>(device.GetContext(), shader);
+            objects.push_back(made.get());
+            if (i == 1) inFlight = made;
+            // 4 holds no device-local memory: evicting it would free nothing.
+            if (i != 4) made->HoldDeviceBytesForTests(mib);
+            cache.Insert({100 + i}, std::move(made));
+        }
+        // Everything was used in this epoch: nothing is old enough.
+        std::vector<std::shared_ptr<ShaderResources>> victims;
+        Require(cache.EvictCold(~VkDeviceSize{0}, victims).Total() == 0 && victims.empty() && cache.ColdCensus().cold == 0, "vram budget: builds used in this epoch were evicted");
+        endEpochs(2);
+        // Use order, least recent first: 1 (held by in-flight work), 2, 3, 4 (no device memory),
+        // 0 (touched now, in the new epoch).
+        Require(cache.Touch({100}), "vram budget: the touch found no entry");
+        const auto census = cache.ColdCensus();
+        Require(census.measured && census.entries == 5 && census.cold == 2 && census.coldBytes == 2 * mib, "vram budget: the cache's census does not count the old cold builds that hold memory");
+        const auto held = cache.EvictCold(~VkDeviceSize{0}, victims);
+        Require(victims.size() == 2 && victims[0].get() == objects[2] && victims[1].get() == objects[3] && held.alone == 2 * mib, "vram budget: the resource cache did not evict its old cold builds least recently used first");
+        Require(cache.Size() == 3 && cache.Find({101}) == inFlight && cache.Find({104}) != nullptr, "vram budget: a build in-flight work holds, or one that holds no memory, was evicted");
+        // 0 was used two epochs after the others: it ages from there.
+        victims.clear();
+        endEpochs(2);
+        cache.EvictCold(~VkDeviceSize{0}, victims);
+        Require(victims.size() == 1 && victims[0].get() == objects[0] && cache.Size() == 2, "vram budget: a build did not age from its last use");
+    }
+
+    // A device buffer recorded work uses and a batch keeps: dropped by its owner while the budget is
+    // over its target (released buffers are destroyed, not retained), its memory stays until the
+    // batch completed, then goes back to the driver (the invariant every staged copy relies on:
+    // GuestBufferMemory keeps region.buffer in the batch at record time).
+    {
+        // A fresh allocation (nothing retained to take), found by its handle.
+        pool->ReleaseDevice();
+        std::map<VkDeviceMemory, VkDeviceSize> before = fake.sizes;
+        auto shadow = std::make_shared<Buffer>(context, 2 * mib, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        for (const auto& [handle, size] : fake.sizes) {
+            if (before.find(handle) == before.end() && size >= 2 * mib) memory = handle;
+        }
+        Require(memory != VK_NULL_HANDLE, "vram budget: the kept buffer's allocation was not seen");
+        {
+            Recorder kept(context);
+            const auto commands = kept.Commands();
+            context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, shadow->Handle(), 0, VK_WHOLE_SIZE, 0x5a5a5a5au);
+            kept.Keep(shadow);
+            budget.SetTargetOverride(1);
+            Require(VramPressure(), "vram budget: a 1-byte target is not over");
+            shadow.reset();
+            Require(fake.sizes.count(memory) == 1, "vram budget: a buffer a recorded batch keeps was freed under pressure before the batch completed");
+            kept.Sync();
+            // The recorder's teardown waits for the release of what its batches kept.
+        }
+        Require(fake.sizes.count(memory) == 0, "vram budget: a released buffer was retained over the target after its batch completed");
+        budget.SetTargetOverride(0);
+    }
+
+    // The image pool opens no 256 MiB block over the target: the image gets memory of its own.
+    if (ImageMemoryPool::Enabled()) {
+        VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        info.imageType = VK_IMAGE_TYPE_2D;
+        info.format = VK_FORMAT_R8G8B8A8_UNORM;
+        info.extent = {64, 64, 1};
+        info.mipLevels = 1;
+        info.arrayLayers = 1;
+        info.samples = VK_SAMPLE_COUNT_1_BIT;
+        info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        const auto create = context.Function<PFN_vkCreateImage>("vkCreateImage");
+        const auto destroy = context.Function<PFN_vkDestroyImage>("vkDestroyImage");
+        const auto place = [&](bool pressure) {
+            ImageMemoryPool images(context);
+            VkImage image = VK_NULL_HANDLE;
+            Require(create(context.device, &info, nullptr, &image) == VK_SUCCESS, "vram budget: vkCreateImage failed");
+            budget.SetTargetOverride(pressure ? 1 : 0);
+            const auto allocation = images.AllocateAndBind(image, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            budget.SetTargetOverride(0);
+            destroy(context.device, image, nullptr);
+            images.Release(allocation);
+            return allocation.pooled;
+        };
+        if (place(false)) {
+            Require(!place(true), "vram budget: the image pool opened a block over the target");
+        } else {
+            std::cout << "vram budget: the device wants this image dedicated: the block gate not tested\n";
+        }
+    }
+
+    // A run against a simulated 64 MiB heap with a 40 MiB target. Each step allocates a 2 MiB device
+    // buffer into a cache (the last three are referenced by in-flight work), a 1 MiB scratch buffer
+    // released into the pool every fourth step, and asks for an optional 2 MiB shadow. The cache's
+    // reclaimer runs at the safe point of each step, the pool's inline in each allocation.
+    struct RunResult {
+        std::uint64_t failures = 0;
+        std::uint64_t evicted = 0;
+        std::uint64_t refusedShadows = 0;
+        VkDeviceSize peak = 0;
+    };
+    const auto run = [&](bool enabled) {
+        RunResult result;
+        budget.SetEnabled(enabled);
+        std::list<std::pair<int, std::shared_ptr<Buffer>>> cache;
+        std::deque<std::shared_ptr<Buffer>> inFlight;
+        testReclaimer = budget.AddReclaimer("test-cache", VramReclaimLevel::SafePoint, 30, [&](VkDeviceSize want, std::uint64_t& evicted) -> VkDeviceSize {
+            VkDeviceSize freed = 0;
+            int last = -1;
+            for (auto it = cache.begin(); it != cache.end() && freed < want;) {
+                if (it->second.use_count() != 1) {
+                    ++it;
+                    continue;
+                }
+                Require(it->first > last, "vram budget: the cache did not evict least recently used first");
+                last = it->first;
+                freed += it->second->AllocationBytes();
+                ++evicted;
+                it = cache.erase(it);
+            }
+            result.evicted += evicted;
+            return freed;
+        });
+        const auto start = fake.live;
+        fake.budget = start + 64 * mib;
+        budget.SetTargetOverride(budget.Used() + 40 * mib);
+        for (int step = 0; step < 60; ++step) {
+            VramPresent();
+            try {
+                auto buffer = std::make_shared<Buffer>(context, 2 * mib, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                cache.emplace_back(step, buffer);
+                inFlight.push_back(std::move(buffer));
+                if (inFlight.size() > 3) inFlight.pop_front();
+                if (step % 4 == 0) DeviceBuffer scratch(context, 1 * mib, usage);
+                if (AdmitVram(VramClass::Buffers, 2 * mib)) Buffer shadow(context, 2 * mib, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                else ++result.refusedShadows;
+            } catch (const std::exception&) {
+                ++result.failures;
+            }
+            result.peak = std::max(result.peak, fake.live - start);
+            for (const auto& held : inFlight) Require(held.use_count() > 1, "vram budget: a buffer in-flight work references was evicted");
+        }
+        budget.RemoveReclaimer(testReclaimer);
+        testReclaimer = 0;
+        inFlight.clear();
+        cache.clear();
+        budget.SetTargetOverride(0);
+        fake.budget = ~VkDeviceSize{0};
+        pool->ReleaseDevice();
+        return result;
+    };
+    const auto on = run(true);
+    Require(on.failures == 0, "vram budget: " + std::to_string(on.failures) + " allocations failed against the simulated heap with the budget on");
+    Require(on.evicted != 0 && on.peak <= 64 * mib, "vram budget: the cache was never trimmed under the budget");
+    const auto off = run(false);
+    Require(off.failures != 0 && off.evicted == 0 && off.refusedShadows == 0, "vram budget: the simulated heap did not run out with the budget off");
+    std::cout << "vram budget: simulated 64 MiB heap, 40 MiB target: " << on.evicted << " cold buffers evicted, " << on.refusedShadows << " shadows refused, peak " << on.peak / mib << " MiB, 0 failed (off: " << off.failures << " failed)\n";
 }
 
 void movedMetadataTests(const Device& device, Recorder& recorder) {
@@ -4715,6 +5143,80 @@ void residentReadTests(const Device& device, Recorder& recorder) {
     Require(remapped->ServedResident(address + at), "(r) the range was not bound from its copy after the import changed");
     expect(&ResidentReadStatistics::refreshImport, 1, "refreshes after a changed import");
     bound(resident, *remapped, at, span);
+    // The video memory guard (APS5_VRAM_GUARD): after a recycle a reused build holding a copy made
+    // before it is rebuilt and the next build makes the copy anew; during a pressure episode the
+    // cache is trimmed and no copy is made (in place); after it, copies are made again.
+    resident.Sync();
+    {
+        VideoMemorySample fake;
+        fake.valid = true;
+        fake.budget = std::uint64_t{1} << 40u;
+        VideoMemory::ConfigureForTests(1, [&fake](const Context&, VideoMemorySample& sample) {
+            sample = fake;
+            return true;
+        }, 0, std::uint64_t{1} << 20u, 0);
+        VideoMemory::ResetForTests();
+        struct Restore {
+            ~Restore() {
+                VideoMemory::ConfigureForTests(-1, nullptr, 0, 0, 0);
+                VideoMemory::ResetForTests();
+            }
+        } restore;
+        VideoMemory::Poll(context);
+        auto held = build(at, span, false);
+        Require(held->ServedResident(address + at), "(v) a copy under the budget was not bound");
+        const auto heldBuffer = bufferOf(*held, at, span);
+        resident.Sync();
+        VideoMemory::RecycleNowForTests(context);
+        counts = ResidentReadCounts();
+        Require(!held->RecordResidentReads(resident), "(v) a reused build over a copy made before the recycle was not rebuilt");
+        expect(&ResidentReadStatistics::rebuiltRecycled, 1, "reused builds rebuilt over a recycled copy");
+        auto remade = build(at, span, false);
+        Require(remade->ServedResident(address + at) && bufferOf(*remade, at, span) != heldBuffer, "(v) the build after the recycle bound the copy made before it");
+        expect(&ResidentReadStatistics::recycled, 1, "cached copies made anew after the recycle");
+        expect(&ResidentReadStatistics::made, 1, "copies made after the recycle");
+        bound(resident, *remade, at, span);
+        held.reset();
+        // Far over the budget: the pool and then the cache are trimmed (the held copies too, as
+        // held: their builds are rebuilt); a new range stays in place.
+        fake.usage = fake.budget + (std::uint64_t{1} << 38u);
+        counts = ResidentReadCounts();
+        VideoMemory::Poll(context);
+        Require(VideoMemory::UnderPressure(), "(v) the episode did not start");
+        const auto afterTrim = ResidentReadCounts();
+        Require(afterTrim.trimmedHeld > counts.trimmedHeld && afterTrim.entries == 0, "(v) the episode did not trim the held resident copies as held");
+        Require(VideoMemory::Read().residentHeldCopies == afterTrim.trimmedHeld - counts.trimmedHeld && VideoMemory::Read().residentTrimmedCopies == afterTrim.trimmed - counts.trimmed, "(v) the guard counted the held copies as freed");
+        // A trimmed copy a build still holds stays tracked: a noted GPU write over it stales it.
+        counts = afterTrim;
+        NoteResidentReadsWrite(address + at + 64, address + at + 80);
+        Require(ResidentReadCounts().notedStale > counts.notedStale, "(v) a noted write did not stale the trimmed copy a build holds");
+        // The build holding it is rebuilt at its next reuse, and binds in place during the episode.
+        counts = ResidentReadCounts();
+        Require(!remade->RecordResidentReads(resident), "(v) a reused build over a trimmed copy was not rebuilt");
+        expect(&ResidentReadStatistics::rebuiltTrimmed, 1, "reused builds rebuilt over a trimmed copy");
+        counts = ResidentReadCounts();
+        auto pressured = build(3 * unit, 4096, false);
+        Require(pressured->ServedInPlace(address + 3 * unit) && !pressured->ServedResident(address + 3 * unit), "(v) a copy was made during the episode");
+        expect(&ResidentReadStatistics::refusedBudget, 1, "copies refused for the budget");
+        // Not rebuilt while the episode lasts.
+        Require(pressured->RecordResidentReads(resident), "(v) a build refused for the budget was rebuilt during the episode");
+        resident.Sync();
+        // Back under: the build refused for the budget is rebuilt, and copies are made again (the
+        // recycle waits for its spacing).
+        fake.usage = 0;
+        VideoMemory::Poll(context);
+        Require(!VideoMemory::UnderPressure(), "(v) the episode did not end");
+        counts = ResidentReadCounts();
+        Require(!pressured->RecordResidentReads(resident), "(v) a build refused for the budget was not rebuilt after the episode");
+        expect(&ResidentReadStatistics::rebuiltRefused, 1, "reused builds rebuilt after an episode refused them a copy");
+        counts = ResidentReadCounts();
+        auto after = build(3 * unit, 4096, false);
+        Require(after->ServedResident(address + 3 * unit), "(v) no copy after the episode");
+        bound(resident, *after, 3 * unit, 4096);
+        remade.reset();
+        pressured.reset();
+        after.reset();
+    }
     std::cout << "resident read tests passed\n";
     resident.Sync();
     remapped.reset();
@@ -5006,6 +5508,35 @@ void gpuTimingDigestTests() {
     std::cout << "gpu timing digest checked\n";
 }
 
+// The [gputime] retile row sums the write-back's three stages (ContinueGpuTiming) and counts the
+// write-back once, by its first stage; its bytes are the stored ones.
+void retileRowDigestTests() {
+    using Kind = Recorder::TimingKind;
+    using Class = Recorder::CommandClass;
+    constexpr std::uint64_t MiB = 1048576;
+    const auto range = [](std::uint64_t key, Kind kind, std::uint64_t begin, std::uint64_t end, std::uint64_t bytes) {
+        Recorder::TimedRange timed;
+        timed.key = key;
+        timed.kind = kind;
+        timed.queue = 0;
+        timed.begin = begin;
+        timed.end = end;
+        timed.bytes = bytes;
+        return timed;
+    };
+    std::vector<Recorder::TimedRange> ranges;
+    ranges.push_back(range(Recorder::BatchTimingKey, Kind::Batch, 0, 10000, 0));
+    ranges.push_back(range(Recorder::ClassKey(Class::StorageWriteBack), Kind::Class, 0, 1000, 2 * MiB));
+    ranges.push_back(range(Recorder::ClassKey(Class::StorageRetile), Kind::Class, 1000, 1500, 2 * MiB));
+    ranges.push_back(range(Recorder::ClassKey(Class::StorageStore), Kind::Class, 1500, 4000, MiB));
+    GpuTimingDigest digest;
+    digest.AddBatch(ranges, 1000.0);
+    const auto lines = digest.Report(1, 0, 512, 0);
+    Require(lineHas(lines, "[gputime] row retile:", "4.00 ms per present (40.0% of busy), x1.0, 1.00 MiB (storage image write-backs: image->linear 1.00 ms 2.00 MiB, retile 0.50 ms 2.00 MiB, store 2.50 ms; 4.000 ms and 1.00 MiB stored per write-back)"), "digest: wrong retile row");
+    Require(lines.front().find("storage-retile x1 0.5ms") != std::string::npos && lines.front().find("storage-store x1 2.5ms") != std::string::npos, "digest: the retile stages are missing from the classes");
+    std::cout << "retile row digest checked\n";
+}
+
 // APS5_PROFILE_GPU=1 runs (the timing switch is read once): a timed range leaves the queued
 // copy-backs queued and the barrier-merge state as it was, and the ranges reach the digest with
 // their queue tag, in-place bytes, pass target and kind.
@@ -5155,6 +5686,7 @@ void gpuTimingRecorderTests(const Device& device, Recorder& recorder) {
 int main() {
     try {
         gpuTimingDigestTests();
+        retileRowDigestTests();
         Device device;
         std::lock_guard gpu(GpuMutex());
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
@@ -5187,6 +5719,8 @@ int main() {
         importMemoTests(device);
         samplerMemoTests(device);
         outOfVideoMemoryTests(device);
+        videoMemoryGuardTests(device);
+        vramBudgetTests(device);
         movedMetadataTests(device, recorder);
         keysFillTests(device, recorder);
         unitShadowTests(device, recorder);

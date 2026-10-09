@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -25,6 +26,15 @@ class Recorder;
 
 void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
+// Video-memory budget ("textures" reclaimer, a safe point): evicts sampled texture cache entries
+// held by the cache alone (no build, no batch references them) and not used for the budget's
+// MinAge epochs, least recently used first, until about `want` bytes of images went; by try_lock
+// (0 when the cache is busy). Images in the image pool's blocks only while the pool's slack is
+// below VramBudget::SlackRoom (their eviction leaves a hole, not free memory). The textures are
+// appended to `victims` (the caller disposes of them); `dedicated` gets the bytes of those with
+// memory of their own. Returns the bytes of all of them.
+VkDeviceSize EvictColdTextures(VkDeviceSize want, std::vector<std::shared_ptr<void>>& victims, VkDeviceSize& dedicated);
+VramCacheCensus SampledTextureCensus();
 
 // The cached storage image of a surface (render targets use it as their resident image); brought up
 // to date with guest memory before it is returned.
@@ -354,6 +364,17 @@ public:
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces() const;
     bool Reusable() const { return reusable; }
+    // What destroying this object gives back (VramBudget): alone, the staging shadows and buffers
+    // nothing else references; shared, the textures only it and one other holder reference (then
+    // the texture cache's entry, for the "textures" reclaimer) and the shadows one other holder
+    // references (the staging registry, for the "shadows" reclaimer, or a batch). Only for an
+    // object no other thread can reach (the cache's alone).
+    VramHeld DeviceBytesHeldAlone() const;
+    // The resource cache's epoch of its last use (Find, Touch, Insert; VramBudget::Aged).
+    void NoteCacheUse(std::uint64_t epoch) { cacheUsedAt.store(epoch, std::memory_order_relaxed); }
+    std::uint64_t CacheUsedAt() const { return cacheUsedAt.load(std::memory_order_relaxed); }
+    // Tests: device-local bytes this object counts as holding alone (no shadow of its own).
+    void HoldDeviceBytesForTests(VkDeviceSize bytes) { testDeviceBytes = bytes; }
     // Lease templates (default with the rebased ones; APS5_NO_LEASE_REBASE=1 none): an address-based build over the cached space
     // alone (LeaseShape 0) is kept in the resource cache, though not Reusable (its fault buffer and
     // lease are per use), and serves a later dispatch of the same content key once its previous
@@ -636,6 +657,9 @@ private:
     std::vector<bool> storageFirstLayer;
     std::vector<bool> storageWritten;
     std::vector<std::shared_ptr<Sampler>> samplers;
+    // NoteCacheUse, HoldDeviceBytesForTests.
+    std::atomic<std::uint64_t> cacheUsedAt{0};
+    VkDeviceSize testDeviceBytes = 0;
     bool reusable = false;
     bool leaseTemplate = false;
     // The cached space's serial the template was built over (LeaseTemplate).
@@ -726,6 +750,16 @@ public:
     // Moves the entry to the front of the LRU (a recipe hit uses its template without Find, and a
     // hot template must not age out under the recipes that depend on it); false when no entry.
     bool Touch(const Key& key);
+    // Video-memory budget ("builds" reclaimer, a safe point): moves into `victims` the least
+    // recently used entries the cache alone holds (no batch, recipe or caller references them),
+    // not used for the budget's MinAge epochs and holding device-local memory
+    // (DeviceBytesHeldAlone not empty: evicting one that holds none frees nothing and costs a
+    // rebuild), until their bytes reach `want` (at most 256 per call, 4096 entries looked at); by
+    // try_lock (nothing when busy). Returns their bytes.
+    VramHeld EvictCold(VkDeviceSize want, std::vector<std::shared_ptr<ShaderResources>>& victims);
+    // The entries, and of the 4096 least recently used the ones EvictCold could take and their
+    // DeviceBytesHeldAlone (the [vram] line), by try_lock.
+    VramCacheCensus ColdCensus();
     // Find and Touch calls so far (the [rescache] line: a recipe hit touches instead of finding).
     static std::uint64_t Finds();
     static std::uint64_t Touches();
