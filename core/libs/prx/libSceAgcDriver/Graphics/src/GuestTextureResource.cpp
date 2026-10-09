@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -183,8 +184,14 @@ GuestTextureResource decodeTextureWords(std::span<const std::uint32_t> words) {
     return result;
 }
 
+// Default on since t447/t448 (R3): APS5_ARRAY_PITCH=0 or APS5_NO_ARRAY_PITCH=1 throws as before.
 bool upperHalfRepairEnabled() {
-    static const bool enabled = std::getenv("APS5_ARRAY_PITCH") != nullptr;
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARRAY_PITCH");
+        if (value != nullptr && *value != '\0') return std::strcmp(value, "0") != 0;
+        const char* off = std::getenv("APS5_NO_ARRAY_PITCH");
+        return off == nullptr || *off == '\0' || std::strcmp(off, "0") == 0;
+    }();
     return enabled;
 }
 

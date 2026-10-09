@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -1173,8 +1174,15 @@ bool ResourceMaterializer::StrictTableEntries() {
     return enabled;
 }
 
+// Default on since t447/t448 (the R3 thrown draws served, picture clean): APS5_LOOP_TABLE_FIT=0 or
+// APS5_NO_LOOP_TABLE_FIT=1 restores the opt-in loop keys (off unless APS5_LOOP_TABLE_KEYS=1).
 bool ResourceMaterializer::LoopTableFit() {
-    static const bool enabled = std::getenv("APS5_LOOP_TABLE_FIT") != nullptr;
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_LOOP_TABLE_FIT");
+        if (value != nullptr && *value != '\0') return std::strcmp(value, "0") != 0;
+        const char* off = std::getenv("APS5_NO_LOOP_TABLE_FIT");
+        return off == nullptr || *off == '\0' || std::strcmp(off, "0") == 0;
+    }();
     return enabled;
 }
 
