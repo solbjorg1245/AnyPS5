@@ -527,6 +527,14 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    # The shader-memory tests again with the fast walk's in-place build off (APS5_NO_WALK_REUSE=1,
+    # latched once per process): TryMaterialize's fresh-object form.
+    add_test(NAME agc_shader_memory_no_walk_reuse COMMAND agc_shader_memory_tests)
+    set_tests_properties(agc_shader_memory_no_walk_reuse PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_WALK_REUSE=1" SKIP_RETURN_CODE 77)
+    if(WIN32)
+        set_tests_properties(agc_shader_memory_no_walk_reuse PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 endif()
 
 option(AGC_BUILD_VISUAL_TEST "Enable the standalone AGC SPIR-V visual test" OFF)

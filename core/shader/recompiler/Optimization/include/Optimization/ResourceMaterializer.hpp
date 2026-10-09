@@ -66,7 +66,9 @@ public:
     // Materialize without an exception for a failed SRT or uniform-fill evaluation (the fast walk's
     // declined read, SrtWalker::TryEvaluateRuntimeSources): false; every other failure throws as
     // Materialize does. Built in place, for the fast walk's per-thread snapshot and specialization:
-    // their vectors keep their capacity, and false or a throw leaves them unspecified.
+    // their vectors keep their capacity, and false or a throw leaves them unspecified. The runtime
+    // must be express-only (SrtRuntime::expressOnly, std::logic_error otherwise): an interpreter
+    // evaluation that fails is a genuine error, not a decline.
     [[nodiscard]] bool TryMaterialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, ResourceSpecialization& specialization) const;
     // APS5_PROFILE_DRAW: the time Materialize spent building specializations, over every call.
     static std::uint64_t SpecializationNanoseconds();

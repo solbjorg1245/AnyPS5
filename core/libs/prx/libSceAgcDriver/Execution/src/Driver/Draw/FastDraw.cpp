@@ -260,11 +260,20 @@ std::optional<DrawVerdict> Driver::fastDraw(QueueState& queue, const Submission&
         lap = now;
     };
     const auto elapsedUs = [&] { return profile ? std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count() : 0.0; };
+    // The driver's rows as the fast path found them: a decline takes back what its phases charged
+    // to decode, capture, recompile, vectors, lock wait, labels and Graphics::Draw.
+    const auto entryPhaseMs = phaseTiming.profile ? phaseTiming.phaseMs : std::array<double, DrawDriverPhaseCount>{};
+    const auto entryPhaseLap = phaseTiming.phaseLap;
     const auto declined = [&](FastDecline reason) -> std::optional<DrawVerdict> {
         ++local.declines[static_cast<std::size_t>(reason)];
         local.declinedUs = elapsedUs();
         local.declineUs[static_cast<std::size_t>(reason)] = local.declinedUs;
-        // The fast path's time since its last phase goes to its own row, not to the old path's next one.
+        // The whole fast attempt, from this function's entry, goes to its own row: the old path
+        // that follows fills the other rows alone.
+        if (phaseTiming.profile) {
+            phaseTiming.phaseMs = entryPhaseMs;
+            phaseTiming.phaseLap = entryPhaseLap;
+        }
         phaseTiming.Phase(DrawRowFastDeclined);
         commit(local);
         return std::nullopt;

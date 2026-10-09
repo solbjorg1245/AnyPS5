@@ -1077,6 +1077,11 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
 }
 
 bool ResourceMaterializer::TryMaterialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, ResourceSpecialization& specialization) const {
+    // Quiet is the express walk's decline only: over the interpreter a false evaluation is a
+    // genuine failure, which Materialize reports.
+    if (!runtime.expressOnly) {
+        throw std::logic_error("ResourceMaterializer::TryMaterialize requires an express-only runtime");
+    }
     return materialize(program, runtime, true, snapshot, specialization);
 }
 
