@@ -3316,6 +3316,46 @@ void ignoredWordBitsTests() {
     }
 }
 
+// Deferred flat words and the run layout (APS5_DRAW_ENTRY_RUNS_CHECK): a stored capture that
+// left two words to the GPU (2 runs / 16 words) against a fresh one that read them (3 / 18)
+// compares equal once they are left out, and only then; a deferred word lapses once nothing
+// pending overlaps it.
+void deferredRunsTests() {
+    using AgcDriver::DeferredFlatAddresses;
+    using AgcDriver::DeferredWordLapsed;
+    using AgcDriver::RunsEqualBesideDeferred;
+    using Runs = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    using Bits = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
+    std::vector<ShaderRecompiler::DescriptorBinding> bindings(2);
+    bindings[1].role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+    bindings[1].deferredWords = {{3, 0x5008}, {2, 0x5004}};
+    const auto deferred = DeferredFlatAddresses(bindings);
+    Require(deferred == std::vector<std::uint64_t>{0x5004, 0x5008}, "the deferred addresses are wrong or unsorted");
+    const Runs storedRuns{{0x1000, 0x1020}, {0x3000, 0x3020}};
+    std::vector<std::uint32_t> storedWords(16);
+    for (std::size_t i = 0; i < storedWords.size(); ++i) storedWords[i] = 0x100u + static_cast<std::uint32_t>(i);
+    const Runs freshRuns{{0x1000, 0x1020}, {0x3000, 0x3020}, {0x5004, 0x500c}};
+    auto freshWords = storedWords;
+    freshWords.insert(freshWords.end(), {0xaaaa, 0xbbbb});
+    Require(!RunsEqualBesideDeferred(storedRuns, storedWords, freshRuns, freshWords, {}, {}), "an extra run compared equal without deferred words");
+    Require(RunsEqualBesideDeferred(storedRuns, storedWords, freshRuns, freshWords, deferred, {}), "a layout differing only by deferred words compared unequal");
+    Require(RunsEqualBesideDeferred(freshRuns, freshWords, storedRuns, storedWords, deferred, {}), "the reverse direction compared unequal");
+    const std::vector<std::uint64_t> one{0x5004};
+    Require(!RunsEqualBesideDeferred(storedRuns, storedWords, freshRuns, freshWords, one, {}), "a word read beside the deferred one was left out");
+    auto changed = freshWords;
+    changed[9] ^= 0x10u;
+    Require(!RunsEqualBesideDeferred(storedRuns, storedWords, freshRuns, changed, deferred, {}), "a differing word outside the deferred ones compared equal");
+    Require(RunsEqualBesideDeferred(storedRuns, storedWords, freshRuns, changed, deferred, Bits{{9, 0x10u}}), "a difference inside the don't-care bits compared unequal");
+    const Runs moved{{0x1000, 0x1020}, {0x3004, 0x3024}, {0x5004, 0x500c}};
+    Require(!RunsEqualBesideDeferred(storedRuns, storedWords, moved, freshWords, deferred, {}), "a moved run compared equal");
+    Require(!RunsEqualBesideDeferred(storedRuns, std::span(storedWords).first(15), freshRuns, freshWords, deferred, {}), "runs not covering their words compared equal");
+    const auto overlapsFrom = [](std::uint64_t begin, std::uint64_t end) { return [=](std::uint64_t address, std::size_t bytes) { return address < end && address + bytes > begin; }; };
+    Require(!DeferredWordLapsed(bindings, overlapsFrom(0x5000, 0x6000)), "a deferred word under a pending write lapsed");
+    Require(DeferredWordLapsed(bindings, overlapsFrom(0x5000, 0x5008)), "a deferred word beyond the pending write did not lapse");
+    Require(DeferredWordLapsed(bindings, overlapsFrom(0, 0)), "deferred words with nothing pending did not lapse");
+    Require(!DeferredWordLapsed(std::span(bindings).first(1), overlapsFrom(0, 0)), "a binding without deferred words lapsed");
+}
+
 // The buffer base slots of a variant (BufferBaseWords): a read-only guest-buffer V# whose base
 // (word 0, the low half of word 1) is located once among the words, consecutive in address and
 // read by the walk, yields its base words' slots (word 1 masked to the base bits), whatever the
@@ -5731,6 +5771,7 @@ int main() {
         importWindowTests(device, recorder);
         dataWordPositionsTests();
         ignoredWordBitsTests();
+        deferredRunsTests();
         bufferBaseWordsTests();
         dataRefreshTests(device, recorder);
         minLodTests(device, recorder);
