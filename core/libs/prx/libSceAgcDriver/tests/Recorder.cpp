@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/FastRing.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -37,6 +38,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -931,6 +933,117 @@ void batchedImportTests(const Device& device) {
         mutation.Remove(block);
     }
     HostImportFor(context, first, bytes);
+}
+
+// The fast paths' import memo against HostImportFor on a real registry (s53-fast-cost-b-fix, review
+// F5a): at every step HostImportMemoized answers what HostImportFor answers; a lookup in an
+// unchanged registry is a memo hit, and a range mapped again at another size or removed is never
+// answered from an entry noted before.
+void importMemoTests(const Device& device) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: the import memo not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 131072;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the import memo test block");
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    const bool memoOn = std::getenv("APS5_NO_IMPORT_MEMO") == nullptr;
+    auto& memo = ThreadHostImportMemo();
+    // The memo's answer first (a hit must not depend on HostImportFor's reconcile), then HostImportFor's.
+    const auto same = [&](std::uint64_t at, std::size_t size, const char* what) {
+        const auto* memoized = HostImportMemoized(context, at, size);
+        const auto* direct = HostImportFor(context, at, size);
+        Require(memoized == direct, what);
+        return direct;
+    };
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        bool registered = true;
+        ~Unregister() {
+            if (registered) {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{context, block, address};
+    const auto* first = same(address, bytes, "import memo: the first lookup differs from HostImportFor");
+    if (first == nullptr) {
+        std::cout << "host import of the import memo test block refused: the import memo not tested\n";
+        return;
+    }
+    auto hits = memo.hits;
+    Require(HostImportMemoized(context, address + 4096, 256) == first && HostImportMemoized(context, address, bytes) == first, "import memo: a range of the import in an unchanged registry was not answered");
+    Require(!memoOn || memo.hits == hits + 2, "import memo: lookups in an unchanged registry were not memo hits");
+    Require(HostImportMemoized(context, address + bytes - 4, 8) == HostImportFor(context, address + bytes - 4, 8), "import memo: a range past the import's end differs from HostImportFor");
+    // Mapped again at half the size: the generation moves and the reconcile retires the import.
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+        mutation.Add(block, bytes / 2, true, true);
+    }
+    const auto misses = memo.misses;
+    const auto* shrunk = same(address + 4096, 256, "import memo: a range of a range mapped again differs from HostImportFor");
+    Require(!memoOn || memo.misses == misses + 1, "import memo: an entry noted before the registry changed was not a miss");
+    Require(shrunk != nullptr && shrunk->bytes == bytes / 2, "import memo: a range mapped again was not imported again at its new size");
+    Require(same(address, bytes, "import memo: the old whole range differs from HostImportFor after the range shrank") == nullptr, "import memo: the old whole range was answered after the range shrank");
+    hits = memo.hits;
+    Require(HostImportMemoized(context, address, bytes / 2) == shrunk, "import memo: the new import was not answered");
+    Require(!memoOn || memo.hits == hits + 1, "import memo: the new import was not noted");
+    // Removed: nothing answers any more, the memo's entry for the new import included.
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    unregister.registered = false;
+    Require(same(address + 4096, 256, "import memo: a removed range differs from HostImportFor") == nullptr, "import memo: a removed range was answered");
+}
+
+// The S# memo against the sampler cache (s53-fast-cost-b-fix, reviews F2 and F5b): GetMemoized
+// answers what Get answers through evictions; a memo hit keeps its sampler as recent as a Get hit
+// would (the eviction takes the least recently used sampler); an eviction makes the memo miss, and
+// a cache made at a destroyed one's address is not answered from the old cache's entries.
+void samplerMemoTests(const Device& device) {
+    const auto& context = device.GetContext();
+    // GuestSamplerResource's captured 2D sampler, and the same with another maximum LOD.
+    const std::array<std::uint32_t, 4> wordsA{0u, 0x00fff000u, 0x09000000u, 0u};
+    const std::array<std::uint32_t, 4> wordsB{0u, 0x00800000u, 0x09000000u, 0u};
+    std::optional<SamplerCache> cache;
+    cache.emplace(2);
+    const auto a = cache->GetMemoized(context, wordsA, false);
+    Require(a != nullptr && cache->Get(context, wordsA, false) == a, "sampler memo: the first lookup differs from Get");
+    const auto b = cache->GetMemoized(context, wordsA, true);
+    Require(b != nullptr && b != a, "sampler memo: the compare sampler is the plain one");
+    // A memo hit on `a` (nothing evicted since it was noted): `a` is now more recent than `b`.
+    Require(cache->GetMemoized(context, wordsA, false) == a, "sampler memo: an unchanged cache's sampler was not answered");
+    const auto removals = cache->Removals();
+    const auto c = cache->Get(context, wordsB, false);
+    Require(c != nullptr && cache->Removals() == removals + 1, "sampler memo: a third sampler in a cache of two evicted nothing");
+    Require(cache->Get(context, wordsA, false) == a, "sampler memo: a memo hit left its sampler the least recently used one (evicted before an older one)");
+    // `b` was evicted (the test still holds it): its memo entry, noted before, must not answer.
+    const auto again = cache->GetMemoized(context, wordsA, true);
+    Require(again != b && again == cache->Get(context, wordsA, true), "sampler memo: an evicted sampler was answered from the memo");
+    Require(cache->GetMemoized(context, wordsB, false) == cache->Get(context, wordsB, false), "sampler memo: a lookup after evictions differs from Get");
+    // Another cache, possibly at the same address, with no removal yet (as the old one had when `a`
+    // was noted): the instance tells them apart.
+    const auto instance = cache->Instance();
+    cache.reset();
+    cache.emplace(2);
+    Require(cache->Instance() != instance, "sampler memo: a new cache has the old one's instance");
+    const auto fresh = cache->GetMemoized(context, wordsA, false);
+    Require(fresh != a && fresh == cache->Get(context, wordsA, false), "sampler memo: a new cache was answered from the old cache's memo");
 }
 
 void movedMetadataTests(const Device& device, Recorder& recorder) {
@@ -3129,6 +3242,8 @@ int main() {
         storeRunTests(device, recorder);
         remappedImportTests(device);
         batchedImportTests(device);
+        importMemoTests(device);
+        samplerMemoTests(device);
         movedMetadataTests(device, recorder);
         keysFillTests(device, recorder);
         unitShadowTests(device, recorder);

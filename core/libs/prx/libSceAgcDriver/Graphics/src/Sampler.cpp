@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <cstdlib>
 
@@ -40,29 +41,83 @@ namespace AgcDriver::Graphics {
         return sampler;
     }
 
-    SamplerCache::SamplerCache(std::size_t capacity) : capacity(std::max<std::size_t>(capacity, 1)) {}
+    namespace {
+
+    std::uint64_t nextInstance() {
+        static std::atomic<std::uint64_t> instances{0};
+        return instances.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+
+    bool samplerMemoEnabled() {
+        static const bool enabled = std::getenv("APS5_NO_SAMPLER_MEMO") == nullptr;
+        return enabled;
+    }
+
+    // A thread's last samplers by cache instance and key (GetMemoized). Held weakly: the memo must
+    // not keep a device's samplers past the device.
+    struct SamplerMemo {
+        struct Entry {
+            std::uint64_t instance = 0;
+            std::uint64_t removals = 0;
+            std::array<std::uint32_t, 5> key{};
+            std::weak_ptr<Sampler> sampler;
+        };
+        static constexpr std::size_t Entries = 8;
+        std::array<Entry, Entries> entries{};
+        std::size_t next = 0;
+    };
+    struct SamplerMemoTag {};
+
+    }
+
+    SamplerCache::SamplerCache(std::size_t capacity) : capacity(std::max<std::size_t>(capacity, 1)), instance(nextInstance()) {}
+
+    std::shared_ptr<Sampler> SamplerCache::GetMemoized(const Context& context, std::span<const std::uint32_t> words, bool compareEnable) {
+        if (!samplerMemoEnabled() || words.size() != 4) return Get(context, words, compareEnable);
+        const std::array<std::uint32_t, 5> key{words[0], words[1], words[2], words[3], compareEnable ? 1u : 0u};
+        auto& memo = HostThreadLocal<SamplerMemo, SamplerMemoTag>();
+        // Read before Get answers: an eviction from here on makes the noted entry miss.
+        const auto dropped = Removals();
+        for (const auto& entry : memo.entries) {
+            if (entry.instance != instance || entry.removals != dropped || entry.key != key) continue;
+            if (auto sampler = entry.sampler.lock()) {
+                // As recent as Get's hit would have made it (the eviction's order).
+                sampler->cacheUse.store(clock.fetch_add(1, std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+                // Counted for the APS5_PROFILE_DRAW line only (the stamp above is the one shared write per hit).
+                static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+                if (profile) memoHits.fetch_add(1, std::memory_order_relaxed);
+                return sampler;
+            }
+        }
+        auto sampler = Get(context, words, compareEnable);
+        memo.entries[memo.next] = {instance, dropped, key, sampler};
+        memo.next = (memo.next + 1) % SamplerMemo::Entries;
+        return sampler;
+    }
 
     std::shared_ptr<Sampler> SamplerCache::Get(const Context& context, std::span<const std::uint32_t> words, bool compareEnable) {
         Require(words.size() == 4, "guest sampler descriptor must contain 4 dwords");
         const std::array<std::uint32_t, 5> key{words[0], words[1], words[2], words[3], compareEnable ? 1u : 0u};
         std::lock_guard lock(mutex);
-        ++clock;
+        const auto now = clock.fetch_add(1, std::memory_order_relaxed) + 1;
         if (const auto found = entries.find(key); found != entries.end()) {
             ++hits;
-            found->second.lastUse = clock;
+            found->second.sampler->cacheUse.store(now, std::memory_order_relaxed);
             return found->second.sampler;
         }
         ++misses;
         auto resource = DecodeSamplerResource(words);
         resource.compareEnable = compareEnable;
         auto sampler = std::make_shared<Sampler>(context, resource);
+        sampler->cacheUse.store(now, std::memory_order_relaxed);
         // The cap keeps live samplers well below the device's limit (NVIDIA: ~4000); a set in flight
         // still holds the evicted sampler through its own shared_ptr.
         while (entries.size() >= capacity) {
-            const auto oldest = std::min_element(entries.begin(), entries.end(), [](const auto& left, const auto& right) { return left.second.lastUse < right.second.lastUse; });
+            const auto oldest = std::min_element(entries.begin(), entries.end(), [](const auto& left, const auto& right) { return left.second.sampler->cacheUse.load(std::memory_order_relaxed) < right.second.sampler->cacheUse.load(std::memory_order_relaxed); });
+            removals.fetch_add(1, std::memory_order_release);
             entries.erase(oldest);
         }
-        entries.emplace(key, Entry{sampler, clock});
+        entries.emplace(key, Entry{sampler});
         return sampler;
     }
 

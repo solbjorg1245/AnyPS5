@@ -38,7 +38,7 @@ const char* FastDeclineName(FastDecline decline) {
 }
 
 bool HostImportResolver(const Context& context, std::uint64_t address, std::size_t bytes, VkBuffer& buffer, VkDeviceSize& offset) {
-    const auto* import = HostImportFor(context, address, bytes);
+    const auto* import = HostImportMemoized(context, address, bytes);
     if (import == nullptr) return false;
     buffer = import->buffer;
     offset = address - import->base;
@@ -221,7 +221,7 @@ std::optional<FastDecline> FastBindings::Build(const Context& context, std::span
                     item.type = VK_DESCRIPTOR_TYPE_SAMPLER;
                     item.first = images.size();
                     for (std::uint32_t element = 0; element < binding.count; ++element) {
-                        auto sampler = context.samplerCache->Get(context, std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4u, 4u), binding.samplerDepthCompare[element]);
+                        auto sampler = context.samplerCache->GetMemoized(context, std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4u, 4u), binding.samplerDepthCompare[element]);
                         images.push_back({sampler->Handle(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
                         objects.push_back(std::move(sampler));
                     }

@@ -164,6 +164,14 @@ private:
     std::optional<DrawVerdict> fastPrecheckRegisters(const QueueState& queue, const Submission& submission, const Pm4::DrawParameters& drawParameters, std::string& rejected);
     DrawKey fastDrawKey(const QueueState& queue, const Submission& submission, std::uint64_t deviceSerial);
     std::shared_ptr<const DrawDecode> fastDrawDecode(const QueueState& queue, const Submission& submission);
+    // fastDrawDecode for the state entry fastStateEntry already found (one lookup per draw).
+    std::shared_ptr<const DrawDecode> fastDrawDecodeFor(FastStateEntry& entry, const QueueState& queue, const Submission& submission);
+    // fastDrawDecode for a caller that keeps nothing of the decode past the draw (the fast draw):
+    // the state's template with the live user words is copied into `scratch` in place (its vectors
+    // keep their storage) instead of into a new shared object; a state's first decode, which
+    // becomes the template, comes back through `held` as fastDrawDecode returns it.
+    // APS5_NO_DECODE_REUSE=1: always fastDrawDecode.
+    const DrawDecode& fastDrawDecodeInto(const QueueState& queue, const Submission& submission, DrawDecode& scratch, std::shared_ptr<const DrawDecode>& held);
     // The draw fast path (APS5_FAST_DRAW, FastDraw.cpp, draw-fastpath.md F3b): the draw's verdict
     // when the fast path took it (Drawn, or Rejected by a known validation failure), nullopt when it
     // declined and Driver::draw goes on with the packet (nothing recorded). `retrying` (a snapshot

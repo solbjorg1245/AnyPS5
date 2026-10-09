@@ -30,9 +30,11 @@ namespace {
 using Graphics::FastDecline;
 constexpr std::size_t DeclineCount = static_cast<std::size_t>(FastDecline::Count);
 
-// The front end's per-thread state: per stage the walk's snapshot and specialization and the
-// populated result, the stages handed to DrawFast, the linked programs of the compile requests.
+// The front end's per-thread state: the draw's decode (Driver::fastDrawDecodeInto), per stage the
+// walk's snapshot and specialization and the populated result, the stages handed to DrawFast, the
+// linked programs of the compile requests.
 struct FrontScratch {
+    DrawDecode decode;
     std::array<ShaderRecompiler::ResourceSnapshot, 2> snapshots;
     std::array<ShaderRecompiler::ResourceSpecialization, 2> specializations;
     std::array<ShaderRecompiler::RecompileResult, 2> results;
@@ -291,14 +293,16 @@ std::optional<DrawVerdict> Driver::fastDraw(QueueState& queue, const Submission&
     if (localDevice == nullptr) return declined(FastDecline::NoDevice);
     auto& scratch = HostThreadLocal<FrontScratch, FrontScratchTag>();
     auto parameters = drawParameters;
-    std::shared_ptr<const DrawDecode> decode;
+    // The decode lives in the thread's scratch, or in `heldDecode` for a state's first decode.
+    std::shared_ptr<const DrawDecode> heldDecode;
+    const DrawDecode* decode = nullptr;
     std::size_t count = 0;
     // A failure of the front end (a decode or a vertex fetch that throws, a bad offset SGPR) is a
     // decline at the step it happened in: the old path meets it with its own accounting.
     auto failure = FastDecline::Decode;
     try {
         // The draw state's decode with the live user words (F1's memo).
-        decode = fastDrawDecode(queue, submission);
+        decode = &fastDrawDecodeInto(queue, submission, scratch.decode, heldDecode);
         const auto& graphics = decode->state;
         const auto& programs = decode->programs;
         const auto& roles = decode->roles;
@@ -333,21 +337,20 @@ std::optional<DrawVerdict> Driver::fastDraw(QueueState& queue, const Submission&
             const auto& program = programs[i];
             if (program.snapshot == nullptr) return declined(FastDecline::NoSource);
             failure = FastDecline::WalkOther;
-            // The vertex stage info from the live attribute and V# words (F2's direct reader).
-            std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertex;
-            if (program.binary.stage != Stage::Fragment) {
-                vertex.emplace();
-                if (const auto why = FastResolveVertex(programs, program, *vertex, &local.pending)) return declined(walkDecline(*why));
-            }
             // compileDrawStage's request without memory regions: the walk reads live.
             const auto waveSize = program.binary.stage == Stage::Fragment ? graphics.stages.fragmentWaveSize : graphics.stages.vertexWaveSize;
             ShaderRecompiler::RecompileRequest request{
                 program.binary,
-                {waveSize, program.firstUserSgpr, program.userData, std::nullopt, program.binary.stage == Stage::Fragment ? std::optional(decode->pixel) : std::nullopt, vertex, {}},
+                {waveSize, program.firstUserSgpr, program.userData, std::nullopt, program.binary.stage == Stage::Fragment ? std::optional(decode->pixel) : std::nullopt, std::nullopt, {}},
                 localDevice->Target(),
                 {0, 0, pushCursor, Graphics::PipelinePushConstantBytes - pushCursor},
                 ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, graphics.stages.mesh, graphics.stages.tessellation, {parameters.indexAddress, parameters.indexCount, parameters.indexSize, parameters.instanceCount}}
             };
+            // The vertex stage info from the live attribute and V# words (F2's direct reader),
+            // resolved in the request's own (no copy of the 1 KiB info per stage).
+            if (program.binary.stage != Stage::Fragment) {
+                if (const auto why = FastResolveVertex(programs, program, request.context.vertex.emplace(), &local.pending)) return declined(walkDecline(*why));
+            }
             failure = FastDecline::NoSource;
             const std::string* poisoned = nullptr;
             const auto handle = SourceHandleFor(*program.snapshot, program.codeOffset, localDevice->Serial(), request, false, &poisoned);

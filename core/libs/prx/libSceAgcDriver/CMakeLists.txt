@@ -532,14 +532,39 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
-    # The shader-memory tests again with the fast walk's in-place build off (APS5_NO_WALK_REUSE=1,
-    # latched once per process): TryMaterialize's fresh-object form.
-    add_test(NAME agc_shader_memory_no_walk_reuse COMMAND agc_shader_memory_tests)
-    set_tests_properties(agc_shader_memory_no_walk_reuse PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_WALK_REUSE=1" SKIP_RETURN_CODE 77)
-    if(WIN32)
-        set_tests_properties(agc_shader_memory_no_walk_reuse PROPERTIES ENVIRONMENT_MODIFICATION
-            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    # Test binaries again with a fast-path switch set (latched once per process), so each fallback
+    # the switch restores stays covered:
+    # - agc_shader_memory_no_walk_reuse: the fast walk's in-place build off (APS5_NO_WALK_REUSE=1):
+    #   TryMaterialize's fresh-object form;
+    # - agc_shader_memory_no_variant_memo: PopulateVariant's memo off (APS5_NO_VARIANT_MEMO=1): its
+    #   scan and fresh result;
+    # - agc_driver_no_memos, agc_driver_fast_dispatch_no_memos: every s53-fast-cost-b memo off (the
+    #   import, pipeline, sampler and variant memos, the in-place decode).
+    # Fields: name|target|environment (comma-separated, no list separators inside one entry).
+    set(agcFastCostMemosOff "APS5_NO_IMPORT_MEMO=1,APS5_NO_PIPELINE_MEMO=1,APS5_NO_SAMPLER_MEMO=1,APS5_NO_VARIANT_MEMO=1,APS5_NO_DECODE_REUSE=1")
+    set(agcSwitchedTests
+        "agc_shader_memory_no_walk_reuse|agc_shader_memory_tests|APS5_NO_WALK_REUSE=1"
+        "agc_shader_memory_no_variant_memo|agc_shader_memory_tests|APS5_NO_VARIANT_MEMO=1"
+        "agc_driver_no_memos|agc_driver_tests|${agcFastCostMemosOff}")
+    if(TARGET agc_driver_fast_dispatch_tests)
+        list(APPEND agcSwitchedTests "agc_driver_fast_dispatch_no_memos|agc_driver_fast_dispatch_tests|${agcFastCostMemosOff}")
     endif()
+    foreach(agcSwitchedTest IN LISTS agcSwitchedTests)
+        string(REPLACE "|" ";" agcSwitchedFields "${agcSwitchedTest}")
+        list(GET agcSwitchedFields 0 agcSwitchedName)
+        list(GET agcSwitchedFields 1 agcSwitchedTarget)
+        list(GET agcSwitchedFields 2 agcSwitchedEnvironment)
+        string(REPLACE "," ";" agcSwitchedEnvironment "${agcSwitchedEnvironment}")
+        add_test(NAME ${agcSwitchedName} COMMAND ${agcSwitchedTarget})
+        set_tests_properties(${agcSwitchedName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;${agcSwitchedEnvironment}" SKIP_RETURN_CODE 77)
+        if(agcSwitchedTarget IN_LIST agcExecutionTests)
+            set_tests_properties(${agcSwitchedName} PROPERTIES LABELS gpu)
+        endif()
+        if(WIN32)
+            set_tests_properties(${agcSwitchedName} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
 endif()
 
 option(AGC_BUILD_VISUAL_TEST "Enable the standalone AGC SPIR-V visual test" OFF)
