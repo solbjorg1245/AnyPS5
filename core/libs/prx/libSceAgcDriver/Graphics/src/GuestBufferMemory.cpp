@@ -2246,8 +2246,16 @@ CopyStats& Copies() {
 
 // A shadow the device cannot provide (device memory or the allocation count exhausted: every
 // shadow is its own VkDeviceMemory, retained by cached builds) is no error: nullptr, and the
-// region takes the path it would take without staging (Region::unstaged).
-std::shared_ptr<Buffer> stagingBuffer(const Context& context, std::size_t bytes, VkBufferUsageFlags usage) {
+// region takes the path it would take without staging (Region::unstaged). `budgetRefused`: set
+// when the video-memory budget refused it (no allocation was tried).
+std::shared_ptr<Buffer> stagingBuffer(const Context& context, std::size_t bytes, VkBufferUsageFlags usage, bool* budgetRefused = nullptr) {
+    // Over the video-memory budget the region binds in place instead (the path a refused shadow
+    // takes); APS5_NO_VRAM_BUDGET=1: always admitted.
+    if (!AdmitVram(VramClass::Buffers, BufferPool::Capacity(bytes))) {
+        Copies().stagingRefused.fetch_add(1, std::memory_order_relaxed);
+        if (budgetRefused != nullptr) *budgetRefused = true;
+        return nullptr;
+    }
     try {
         return std::make_shared<Buffer>(context, bytes, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     } catch (const std::exception& error) {
@@ -2504,6 +2512,52 @@ std::shared_ptr<Buffer> takeStagedShadow(const Recorder* recorder, std::uint64_t
     return nullptr;
 }
 
+// The registry's part of the video-memory budget: entries whose shadow only the registry holds
+// (use count 1 under its lock: no build, no batch, no queued copy-back keeps it), the oldest
+// registered first (the tracker generation they were registered at); their buffers are released
+// after the lock.
+VkDeviceSize trimStagedShadows(VkDeviceSize want, std::uint64_t& evicted) {
+    evicted = 0;
+    std::vector<std::shared_ptr<Buffer>> released;
+    VkDeviceSize freed = 0;
+    {
+        auto& shadows = stagedShadows();
+        std::unique_lock lock(shadows.mutex, std::try_to_lock);
+        if (!lock.owns_lock()) return 0;
+        using Entry = decltype(shadows.entries)::iterator;
+        std::vector<std::pair<std::uint64_t, Entry>> cold;
+        for (auto it = shadows.entries.begin(); it != shadows.entries.end(); ++it) {
+            const auto& buffer = it->second.buffer;
+            if (buffer != nullptr && buffer.use_count() == 1 && buffer->DeviceLocalOnly()) cold.emplace_back(it->second.generation, it);
+        }
+        std::sort(cold.begin(), cold.end(), [](const auto& left, const auto& right) { return left.first < right.first; });
+        for (const auto& [generation, it] : cold) {
+            if (freed >= want) break;
+            freed += it->second.buffer->AllocationBytes();
+            if (shadowIndexEnabled()) unindexShadow(shadows, it->second.buffer.get(), it->first);
+            released.push_back(std::move(it->second.buffer));
+            shadows.entries.erase(it);
+        }
+    }
+    evicted = released.size();
+    return freed;
+}
+
+VramCacheCensus stagedShadowCensus() {
+    VramCacheCensus census;
+    auto& shadows = stagedShadows();
+    std::unique_lock lock(shadows.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return census;
+    census.measured = true;
+    census.entries = shadows.entries.size();
+    for (const auto& [range, entry] : shadows.entries) {
+        if (entry.buffer == nullptr || entry.buffer.use_count() != 1 || !entry.buffer->DeviceLocalOnly()) continue;
+        ++census.cold;
+        census.coldBytes += entry.buffer->AllocationBytes();
+    }
+    return census;
+}
+
 void registerStagedShadow(const Recorder* recorder, std::uint64_t begin, std::uint64_t end, std::shared_ptr<Buffer> buffer, std::uint64_t generation, VkDeviceSize baselineDelta = 0, bool baselineTrusted = false) {
     auto& shadows = stagedShadows();
     std::lock_guard lock(shadows.mutex);
@@ -2756,11 +2810,17 @@ std::shared_ptr<ResidentCopy> acquireResidentCopy(const Context& context, const 
         ++cache.counts.refused;
         return nullptr;
     }
+    // Over the video-memory budget the range stays in place (APS5_NO_VRAM_BUDGET=1: admitted).
+    if (!AdmitVram(VramClass::Resident, charged)) {
+        ++cache.counts.refused;
+        return nullptr;
+    }
     // Read before the buffer is made: a recycle in between leaves the copy older, not newer, than
     // its memory (it is made anew at its next use).
     const auto madeEpoch = VideoMemory::Epoch();
     std::shared_ptr<Buffer> buffer;
     try {
+        const VramClassScope resident(VramClass::Resident);
         buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     } catch (const std::exception& error) {
         static std::atomic<int> reported{0};
@@ -2953,6 +3013,70 @@ std::size_t ClearResidentReads() {
     }
     std::lock_guard lock(cache.mutex);
     return cache.live.size();
+}
+
+VkDeviceSize TrimResidentReads(VkDeviceSize want, std::uint64_t& evicted) {
+    evicted = 0;
+    auto& cache = residentReadCache();
+    // Released after the lock: the last reference's destructor takes it.
+    std::vector<std::shared_ptr<ResidentCopy>> released;
+    VkDeviceSize freed = 0;
+    {
+        std::unique_lock lock(cache.mutex, std::try_to_lock);
+        if (!lock.owns_lock()) return 0;
+        std::vector<std::pair<std::uint64_t, ResidentEntries::iterator>> cold;
+        for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) {
+            if (it->second != nullptr && it->second.use_count() == 1) cold.emplace_back(it->second->lastUse, it);
+        }
+        std::sort(cold.begin(), cold.end(), [](const auto& left, const auto& right) { return left.first < right.first; });
+        for (const auto& [lastUse, it] : cold) {
+            if (freed >= want) break;
+            freed += it->second->charged;
+            dropResidentEntry(cache, it, released);
+            ++cache.counts.evicted;
+        }
+    }
+    evicted = released.size();
+    return freed;
+}
+
+VkDeviceSize TrimStagedShadows(VkDeviceSize want, std::uint64_t& evicted) {
+    return trimStagedShadows(want, evicted);
+}
+
+VramCacheCensus StagedShadowCensus() {
+    return stagedShadowCensus();
+}
+
+void ClearStagedShadows(VkDevice device) {
+    std::vector<std::shared_ptr<Buffer>> released;
+    {
+        auto& shadows = stagedShadows();
+        std::lock_guard lock(shadows.mutex);
+        for (auto it = shadows.entries.begin(); it != shadows.entries.end();) {
+            if (it->second.buffer == nullptr || it->second.buffer->Device() != device) {
+                ++it;
+                continue;
+            }
+            if (shadowIndexEnabled()) unindexShadow(shadows, it->second.buffer.get(), it->first);
+            released.push_back(std::move(it->second.buffer));
+            it = shadows.entries.erase(it);
+        }
+    }
+    // Released here, after the lock: back to the device's pool while it still lives.
+}
+
+VramHeld GuestBufferMemory::DeviceBytesHeldAlone() const {
+    VramHeld held;
+    for (const auto& region : regions) {
+        if (region.buffer == nullptr || !region.buffer->DeviceLocalOnly()) continue;
+        const auto count = region.buffer.use_count();
+        // One other holder: the staging registry (the "shadows" reclaimer frees it next), a
+        // batch or a queued copy-back (freed when they are done), or another build (not freed).
+        if (count == 1) held.alone += region.buffer->AllocationBytes();
+        else if (count == 2) held.shared += region.buffer->AllocationBytes();
+    }
+    return held;
 }
 
 void ShutdownGuestBufferWorkers() {
@@ -3468,12 +3592,16 @@ std::shared_ptr<Buffer> GuestBufferMemory::stagingShadow(Region& region, bool ad
     region.baselineTrusted = false;
     region.baselineInherited = false;
     // Narrow copy-backs: the baseline behind the bytes, device-addressed for the compare pass; a
-    // device that refuses the larger shadow gets the plain one.
+    // device that refuses the larger shadow gets the plain one. One the video-memory budget
+    // refused is not asked for again smaller: over the target the region binds without a shadow
+    // (one refusal counted per region).
     if (const auto delta = narrowBaselineDelta(region.begin, bytes); delta != 0) {
-        if (auto shadow = stagingBuffer(context, static_cast<std::size_t>(delta + bytes), gpuCopyUsage(addressable) | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)) {
+        bool budgetRefused = false;
+        if (auto shadow = stagingBuffer(context, static_cast<std::size_t>(delta + bytes), gpuCopyUsage(addressable) | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, &budgetRefused)) {
             region.baselineDelta = delta;
             return shadow;
         }
+        if (budgetRefused) return nullptr;
     }
     return stagingBuffer(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable));
 }

@@ -313,6 +313,8 @@ struct VulkanDevice::State {
     bool textureCompressionBC = false;
     // VK_KHR_timeline_semaphore enabled: the recorder's unlocked waits are available.
     bool timelineSemaphores = false;
+    // VK_EXT_memory_budget enabled: the video-memory budget reads the heap's budget and usage.
+    bool memoryBudget = false;
     // Indirect draw features enabled (see Graphics::Context).
     bool drawIndirectFirstInstance = false;
     bool multiDrawIndirect = false;
@@ -320,8 +322,7 @@ struct VulkanDevice::State {
     // VK_KHR_push_descriptor enabled and its limit (see Graphics::Context).
     bool pushDescriptors = false;
     std::uint32_t maxPushDescriptors = 0;
-    // VK_EXT_memory_budget for the video memory guard (see Graphics::Context).
-    bool memoryBudget = false;
+    // vkGetPhysicalDeviceMemoryProperties2 for the video memory guard (see Graphics::Context).
     PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
     // The device's resolved entry points (Graphics::DeviceFunctions) and the Graphics::Context
     // built once after setup (see graphicsContext); the context's pool reference is dropped before
@@ -600,6 +601,8 @@ struct VulkanDevice::State {
     ~State() {
         contextReady = false;
         if (device != VK_NULL_HANDLE) {
+            // The video-memory budget stops trimming this device's pool and querying its heap.
+            Graphics::ReleaseVram(device);
             const auto idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device);
             if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
             // Resident images kept for unfinished presentations go before the caches they came from.
@@ -646,6 +649,10 @@ struct VulkanDevice::State {
             if (Graphics::ResidentReadsLive()) {
                 if (const auto left = Graphics::ClearResidentReads(); left != 0) std::fprintf(stderr, "[resident-reads] %zu copies still held at the device teardown\n", left);
             }
+            // The staging-chain registry's shadows of this device go back to its pool before the
+            // pool and the device go (the registry is process-wide; the video-memory budget's
+            // "shadows" reclaimer would otherwise free them on a destroyed device).
+            Graphics::ClearStagedShadows(device);
             patternBuffers.clear();
             fastRing.reset();
             fastLayouts.reset();
@@ -883,17 +890,6 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     // drops those writes instead of faulting the device.
     const bool imageRobustness = hasExtension(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME);
     if (imageRobustness) deviceExtensions.push_back(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME);
-    // VK_EXT_memory_budget: this process's video memory usage and budget, sampled by the video
-    // memory guard and the [vram] line (Graphics::VideoMemory). Asked for only when either is on.
-    if (Graphics::VideoMemory::Wanted() && hasExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
-        auto query = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(state->instanceProc(state->instance, "vkGetPhysicalDeviceMemoryProperties2"));
-        if (query == nullptr) query = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(state->instanceProc(state->instance, "vkGetPhysicalDeviceMemoryProperties2KHR"));
-        if (query != nullptr) {
-            state->memoryBudget = true;
-            state->memoryProperties2 = query;
-            deviceExtensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
-        }
-    }
     // Indirect draws with a GPU-side count (DRAW_INDIRECT_MULTI with count_indirect); a device
     // without it resolves such draws on the CPU.
     state->drawIndirectCount = hasExtension(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
@@ -925,6 +921,18 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         }
 #endif
         deviceExtensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    }
+    // The video-memory budget (Graphics::VramBudget) and the video memory guard and its [vram] line
+    // (Graphics::VideoMemory) read the heap's budget and this process's usage of it.
+    // APS5_NO_VRAM_BUDGET=1 leaves the extension off, as before, unless the guard wants it.
+    if (hasExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) && (std::getenv("APS5_NO_VRAM_BUDGET") == nullptr || Graphics::VideoMemory::Wanted())) {
+        auto query = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(state->instanceProc(state->instance, "vkGetPhysicalDeviceMemoryProperties2"));
+        if (query == nullptr) query = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(state->instanceProc(state->instance, "vkGetPhysicalDeviceMemoryProperties2KHR"));
+        if (query != nullptr) {
+            state->memoryBudget = true;
+            state->memoryProperties2 = query;
+            deviceExtensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+        }
     }
     VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT listRestartFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT};
     if (hasExtension(VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME)) {
@@ -1144,6 +1152,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &poolInfo, nullptr, &state->pool), "vkCreateCommandPool");
     Graphics::PrepareImportWatch(graphicsContext());
     state->bufferPool = std::make_shared<Graphics::BufferPool>(graphicsContext());
+    // The video-memory budget: the driver caches' reclaimers (once), the heap of this device's
+    // DEVICE_LOCAL memory, the driver's report on it, and this pool for the "pool" reclaimer.
+    Graphics::RegisterDriverVramReclaimers();
+    Graphics::ConfigureVram(graphicsContext(), state->memoryBudget ? state->InstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties2>("vkGetPhysicalDeviceMemoryProperties2") : nullptr, state->bufferPool, state->properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU);
     state->emptyBuffer = std::make_unique<Graphics::Buffer>(graphicsContext(), Graphics::EmptyBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     state->pipelineCache = std::make_unique<Graphics::PipelineCache>(graphicsContext(), state->properties);
     state->detiler = std::make_unique<Graphics::TextureDetiler>(graphicsContext());
@@ -2175,6 +2187,9 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     require(state->extent.width != 0 && state->extent.height != 0, "output window is minimized");
     require(!state->queuePending, "the previous presentation was not queued");
     require(!state->presentSlots.empty(), "device has no presentation slots");
+    // A safe point of the video-memory budget, once per frame (no cache lock is held here): the
+    // epoch ends and the reclaimers run while over.
+    Graphics::VramPresent();
     // The game path acquired the image before taking GpuMutex (Driver::Present); tests, tools and
     // APS5_SYNC_FLIP=1 acquire here.
     if (!state->imageAcquired && !AcquireImage()) return false;

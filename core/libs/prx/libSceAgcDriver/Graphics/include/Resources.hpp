@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include <atomic>
+#include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
 #include <span>
 #include <string>
 
@@ -45,7 +46,9 @@ void ReportCheckpoints();
 // pool kept ~2 GiB of device-local allocations no work used) first releases those
 // (BufferPool::ReleaseDevice) and, when that freed anything, allocates once more. The failure is
 // returned as before when nothing was retained. APS5_NO_OOM_RECLAIM=1 returns it at once (old).
-VkResult AllocateDeviceMemory(const Context& context, const VkMemoryAllocateInfo& allocation, VkDeviceMemory* memory);
+// An allocation in the budgeted heap is accounted under `type` (free it with FreeDeviceMemory), and
+// over the video-memory budget the Inline reclaimers run before it (see VramBudget).
+VkResult AllocateDeviceMemory(const Context& context, const VkMemoryAllocateInfo& allocation, VkDeviceMemory* memory, VramClass type = VramClass::Other);
 
 class Buffer {
 public:
@@ -59,6 +62,10 @@ public:
     // shadows of GuestBufferMemory) has no mapping and its bytes move by GPU copies alone.
     std::span<std::byte> Bytes();
     bool Mapped() const { return mapping != nullptr; }
+    // The bytes its memory allocation holds (the video-memory budget's estimates).
+    VkDeviceSize AllocationBytes() const { return allocationBytes; }
+    bool DeviceLocalOnly() const { return (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0; }
+    VkDevice Device() const { return context.device; }
     void Invalidate();
     // The video memory guard's epoch when its memory was allocated (VideoMemory::Epoch).
     std::uint64_t Epoch() const { return epoch; }

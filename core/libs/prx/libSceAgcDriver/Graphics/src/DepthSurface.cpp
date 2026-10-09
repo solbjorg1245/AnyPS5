@@ -244,7 +244,7 @@ private:
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        Check(AllocateDeviceMemory(context, allocation, &memory), "vkAllocateMemory depth target");
+        Check(AllocateDeviceMemory(context, allocation, &memory, VramClass::Targets), "vkAllocateMemory depth target");
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory depth");
         layers = count;
     }
@@ -306,7 +306,7 @@ private:
             old.textures.clear();
             for (const auto& [layer, view] : old.views) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
             if (old.image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, old.image, nullptr);
-            if (old.memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, old.memory, nullptr);
+            if (old.memory) FreeDeviceMemory(context, old.memory);
         };
         Retired current{image, memory, std::move(layerViews), std::move(textures)};
         discard(current);

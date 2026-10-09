@@ -21,7 +21,7 @@ PresentationScaler::~PresentationScaler() {
 
 void PresentationScaler::release() noexcept {
     if (sourceImage != VK_NULL_HANDLE) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, sourceImage, nullptr);
-    if (sourceMemory != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, sourceMemory, nullptr);
+    if (sourceMemory != VK_NULL_HANDLE) Graphics::FreeDeviceMemory(context, sourceMemory);
     sourceImage = VK_NULL_HANDLE;
     sourceMemory = VK_NULL_HANDLE;
     sourceWidth = 0;
@@ -50,6 +50,7 @@ void PresentationScaler::EnsureSourceImage(std::uint32_t width, std::uint32_t he
     allocation.allocationSize = requirements.size;
     allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     Graphics::Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &sourceMemory), "vkAllocateMemory presentation source");
+    Graphics::NoteDeviceMemory(context, sourceMemory, allocation, Graphics::VramClass::Other);
     Graphics::Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, sourceImage, sourceMemory, 0), "vkBindImageMemory presentation source");
     sourceWidth = width;
     sourceHeight = height;
