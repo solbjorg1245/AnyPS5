@@ -4368,6 +4368,379 @@ void residentBufferTests(const Device& device, Recorder& recorder) {
     HostImportFor(context, address, bytes);
 }
 
+// Resident read-only copies (APS5_RESIDENT_READS=1, GuestBufferMemory.cpp "Resident reads"): a
+// dispatch build's element it only reads, inside a watched host import, binds a device-local copy
+// (not the import, and not among the in-place reads) holding the guest bytes; another build of the
+// range takes the copy as it stands; and every kind of write over the range makes the next use
+// refresh it from the import first: a CPU store (write watch), a GPU write the recorder notes (a
+// fill into the import, noted only), a queued label store (landed before the refresh copies), an
+// address-based use whose BDA table may store over the range while its batch is in flight (once
+// it finished, only its stamped stores count), a failed write-watch collect, a batch submitted
+// between the check and the record (RecheckResidentReads), and a changed import. Writes elsewhere
+// leave it standing; a reused build refreshes into the buffer its descriptor names; a written
+// element, a refused copy and a recorder without the switch bind in place; a range refreshed at
+// most uses is demoted to in place; APS5_RESIDENT_READS_VERIFY compares a standing copy with its
+// import and catches a write that escaped every tracker; no copy outlives its builds and the cache.
+void residentReadTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: resident reads not tested\n";
+        return;
+    }
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t bytes = 4 * unit;
+    void* block = AllocateWatched(bytes, unit);
+    if (block == nullptr) {
+        std::cout << "no write watching: resident reads not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* guest = static_cast<volatile unsigned char*>(block);
+    for (std::size_t at = 0; at < bytes; ++at) guest[at] = static_cast<unsigned char>(at * 11 + 7);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            ClearResidentReads();
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{context, block, address};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || import->unwatched || !AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "host import of the resident read block refused or unwatched: resident reads not tested\n";
+        return;
+    }
+    const auto build = [&](std::size_t at, std::size_t count, bool written) {
+        auto memory = std::make_unique<GuestBufferMemory>(context);
+        memory->AllowDeviceStaging();
+        if (written) memory->AddWritable(address + at, count);
+        else memory->AddReadable(address + at, count);
+        memory->UploadPrepare(false);
+        memory->UploadFinish(false);
+        return memory;
+    };
+    const auto fill = [&](Recorder& target, std::size_t at, std::uint32_t value) {
+        const auto commands = target.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, import->buffer, address + at - import->base, 16, value);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    };
+    // What the build binds for [at, at + count), copied to the host after everything recorded.
+    const auto bound = [&](Recorder& target, const GuestBufferMemory& memory, std::size_t at, std::size_t count) {
+        std::uint32_t adjustment = 0;
+        const auto info = memory.Descriptor(address + at, count, adjustment);
+        auto readback = std::make_shared<Buffer>(context, count, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = target.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, commands, info.buffer, info.offset + adjustment, readback->Handle(), 0, count);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        target.Keep(readback);
+        target.Submit();
+        target.Sync();
+        const auto copied = readback->Bytes();
+        for (std::size_t index = 0; index < count; ++index) {
+            if (std::to_integer<unsigned char>(copied[index]) != guest[at + index]) throw std::runtime_error("(r) the bound copy of the range differs from guest memory at offset " + std::to_string(at + index));
+        }
+    };
+    const auto bufferOf = [&](const GuestBufferMemory& memory, std::size_t at, std::size_t count) {
+        std::uint32_t adjustment = 0;
+        return memory.Descriptor(address + at, count, adjustment).buffer;
+    };
+    constexpr std::size_t at = unit + 4096;
+    constexpr std::size_t span = 8192;
+    // Without the switch: in place.
+    {
+        auto plain = build(at, span, false);
+        Require(plain->ServedInPlace(address + at) && !plain->ServedResident(address + at) && bufferOf(*plain, at, span) == import->buffer, "(r) a recorder without APS5_RESIDENT_READS bound a resident copy");
+        recorder.Sync();
+    }
+    setSwitch("APS5_RESIDENT_READS", "1");
+    setSwitch("APS5_RESIDENT_READS_MIN_KIB", "0");
+    Recorder resident(context);
+    setSwitch("APS5_RESIDENT_READS_MIB", "0");
+    Recorder refusing(context);
+    setSwitch("APS5_RESIDENT_READS_MIB", "");
+    setSwitch("APS5_RESIDENT_READS_VERIFY", "1");
+    Recorder verifying(context);
+    setSwitch("APS5_RESIDENT_READS_VERIFY", "");
+    setSwitch("APS5_RESIDENT_READS", "");
+    setSwitch("APS5_RESIDENT_READS_MIN_KIB", "");
+    Require(resident.KeepsResidentReads() && resident.ResidentReads().verifyEvery == 0 && verifying.ResidentReads().verifyEvery == 1 && refusing.ResidentReads().limitBytes == 0 && !recorder.KeepsResidentReads(), "APS5_RESIDENT_READS did not set up the recorders");
+    resident.Activate();
+    auto counts = ResidentReadCounts();
+    const auto expect = [&](std::uint64_t ResidentReadStatistics::*field, std::uint64_t delta, const char* what) {
+        const auto now = ResidentReadCounts();
+        if (now.*field - counts.*field != delta) throw std::runtime_error(std::string("(r) ") + what + ": counted " + std::to_string(now.*field - counts.*field) + ", expected " + std::to_string(delta));
+    };
+    // The first build makes the copy and fills it.
+    auto first = build(at, span, false);
+    Require(first->ServedResident(address + at) && !first->ServedInPlace(address + at) && first->InPlaceReads().empty(), "(r) a read-only element was not bound from a resident copy");
+    const auto copyBuffer = bufferOf(*first, at, span);
+    Require(copyBuffer != import->buffer, "(r) the resident copy is the import");
+    Require(first->DirectRegions().has_value() && first->DirectRegions()->size() == 1, "(r) a resident region is not keyed by its import for reuse");
+    expect(&ResidentReadStatistics::made, 1, "copies made");
+    expect(&ResidentReadStatistics::refreshFirst, 1, "first refreshes");
+    bound(resident, *first, at, span);
+    counts = ResidentReadCounts();
+    // Unchanged: the next build takes the copy as it stands.
+    auto second = build(at, span, false);
+    Require(bufferOf(*second, at, span) == copyBuffer, "(r) a second build of the range made another copy");
+    expect(&ResidentReadStatistics::hits, 1, "uses as they stood");
+    expect(&ResidentReadStatistics::made, 0, "copies made by a reuse");
+    // A CPU store into the range: refreshed.
+    counts = ResidentReadCounts();
+    guest[at + 100] = 0xEE;
+    auto third = build(at, span, false);
+    expect(&ResidentReadStatistics::refreshStamp, 1, "refreshes after a CPU store");
+    bound(resident, *third, at, span);
+    // A CPU store in another block and a noted GPU write elsewhere: standing.
+    counts = ResidentReadCounts();
+    guest[3 * unit + 5] = static_cast<unsigned char>(guest[3 * unit + 5] ^ 1u);
+    resident.NotePendingWrite(address + 3 * unit + 64, 16, Recorder::WriteKind::Fill);
+    auto fourth = build(at, span, false);
+    expect(&ResidentReadStatistics::hits, 1, "uses as they stood after writes elsewhere");
+    resident.Sync();
+    // A GPU write the recorder notes (here a fill noted only, no stamp): refreshed after it.
+    counts = ResidentReadCounts();
+    fill(resident, at + 256, 0xA5A5A5A5u);
+    resident.NotePendingWrite(address + at + 256, 16, Recorder::WriteKind::Fill);
+    auto fifth = build(at, span, false);
+    expect(&ResidentReadStatistics::refreshNoted, 1, "refreshes after a noted GPU write");
+    bound(resident, *fifth, at, span);
+    Require(guest[at + 256] == 0xA5 && guest[at + 271] == 0xA5, "(r) the noted fill did not land");
+    // A queued label store over the range: it lands before the refresh copies the range.
+    counts = ResidentReadCounts();
+    const std::array<std::byte, 4> label{std::byte{0x11}, std::byte{0x22}, std::byte{0x33}, std::byte{0x44}};
+    resident.RecordStore(import->buffer, address + at + 512 - import->base, label, address + at + 512);
+    resident.NotePendingWrite(address + at + 512, 4, Recorder::WriteKind::Label);
+    auto sixth = build(at, span, false);
+    expect(&ResidentReadStatistics::refreshNoted, 1, "refreshes after a label store");
+    Require(!resident.QueuedStoreOverlaps(address + at + 512, 4), "(r) a refresh left a queued label store over its range");
+    bound(resident, *sixth, at, span);
+    Require(guest[at + 512] == 0x11 && guest[at + 515] == 0x44, "(r) the label did not land");
+    // An address-based use whose table may store over the range (here its store is a fill neither
+    // noted nor stamped, as a BDA store until its batch completed): refreshed; one elsewhere: standing.
+    counts = ResidentReadCounts();
+    fill(resident, at + 1024, 0x5A5A5A5Au);
+    NoteResidentReadsAddressWriter(std::make_shared<const std::vector<std::pair<std::uint64_t, std::uint64_t>>>(std::vector<std::pair<std::uint64_t, std::uint64_t>>{{address, address + 64}, {address + at + 1024, address + at + 1040}}), &resident);
+    auto seventh = build(at, span, false);
+    expect(&ResidentReadStatistics::refreshWriter, 1, "refreshes after an address-based writer");
+    bound(resident, *seventh, at, span);
+    counts = ResidentReadCounts();
+    NoteResidentReadsAddressWriter(std::make_shared<const std::vector<std::pair<std::uint64_t, std::uint64_t>>>(std::vector<std::pair<std::uint64_t, std::uint64_t>>{{address + 3 * unit, address + 4 * unit}}), &resident);
+    auto eighth = build(at, span, false);
+    expect(&ResidentReadStatistics::hits, 1, "uses as they stood after an address-based writer elsewhere");
+    // A reused build (Revalidate): a CPU store, then its own copy refreshed in place.
+    counts = ResidentReadCounts();
+    guest[at + 2000] = 0x77;
+    Require(first->RecordResidentReads(resident), "(r) a reused build's copy was taken as demoted");
+    expect(&ResidentReadStatistics::refreshStamp, 1, "refreshes of a reused build");
+    Require(bufferOf(*first, at, span) == copyBuffer, "(r) a reused build's copy moved");
+    bound(resident, *first, at, span);
+    counts = ResidentReadCounts();
+    Require(first->RecordResidentReads(resident), "(r) a reused build's copy was taken as demoted");
+    expect(&ResidentReadStatistics::hits, 1, "reused builds' uses as they stood");
+    // An address-based writer's note lasts while its batch is in flight: once the batch finished,
+    // its stores are stamps (BdaResources::CheckFault marks the pages each use stored to). One
+    // that stored elsewhere leaves the copy standing; one that stored over the range refreshes it
+    // as a stamp, not as a writer.
+    resident.Sync();
+    Require(ResidentReadCounts().writers == 0, "(r) address-based writer notes outlived their batches");
+    counts = ResidentReadCounts();
+    const auto overRange = std::make_shared<const std::vector<std::pair<std::uint64_t, std::uint64_t>>>(std::vector<std::pair<std::uint64_t, std::uint64_t>>{{address, address + bytes}});
+    RecordMemoryBarrier(context, resident.Commands(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    NoteResidentReadsAddressWriter(overRange, &resident);
+    NoteResidentReadsAddressWriter(overRange, &resident);
+    Require(ResidentReadCounts().writers == 1, "(r) an address-based writer in flight was not listed once");
+    resident.Submit();
+    resident.Sync();
+    Require(ResidentReadCounts().writers == 0, "(r) an address-based writer's note outlived its batch");
+    auto ninth = build(at, span, false);
+    expect(&ResidentReadStatistics::hits, 1, "uses as they stood after a finished address-based writer that stored elsewhere");
+    counts = ResidentReadCounts();
+    fill(resident, at + 1536, 0x3C3C3C3Cu);
+    NoteResidentReadsAddressWriter(overRange, &resident);
+    const auto storedPage = (address + at + 1536) & ~std::uint64_t{4095};
+    resident.OnComplete([storedPage] { AgcDriver::GuestMemory::MarkWritten(storedPage, 4096); });
+    resident.Submit();
+    resident.Sync();
+    auto tenth = build(at, span, false);
+    expect(&ResidentReadStatistics::refreshStamp, 1, "refreshes after a finished address-based writer that stored over the range");
+    expect(&ResidentReadStatistics::refreshWriter, 0, "writer refreshes after the writer's batch finished");
+    bound(resident, *tenth, at, span);
+    // A failed write-watch collect over the range (its dirty bits may be gone without stamps):
+    // refreshed.
+    counts = ResidentReadCounts();
+    ResidentReadsFailCollectForTests(true);
+    std::unique_ptr<GuestBufferMemory> eleventh;
+    try {
+        eleventh = build(at, span, false);
+    } catch (...) {
+        ResidentReadsFailCollectForTests(false);
+        throw;
+    }
+    ResidentReadsFailCollectForTests(false);
+    expect(&ResidentReadStatistics::refreshUnwatched, 1, "refreshes after a failed collect");
+    bound(resident, *eleventh, at, span);
+    // A batch submitted between a build's check and its record, whose completion stored into the
+    // range: the record checks again and refreshes into the open batch; with no submit since, the
+    // record checks nothing.
+    counts = ResidentReadCounts();
+    auto twelfth = build(at, span, false);
+    expect(&ResidentReadStatistics::hits, 1, "uses as they stood before a recheck");
+    twelfth->RecheckResidentReads(resident);
+    expect(&ResidentReadStatistics::rechecks, 0, "rechecks with no submit since the check");
+    const auto completionStore = at + 3000;
+    resident.OnComplete([guest, completionStore] { guest[completionStore] = 0x5D; });
+    resident.Submit();
+    resident.Sync();
+    Require(guest[at + 3000] == 0x5D, "(r) the completion store did not land");
+    twelfth->RecheckResidentReads(resident);
+    expect(&ResidentReadStatistics::rechecks, 1, "rechecks after a submit");
+    expect(&ResidentReadStatistics::recheckRefreshes, 1, "refreshes of a recheck after a completion store");
+    expect(&ResidentReadStatistics::refreshStamp, 1, "the recheck's refresh reason");
+    expect(&ResidentReadStatistics::uses, 1, "uses counted by a recheck");
+    bound(resident, *twelfth, at, span);
+    // A written element, and a copy the cap refuses: in place.
+    {
+        auto written = build(2 * unit, 4096, true);
+        Require(written->ServedInPlace(address + 2 * unit) && !written->ServedResident(address + 2 * unit), "(r) a written element was bound from a resident copy");
+        resident.Sync();
+        refusing.Activate();
+        counts = ResidentReadCounts();
+        auto refused = build(2 * unit + 8192, 4096, false);
+        Require(refused->ServedInPlace(address + 2 * unit + 8192), "(r) a copy over the cap was bound");
+        expect(&ResidentReadStatistics::refused, 1, "refused copies");
+        refusing.Sync();
+        resident.Activate();
+    }
+    // Refreshed at every use: demoted, the next build binds in place.
+    counts = ResidentReadCounts();
+    constexpr std::size_t churn = 2 * unit + 16384;
+    std::unique_ptr<GuestBufferMemory> churned;
+    for (int round = 0; round < 8; ++round) {
+        guest[churn + static_cast<std::size_t>(round)] = static_cast<unsigned char>(round);
+        churned = build(churn, 4096, false);
+        Require(churned->ServedResident(address + churn), "(r) a churning range was not bound from its copy before its demotion");
+        resident.Sync();
+    }
+    expect(&ResidentReadStatistics::demoted, 1, "demoted ranges");
+    // A reused build holding the demoted copy fails its proof (the rebuild binds in place).
+    Require(!churned->RecordResidentReads(resident), "(r) a reused build over a demoted copy was not rebuilt");
+    expect(&ResidentReadStatistics::rebuiltDemoted, 1, "reused builds rebuilt over a demoted copy");
+    churned.reset();
+    {
+        auto demoted = build(churn, 4096, false);
+        Require(demoted->ServedInPlace(address + churn), "(r) a demoted range was bound from a copy");
+    }
+    // Verify: a standing copy compares equal; a write no tracker saw is caught.
+    resident.Sync();
+    verifying.Activate();
+    counts = ResidentReadCounts();
+    {
+        auto checked = build(at, span, false);
+        verifying.Submit();
+        verifying.Sync();
+        expect(&ResidentReadStatistics::verified, 1, "verified uses");
+        expect(&ResidentReadStatistics::mismatched, 0, "mismatched uses of a current copy");
+        counts = ResidentReadCounts();
+        fill(verifying, at + 4096, 0xC3C3C3C3u);
+        auto escaped = build(at, span, false);
+        verifying.Submit();
+        verifying.Sync();
+        expect(&ResidentReadStatistics::mismatched, 1, "mismatched uses after an untracked write");
+        // Tracked from here on: the next use refreshes.
+        verifying.NotePendingWrite(address + at + 4096, 16, Recorder::WriteKind::Fill);
+        counts = ResidentReadCounts();
+        auto refreshed = build(at, span, false);
+        expect(&ResidentReadStatistics::refreshNoted, 1, "refreshes after the noted write");
+        bound(verifying, *refreshed, at, span);
+    }
+    resident.Activate();
+    // A changed import (the range registered again): refreshed from the new import.
+    resident.Sync();
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    import = HostImportFor(context, address, bytes);
+    Require(import != nullptr, "(r) the block was not imported again");
+    counts = ResidentReadCounts();
+    auto remapped = build(at, span, false);
+    Require(remapped->ServedResident(address + at), "(r) the range was not bound from its copy after the import changed");
+    expect(&ResidentReadStatistics::refreshImport, 1, "refreshes after a changed import");
+    bound(resident, *remapped, at, span);
+    std::cout << "resident read tests passed\n";
+    resident.Sync();
+    remapped.reset();
+    first.reset();
+    second.reset();
+    third.reset();
+    fourth.reset();
+    fifth.reset();
+    sixth.reset();
+    seventh.reset();
+    eighth.reset();
+    ninth.reset();
+    tenth.reset();
+    eleventh.reset();
+    twelfth.reset();
+    // Nothing holds a copy now: dropping the cache's references frees them all (the device
+    // teardown's ClearResidentReads).
+    const auto left = ClearResidentReads();
+    const auto after = ResidentReadCounts();
+    if (left != 0 || after.liveBytes != 0 || after.entries != 0 || after.bytes != 0) throw std::runtime_error("(r) resident copies outlived their builds and the cache: " + std::to_string(left) + " live, " + std::to_string(after.liveBytes) + " live bytes");
+    recorder.Activate();
+}
+
+// SpirvMayStoreThroughBda: a store or atomic through a physical storage buffer pointer counts,
+// whatever the names; loads through one and stores to other storage classes do not; a store
+// through a pointer the scan cannot type counts.
+void bdaStoreScanTests() {
+    constexpr std::uint32_t uint32 = 1, uint64 = 2, pointer = 3, zero = 4, seven = 5, voidType = 6, functionType = 7, function = 8, label = 9, address = 10, loaded = 11, scope = 12, semantics = 13, added = 14;
+    const auto op = [](std::uint32_t opcode, std::uint32_t words) { return (words << 16u) | opcode; };
+    // body: the instructions inside the function, after `address` was made from pointer type `storage`.
+    const auto module = [&](std::uint32_t storage, bool fromVariable, std::initializer_list<std::uint32_t> body) {
+        std::vector<std::uint32_t> words{0x07230203u, 0x00010500u, 0, 32, 0};
+        words.insert(words.end(), {op(17, 2), 5347});  // OpCapability PhysicalStorageBufferAddresses
+        words.insert(words.end(), {op(21, 4), uint32, 32, 0, op(21, 4), uint64, 64, 0});
+        words.insert(words.end(), {op(32, 4), pointer, storage, uint32});
+        words.insert(words.end(), {op(43, 5), uint64, zero, 0, 0, op(43, 4), uint32, seven, 7, op(43, 4), uint32, scope, 1, op(43, 4), uint32, semantics, 0});
+        words.insert(words.end(), {op(19, 2), voidType, op(33, 3), functionType, voidType, op(54, 5), voidType, function, 0, functionType, op(248, 2), label});
+        if (fromVariable) words.insert(words.end(), {op(59, 4), pointer, address, storage});
+        else words.insert(words.end(), {op(120, 4), pointer, address, zero});
+        words.insert(words.end(), body);
+        words.insert(words.end(), {op(253, 1), op(56, 1)});
+        return words;
+    };
+    constexpr std::uint32_t PhysicalStorageBuffer = 5349, FunctionStorage = 7;
+    Require(SpirvMayStoreThroughBda(module(PhysicalStorageBuffer, false, {op(62, 5), address, seven, 2, 4})), "(s) a store through a physical pointer was not seen");
+    Require(SpirvMayStoreThroughBda(module(PhysicalStorageBuffer, false, {op(234, 7), uint32, added, address, scope, semantics, seven})), "(s) an atomic through a physical pointer was not seen");
+    Require(!SpirvMayStoreThroughBda(module(PhysicalStorageBuffer, false, {op(61, 6), uint32, loaded, address, 2, 4})), "(s) a load through a physical pointer counted as a store");
+    Require(!SpirvMayStoreThroughBda(module(FunctionStorage, true, {op(62, 3), address, seven})), "(s) a store to a function variable counted as a BDA store");
+    Require(SpirvMayStoreThroughBda(module(FunctionStorage, true, {op(62, 3), 31, seven})), "(s) a store through an untyped pointer did not count");
+    Require(SpirvMayStoreThroughBda(std::vector<std::uint32_t>{0x07230203u}), "(s) a truncated module did not count as storing");
+    std::cout << "BDA store scan tests passed\n";
+}
+
 // Sets (or, for an empty value, removes) an environment variable.
 void setEnvironment(const char* name, const char* value) {
 #ifdef _WIN32
@@ -4809,6 +5182,8 @@ int main() {
         sharedViewGuardTests();
         residentBufferTests(device, recorder);
         residentSharedViewTests(device, recorder);
+        residentReadTests(device, recorder);
+        bdaStoreScanTests();
         fastRingReclaimTests(device, recorder);
         templateRefreshRingTests(device, recorder);
         templateRefreshPatchTests(device, recorder);
