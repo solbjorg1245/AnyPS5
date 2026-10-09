@@ -72,6 +72,11 @@ public:
     // Destroyed instead of returned to the buffer pool once the last reference goes (the video
     // memory guard's trim of resident copies: their memory is to be freed, not retained).
     void DiscardOnRelease() noexcept { discard.store(true, std::memory_order_relaxed); }
+    // APS5_POISON_POOL (see PoisonPooled): true once for a device-local buffer whose poison its
+    // first user still owes; the VkBuffer's size and whether the pool handed out a reused slot.
+    bool TakePoison() noexcept { return poisonPending.exchange(false, std::memory_order_relaxed); }
+    std::size_t Capacity() const { return capacity; }
+    bool Pooled() const { return pooled; }
 
 private:
     void initializeAddress(VkBufferUsageFlags usage);
@@ -95,6 +100,11 @@ private:
     std::uint64_t epoch = 0;
     std::uint32_t memoryType = ~0u;
     std::atomic<bool> discard{false};
+    // A reused pool slot, and APS5_POISON_POOL's owed fill of a device-local one.
+    bool pooled = false;
+    std::atomic<bool> poisonPending{false};
+    // APS5_POISON_POOL: a host-visible buffer is filled here, a device-local one owes its fill.
+    void poisonOnHandOut() noexcept;
 };
 
 // Device-local scratch memory for GPU-side layout conversion. The detiler reads and writes scattered
@@ -115,6 +125,9 @@ public:
     std::uint64_t Epoch() const { return epoch; }
     bool MadeUnderPressure() const { return madeUnderPressure; }
     std::uint32_t MemoryType() const { return memoryType; }
+    // APS5_POISON_POOL (see PoisonPooled): true once while its first user still owes the poison.
+    bool TakePoison() noexcept { return poisonPending.exchange(false, std::memory_order_relaxed); }
+    std::size_t Capacity() const { return capacity; }
 
 private:
     void release() noexcept;
@@ -128,9 +141,43 @@ private:
     std::shared_ptr<BufferPool> cache;
     bool pooled = false;
     bool madeUnderPressure = false;
+    std::atomic<bool> poisonPending{false};
     std::uint64_t epoch = 0;
     std::uint32_t memoryType = ~0u;
 };
+
+// Debug aid APS5_POISON_POOL (default off; s1504 streaks): every buffer the buffer pool hands out
+// (BufferPool::Take's reused slot or a new allocation) holds a loud word in all of its bytes
+// before its first use, so a reader of bytes nobody wrote (another resource's leftovers in pooled
+// memory, as the retile scratch's padding was) shows that word instead of run-varying colours.
+// - Host-visible buffers are filled by the CPU when made (FillPoolPoison over the VkBuffer's size).
+// - A device-local one owes its fill to its first user: PoisonPooled records a vkCmdFillBuffer in
+//   the command buffer of its first write, before it. Device-local buffers get TRANSFER_DST usage
+//   while the switch is on (PoolPoisonUsage), so the pool's classes differ from the old path's
+//   only then. One released still owing it is counted (a first-use site without the call).
+// - The fast ring's regions are filled when handed out, sampled images cleared before their upload.
+// The word (PoolPoisonWordFrom): =1 0x40ff00ff (RGBA8/BGRA8 magenta at alpha 0.25, float32 ~7.97,
+// half pairs (0, 2.5), 16-bit indices 255/16639); =geometry 0x47ff00ff (float32 ~130000: a vertex
+// position far off, triangles streak off screen); =0x<hex> any word. The [pool-poison] line counts
+// the fills every 10 s (APS5_PROFILE_DRAW). APS5_POISON_POOL unset or 0: the old path.
+bool PoisonPool();
+std::uint32_t PoolPoisonWord();
+std::uint32_t PoolPoisonWordFrom(const char* value);
+// `usage` plus TRANSFER_DST for a device-local buffer while the poison is on.
+VkBufferUsageFlags PoolPoisonUsage(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
+// Writes `word` over `bytes` (little-endian, the last partial word too).
+void FillPoolPoison(std::span<std::byte> bytes, std::uint32_t word) noexcept;
+// A device-local buffer released while still owing its fill (counted on the line).
+void NotePoolPoisonOwed(std::size_t bytes) noexcept;
+enum class PoisonSite : std::uint8_t { Staging, Resident, TextureUpload, StorageUpload, WriteBack, DrawTarget, Indirect, Depth, Pattern, Count };
+// Records the owed fill (and a barrier making it visible to every later access) into `commands`,
+// which must be the command buffer of the buffer's first write; nothing when none is owed.
+void PoisonPooled(const Context& context, VkCommandBuffer commands, Buffer& buffer, PoisonSite site);
+void PoisonPooled(const Context& context, VkCommandBuffer commands, DeviceBuffer& buffer, PoisonSite site);
+void NoteRingPoison(std::uint64_t bytes);
+void NoteImagePoison(std::uint64_t bytes, bool pooled);
+// The [pool-poison] line (BufferPool's 10 s report); nothing while the switch is off.
+void ReportPoolPoison();
 
 // Records a whole-range buffer copy.
 void CopyBuffer(const Context& context, VkCommandBuffer commands, VkBuffer source, VkDeviceSize sourceOffset, VkBuffer destination, VkDeviceSize destinationOffset, VkDeviceSize bytes);

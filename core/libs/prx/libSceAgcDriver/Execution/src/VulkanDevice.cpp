@@ -1525,6 +1525,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
             const auto chain = recorder.Commands();
             const auto copyBuffer = context.Resolved(&Graphics::DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
             const VkBufferCopy first{0, 0, 16};
+            Graphics::PoisonPooled(context, chain, *patternBuffer, Graphics::PoisonSite::Pattern);
             copyBuffer(chain, seed->Handle(), patternBuffer->Handle(), 1, &first);
             for (std::size_t done = 16; done < PatternBufferBytes; done *= 2) {
                 Graphics::RecordMemoryBarrier(context, chain, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);

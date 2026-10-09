@@ -1419,6 +1419,7 @@ bool recordIndirectArguments(const Context& context, VkCommandBuffer commands, R
     Require(!inPass, "rewritten indirect records inside a render pass");
     const auto bytes = static_cast<std::size_t>(args->RangeBytes());
     scratch = std::make_unique<DeviceBuffer>(context, bytes, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    PoisonPooled(context, commands, *scratch, PoisonSite::Indirect);
     CopyBuffer(context, commands, argumentBuffer, argumentOffset, scratch->Handle(), 0, bytes);
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     countBarrier(1);
@@ -2231,6 +2232,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         const VkBuffer linear = binding.gpuTiling ? binding.linearDevice->Handle() : binding.transfer->Handle();
         countBarrier(binding.gpuTiling ? 4 : 2);
         if (binding.gpuTiling) {
+            PoisonPooled(context, commands, *binding.tiledDevice, PoisonSite::DrawTarget);
+            PoisonPooled(context, commands, *binding.linearDevice, PoisonSite::DrawTarget);
             CopyBuffer(context, commands, binding.tiled->Handle(), 0, binding.tiledDevice->Handle(), 0, binding.original.size());
             memoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
             context.detiler->Dispatch(commands, TextureTileMode::kR64KBX, binding.color.elementBytes, binding.tiledDevice->Handle(), 0, binding.linearDevice->Handle(), 0, binding.mip);
