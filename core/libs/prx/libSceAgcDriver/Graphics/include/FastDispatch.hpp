@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -80,6 +82,15 @@ struct FastDispatchTiming {
 // all their imports (HostImportsFor). APS5_FAST_DISPATCH_PER_ELEMENT=1 makes the per-element
 // calls as before.
 bool FastDispatchBatchedElements();
+
+// RecordFastDispatch's step 1 flush over its in-place element ranges (UploadFinish's rule):
+// StorageTexture::FlushPending of each range in order ("imported buffer region"). Batched, one scan
+// of the storage-result registry (AnyPendingOverlaps: a superset of what FlushPending lists) and one
+// of the unit shadows (AnyShadowedOverlaps: PublishShadowsOnly's test) cover all of them first; when
+// neither finds anything every FlushPending would store and publish nothing, so none is made.
+// Returns whether that scan spared the ranges their FlushPending. Under GuestMemory::GpuMutex (the
+// shadow registry changes only under it).
+bool FlushFastDispatchRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, bool batched);
 
 // The declines of RecordFastDispatch that follow from the walked words and the configuration
 // alone: a V# a build rejects (the adjustment slot a build requires of every element included), a

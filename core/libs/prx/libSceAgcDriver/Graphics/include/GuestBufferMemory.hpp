@@ -78,12 +78,14 @@ void SetImportWatch(const Context& context, ImportWatch watch);
 // (alignment and budget permitting), or null. Bytes at `address` are at `address - import->base` in
 // the import's buffer.
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
-// HostImportFor of each [begin, end) of `ranges` in order, under one hold of the import registry's
-// lock (each lookup makes HostImportFor's steps; no other thread's lookup, reconcile or retire comes
-// between two of them). `visit(user, index, import)` receives what HostImportFor would return for
-// range `index` and returns whether to go on: no range after the one it stops at is looked up (or
-// imported). The visitor runs under the registry's lock, so it must not take it (no HostImport*
-// call) and should be short.
+// HostImportFor of each [begin, end) of `ranges` in order. The leading ranges an existing import
+// answers (registry unchanged since the last reconcile) are looked up under one hold of the import
+// registry's lock, with no other thread's lookup, reconcile or retire between two of them; from the
+// first miss or stale registry on, each range takes HostImportFor itself (its own hold, so a
+// reconcile or an import's creation holds the lock as long as before). `visit(user, index, import)`
+// receives what HostImportFor would return for range `index` and returns whether to go on: no range
+// after the one it stops at is looked up (or imported). The visitor may run under the registry's
+// lock, so it must not take it (no HostImport* call) and should be short.
 using HostImportVisitor = bool (*)(void* user, std::size_t index, const HostImport* import);
 void HostImportsFor(const Context& context, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, HostImportVisitor visit, void* user);
 // Whether an existing import covers [address, address + bytes), without reconciling the imports

@@ -54,11 +54,13 @@ struct FastReader {
     // The exact test behind the pending-block prefilter (FastSrtRead); false declines on the block
     // alone (FastPendingExact). The pending-write snapshot (Recorder::PendingWriteSnapshot) last
     // loaded and the publish generation it was loaded at: reloaded when the generation moved, as
-    // the old capture's PendingView reloads. The reads in a pending block the exact test let through.
+    // the old capture's PendingView reloads. This walk's reads that met a pending block, and those
+    // of them the exact test let through (each walk's owner adds them to its own report line).
     bool exactPending = FastPendingExact();
     bool snapshotLoaded = false;
     std::uint64_t snapshotGeneration = 0;
     std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> snapshot;
+    std::uint64_t pendingInBlocks = 0;
     std::uint64_t pendingPassed = 0;
 };
 
@@ -73,14 +75,21 @@ struct FastReader {
 // host pointers). No page copy, no flush hook.
 bool FastSrtRead(void* context, std::uint64_t address, std::uint32_t* value);
 
-// APS5_PROFILE_DRAW: the reads of every fast walk (F2, F3b, F5) that met a pending block, and those
-// of them the exact test let through, counted since the process started (a reporter prints the
-// difference to its own last values). Zero without the profile.
+// A tally of walks' reads that met a pending block and of those the exact test let through
+// (FastReader::pendingInBlocks, pendingPassed): each report line ([fastpath] walk, draws,
+// dispatches) sums its own walks' readers, so no read is counted on two lines.
 struct FastPendingReads {
     std::uint64_t inBlocks = 0;
     std::uint64_t readPast = 0;
+    void Add(const FastReader& reader) {
+        inBlocks += reader.pendingInBlocks;
+        readPast += reader.pendingPassed;
+    }
+    void Add(const FastPendingReads& other) {
+        inBlocks += other.inBlocks;
+        readPast += other.readPast;
+    }
 };
-FastPendingReads FastPendingReadTotals();
 
 // The decline of a walk that ended with `status` (a read the reader declined names its reason).
 WalkDecline WalkDeclineOf(ShaderRecompiler::WalkStatus status, const FastReader& reader);

@@ -1374,12 +1374,29 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
 void HostImportsFor(const Context& context, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, HostImportVisitor visit, void* user) {
     if (ranges.empty()) return;
     auto& state = Imports();
-    std::lock_guard lock(state.mutex);
-    for (std::size_t index = 0; index < ranges.size(); ++index) {
-        const auto [begin, end] = ranges[index];
-        const auto bytes = end > begin ? static_cast<std::size_t>(end - begin) : std::size_t{0};
-        const auto* import = importRangeInvalid(context, begin, bytes) ? nullptr : hostImportLocked(context, state, begin, bytes);
-        if (!visit(user, index, import)) return;
+    const auto bytesOf = [](const std::pair<std::uint64_t, std::uint64_t>& range) { return range.second > range.first ? static_cast<std::size_t>(range.second - range.first) : std::size_t{0}; };
+    std::size_t index = 0;
+    {
+        // The hits under one hold: hostImportLocked's first step (a valid range, a registry
+        // unchanged since the last reconcile, an import covering the range) answers alone.
+        std::lock_guard lock(state.mutex);
+        for (; index < ranges.size(); ++index) {
+            const auto begin = ranges[index].first;
+            const auto bytes = bytesOf(ranges[index]);
+            const HostImport* import = nullptr;
+            if (!importRangeInvalid(context, begin, bytes)) {
+                if (importsStale(context, state)) break;
+                import = findImport(state, begin, begin + bytes);
+                if (import == nullptr) break;
+            }
+            if (!visit(user, index, import)) return;
+        }
+    }
+    // A stale registry or a miss: that range and every later one take HostImportFor, each under
+    // its own hold, so a reconcile or an import's creation (a VirtualQuery walk and a Vulkan import)
+    // holds the lock no longer than the per-range calls did.
+    for (; index < ranges.size(); ++index) {
+        if (!visit(user, index, HostImportFor(context, ranges[index].first, bytesOf(ranges[index])))) return;
     }
 }
 

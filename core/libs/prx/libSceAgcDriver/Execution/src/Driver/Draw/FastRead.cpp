@@ -6,7 +6,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
-#include <atomic>
 #include <cstdlib>
 #include <cstring>
 
@@ -17,14 +16,6 @@ namespace {
 constexpr std::uint64_t NullPageBytes = 0x10000;
 constexpr std::uint64_t ReaderPageBytes = 0x1000;
 
-bool pendingProfiled() {
-    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    return profiled;
-}
-
-std::atomic<std::uint64_t> readsInPendingBlocks{0};
-std::atomic<std::uint64_t> readsPastPendingBlocks{0};
-
 // Whether a pending write overlaps the word at `address` (in a pending block): the exact ranges of
 // the pending-write snapshot, the set the old capture's classifyPendingWrite and the flush hook
 // test. It holds every range noted into the open, in-flight and finishing batches, and every
@@ -33,10 +24,14 @@ std::atomic<std::uint64_t> readsPastPendingBlocks{0};
 // batch's fence failed: its work never lands, and the old path's reads stop waiting for it too).
 // The snapshot the reader holds is reloaded whenever the publish generation moved since it was
 // loaded (the generation moves right after each publish), so a read sees every range published
-// before it. A range whose block mark is visible but whose publish is not yet is the noting
-// thread's open note: it is published, fenced and only then submitted, so the word still holds
-// what a read ordered before the note sees (the block test alone gives no more: a read just
-// before the mark reads the word raw too).
+// before it. A range whose block mark is visible but whose publish is not yet is a note in
+// progress on the noting thread (which holds GuestMemory::GpuMutex). Into the open batch it is
+// published, fenced and only then submitted, so the word still holds what a read ordered before
+// the note sees. Into an in-flight batch (Recorder::noteWriteOn: a completion label appended to a
+// submitted batch) the GPU may have stored the word already; the old capture's PendingView loads
+// the same snapshot in that window and reads the word raw as well (classifyPendingWrite: no
+// overlap, None), so this read gives what the old path gives. The block test alone was stricter
+// than the old path there.
 bool exactPendingOverlap(FastReader& reader, std::uint64_t address) {
     const auto generation = Graphics::Recorder::PublishGeneration();
     if (!reader.snapshotLoaded || generation != reader.snapshotGeneration) {
@@ -93,10 +88,6 @@ bool FastPendingExact() {
     return exact;
 }
 
-FastPendingReads FastPendingReadTotals() {
-    return {readsInPendingBlocks.load(std::memory_order_relaxed), readsPastPendingBlocks.load(std::memory_order_relaxed)};
-}
-
 bool FastSrtRead(void* context, std::uint64_t address, std::uint32_t* value) {
     auto& reader = *static_cast<FastReader*>(context);
     ++reader.reads;
@@ -121,18 +112,16 @@ bool FastSrtRead(void* context, std::uint64_t address, std::uint32_t* value) {
     // The 64 KiB block is the prefilter; a word in a pending block that no pending range overlaps
     // reads as the old capture reads it (raw).
     if (Graphics::Recorder::BlockPending(address)) {
-        const bool overlaps = !reader.exactPending || exactPendingOverlap(reader, address);
-        if (pendingProfiled()) {
-            readsInPendingBlocks.fetch_add(1, std::memory_order_relaxed);
-            if (!overlaps) readsPastPendingBlocks.fetch_add(1, std::memory_order_relaxed);
-        }
-        if (overlaps) {
+        ++reader.pendingInBlocks;
+        if (!reader.exactPending || exactPendingOverlap(reader, address)) {
             reader.declined = WalkDecline::Pending;
             return false;
         }
         ++reader.pendingPassed;
     }
-    if (Graphics::Recorder::QueuedLabelOverlapsThisThread(address, sizeof(*value))) {
+    // The uncounted query: the [labels] line's "capture pages read word-wise over a queued label"
+    // counts the old capture's page queries only (a declined walk's old path counts its own).
+    if (Graphics::Recorder::QueuedLabelOverlapsThisThreadUncounted(address, sizeof(*value))) {
         reader.declined = WalkDecline::QueuedLabel;
         return false;
     }

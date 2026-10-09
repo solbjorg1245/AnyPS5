@@ -67,6 +67,9 @@ struct FastDrawCounters {
     // [0]: plain old results, [1]: results the old path bound by a heuristic.
     std::array<std::uint64_t, 2> verifyMismatched{};
     std::array<std::uint64_t, VerifyKinds> verifyKinds{};
+    // The F3b walks' reads (vertex fetch and stage walks, taken and declined draws) that met a
+    // pending block, and those the exact ranges let through.
+    FastPendingReads pending;
 };
 
 struct FastDrawTotals {
@@ -115,12 +118,7 @@ void report(const FastDrawCounters& total) {
         std::snprintf(item, sizeof(item), "%s%s %llu (%.1f us each)", declines.empty() ? "" : ", ", Graphics::FastDeclineName(static_cast<FastDecline>(reason)), count(total.declines[reason]), total.declineUs[reason] / static_cast<double>(total.declines[reason]));
         declines += item;
     }
-    // The reads of every fast walk that met a pending block, and those of them the exact ranges let
-    // through (FastSrtRead), since the last line (report runs under the totals' mutex).
-    static FastPendingReads lastPending;
-    const auto pending = FastPendingReadTotals();
-    std::fprintf(stderr, "[fastpath] draws (10 s): %llu offered, %llu taken (%.1f%%; %llu indirect, %llu continued a pass); us per taken draw: %s = %.2f; %.1f allocations per taken draw; declined draws spent %.1f ms before declining; declines: %s; pending-block reads (all fast walks) %llu, read past by the exact ranges %llu%s\n", count(total.offered), count(total.taken), total.offered != 0 ? 100.0 * static_cast<double>(total.taken) / static_cast<double>(total.offered) : 0.0, count(total.indirect), count(total.continued), parts.c_str(), total.takenUs / taken, static_cast<double>(total.allocations) / taken, total.declinedUs / 1000.0, declines.empty() ? "none" : declines.c_str(), count(pending.inBlocks - lastPending.inBlocks), count(pending.readPast - lastPending.readPast), FastPendingExact() ? "" : " (APS5_FAST_PENDING_BLOCKS: blocks only)");
-    lastPending = pending;
+    std::fprintf(stderr, "[fastpath] draws (10 s): %llu offered, %llu taken (%.1f%%; %llu indirect, %llu continued a pass); us per taken draw: %s = %.2f; %.1f allocations per taken draw; declined draws spent %.1f ms before declining; declines: %s; draw walk reads in pending blocks %llu, read past by the exact ranges %llu%s\n", count(total.offered), count(total.taken), total.offered != 0 ? 100.0 * static_cast<double>(total.taken) / static_cast<double>(total.offered) : 0.0, count(total.indirect), count(total.continued), parts.c_str(), total.takenUs / taken, static_cast<double>(total.allocations) / taken, total.declinedUs / 1000.0, declines.empty() ? "none" : declines.c_str(), count(total.pending.inBlocks), count(total.pending.readPast), FastPendingExact() ? "" : " (APS5_FAST_PENDING_BLOCKS: blocks only)");
     if (FastDrawVerifyEvery() == 0) return;
     const auto bindings = Graphics::TakeFastVerifyCounts();
     std::string kinds;
@@ -143,6 +141,7 @@ void commit(const FastDrawCounters& local) {
     total.indirect += local.indirect;
     total.continued += local.continued;
     total.allocations += local.allocations;
+    total.pending.Add(local.pending);
     if (local.taken != 0) {
         for (std::size_t part = 0; part < PartCount; ++part) total.us[part] += local.us[part];
     }
@@ -338,7 +337,7 @@ std::optional<DrawVerdict> Driver::fastDraw(QueueState& queue, const Submission&
             std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertex;
             if (program.binary.stage != Stage::Fragment) {
                 vertex.emplace();
-                if (const auto why = FastResolveVertex(programs, program, *vertex)) return declined(walkDecline(*why));
+                if (const auto why = FastResolveVertex(programs, program, *vertex, &local.pending)) return declined(walkDecline(*why));
             }
             // compileDrawStage's request without memory regions: the walk reads live.
             const auto waveSize = program.binary.stage == Stage::Fragment ? graphics.stages.fragmentWaveSize : graphics.stages.vertexWaveSize;
@@ -354,7 +353,7 @@ std::optional<DrawVerdict> Driver::fastDraw(QueueState& queue, const Submission&
             const auto handle = SourceHandleFor(*program.snapshot, program.codeOffset, localDevice->Serial(), request, false, &poisoned);
             if (handle == nullptr) return declined(FastDecline::NoSource);
             failure = FastDecline::WalkOther;
-            if (const auto why = FastWalkStage(programs, *handle, program, scratch.snapshots[i], scratch.specializations[i])) return declined(walkDecline(*why));
+            if (const auto why = FastWalkStage(programs, *handle, program, scratch.snapshots[i], scratch.specializations[i], &local.pending)) return declined(walkDecline(*why));
             phaseTiming.Phase(DrawRowCapture);
             part(PartWalk);
             // The variant the specialization selects, populated over the live snapshot; a

@@ -25,7 +25,8 @@
 // and keeps its 64 KiB block pending until the batch completed; an old-path dispatch recorded
 // right after it in the same batch reads what it wrote; a GPU-indirect fast dispatch takes its
 // group counts from the import; a V# outside every registered allocation declines (no import)
-// without recording anything.
+// without recording anything, whether it is the dispatch's first or its second in-place element (the
+// one after an import hit: HostImportsFor's per-range fallback).
 
 namespace {
 
@@ -123,6 +124,7 @@ void Run(AgcDriver::VulkanDevice& device) {
     const auto old = Compile(device, fastOutput, oldOutput);
     const auto indirect = Compile(device, input, indirectOutput);
     const auto unregistered = Compile(device, input, Unregistered.data());
+    const auto unregisteredInput = Compile(device, Unregistered.data(), indirectOutput);
     const auto program = reinterpret_cast<std::uintptr_t>(IncrementCode.data());
     const auto outputAddress = reinterpret_cast<std::uint64_t>(fastOutput);
     const auto outputBytes = Words * sizeof(std::uint32_t);
@@ -145,7 +147,10 @@ void Run(AgcDriver::VulkanDevice& device) {
     Require(timing.flushSkipped == Graphics::FastDispatchBatchedElements(), "the per-dispatch scan did not spare the elements their flush (or ran per element)");
     timing = {};
     const auto declined = device.FastDispatch(unregistered, 1, 1, 1, 0, program, timing);
-    Require(declined == Decline::NoImport && !timing.recorded, std::string("a V# outside the registered allocations: ") + (declined ? Graphics::FastDispatchDeclineNames[static_cast<std::size_t>(*declined)] : "taken"));
+    Require(declined == Decline::NoImport && !timing.recorded && timing.elements == 2, std::string("a V# outside the registered allocations: ") + (declined ? Graphics::FastDispatchDeclineNames[static_cast<std::size_t>(*declined)] : "taken"));
+    timing = {};
+    const auto declinedInput = device.FastDispatch(unregisteredInput, 1, 1, 1, 0, program, timing);
+    Require(declinedInput == Decline::NoImport && !timing.recorded && timing.elements == 2, std::string("an input V# outside the registered allocations: ") + (declinedInput ? Graphics::FastDispatchDeclineNames[static_cast<std::size_t>(*declinedInput)] : "taken"));
     Require(Graphics::Recorder::BlockPending(outputAddress), "the written range's block is not pending before its batch completed");
     if (watched) Require(!GuestMemory::UnchangedSince(outputAddress, outputBytes, generation), "the written range was not stamped as written");
     // The old path in the same batch reads the fast dispatch's results.

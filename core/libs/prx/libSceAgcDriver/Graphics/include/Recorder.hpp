@@ -453,6 +453,9 @@ public:
     // page is read word by word and only a read of the label's own dwords records and waits
     // (APS5_NO_WORDWISE_QUEUED_LABELS=1: the old path). Counts the true answers.
     static bool QueuedLabelOverlapsThisThread(std::uint64_t address, std::size_t bytes);
+    // The same answer without the count: for the fast walks' direct reader (FastSrtRead), whose
+    // word reads are not the old capture's page queries.
+    static bool QueuedLabelOverlapsThisThreadUncounted(std::uint64_t address, std::size_t bytes);
     // Pending blocks (docs/design/draw-fastpath.md section 2.3, F2): per 64 KiB block of guest
     // memory, the serial of the newest batch of the active recorder that noted a pending write
     // into it (every noted range: NotePendingWrite(s), labels, completion stores), set beside the

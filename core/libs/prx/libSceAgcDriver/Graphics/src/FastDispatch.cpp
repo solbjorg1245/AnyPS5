@@ -137,6 +137,17 @@ bool FastDispatchBatchedElements() {
     return batched;
 }
 
+bool FlushFastDispatchRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, bool batched) {
+    if (ranges.empty()) return false;
+    // FlushPending of a range lists only images in the pending registry that overlap it
+    // (AnyPendingOverlaps finds those, the ones being flushed and the refreshing one: a superset),
+    // and with none it only publishes the unit shadows over the range when AnyShadowedOverlaps finds
+    // one (PublishShadowsOnly). Otherwise every range takes it, in order, as before.
+    if (batched && !StorageTexture::AnyPendingOverlaps(ranges) && !AnyShadowedOverlaps(ranges)) return true;
+    for (const auto& [begin, end] : ranges) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "imported buffer region");
+    return false;
+}
+
 std::optional<FastDispatchDecline> FastComputeLayoutKey(const ShaderRecompiler::RecompileResult& shader, std::vector<std::uint32_t>& key) {
     key.clear();
     const VkShaderStageFlags flags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -314,21 +325,15 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
             scratch.writes.push_back(write);
             laps.add(*part);
         }
-        // Batched: one scan of each registry for every in-place range. FlushPending of a range lists
-        // only images in the pending registry that overlap it (AnyPendingOverlaps finds those and
-        // the ones being flushed, a superset), and with none it only publishes the unit shadows
-        // over the range when AnyShadowedOverlaps finds one (PublishShadowsOnly). So when neither
-        // scan finds anything, every element's FlushPending would store and publish nothing, and
-        // nothing is done; otherwise every element takes it, in order, as before. The shadow
-        // registry changes only under GuestMemory::GpuMutex, which this thread holds.
+        // `reads` holds the in-place elements' ranges, one per element in their order (pushed
+        // together above): the flush covers exactly the elements' ranges and step 3 pairs the
+        // imports with the elements by index. A range added to `reads` alone would bind an element
+        // from another range's import, so the dispatch goes to the old path instead.
+        if (scratch.reads.size() != scratch.elements.size()) return Decline::Invalid;
         timing.elements = static_cast<std::uint32_t>(scratch.elements.size());
-        if (!scratch.elements.empty()) {
-            if (!batched || StorageTexture::AnyPendingOverlaps(scratch.reads) || AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>>(scratch.reads))) {
-                for (const auto& element : scratch.elements) StorageTexture::FlushPending(element.address, static_cast<std::size_t>(element.bytes), nullptr, "imported buffer region");
-            } else {
-                timing.flushSkipped = true;
-            }
-        }
+        // Batched: one scan of each registry for every in-place range (FlushFastDispatchRanges); this
+        // thread holds GuestMemory::GpuMutex.
+        timing.flushSkipped = FlushFastDispatchRanges(scratch.reads, batched);
         laps.add(timing.flushNs);
     } catch (const std::exception&) {
         // The old path's build throws the same and reports it (a skipped dispatch).
@@ -373,7 +378,7 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
     // the recorded dispatch.
     recorder.Keep(call.pipelineObjects);
     // One element's binding from its import (HostImportFor's answer), or its decline. Local work
-    // only: it runs under the import registry's lock when batched.
+    // only: it may run under the import registry's lock when batched.
     const auto bindElement = [&](const BufferElement& element, const HostImport* import) -> std::optional<Decline> {
         if (import == nullptr) return Decline::NoImport;
         const auto offset = element.address - import->base;
@@ -390,9 +395,10 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
         return std::nullopt;
     };
     if (batched) {
-        // The element loop below under one hold of the registry's lock: the same lookups in the same
-        // order, stopping at the same element (HostImportsFor), with no other thread's lookup,
-        // reconcile or retire between two of them.
+        // The element loop below through HostImportsFor: the same lookups in the same order,
+        // stopping at the same element; the leading hits under one hold of the registry's lock (no
+        // other thread's lookup, reconcile or retire between two of them), the rest from the first
+        // miss on per element, as below.
         struct Visit {
             const decltype(bindElement)& bind;
             const std::vector<BufferElement>& elements;
