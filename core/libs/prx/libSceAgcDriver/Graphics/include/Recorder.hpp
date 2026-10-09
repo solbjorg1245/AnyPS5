@@ -727,9 +727,17 @@ public:
     // or APS5_PROFILE_GPU). A class range covers the command with its own barriers (a dispatch's
     // barriers are classes of their own, its program range stays keyed by the program), so the
     // union of every range of a batch and the batch span differ by what no class times ('untimed').
-    enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, DeferredFlat, Count };
+    // A storage image write-back is timed in three stages (Texture.cpp, ContinueGpuTiming):
+    // StorageWriteBack (its leading barrier, the seeds and the image -> linear copy), StorageRetile
+    // (the retile dispatches) and StorageStore (scratch -> unit shadow slabs / import copies and the
+    // trailing barrier); the [gputime] "retile" row sums them.
+    enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, DeferredFlat, StorageRetile, StorageStore, Count };
     static constexpr std::uint64_t ClassKey(CommandClass which) { return 0x10 + static_cast<std::uint64_t>(which); }
     std::uint32_t BeginGpuTiming(CommandClass which) { return startGpuTiming(ClassKey(which), TimingKind::Class); }
+    // Ends range `index` (adding `bytes`) and begins one of class `next` in the same command
+    // sequence, without a Commands() of its own (a flushing timing mode would record queued work
+    // between the caller's stages). NoTiming stays NoTiming; none begins inside a render pass.
+    std::uint32_t ContinueGpuTiming(std::uint32_t index, std::uint64_t bytes, CommandClass next);
     // Records buffer copies into the open batch outside any render pass (an open pass ends),
     // ordered behind every earlier recorded write of their sources and visible to the work after;
     // `which` names the [gputime]/[barriers] class (deferred flat slots: Draw.cpp

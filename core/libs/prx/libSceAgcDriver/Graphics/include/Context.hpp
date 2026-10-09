@@ -150,6 +150,10 @@ struct Context {
     std::uint32_t maxPushDescriptors = 0;
     FastLayouts* fastLayouts = nullptr;
     FastRing* fastRing = nullptr;
+    // VK_EXT_memory_budget supported and asked for (VideoMemory::Wanted), with the instance's
+    // vkGetPhysicalDeviceMemoryProperties2: the video memory guard's sample. Off and null in tests.
+    bool memoryBudget = false;
+    PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

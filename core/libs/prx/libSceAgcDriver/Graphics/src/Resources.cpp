@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -18,6 +19,8 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         mapping = allocation->mapping;
         deviceAddress = allocation->address;
         allocationBytes = allocation->allocationBytes;
+        epoch = allocation->epoch;
+        memoryType = allocation->memoryType;
         ready = true;
         return;
     }
@@ -47,6 +50,8 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         } else {
             allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, properties);
         }
+        epoch = VideoMemory::Epoch();
+        memoryType = allocation.memoryTypeIndex;
         Check(AllocateDeviceMemory(context, allocation, &memory), "vkAllocateMemory buffer");
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory");
         initializeAddress(usage);
@@ -63,8 +68,8 @@ Buffer::~Buffer() {
 }
 
 void Buffer::release() noexcept {
-    if (ready && cache) {
-        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties});
+    if (ready && cache && !discard.load(std::memory_order_relaxed)) {
+        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, epoch, memoryType});
         return;
     }
     if (mapping) context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")(context.device, memory);
@@ -97,6 +102,9 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         buffer = allocation->buffer;
         memory = allocation->memory;
         allocationBytes = allocation->allocationBytes;
+        epoch = allocation->epoch;
+        memoryType = allocation->memoryType;
+        pooled = true;
         return;
     }
     try {
@@ -112,7 +120,12 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         allocation.allocationSize = requirements.size;
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        epoch = VideoMemory::Epoch();
+        memoryType = allocation.memoryTypeIndex;
+        // Also the allocation whose own refusal started the episode (AllocateDeviceMemory).
+        const bool pressuredBefore = VideoMemory::UnderPressure();
         Check(AllocateDeviceMemory(context, allocation, &memory), "vkAllocateMemory device buffer");
+        madeUnderPressure = pressuredBefore || VideoMemory::UnderPressure();
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory device");
     } catch (...) {
         release();
@@ -126,7 +139,7 @@ DeviceBuffer::~DeviceBuffer() {
 
 void DeviceBuffer::release() noexcept {
     if (buffer && memory && cache) {
-        cache->Put({buffer, memory, nullptr, 0, allocationBytes, capacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT});
+        cache->Put({buffer, memory, nullptr, 0, allocationBytes, capacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, epoch, memoryType});
         return;
     }
     if (buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);

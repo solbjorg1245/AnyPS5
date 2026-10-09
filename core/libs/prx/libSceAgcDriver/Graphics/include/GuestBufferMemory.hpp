@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_GUESTBUFFERMEMORY_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <array>
@@ -59,6 +60,8 @@ struct HostImport {
     // A span import (over several adjoining registered ranges): not in the per-range registry, so
     // no serial names it and recipes do not key on it.
     bool span = false;
+    // The memory type it was imported into (~0u: unknown; the [retile] line names it).
+    std::uint32_t memoryType = ~0u;
 };
 
 enum class ImportWatch : std::uint8_t { Watch, Unwatch };
@@ -187,6 +190,13 @@ struct ResidentReadStatistics {
     // APS5_RESIDENT_READS_VERIFY: uses compared on completion, and those whose copy differed
     // from the import.
     std::uint64_t verified = 0, mismatched = 0;
+    // The video memory guard (VideoMemory, APS5_VRAM_GUARD): copies refused for the budget, copies
+    // evicted by its trims that no build held (and their bytes) and that builds held (their builds
+    // are rebuilt), cached copies made before its last recycle and made anew, and reused builds
+    // rebuilt over a recycled copy, over a trimmed one, and after an episode ended that refused
+    // them a copy.
+    std::uint64_t refusedBudget = 0, trimmed = 0, trimmedBytes = 0, trimmedHeld = 0, trimmedHeldBytes = 0, recycled = 0;
+    std::uint64_t rebuiltRecycled = 0, rebuiltTrimmed = 0, rebuiltRefused = 0;
     // The cache now: copies and their allocated bytes (BufferPool::Capacity); the bytes of every
     // live copy (cached, or evicted and still held by a build); address-based writers in flight.
     std::uint64_t entries = 0, bytes = 0, liveBytes = 0, writers = 0;
@@ -212,6 +222,10 @@ void NoteResidentReadsFinished(std::uint64_t recorderId, std::uint64_t serial);
 std::size_t ClearResidentReads();
 // Tests: the resident checks take every write-watch collect as failed.
 void ResidentReadsFailCollectForTests(bool fail);
+// The video memory guard's trim (VideoMemory::SetResidentTrimmer, registered with the first copy):
+// see VideoMemory::ResidentTrimmer. A held copy it evicts is marked trimmed, so a reused build
+// holding it is rebuilt (RecordResidentReads) and its memory goes with the last holder.
+VideoMemory::ResidentTrim TrimResidentReads(std::uint64_t bytes);
 
 // The import table's identity (the fast Revalidate): serials proved under one identity stand
 // while the table still has it, i.e. the same device, the same epoch (bumped by every retire)
@@ -603,6 +617,9 @@ private:
     // Some region is bound from a resident read-only copy (RecordResidentReads has work), and the
     // recorder and its submission count at the last check (RecheckResidentReads).
     bool residentRegions = false;
+    // A resident copy was refused for the video memory budget: VideoMemory::Rounds() + 1 at the
+    // refusal (0: none). Once an episode ended since, the reused build is rebuilt to take copies.
+    std::uint64_t residentBudgetRound = 0;
     const Recorder* residentCheckedBy = nullptr;
     std::uint64_t residentCheckedAt = 0;
     // NoteAddressWriter's list for this build (the space's writable ranges, merged with the

@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libc/include/HostMutex.hpp"
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -24,6 +25,11 @@ struct BufferAllocation {
     std::size_t bytes;
     VkBufferUsageFlags usage;
     VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    // The video memory guard's epoch when the memory was allocated (VideoMemory::Epoch): with the
+    // guard on, a device-tier allocation older than the current epoch is destroyed instead of
+    // retained or handed out again. And the memory type it was allocated from (~0u: unknown).
+    std::uint64_t epoch = 0;
+    std::uint32_t memoryType = ~0u;
 };
 
 // Released buffer allocations kept for reuse, since creating, binding and mapping one costs tens of
@@ -62,6 +68,15 @@ public:
     // retains (all released, so no work uses one) and returns their bytes; 0 when it held none.
     // Counted as evictions.
     VkDeviceSize ReleaseDevice() noexcept;
+    // Video memory guard (VideoMemory, APS5_VRAM_GUARD): destroys the device tier's least recently
+    // used retained slots that came back at least `idle` ago (the working set, taken again sooner,
+    // stays) until `bytes` are freed or `floor` bytes are left. The tier's limit is left as it is:
+    // capping it made the working set's slots miss and be allocated again (allocate/free churn).
+    // Returns the bytes freed.
+    VkDeviceSize TrimDevice(VkDeviceSize bytes, VkDeviceSize floor, std::chrono::milliseconds idle) noexcept;
+    // The device tier's retained bytes and its limit (tests).
+    VkDeviceSize DeviceRetainedBytes();
+    VkDeviceSize DeviceLimit();
     // AllocateDeviceMemory's outcomes since the start (the [bufferpool] line): allocations refused
     // with VK_ERROR_OUT_OF_DEVICE_MEMORY, releases that freed something and their bytes, and the
     // allocations made on the try after a release.
@@ -74,6 +89,9 @@ private:
     struct Slot {
         BufferAllocation allocation;
         std::uint64_t lastUse;
+        // When it came back (the device tier with the video memory guard on: TrimDevice's idle
+        // time; the epoch of the clock otherwise, so idle).
+        std::chrono::steady_clock::time_point returned {};
     };
     // Retained slots are grouped by what a Take must match (capacity, usage, memory properties),
     // each group oldest first: a Take is a map lookup instead of a scan of every slot (with
@@ -100,6 +118,8 @@ private:
     // releasing the mutex, so builds taking buffers on other threads do not wait behind the
     // Vulkan destroy calls. Nothing changes when the vector cannot grow.
     void evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted);
+    // The group holding the tier's least recently used slot (at its front); the tier is not empty.
+    std::map<SlotKey, std::deque<Slot>>::iterator oldestGroup(Tier& tier);
     // The retained-slot bound of each tier (APS5_BUFFER_POOL_SLOTS, default `defaultSlots`), read once.
     static std::size_t MaxSlots();
     VkDevice device;
@@ -112,6 +132,9 @@ private:
     Tier largeTier;
     Tier deviceTier;
     std::uint64_t clock = 0;
+    // The video memory guard's actions: slots trimmed, and slots destroyed for an older epoch
+    // (on Put, or met by a Take), with their bytes.
+    std::uint64_t guardTrimmed = 0, guardTrimmedBytes = 0, guardRecycled = 0, guardRecycledBytes = 0;
     static constexpr VkDeviceSize budget = 512ull * 1024 * 1024;
     // The small tier's own budget (slots of at most half a MiB each): pinned host memory the
     // large tier's budget does not count.

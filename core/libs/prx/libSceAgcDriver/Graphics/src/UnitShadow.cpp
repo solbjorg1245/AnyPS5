@@ -204,7 +204,9 @@ std::shared_ptr<ShadowSlab> makeSlab(const Context& context, std::uint64_t first
         context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
         return nullptr;
     }
-    return std::make_shared<ShadowSlab>(context, buffer, memory, firstUnit, units);
+    auto slab = std::make_shared<ShadowSlab>(context, buffer, memory, firstUnit, units);
+    slab->memoryType = allocation.memoryTypeIndex;
+    return slab;
 }
 
 struct SlabCopies {
