@@ -1,6 +1,7 @@
 target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/Export.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/General.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/PortSettings.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/gcc/StackGuard.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/windows/CrashReport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/linux/DlIteratePhdr.cpp
@@ -230,6 +231,20 @@ target_include_directories(guest_locale_tests PRIVATE ${LIBS_INCLUDE_DIR})
 set_target_properties(guest_locale_tests PROPERTIES CXX_EXTENSIONS OFF)
 target_link_libraries(guest_locale_tests PRIVATE libc)
 configure_windows_unwind(guest_locale_tests)
+
+add_test_executable(port_settings_tests EXCLUDE_FROM_ALL ${LIBS_INCLUDE_DIR}/tests/PortSettings.cpp)
+target_include_directories(port_settings_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(port_settings_tests PRIVATE libc libkernel)
+set_target_properties(port_settings_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(port_settings_tests)
+if(BUILD_TESTING)
+    set_target_properties(port_settings_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME port_settings COMMAND port_settings_tests)
+    if(WIN32)
+        set_tests_properties(port_settings PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
 
 if(MINGW)
     foreach(runtimeLinkFlag IN ITEMS -static-libgcc -static-libstdc++ -static)

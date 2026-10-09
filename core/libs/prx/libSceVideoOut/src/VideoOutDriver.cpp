@@ -17,6 +17,7 @@
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
+#include "prx/libSceVideoOut/include/TimestepPatch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -34,10 +35,15 @@ void require(bool condition, const char* reason) {
 // patch_game.py --fps120, which turns the title's 60 FPS mode into 120: the title steps physics once
 // per frame by 1/refresh, so it must flip at the refresh it was patched for. A value within 0.01 of an
 // NTSC rate (29.97, 59.94, 119.88) snaps to its exact n*1000/1001; a whole number is taken as is
-// (below 10 Hz every integer lies within 0.01 of n/1.001).
+// (below 10 Hz every integer lies within 0.01 of n/1.001). Unset, an FpsLimit other than the title's 30
+// or 60 (player settings, with Timestep = variable) sets it: the title flips once per vblank.
 double vblankHz() {
     const char* value = std::getenv("APS5_VBLANK_HZ");
-    if (value == nullptr) return 0.0;
+    if (value == nullptr) {
+        const double limit = PortSettings::VblankHz(GetPortSettings_nid_no_patch());
+        if (limit != 0.0) std::fprintf(stderr, "[videoout] vblank at %.4f Hz (FpsLimit)\n", limit);
+        return limit;
+    }
     char* end = nullptr;
     double hz = std::strtod(value, &end);
     if (end == value || *end != '\0' || !(hz >= 1.0 && hz <= 1000.0)) {
@@ -47,6 +53,12 @@ double vblankHz() {
     const double ntsc = std::round(hz * 1.001);
     if (hz != std::round(hz) && std::abs(hz * 1.001 - ntsc) < 0.01) hz = ntsc / 1.001;
     std::fprintf(stderr, "[videoout] vblank at %.4f Hz (APS5_VBLANK_HZ=%s)\n", hz, value);
+    return hz;
+}
+
+// vblankHz() once: the vblank thread and the timestep patch share it.
+double vblankRate() {
+    static const double hz = vblankHz();
     return hz;
 }
 
@@ -129,6 +141,7 @@ public:
         ++cfg->flipStatus.flipPendingNum;
         if (info.index >= 0) ++cfg->bufferPending[info.index];
         request->reserved = true;
+        TimestepPatch::Get().Flip(vblankRate());
         return request;
     }
 
@@ -559,7 +572,7 @@ void VideoOutDriver::presentLoop(std::stop_token token) {
 void VideoOutDriver::vblankLoop(std::stop_token token) {
     using Frame = std::chrono::duration<int64_t, std::ratio<1001, 60000>>;
     using Clock = std::chrono::steady_clock;
-    const double hz = vblankHz();
+    const double hz = vblankRate();
     // APS5_NO_PRECISE_VBLANK=1 restores the condition-variable wait_until, which winpthreads ends on a
     // 15.6 ms tick (vblank intervals of 2-34 ms instead of 16.68 ms).
     static const bool precise = std::getenv("APS5_NO_PRECISE_VBLANK") == nullptr;

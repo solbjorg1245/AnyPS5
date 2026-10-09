@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
+#include "prx/libc/include/PortSettings.hpp"
 #include "SDL_vulkan.h"
 #include <cstdio>
 #include <stdexcept>
@@ -42,18 +43,26 @@ void DisplayWindow::create(std::uint32_t sourceWidth, std::uint32_t sourceHeight
     require(usable.w > 0 && usable.h > 0, "usable display extent must be positive");
     const auto boundsWidth = static_cast<std::uint32_t>(static_cast<std::uint64_t>(usable.w) * DisplayWindowInitialSizePercent / 100);
     const auto boundsHeight = static_cast<std::uint32_t>(static_cast<std::uint64_t>(usable.h) * DisplayWindowInitialSizePercent / 100);
-    const auto initialSize = AgcDriver::ComputeContainSize_nid_postfix(sourceWidth, sourceHeight, boundsWidth, boundsHeight, true);
+    // Resolution = WxH (player settings): the client area is that size, or the largest of its aspect the
+    // usable display holds; the presenter letterboxes the frame into it.
+    const auto& settings = GetPortSettings_nid_no_patch();
+    const auto initialSize = settings.width != 0
+        ? AgcDriver::ComputeContainSize_nid_postfix(settings.width, settings.height, static_cast<std::uint32_t>(usable.w), static_cast<std::uint32_t>(usable.h), false)
+        : AgcDriver::ComputeContainSize_nid_postfix(sourceWidth, sourceHeight, boundsWidth, boundsHeight, true);
     require(initialSize.width >= DisplayWindowMinimumWidth && initialSize.height >= DisplayWindowMinimumHeight, "initial window extent is smaller than the minimum");
     const auto title = GetAppTitle_nid_postfix();
     window = SDL_CreateWindow(title.value, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, static_cast<int>(initialSize.width), static_cast<int>(initialSize.height), SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     require(window != nullptr, SDL_GetError());
     SDL_SetWindowMinimumSize(window, static_cast<int>(DisplayWindowMinimumWidth), static_cast<int>(DisplayWindowMinimumHeight));
     installSubclass();
+    if (settings.windowMode == PortSettings::WindowMode::Fullscreen) require(SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP) == 0, SDL_GetError());
 }
 
 void DisplayWindow::updateAspectRatio(std::uint32_t sourceWidth, std::uint32_t sourceHeight) {
-    aspectWidth = sourceWidth;
-    aspectHeight = sourceHeight;
+    // Resizing keeps the aspect of the settings' Resolution when there is one, else the frame's.
+    const auto& settings = GetPortSettings_nid_no_patch();
+    aspectWidth = settings.width != 0 ? settings.width : sourceWidth;
+    aspectHeight = settings.width != 0 ? settings.height : sourceHeight;
 }
 
 void DisplayWindow::Destroy() noexcept {

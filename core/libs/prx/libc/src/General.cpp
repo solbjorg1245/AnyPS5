@@ -11,6 +11,7 @@
 #include <cstring>
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
+#include "prx/libc/include/PortSettings.hpp"
 
 namespace {
 // Guest prefixes (without leading slashes) mapped to host directories, e.g. save-data mount points:
@@ -162,6 +163,15 @@ extern "C" void RemovePathAlias_nid_no_patch(const char* guestPrefix) {
 extern "C" std::filesystem::path ResolvePath_nid_no_patch(const char* path) {
     if (!path) { APS5_INVALID_ARG_EX; }
     auto& state = Directories();
+    // The player settings' title arguments alias the command-line and render-config files to merged
+    // copies before the first guest path resolves (PortSettings.cpp); without settings nothing changes.
+    static std::once_flag settingsOverlay;
+    std::call_once(settingsOverlay, [&state] {
+        InstallPortSettingsOverlay([&state](const char* guest) {
+            std::lock_guard lock(state.mutex);
+            return Resolve(state, guest);
+        });
+    });
     std::lock_guard lock(state.mutex);
     return Resolve(state, path);
 }
