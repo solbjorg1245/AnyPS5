@@ -109,23 +109,14 @@ struct HostImportMemo {
 };
 HostImportMemo& ThreadHostImportMemo();
 // HostImportFor through the calling thread's HostImportMemo: a hit takes no registry mutex. The
-// fast draw's bindings (HostImportResolver) and the fast dispatch's elements and records use it;
-// APS5_NO_IMPORT_MEMO=1 calls HostImportFor.
+// fast draw (its bindings through HostImportResolver, its in-place inputs and indirect records
+// through CopyDrawInput's and indirectPathFor's flags) and the fast dispatch's elements and records
+// use it; Draw keeps HostImportFor. APS5_NO_IMPORT_MEMO=1 calls HostImportFor.
+// A hit reads the registry generation and the published epoch without the registry mutex, so a
+// caller must be serialized with every reconcile and retire (GuestMemory::GpuMutex, held by every
+// caller), as any user of a HostImportFor pointer already must be: an epoch bump that follows an
+// erase on another thread would not stop a hit on the erased import.
 const HostImport* HostImportMemoized(const Context& context, std::uint64_t address, std::size_t bytes);
-// While one lives on the calling thread, HostImportForPath answers through HostImportMemoized:
-// DrawFast holds one, so the steps it shares with Draw (the in-place inputs, the indirect records)
-// use the memo there and HostImportFor on the old path.
-class FastImportScope {
-public:
-    FastImportScope();
-    ~FastImportScope();
-    FastImportScope(const FastImportScope&) = delete;
-    FastImportScope& operator=(const FastImportScope&) = delete;
-
-private:
-    bool previous;
-};
-const HostImport* HostImportForPath(const Context& context, std::uint64_t address, std::size_t bytes);
 
 // Whether an existing import covers [address, address + bytes), without reconciling the imports
 // with the registry or making one (HostImportFor may take a registry lease): a hint for choices

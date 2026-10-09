@@ -442,6 +442,10 @@ const GuestAllocations::Range* containingRange(const GuestAllocations::Lease& le
 // guest addresses. Walks the imports only when the registry changed since the last walk.
 void refreshImports(const Context& context, HostImports& state, const GuestAllocations::Lease& lease) {
     if (state.device != context.device) {
+        // Published before any import is freed, as retireImport and retireSpan do: a lock-free
+        // reader (HostImportsEpoch, HostImportMemoized) must never see the old epoch with a freed
+        // import behind it.
+        bumpEpoch(state);
         for (const auto& [address, entry] : state.imports) {
             if (state.device != VK_NULL_HANDLE && state.destroyBuffer != nullptr && state.freeMemory != nullptr) {
                 state.destroyBuffer(state.device, entry.buffer, nullptr);
@@ -465,7 +469,6 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         state.destroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
         state.freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
         state.refreshedGeneration = 0;
-        bumpEpoch(state);
     }
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (generation == state.refreshedGeneration) return;
@@ -1380,7 +1383,6 @@ bool importMemoEnabled() {
 }
 
 struct HostImportMemoTag {};
-struct FastImportScopeTag {};
 
 }
 
@@ -1426,18 +1428,6 @@ const HostImport* HostImportMemoized(const Context& context, std::uint64_t addre
     // and the epoch stay what they were, i.e. while this lookup would find the same import.
     if (import != nullptr && !importsStale(context, state)) memo.Note(context.device, state.refreshedGeneration, state.epoch, *import);
     return import;
-}
-
-FastImportScope::FastImportScope() : previous(HostThreadLocal<bool, FastImportScopeTag>()) {
-    HostThreadLocal<bool, FastImportScopeTag>() = true;
-}
-
-FastImportScope::~FastImportScope() {
-    HostThreadLocal<bool, FastImportScopeTag>() = previous;
-}
-
-const HostImport* HostImportForPath(const Context& context, std::uint64_t address, std::size_t bytes) {
-    return HostThreadLocal<bool, FastImportScopeTag>() ? HostImportMemoized(context, address, bytes) : HostImportFor(context, address, bytes);
 }
 
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes) {

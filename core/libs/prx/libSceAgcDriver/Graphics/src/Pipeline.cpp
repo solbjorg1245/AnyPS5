@@ -452,6 +452,9 @@ struct PipelineStore {
     std::atomic<std::uint64_t> removals{0};
     // CachedFastPipeline lookups its memo answered (the [pipecache] line).
     std::atomic<std::uint64_t> memoHits{0};
+    // Ticks once per lookup that answers a stored pipeline (store hit, insert, memo hit): the
+    // pipelines' storeUse stamps, by which the eviction picks the least recently used entry.
+    std::atomic<std::uint64_t> useClock{0};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
@@ -460,6 +463,13 @@ struct PipelineStore {
 PipelineStore& Pipelines() {
     static auto* store = new PipelineStore();
     return *store;
+}
+
+// Marks `pipeline` as used now (PipelineStore::useClock). Under the store's mutex for its own hits
+// and inserts, in the order it splices them, so the stamps rank the entries as the list does; a
+// memo hit stamps without the lock and so ranks its entry as recent as a store hit would.
+void touch(PipelineStore& store, const Pipeline& pipeline) {
+    pipeline.storeUse.store(store.useClock.fetch_add(1, std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 }
 
 // Whether the entry's objects belong to the device the context names. A context without a buffer
@@ -516,6 +526,7 @@ std::shared_ptr<Pipeline> cachedPipeline(const Context& context, const std::vect
             if (alive(*it, context)) {
                 ++store.hits;
                 store.entries.splice(store.entries.end(), store.entries, it);
+                touch(store, *it->pipeline);
                 if (stored != nullptr) *stored = true;
                 return it->pipeline;
             }
@@ -533,6 +544,7 @@ std::shared_ptr<Pipeline> cachedPipeline(const Context& context, const std::vect
         it = alive(*it, context) ? std::next(it) : abandon(store, it);
     }
     auto pipeline = make();
+    touch(store, *pipeline);
     store.entries.push_back({context.device, context.bufferPool, hash, key, pipeline});
     store.index[hash] = std::prev(store.entries.end());
     if (stored != nullptr) *stored = true;
@@ -544,8 +556,20 @@ std::shared_ptr<Pipeline> cachedPipeline(const Context& context, const std::vect
         return parsed != 0 ? static_cast<std::size_t>(parsed) : std::size_t{8192};
     }();
     while (store.entries.size() > bound) {
-        // Only an entry no recorded draw still holds may go (Kept keeps its shared_ptr until the fence).
-        const auto victim = std::find_if(store.entries.begin(), store.entries.end(), [](const PipelineStore::Entry& entry) { return entry.pipeline.use_count() == 1; });
+        // The least recently used entry no recorded draw still holds (Kept keeps its shared_ptr
+        // until the fence). Recency is the pipeline's stamp (touch): store hits and inserts stamp
+        // in list order, so without memo hits this is the first such entry of the list, as
+        // before; a memo hit (CachedFastPipeline) stamps without moving its entry in the list.
+        auto victim = store.entries.end();
+        std::uint64_t oldest = 0;
+        for (auto it = store.entries.begin(); it != store.entries.end(); ++it) {
+            if (it->pipeline.use_count() != 1) continue;
+            const auto used = it->pipeline->storeUse.load(std::memory_order_relaxed);
+            if (victim == store.entries.end() || used < oldest) {
+                victim = it;
+                oldest = used;
+            }
+        }
         if (victim == store.entries.end()) break;
         store.removals.fetch_add(1, std::memory_order_release);
         store.index.erase(victim->hash);
@@ -598,7 +622,9 @@ std::shared_ptr<Pipeline> CachedFastPipeline(const Context& context, const State
     const auto removals = store.removals.load(std::memory_order_acquire);
     if (auto pipeline = scratch.memo.Find(scratch.key, hash, removals, owner)) {
         ++scratch.memo.hits;
-        // Counted for the APS5_PROFILE_DRAW line only: no shared write per hit otherwise.
+        // As recent as the store's hit would have made it (the eviction's order).
+        touch(store, *pipeline);
+        // Counted for the APS5_PROFILE_DRAW line only (the stamp above is the one shared write per hit).
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
         if (profile) store.memoHits.fetch_add(1, std::memory_order_relaxed);
         return pipeline;

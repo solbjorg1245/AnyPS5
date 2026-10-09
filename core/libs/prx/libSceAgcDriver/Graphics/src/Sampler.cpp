@@ -81,7 +81,9 @@ namespace AgcDriver::Graphics {
         for (const auto& entry : memo.entries) {
             if (entry.instance != instance || entry.removals != dropped || entry.key != key) continue;
             if (auto sampler = entry.sampler.lock()) {
-                // Counted for the APS5_PROFILE_DRAW line only: no shared write per hit otherwise.
+                // As recent as Get's hit would have made it (the eviction's order).
+                sampler->cacheUse.store(clock.fetch_add(1, std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+                // Counted for the APS5_PROFILE_DRAW line only (the stamp above is the one shared write per hit).
                 static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
                 if (profile) memoHits.fetch_add(1, std::memory_order_relaxed);
                 return sampler;
@@ -97,24 +99,25 @@ namespace AgcDriver::Graphics {
         Require(words.size() == 4, "guest sampler descriptor must contain 4 dwords");
         const std::array<std::uint32_t, 5> key{words[0], words[1], words[2], words[3], compareEnable ? 1u : 0u};
         std::lock_guard lock(mutex);
-        ++clock;
+        const auto now = clock.fetch_add(1, std::memory_order_relaxed) + 1;
         if (const auto found = entries.find(key); found != entries.end()) {
             ++hits;
-            found->second.lastUse = clock;
+            found->second.sampler->cacheUse.store(now, std::memory_order_relaxed);
             return found->second.sampler;
         }
         ++misses;
         auto resource = DecodeSamplerResource(words);
         resource.compareEnable = compareEnable;
         auto sampler = std::make_shared<Sampler>(context, resource);
+        sampler->cacheUse.store(now, std::memory_order_relaxed);
         // The cap keeps live samplers well below the device's limit (NVIDIA: ~4000); a set in flight
         // still holds the evicted sampler through its own shared_ptr.
         while (entries.size() >= capacity) {
-            const auto oldest = std::min_element(entries.begin(), entries.end(), [](const auto& left, const auto& right) { return left.second.lastUse < right.second.lastUse; });
+            const auto oldest = std::min_element(entries.begin(), entries.end(), [](const auto& left, const auto& right) { return left.second.sampler->cacheUse.load(std::memory_order_relaxed) < right.second.sampler->cacheUse.load(std::memory_order_relaxed); });
             removals.fetch_add(1, std::memory_order_release);
             entries.erase(oldest);
         }
-        entries.emplace(key, Entry{sampler, clock});
+        entries.emplace(key, Entry{sampler});
         return sampler;
     }
 

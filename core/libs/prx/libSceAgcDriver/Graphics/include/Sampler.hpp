@@ -22,6 +22,10 @@ public:
     Sampler& operator=(const Sampler&) = delete;
 
     VkSampler Handle() const;
+    // The sampler cache's recency stamp (SamplerCache): the cache's clock at the last lookup that
+    // answered this sampler, by Get or by a thread's memo (GetMemoized, which takes no lock), so the
+    // cache evicts the least recently used sampler as if every lookup had reached Get.
+    mutable std::atomic<std::uint64_t> cacheUse{0};
 
 private:
     void release() noexcept;
@@ -57,12 +61,13 @@ public:
 
 private:
     struct Entry {
+        // Its last use is the sampler's cacheUse.
         std::shared_ptr<Sampler> sampler;
-        std::uint64_t lastUse;
     };
     HostMutex mutex;
     std::map<std::array<std::uint32_t, 5>, Entry> entries;
-    std::uint64_t clock = 0;
+    // Ticks once per lookup (Get, under the mutex; a memo hit, without it).
+    std::atomic<std::uint64_t> clock{0};
     std::size_t capacity;
     std::uint64_t hits = 0;
     std::uint64_t misses = 0;

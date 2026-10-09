@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_PIPELINE_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include <atomic>
 #include <set>
 
 namespace AgcDriver::Graphics {
@@ -52,6 +53,11 @@ public:
     void PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
     // Forgets the Vulkan objects without destroying them: for entries of a device that is already gone.
     void Abandon() noexcept;
+    // The pipeline store's recency stamp (Pipeline.cpp): the store's use clock at the last lookup
+    // that answered this pipeline, by the store or by a thread's memo (CachedFastPipeline, which
+    // takes no lock), so the store evicts the least recently used entry as if every lookup had
+    // reached it.
+    mutable std::atomic<std::uint64_t> storeUse{0};
 
 private:
     struct CachedFramebuffer {

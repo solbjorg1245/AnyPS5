@@ -667,7 +667,7 @@ void testHostImportMemo() {
     for (const auto& other : others) check(memo.Find(device, 5, 7, other.base, 4) == &other, "import memo: a noted import was lost");
     // No import at all without host imports (as HostImportFor).
     Context context{};
-    check(HostImportMemoized(context, 0x10000, 4) == nullptr && HostImportForPath(context, 0x10000, 4) == nullptr, "import memo: a context without host imports was answered");
+    check(HostImportMemoized(context, 0x10000, 4) == nullptr && HostImportFor(context, 0x10000, 4) == nullptr, "import memo: a context without host imports was answered");
 }
 
 // The fast pipeline lookup (s53-fast-cost-b step 2d): the key is the store's bytes, built into a
