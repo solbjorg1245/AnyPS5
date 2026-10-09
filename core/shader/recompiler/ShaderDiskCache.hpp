@@ -12,7 +12,8 @@
 
 namespace ShaderRecompiler::ShaderDiskCache {
 
-inline constexpr std::uint32_t FormatVersion = 4;
+// 5: the legacy float rules (Recompiler.hpp) changed translations, pinned source version or not.
+inline constexpr std::uint32_t FormatVersion = 5;
 
 enum class LoadStatus {
     Loaded,

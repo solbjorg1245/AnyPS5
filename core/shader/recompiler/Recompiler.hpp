@@ -425,6 +425,20 @@ void SetDebugProbeActive(bool active);
 [[nodiscard]] std::uint64_t DebugProbeKey();
 [[nodiscard]] bool RayTracingStrict();
 [[nodiscard]] bool RayTracingMiss();
+// The DX9 ("legacy") float rules the hardware applies and a plain SPIR-V translation does not. Each
+// is on by default and keyed into the recompile caches; APS5_NO_<NAME>_RULE=1 translates as before.
+// LegacyMadRule: v_mad_legacy_f32 (v_fma_legacy_f32) gives a +0 product when either multiplicand is
+// +-0, Inf and NaN included, as v_mul_legacy_f32 does (APS5_NO_LEGACY_MAD_RULE). MullitRule:
+// v_mullit_f32 takes that rule too (APS5_NO_MULLIT_RULE). ClampNanRule: the clamp output modifier
+// turns NaN into 0 as the hardware does with DX10_CLAMP; FClamp leaves it undefined
+// (APS5_NO_CLAMP_NAN_RULE).
+[[nodiscard]] bool LegacyMadRule();
+[[nodiscard]] bool MullitRule();
+[[nodiscard]] bool ClampNanRule();
+enum class LegacyFloatSite : std::uint32_t { MadLegacy, Mullit, ClampNan, Count };
+// The instructions translated under each rule since start (the [recompile] digest, APS5_PROFILE_DRAW).
+void CountLegacyFloatSite(LegacyFloatSite site);
+[[nodiscard]] std::uint64_t LegacyFloatSites(LegacyFloatSite site);
 
 struct RectListShaders {
     RecompileResult control;
