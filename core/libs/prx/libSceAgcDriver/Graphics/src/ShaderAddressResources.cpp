@@ -142,9 +142,9 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
         Require(shader.program->bdaAbiVersion == (faults == 0 ? 0u : ShaderRecompiler::BdaAbi::Version), "incompatible BDA ABI version");
         // Rect-list validation needs a fault buffer, but never accesses guest addresses.
         usesBda = usesBda || tables != 0;
-        // The scan only when resident reads may use it; otherwise every BDA program counts as
-        // storing (nothing reads the flag without a resident copy).
-        bdaStores = bdaStores || (tables != 0 && (!Recorder::ResidentReadsConfigured() || programStoresThroughBda(*shader.program)));
+        // The scan only when resident reads or written ranges may use it; otherwise every BDA
+        // program counts as storing (nothing reads the flag without them).
+        bdaStores = bdaStores || (tables != 0 && (!(Recorder::ResidentReadsConfigured() || Recorder::ResidentWritesConfigured()) || programStoresThroughBda(*shader.program)));
         usesFaultBuffer = usesFaultBuffer || faults != 0;
     }
     if (usesBda) {

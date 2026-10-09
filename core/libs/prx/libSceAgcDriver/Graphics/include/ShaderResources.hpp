@@ -261,6 +261,8 @@ public:
     void NoteInPlaceWrites(std::uint64_t program) const { guestMemory.NoteInPlaceWrites(program); }
     int LeaseShape() const { return guestMemory.LeaseShape(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
+    // Whether a region binds the device copy of the resident written range `key` (APS5_RESIDENT_WRITES).
+    bool BindsResidentLand(const void* key) const { return guestMemory.BindsResidentLand(key); }
     // Whether a region the recorded work reads in place through a host import overlaps the range.
     bool ReadsOverlap(std::uint64_t address, std::size_t bytes) const;
     // The recorder's hazard tracker inputs (Recorder::NoteAccess): the written elements' guest

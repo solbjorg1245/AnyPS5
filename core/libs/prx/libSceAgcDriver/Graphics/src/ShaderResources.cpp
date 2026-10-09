@@ -4368,6 +4368,9 @@ void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoi
     // An address-based use may store through its BDA table anywhere the table allows: the resident
     // read-only copies over those ranges are refreshed at their next use, after this one.
     if (usesBda && bdaStores) guestMemory.NoteAddressWriter(Recorder::Active());
+    // Resident written ranges (APS5_RESIDENT_WRITES): it may store over any of them in its import,
+    // so each refreshes its device copy before its next use.
+    if (usesBda && bdaStores && ResidentWritesLive()) NoteResidentWritesAddressWriter();
     if (set == VK_NULL_HANDLE) return;
     if (CheckStaleImports()) {
         for (const auto buffer : boundBuffers) {

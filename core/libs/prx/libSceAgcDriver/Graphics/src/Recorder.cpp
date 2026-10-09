@@ -47,6 +47,8 @@ std::atomic<std::atomic<std::uint64_t>*> pendingBlockTable{nullptr};
 std::atomic<std::uint64_t> completedBlockSerial{0};
 // Some recorder was made with APS5_RESIDENT_READS (Recorder::ResidentReadsConfigured).
 std::atomic<bool> residentReadsConfigured{false};
+// Some recorder was made with APS5_RESIDENT_WRITES (Recorder::ResidentWritesConfigured).
+std::atomic<bool> residentWritesConfigured{false};
 
 void trackPendingBlocksFromEnvironment() {
     static const bool tracked = [] {
@@ -558,6 +560,8 @@ std::atomic<std::uint64_t> copyBacksDeferred{0}, copyBackBytesDeferred{0}, copyB
 std::atomic<std::uint64_t> copyBacksNarrow{0}, copyBackNarrowSpans{0}, copyBackBytesNarrow{0}, copyBacksNarrowWhole{0}, copyBackNarrowDispatches{0}, copyBackNarrowStoredWords{0};
 // APS5_NARROW_VERIFY: dwords the compare passes found stale (import != shadow == baseline).
 std::atomic<std::uint64_t> copyBackNarrowStaleWords{0};
+// Resident written ranges' lands recorded (Recorder::ResidentLandCounts): by reason, then bytes.
+std::array<std::atomic<std::uint64_t>, 9> residentLands{};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Recorder::FlushReason::Count)> copyBackFlushes{};
 // Resident buffers (Recorder::KeepsResidentBuffers): counters (relaxed, on the [barriers] line),
 // the bytes kept resident at the last decision, and the live guards by sequence, which the fault
@@ -1285,6 +1289,21 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
         static_cast<void>(ResidentResolverQueue());
         GuestWriteWatch::GuestPageGuardInstall_nid_postfix(&Recorder::ResolveResidentFault);
     }
+    // Resident written ranges (KeepsResidentWrites): their lands are queued narrow copy-backs
+    // (coalescing; narrow copy-backs are checked when asked), never kept resident past a batch.
+    const char* residentWritesSwitch = std::getenv("APS5_RESIDENT_WRITES");
+    residentWrites.enabled = coalesceCopyBacks && !residentBuffers && residentWritesSwitch != nullptr && *residentWritesSwitch != '\0' && std::strcmp(residentWritesSwitch, "0") != 0;
+    if (residentWrites.enabled) {
+        residentWritesConfigured.store(true, std::memory_order_relaxed);
+        const auto number = [](const char* name, std::uint64_t fallback) {
+            const char* value = std::getenv(name);
+            return value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : fallback;
+        };
+        residentWrites.uses = static_cast<std::uint32_t>(std::max<std::uint64_t>(number("APS5_RESIDENT_WRITES_USES", 8), 1));
+        residentWrites.limitBytes = number("APS5_RESIDENT_WRITES_MIB", 512) << 20u;
+        const auto verify = number("APS5_RESIDENT_WRITES_VERIFY", 0);
+        residentWrites.verifyEvery = static_cast<std::uint32_t>(verify == 1 ? 16 : verify);
+    }
     // The compare pass and the shadows' baselines are addressed by buffer device address.
     if (narrowCopyBacks && ((!coalesceCopyBacks && DeferCopyBacks()) || !context.bufferDeviceAddress)) narrowCopyBacks = false;
     {
@@ -1571,6 +1590,10 @@ bool Recorder::ResidentReadsConfigured() {
     return residentReadsConfigured.load(std::memory_order_relaxed);
 }
 
+bool Recorder::ResidentWritesConfigured() {
+    return residentWritesConfigured.load(std::memory_order_relaxed);
+}
+
 void Recorder::markPendingBlocks(std::uint64_t address, std::uint64_t end, std::uint64_t serial) const {
     if (!PendingBlocksTracked() || activeRecorder != this || end <= address) return;
     auto* table = pendingBlockTable.load(std::memory_order_acquire);
@@ -1688,6 +1711,13 @@ struct Recorder::ResidentGuard {
 };
 
 namespace {
+// Restores the lands' reason (Recorder::landReason) when a scope ends.
+struct RestoreLandReason {
+    std::uint8_t& slot;
+    std::uint8_t saved;
+    ~RestoreLandReason() { slot = saved; }
+};
+
 // Moves the copies of `from` whose source is `sourceKey` to the end of `to`.
 void moveCopies(std::vector<Recorder::DeferredCopy>& from, std::vector<Recorder::DeferredCopy>& to, const std::function<bool(const Recorder::DeferredCopy&)>& selected) {
     const auto kept = std::stable_partition(from.begin(), from.end(), [&](const Recorder::DeferredCopy& copy) { return !selected(copy); });
@@ -1785,6 +1815,23 @@ std::uint64_t Recorder::DeferredCopyBytes() const {
     for (const auto& copy : deferredCopies) bytes += copy.bytes;
     for (const auto& copy : claimedCopies) bytes += copy.bytes;
     return bytes;
+}
+
+bool Recorder::ResidentLandQueued(const void* key) const {
+    const auto lands = [key](const DeferredCopy& copy) { return copy.land && copy.sourceKey == key; };
+    return std::any_of(deferredCopies.begin(), deferredCopies.end(), lands) || std::any_of(claimedCopies.begin(), claimedCopies.end(), lands);
+}
+
+void Recorder::FlushResidentLand(const void* key, bool demote) {
+    if (!ResidentLandQueued(key)) return;
+    const RestoreLandReason restore{landReason, std::exchange(landReason, demote ? std::uint8_t{7} : landReason)};
+    FlushDeferredWhere([key](const DeferredCopy& copy, bool) { return copy.land && copy.sourceKey == key; }, FlushReason::CopyIn);
+}
+
+std::array<std::uint64_t, 9> Recorder::ResidentLandCounts() {
+    std::array<std::uint64_t, 9> counts{};
+    for (std::size_t index = 0; index < counts.size(); ++index) counts[index] = residentLands[index].load(std::memory_order_relaxed);
+    return counts;
 }
 
 Recorder::CopyBackStatistics Recorder::CopyBackCounts() {
@@ -2115,6 +2162,15 @@ void Recorder::recordDeferredCopies(std::vector<DeferredCopy> copies, FlushReaso
         }
     }
     if (copies.empty()) return;
+    if (residentWrites.enabled) {
+        // Resident written ranges' lands, by why they are recorded (a reader's sync, a demotion apart).
+        const std::size_t slot = landReason != 0xff ? landReason : static_cast<std::size_t>(reason);
+        for (const auto& copy : copies) {
+            if (!copy.land) continue;
+            residentLands[slot].fetch_add(1, std::memory_order_relaxed);
+            residentLands[8].fetch_add(copy.bytes, std::memory_order_relaxed);
+        }
+    }
     copyBackPasses.fetch_add(1, std::memory_order_relaxed);
     copyBackFlushes[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     copyBacksRecorded.fetch_add(copies.size(), std::memory_order_relaxed);
@@ -3578,6 +3634,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     // Resident read-only copies over the range are stale from here on (GuestBufferMemory.cpp,
     // "Resident reads"): every GPU write into guest memory is noted here.
     if (ResidentReadsLive()) NoteResidentReadsWrite(address, address + bytes);
+    if (ResidentWritesLive()) NoteResidentWritesWrite(address, address + bytes);
     ensureOpen();
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
@@ -3611,6 +3668,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
     if (ResidentReadsLive()) NoteResidentReadsWrite(address, address + bytes);
+    if (ResidentWritesLive()) NoteResidentWritesWrite(address, address + bytes);
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
     markPendingBlocks(address, address + bytes, batch.serial);
@@ -4341,6 +4399,8 @@ void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUn
         if (announcedSite == nullptr) announcedSite = __builtin_return_address(0);
         // The open batch's work has not run; without one the newest in flight is the target.
         if (open != nullptr || (!inFlight.empty() && unsignaled(inFlight.back()->serial))) ++hookRealWaits;
+        // Resident written ranges: the lands this sync records are a CPU reader's.
+        const RestoreLandReason reader{landReason, std::exchange(landReason, std::uint8_t{6})};
         Sync();
         return;
     }
@@ -4435,6 +4495,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     // SyncThrough disabled everything is the target as well.
     std::uint64_t targetSerial = 0;
     if (!SyncThroughEnabled() || (open != nullptr && overlaps(*open, address, end))) {
+        const RestoreLandReason reader{landReason, std::exchange(landReason, std::uint8_t{6})};
         Submit();
         targetSerial = submissions;
     } else {

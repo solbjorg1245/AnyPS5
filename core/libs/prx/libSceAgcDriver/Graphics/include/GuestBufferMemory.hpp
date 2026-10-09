@@ -246,6 +246,36 @@ void ResidentReadsFailCollectForTests(bool fail);
 // holding it is rebuilt (RecordResidentReads) and its memory goes with the last holder.
 VideoMemory::ResidentTrim TrimResidentReads(std::uint64_t bytes);
 
+// Resident written ranges (Recorder::KeepsResidentWrites, APS5_RESIDENT_WRITES=1; see
+// GuestBufferMemory.cpp "Resident written ranges"): the range of a written element too large to
+// stage binds a device copy D in its dispatch builds, and its writes reach the import by a land.
+struct ResidentWrite;
+struct ResidentWriteStatistics {
+    // Ranges promoted and refused (another range overlaps it, the video-memory budget or the
+    // device, the cap, a span or unwatched import); uses bound to D; refreshes of D from the import
+    // by reason (the promotion's fill, a stamp: a collected CPU store or a driver store, a GPU write
+    // noted that is not the use's own, an address-based use) and their bytes; changes a CPU store
+    // made while a land was queued (both sides wrote); ranges demoted (a changed import); reused
+    // builds rebuilt over a changed registry; fast-dispatch elements declined; collects and their
+    // time; APS5_RESIDENT_WRITES_VERIFY's compares and mismatches; the live ranges and their bytes.
+    std::uint64_t promoted = 0, refusedOverlap = 0, refusedVram = 0, refusedCap = 0, refusedSpan = 0, uses = 0;
+    std::uint64_t refreshFirst = 0, refreshStamp = 0, refreshNoted = 0, refreshAddress = 0, refreshedBytes = 0;
+    std::uint64_t both = 0, demoted = 0, rebuilt = 0, declines = 0, collects = 0, collectUs = 0, verified = 0, mismatched = 0;
+    std::uint64_t live = 0, liveBytes = 0;
+};
+ResidentWriteStatistics ResidentWriteCounts();
+// Whether a range lives (one relaxed load).
+bool ResidentWritesLive();
+// Under GuestMemory::GpuMutex: a GPU write the recorder noted over [begin, end) (Recorder::
+// noteWrite: the ranges over it refresh D before their next use, unless the note is that use's
+// own), and an address-based use that may store through its BDA table (every range refreshes).
+void NoteResidentWritesWrite(std::uint64_t begin, std::uint64_t end);
+void NoteResidentWritesAddressWriter();
+// Any thread: whether a live range overlaps [begin, end) (the fast dispatch declines the element).
+bool ResidentWritesOverlap(std::uint64_t begin, std::uint64_t end);
+// The device teardown and tests: drops every range (their lands were recorded already).
+void ClearResidentWrites();
+
 // The import table's identity (the fast Revalidate): serials proved under one identity stand
 // while the table still has it, i.e. the same device, the same epoch (bumped by every retire)
 // and the registry generation it was reconciled with, which must still be the live one.
@@ -392,6 +422,9 @@ public:
     void NoteAddressWriter(const Recorder* recorder) const;
     // Whether the region owning `address` is bound from a resident read-only copy.
     bool ServedResident(std::uint64_t address) const;
+    // Whether a region binds the device copy of the resident written range `key` (VulkanDevice::
+    // recordDispatch leaves that range's queued land queued past the use).
+    bool BindsResidentLand(const void* key) const;
     void AddSnapshot(const GuestMemorySnapshot& snapshot);
     // Upload is the two stages below back to back. UploadPrepare needs no device lock: it merges the
     // regions, binds the image mirrors and host imports that already serve them (an import pointer is
@@ -570,6 +603,10 @@ private:
         // base in `copySource`/`copySourceBase`.
         std::shared_ptr<ResidentCopy> resident {};
         std::uint64_t residentSerial = 0;
+        // Resident written ranges (Recorder::KeepsResidentWrites): the range whose device copy
+        // Descriptor binds in the import's place (`direct` stays the import: the land's target and
+        // the identity the region is reused under).
+        std::shared_ptr<ResidentWrite> residentWrite {};
     };
 
     // How [begin, end) lies against the space's base regions.
@@ -626,6 +663,16 @@ private:
     // resident regions (RecordResidentReads).
     bool residentEligible(const Region& region, const HostImport& entry, bool addressable, const Recorder* recorder) const;
     void recordResidentReads(Recorder& recorder, std::span<Region* const> resident, bool recheck = false);
+    // Resident written ranges (see GuestBufferMemory.cpp): UploadFinish's pass (promotion, binding,
+    // the check of each range bound), the promotion's use of the build's in-place regions, a
+    // reused build's pass (false: rebuilt), the check of the ranges bound, a use's lands
+    // (RecordCopyBacks) and its own writes taken as D's (MarkDirectWrites).
+    void bindResidentWrites(Recorder& recorder, std::vector<Region*>& residentWanted);
+    bool noteResidentCandidates(Recorder& recorder);
+    bool recordResidentWrites(Recorder& recorder);
+    void checkResidentWrites(Recorder& recorder);
+    void queueResidentLands(Recorder& recorder, bool defer);
+    void absorbResidentWrites() const;
     void allocateRegionBuffer(Region& region, bool addressable);
     void takeHeapReferences();
     Context context;
@@ -649,6 +696,11 @@ private:
     std::uint64_t residentBudgetRound = 0;
     const Recorder* residentCheckedBy = nullptr;
     std::uint64_t residentCheckedAt = 0;
+    // Some region binds a resident written range; the registry epoch the build's bindings stand
+    // for (0: it never took the pass), and the recorder's submissions at the last check.
+    bool residentWriteRegions = false;
+    std::uint64_t residentWriteEpoch = 0;
+    std::uint64_t residentWritesCheckedAt = 0;
     // NoteAddressWriter's list for this build (the space's writable ranges, merged with the
     // build's own when it has any), made at its first use after an upload, for the space it held.
     mutable std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> addressWriterRanges;

@@ -126,6 +126,8 @@ public:
         VkDeviceAddress sourceAddress = 0;
         VkDeviceAddress destinationAddress = 0;
         VkDeviceSize baselineOffset = 0;
+        // A resident written range's land (KeepsResidentWrites): `sourceKey` is the range.
+        bool land = false;
     };
     static bool DeferCopyBacks();
     // Copy-back coalescing (on by default; APS5_NO_COALESCE_COPY_BACKS=1 or APS5_COALESCE_COPY_BACKS=0
@@ -206,6 +208,31 @@ public:
     // resident reads use (an address space's writable ranges, a program's BDA store scan) is
     // prepared only then.
     static bool ResidentReadsConfigured();
+    // Resident written ranges (APS5_RESIDENT_WRITES=1, read when the recorder is made, with
+    // coalescing on and resident buffers off; narrow copy-backs needed; docs/design/
+    // resident-memory-2.md S7a, GuestBufferMemory.cpp "Resident written ranges"): a written element
+    // too large to stage, which dispatch builds bind in place, binds a device-local copy once its
+    // range had APS5_RESIDENT_WRITES_USES (8) uses within 10 s, and a use writing it queues one
+    // narrow land into the import (DeferredCopy::land) instead of storing over PCIe.
+    // APS5_RESIDENT_WRITES_MIB (512) caps the copies; APS5_RESIDENT_WRITES_VERIFY=N compares a
+    // window of every Nth clean, unchanged copy with its import once the batch completed (1: every
+    // 16th).
+    struct ResidentWriteSettings {
+        bool enabled = false;
+        std::uint32_t uses = 0;
+        std::uint32_t verifyEvery = 0;
+        std::uint64_t limitBytes = 0;
+    };
+    bool KeepsResidentWrites() const { return residentWrites.enabled && NarrowsCopyBacks(); }
+    const ResidentWriteSettings& ResidentWrites() const { return residentWrites; }
+    static bool ResidentWritesConfigured();
+    // Whether a land of the range `key` is queued; records it now (`demote`: counted as a
+    // demotion's land, else as a copy-in's).
+    bool ResidentLandQueued(const void* key) const;
+    void FlushResidentLand(const void* key, bool demote);
+    // Lands recorded since start by reason (FlushReason, then a CPU reader's sync and a demotion)
+    // and, last, the bytes they compared (relaxed).
+    static std::array<std::uint64_t, 9> ResidentLandCounts();
     // This recorder's identity (never reused, unlike its address).
     std::uint64_t Id() const { return id; }
     std::uint64_t ResidentCopyBytes() const;
@@ -1052,6 +1079,10 @@ private:
     void landResident(const std::vector<DeferredCopy>& copies);
     bool residentBuffers = false;
     ResidentReadSettings residentReads;
+    ResidentWriteSettings residentWrites;
+    // The ResidentLandCounts slot the lands recorded now count under instead of their flush's
+    // reason (6 a CPU reader's sync, 7 a demotion; 0xff none).
+    std::uint8_t landReason = 0xff;
     std::uint64_t residentGeneration = 0;
     std::uint64_t passSerials = 0;
     std::vector<DeferredCopy> deferredCopies;

@@ -649,6 +649,9 @@ struct VulkanDevice::State {
             if (Graphics::ResidentReadsLive()) {
                 if (const auto left = Graphics::ClearResidentReads(); left != 0) std::fprintf(stderr, "[resident-reads] %zu copies still held at the device teardown\n", left);
             }
+            // Resident written ranges (APS5_RESIDENT_WRITES): their lands were recorded and waited
+            // for with the recorder above.
+            if (Graphics::ResidentWritesLive()) Graphics::ClearResidentWrites();
             // The staging-chain registry's shadows of this device go back to its pool before the
             // pool and the device go (the registry is process-wide; the video-memory budget's
             // "shadows" reclaimer would otherwise free them on a destroyed device).
@@ -3648,8 +3651,10 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             const auto throughImport = [&](std::uint64_t begin, std::uint64_t end) {
                 return std::any_of(inPlace.begin(), inPlace.end(), [&](const auto& range) { return begin < range.second && range.first < end; }) || (argumentImport != nullptr && begin < arguments + 12 && arguments < end);
             };
+            // A resident written range's land (APS5_RESIDENT_WRITES) stays queued past a use bound
+            // to the range's device copy: the use reads and writes no byte of the import under it.
             recorder.FlushDeferredWhere([&](const Graphics::Recorder::DeferredCopy& copy, bool claimed) {
-                return throughImport(copy.address, copy.address + copy.bytes) || (!claimed && resources.WritesOverlap(copy.address, static_cast<std::size_t>(copy.bytes)));
+                return throughImport(copy.address, copy.address + copy.bytes) || (!claimed && resources.WritesOverlap(copy.address, static_cast<std::size_t>(copy.bytes)) && !(copy.land && resources.BindsResidentLand(copy.sourceKey)));
             }, FlushReason::Dispatch);
         }
     }

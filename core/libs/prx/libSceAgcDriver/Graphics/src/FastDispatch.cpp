@@ -124,6 +124,8 @@ std::optional<Decline> checkBufferElement(const Context& context, const ShaderRe
     element.written = index >= binding.bufferWritten.size() || binding.bufferWritten[index] || allBuffersWritten();
     const bool atomic = index < binding.bufferAtomic.size() && binding.bufferAtomic[index];
     if (element.written && DeviceStagingWanted(bytes, atomic)) return Decline::Staged;
+    // Over a resident written range (APS5_RESIDENT_WRITES): a build binds its device copy.
+    if (ResidentWritesOverlap(address, address + bytes)) return Decline::Staged;
     element.address = address;
     element.bytes = bytes;
     element.atomic = atomic;
