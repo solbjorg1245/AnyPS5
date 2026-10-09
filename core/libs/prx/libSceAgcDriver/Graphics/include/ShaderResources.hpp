@@ -247,6 +247,8 @@ public:
     // Whether a written buffer was copied (its results reach guest memory by the CPU write-back).
     bool HasCopiedWrites() const { return guestMemory.HasCopiedWrites(); }
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
+    // The [inplace-writes] census of this use (GuestBufferMemory::NoteInPlaceWrites).
+    void NoteInPlaceWrites(std::uint64_t program) const { guestMemory.NoteInPlaceWrites(program); }
     int LeaseShape() const { return guestMemory.LeaseShape(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
     // Whether a region the recorded work reads in place through a host import overlaps the range.
