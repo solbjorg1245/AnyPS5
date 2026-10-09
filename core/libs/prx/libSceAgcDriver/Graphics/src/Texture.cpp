@@ -114,6 +114,81 @@ RetileCounters& Retiles() {
     return counters;
 }
 
+// The tiled scratch of a GPU-direct write-back is a pooled device buffer that the retile writes
+// texel by texel: tile padding past a mip's extent and the gaps of a mip-tail block keep whatever
+// the pooled memory held last, and the kept ranges are copied whole into the import (or a unit
+// shadow slab), so those bytes reach guest memory as another resource's leftovers (the CPU
+// write-back starts from the guest bytes instead). Debug aid: APS5_POISON_RETILE_SCRATCH=1 fills
+// the scratch with RetileScratchPoisonWord first, so a reader of those bytes shows magenta.
+// Candidate fix: APS5_SEED_RETILE_SCRATCH=1 copies the guest bytes of the stored ranges from the
+// import into the scratch first, as the CPU write-back starts from them; =zero fills it with zeros
+// instead (no import read). Both are counted on the [scratch-init] line.
+enum class ScratchSeed : std::uint8_t { None, Import, Zero };
+
+ScratchSeed SeedRetileScratch() {
+    static const ScratchSeed seed = [] {
+        const char* value = std::getenv("APS5_SEED_RETILE_SCRATCH");
+        if (value == nullptr) return ScratchSeed::None;
+        return std::strcmp(value, "zero") == 0 ? ScratchSeed::Zero : ScratchSeed::Import;
+    }();
+    return seed;
+}
+
+bool PoisonRetileScratch() {
+    static const bool poison = std::getenv("APS5_POISON_RETILE_SCRATCH") != nullptr;
+    return poison;
+}
+
+// The scratch is a transfer destination only while one of them is on (the pool keys by usage).
+VkBufferUsageFlags RetileScratchInitUsage() {
+    return PoisonRetileScratch() || SeedRetileScratch() != ScratchSeed::None ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u;
+}
+
+struct ScratchInitCounters {
+    std::atomic<std::uint64_t> poisoned{0}, poisonedBytes{0}, seeded{0}, seededBytes{0}, zeroed{0}, zeroedBytes{0};
+};
+
+ScratchInitCounters& ScratchInits() {
+    static ScratchInitCounters counters;
+    return counters;
+}
+
+// Records the scratch's first bytes ahead of the retile: the poison over the whole buffer, then the
+// seed (zeros, or the import's bytes at `seeds`: import offset, scratch offset, size). The caller's
+// barrier ahead of the retile orders these transfer writes before its shader writes.
+void InitRetileScratch(const Context& context, VkCommandBuffer commands, Recorder* recorder, VkFormat format, const DeviceBuffer& scratch, VkBuffer import, std::span<const VkBufferCopy> seeds) {
+    const bool poison = PoisonRetileScratch();
+    const auto seed = SeedRetileScratch();
+    if (!poison && seed == ScratchSeed::None) return;
+    auto& counters = ScratchInits();
+    // The import's bytes (host stores and earlier GPU writes included) precede the seed copies.
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    if (recorder != nullptr) Recorder::CountBarriers(Recorder::CommandClass::StorageWriteBack);
+    const auto fill = context.Resolved(&DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer");
+    if (seed == ScratchSeed::Zero) {
+        fill(commands, scratch.Handle(), 0, VK_WHOLE_SIZE, 0u);
+        counters.zeroed.fetch_add(1, std::memory_order_relaxed);
+        counters.zeroedBytes.fetch_add(scratch.Size(), std::memory_order_relaxed);
+        return;
+    }
+    if (poison) {
+        fill(commands, scratch.Handle(), 0, VK_WHOLE_SIZE, RetileScratchPoisonWord(format));
+        counters.poisoned.fetch_add(1, std::memory_order_relaxed);
+        counters.poisonedBytes.fetch_add(scratch.Size(), std::memory_order_relaxed);
+    }
+    if (seed != ScratchSeed::Import || seeds.empty()) return;
+    if (poison) {
+        // The seed lands over the poison: write after write on the same bytes.
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        if (recorder != nullptr) Recorder::CountBarriers(Recorder::CommandClass::StorageWriteBack);
+    }
+    context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, import, scratch.Handle(), static_cast<std::uint32_t>(seeds.size()), seeds.data());
+    std::uint64_t bytes = 0;
+    for (const auto& copy : seeds) bytes += copy.size;
+    counters.seeded.fetch_add(1, std::memory_order_relaxed);
+    counters.seededBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
 struct RetileBytes {
     std::uint64_t linear = 0, tiled = 0, slab = 0, import = 0, seed = 0;
 };
@@ -171,6 +246,13 @@ void reportRetiles() {
     const auto count = take(c.writeBacks);
     const auto linear = take(c.linearBytes), tiled = take(c.tiledBytes), slab = take(c.slabBytes), import = take(c.importBytes), seed = take(c.seedBytes);
     const auto made = take(c.scratchMade), pooled = take(c.scratchPooled), madeUnder = take(c.scratchMadeUnderPressure), usedUnder = take(c.usedUnderPressure), older = take(c.scratchOlderEpoch);
+    if (PoisonRetileScratch() || SeedRetileScratch() != ScratchSeed::None) {
+        // Cumulative over the 10 s window like the [retile] line, and printed with it.
+        auto& s = ScratchInits();
+        const auto poisoned = take(s.poisoned), seeded = take(s.seeded), zeroed = take(s.zeroed);
+        const auto poisonedBytes = take(s.poisonedBytes), seededBytes = take(s.seededBytes), zeroedBytes = take(s.zeroedBytes);
+        std::fprintf(stderr, "[scratch-init] (10 s) GPU-direct write-back scratch: %llu poisoned (%.1f MiB filled), %llu seeded from the import (%.1f MiB copied), %llu zero-filled (%.1f MiB)\n", static_cast<unsigned long long>(poisoned), static_cast<double>(poisonedBytes) / 1048576.0, static_cast<unsigned long long>(seeded), static_cast<double>(seededBytes) / 1048576.0, static_cast<unsigned long long>(zeroed), static_cast<double>(zeroedBytes) / 1048576.0);
+    }
     if (count == 0) return;
     const auto mib = [](std::uint64_t bytes) { return static_cast<double>(bytes) / 1048576.0; };
     const auto each = [&](std::uint64_t bytes) { return mib(bytes) / static_cast<double>(count); };
@@ -922,6 +1004,36 @@ VkFormat StorageFormatForGuest(const Context& context, std::uint32_t guestFormat
 bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, DccKeys keys) {
     VkClearColorValue clear{};
     return IsDccClear(keys) && StorageFormatAvailable(context, guestFormat) && ClearColorFor(StorageFormatForGuest(context, guestFormat), keys, clear);
+}
+
+std::uint32_t RetileScratchPoisonWord(VkFormat format) {
+    switch (format) {
+        // Bytes R, G, B, A (or B, G, R, A) = 255, 0, 255, 255.
+        case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
+        case VK_FORMAT_A8B8G8R8_UNORM_PACK32: case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+            return 0xffff00ffu;
+        // The outer 10-bit channels and the 2-bit alpha all ones, the middle channel 0.
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+            return 0xfff003ffu;
+        // R11 = 4.0 (exponent 17), G11 = 0, B10 = 4.0.
+        case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+            return (17u << 6) | ((17u << 5) << 22);
+        // Each word is (4.0, 0): red and blue of RGBA16F at 4.0, green and alpha 0.
+        case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R16G16_SFLOAT:
+            return 17u << 10;
+        case VK_FORMAT_R16_SFLOAT:
+            return (17u << 10) | ((17u << 10) << 16);
+        case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R16G16_UNORM:
+            return 0x0000ffffu;
+        case VK_FORMAT_R8G8_UNORM:
+            return 0x00ff00ffu;
+        // 4.0 in every channel: these hold no magenta in a repeated word.
+        case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R32G32_SFLOAT: case VK_FORMAT_R32G32B32A32_SFLOAT:
+            return 0x40800000u;
+        // Integer formats and the rest: all ones (the unsigned maximum).
+        default:
+            return 0xffffffffu;
+    }
 }
 
 StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel) : context(context), detiler(detiler), descriptor(descriptor) {
@@ -2115,7 +2227,7 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
         flushEnd = std::max(flushEnd, seed.end);
     }
     auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearTotal), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-    auto tiledScratch = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(scratchTotal), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    auto tiledScratch = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(scratchTotal), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | RetileScratchInitUsage());
     detiler.BeginBatch();
     auto* recorder = Recorder::Active();
     std::unique_ptr<CommandBatch> batch;
@@ -2168,6 +2280,19 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
             context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, import.buffer, slab->buffer, 1, &seed);
             NoteShadowSeed(begin, end);
         }
+    }
+    {
+        // APS5_SEED_RETILE_SCRATCH: each scratch region from the import's bytes of its window (a
+        // shared tail region once); see InitRetileScratch.
+        std::vector<VkBufferCopy> scratchSeeds;
+        if (SeedRetileScratch() == ScratchSeed::Import) {
+            const auto importOffset = descriptor.baseAddress - import.base;
+            for (std::size_t i = 0; i < windows.size(); ++i) {
+                if (std::any_of(scratchSeeds.begin(), scratchSeeds.end(), [&](const VkBufferCopy& seed) { return seed.dstOffset == scratchPositions[i]; })) continue;
+                scratchSeeds.push_back({importOffset + windows[i].tiledBegin, scratchPositions[i], windows[i].tiledEnd - windows[i].tiledBegin});
+            }
+        }
+        InitRetileScratch(context, commands, recorder, storageFormat, *tiledScratch, import.buffer, scratchSeeds);
     }
     std::vector<VkBufferImageCopy> regions;
     for (std::size_t i = 0; i < windows.size(); ++i) {
@@ -3680,7 +3805,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         // untouched blocks are copied into the imported bytes in place, recorded behind the work that
         // produced the image; nothing crosses to the CPU.
         auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(sliceLinearBytes * arrayLayers), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        auto tiledScratch = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        auto tiledScratch = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | RetileScratchInitUsage());
         detiler.BeginBatch();
         auto* recorder = Recorder::Active();
         std::unique_ptr<CommandBatch> batch;
@@ -3720,6 +3845,14 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         toSource.image = image;
         toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
+        {
+            // APS5_SEED_RETILE_SCRATCH: the kept ranges from the import's bytes; see InitRetileScratch.
+            std::vector<VkBufferCopy> scratchSeeds;
+            if (SeedRetileScratch() == ScratchSeed::Import) {
+                for (const auto& [from, to] : keep) scratchSeeds.push_back({importOffset + (from - descriptor.baseAddress), from - descriptor.baseAddress, to - from});
+            }
+            InitRetileScratch(context, commands, recorder, storageFormat, *tiledScratch, import->buffer, scratchSeeds);
+        }
         const auto regions = CopyRegions(storedLayers);
         context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
         // [gputime]: the stages timed apart, as writeBackWindows does.
