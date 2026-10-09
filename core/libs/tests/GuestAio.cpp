@@ -81,6 +81,15 @@ int main() {
     Check(sceKernelClose(writeFd) == 0);
     { std::ifstream stream(file, std::ios::binary); std::string contents; std::getline(stream, contents);
       Check(contents.rfind("HELLO", 0) == 0); }
+    // A read on a write-only descriptor aborts with EBADF, as pread reports it.
+    const int writeOnlyFd = sceKernelOpen(file.string().c_str(), SCE_KERNEL_O_WRONLY, 0);
+    Check(writeOnlyFd >= 0);
+    KernelAioResult deniedResult{-1, 0};
+    KernelAioRwRequest deniedRequest{0, first.size(), first.data(), &deniedResult, writeOnlyFd};
+    std::int32_t deniedId = 0;
+    Check(sceKernelAioSubmitReadCommands(&deniedRequest, 1, 0, &deniedId) == 0);
+    Check(deniedResult.state == 4 && deniedResult.return_value == SCE_KERNEL_ERROR_EBADF);
+    Check(sceKernelClose(writeOnlyFd) == 0);
     Check(sceKernelAioSubmitReadCommands(nullptr, 1, 0, &id) == SCE_KERNEL_ERROR_EFAULT);
     Check(sceKernelAioSubmitReadCommands(requests, 0, 0, &id) == SCE_KERNEL_ERROR_EINVAL);
     Check(sceKernelAioSubmitReadCommands(requests, 1, 0, nullptr) == SCE_KERNEL_ERROR_EFAULT);

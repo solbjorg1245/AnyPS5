@@ -72,8 +72,11 @@ std::int64_t NativePositioned(std::int32_t fd, void* buf, std::size_t nbyte, std
     const BOOL ok = write ? ::WriteFile(handle, buf, static_cast<DWORD>(nbyte), &done, &overlapped)
                           : ::ReadFile(handle, buf, static_cast<DWORD>(nbyte), &done, &overlapped);
     if (!ok) {
-        if (!write && ::GetLastError() == ERROR_HANDLE_EOF) return 0;
-        errno = EIO;
+        const DWORD error = ::GetLastError();
+        if (!write && error == ERROR_HANDLE_EOF) return 0;
+        // A transfer the descriptor's access mode does not allow (a read on a write-only fd) is
+        // EBADF, as _read/_write reported it before and as pread/pwrite report it.
+        errno = error == ERROR_ACCESS_DENIED || error == ERROR_INVALID_HANDLE ? EBADF : EIO;
         return -1;
     }
     return done;
