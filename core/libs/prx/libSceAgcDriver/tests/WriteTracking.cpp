@@ -97,6 +97,47 @@ void CheckSharedBlock() {
     if (!Watched(outside, unwatched.size())) Require(StoredOver(outside, unwatched.size(), TrackerGeneration()), "an unwatched range reads as not stored over");
 }
 
+// APS5_FIX_BOOT_STRIP: a store into one page of a block leaves the block's other pages to a
+// surface sharing it (the Bink chroma plane's last 14 pages and the CPU's table after them).
+void CheckUnstoredPages() {
+    void* memory = AllocateWatched(2 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, 2 * Block);
+    const auto synced = CollectWrites(base, 2 * Block);
+    Require(synced != 0, "the unstored-pages block is not collected");
+    const char* fix = std::getenv("APS5_FIX_BOOT_STRIP");
+    const bool off = (fix != nullptr && std::string(fix) == "0") || std::getenv("APS5_NO_EDGE_PAGE_KEEP") != nullptr;
+    constexpr std::uint32_t all = 0xffff;
+    constexpr std::uint32_t surface = 0x3fff;
+    constexpr std::size_t surfaceBytes = 14 * 4096;
+    Require(PagesUnstoredSince(base, surfaceBytes, synced) == (off ? 0u : surface), "pages of an unwritten block read as stored");
+
+    bytes[14 * 4096 + 8] = 0x22;
+    CollectWritesUncached(base, 2 * Block);
+    std::array<std::uint64_t, 1> generations{synced};
+    std::array<std::uint8_t, 1> changed{};
+    Require(ChangedBlocks(base, Block, generations, changed) && changed[0] == BlockWritten, "the table store does not mark its block written");
+    if (off) {
+        Require(PagesUnstoredSince(base, surfaceBytes, synced) == 0, "pages are kept with APS5_FIX_BOOT_STRIP=0 or APS5_NO_EDGE_PAGE_KEEP");
+        return;
+    }
+    Require(PagesUnstoredSince(base, surfaceBytes, synced) == surface, "a CPU store into the table's page drops the surface's pages");
+    Require(PagesUnstoredSince(base, Block, synced) == (all & ~(1u << 14)), "the table's stored page reads as unstored");
+
+    MarkWritten(base + 2 * 4096 + 16, 32);
+    Require(PagesUnstoredSince(base, surfaceBytes, synced) == (surface & ~(1u << 2)), "a driver piece in the surface is not seen");
+    Require(PagesUnstoredSince(base + 4096, 4096, synced) == (1u << 1), "a one-page range answers for other pages");
+    Require(PagesUnstoredSince(base, Block, TrackerGeneration()) == all, "stores older than the generation are seen");
+
+    const auto beforeWhole = TrackerGeneration();
+    MarkWritten(base + Block, Block);
+    bytes[Block + 15 * 4096] = 0x33;
+    CollectWritesUncached(base, 2 * Block);
+    Require(PagesUnstoredSince(base + Block, surfaceBytes, beforeWhole) == 0, "a whole-block driver store into an unnoted block is missed");
+    Require(PagesUnstoredSince(base + Block - 4096, 2 * 4096, synced) == 0, "a range across two blocks is answered");
+}
+
 void CheckOwnStore() {
     void* memory = AllocateWatched(2 * Block);
     const auto base = reinterpret_cast<std::uint64_t>(memory);
@@ -158,6 +199,7 @@ int main() {
             return 77;
         }
         CheckSharedBlock();
+        CheckUnstoredPages();
         CheckOwnStore();
         CheckEqualsSince();
     } catch (const std::exception& error) {

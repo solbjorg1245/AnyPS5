@@ -986,7 +986,10 @@ struct WriteTracker {
     struct DriverPieces {
         std::uint32_t whole = 0;
         std::uint32_t dropped = 0;
-        std::uint32_t next = 0;
+        // The newest driver store into the block, noted or not (PagesUnstoredSince): a whole-block
+        // store into a block no partial store noted leaves no other trace.
+        std::uint32_t latest = 0;
+        std::uint8_t next = 0;
         // Whether any driver store was noted for the block (an unordered_map held only noted
         // blocks before; the flat table, one entry per block like the stamps, costs no lookup
         // or allocation per block marked).
@@ -1025,15 +1028,18 @@ struct WriteTracker {
         const auto to = static_cast<std::uint32_t>(std::min<std::uint64_t>(end, begin + WriteBlockBytes) - begin);
         if (from == 0 && to == WriteBlockBytes) {
             auto& whole = driverPieces[block];
+            const auto latest = std::max(whole.latest, stampGeneration);
             if (whole.noted) {
                 whole = DriverPieces{};
                 whole.noted = true;
                 whole.whole = stampGeneration;
             }
+            whole.latest = latest;
             return;
         }
         auto& entry = driverPieces[block];
         entry.noted = true;
+        entry.latest = std::max(entry.latest, stampGeneration);
         auto& slot = entry.pieces[entry.next++ % entry.pieces.size()];
         entry.dropped = std::max(entry.dropped, slot.generation);
         slot = {stampGeneration, from, to};
@@ -1153,6 +1159,18 @@ bool sharedCollectMemo() {
 // whole-block answer and skips the page bookkeeping.
 bool edgePageKeep() {
     static const bool enabled = std::getenv("APS5_NO_EDGE_PAGE_KEEP") == nullptr;
+    return enabled;
+}
+
+// The unit shadow dropped a whole 64 KiB unit any store reached after its retile, so the CPU's
+// per-macroblock table right after the Bink chroma plane dropped the plane's last 56 KiB every
+// frame (the boot videos' bottom right strip). PagesUnstoredSince names the pages it may still
+// publish. APS5_FIX_BOOT_STRIP=0 makes it answer 0: the whole unit is dropped as before.
+bool pageKeepUnits() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_FIX_BOOT_STRIP");
+        return text == nullptr || std::strcmp(text, "0") != 0;
+    }();
     return enabled;
 }
 
@@ -1570,6 +1588,37 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
         }
     }
     return false;
+}
+
+std::uint32_t PagesUnstoredSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    static_assert(UnstoredPageBytes == WritePageBytes && WritePagesPerBlock <= 32);
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!pageKeepUnits() || !edgePageKeep() || !tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return 0;
+    const auto block = tracker.blockOf(address);
+    if (tracker.blockOf(address + bytes - 1) != block) return 0;
+    const auto from = address - tracker.blockBegin(block);
+    const auto to = from + bytes;
+    std::uint32_t pages = 0;
+    for (auto page = from / WritePageBytes; page <= (to - 1) / WritePageBytes; ++page) pages |= 1u << page;
+    if (tracker.writtenStampOf(block) <= generation) return pages;
+    if (tracker.cpuStampOf(block) > generation) {
+        const auto found = tracker.cpuPages.find(block);
+        if (found == tracker.cpuPages.end()) return 0;
+        for (std::size_t page = 0; page < WritePagesPerBlock; ++page) {
+            if (found->second.pages[page] > generation) pages &= ~(1u << page);
+        }
+    }
+    const auto& entry = tracker.driverPieces[block];
+    if (entry.latest > generation) {
+        if (!entry.noted || entry.whole > generation || entry.dropped > generation) return 0;
+        for (const auto& piece : entry.pieces) {
+            if (piece.generation <= generation || piece.end <= piece.begin) continue;
+            for (auto page = piece.begin / WritePageBytes; page <= (piece.end - 1) / WritePageBytes; ++page) pages &= ~(1u << page);
+        }
+    }
+    return pages;
 }
 
 std::uint64_t TrackerGeneration() {

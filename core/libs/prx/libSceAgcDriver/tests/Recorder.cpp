@@ -2475,13 +2475,18 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
     Require(words[3 * unit] == 0x33 && words[4 * unit - 1] == 0x33 && words[4 * unit] == 0x11, "the partial publish's bytes are wrong");
     // A CPU write into a page of unit 4 makes it stale: the publish collects the unit itself (no
-    // walk saw the store before it), copies nothing and drops it.
+    // walk saw the store before it) and drops it. The pages the store missed still publish the
+    // retile's bytes (APS5_FIX_BOOT_STRIP; =0 or APS5_NO_EDGE_PAGE_KEEP: nothing is copied).
+    const char* bootStrip = std::getenv("APS5_FIX_BOOT_STRIP");
+    const bool pageKeep = (bootStrip == nullptr || std::string(bootStrip) != "0") && std::getenv("APS5_NO_EDGE_PAGE_KEEP") == nullptr;
     static_cast<void>(CollectWritesUncached(unit4, unit));
     *static_cast<volatile std::uint8_t*>(static_cast<void*>(static_cast<std::uint8_t*>(block) + 4 * unit + 4096)) = 0x55;
-    Require(PublishShadow(unit4, unit, PublishScope::Whole, PublishReason::Hook) == 0, "a stale unit was published");
+    Require(PublishShadow(unit4, unit, PublishScope::Whole, PublishReason::Hook) == (pageKeep ? 1u : 0u), pageKeep ? "a stale unit's unstored pages were not published" : "a stale unit was published");
     Require(!AnyShadowedOverlaps(unit4, unit), "a stale unit still counts as shadowed after its publish");
     recorder.Sync();
-    Require(words[4 * unit + 4096] == 0x55 && words[4 * unit] == 0x11, "a stale unit's publish overwrote the CPU's bytes");
+    Require(words[4 * unit + 4096] == 0x55 && words[4 * unit + 4096 + 1] == 0x11, "a stale unit's publish overwrote the CPU's page");
+    const std::uint8_t unstored = pageKeep ? 0x44 : 0x11;
+    Require(words[4 * unit] == unstored && words[4 * unit + 4095] == unstored && words[4 * unit + 2 * 4096] == unstored && words[5 * unit - 1] == unstored && words[5 * unit] == 0x11, "a stale unit's unstored pages are wrong");
     // The slab boundary: a piece over units 127 and 128 is refused, each alone lands in its slab.
     const auto unit127 = address + 127 * unit;
     const auto unit128 = unit127 + unit;
