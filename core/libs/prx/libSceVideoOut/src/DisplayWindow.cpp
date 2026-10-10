@@ -45,15 +45,15 @@ void DisplayWindow::create(std::uint32_t sourceWidth, std::uint32_t sourceHeight
     const auto boundsWidth = static_cast<std::uint32_t>(static_cast<std::uint64_t>(usable.w) * DisplayWindowInitialSizePercent / 100);
     const auto boundsHeight = static_cast<std::uint32_t>(static_cast<std::uint64_t>(usable.h) * DisplayWindowInitialSizePercent / 100);
     // Resolution = WxH (player settings): the client area is that size, or the largest of its aspect the
-    // usable display holds; the presenter letterboxes the frame into it.
+    // usable display holds; the presenter letterboxes the frame into it. SDL units are physical pixels
+    // here: with Resolution set, VideoOutDriver makes the process DPI aware before SDL starts its video.
     const auto& settings = GetPortSettings_nid_no_patch();
-    auto initialSize = settings.width != 0
-        ? AgcDriver::ComputeContainSize_nid_postfix(settings.width, settings.height, static_cast<std::uint32_t>(usable.w), static_cast<std::uint32_t>(usable.h), false)
-        : AgcDriver::ComputeContainSize_nid_postfix(sourceWidth, sourceHeight, boundsWidth, boundsHeight, true);
+    AgcDriver::AspectFitSize initialSize{};
     if (settings.width != 0) {
-        // An extreme aspect (3840x400 on a 1920 screen) can contain to less than the minimum: raise it.
-        initialSize.width = std::max(initialSize.width, DisplayWindowMinimumWidth);
-        initialSize.height = std::max(initialSize.height, DisplayWindowMinimumHeight);
+        const auto client = PortSettings::WindowClientSize(settings.width, settings.height, static_cast<std::uint32_t>(usable.w), static_cast<std::uint32_t>(usable.h), DisplayWindowMinimumWidth, DisplayWindowMinimumHeight);
+        initialSize = AgcDriver::AspectFitSize{client.width, client.height};
+    } else {
+        initialSize = AgcDriver::ComputeContainSize_nid_postfix(sourceWidth, sourceHeight, boundsWidth, boundsHeight, true);
     }
     require(initialSize.width >= DisplayWindowMinimumWidth && initialSize.height >= DisplayWindowMinimumHeight, "initial window extent is smaller than the minimum");
     const auto title = GetAppTitle_nid_postfix();
