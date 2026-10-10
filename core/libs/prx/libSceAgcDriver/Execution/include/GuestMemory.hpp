@@ -92,12 +92,15 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std:
 bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 // The pages of [address, address + bytes), a range inside one 64 KiB tracker block, that no store
 // since `generation` reached: bit p for the block's bytes [p * UnstoredPageBytes, (p + 1) *
-// UnstoredPageBytes), told apart as StoredOver does (the CPU's dirty pages, the driver's noted
-// pieces). 0 when the block's bookkeeping cannot tell (a whole-block or forgotten driver store
-// since, no page record, APS5_NO_EDGE_PAGE_KEEP), outside the watched arena, for a generation of 0,
-// and with APS5_FIX_BOOT_STRIP=0 (the unit shadow then drops a whole unit a store reached).
+// UnstoredPageBytes), from the CPU's dirty pages and the driver's partial stores by page. 0 when
+// the block's bookkeeping cannot tell (a whole-block driver store since, a newer stamp no page
+// record explains, APS5_NO_EDGE_PAGE_KEEP), outside the watched arena, for a generation of 0, and
+// with APS5_FIX_BOOT_STRIP=0 (a write-back then leaves a stamped edge block to the CPU whole, the
+// unit shadow drops a whole stale unit). `cause`, when given, names what stored the range's other
+// pages: the CPU's pages, the driver's, a whole-block driver store, or nothing known (Unknown).
 constexpr std::size_t UnstoredPageBytes = 4096;
-std::uint32_t PagesUnstoredSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
+enum class PageStoreCause : std::uint8_t { None, CpuPages, DriverPages, DriverWhole, Unknown };
+std::uint32_t PagesUnstoredSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, PageStoreCause* cause = nullptr);
 // Collect epoch: within one epoch a range already collected is not walked again, CollectWrites
 // returns the current generation instead. A guest write landing between two collects of the same
 // epoch is seen by the next epoch, which is the ordering real hardware gives a CPU write made while a

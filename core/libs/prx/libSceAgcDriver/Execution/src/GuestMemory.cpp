@@ -889,6 +889,8 @@ constexpr std::size_t WritePagesPerBlock = WriteBlockBytes / WritePageBytes;
 
 enum class StampKind : std::uint8_t { Cpu, Driver, ImportWindow };
 
+bool pageKeepUnits();
+
 struct WriteTracker {
     HostMutex mutex;
     bool initialized = false;
@@ -1022,6 +1024,10 @@ struct WriteTracker {
         }
     }
 
+    // The driver's partial stores by page (APS5_FIX_BOOT_STRIP): the pieces ring above forgets
+    // all but the last four, which a block of small stores (a table beside a surface) outgrows.
+    std::unordered_map<std::uint64_t, CpuPages> driverPages;
+
     void noteDriverStore(std::uint64_t block, std::uint64_t address, std::uint64_t end, std::uint32_t stampGeneration) {
         const auto begin = blockBegin(block);
         const auto from = static_cast<std::uint32_t>(std::max(address, begin) - begin);
@@ -1032,14 +1038,19 @@ struct WriteTracker {
             if (whole.noted) {
                 whole = DriverPieces{};
                 whole.noted = true;
-                whole.whole = stampGeneration;
             }
+            // Kept for a block no partial store noted too (StoredOver reads it for noted ones only).
+            whole.whole = stampGeneration;
             whole.latest = latest;
             return;
         }
         auto& entry = driverPieces[block];
         entry.noted = true;
         entry.latest = std::max(entry.latest, stampGeneration);
+        if (pageKeepUnits()) {
+            auto& pages = driverPages[block].pages;
+            for (auto page = from / WritePageBytes; page <= (to - 1) / WritePageBytes; ++page) pages[page] = std::max(pages[page], stampGeneration);
+        }
         auto& slot = entry.pieces[entry.next++ % entry.pieces.size()];
         entry.dropped = std::max(entry.dropped, slot.generation);
         slot = {stampGeneration, from, to};
@@ -1162,13 +1173,12 @@ bool edgePageKeep() {
     return enabled;
 }
 
-// The CPU's per-macroblock table right after the Bink chroma plane shares the plane's last 64 KiB
-// block. StoredOver took a block no partial driver store had noted as stored over whatever the
-// CPU's pages said, so every refresh write-back left that edge block to the CPU and the plane's
-// last 56 KiB re-uploaded stale (the boot videos' bottom right strip). With the switch such a
-// block answers by its CPU pages when no driver store reached it since (DriverPieces::latest),
-// and the unit shadow publishes a stale unit's unstored retiled pages (PagesUnstoredSince).
-// APS5_FIX_BOOT_STRIP=0 restores both old answers.
+// The Bink chroma plane shares its last 64 KiB block with a table written every frame, so every
+// refresh write-back left that edge block to the CPU whole (StoredOver) and the plane's last
+// 56 KiB re-uploaded stale (the boot videos' bottom right strip). With the switch the write-back
+// stores the block's pages no store reached since (PagesUnstoredSince, a per-page merge), and
+// the unit shadow publishes a stale unit's unstored retiled pages. APS5_FIX_BOOT_STRIP=0 leaves
+// both whole to the CPU as before.
 bool pageKeepUnits() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_FIX_BOOT_STRIP");
@@ -1581,13 +1591,7 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
             }
         }
         const auto& entry = tracker.driverPieces[block];
-        if (!entry.noted) {
-            // No partial driver store noted: the newer written stamp is the CPU's (checked above,
-            // page by page) unless a driver store (a whole-block one) came since, or neither
-            // explains it.
-            if (!pageKeepUnits() || entry.latest > generation || tracker.cpuStampOf(block) <= generation) return true;
-            continue;
-        }
+        if (!entry.noted) return true;
         if (entry.whole > generation || entry.dropped > generation) return true;
         const auto begin = tracker.blockBegin(block);
         const auto from = std::max(address, begin) - begin;
@@ -1599,46 +1603,51 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
     return false;
 }
 
-std::uint32_t PagesUnstoredSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+std::uint32_t PagesUnstoredSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, PageStoreCause* cause) {
     static_assert(UnstoredPageBytes == WritePageBytes && WritePagesPerBlock <= 32);
+    PageStoreCause ignored = PageStoreCause::None;
+    auto& why = cause != nullptr ? *cause : ignored;
+    why = PageStoreCause::None;
     if (!pageKeepUnits() || !edgePageKeep() || generation == 0 || bytes == 0) return 0;
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
+    why = PageStoreCause::Unknown;
     if (!tracker.watched || !tracker.covers(address, bytes)) return 0;
     const auto block = tracker.blockOf(address);
     if (tracker.blockOf(address + bytes - 1) != block) return 0;
     const auto from = address - tracker.blockBegin(block);
     const auto to = from + bytes;
-    std::uint32_t pages = 0;
-    for (auto page = from / WritePageBytes; page <= (to - 1) / WritePageBytes; ++page) pages |= 1u << page;
-    if (tracker.writtenStampOf(block) <= generation) return pages;
-    const bool cpuNewer = tracker.cpuStampOf(block) > generation;
-    if (cpuNewer) {
-        const auto found = tracker.cpuPages.find(block);
-        if (found == tracker.cpuPages.end()) return 0;
+    std::uint32_t range = 0;
+    for (auto page = from / WritePageBytes; page <= (to - 1) / WritePageBytes; ++page) range |= 1u << page;
+    why = PageStoreCause::None;
+    if (tracker.writtenStampOf(block) <= generation) return range;
+    const auto pagesOver = [&](const auto& record, std::uint32_t& stored) {
+        const auto found = record.find(block);
+        if (found == record.end()) return false;
         for (std::size_t page = 0; page < WritePagesPerBlock; ++page) {
-            if (found->second.pages[page] > generation) pages &= ~(1u << page);
+            if (found->second.pages[page] > generation) stored |= 1u << page;
         }
-    }
+        return true;
+    };
+    std::uint32_t cpuStored = 0, driverStored = 0;
+    why = PageStoreCause::Unknown;
+    if (tracker.cpuStampOf(block) > generation && !pagesOver(tracker.cpuPages, cpuStored)) return 0;
 #ifdef _WIN32
     const auto* entry = &tracker.driverPieces[block];
 #else
     const auto noted = tracker.driverPieces.find(block);
     const auto* entry = noted != tracker.driverPieces.end() ? &noted->second : nullptr;
 #endif
-    const bool driverNewer = entry != nullptr && entry->latest > generation;
-    // A newer written stamp neither a collect nor a noted driver store explains (a driver walk's
-    // stamp): unknown, read as stored over the whole block, as StoredOver does.
-    if (!cpuNewer && !driverNewer) return 0;
-    if (driverNewer) {
-        if (!entry->noted || entry->whole > generation || entry->dropped > generation) return 0;
-        for (const auto& piece : entry->pieces) {
-            if (piece.generation <= generation || piece.end <= piece.begin) continue;
-            for (auto page = piece.begin / WritePageBytes; page <= (piece.end - 1) / WritePageBytes; ++page) pages &= ~(1u << page);
-        }
+    if (entry != nullptr && entry->whole > generation) {
+        why = PageStoreCause::DriverWhole;
+        return 0;
     }
-    return pages;
+    if (entry != nullptr && entry->latest > generation && !pagesOver(tracker.driverPages, driverStored)) return 0;
+    // A newer written stamp no page record explains (a driver walk's stamp): stored over whole.
+    if ((cpuStored | driverStored) == 0) return 0;
+    why = (cpuStored & range) != 0 ? PageStoreCause::CpuPages : (driverStored & range) != 0 ? PageStoreCause::DriverPages : PageStoreCause::None;
+    return range & ~(cpuStored | driverStored);
 }
 
 std::uint64_t TrackerGeneration() {
