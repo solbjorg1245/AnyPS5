@@ -67,6 +67,18 @@ The launcher sets these unless you already set them yourself:
 Other user settings: `ANYPS5_INPUT_CONFIG` (input file path), `ANYPS5_SHADER_CACHE_DIR` (move the shader
 cache), `ANYPS5_NO_SHADER_CACHE=1` (no disk cache).
 
+Display settings live in `anyps5-settings.ini` next to the game: rename `anyps5-settings.ini.example`
+and edit it. The game's own performance and cinematic modes are replaced by these keys:
+
+| Key | Variable | Values |
+|---|---|---|
+| `Resolution` | `APS5_RESOLUTION` | `auto` or `WIDTHxHEIGHT`, e.g. `1280x800` (Steam Deck), `1920x1080`, `2560x1440`; sets the window size and the game's render resolution |
+| `FpsLimit` | `APS5_FPS_LIMIT` | `auto`, `30`, `60`; other values (20 to 240) need `Timestep = variable` |
+| `Timestep` | `APS5_TIMESTEP` | `fixed` (the game's own: slow motion below the limit) or `variable` (experimental: the game keeps its speed at any frame rate) |
+| `WindowMode` | `APS5_WINDOW_MODE` | `windowed` or `fullscreen` |
+
+The log shows the result in its `[settings]` lines.
+
 Troubleshooting: GPU-to-guest copy-backs are coalesced and narrowed (only changed dwords are written
 back) by default. `APS5_NO_COALESCE_COPY_BACKS=1` and `APS5_NO_NARROW_COPY_BACKS=1` turn these off
 if you see stale or flickering geometry.

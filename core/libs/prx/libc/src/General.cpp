@@ -11,13 +11,14 @@
 #include <cstring>
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
+#include "prx/libc/include/PortSettings.hpp"
 
 namespace {
 // Guest prefixes (without leading slashes) mapped to host directories, e.g. save-data mount points:
 // the PS5 hands the title a short mount point ("/savedata0") whose files live under _sd/<dir name>.
 struct PathAliases {
     std::mutex mutex;
-    std::vector<std::pair<std::string, std::string>> entries;
+    std::vector<std::pair<std::string, std::filesystem::path>> entries;
 };
 
 PathAliases& Aliases() {
@@ -133,8 +134,8 @@ int DirectoryFailure(const std::error_code& error) {
 }
 }
 
-extern "C" void AddPathAlias_nid_no_patch(const char* guestPrefix, const char* hostPath) {
-    if (guestPrefix == nullptr || hostPath == nullptr) {
+void AddPathAliasHost_nid_no_patch(const char* guestPrefix, const std::filesystem::path& hostPath) {
+    if (guestPrefix == nullptr || hostPath.empty()) {
         APS5_INVALID_ARG_EX;
     }
     auto& aliases = Aliases();
@@ -147,6 +148,13 @@ extern "C" void AddPathAlias_nid_no_patch(const char* guestPrefix, const char* h
         }
     }
     aliases.entries.emplace_back(prefix, hostPath);
+}
+
+extern "C" void AddPathAlias_nid_no_patch(const char* guestPrefix, const char* hostPath) {
+    if (guestPrefix == nullptr || hostPath == nullptr) {
+        APS5_INVALID_ARG_EX;
+    }
+    AddPathAliasHost_nid_no_patch(guestPrefix, std::filesystem::path(hostPath));
 }
 
 extern "C" void RemovePathAlias_nid_no_patch(const char* guestPrefix) {
@@ -162,6 +170,15 @@ extern "C" void RemovePathAlias_nid_no_patch(const char* guestPrefix) {
 extern "C" std::filesystem::path ResolvePath_nid_no_patch(const char* path) {
     if (!path) { APS5_INVALID_ARG_EX; }
     auto& state = Directories();
+    // The player settings' title arguments alias the command-line and render-config files to merged
+    // copies before the first guest path resolves (PortSettings.cpp); without settings nothing changes.
+    static std::once_flag settingsOverlay;
+    std::call_once(settingsOverlay, [&state] {
+        InstallPortSettingsOverlay([&state](const char* guest) {
+            std::lock_guard lock(state.mutex);
+            return Resolve(state, guest);
+        });
+    });
     std::lock_guard lock(state.mutex);
     return Resolve(state, path);
 }

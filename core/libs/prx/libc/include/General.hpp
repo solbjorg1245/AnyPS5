@@ -16,6 +16,8 @@ extern "C" std::filesystem::path ResolvePath_nid_no_patch(const char* path);
 // directory instead of the run directory; the prefix matches whole path components only.
 extern "C" void AddPathAlias_nid_no_patch(const char* guestPrefix, const char* hostPath);
 extern "C" void RemovePathAlias_nid_no_patch(const char* guestPrefix);
+// The same with a host path kept as a path (no narrow code page round trip, so non-ASCII folders work).
+void AddPathAliasHost_nid_no_patch(const char* guestPrefix, const std::filesystem::path& hostPath);
 
 #define APS5_INVALID_ARG_EX throw std::invalid_argument(std::string(__func__) + ": invalid argument")
 

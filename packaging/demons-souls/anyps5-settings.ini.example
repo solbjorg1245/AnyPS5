@@ -1,0 +1,28 @@
+# AnyPS5 display settings for Demon's Souls. Rename this file to anyps5-settings.ini (next to the game
+# executable) to use it. A key left out, or set to auto, keeps the default: the window opens at 60% of the
+# screen and the game's own graphics mode picks the render resolution and the frame rate.
+# Each key has an environment variable that overrides it (APS5_RESOLUTION, APS5_FPS_LIMIT, ...).
+
+# Output resolution: the window's size (any WIDTHxHEIGHT; the image keeps 16:9 and is letterboxed).
+# It also picks the game's render resolution: 900p up to 1600x900 (and the Steam Deck), 1080p up to
+# 1920x1080, 1440p above. Common sizes: 1280x720, 1280x800 (Steam Deck), 1600x900, 1920x1080,
+# 1920x1200, 2560x1080, 2560x1440, 2560x1600, 3440x1440, 3840x2160.
+# Resolution = 1920x1080
+
+# Render resolution by hand: auto, 900, 1080, 1440 or 2160 (2160 is the game's cinematic setting).
+# RenderResolution = auto
+
+# Frame rate limit: auto, 30, 60, or any value from 20 to 240 with Timestep = variable.
+# FpsLimit = 60
+
+# The game advances one fixed 1/60 s step per frame, so below the limit it runs in slow motion.
+# variable: each step follows the measured frame time (down to TimestepMinHz), so the game keeps its
+# speed at any frame rate. Needed for limits other than 30 and 60. Experimental.
+# Timestep = fixed
+# TimestepMinHz = 19.98
+
+# windowed or fullscreen (fullscreen uses the desktop resolution; F11 toggles it).
+# WindowMode = windowed
+
+# Upscaler: off. AMD FSR and NVIDIA DLSS are planned.
+# Upscaler = off
