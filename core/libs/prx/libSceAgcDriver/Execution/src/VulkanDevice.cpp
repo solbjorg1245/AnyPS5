@@ -3662,6 +3662,11 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             }, FlushReason::Dispatch);
         }
     }
+    // APS5_DISPATCH_OVERLAP (Graphics::Recorder::DispatchOverlap): a direct dispatch with known
+    // ranges, recorded for a DISPATCH_DIRECT packet, defers its trailing barrier; the next one of
+    // the same guest order span (only register writes between the packets) runs alongside it.
+    const auto guestOrder = Graphics::Recorder::DispatchOverlap() && argumentImport == nullptr && !resources.HoldsLease() ? Graphics::Recorder::GuestOrder() : Graphics::Recorder::GuestOrderKey{};
+    const bool holdsTrail = recorder.HoldDispatchTrail(guestOrder);
     VkAccessFlags covered = 0;
     const auto commands = keepCopyBacks ? recorder.CommandsKeepingCopyBacks(&covered) : recorder.Commands(&covered);
     recordStep(PhaseRecordCommands);
@@ -3705,7 +3710,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             record.refreshed = true;
         } else if (forkOutcome == ForkOutcome::Same || forkOutcome == ForkOutcome::Reused) {
             ++d.templateSameWords;
-        } else if (differs && resources.RefreshData(commands, *record.shader, &recorder)) {
+        } else if (differs && (recorder.RecordDispatchTrail(), resources.RefreshData(commands, *record.shader, &recorder))) {
+            // (A held-over dispatch may still read the template's buffers: its trailing barrier goes
+            // in before the update.)
             covered = 0;
             ++d.templateRefreshed;
             d.templateRevalidateMs += record.revalidateMs;
@@ -3717,6 +3724,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     // ForkData adopts words into this template only once the batch recording this use finished.
     if (TemplateRefreshRing()) resources.NoteRecorded(recorder);
+    // Nothing recorded since the held-over dispatch: this one overlaps it (its leading barrier is
+    // covered by the mask the deferral marked).
+    if (holdsTrail) recorder.ElideDispatchTrail();
     record.forked = forkedSet != VK_NULL_HANDLE;
     using CommandClass = Graphics::Recorder::CommandClass;
     if (Graphics::Recorder::BarrierValidate()) {
@@ -3768,12 +3778,16 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         const auto inPlace = resources.InPlaceReads();
         recorder.NoteInPlace(gpuTiming, Graphics::Recorder::InPlaceUseOf(inPlace, resources.GpuWrites(), {}, resources.HoldsLease()));
     }
-    const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
     constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
-    Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
-    recorder.EndGpuTiming(trailingTiming);
-    recorder.MarkCovered(dispatchedAccess);
+    if (guestOrder.span != 0) {
+        recorder.DeferDispatchTrail(guestOrder, dispatchedAccess);
+    } else {
+        const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
+        Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
+        recorder.EndGpuTiming(trailingTiming);
+        recorder.MarkCovered(dispatchedAccess);
+    }
     recordStep(PhaseRecordBind);
     // The marks' parts (ShaderResources::MarkGpuWrites' timing) as rows splitting "record: marks".
     const auto marksBefore = timer.profile ? resources.Timing() : Graphics::ShaderResources::BuildTiming{};

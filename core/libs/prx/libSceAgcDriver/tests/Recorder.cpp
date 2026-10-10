@@ -1110,6 +1110,67 @@ void storeRunTests(const Device& device, Recorder& recorder) {
     HostImportFor(context, address, bytes);
 }
 
+// APS5_DISPATCH_OVERLAP: the guest order spans and the pending dispatch trail (the switch gates
+// the callers, not these).
+void dispatchOverlapTests(Recorder& recorder) {
+    static_assert(Recorder::KeepsGuestOrder(0x15, false) && Recorder::KeepsGuestOrder(0x76, false) && Recorder::KeepsGuestOrder(0x69, false) && Recorder::KeepsGuestOrder(0x79, false) && Recorder::KeepsGuestOrder(0x63, false) && Recorder::KeepsGuestOrder(0x10, false), "register writes and dispatches keep the order span");
+    static_assert(!Recorder::KeepsGuestOrder(0x46, false) && !Recorder::KeepsGuestOrder(0x58, false) && !Recorder::KeepsGuestOrder(0x49, false) && !Recorder::KeepsGuestOrder(0x3c, false) && !Recorder::KeepsGuestOrder(0x37, false) && !Recorder::KeepsGuestOrder(0x16, false) && !Recorder::KeepsGuestOrder(0x2d, false), "sync, label, wait, write and indirect packets end the span");
+    static_assert(!Recorder::KeepsGuestOrder(0x10, true), "the flip and rendering-wait NOPs end the span");
+    Recorder::NoteGuestSubmission();
+    Recorder::NoteGuestPacket(0x76, false);
+    Require(Recorder::GuestOrder().span == 0, "a register write has an order key");
+    Recorder::NoteGuestPacket(0x15, false);
+    const auto first = Recorder::GuestOrder();
+    Recorder::NoteGuestPacket(0x76, false);
+    Recorder::NoteGuestPacket(0x15, false);
+    const auto second = Recorder::GuestOrder();
+    Require(first.span != 0 && second.span == first.span && second.packet != first.packet, "two dispatches with register writes between them are not one span");
+    Recorder::NoteGuestPacket(0x46, false);
+    Recorder::NoteGuestPacket(0x15, false);
+    const auto third = Recorder::GuestOrder();
+    Require(third.span != 0 && third.span != second.span, "an EVENT_WRITE did not end the span");
+    Recorder::NoteGuestSubmission();
+    Recorder::NoteGuestPacket(0x15, false);
+    Require(Recorder::GuestOrder().span != third.span, "a submission did not end the span");
+
+    constexpr VkAccessFlags access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    const auto before = Recorder::DispatchTrailCounts();
+    recorder.Commands();
+    // Held and elided: the holder's one Commands() call leaves it out and reads the deferral's mask.
+    recorder.DeferDispatchTrail(first, access);
+    Require(recorder.DispatchTrailPending(), "the trail is not pending");
+    Require(!recorder.HoldDispatchTrail(first), "a dispatch held its own packet's trail");
+    Require(!recorder.HoldDispatchTrail(third), "a dispatch of another span held the trail");
+    Require(!recorder.HoldDispatchTrail(Recorder::GuestOrderKey{}), "a dispatch without an order key held the trail");
+    Require(recorder.HoldDispatchTrail(second), "a dispatch of the same span did not hold the trail");
+    VkAccessFlags covered = 0;
+    recorder.Commands(&covered);
+    Require(covered == access && recorder.DispatchTrailPending(), "the holder's Commands() recorded the trail or lost the mask");
+    Require(recorder.ElideDispatchTrail() && !recorder.DispatchTrailPending(), "the held trail was not elided");
+    Require(!recorder.ElideDispatchTrail(), "an elided trail was elided twice");
+    // Not held: the next Commands() records it first; held but recorded by the holder (a refresh).
+    recorder.DeferDispatchTrail(second, access);
+    recorder.Commands(&covered);
+    Require(!recorder.DispatchTrailPending() && covered == access, "Commands() did not record the trail first");
+    recorder.DeferDispatchTrail(first, access);
+    Require(recorder.HoldDispatchTrail(second), "the trail was not held");
+    recorder.Commands();
+    recorder.RecordDispatchTrail();
+    Require(!recorder.DispatchTrailPending() && !recorder.ElideDispatchTrail(), "RecordDispatchTrail left the trail pending");
+    // A hold lasts one Commands() call; Submit records a pending trail.
+    recorder.DeferDispatchTrail(first, access);
+    Require(recorder.HoldDispatchTrail(second), "the trail was not held again");
+    recorder.Commands();
+    recorder.Commands();
+    Require(!recorder.DispatchTrailPending(), "a hold outlived its Commands() call");
+    recorder.DeferDispatchTrail(first, access);
+    recorder.Submit();
+    recorder.Sync();
+    const auto after = Recorder::DispatchTrailCounts();
+    Require(after.deferred == before.deferred + 5 && after.elided == before.elided + 1 && after.command == before.command + 2 && after.refresh == before.refresh + 1 && after.submit == before.submit + 1, "dispatch trail counters are off");
+    std::cout << "dispatch overlap checked\n";
+}
+
 void remappedImportTests(const Device& device) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
@@ -5754,6 +5815,7 @@ int main() {
         drawInputReuseTests(device, recorder);
         RunResidentPresentTests(device.GetContext());
         storeRunTests(device, recorder);
+        dispatchOverlapTests(recorder);
         remappedImportTests(device);
         batchedImportTests(device);
         importMemoTests(device);

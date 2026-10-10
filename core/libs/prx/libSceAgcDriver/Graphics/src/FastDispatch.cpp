@@ -456,11 +456,16 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
             return touches(copy.address, copy.address + copy.bytes) || (!claimed && overlaps(scratch.written, copy.address, copy.address + copy.bytes));
         }, Recorder::FlushReason::Dispatch);
     }
+    // APS5_DISPATCH_OVERLAP (see VulkanDevice::recordDispatch): the data words are in the ring
+    // (no transfer), so a held-over dispatch of the same guest order span is overlapped.
+    const auto guestOrder = Recorder::DispatchOverlap() && !indirect ? Recorder::GuestOrder() : Recorder::GuestOrderKey{};
+    const bool holdsTrail = recorder.HoldDispatchTrail(guestOrder);
     VkAccessFlags covered = 0;
     const auto commands = keepCopyBacks ? recorder.CommandsKeepingCopyBacks(&covered) : recorder.Commands(&covered);
     // The ring regions belong to the open batch (nothing above submits).
     if (!scratch.data.empty() && recorder.Submissions() + 1 != serial) return Decline::Ring;
     timing.recorded = true;
+    if (holdsTrail) recorder.ElideDispatchTrail();
     for (auto& object : scratch.keep) recorder.Keep(std::move(object));
     using CommandClass = Recorder::CommandClass;
     if (indirect) {
@@ -492,12 +497,16 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
     recorder.EndGpuTiming(gpuTiming);
     // APS5_PROFILE_GPU: everything a fast dispatch binds is in place (its [gputime] MiB read/written).
     if (gpuTiming != Recorder::NoTiming) recorder.NoteInPlace(gpuTiming, Recorder::InPlaceUseOf(scratch.reads, scratch.written));
-    const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
     constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
-    Recorder::CountBarriers(CommandClass::DispatchTrailing);
-    recorder.EndGpuTiming(trailingTiming);
-    recorder.MarkCovered(dispatchedAccess);
+    if (guestOrder.span != 0) {
+        recorder.DeferDispatchTrail(guestOrder, dispatchedAccess);
+    } else {
+        const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
+        Recorder::CountBarriers(CommandClass::DispatchTrailing);
+        recorder.EndGpuTiming(trailingTiming);
+        recorder.MarkCovered(dispatchedAccess);
+    }
     // 5. The marks of ShaderResources::MarkGpuWrites for an upload served wholly in place: every
     // in-place range is a pending read (a CPU store into it waits for the batch), the written ones
     // pending writes (CPU reads wait, PendingBlocks decline walks over them) stamped as written, and
