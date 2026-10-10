@@ -335,6 +335,31 @@ inline const RenderTier* SelectRenderTier(const Settings& settings) {
     return &RenderTiers[RenderTiers.size() - 2];
 }
 
+struct ClientSize {
+    std::uint32_t width;
+    std::uint32_t height;
+};
+
+// The window's client area for Resolution (physical pixels) on a display whose usable area (the work
+// area, physical pixels) is usableWidth x usableHeight: Resolution itself when it fits, else the largest
+// size of its aspect that does; never below the minimum (3840x400 on a 1920 screen is raised).
+inline ClientSize WindowClientSize(std::uint32_t width, std::uint32_t height, std::uint32_t usableWidth, std::uint32_t usableHeight, std::uint32_t minimumWidth, std::uint32_t minimumHeight) {
+    if (width == 0 || height == 0 || usableWidth == 0 || usableHeight == 0) return {std::max(width, minimumWidth), std::max(height, minimumHeight)};
+    const double scale = std::min({1.0, static_cast<double>(usableWidth) / width, static_cast<double>(usableHeight) / height});
+    const auto extent = [scale](std::uint32_t requested, std::uint32_t minimum) {
+        return std::max({minimum, std::uint32_t{1}, static_cast<std::uint32_t>(std::lround(requested * scale))});
+    };
+    return {extent(width, minimumWidth), extent(height, minimumHeight)};
+}
+
+// Resolution counts physical pixels, so the process declares itself DPI aware (Windows would otherwise
+// scale the window by the display scale: 1280x800 at 125% gives a 1600x1000 client, the frame stretched).
+// `switchValue` is APS5_DPI_AWARE: "0" keeps the process DPI unaware. Without Resolution nothing changes.
+inline bool DpiAwareWindow(const Settings& settings, const char* switchValue) {
+    if (settings.width == 0) return false;
+    return switchValue == nullptr || std::string_view(switchValue) != "0";
+}
+
 // The title's arguments the settings imply; empty when they imply none.
 inline std::vector<std::string> GameArgs(const Settings& settings) {
     std::vector<std::string> args;

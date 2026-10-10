@@ -101,6 +101,27 @@ static void TestFrameRate() {
     Require(PortSettings::AppendWords("+x=false", args) == "+x=false +r_Wants4K=WantsPerf +TargetFramesPerSecond=30", "command line append");
 }
 
+static void TestWindowSize() {
+    const auto size = [](std::uint32_t w, std::uint32_t h, std::uint32_t uw, std::uint32_t uh) {
+        const auto client = PortSettings::WindowClientSize(w, h, uw, uh, 320, 180);
+        return std::to_string(client.width) + "x" + std::to_string(client.height);
+    };
+    Require(size(1280, 800, 2560, 1392) == "1280x800", "1280x800 fits a 1440p work area as is");
+    Require(size(1280, 800, 1280, 800) == "1280x800", "Steam Deck: exactly the screen");
+    Require(size(1920, 1080, 1920, 1032) == "1835x1032", "taller than the work area: shrunk, aspect kept");
+    Require(size(3840, 2160, 2560, 1392) == "2475x1392", "4K on a 1440p work area");
+    Require(size(1280, 800, 1024, 1392) == "1024x640", "wider than the work area");
+    Require(size(3840, 400, 1920, 1032) == "1920x200", "extreme aspect contained");
+    Require(size(7680, 400, 1920, 1032) == "1920x180", "below the minimum height: raised");
+    Require(size(1280, 800, 0, 0) == "1280x800", "no usable area: the request");
+
+    const auto with = FromText("Resolution = 1280x800\n");
+    const auto without = FromText("");
+    Require(PortSettings::DpiAwareWindow(with, nullptr) && PortSettings::DpiAwareWindow(with, "1"), "Resolution makes the window DPI aware");
+    Require(!PortSettings::DpiAwareWindow(with, "0"), "APS5_DPI_AWARE=0 keeps it unaware");
+    Require(!PortSettings::DpiAwareWindow(without, nullptr) && !PortSettings::DpiAwareWindow(without, "1"), "no Resolution: unchanged");
+}
+
 static void TestPacer() {
     constexpr std::uint64_t ms = 1000000ULL;
     PortSettings::TimestepPacer pacer(PortSettings::DefaultTimestepMinHz, 45.0);
@@ -217,6 +238,7 @@ int main() {
     TestRenderTier();
     TestFrameRate();
     TestPacer();
+    TestWindowSize();
     TestOverlay();
     std::printf("port_settings_tests: ok\n");
     return 0;

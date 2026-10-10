@@ -190,10 +190,12 @@ void TimestepPatch::Flip(double vblankHz) {
             std::fflush(stderr);
             table = nullptr;
         }
-        step = 1.0 / (mode30 ? rate30 : rate60);
+        // The digest reports the entry the title reads: entry 2 in its 30 FPS mode, entry 1 in the 60 FPS one.
+        const auto rate = mode30 ? rate30 : rate60;
+        step = 1.0 / rate;
         windowFloored += pacer->Floored() ? 1u : 0u;
-        windowMinHz = windowFlips == 0 ? rate60 : std::min<double>(windowMinHz, rate60);
-        windowMaxHz = windowFlips == 0 ? rate60 : std::max<double>(windowMaxHz, rate60);
+        windowMinHz = windowFlips == 0 ? rate : std::min<double>(windowMinHz, rate);
+        windowMaxHz = windowFlips == 0 ? rate : std::max<double>(windowMaxHz, rate);
     }
     ++windowFlips;
     windowGameSeconds += step;
@@ -232,8 +234,8 @@ bool TimestepPatch::store(float rate60, float rate30) {
 void TimestepPatch::report(std::uint64_t now) {
     const double seconds = static_cast<double>(now - windowStart) / 1e9;
     if (table != nullptr) {
-        std::fprintf(stderr, "[timestep] 10 s: %llu flips (%.2f FPS), game speed %.3fx, variable step %.2f-%.2f Hz (60 FPS mode entry), %llu flips slower than the %.2f Hz floor\n",
-            static_cast<unsigned long long>(windowFlips), windowFlips / seconds, windowGameSeconds / seconds, windowMinHz, windowMaxHz,
+        std::fprintf(stderr, "[timestep] 10 s: %llu flips (%.2f FPS), game speed %.3fx, variable step %.2f-%.2f Hz (%d FPS mode entry), %llu flips slower than the %.2f Hz floor\n",
+            static_cast<unsigned long long>(windowFlips), windowFlips / seconds, windowGameSeconds / seconds, windowMinHz, windowMaxHz, mode30 ? 30 : 60,
             static_cast<unsigned long long>(windowFloored), floorHz);
     } else {
         std::fprintf(stderr, "[timestep] 10 s: %llu flips (%.2f FPS), game speed %.3fx, fixed step (%d FPS mode)%s\n",

@@ -234,6 +234,12 @@ VideoOutDriver& VideoOutDriver::Get() {
 }
 
 VideoOutDriver::VideoOutDriver() {
+    // Resolution sizes the window in physical pixels (PortSettings::DpiAwareWindow); SDL reads the hint
+    // when its video starts, Windows only.
+    if (PortSettings::DpiAwareWindow(GetPortSettings_nid_no_patch(), std::getenv("APS5_DPI_AWARE"))) {
+        SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+        std::fprintf(stderr, "[videoout] per-monitor DPI aware: the window's client area is Resolution in physical pixels (APS5_DPI_AWARE=0 turns this off)\n");
+    }
     if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {
         throw std::runtime_error(std::string("SDL_InitSubSystem(VIDEO | GAMECONTROLLER) failed: ") + SDL_GetError());
     }
