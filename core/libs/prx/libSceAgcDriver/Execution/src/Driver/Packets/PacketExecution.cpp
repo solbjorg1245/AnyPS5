@@ -192,6 +192,9 @@ void Driver::execute(const Submission& submission) {
     ++packetProfile.submissions;
 
     bumpEpoch(&EpochBumps::submissions);
+    // APS5_DISPATCH_OVERLAP: the guest order spans (Graphics::Recorder::NoteGuestPacket).
+    static const bool guestOrder = Graphics::Recorder::DispatchOverlap();
+    if (guestOrder) Graphics::Recorder::NoteGuestSubmission();
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
         CheckFailure();
@@ -204,6 +207,7 @@ void Driver::execute(const Submission& submission) {
         if (opcode != 0x3c && opcode != 0x93 && header != RenderingWaitPacketHeader && header != FlipPacketHeader) deviceUse.lock();
 
         GuestMemory::SetCurrentPacket(header == FlipPacketHeader ? 0xffffu : opcode, submission.queue);
+        if (guestOrder) Graphics::Recorder::NoteGuestPacket(opcode, header == FlipPacketHeader || header == RenderingWaitPacketHeader);
         CaptureTrace::Log("packet submission=%llu queue=%x offset=%zu header=%08x words=%zu", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, header, packet.size());
 
         const auto flushStart = profilePackets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

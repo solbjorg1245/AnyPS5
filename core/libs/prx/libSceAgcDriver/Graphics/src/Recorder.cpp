@@ -552,6 +552,18 @@ std::atomic<std::uint64_t> storeCount{0}, storeRuns{0}, storesJoined{0}, storesR
 std::atomic<std::uint64_t> keyStoreCount{0}, keyStoreRuns{0}, keyStoreRunsForWriter{0}, keyStoresJoined{0};
 // Deferred copy-back counters (Recorder::CopyBackCounts), relaxed likewise.
 std::atomic<std::uint64_t> copyBacksDeferred{0}, copyBackBytesDeferred{0}, copyBacksOverwritten{0}, copyBackBytesOverwritten{0}, copyBacksRecorded{0}, copyBackBytesRecorded{0}, copyBackPasses{0};
+// Dispatch overlap (Recorder::DispatchOverlap): the order spans handed out, this thread's span,
+// packet count and whether its current packet is DISPATCH_DIRECT; the trails deferred, elided
+// and recorded late by reason (TrailReason).
+std::atomic<std::uint64_t> guestOrderSpans{0};
+struct GuestOrderState {
+    std::uint64_t span = 0;
+    std::uint64_t packet = 0;
+    bool dispatch = false;
+};
+thread_local GuestOrderState guestOrderState;
+std::atomic<std::uint64_t> trailsDeferred{0}, trailsElided{0};
+std::array<std::atomic<std::uint64_t>, 4> trailsRecorded{};
 // Narrow copy-backs (Recorder::NarrowsCopyBacks): copies recorded with a baseline, the spans they
 // made (back-to-back copies of one shadow joined) and the bytes compared, spans copied whole, the
 // compare dispatches, and the dwords the passes stored (counted under profiling only).
@@ -1652,6 +1664,12 @@ VkCommandBuffer Recorder::commandsFor(VkAccessFlags* coveredAccess, bool keepCop
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
     // for a caller whose ranges overlap a queued store: FlushStores).
     if (open->renderPass.open) endOpenRenderPass();
+    // A dispatch's pending trailing barrier goes in first, except for the one call its holder
+    // (a dispatch of the same order span) makes.
+    if (open->trail.pending) {
+        if (open->trail.held) open->trail.held = false;
+        else recordDispatchTrail(TrailReason::Command);
+    }
     if (open->run.open && !LabelRunsPerBatch()) closeStoreRun();
     if (coveredAccess != nullptr) *coveredAccess = open->coveredAccess;
     open->coveredAccess = 0;
@@ -2119,6 +2137,7 @@ void Recorder::recordDeferredCopies(std::vector<DeferredCopy> copies, FlushReaso
     copyBackFlushes[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     copyBacksRecorded.fetch_add(copies.size(), std::memory_order_relaxed);
     if (open->renderPass.open) endOpenRenderPass();
+    if (open->trail.pending) recordDispatchTrail(TrailReason::Other);
     copyBackBytesRecorded.fetch_add(recordCopyPass(open->commands, std::move(copies)), std::memory_order_relaxed);
 }
 
@@ -2376,6 +2395,85 @@ void Recorder::MarkCovered(VkAccessFlags access) {
     if (open != nullptr) open->coveredAccess = access;
 }
 
+bool Recorder::DispatchOverlap() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_DISPATCH_OVERLAP");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }() && MergeBarriers();
+    return enabled;
+}
+
+void Recorder::NoteGuestSubmission() {
+    auto& state = guestOrderState;
+    state.span = guestOrderSpans.fetch_add(1, std::memory_order_relaxed) + 1;
+    state.dispatch = false;
+}
+
+void Recorder::NoteGuestPacket(std::uint32_t opcode, bool special) {
+    auto& state = guestOrderState;
+    ++state.packet;
+    state.dispatch = opcode == 0x15u && !special;
+    if (!KeepsGuestOrder(opcode, special) || state.span == 0) state.span = guestOrderSpans.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+Recorder::GuestOrderKey Recorder::GuestOrder() {
+    const auto& state = guestOrderState;
+    if (!state.dispatch) return {};
+    return {state.span, state.packet};
+}
+
+void Recorder::DeferDispatchTrail(GuestOrderKey order, VkAccessFlags access) {
+    ensureOpen();
+    if (open->trail.pending) recordDispatchTrail(TrailReason::Other);
+    open->trail.pending = true;
+    open->trail.held = false;
+    open->trail.order = order;
+    open->trail.access = access;
+    // Covered as after the barrier: whoever reads the mask (Commands()) records the barrier first,
+    // except the holder, which elides it (or records it before its own transfer and clears the mask).
+    open->coveredAccess = access;
+    trailsDeferred.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool Recorder::HoldDispatchTrail(GuestOrderKey order) {
+    if (open == nullptr || !open->trail.pending || order.span == 0 || order.span != open->trail.order.span || order.packet == open->trail.order.packet) return false;
+    open->trail.held = true;
+    return true;
+}
+
+void Recorder::RecordDispatchTrail() {
+    if (open != nullptr && open->trail.pending) recordDispatchTrail(TrailReason::Refresh);
+}
+
+bool Recorder::ElideDispatchTrail() {
+    if (open == nullptr || !open->trail.pending) return false;
+    open->trail = {};
+    trailsElided.fetch_add(1, std::memory_order_relaxed);
+    CountMerged(CommandClass::DispatchTrailing);
+    return true;
+}
+
+void Recorder::recordDispatchTrail(TrailReason reason) {
+    const auto access = open->trail.access;
+    open->trail = {};
+    const auto timing = beginTiming(ClassKey(CommandClass::DispatchTrailing), TimingKind::Class);
+    recordBarrier(open->commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, access);
+    CountBarriers(CommandClass::DispatchTrailing);
+    EndGpuTiming(timing);
+    trailsRecorded[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+Recorder::DispatchTrailStatistics Recorder::DispatchTrailCounts() {
+    DispatchTrailStatistics counts;
+    counts.deferred = trailsDeferred.load(std::memory_order_relaxed);
+    counts.elided = trailsElided.load(std::memory_order_relaxed);
+    counts.command = trailsRecorded[0].load(std::memory_order_relaxed);
+    counts.refresh = trailsRecorded[1].load(std::memory_order_relaxed);
+    counts.submit = trailsRecorded[2].load(std::memory_order_relaxed);
+    counts.other = trailsRecorded[3].load(std::memory_order_relaxed);
+    return counts;
+}
+
 bool Recorder::ContinuesRenderPass(std::uint64_t key) const {
     return open != nullptr && open->renderPass.open && open->renderPass.continuable && open->renderPass.key == key;
 }
@@ -2581,6 +2679,7 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
     else flushDeferredCopies(true, FlushReason::StoreRun);
     if (!open->keyStores.empty()) recordKeyStores(true);
     if (open->renderPass.open) endOpenRenderPass();
+    if (open->trail.pending) recordDispatchTrail(TrailReason::Other);
     open->coveredAccess = 0;
     // Two transfers to the same bytes have no order of their own within the run.
     const auto overlapsRecorded = [&] { return std::any_of(run.recorded.begin(), run.recorded.end(), [&](const auto& store) { return std::get<0>(store) == buffer && offset < std::get<2>(store) && std::get<1>(store) < end; }); };
@@ -2659,6 +2758,7 @@ bool Recorder::closeStoreRun(bool atSubmit) {
         // land ahead of every store of the run, and the pass a draw left open ends.
         if (!open->keyStores.empty()) recordKeyStores(true);
         if (open->renderPass.open) endOpenRenderPass();
+        if (open->trail.pending) recordDispatchTrail(TrailReason::Other);
         const auto commands = open->commands;
         run.timing = beginTiming(ClassKey(CommandClass::LabelRun), TimingKind::Class);
         if (BarrierValidate()) {
@@ -2782,6 +2882,13 @@ void reportBarriers() {
         mergedLine += text;
     }
     std::fprintf(stderr, "[barriers] %llu recorded (10 s) by class:%s; merged %llu:%s", static_cast<unsigned long long>(total), line.c_str(), static_cast<unsigned long long>(merged), mergedLine.c_str());
+    // APS5_DISPATCH_OVERLAP: trailing barriers left pending, dropped for an overlapping dispatch,
+    // and recorded late by what recorded them.
+    if (const auto trails = Recorder::DispatchTrailCounts(); trails.deferred != 0) {
+        static Recorder::DispatchTrailStatistics last{};
+        std::fprintf(stderr, "; dispatch overlap: %llu trails deferred, %llu elided, recorded late by command %llu, refresh %llu, submit %llu, other %llu", static_cast<unsigned long long>(trails.deferred - last.deferred), static_cast<unsigned long long>(trails.elided - last.elided), static_cast<unsigned long long>(trails.command - last.command), static_cast<unsigned long long>(trails.refresh - last.refresh), static_cast<unsigned long long>(trails.submit - last.submit), static_cast<unsigned long long>(trails.other - last.other));
+        last = trails;
+    }
     if (Recorder::BarrierValidate()) {
         std::uint64_t emitted = 0, skipped = 0;
         std::string classes, kinds;
@@ -3140,6 +3247,7 @@ void Recorder::CountSamples() {
     countingSamples = true;
     if (open == nullptr || open->samples != VK_NULL_HANDLE) return;
     if (open->renderPass.open) endOpenRenderPass();
+    if (open->trail.pending) recordDispatchTrail(TrailReason::Other);
     beginSamples(*open);
 }
 
@@ -4143,6 +4251,7 @@ void Recorder::Submit() {
     else flushDeferredCopies(true, FlushReason::Submit);
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
+    if (open->trail.pending) recordDispatchTrail(TrailReason::Submit);
     if (open->samples != VK_NULL_HANDLE) context.Function<PFN_vkCmdEndQuery>("vkCmdEndQuery")(open->commands, open->samples, 0);
     const bool hostReadCovered = (open->run.open || !open->run.queued.empty()) && closeStoreRun(true);
     if (BarrierValidate()) validateBatchEnds.fetch_add(1, std::memory_order_relaxed);

@@ -61,6 +61,54 @@ public:
     // destination access mask.
     void MarkCovered(VkAccessFlags access);
     void MarkShaderReadsCovered() { MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT); }
+    // Dispatch overlap (APS5_DISPATCH_OVERLAP=1, default off; needs barrier elision): the guest
+    // orders two compute dispatches of one queue only through packets between them (a partial
+    // flush, ACQUIRE_MEM, RELEASE_MEM, a wait, a label); with nothing but register writes between
+    // two DISPATCH_DIRECT packets the GPU runs them concurrently. Such a pair may overlap here
+    // too: the first's trailing barrier waits (DeferDispatchTrail) and the second, holding the
+    // same order span, takes the command buffer without it (HoldDispatchTrail, then
+    // ElideDispatchTrail when it records no transfer of its own first). Anything else recorded
+    // after the first records the barrier first: Commands(), the copy passes, store runs, key
+    // stores, Submit. Old path: every dispatch records its trailing barrier at once.
+    static bool DispatchOverlap();
+    // The guest order: a span ends at every packet that may order work (KeepsGuestOrder false)
+    // and at every submission; spans are unique across threads. Called by the packet loop of the
+    // thread that records the packet's work. `special`: the flip or rendering-wait NOP.
+    struct GuestOrderKey {
+        std::uint64_t span = 0;
+        std::uint64_t packet = 0;
+    };
+    static constexpr bool KeepsGuestOrder(std::uint32_t opcode, bool special) {
+        if (special) return false;
+        switch (opcode) {
+            case 0x10: case 0x15: case 0x63: case 0x64: case 0x69: case 0x76: case 0x79: return true;
+            default: return false;
+        }
+    }
+    static void NoteGuestSubmission();
+    static void NoteGuestPacket(std::uint32_t opcode, bool special);
+    // This thread's order key while it runs a DISPATCH_DIRECT packet (span 0 otherwise).
+    static GuestOrderKey GuestOrder();
+    // Instead of a dispatch's trailing barrier (COMPUTE -> ALL_COMMANDS, shader writes to
+    // `access`, which it marks covered): kept pending for `order` until the next command.
+    void DeferDispatchTrail(GuestOrderKey order, VkAccessFlags access);
+    // A dispatch of the same span (a later packet) about to call Commands(): that one call leaves
+    // the pending trail out. False (nothing held) otherwise.
+    bool HoldDispatchTrail(GuestOrderKey order);
+    // The pending trail now, if any (a holder that records a transfer before its dispatch).
+    void RecordDispatchTrail();
+    // Drops the pending trail (the holder's dispatch overlaps the earlier one); false if none.
+    bool ElideDispatchTrail();
+    bool DispatchTrailPending() const { return open != nullptr && open->trail.pending; }
+    struct DispatchTrailStatistics {
+        std::uint64_t deferred = 0;
+        std::uint64_t elided = 0;
+        std::uint64_t command = 0;
+        std::uint64_t refresh = 0;
+        std::uint64_t submit = 0;
+        std::uint64_t other = 0;
+    };
+    static DispatchTrailStatistics DispatchTrailCounts();
     // A recorded draw's render pass (Draw.cpp) is left open after the draw: the next draw of the
     // same attachments (`key`: the views and the extent) continues it when nothing was recorded in
     // between and the earlier draw allowed it (`continuable`: it wrote nothing but its
@@ -935,6 +983,13 @@ private:
         } renderPass;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
         bool hostReadOwed = false;
+        // A dispatch's trailing barrier left pending (see DeferDispatchTrail).
+        struct DispatchTrail {
+            bool pending = false;
+            bool held = false;
+            GuestOrderKey order;
+            VkAccessFlags access = 0;
+        } trail;
         // Queued DCC key stores (see QueueKeyStore).
         struct KeyStore {
             VkBuffer buffer;
@@ -997,6 +1052,9 @@ private:
     bool closeStoreRun(bool atSubmit = false);
     // Ends the render pass a draw left open (vkCmdEndRenderPass, the pass's trailing barrier).
     void endOpenRenderPass();
+    // Records the pending dispatch trail (DeferDispatchTrail), counted by what recorded it.
+    enum class TrailReason : std::uint8_t { Command, Refresh, Submit, Other };
+    void recordDispatchTrail(TrailReason reason);
     // Records the queued key stores as one run (`forWriter`: before a command writing, reading or
     // labelling over one, not at Submit).
     void recordKeyStores(bool forWriter);
