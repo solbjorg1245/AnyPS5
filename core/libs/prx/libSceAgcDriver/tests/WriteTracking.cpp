@@ -130,6 +130,19 @@ void CheckUnstoredPages() {
     Require(PagesUnstoredSince(base + 4096, 4096, synced) == (1u << 1), "a one-page range answers for other pages");
     Require(PagesUnstoredSince(base, Block, TrackerGeneration()) == all, "stores older than the generation are seen");
 
+    // A whole-block driver store into a noted block, a piece after it, and a ring overflow.
+    const auto beforeNotedWhole = TrackerGeneration();
+    MarkWritten(base, Block);
+    Require(PagesUnstoredSince(base, surfaceBytes, beforeNotedWhole) == 0, "a whole-block driver store into a noted block is missed");
+    const auto afterNotedWhole = TrackerGeneration();
+    MarkWritten(base + 3 * 4096 + 8, 8);
+    Require(PagesUnstoredSince(base, surfaceBytes, afterNotedWhole) == (surface & ~(1u << 3)), "a piece after a whole-block store is taken for the whole block");
+    const auto beforeRing = TrackerGeneration();
+    for (int store = 0; store < 4; ++store) MarkWritten(base + 4 * 4096 + static_cast<std::uint64_t>(store) * 64, 4);
+    Require(PagesUnstoredSince(base, surfaceBytes, beforeRing) == (surface & ~(1u << 4)), "four pieces in one page are not told apart");
+    MarkWritten(base + 5 * 4096, 4);
+    Require(PagesUnstoredSince(base, surfaceBytes, beforeRing) == 0, "a piece pushed out of the ring is forgotten");
+
     const auto beforeWhole = TrackerGeneration();
     MarkWritten(base + Block, Block);
     bytes[Block + 15 * 4096] = 0x33;

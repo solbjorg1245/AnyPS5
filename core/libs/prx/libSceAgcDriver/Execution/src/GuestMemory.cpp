@@ -1592,10 +1592,11 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
 
 std::uint32_t PagesUnstoredSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     static_assert(UnstoredPageBytes == WritePageBytes && WritePagesPerBlock <= 32);
+    if (!pageKeepUnits() || !edgePageKeep() || generation == 0 || bytes == 0) return 0;
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    if (!pageKeepUnits() || !edgePageKeep() || !tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return 0;
+    if (!tracker.watched || !tracker.covers(address, bytes)) return 0;
     const auto block = tracker.blockOf(address);
     if (tracker.blockOf(address + bytes - 1) != block) return 0;
     const auto from = address - tracker.blockBegin(block);
@@ -1603,17 +1604,27 @@ std::uint32_t PagesUnstoredSince(std::uint64_t address, std::size_t bytes, std::
     std::uint32_t pages = 0;
     for (auto page = from / WritePageBytes; page <= (to - 1) / WritePageBytes; ++page) pages |= 1u << page;
     if (tracker.writtenStampOf(block) <= generation) return pages;
-    if (tracker.cpuStampOf(block) > generation) {
+    const bool cpuNewer = tracker.cpuStampOf(block) > generation;
+    if (cpuNewer) {
         const auto found = tracker.cpuPages.find(block);
         if (found == tracker.cpuPages.end()) return 0;
         for (std::size_t page = 0; page < WritePagesPerBlock; ++page) {
             if (found->second.pages[page] > generation) pages &= ~(1u << page);
         }
     }
-    const auto& entry = tracker.driverPieces[block];
-    if (entry.latest > generation) {
-        if (!entry.noted || entry.whole > generation || entry.dropped > generation) return 0;
-        for (const auto& piece : entry.pieces) {
+#ifdef _WIN32
+    const auto* entry = &tracker.driverPieces[block];
+#else
+    const auto noted = tracker.driverPieces.find(block);
+    const auto* entry = noted != tracker.driverPieces.end() ? &noted->second : nullptr;
+#endif
+    const bool driverNewer = entry != nullptr && entry->latest > generation;
+    // A newer written stamp neither a collect nor a noted driver store explains (a driver walk's
+    // stamp): unknown, read as stored over the whole block, as StoredOver does.
+    if (!cpuNewer && !driverNewer) return 0;
+    if (driverNewer) {
+        if (!entry->noted || entry->whole > generation || entry->dropped > generation) return 0;
+        for (const auto& piece : entry->pieces) {
             if (piece.generation <= generation || piece.end <= piece.begin) continue;
             for (auto page = piece.begin / WritePageBytes; page <= (piece.end - 1) / WritePageBytes; ++page) pages &= ~(1u << page);
         }

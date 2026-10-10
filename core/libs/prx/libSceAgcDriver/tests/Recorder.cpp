@@ -2417,7 +2417,7 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     Require(firstSlab->pins.load() == 2 && half->pin != nullptr, "destinations do not pin their slab");
     // The retile as writeBackWindows records it: the seed, then the piece's bytes over its half.
     const auto copyBuffer = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
-    const auto retile = [&](const ShadowDestination& destination, std::uint64_t begin, std::uint64_t length, std::uint8_t value, bool seed) {
+    const auto retile = [&](const ShadowDestination& destination, std::uint64_t begin, std::uint64_t length, std::uint8_t value, bool seed, bool mark = true) {
         auto pattern = std::make_shared<Buffer>(context, static_cast<std::size_t>(length), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         std::memset(pattern->Bytes().data(), value, pattern->Bytes().size());
         const auto commands = recorder.Commands();
@@ -2433,7 +2433,10 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
         copyBuffer(commands, pattern->Handle(), destination.buffer, 1, &piece);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-        const ShadowedRange range{begin & ~(unit - 1), (begin & ~(unit - 1)) + unit, destination.slab};
+        // The piece's own extent, as writeBackWindows marks it (a stale unit publishes only the
+        // retiled pages); `mark` false leaves bytes in the slab no retile marked.
+        if (!mark) return;
+        const ShadowedRange range{begin, begin + length, destination.slab};
         MarkShadowed(*import, std::span(&range, 1), TrackerGeneration());
     };
     retile(*half, unit3, unit / 2, 0x22, true);
@@ -2487,6 +2490,36 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     Require(words[4 * unit + 4096] == 0x55 && words[4 * unit + 4096 + 1] == 0x11, "a stale unit's publish overwrote the CPU's page");
     const std::uint8_t unstored = pageKeep ? 0x44 : 0x11;
     Require(words[4 * unit] == unstored && words[4 * unit + 4095] == unstored && words[4 * unit + 2 * 4096] == unstored && words[5 * unit - 1] == unstored && words[5 * unit] == 0x11, "a stale unit's unstored pages are wrong");
+    {
+        // A half-unit retile whose seeded half holds bytes older than the import (0x99 stands in
+        // for the table a CPU store after the publish's collect rewrote): a stale publish copies
+        // the retiled pages the store missed, never the seeded ones.
+        const auto unit20 = address + 20 * unit;
+        static_cast<void>(CollectWritesUncached(unit20, 2 * unit));
+        auto lower = ShadowDestinationFor(context, *import, unit20, unit20 + unit / 2);
+        Require(lower.has_value() && lower->seedUnits.size() == 1, "unit 20's half retile does not seed");
+        retile(*lower, unit20, unit / 2, 0x77, true);
+        retile(*lower, unit20 + unit / 2, unit / 2, 0x99, false, false);
+        lower.reset();
+        *static_cast<volatile std::uint8_t*>(static_cast<void*>(static_cast<std::uint8_t*>(block) + 20 * unit + 4096 + 8)) = 0x56;
+        Require(PublishShadow(unit20, unit, PublishScope::Whole, PublishReason::Hook) == (pageKeep ? 1u : 0u), "a stale half-retiled unit's publish count is wrong");
+        recorder.Sync();
+        const std::uint8_t retiled = pageKeep ? 0x77 : 0x11;
+        Require(words[20 * unit + 4096 + 8] == 0x56 && words[20 * unit + 4096] == 0x11, "a stale half-retiled unit's publish overwrote the CPU's page");
+        Require(words[20 * unit] == retiled && words[20 * unit + 2 * 4096] == retiled && words[20 * unit + unit / 2 - 1] == retiled, "a stale half-retiled unit's retiled pages are wrong");
+        Require(words[20 * unit + unit / 2] == 0x11 && words[21 * unit - 1] == 0x11, "a stale unit published its seeded pages");
+        // A whole-block driver store into a retiled unit leaves nothing to publish.
+        const auto unit21 = unit20 + unit;
+        auto next = ShadowDestinationFor(context, *import, unit21, unit21 + unit);
+        Require(next.has_value() && next->seedUnits.empty(), "unit 21's whole retile seeds");
+        retile(*next, unit21, unit, 0x7a, false);
+        next.reset();
+        MarkWritten(unit21, unit);
+        Require(PublishShadow(unit21, unit, PublishScope::Whole, PublishReason::Hook) == 0, "a unit a whole-block driver store reached was published");
+        Require(!AnyShadowedOverlaps(unit21, unit), "a unit a driver store reached still counts as shadowed");
+        recorder.Sync();
+        Require(words[21 * unit] == 0x11 && words[22 * unit - 1] == 0x11, "a driver-stored unit's publish overwrote the import");
+    }
     // The slab boundary: a piece over units 127 and 128 is refused, each alone lands in its slab.
     const auto unit127 = address + 127 * unit;
     const auto unit128 = unit127 + unit;
