@@ -689,7 +689,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 const auto guestLayerOffset = geometry.GuestLayerOffset(layer);
                 const auto linearLayerOffset = geometry.LinearLayerOffset(layer);
                 for (const auto& mip : mips) {
-                    detiler.Dispatch(commands, descriptor.tileMode, elementBytes, tiled->Handle(), guestLayerOffset + mip.tiledOffset, linear->Handle(), linearLayerOffset + mip.linearOffset, mip, false, layer, geometry.thick);
+                    detiler.Dispatch(commands, descriptor.tileMode, elementBytes, tiled->Handle(), guestLayerOffset + mip.tiledOffset, linear->Handle(), linearLayerOffset + mip.linearOffset, mip, false, SwizzleSlice(descriptor, layer), geometry.thick);
                 }
             }
 
@@ -859,7 +859,7 @@ bool Texture::CanCopyFrom(const StorageTexture& source, const GuestTextureResour
     if (IsBlockCompressed(descriptor.format) || IsBlockCompressed(from.format)) return false;
     // Same memory, same layout, same texel size: the GPU copy reinterprets the texels exactly as a
     // guest read through the sampled descriptor would.
-    return descriptor.baseAddress == from.baseAddress && descriptor.width == from.width && descriptor.height == from.height && descriptor.dimension == from.dimension && descriptor.tileMode == from.tileMode && descriptor.mipCount <= from.mipCount && descriptor.depthOrLastArray == from.depthOrLastArray && BytesPerElement(descriptor.format) == BytesPerElement(from.format) && BlockWidth(descriptor.format) == BlockWidth(from.format);
+    return descriptor.baseAddress == from.baseAddress && descriptor.width == from.width && descriptor.height == from.height && descriptor.dimension == from.dimension && descriptor.tileMode == from.tileMode && descriptor.mipCount <= from.mipCount && descriptor.depthOrLastArray == from.depthOrLastArray && descriptor.swizzleSlice == from.swizzleSlice && BytesPerElement(descriptor.format) == BytesPerElement(from.format) && BlockWidth(descriptor.format) == BlockWidth(from.format);
 }
 
 Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components) : context(context), storageSource(source) {
@@ -1909,7 +1909,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
             if (layers != nullptr && !(*layers)[layer]) continue;
             for (const auto& mip : mips) {
-                detiler.Dispatch(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestLayerOffset(layer) + mip.tiledOffset, linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, mip, false, layer, geometry.thick);
+                detiler.Dispatch(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestLayerOffset(layer) + mip.tiledOffset, linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, mip, false, SwizzleSlice(descriptor, layer), geometry.thick);
             }
         }
         const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -1960,7 +1960,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
                 for (const auto& mip : mips) {
-                    detiler.Dispatch(commands, descriptor.tileMode, elementBytes, tiled.Handle(), geometry.GuestLayerOffset(layer) + mip.tiledOffset, linear.Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, mip, false, layer, geometry.thick);
+                    detiler.Dispatch(commands, descriptor.tileMode, elementBytes, tiled.Handle(), geometry.GuestLayerOffset(layer) + mip.tiledOffset, linear.Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, mip, false, SwizzleSlice(descriptor, layer), geometry.thick);
                 }
             }
             const auto linearRead = WholeBufferBarrier(linear.Handle(), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -2164,11 +2164,11 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
         if (source.shadow) {
             // The slab holds the piece from the window's first tiled byte: the window's tiled base
             // is its range begin (sliceWindows builds it so), read from the piece's slab offset.
-            detiler.Dispatch(commands, descriptor.tileMode, elementBytes, source.buffer, source.offset + (window.tiledBegin - source.begin), linear->Handle(), positions[i], mip, false, window.layer, false, detile);
+            detiler.Dispatch(commands, descriptor.tileMode, elementBytes, source.buffer, source.offset + (window.tiledBegin - source.begin), linear->Handle(), positions[i], mip, false, SwizzleSlice(descriptor, window.layer), false, detile);
         } else {
             // The import holds the whole mip: the window's tiled base is the mip's.
             detile.tiledBase = 0;
-            detiler.Dispatch(commands, descriptor.tileMode, elementBytes, import.buffer, importOffset + geometry.GuestLayerOffset(window.layer) + mip.tiledOffset, linear->Handle(), positions[i], mip, false, window.layer, false, detile);
+            detiler.Dispatch(commands, descriptor.tileMode, elementBytes, import.buffer, importOffset + geometry.GuestLayerOffset(window.layer) + mip.tiledOffset, linear->Handle(), positions[i], mip, false, SwizzleSlice(descriptor, window.layer), false, detile);
         }
         for (auto region : window.regions) {
             region.bufferOffset += positions[i];
@@ -2389,7 +2389,7 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &importReady, 1, &linearRead, 0, nullptr);
     for (std::size_t i = 0; i < windows.size(); ++i) {
         const auto& window = windows[i];
-        detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear->Handle(), linearPositions[i], tiledScratch->Handle(), scratchPositions[i], mips[window.level], true, window.layer, false, window.window);
+        detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear->Handle(), linearPositions[i], tiledScratch->Handle(), scratchPositions[i], mips[window.level], true, SwizzleSlice(descriptor, window.layer), false, window.window);
     }
     if (recorder != nullptr) timing = recorder->ContinueGpuTiming(timing, scratchTotal, Recorder::CommandClass::StorageStore);
     if (LookupOutcomes::Profiled()) {
@@ -2783,13 +2783,13 @@ void StorageTexture::FlushAllPending(const char* reason) {
     static_cast<void>(FlushPending(0, std::numeric_limits<std::size_t>::max(), nullptr, reason));
 }
 
-std::shared_ptr<StorageTexture> StorageTexture::FindPending(std::uint64_t address, std::uint64_t bytes) {
+std::shared_ptr<StorageTexture> StorageTexture::FindPending(std::uint64_t address, std::uint64_t bytes, std::optional<std::uint32_t> swizzleSlice) {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
     for (auto* texture : pending.textures) {
         // Containment, not equality: a descriptor of a chain's first mips (its own guestBytes are
         // shorter) is served by the chain's image; CanCopyFrom then checks the geometry.
-        if (texture->descriptor.baseAddress == address && texture->guestBytes >= bytes) return texture->weak_from_this().lock();
+        if (texture->descriptor.baseAddress == address && texture->guestBytes >= bytes && (!swizzleSlice || texture->descriptor.swizzleSlice == *swizzleSlice)) return texture->weak_from_this().lock();
     }
     return nullptr;
 }
@@ -3484,12 +3484,12 @@ void StorageTexture::WriteBack() {
     flushReason = previous;
 }
 
-std::shared_ptr<StorageTexture> StorageTexture::FindLive(std::uint64_t address, std::uint64_t bytes) {
+std::shared_ptr<StorageTexture> StorageTexture::FindLive(std::uint64_t address, std::uint64_t bytes, std::optional<std::uint32_t> swizzleSlice) {
     auto& live = Live();
     std::lock_guard lock(live.mutex);
     for (auto it = live.textures.rbegin(); it != live.textures.rend(); ++it) {
         auto* texture = *it;
-        if (texture->released || !texture->Cached() || texture->descriptor.baseAddress != address || texture->guestBytes != bytes) continue;
+        if (texture->released || !texture->Cached() || texture->descriptor.baseAddress != address || texture->guestBytes != bytes || (swizzleSlice && texture->descriptor.swizzleSlice != *swizzleSlice)) continue;
         return texture->weak_from_this().lock();
     }
     return nullptr;
@@ -3498,7 +3498,7 @@ std::shared_ptr<StorageTexture> StorageTexture::FindLive(std::uint64_t address, 
 bool StorageTexture::SameSurfaceShape(const StorageTexture& other) const {
     const auto& mine = descriptor;
     const auto& theirs = other.descriptor;
-    return guestBytes == other.guestBytes && mine.width == theirs.width && mine.height == theirs.height && mine.depthOrLastArray == theirs.depthOrLastArray && mine.baseArray == theirs.baseArray && mine.mipCount == theirs.mipCount && mine.tileMode == theirs.tileMode && mine.dimension == theirs.dimension && mine.format == theirs.format && storageFormat == other.storageFormat && geometry.imageLayers == other.geometry.imageLayers && geometry.imageDepth == other.geometry.imageDepth;
+    return guestBytes == other.guestBytes && mine.width == theirs.width && mine.height == theirs.height && mine.depthOrLastArray == theirs.depthOrLastArray && mine.baseArray == theirs.baseArray && mine.swizzleSlice == theirs.swizzleSlice && mine.mipCount == theirs.mipCount && mine.tileMode == theirs.tileMode && mine.dimension == theirs.dimension && mine.format == theirs.format && storageFormat == other.storageFormat && geometry.imageLayers == other.geometry.imageLayers && geometry.imageDepth == other.geometry.imageDepth;
 }
 
 bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
@@ -3680,7 +3680,7 @@ std::shared_ptr<StorageTexture> StorageTexture::pendingAlias() const {
         const auto& theirs = candidate->descriptor;
         // The same texels under another format of the same size: the device copy moves them bit
         // for bit, as the guest bytes would.
-        const bool sameShape = mine.width == theirs.width && mine.height == theirs.height && mine.depthOrLastArray == theirs.depthOrLastArray && mine.baseArray == theirs.baseArray && mine.mipCount == theirs.mipCount && mine.tileMode == theirs.tileMode && mine.dimension == theirs.dimension && BytesPerElement(mine.format) == BytesPerElement(theirs.format) && geometry.imageLayers == candidate->geometry.imageLayers && geometry.imageDepth == candidate->geometry.imageDepth && trackedLayers == candidate->trackedLayers;
+        const bool sameShape = mine.width == theirs.width && mine.height == theirs.height && mine.depthOrLastArray == theirs.depthOrLastArray && mine.baseArray == theirs.baseArray && mine.swizzleSlice == theirs.swizzleSlice && mine.mipCount == theirs.mipCount && mine.tileMode == theirs.tileMode && mine.dimension == theirs.dimension && BytesPerElement(mine.format) == BytesPerElement(theirs.format) && geometry.imageLayers == candidate->geometry.imageLayers && geometry.imageDepth == candidate->geometry.imageDepth && trackedLayers == candidate->trackedLayers;
         if (sameShape && candidate->Cached() && candidate->uploadedKeys == DccKeys::Uncompressed) return candidate;
     }
     return nullptr;
@@ -4023,7 +4023,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
             if (storedLayers != nullptr && !(*storedLayers)[layer]) continue;
             for (const auto& mip : mips) {
-                detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, tiledScratch->Handle(), geometry.GuestLayerOffset(layer) + mip.tiledOffset, mip, true, layer, geometry.thick);
+                detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, tiledScratch->Handle(), geometry.GuestLayerOffset(layer) + mip.tiledOffset, mip, true, SwizzleSlice(descriptor, layer), geometry.thick);
             }
         }
         if (recorder != nullptr) timing = recorder->ContinueGpuTiming(timing, guestBytes, Recorder::CommandClass::StorageStore);
@@ -4126,7 +4126,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 2, toShader, 0, nullptr);
     for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
         for (const auto& mip : mips) {
-            detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear.Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, tiled.Handle(), geometry.GuestLayerOffset(layer) + mip.tiledOffset, mip, true, layer, geometry.thick);
+            detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear.Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, tiled.Handle(), geometry.GuestLayerOffset(layer) + mip.tiledOffset, mip, true, SwizzleSlice(descriptor, layer), geometry.thick);
         }
     }
     // Debug aid: APS5_DUMP_STORAGE=<hex address> saves that storage image's first mip after each of

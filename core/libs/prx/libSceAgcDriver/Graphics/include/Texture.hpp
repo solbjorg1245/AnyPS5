@@ -229,7 +229,9 @@ public:
     // The pending image whose surface starts at `address` and covers at least `bytes` (a mip chain
     // contains a descriptor of its first mips), if any; the caller decides whether the geometry fits
     // (Texture::CanCopyFrom, ResidentPresentable).
-    static std::shared_ptr<StorageTexture> FindPending(std::uint64_t address, std::uint64_t bytes);
+    // `swizzleSlice` (when given) must match the image's descriptor: a slice-k color view and a plain
+    // 2D surface at one address are tiled apart and never stand for each other.
+    static std::shared_ptr<StorageTexture> FindPending(std::uint64_t address, std::uint64_t bytes, std::optional<std::uint32_t> swizzleSlice = std::nullopt);
     // How a buffer fill of [address, address + bytes) (Driver.cpp's fill HLE) meets the storage
     // images alive: none of them; a whole surface (Exact) or one array layer of a surface (Layer),
     // `image` and `layer` naming it, whatever other images lie over the range (`others`, of which
@@ -273,7 +275,8 @@ public:
     bool FillClear(std::span<const std::uint32_t, 4> pattern, std::uint32_t layer, const char*& refusal);
     // The cached, live image whose surface is exactly [address, address + bytes), if any (the newest
     // of several: see ClassifyFill).
-    static std::shared_ptr<StorageTexture> FindLive(std::uint64_t address, std::uint64_t bytes);
+    // `swizzleSlice` as for FindPending.
+    static std::shared_ptr<StorageTexture> FindLive(std::uint64_t address, std::uint64_t bytes, std::optional<std::uint32_t> swizzleSlice = std::nullopt);
     // Whether the two surfaces differ in nothing but their address (and DCC metadata).
     bool SameSurfaceShape(const StorageTexture& other) const;
     // The copy HLE's buffer copy of one whole surface into another (VulkanDevice::CopyBuffer,

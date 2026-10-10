@@ -1619,7 +1619,7 @@ bool AliasCopy(const Graphics::Context& context, std::uint64_t destination, std:
         copyAliasNoSource.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    auto to = Graphics::StorageTexture::FindLive(destination, bytes);
+    auto to = Graphics::StorageTexture::FindLive(destination, bytes, from->Descriptor().swizzleSlice);
     if (to != nullptr && !to->SameSurfaceShape(*from)) {
         copyAliasShape.fetch_add(1, std::memory_order_relaxed);
         return false;

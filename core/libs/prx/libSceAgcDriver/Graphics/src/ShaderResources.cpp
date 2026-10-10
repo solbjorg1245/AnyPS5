@@ -494,7 +494,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // A storage image whose results for this surface (or for a mip chain containing it) are still on
     // the GPU supplies the texture by a view of it; anything else needs those results in guest
     // memory first.
-    auto source = StorageTexture::FindPending(address, guestBytes);
+    auto source = StorageTexture::FindPending(address, guestBytes, resource.swizzleSlice);
     if (source != nullptr && (depthCompare || !Texture::CanCopyFrom(*source, resource) || MetadataMoved(*source, resource))) source.reset();
     std::optional<DccKeys> keys;
     bool clearThroughKeys = false;
@@ -829,10 +829,13 @@ void evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::i
 }
 
 // Storage images are shared by every descriptor of one surface (address, extent, layers, format, tile
-// mode): the image holds the whole mip chain, and render targets in the same memory attach to it.
+// mode): the image holds the whole mip chain, and render targets in the same memory attach to it. A
+// color array slice's surface (swizzleSlice) is tiled apart from a 2D surface at the same address.
 std::array<std::uint32_t, 8> SurfaceKey(const Context& context, const GuestTextureResource& resource) {
+    // The packed words below give baseArray and swizzleSlice 16 bits each; a larger value would collide silently.
+    if (resource.baseArray > 0xffffu || resource.swizzleSlice > 0xffffu) throw std::runtime_error("AGC graphics: texture array base or swizzle slice exceeds the surface key");
     // Guest formats that store in the same Vulkan format share the image (views carry the difference).
-    return {static_cast<std::uint32_t>(resource.baseAddress), static_cast<std::uint32_t>(resource.baseAddress >> 32u), resource.width, resource.height, (resource.depthOrLastArray << 16u) | (resource.mipCount & 0xffffu), (static_cast<std::uint32_t>(resource.tileMode) << 12u) | (static_cast<std::uint32_t>(resource.dimension) << 20u), resource.baseArray, static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format))};
+    return {static_cast<std::uint32_t>(resource.baseAddress), static_cast<std::uint32_t>(resource.baseAddress >> 32u), resource.width, resource.height, (resource.depthOrLastArray << 16u) | (resource.mipCount & 0xffffu), (static_cast<std::uint32_t>(resource.tileMode) << 12u) | (static_cast<std::uint32_t>(resource.dimension) << 20u), resource.baseArray | (resource.swizzleSlice << 16u), static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format))};
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
@@ -2176,7 +2179,7 @@ bool ShaderResources::fastRevalidateEach() {
         // A view made under fast-clear keys stays one only while its image still has results pending
         // over the surface (the lookup prefers them to the clear); once they are flushed the clear
         // the image cannot see wins and the lookup makes a snapshot (cachedTexture's hit rule).
-        if (surface.source != nullptr && surface.keys != DccKeys::Uncompressed && StorageTexture::FindPending(address, surface.bytes).get() != surface.source) return false;
+        if (surface.source != nullptr && surface.keys != DccKeys::Uncompressed && StorageTexture::FindPending(address, surface.bytes, surface.resource.swizzleSlice).get() != surface.source) return false;
     }
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
         if (storageTextures[i] != nullptr && (i >= storageKeys.size() || (storageKeys[i] != 0 && storageKeys[i] != storageTextures[i]->Descriptor().dccAddress))) return false;
@@ -2228,7 +2231,7 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         const bool imported = SampledFromStorageEligible(context, surface.resource, surface.bytes);
         overlap.sourceEligible = imported && SurfaceKey(context, source->Descriptor()) == SurfaceKey(context, surface.resource);
-        auto found = StorageTexture::FindPending(address, surface.bytes);
+        auto found = StorageTexture::FindPending(address, surface.bytes, surface.resource.swizzleSlice);
         if (found != nullptr && !Texture::CanCopyFrom(*found, surface.resource)) found.reset();
         if (found != nullptr) {
             if (found != source) return OwnRefreshFallback::ForeignView;
@@ -3868,7 +3871,7 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
         if (record.resource.dccAddress != 0 && IsDccClear(record.source->FilledKeys())) return nullptr;
         // Under fast-clear keys the view holds only while its image's results are still pending over
         // the surface; flushed, the clear the image cannot see makes the lookup take a snapshot.
-        if (keys != DccKeys::Uncompressed && StorageTexture::FindPending(address, record.guestBytes) != record.source) return nullptr;
+        if (keys != DccKeys::Uncompressed && StorageTexture::FindPending(address, record.guestBytes, record.resource.swizzleSlice) != record.source) return nullptr;
     } else if (keys == DccKeys::Uncompressed && !GuestMemory::UnchangedSince(address, bytes, record.entryGeneration)) {
         return nullptr;
     }

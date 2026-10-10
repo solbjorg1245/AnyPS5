@@ -178,6 +178,28 @@ void RunTextureTilingTests() {
                 }
             }
         }
+
+        // SW_64KB_R_X, 4 byte elements: the slice index flips address bits 11 (slice bit 0) and 10
+        // (slice bit 1), which hold x5 and y5 alone. Slice k tiled as slice 0 therefore moves 32x32
+        // blocks by x^32 (slice 1), y^32 (slice 2) or both (slice 3): the R0b G-buffer blocks.
+        const auto* renderTarget = FindTextureSwizzleEquation(27u, 4u);
+        Require(renderTarget != nullptr, "the 4 byte SW_64KB_R_X equation is missing");
+        const auto blockOffset = [&](std::uint32_t x, std::uint32_t y, std::uint32_t slice) {
+            std::uint32_t offset = 0;
+            for (std::uint32_t bit = 0; bit < 16u; ++bit) {
+                const auto mask = renderTarget->bits[bit];
+                const auto selected = (x & (mask & 0xfffu)) ^ ((y << 12) & (mask & 0xfff000u)) ^ ((slice << 24) & (mask & 0xff000000u));
+                offset |= static_cast<std::uint32_t>(std::popcount(selected) & 1) << bit;
+            }
+            return offset;
+        };
+        for (std::uint32_t y = 0; y < 128u; ++y) {
+            for (std::uint32_t x = 0; x < 128u; ++x) {
+                Require(blockOffset(x, y, 1u) == blockOffset(x ^ 32u, y, 0u), "R_X slice 1 must be slice 0 with x^32");
+                Require(blockOffset(x, y, 2u) == blockOffset(x, y ^ 32u, 0u), "R_X slice 2 must be slice 0 with y^32");
+                Require(blockOffset(x, y, 3u) == blockOffset(x ^ 32u, y ^ 32u, 0u), "R_X slice 3 must be slice 0 with x^32 and y^32");
+            }
+        }
     }
 
     reject([] { ComputeMipLayout(TextureTileMode::kLinear, 1, 0, 4, 1); }, "zero-sized texture");

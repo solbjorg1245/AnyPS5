@@ -309,6 +309,18 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     return resource;
 }
 
+std::uint32_t SwizzleSlice(const GuestTextureResource& resource, std::uint32_t layer) {
+    return resource.swizzleSlice + layer;
+}
+
+bool FixR0bEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_FIX_R0B");
+        return value == nullptr || *value == '\0' || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
 float EffectiveMinLod(const GuestTextureResource& resource) {
     if (resource.minLod <= resource.baseLevel * 256u) return 0.0f;
     return std::min(static_cast<float>(resource.minLod) / 256.0f, static_cast<float>(resource.lastLevel));

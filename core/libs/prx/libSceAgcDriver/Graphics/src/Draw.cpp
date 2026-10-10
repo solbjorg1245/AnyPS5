@@ -68,6 +68,14 @@ GuestTextureResource SurfaceForTarget(const ColorTarget& color) {
     surface.dstSelW = 7;
     surface.dccAddress = color.dccAddress;
     surface.dccAlphaOnMsb = color.dccAlphaOnMsb;
+    // A slice view of a color array is the 2D surface at the slice's address, swizzled with the
+    // slice's index (the array texture reading it detiles layer k with slice k). Under slice 0's
+    // swizzle slices 1-3 of a 4 byte target come back with 32x32 blocks swapped (x^32, y^32, both).
+    surface.swizzleSlice = FixR0bEnabled() ? color.slice : 0u;
+    if (color.slice != 0) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) std::fprintf(stderr, "[gpu] color target 0x%llx renders array slice %u (APS5_FIX_R0B=%d: %s swizzle)\n", static_cast<unsigned long long>(color.address), color.slice, FixR0bEnabled() ? 1 : 0, FixR0bEnabled() ? "slice" : "slice 0");
+    }
     return surface;
 }
 
@@ -1935,7 +1943,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         const auto& color = binding.color;
         binding.gpuTiling = color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr;
         APS5_LOG_OUT_DEBUG("Creating color target %zu address=0x%llx bytes=%llu extent=%ux%u", index, static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(color.bytes), color.extent.width, color.extent.height);
-        const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+        const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes, FixR0bEnabled() ? color.slice : 0u);
         constexpr VkBufferUsageFlags copies = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         timer.phase(PhaseSetup);
         // Debug aid: APS5_NO_RESIDENT_TARGETS=1 copies every target in and out again.
@@ -2236,7 +2244,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             PoisonPooled(context, commands, *binding.linearDevice, PoisonSite::DrawTarget);
             CopyBuffer(context, commands, binding.tiled->Handle(), 0, binding.tiledDevice->Handle(), 0, binding.original.size());
             memoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-            context.detiler->Dispatch(commands, TextureTileMode::kR64KBX, binding.color.elementBytes, binding.tiledDevice->Handle(), 0, binding.linearDevice->Handle(), 0, binding.mip);
+            context.detiler->Dispatch(commands, TextureTileMode::kR64KBX, binding.color.elementBytes, binding.tiledDevice->Handle(), 0, binding.linearDevice->Handle(), 0, binding.mip, false, FixR0bEnabled() ? binding.color.slice : 0u);
             memoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         }
         imageBarrier(context, commands, binding.target->Image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -2287,7 +2295,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                     CopyBuffer(context, commands, binding.linearDevice->Handle(), 0, binding.dump->Handle(), 0, binding.linearDevice->Size());
                 }
             }
-            context.detiler->Dispatch(commands, TextureTileMode::kR64KBX, binding.color.elementBytes, binding.linearDevice->Handle(), 0, binding.tiledDevice->Handle(), 0, binding.mip, true);
+            context.detiler->Dispatch(commands, TextureTileMode::kR64KBX, binding.color.elementBytes, binding.linearDevice->Handle(), 0, binding.tiledDevice->Handle(), 0, binding.mip, true, FixR0bEnabled() ? binding.color.slice : 0u);
             memoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             CopyBuffer(context, commands, binding.tiledDevice->Handle(), 0, binding.tiled->Handle(), 0, binding.original.size());
         }
@@ -2739,7 +2747,7 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
         }
         if (resident != nullptr) {
             const char* refusal = nullptr;
-            const bool current = keys == DccKeys::ClearRegister ? clearToTexel(*resident, texel, color.elementBytes, refusal) : StorageTexture::FindPending(color.address, color.bytes) == resident || resident->UploadedKeys() == keys;
+            const bool current = keys == DccKeys::ClearRegister ? clearToTexel(*resident, texel, color.elementBytes, refusal) : StorageTexture::FindPending(color.address, color.bytes, FixR0bEnabled() ? color.slice : 0u) == resident || resident->UploadedKeys() == keys;
             if (current) {
                 resident->MarkDirty();
                 MarkDccUncompressed(context, color.dccAddress, color.bytes);
