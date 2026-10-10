@@ -151,6 +151,31 @@ void CheckUnstoredPages() {
     Require(PagesUnstoredSince(base + Block - 4096, 2 * 4096, synced) == 0, "a range across two blocks is answered");
 }
 
+// APS5_FIX_BOOT_STRIP: a CPU store into the table after a surface, in a block no driver store
+// noted, is not a store over the surface's part of the block (the refresh write-back's edge rule);
+// a whole-block driver store since still is.
+void CheckUnnotedEdge() {
+    void* memory = AllocateWatched(2 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, 2 * Block);
+    const auto synced = CollectWrites(base, 2 * Block);
+    Require(synced != 0, "the unnoted edge block is not collected");
+    const char* fix = std::getenv("APS5_FIX_BOOT_STRIP");
+    const bool off = (fix != nullptr && std::string(fix) == "0") || std::getenv("APS5_NO_EDGE_PAGE_KEEP") != nullptr;
+    constexpr std::size_t surfaceBytes = 14 * 4096;
+    bytes[14 * 4096 + 8] = 0x22;
+    bytes[Block + 15 * 4096] = 0x22;
+    CollectWritesUncached(base, 2 * Block);
+    Require(StoredOver(base, surfaceBytes, synced) == off, off ? "a CPU store outside an unnoted edge range is missed with the fix off" : "a CPU store outside the surface counts for it in an unnoted block");
+    Require(StoredOver(base, 15 * 4096, synced), "a CPU store into the range of an unnoted block is not seen");
+    const auto beforeWhole = TrackerGeneration();
+    MarkWritten(base + Block, Block);
+    bytes[Block + 15 * 4096] = 0x33;
+    CollectWritesUncached(base, 2 * Block);
+    Require(StoredOver(base + Block, surfaceBytes, beforeWhole), "a whole-block driver store into an unnoted block is not seen");
+}
+
 void CheckOwnStore() {
     void* memory = AllocateWatched(2 * Block);
     const auto base = reinterpret_cast<std::uint64_t>(memory);
@@ -213,6 +238,7 @@ int main() {
         }
         CheckSharedBlock();
         CheckUnstoredPages();
+        CheckUnnotedEdge();
         CheckOwnStore();
         CheckEqualsSince();
     } catch (const std::exception& error) {

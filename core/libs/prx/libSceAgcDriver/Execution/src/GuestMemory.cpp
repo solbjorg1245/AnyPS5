@@ -1162,10 +1162,13 @@ bool edgePageKeep() {
     return enabled;
 }
 
-// The unit shadow dropped a whole 64 KiB unit any store reached after its retile, so the CPU's
-// per-macroblock table right after the Bink chroma plane dropped the plane's last 56 KiB every
-// frame (the boot videos' bottom right strip). PagesUnstoredSince names the pages it may still
-// publish. APS5_FIX_BOOT_STRIP=0 makes it answer 0: the whole unit is dropped as before.
+// The CPU's per-macroblock table right after the Bink chroma plane shares the plane's last 64 KiB
+// block. StoredOver took a block no partial driver store had noted as stored over whatever the
+// CPU's pages said, so every refresh write-back left that edge block to the CPU and the plane's
+// last 56 KiB re-uploaded stale (the boot videos' bottom right strip). With the switch such a
+// block answers by its CPU pages when no driver store reached it since (DriverPieces::latest),
+// and the unit shadow publishes a stale unit's unstored retiled pages (PagesUnstoredSince).
+// APS5_FIX_BOOT_STRIP=0 restores both old answers.
 bool pageKeepUnits() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_FIX_BOOT_STRIP");
@@ -1578,7 +1581,13 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
             }
         }
         const auto& entry = tracker.driverPieces[block];
-        if (!entry.noted) return true;
+        if (!entry.noted) {
+            // No partial driver store noted: the newer written stamp is the CPU's (checked above,
+            // page by page) unless a driver store (a whole-block one) came since, or neither
+            // explains it.
+            if (!pageKeepUnits() || entry.latest > generation || tracker.cpuStampOf(block) <= generation) return true;
+            continue;
+        }
         if (entry.whole > generation || entry.dropped > generation) return true;
         const auto begin = tracker.blockBegin(block);
         const auto from = std::max(address, begin) - begin;
