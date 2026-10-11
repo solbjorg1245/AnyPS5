@@ -2624,6 +2624,7 @@ void StorageTexture::MarkDirty() {
     // A depth surface of this memory and extent now holds older depth than this image (the build
     // notes the write too, but a cached build does not run again).
     NoteDepthSurfaceWrite(descriptor.baseAddress, descriptor.width, descriptor.height);
+    NoteDisplayBufferStorageWrite(descriptor.baseAddress, descriptor.width, descriptor.height);
     markLayersPending(0, trackedLayers);
 }
 

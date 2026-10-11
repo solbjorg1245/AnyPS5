@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/NewDrawKeyTally.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
@@ -1089,6 +1090,27 @@ void testFastPipelineMemo() {
     for (int i = 1; i < 9; ++i) check(ring.Find(keys[i], KeyHash(keys[i]), 0, nullptr) == values[i], "fast pipeline memo: a recent key was lost");
 }
 
+// Native aspect's UI rect (AspectFit): the part of the 16:9 display buffer that is shown undistorted
+// at the window's aspect, and a viewport or scissor carried into it.
+void testUndistortedRect() {
+    using namespace AgcDriver;
+    const auto same = [](AspectFitRect rect, std::int32_t x, std::int32_t y, std::uint32_t width, std::uint32_t height) {
+        return rect.x == x && rect.y == y && rect.width == width && rect.height == height;
+    };
+    check(same(ComputeUndistortedRect_nid_postfix(3840, 2160, 2560, 1080), 480, 0, 2880, 2160), "undistorted rect: 21:9 keeps a centred 2880-wide column");
+    check(same(ComputeUndistortedRect_nid_postfix(1920, 1080, 2560, 1080), 240, 0, 1440, 1080), "undistorted rect: 21:9 in a 1080p buffer");
+    check(same(ComputeUndistortedRect_nid_postfix(3840, 2160, 5120, 1440), 960, 0, 1920, 2160), "undistorted rect: 32:9 keeps half the width");
+    check(same(ComputeUndistortedRect_nid_postfix(3840, 2160, 3440, 1440), 491, 0, 2858, 2160), "undistorted rect: 3440x1440 rounds");
+    check(same(ComputeUndistortedRect_nid_postfix(3840, 2160, 1280, 800), 0, 108, 3840, 1944), "undistorted rect: 16:10 keeps a centred band");
+    check(same(ComputeUndistortedRect_nid_postfix(3840, 2160, 1920, 1080), 0, 0, 3840, 2160), "undistorted rect: 16:9 is the whole buffer");
+    check(same(ComputeUndistortedRect_nid_postfix(3840, 2160, 0, 0), 0, 0, 3840, 2160), "undistorted rect: no presentation aspect");
+    const AspectFitRect column{480, 0, 2880, 2160};
+    check(same(MapRectInto_nid_postfix({0, 0, 3840, 2160}, 3840, 2160, column), 480, 0, 2880, 2160), "map rect: the whole buffer is the rect");
+    check(same(MapRectInto_nid_postfix({0, 1080, 1920, 1080}, 3840, 2160, column), 480, 1080, 1440, 1080), "map rect: the bottom-left quarter");
+    check(same(MapRectInto_nid_postfix({1, 1, 1, 1}, 3840, 2160, column), 480, 1, 2, 1), "map rect: rounds outwards");
+    check(same(MapRectInto_nid_postfix({0, 0, 3840, 2160}, 3840, 2160, {0, 108, 3840, 1944}), 0, 108, 3840, 1944), "map rect: a band");
+}
+
 }
 
 int main() {
@@ -1115,6 +1137,7 @@ int main() {
         testNewestWriterMemo();
         testHostImportMemo();
         testFastPipelineMemo();
+        testUndistortedRect();
         LibcRunShutdown_nid_postfix();
         std::puts("AGC driver submit tests passed");
         return 0;

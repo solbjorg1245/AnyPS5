@@ -473,6 +473,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         tests/TextureDetiler.cpp
         Graphics/src/Draw.cpp
         Graphics/src/DepthSurface.cpp
+        Execution/src/AspectFit.cpp
         Graphics/src/Pipeline.cpp
         Graphics/src/FastLayouts.cpp
         Graphics/src/FastRing.cpp

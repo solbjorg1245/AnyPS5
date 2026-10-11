@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <cstdlib>
 #include <stdexcept>
@@ -12,6 +13,8 @@ namespace AgcDriver::DriverDetail {
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
+    // APS5_ASPECT_PROBE: the display buffer writes of this dispatch (DepthSurface.hpp).
+    const Graphics::AspectProbeDispatch aspectProbe(address);
     auto it = submission.shaders->upper_bound(address);
     require(it != submission.shaders->begin(), "compute program does not belong to a registered shader");
     --it;

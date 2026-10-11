@@ -30,6 +30,15 @@ void SetPresentationAspect_nid_postfix(std::uint32_t width, std::uint32_t height
 AspectFitSize PresentationAspect_nid_postfix();
 // The destination rect of a width x height flip: contained at the presentation aspect when one is set.
 AspectFitRect ComputePresentationRect_nid_postfix(std::uint32_t sourceWidth, std::uint32_t sourceHeight, std::uint32_t destinationWidth, std::uint32_t destinationHeight);
+// The part of a bufferWidth x bufferHeight buffer that keeps the buffer's own aspect once the buffer
+// is presented at presentWidth:presentHeight: a centred full-height column when the presentation is
+// wider, a centred full-width band when it is narrower, the whole buffer at the same aspect or with
+// no presentation aspect (0x0). Native aspect's UI rect: a 16:9 layout drawn into it keeps its
+// proportions on a 21:9 or 16:10 window.
+AspectFitRect ComputeUndistortedRect_nid_postfix(std::uint32_t bufferWidth, std::uint32_t bufferHeight, std::uint32_t presentWidth, std::uint32_t presentHeight);
+// `rect` (pixels of a bufferWidth x bufferHeight buffer) carried into `into` as the whole buffer maps
+// onto it, rounded outwards to whole pixels.
+AspectFitRect MapRectInto_nid_postfix(AspectFitRect rect, std::uint32_t bufferWidth, std::uint32_t bufferHeight, AspectFitRect into);
 
 }
 }

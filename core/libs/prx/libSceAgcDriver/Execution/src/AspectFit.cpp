@@ -67,5 +67,29 @@ AspectFitRect ComputePresentationRect_nid_postfix(std::uint32_t sourceWidth, std
     return ComputeContainRect_nid_postfix(aspect.width, aspect.height, destinationWidth, destinationHeight);
 }
 
+AspectFitRect ComputeUndistortedRect_nid_postfix(std::uint32_t bufferWidth, std::uint32_t bufferHeight, std::uint32_t presentWidth, std::uint32_t presentHeight) {
+    require(bufferWidth != 0 && bufferHeight != 0, "buffer extent must be non-zero");
+    if (presentWidth == 0 || presentHeight == 0) return AspectFitRect{0, 0, bufferWidth, bufferHeight};
+    // How much wider than tall the presenter draws a buffer pixel.
+    const auto stretch = (static_cast<double>(presentWidth) * bufferHeight) / (static_cast<double>(presentHeight) * bufferWidth);
+    if (stretch >= 1.0) {
+        const auto width = std::clamp<std::uint32_t>(roundToExtent(bufferWidth / stretch), 1, bufferWidth);
+        return AspectFitRect{static_cast<std::int32_t>((bufferWidth - width) / 2), 0, width, bufferHeight};
+    }
+    const auto height = std::clamp<std::uint32_t>(roundToExtent(bufferHeight * stretch), 1, bufferHeight);
+    return AspectFitRect{0, static_cast<std::int32_t>((bufferHeight - height) / 2), bufferWidth, height};
+}
+
+AspectFitRect MapRectInto_nid_postfix(AspectFitRect rect, std::uint32_t bufferWidth, std::uint32_t bufferHeight, AspectFitRect into) {
+    require(bufferWidth != 0 && bufferHeight != 0, "buffer extent must be non-zero");
+    const auto scaleX = static_cast<double>(into.width) / bufferWidth;
+    const auto scaleY = static_cast<double>(into.height) / bufferHeight;
+    const auto left = std::floor(into.x + rect.x * scaleX);
+    const auto top = std::floor(into.y + rect.y * scaleY);
+    const auto right = std::ceil(into.x + (static_cast<double>(rect.x) + rect.width) * scaleX);
+    const auto bottom = std::ceil(into.y + (static_cast<double>(rect.y) + rect.height) * scaleY);
+    return AspectFitRect{static_cast<std::int32_t>(left), static_cast<std::int32_t>(top), roundToExtent(right - left), roundToExtent(bottom - top)};
+}
+
 }
 }
