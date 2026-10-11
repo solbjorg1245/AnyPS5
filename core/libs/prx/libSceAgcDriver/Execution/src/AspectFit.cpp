@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -11,6 +12,8 @@ namespace {
 void require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(std::string("AspectFit: ") + reason);
 }
+
+std::atomic<std::uint64_t> presentationAspect{0};
 
 std::uint32_t roundToExtent(double value) {
     require(value >= 0.0 && value <= static_cast<double>(std::numeric_limits<std::uint32_t>::max()), "computed extent is out of range");
@@ -47,6 +50,21 @@ std::uint32_t ComputeWidthForHeight_nid_postfix(std::uint32_t sourceWidth, std::
 std::uint32_t ComputeHeightForWidth_nid_postfix(std::uint32_t sourceWidth, std::uint32_t sourceHeight, std::uint32_t width) {
     require(sourceWidth != 0 && sourceHeight != 0, "source extent must be non-zero");
     return std::max<std::uint32_t>(1, roundToExtent(static_cast<double>(width) * sourceHeight / sourceWidth));
+}
+
+void SetPresentationAspect_nid_postfix(std::uint32_t width, std::uint32_t height) {
+    presentationAspect.store(width == 0 || height == 0 ? 0 : (static_cast<std::uint64_t>(width) << 32) | height, std::memory_order_relaxed);
+}
+
+AspectFitSize PresentationAspect_nid_postfix() {
+    const auto aspect = presentationAspect.load(std::memory_order_relaxed);
+    return AspectFitSize{static_cast<std::uint32_t>(aspect >> 32), static_cast<std::uint32_t>(aspect)};
+}
+
+AspectFitRect ComputePresentationRect_nid_postfix(std::uint32_t sourceWidth, std::uint32_t sourceHeight, std::uint32_t destinationWidth, std::uint32_t destinationHeight) {
+    const auto aspect = PresentationAspect_nid_postfix();
+    if (aspect.width == 0 || aspect.height == 0) return ComputeContainRect_nid_postfix(sourceWidth, sourceHeight, destinationWidth, destinationHeight);
+    return ComputeContainRect_nid_postfix(aspect.width, aspect.height, destinationWidth, destinationHeight);
 }
 
 }

@@ -231,8 +231,59 @@ static void TestReviewFixes() {
     std::filesystem::remove_all(base);
 }
 
+static void TestNativeAspect() {
+    const auto planFor = [](const std::string& text) { return PortSettings::PlanNativeAspect(FromText(text.c_str())); };
+    const auto native = [&](const char* resolution) { return planFor(std::string("NativeAspect = on\nResolution = ") + resolution); };
+    const auto is = [](const PortSettings::NativeAspectPlan& plan, std::uint32_t width, std::uint32_t height, const char* convar) {
+        return plan.Active() && plan.renderWidth == width && plan.renderHeight == height && std::string(plan.slot->convar) == convar;
+    };
+    Require(!planFor("Resolution = 2560x1080").Active(), "off by default");
+    Require(PortSettings::GameArgs(FromText("Resolution = 2560x1080"))[0] == "+r_Wants4K=WantsBase", "off: stage 1 tier");
+    Require(is(native("2560x1080"), 2560, 1080, "WantsHigh"), "21:9 1080p renders 2560x1080 in the 4K-display slot");
+    Require(is(native("1280x800"), 1280, 800, "WantsPerf"), "Steam Deck renders 1280x800 in the 1080p-display slot");
+    Require(is(native("1920x1080"), 1920, 1080, "WantsBase"), "16:9 1080p is the WantsBase tier unchanged");
+    Require(is(native("3840x2160"), 2560, 1440, "WantsHigh"), "4K renders 1440p as before");
+    Require(is(native("1920x1200"), 1920, 1200, "WantsHigh"), "16:10 1200p");
+    Require(is(native("3440x1440"), 3440, 1440, "WantsSuperHigh"), "21:9 1440p needs the 3840-wide slot");
+    Require(is(native("5120x1440"), 3840, 1080, "WantsSuperHigh"), "32:9 is held to 3840 wide");
+    Require(is(planFor("NativeAspect = on\nResolution = 2560x1080\nRenderResolution = 900"), 2136, 900, "WantsHigh"), "RenderResolution sets the height");
+    Require(std::abs(native("2560x1080").Aspect() - 2560.0f / 1080.0f) < 1e-6f, "aspect is the output's");
+    Require(PortSettings::GameArgs(FromText("NativeAspect = on\nResolution = 2560x1080"))[0] == "+r_Wants4K=WantsHigh", "native slot forced");
+    Require(PortSettings::Describe(FromText("NativeAspect = on\nResolution = 2560x1080")).find("native aspect 2.3704: render 2560x1080 in the r_Wants4K=WantsHigh slot") != std::string::npos, "describe");
+
+    const auto alone = FromText("NativeAspect = on");
+    Require(!alone.nativeAspect && alone.warnings.size() == 1 && !PortSettings::PlanNativeAspect(alone).Active(), "needs Resolution");
+    Require(!FromText("NativeAspect = maybe").nativeAspect && FromText("NativeAspect = maybe").warnings.size() == 1, "bad value refused");
+    auto environment = PortSettings::Parse("Resolution = 2560x1080\n", "test.ini");
+    PortSettings::ApplyEnvironment(environment, [](const char* name) -> const char* { return std::string(name) == "APS5_NATIVE_ASPECT" ? "1" : nullptr; });
+    PortSettings::Normalize(environment);
+    Require(environment.nativeAspect && environment.Any(), "APS5_NATIVE_ASPECT");
+
+    // The table rewrite touches only the slot's render width and height.
+    auto table = PortSettings::TierTable;
+    for (const auto& write : PortSettings::TierTableWrites(native("2560x1080"))) table[write.entry] = write.value;
+    Require(table[2] == 2560 && table[7] == 1080, "WantsHigh render entries");
+    for (std::size_t entry = 0; entry < table.size(); ++entry) {
+        if (entry != 2 && entry != 7) Require(table[entry] == PortSettings::TierTable[entry], "other entries untouched");
+    }
+    const auto deck = PortSettings::TierTableWrites(native("1280x800"));
+    Require(deck[0].entry == 0 && deck[0].value == 1280 && deck[1].entry == 5 && deck[1].value == 800, "WantsPerf render entries");
+    Require(PortSettings::AspectBits(16.0f / 9.0f) == PortSettings::Aspect16x9Bits, "16:9 bits");
+
+    // The aspect field follows the display mode, and is left alone when it holds anything else.
+    const auto plan = native("2560x1080");
+    const auto wide = PortSettings::AspectBits(plan.Aspect());
+    Require(PortSettings::DisplayAspectBits(PortSettings::Aspect16x9Bits, 3, plan) == wide, "slot mode: native aspect");
+    Require(PortSettings::DisplayAspectBits(wide, 3, plan) == wide, "kept");
+    Require(PortSettings::DisplayAspectBits(wide, 2, plan) == PortSettings::Aspect16x9Bits, "other mode: back to 16:9");
+    Require(PortSettings::DisplayAspectBits(PortSettings::Aspect16x9Bits, 2, plan) == PortSettings::Aspect16x9Bits, "other mode: 16:9 kept");
+    Require(!PortSettings::DisplayAspectBits(0x3f800000, 3, plan), "unknown value left alone");
+    Require(!PortSettings::DisplayAspectBits(PortSettings::Aspect16x9Bits, 9, plan), "unknown mode left alone");
+}
+
 int main() {
     TestReviewFixes();
+    TestNativeAspect();
     TestParse();
     TestEnvironment();
     TestRenderTier();
