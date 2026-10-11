@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_FASTCENSUS_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -282,20 +283,29 @@ struct PipeCensusRuns {
 };
 
 // The ranges the open run writes, by kind (shader-written buffers; color and depth targets). A range
-// inside a known one of the same kind is not added again.
+// inside a known one of the same kind is not added again: the known one keeps the newer serial (the
+// recording pipe's item, RecordPipe.hpp; the census leaves it 0), and Prune drops recorded ones.
 struct PipeCensusOverlay {
     static constexpr std::uint8_t Write = 1, Target = 2;
     struct Range {
         std::uint64_t begin, end;
         std::uint8_t kind;
+        std::uint64_t serial = 0;
     };
     std::vector<Range> ranges;
 
     void Add(const Range& range) {
-        for (const auto& known : ranges) {
-            if (known.begin <= range.begin && range.end <= known.end && (known.kind & range.kind) == range.kind) return;
+        for (auto& known : ranges) {
+            if (known.begin <= range.begin && range.end <= known.end && (known.kind & range.kind) == range.kind) {
+                known.serial = std::max(known.serial, range.serial);
+                return;
+            }
         }
         ranges.push_back(range);
+    }
+    // Drops the ranges of the items up to `consumed`.
+    void Prune(std::uint64_t consumed) {
+        std::erase_if(ranges, [consumed](const Range& range) { return range.serial <= consumed; });
     }
     // The kinds of the known ranges [begin, end) overlaps; 0 for none.
     std::uint8_t Overlaps(std::uint64_t begin, std::uint64_t end) const {
