@@ -3823,6 +3823,8 @@ void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes) {
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
+    // The crash report's store ring names this image for every store below (texels and keys).
+    const GuestMemory::StoreTag storeTag("storage write-back", flushReason, descriptor.baseAddress);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
     struct Account {
@@ -4012,6 +4014,12 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         settle(true);
         return;
     }
+    lastWriteBackMs = GuestMemory::StoreClockMs();
+    lastWriteBackReason = flushReason;
+    lastStoredBegin = keep.front().first;
+    lastStoredEnd = keep.back().second;
+    lastKeysStored = descriptor.dccAddress != 0 && !IsDccClear(filledKeys);
+    ++writeBacks;
     if (const auto* import = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
         if (blockUnits) {
             // The kept blocks alone pass through the retiler (windows of their slices).
@@ -4313,6 +4321,40 @@ void StorageTexture::release() noexcept {
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
     if (memory) FreeDeviceMemory(context, memory);
+}
+
+void StorageTexture::DescribeForCrash(std::uint64_t address, void (*print)(const char* text)) {
+    auto& live = Live();
+    std::unique_lock lock(live.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        print("[crash-resources]   storage images: live registry busy\n");
+        return;
+    }
+    constexpr std::uint64_t block = 65536;
+    const auto now = GuestMemory::StoreClockMs();
+    std::size_t covering = 0;
+    char line[512];
+    for (const auto* texture : live.textures) {
+        const auto& d = texture->descriptor;
+        const auto end = d.baseAddress + texture->guestBytes;
+        const bool inside = address >= d.baseAddress && address < end;
+        const bool edge = !inside && address >= (d.baseAddress & ~(block - 1)) && address < ((end + block - 1) & ~(block - 1));
+        const bool keys = d.dccAddress != 0 && address >= d.dccAddress && address < d.dccAddress + texture->guestBytes / 256;
+        if (!inside && !edge && !keys) continue;
+        if (++covering > 7) continue;
+        const auto unit = inside && texture->trackedLayerBytes != 0 ? std::min<std::uint64_t>((address - d.baseAddress) / texture->trackedLayerBytes, texture->trackedLayers - 1) : 0;
+        const bool unitPending = unit < texture->layerPending.size() && texture->layerPending[unit];
+        const auto unitGeneration = unit < texture->layerGeneration.size() ? texture->layerGeneration[unit] : 0;
+        const auto pendingUnits = std::count(texture->layerPending.begin(), texture->layerPending.end(), true);
+        std::snprintf(line, sizeof(line), "[crash-resources]   storage image 0x%llx+0x%llx (address %s) format %u tile %u %ux%u mips %u dcc 0x%llx: unit %llu of %u pending %d gen %llu (image gen %llu, %lld units pending, dirty %d, released %d); last write-back %s at %llu ms (%llu ms ago) stored 0x%llx-0x%llx keys %d, %u write-backs\n", static_cast<unsigned long long>(d.baseAddress), static_cast<unsigned long long>(texture->guestBytes), inside ? "inside" : keys ? "in its DCC keys" : "in its 64 KiB edge blocks", static_cast<unsigned>(d.format), static_cast<unsigned>(d.tileMode), d.width, d.height, static_cast<unsigned>(d.mipCount), static_cast<unsigned long long>(d.dccAddress), static_cast<unsigned long long>(unit), texture->trackedLayers, unitPending ? 1 : 0, static_cast<unsigned long long>(unitGeneration), static_cast<unsigned long long>(texture->generation), static_cast<long long>(pendingUnits), texture->dirty ? 1 : 0, texture->released ? 1 : 0, texture->lastWriteBackReason != nullptr ? texture->lastWriteBackReason : "-", static_cast<unsigned long long>(texture->lastWriteBackMs), static_cast<unsigned long long>(texture->lastWriteBackMs != 0 ? now - std::min(now, texture->lastWriteBackMs) : 0), static_cast<unsigned long long>(texture->lastStoredBegin), static_cast<unsigned long long>(texture->lastStoredEnd), texture->lastKeysStored ? 1 : 0, texture->writeBacks);
+        print(line);
+    }
+    std::snprintf(line, sizeof(line), "[crash-resources]   storage images: %zu of %zu live cover it%s\n", covering, live.textures.size(), covering > 7 ? " (first 7 shown)" : "");
+    print(line);
+}
+
+namespace {
+const bool storageCrashDescriber = (GuestMemory::AddCrashDescriber(&StorageTexture::DescribeForCrash), true);
 }
 
 std::uint64_t StorageTexture::GuestBytes() const {

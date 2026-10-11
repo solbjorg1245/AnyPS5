@@ -29,6 +29,8 @@ bool GuestArenaProtection_nid_postfix(std::uintptr_t address, std::uint32_t* pro
 bool GuestArenaCollectWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear);
 // Debug aid: the page's shared-view and clean/fresh range state (WindowsMappings::Describe).
 void GuestArenaDescribePage_nid_postfix(std::uintptr_t address, char* text, std::size_t size);
+// The same without waiting (the crash report): false while the mappings are busy.
+bool GuestArenaTryDescribePage_nid_postfix(std::uintptr_t address, char* text, std::size_t size);
 // Bumped by every commit over a placeholder, shared map and release of guest memory.
 std::uint64_t GuestArenaMappingSerial_nid_postfix();
 // Fine (4 KiB) write tracking for the shared views over the range (WindowsMappings::TrackParts);

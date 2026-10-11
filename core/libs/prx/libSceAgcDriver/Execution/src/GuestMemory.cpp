@@ -3,6 +3,8 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libc/include/CrashResources.hpp"
+#include <cstdarg>
 #include <mutex>
 #include <array>
 #include <chrono>
@@ -1494,9 +1496,204 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     return true;
 }
 
+namespace {
+
+// The crash-time store ring (see CrashResourcesEnabled). A slot's sequence is 2 * index + 2 once
+// record `index` is complete there and odd while a store writes it; a reader keeps a record only
+// when the sequence matched before and after its copy.
+constexpr std::size_t StoreRingSize = std::size_t{1} << 15;
+constexpr std::uint64_t RecordedStoreBytes = 16;
+
+struct StoreSlot {
+    std::atomic<std::uint64_t> sequence{0};
+    GuestStoreRecord record;
+};
+
+// Made at the first store (3 MiB), so a test may set the switch before it.
+StoreSlot* StoreSlots() {
+    static StoreSlot* const slots = [] {
+        const char* text = std::getenv("APS5_CRASH_RESOURCES");
+        return text != nullptr && std::strcmp(text, "1") == 0 ? new StoreSlot[StoreRingSize] : nullptr;
+    }();
+    return slots;
+}
+
+std::atomic<std::uint64_t> storeRingNext{0};
+thread_local const char* storeTag = nullptr;
+thread_local const char* storeReason = nullptr;
+thread_local std::uint64_t storeTagAddress = 0;
+std::atomic<CrashDescriber> crashDescribers[8] = {};
+std::atomic<std::size_t> crashDescriberCount{0};
+
+void recordStore(std::uint64_t begin, std::uint64_t end, std::uint32_t generation, const char* kind) {
+    auto* slots = StoreSlots();
+    if (slots == nullptr || end <= begin || end - begin < RecordedStoreBytes) return;
+    const auto index = storeRingNext.fetch_add(1, std::memory_order_relaxed);
+    auto& slot = slots[index % StoreRingSize];
+    slot.sequence.store(2 * index + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    auto& record = slot.record;
+    record = GuestStoreRecord{};
+    record.begin = begin;
+    record.end = end;
+    record.milliseconds = StoreClockMs();
+    record.generation = generation;
+#ifdef _WIN32
+    record.thread = static_cast<std::uint32_t>(GetCurrentThreadId());
+#endif
+    record.kind = kind;
+    record.tag = storeTag;
+    record.reason = storeReason;
+    record.tagAddress = storeTagAddress;
+    CaptureCallerOffsets(std::span(record.callers), 1);
+    slot.sequence.store(2 * index + 2, std::memory_order_release);
+}
+
+#ifdef _WIN32
+void crashLine(CrashPrint print, const char* format, ...) {
+    char line[512];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(line, sizeof(line), format, args);
+    va_end(args);
+    print(line);
+}
+
+// The write tracker's stamps over `address` (try-lock: "busy" while another thread holds it).
+void describeTrackerAt(std::uint64_t address, CrashPrint print) {
+    auto& tracker = Tracker();
+    std::unique_lock lock(tracker.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        print("[crash-resources]   write tracker: busy\n");
+        return;
+    }
+    if (!tracker.initialized || !tracker.watched || !tracker.covers(address, 1)) {
+        print("[crash-resources]   write tracker: address not tracked\n");
+        return;
+    }
+    const auto block = tracker.blockOf(address);
+    const auto page = static_cast<std::size_t>((address - tracker.blockBegin(block)) / WritePageBytes);
+    const auto pageStamp = [&](const std::unordered_map<std::uint64_t, WriteTracker::CpuPages>& record) -> std::uint32_t {
+        const auto found = record.find(block);
+        return found != record.end() ? found->second.pages[page] : 0u;
+    };
+    const auto* pieces = block < tracker.driverPieces.size() ? &tracker.driverPieces[block] : nullptr;
+    crashLine(print, "[crash-resources]   write tracker: now %u; 64 KiB block 0x%llx stamps any %u cpu %u written %u; its 4 KiB page %zu: cpu %u driver %u; driver whole %u latest %u\n", tracker.generation.load(std::memory_order_relaxed), static_cast<unsigned long long>(tracker.blockBegin(block)), tracker.stampOf(block), tracker.cpuStampOf(block), tracker.writtenStampOf(block), page, pageStamp(tracker.cpuPages), pageStamp(tracker.driverPages), pieces != nullptr ? pieces->whole : 0u, pieces != nullptr ? pieces->latest : 0u);
+}
+
+void describeAddress(std::uint64_t address, std::uint64_t now, CrashPrint print) {
+    MEMORY_BASIC_INFORMATION memory{};
+    const bool queried = VirtualQuery(reinterpret_cast<const void*>(address), &memory, sizeof(memory)) == sizeof(memory);
+    char page[384];
+    if (!GuestArena::GuestArenaTryDescribePage_nid_postfix(static_cast<std::uintptr_t>(address), page, sizeof(page))) std::snprintf(page, sizeof(page), "mappings busy");
+    crashLine(print, "[crash-resources] 0x%llx: host state 0x%lx protect 0x%lx type 0x%lx; %s\n", static_cast<unsigned long long>(address), queried ? memory.State : 0ul, queried ? memory.Protect : 0ul, queried ? memory.Type : 0ul, page);
+    describeTrackerAt(address, print);
+    // The 64 bytes from the address: the words the dump printed for a register pointing there.
+    GuestStoreRecord stores[12];
+    const auto found = RecentGuestStores(address, 64, stores);
+    for (std::size_t i = 0; i < found; ++i) {
+        const auto& store = stores[i];
+        crashLine(print, "[crash-resources]   store %s 0x%llx+0x%llx at %llu ms (%llu ms ago) thread %u gen %u by %s/%s 0x%llx; callers +0x%llx +0x%llx +0x%llx +0x%llx +0x%llx +0x%llx\n", store.kind != nullptr ? store.kind : "?", static_cast<unsigned long long>(store.begin), static_cast<unsigned long long>(store.end - store.begin), static_cast<unsigned long long>(store.milliseconds), static_cast<unsigned long long>(now - std::min(now, store.milliseconds)), store.thread, store.generation, store.tag != nullptr ? store.tag : "-", store.reason != nullptr ? store.reason : "-", static_cast<unsigned long long>(store.tagAddress), store.callers[0], store.callers[1], store.callers[2], store.callers[3], store.callers[4], store.callers[5]);
+    }
+    if (found == 0) print("[crash-resources]   no recorded driver store over its 64 bytes\n");
+    const auto describers = std::min(crashDescriberCount.load(std::memory_order_acquire), std::size(crashDescribers));
+    for (std::size_t i = 0; i < describers; ++i) {
+        if (const auto describer = crashDescribers[i].load(std::memory_order_acquire)) describer(address, print);
+    }
+}
+
+// The libc crash report's describer: every distinct 64-byte line of guest memory among `addresses`
+// (at most 24), in the order the dump named them.
+void describeCrash(const std::uint64_t* addresses, std::size_t count, CrashResources::Print print) {
+    std::uintptr_t arenaBase = 0;
+    std::size_t arenaBytes = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
+    const auto now = StoreClockMs();
+    const auto next = storeRingNext.load(std::memory_order_acquire);
+    std::uint64_t oldest = now;
+    if (auto* slots = StoreSlots(); slots != nullptr && next != 0) {
+        const auto index = next > StoreRingSize ? next - StoreRingSize : 0;
+        oldest = slots[index % StoreRingSize].record.milliseconds;
+    }
+    char module[MAX_PATH] = "?";
+    HMODULE handle = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(&describeCrash), &handle) && handle != nullptr) GetModuleFileNameA(handle, module, sizeof(module));
+    crashLine(print, "[crash-resources] at %llu ms: guest arena 0x%llx+0x%llx; store ring %llu stores, kept since %llu ms; callers are offsets into %s\n", static_cast<unsigned long long>(now), static_cast<unsigned long long>(arenaBase), static_cast<unsigned long long>(arenaBytes), static_cast<unsigned long long>(next), static_cast<unsigned long long>(oldest), module);
+    std::uint64_t lines[24];
+    std::size_t described = 0;
+    for (std::size_t i = 0; i < count && described < std::size(lines); ++i) {
+        const auto address = addresses[i];
+        if (address < arenaBase || address - arenaBase >= arenaBytes) continue;
+        const auto line = address & ~std::uint64_t{63};
+        if (std::find(lines, lines + described, line) != lines + described) continue;
+        lines[described++] = line;
+        describeAddress(address, now, print);
+    }
+    crashLine(print, "[crash-resources] %zu guest addresses described\n", described);
+}
+
+const bool crashResourcesRegistered = [] {
+    const char* text = std::getenv("APS5_CRASH_RESOURCES");
+    if (text != nullptr && std::strcmp(text, "1") == 0) CrashResources::CrashResourcesSetDescriber_nid_postfix(&describeCrash);
+    return true;
+}();
+#endif
+
+}
+
+bool CrashResourcesEnabled() {
+    return StoreSlots() != nullptr;
+}
+
+std::uint64_t StoreClockMs() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+std::size_t RecentGuestStores(std::uint64_t address, std::size_t bytes, std::span<GuestStoreRecord> out) {
+    auto* slots = StoreSlots();
+    if (slots == nullptr || out.empty() || bytes == 0) return 0;
+    const auto end = address + bytes;
+    const auto next = storeRingNext.load(std::memory_order_acquire);
+    std::size_t found = 0;
+    for (auto index = next; index > 0 && next - index < StoreRingSize && found < out.size(); --index) {
+        const auto& slot = slots[(index - 1) % StoreRingSize];
+        const auto sequence = slot.sequence.load(std::memory_order_acquire);
+        if (sequence != 2 * (index - 1) + 2) continue;
+        const GuestStoreRecord record = slot.record;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (slot.sequence.load(std::memory_order_relaxed) != sequence) continue;
+        if (record.begin >= end || address >= record.end) continue;
+        out[found++] = record;
+    }
+    return found;
+}
+
+void NoteGuestStore(std::uint64_t address, std::size_t bytes, const char* kind) {
+    if (StoreSlots() == nullptr) return;
+    recordStore(address, address + bytes, Tracker().generation.load(std::memory_order_relaxed) + 1, kind);
+}
+
+StoreTag::StoreTag(const char* tag, const char* reason, std::uint64_t address) : previousTag(storeTag), previousReason(storeReason), previousAddress(storeTagAddress) {
+    storeTag = tag;
+    storeReason = reason;
+    storeTagAddress = address;
+}
+
+StoreTag::~StoreTag() {
+    storeTag = previousTag;
+    storeReason = previousReason;
+    storeTagAddress = previousAddress;
+}
+
+void AddCrashDescriber(CrashDescriber describer) {
+    const auto index = crashDescriberCount.fetch_add(1, std::memory_order_acq_rel);
+    if (index < std::size(crashDescribers)) crashDescribers[index].store(describer, std::memory_order_release);
+}
+
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
     if (bytes == 0) return 0;
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
+        recordStore(stored.first, stored.second, tracker.generation.load(std::memory_order_relaxed) + 1, "driver memcpy");
         if (stored.second <= stored.first || !tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) return 0;
         ++tracker.generation;
         for (auto block = tracker.blockOf(stored.first); block <= tracker.blockOf(stored.second - 1); ++block) {
@@ -1555,6 +1752,7 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
     if (traced.first != traced.second && address < traced.second && address + bytes > traced.first) {
         std::fprintf(stderr, "[gpu-writes] 0x%llx+0x%zx reported from +0x%llx\n", static_cast<unsigned long long>(address), bytes, ModuleOffset(__builtin_return_address(0)));
     }
+    if (StoreSlots() != nullptr) recordStore(address, address + bytes, Tracker().generation.load(std::memory_order_relaxed) + 1, "gpu (MarkWritten)");
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();

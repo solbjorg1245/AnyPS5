@@ -301,6 +301,10 @@ public:
     // `address` to zero on the device (all mips and layers). The GPU must be idle. Returns the number
     // of images cleared.
     static std::size_t DebugClear(const Context& context, std::uint64_t address);
+    // Crash-time resource report (APS5_CRASH_RESOURCES=1, GuestMemory::AddCrashDescriber): the live
+    // images whose guest range, its 64 KiB edge blocks or its DCC key range hold `address`, with their
+    // pending state and last write-back. Try-locks the live registry; at most 8 lines.
+    static void DescribeForCrash(std::uint64_t address, void (*print)(const char* text));
     VkImage Image() const { return image; }
     const GuestTextureResource& Descriptor() const { return descriptor; }
     std::uint32_t ImageLayers() const { return geometry.imageLayers; }
@@ -488,6 +492,14 @@ private:
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;
+    // The last write-back that stored anything (DescribeForCrash): when (GuestMemory::StoreClockMs),
+    // why, the span of its stored ranges, whether it stored the DCC keys, and how many there were.
+    std::uint64_t lastWriteBackMs = 0;
+    const char* lastWriteBackReason = nullptr;
+    std::uint64_t lastStoredBegin = 0;
+    std::uint64_t lastStoredEnd = 0;
+    bool lastKeysStored = false;
+    std::uint32_t writeBacks = 0;
     std::atomic<bool> cached{false};
     // The present a consumer last proved the image current at (NoteProved).
     mutable std::atomic<std::uint64_t> provedPresent{0};

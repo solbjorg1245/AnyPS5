@@ -9,6 +9,7 @@
 #else
 #include <sys/mman.h>
 #endif
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdlib>
@@ -241,14 +242,55 @@ void CheckEqualsSince() {
     Require(EqualsCommittedSince(base + Block / 2, partial, synced), "a store outside the compared range is compared");
     Require(!EqualsCommittedSince(base, snapshot, synced), "a driver store into a stamped block is not seen");
 }
+
+// The crash report's store ring (APS5_CRASH_RESOURCES=1, set by main): the driver's stores of 16
+// bytes or more over an address, newest first, with the thread's StoreTag and the stored span.
+void CheckStoreRing() {
+    Require(CrashResourcesEnabled(), "the store ring is off with APS5_CRASH_RESOURCES=1");
+    void* memory = AllocateWatched(Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0, Block);
+    CollectWrites(base, Block);
+    std::array<std::byte, 256> bytes{};
+    bytes.fill(std::byte{0x5a});
+    {
+        const StoreTag tag("test image", "test reason", base);
+        Write(base + 512, bytes);
+    }
+    MarkWritten(base + 4096, 64);
+    Write(base + 8192, std::array<std::byte, 8>{});
+    std::vector<std::byte> original(1024, std::byte{0});
+    std::vector<std::byte> current(original);
+    std::fill(current.begin() + 100, current.begin() + 300, std::byte{1});
+    WriteChanged(base + 16384, current, original);
+
+    std::array<GuestStoreRecord, 8> found{};
+    auto count = RecentGuestStores(base + 600, 16, found);
+    Require(count == 1 && found[0].begin == base + 512 && found[0].end == base + 768, "the ring does not hold the store over the address");
+    Require(found[0].tag != nullptr && std::strcmp(found[0].tag, "test image") == 0 && found[0].reason != nullptr && std::strcmp(found[0].reason, "test reason") == 0 && found[0].tagAddress == base, "the store's tag is not recorded");
+    Require(found[0].kind != nullptr && std::strcmp(found[0].kind, "driver memcpy") == 0, "a Write is not recorded as a driver memcpy");
+    count = RecentGuestStores(base, Block, found);
+    Require(count == 3, "the ring holds " + std::to_string(count) + " stores over the block, not 3 (an 8-byte store is below the recorded size)");
+    Require(found[0].begin == base + 16384 + 100 && found[0].end == base + 16384 + 300, "WriteChanged is not recorded as its changed span");
+    Require(found[1].begin == base + 4096 && found[1].end == base + 4096 + 64 && found[1].kind != nullptr && std::strcmp(found[1].kind, "gpu (MarkWritten)") == 0 && found[1].tag == nullptr, "MarkWritten is not recorded untagged after the tag's scope");
+    Require(found[2].begin == base + 512, "the stores are not listed newest first");
+    Require(RecentGuestStores(base + 768, 4096 - 768, found) == 0, "a store is listed outside its range");
+}
 }
 
 int main() {
+    // Before the first store: the ring is made then (CheckStoreRing).
+#ifdef _WIN32
+    _putenv_s("APS5_CRASH_RESOURCES", "1");
+#else
+    setenv("APS5_CRASH_RESOURCES", "1", 1);
+#endif
     try {
         if (!WriteWatched()) {
             std::cout << "no write watching: skipped\n";
             return 77;
         }
+        CheckStoreRing();
         CheckSharedBlock();
         CheckUnstoredPages();
         CheckMixedEdge();

@@ -291,6 +291,56 @@ private:
 // written. Stack unwinding, so only for rare, profiled events.
 std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned skip);
 
+// Crash-time resource report (APS5_CRASH_RESOURCES=1, Windows; off by default). The crash report
+// (libc CrashResources.hpp) hands the driver every guest address a FATAL dumped; for each one the
+// driver prints its page's tracking state, the recent driver stores over it (a ring of the last
+// 32768 stores of 16 bytes or more: Write, WriteChanged's changed span, StoreOwnBytes, MarkWritten's
+// reported GPU stores, NoteGuestStore) and what the registries added with AddCrashDescriber hold
+// there. Everything at crash time takes try-locks only and prints a bounded number of lines.
+bool CrashResourcesEnabled();
+// The store ring's clock (steady, milliseconds; the [watch] lines use the same).
+std::uint64_t StoreClockMs();
+struct GuestStoreRecord {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::uint64_t milliseconds = 0;
+    // The tracker generation the store was stamped at (MarkWritten, NoteGuestStore: the one after the
+    // current generation when it was noted).
+    std::uint32_t generation = 0;
+    std::uint32_t thread = 0;
+    const char* kind = nullptr;
+    // The thread's StoreTag then: what stored (a storage write-back, a unit shadow publish), why, and
+    // the resource's base address.
+    const char* tag = nullptr;
+    const char* reason = nullptr;
+    std::uint64_t tagAddress = 0;
+    // Driver frames above the store, as CaptureCallerOffsets writes them.
+    unsigned long long callers[6] = {};
+};
+// The recorded stores overlapping [address, address + bytes), newest first (at most out.size());
+// lock-free, so the crash report may call it.
+std::size_t RecentGuestStores(std::uint64_t address, std::size_t bytes, std::span<GuestStoreRecord> out);
+// A store into guest memory the driver makes outside the paths above (a unit shadow's slab copy).
+void NoteGuestStore(std::uint64_t address, std::size_t bytes, const char* kind);
+// Names this thread's stores into guest memory for the ring until the scope ends.
+class StoreTag {
+public:
+    StoreTag(const char* tag, const char* reason, std::uint64_t address);
+    ~StoreTag();
+    StoreTag(const StoreTag&) = delete;
+    StoreTag& operator=(const StoreTag&) = delete;
+
+private:
+    const char* previousTag;
+    const char* previousReason;
+    std::uint64_t previousAddress;
+};
+using CrashPrint = void (*)(const char* text);
+// A registry's part of the report: prints (try-locks only, at most 8 lines) what it tracks over
+// `address`. Up to 8 describers; registered at static initialization.
+using CrashDescriber = void (*)(std::uint64_t address, CrashPrint print);
+void AddCrashDescriber(CrashDescriber describer);
+
 }
 
 extern "C" void AgcDriverCheckGuestMemory_nid_postfix(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable = false);

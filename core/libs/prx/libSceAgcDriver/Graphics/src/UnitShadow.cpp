@@ -391,9 +391,38 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         std::fprintf(stderr, "[shadow] publish %s: 0x%llx+0x%llx, %zu units, %.2f MiB, %zu slabs (packet 0x%x queue 0x%x)\n", ReasonNames[static_cast<std::size_t>(reason)], static_cast<unsigned long long>(ranges.front().first), static_cast<unsigned long long>(ranges.back().second - ranges.front().first), units, bytes / 1048576.0, copies.size(), packet.opcode, packet.queue);
     }
     recordCopies(*shadow, copies, ranges, bytes);
+    if (GuestMemory::CrashResourcesEnabled()) {
+        // The crash report's store ring: the slab copies land in the import (no MarkWritten).
+        const GuestMemory::StoreTag tag("unit shadow", ReasonNames[static_cast<std::size_t>(reason)], shadow->importBase);
+        for (const auto& [begin, end] : ranges) GuestMemory::NoteGuestStore(begin, static_cast<std::size_t>(end - begin), "gpu (shadow publish)");
+    }
     if (ShadowVerify()) verifyPublished(*shadow, copies);
     return units;
 }
+
+// Crash-time resource report (APS5_CRASH_RESOURCES=1): the unit shadows over `address`, try-locked.
+void describeShadowsAt(std::uint64_t address, GuestMemory::CrashPrint print) {
+    auto& registry = Registry();
+    std::unique_lock lock(registry.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        print("[crash-resources]   unit shadows: registry busy\n");
+        return;
+    }
+    char line[384];
+    std::size_t covering = 0;
+    for (const auto& [base, shadow] : registry.byBase) {
+        if (shadow == nullptr || address < shadow->importBase || address >= shadow->ImportEnd()) continue;
+        const auto unit = shadow->UnitOf(address);
+        if (unit >= shadow->Units() || ++covering > 4) continue;
+        const auto slabIndex = static_cast<std::size_t>(unit / SlabUnits());
+        const bool slab = slabIndex < shadow->slabs.size() && shadow->slabs[slabIndex] != nullptr;
+        std::snprintf(line, sizeof(line), "[crash-resources]   unit shadow of import 0x%llx+0x%llx: unit %llu at 0x%llx generation %llu published %u retiled pages 0x%08x slab %d, %u live units\n", static_cast<unsigned long long>(shadow->importBase), static_cast<unsigned long long>(shadow->importBytes), static_cast<unsigned long long>(unit), static_cast<unsigned long long>(shadow->UnitBegin(unit)), static_cast<unsigned long long>(shadow->generation[unit]), static_cast<unsigned>(shadow->published[unit]), shadow->retiledPages[unit], slab ? 1 : 0, shadow->liveUnits);
+        print(line);
+    }
+    if (covering == 0) print("[crash-resources]   unit shadows: none covers it\n");
+}
+
+const bool shadowCrashDescriber = (GuestMemory::AddCrashDescriber(&describeShadowsAt), true);
 
 std::size_t publishRange(const std::shared_ptr<UnitShadow>& shadow, std::uint64_t address, std::uint64_t end, PublishScope scope, PublishReason reason) {
     const auto begin = std::max(address, shadow->importBase);
