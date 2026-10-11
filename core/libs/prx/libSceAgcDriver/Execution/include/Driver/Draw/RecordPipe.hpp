@@ -21,7 +21,8 @@ namespace AgcDriver::DriverDetail {
 // below are header-only for tests/Submit.cpp; the threads, drains and stale redo are in RecordPipe.cpp.
 
 // APS5_RECORD_PIPE (read once; on by default since s60, "0" = off), declined under the switches that
-// need A-side state (plan 7), APS5_CAPTURE_DIR among them. The stage-0 census is off while it is on.
+// need A-side state (plan 7); APS5_CAPTURE_DIR no longer does (S3.1b: A records on its own while a
+// frame trace runs). The stage-0 census is off while it is on.
 bool RecordPipeActive();
 
 // APS5_RECORD_PIPE_DISPATCH=1 (read once, only with the pipe on; default off): queue-0 direct
