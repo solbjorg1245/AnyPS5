@@ -727,21 +727,37 @@ static void TestAddonContent() {
     const auto find = [&](const std::filesystem::path& addonDir = {}) { return AddonContent::Find(AddonContent::DumpFolders(app0), addonDir); };
     Require(find().empty() && AddonContent::DumpFolders(app0).size() == 1, "a plain dump holds no add-on");
 
-    // Not an add-on: an empty folder named after the label, another title's content id, a folder inside
-    // another dump (another region's app0 is not looked into).
+    // Not an add-on: an empty folder named after the label, a non-empty one with only the name (no
+    // metadata, also "...GIFT20" and a prefixed name), the wrong title id, GIFT1 metadata in a GIFT2-named
+    // folder, the base game folder, another title's content id, a folder inside another dump (another
+    // region's app0 is not looked into).
     std::filesystem::create_directories(dumps / "DEMONSSOULSGIFT2");
+    WriteFile(dumps / "EP9000-PPSA01341_00-DEMONSSOULSGIFT2" / "readme.txt", "just a file");
+    WriteFile(dumps / "XDEMONSSOULSGIFT2 old" / "license.dat", "x");
+    WriteFile(dumps / "DEMONSSOULSGIFT20" / "sce_sys" / "param.json", "{}");
+    WriteFile(dumps / "wrongtitle-DEMONSSOULSGIFT2" / "sce_sys" / "param.json", "{\"contentId\": \"EP9000-PPSA99999_00-DEMONSSOULSGIFT2\"}");
+    WriteFile(dumps / "gift1-DEMONSSOULSGIFT2" / "sce_sys" / "param.json", "{\"contentId\": \"EP9000-PPSA01341_00-DEMONSSOULSGIFT1\"}");
+    WriteFile(dumps / "sfo-wrongtitle" / "sce_sys" / "param.sfo", std::string(8, '\0') + "CONTENT_ID" + std::string(2, '\0') + "EP9000-PPSA99999_00-DEMONSSOULSGIFT2" + std::string(3, '\0'));
     WriteFile(dumps / "other" / "sce_sys" / "param.json", "{\"contentId\": \"EP9000-PPSA99999_00-DEMONSSOULSGIFT2\"}");
     MakeDump(dumps / "PPSA01342-app0", FakeEboot(true), "PPSA01342");
     WriteFile(dumps / "PPSA01342-app0" / "DEMONSSOULSGIFT2" / "license.dat", "x");
-    Require(find().empty(), "empty, foreign and in-dump folders are no add-on");
+    auto junk = find();
+    Require(junk.size() == 1 && junk[0].label == AddonContent::PreOrderLabel && junk[0].folder.filename() == "gift1-DEMONSSOULSGIFT2", "name-only, wrong-title, empty, foreign and in-dump folders are no add-on; GIFT1 metadata is only GIFT1");
+    Require(AddonContent::FindLabel(find(dumps / "DEMONSSOULSGIFT2"), AddonContent::DeluxeEditionLabel) == nullptr && AddonContent::FindLabel(find(dumps / "gift1-DEMONSSOULSGIFT2"), AddonContent::DeluxeEditionLabel) == nullptr, "AddonDir: a bare named folder, or GIFT1 metadata in a GIFT2-named folder, is not the Deluxe Edition");
+    std::filesystem::remove_all(dumps / "gift1-DEMONSSOULSGIFT2", error);
+    // The base game folder is not an add-on even with the label in its metadata.
+    WriteFile(app0 / "sce_sys" / "param.json", "{\"contentId\": \"EP9000-PPSA01341_00-DEMONSSOULSGIFT2\", \"titleId\": \"PPSA01341\"}");
+    Require(AddonContent::FindLabel(find(), AddonContent::DeluxeEditionLabel) == nullptr, "the base game folder is no add-on");
+    MakeDump(app0, FakeEboot(true));
 
-    // Next to app0 by its content id name; the pre-order gift by param.sfo two levels into an addcont folder.
-    WriteFile(dumps / "EP9000-PPSA01341_00-DEMONSSOULSGIFT2" / "sce_sys" / "param.json", "{}");
+    // Next to app0 by its metadata (content id in param.json); the pre-order gift by param.sfo two levels into an addcont folder.
+    std::filesystem::remove_all(dumps / "EP9000-PPSA01341_00-DEMONSSOULSGIFT2", error);
+    WriteFile(dumps / "EP9000-PPSA01341_00-DEMONSSOULSGIFT2" / "sce_sys" / "param.json", "{\"contentId\": \"EP9000-PPSA01341_00-DEMONSSOULSGIFT2\"}");
     WriteFile(dumps / "addcont" / "PPSA01341" / "gift" / "sce_sys" / "param.sfo", std::string(8, '\0') + "CONTENT_ID" + std::string(2, '\0') + "EP9000-PPSA01341_00-DEMONSSOULSGIFT1" + std::string(3, '\0'));
     auto found = find();
     const auto* deluxe = AddonContent::FindLabel(found, AddonContent::DeluxeEditionLabel);
     const auto* preOrder = AddonContent::FindLabel(found, AddonContent::PreOrderLabel);
-    Require(found.size() == 2 && deluxe != nullptr && deluxe->reason == "its name" && deluxe->folder.filename() == "EP9000-PPSA01341_00-DEMONSSOULSGIFT2", "Deluxe Edition next to app0 by name");
+    Require(found.size() == 2 && deluxe != nullptr && deluxe->reason == "its sce_sys/param.json" && deluxe->folder.filename() == "EP9000-PPSA01341_00-DEMONSSOULSGIFT2", "Deluxe Edition next to app0 by param.json");
     Require(preOrder != nullptr && preOrder->reason == "its param.sfo" && preOrder->folder.filename() == "gift", "pre-order gift by param.sfo in addcont");
 
     // By param.json in a folder named with the title id; and in the player's AddonDir anywhere else.
@@ -752,6 +768,8 @@ static void TestAddonContent() {
     Require(found.size() == 1 && found[0].label == AddonContent::DeluxeEditionLabel && found[0].reason == "its sce_sys/param.json", "Deluxe Edition by param.json in PPSA01341-ac");
     std::filesystem::remove_all(dumps / "PPSA01341-ac", error);
     WriteFile(base / "elsewhere" / "EP9000-PPSA01341_00-DEMONSSOULSGIFT2" / "license.dat", "x");
+    Require(find().empty() && find(base / "elsewhere").empty(), "AddonDir: a named folder without metadata is not it");
+    WriteFile(base / "elsewhere" / "EP9000-PPSA01341_00-DEMONSSOULSGIFT2" / "sce_sys" / "param.json", "{\"contentId\": \"EP9000-PPSA01341_00-DEMONSSOULSGIFT2\"}");
     Require(find().empty() && find(base / "elsewhere").size() == 1, "AddonDir names a folder elsewhere");
 
     // What the query answers: the file's labels but its Deluxe Edition, then the dump's (Deluxe only when on).

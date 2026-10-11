@@ -516,10 +516,16 @@ void Colored(const ImVec4& color, const std::string& text) {
 void DrawDeluxe(Model& model) {
     Label("Deluxe Edition content");
     const auto* found = Checking(model) ? nullptr : AddonContent::FindLabel(model.addons, AddonContent::DeluxeEditionLabel);
-    ImGui::BeginDisabled(found == nullptr);
-    bool enabled = found != nullptr && model.settings.deluxeEdition != PortSettings::DeluxeEdition::Off;
+    // APS5_DELUXE_EDITION wins over the ini (the game reads it): the box shows what the game will do.
+    const char* environment = std::getenv("APS5_DELUXE_EDITION");
+    const bool overridden = environment != nullptr && environment[0] != '\0';
+    const std::string value = overridden ? AddonContent::Upper(environment) : std::string();
+    const auto effective = overridden ? (value == "OFF" || value == "0" || value == "FALSE" ? PortSettings::DeluxeEdition::Off : PortSettings::DeluxeEdition::Auto) : model.settings.deluxeEdition;
+    ImGui::BeginDisabled(found == nullptr || overridden);
+    bool enabled = found != nullptr && effective != PortSettings::DeluxeEdition::Off;
     if (ImGui::Checkbox("Deluxe Edition items (Fluted armour set)##deluxe", &enabled)) model.settings.deluxeEdition = enabled ? PortSettings::DeluxeEdition::Auto : PortSettings::DeluxeEdition::Off;
     ImGui::EndDisabled();
+    if (overridden) Note((std::string("(set by APS5_DELUXE_EDITION=") + environment + ")").c_str());
     if (Checking(model)) {
         Note("Checking the folder...");
     } else if (found != nullptr) {

@@ -6,12 +6,15 @@
 // ("DigitalDeluxe"); a label in the answer is owned (status 2, 0x88a8b0). DigitalDeluxe owned: the character
 // creator offers the Deluxe package (Player_DeluxePackageAvailable) and 0x449460 puts the Deluxe items (the
 // Fluted armour set) into the inventory of a character that took it; not owned: it takes them away again.
-// A dump holds an add-on as a folder near the game's app0: named after the label or its content id
-// (EP9000-PPSA01341_00-DEMONSSOULSGIFT2), or whose sce_sys/param.json or param.sfo names that content id.
+// A dump holds an add-on as a folder near the game's app0 whose sce_sys/param.json or param.sfo names the
+// add-on's content id (EP9000-PPSA01341_00-DEMONSSOULSGIFT2: this title's id and the label). A folder's name
+// is no evidence (a bare folder named after the label is not the add-on); it only decides where to look.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -68,8 +71,10 @@ inline std::string ReadSmall(const std::filesystem::path& path, std::size_t limi
     if (!std::filesystem::is_regular_file(path, error)) return {};
     std::ifstream file(path, std::ios::binary);
     if (!file) return {};
-    std::string text(limit, '\0');
-    file.read(text.data(), static_cast<std::streamsize>(limit));
+    const auto size = std::filesystem::file_size(path, error);
+    if (error) return {};
+    std::string text(std::min<std::uintmax_t>(size, limit), '\0');
+    file.read(text.data(), static_cast<std::streamsize>(text.size()));
     text.resize(static_cast<std::size_t>(file.gcount()));
     return text;
 }
@@ -101,11 +106,10 @@ inline bool HasEntries(const std::filesystem::path& folder) {
     return !error && entries != std::filesystem::directory_iterator();
 }
 
-// The labels a folder holds: its name holds the label (or the content id), or its param.json / param.sfo
-// names the content id. An empty folder holds nothing.
+// The labels a folder holds: its param.json / param.sfo names the content id (this title's id and the
+// label). The folder's name counts for nothing; an empty folder or one without such metadata holds nothing.
 inline void LookAt(const std::filesystem::path& folder, std::vector<Found>& found) {
     if (!HasEntries(folder)) return;
-    const auto name = Upper(NameText(folder));
     std::string json;
     std::string sfo;
     std::string sfoUpper;
@@ -114,10 +118,6 @@ inline void LookAt(const std::filesystem::path& folder, std::vector<Found>& foun
         bool known = false;
         for (const auto& entry : found) known = known || entry.label == label;
         if (known) continue;
-        if (name.find(label) != std::string::npos) {
-            found.push_back({label, folder, "its name"});
-            continue;
-        }
         if (!read) {
             read = true;
             json = ReadSmall(folder / "sce_sys" / "param.json");

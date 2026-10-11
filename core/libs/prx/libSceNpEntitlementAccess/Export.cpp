@@ -71,12 +71,13 @@ std::vector<std::filesystem::path> GameFolders(const PortSettings::Settings& set
 // with the '[settings] deluxe edition' line.
 const std::vector<NpEntitlementAccessAddcontEntitlementInfo>& OwnedAddons() {
     static const auto owned = [] {
+        std::vector<NpEntitlementAccessAddcontEntitlementInfo> addons;
+        try {
         const auto& settings = GetPortSettings_nid_no_patch();
         const bool deluxe = settings.deluxeEdition != PortSettings::DeluxeEdition::Off;
         const auto found = AddonContent::Find(GameFolders(settings), AddonContent::PathFromText(settings.addonDir));
         std::vector<std::string> notes;
         const auto labels = AddonContent::AnsweredLabels(FileLabels(), found, deluxe, notes);
-        std::vector<NpEntitlementAccessAddcontEntitlementInfo> addons;
         for (const auto& label : labels) {
             NpEntitlementAccessAddcontEntitlementInfo info{};
             std::memcpy(info.entitlement_label.data, label.data(), label.size());
@@ -87,10 +88,20 @@ const std::vector<NpEntitlementAccessAddcontEntitlementInfo>& OwnedAddons() {
         const auto* entry = AddonContent::FindLabel(found, AddonContent::DeluxeEditionLabel);
         if (entry != nullptr) std::fprintf(stderr, "[settings] deluxe edition: found in the dump (%s: %s), %s\n", PortSettings::PathText(entry->folder).c_str(), entry->reason.c_str(), deluxe ? "enabled" : "turned off (DeluxeEdition = off)");
         else std::fprintf(stderr, "[settings] deluxe edition: not found in the dump, not owned%s\n", deluxe ? "" : " (DeluxeEdition = off)");
+        const auto* gift = AddonContent::FindLabel(found, AddonContent::PreOrderLabel);
+        if (gift != nullptr) std::fprintf(stderr, "[settings] pre-order gift: found in the dump (%s: %s), owned (same rule as the Deluxe Edition)\n", PortSettings::PathText(gift->folder).c_str(), gift->reason.c_str());
         for (const auto& note : notes) std::fprintf(stderr, "[entitlement] %s\n", note.c_str());
         std::string answered;
         for (const auto& label : labels) answered += (answered.empty() ? "" : ", ") + label;
         std::fprintf(stderr, "[entitlement] owned add-ons: %s\n", answered.empty() ? "none" : answered.c_str());
+        } catch (const std::exception& error) {
+            // No C++ exception crosses the HLE boundary: the add-ons are then not owned and the game boots.
+            addons.clear();
+            std::fprintf(stderr, "[entitlement] error reading the add-ons, none owned: %s\n", error.what());
+        } catch (...) {
+            addons.clear();
+            std::fprintf(stderr, "[entitlement] unknown error reading the add-ons, none owned\n");
+        }
         std::fflush(stderr);
         return addons;
     }();

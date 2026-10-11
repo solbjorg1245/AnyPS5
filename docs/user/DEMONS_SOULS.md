@@ -158,9 +158,11 @@ from what your dump holds: the add-on counts as owned only when your dump contai
 ever written into your dump. When it is owned, the game offers the Deluxe items when you create a
 character and puts them into that character's inventory.
 
-What counts as the add-on in your dump: a non-empty folder whose name holds the entitlement label or its
-content id (for example `EP9000-PPSA01341_00-DEMONSSOULSGIFT2`), or whose `sce_sys/param.json` or
-`param.sfo` names that content id. It is looked for next to the game folder (the dump's `app0`), up to
+What counts as the add-on in your dump: a folder whose `sce_sys/param.json` or `param.sfo` names the
+add-on's content id, this title's id and the label (for example `EP9000-PPSA01341_00-DEMONSSOULSGIFT2`).
+A folder's name alone is not enough, and an empty folder or one with other metadata (another title, another
+add-on) is ignored. The same rule decides the pre-order gift (`DEMONSSOULSGIFT1`): it is owned when your
+dump holds it (or you list it in `anyps5-entitlements.ini`); the launcher has no switch for it. It is looked for next to the game folder (the dump's `app0`), up to
 two levels into a folder named with the title id or `addcont` / `dlc` there (`PPSA01341-ac\...`,
 `addcont\PPSA01341\...`), and in `AddonDir` when you set one. Other game dumps (folders with an
 `eboot.bin`) are not looked into.
@@ -169,7 +171,9 @@ The settings window shows the row **Deluxe Edition content**: "Found in your dum
 turn the owned add-on off (and on again), or "Not found in your dump", greyed out. Turning it off makes
 the game take the Deluxe items away from a character that has them (as on a console without the
 add-on); turning it on again gives them back. The log line `[settings] deluxe edition: ...` says what was
-found and whether it is enabled. An `anyps5-entitlements.ini` entry for `DEMONSSOULSGIFT2` is ignored.
+found and whether it is enabled, and the `[entitlement] owned add-ons` line lists everything answered
+(the pre-order gift included). If reading the add-ons fails, the log says so and the game boots with none owned.
+`APS5_DELUXE_EDITION`, when set, wins over the window's box, which then shows "(set by APS5_DELUXE_EDITION=...)". An `anyps5-entitlements.ini` entry for `DEMONSSOULSGIFT2` is ignored.
 
 Troubleshooting: GPU-to-guest copy-backs are coalesced and narrowed (only changed dwords are written
 back) by default. `APS5_NO_COALESCE_COPY_BACKS=1` and `APS5_NO_NARROW_COPY_BACKS=1` turn these off
