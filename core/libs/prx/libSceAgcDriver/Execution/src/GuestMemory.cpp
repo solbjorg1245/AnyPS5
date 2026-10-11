@@ -1603,7 +1603,7 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
     return false;
 }
 
-std::uint32_t PagesUnstoredSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, PageStoreCause* cause) {
+std::uint32_t PagesUnstoredSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, PageStoreCause* cause, std::uint32_t* cpuPages, std::uint32_t* driverPages) {
     static_assert(UnstoredPageBytes == WritePageBytes && WritePagesPerBlock <= 32);
     PageStoreCause ignored = PageStoreCause::None;
     auto& why = cause != nullptr ? *cause : ignored;
@@ -1646,9 +1646,98 @@ std::uint32_t PagesUnstoredSince(std::uint64_t address, std::size_t bytes, std::
     if (entry != nullptr && entry->latest > generation && !pagesOver(tracker.driverPages, driverStored)) return 0;
     // A newer written stamp no page record explains (a driver walk's stamp): stored over whole.
     if ((cpuStored | driverStored) == 0) return 0;
+    // Diagnostics (the edge-merge trace): which of the block's pages each store record holds.
+    if (cpuPages != nullptr) *cpuPages = cpuStored;
+    if (driverPages != nullptr) *driverPages = driverStored;
     why = (cpuStored & range) != 0 ? PageStoreCause::CpuPages : (driverStored & range) != 0 ? PageStoreCause::DriverPages : PageStoreCause::None;
     return range & ~(cpuStored | driverStored);
 }
+
+std::size_t TrackEdgeParts(std::uint64_t address, std::size_t bytes) {
+    static const bool enabled = std::getenv("APS5_NO_FINE_EDGE_TRACKING") == nullptr;
+    if (!enabled || !pageKeepUnits() || bytes == 0) return 0;
+#ifdef _WIN32
+    return GuestArena::GuestArenaTrackWriteParts_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
+#else
+    return 0;
+#endif
+}
+
+std::size_t TrackSurfaceEdgeParts(std::uint64_t address, std::size_t bytes) {
+    static const bool enabled = std::getenv("APS5_NO_FINE_EDGE_TRACKING") == nullptr && std::getenv("APS5_NO_EARLY_EDGE_TRACKING") == nullptr;
+    if (!enabled || !pageKeepUnits() || bytes == 0) return 0;
+#ifdef _WIN32
+    return GuestArena::GuestArenaTrackEdgeWriteParts_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::uintptr_t>(address + bytes));
+#else
+    return 0;
+#endif
+}
+
+#ifdef _WIN32
+namespace {
+std::atomic<std::uintptr_t> edgeWatchBegin{0};
+std::atomic<std::uintptr_t> edgeWatchEnd{0};
+
+void describeCode(std::uint64_t address, char* text, std::size_t size) {
+    HMODULE module = nullptr;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(address), &module) && module != nullptr) GetModuleFileNameA(module, name, MAX_PATH);
+    const char* base = std::strrchr(name, '\\');
+    std::snprintf(text, size, "%s+0x%llx", base != nullptr ? base + 1 : name, static_cast<unsigned long long>(address - reinterpret_cast<std::uintptr_t>(module)));
+}
+
+LONG CALLBACK edgeWatchHandler(EXCEPTION_POINTERS* info) {
+    const auto* record = info->ExceptionRecord;
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    const auto address = static_cast<std::uintptr_t>(record->ExceptionInformation[1]);
+    const auto begin = edgeWatchBegin.load(std::memory_order_acquire);
+    const auto end = edgeWatchEnd.load(std::memory_order_acquire);
+    if (begin == 0 || address < begin || address >= end) return EXCEPTION_CONTINUE_SEARCH;
+    DWORD old = 0;
+    VirtualProtect(reinterpret_cast<void*>(begin), end - begin, PAGE_READWRITE, &old);
+    edgeWatchBegin.store(0, std::memory_order_release);
+    std::uint64_t before = 0;
+    std::memcpy(&before, reinterpret_cast<const void*>(address & ~std::uintptr_t{7}), sizeof(before));
+    const auto rip = static_cast<std::uint64_t>(info->ContextRecord->Rip);
+    std::uint8_t code[12] = {};
+    std::memcpy(code, reinterpret_cast<const void*>(rip), sizeof(code));
+    char frames[6][MAX_PATH + 32] = {};
+    CONTEXT context = *info->ContextRecord;
+    for (int frame = 0; frame < 6; ++frame) {
+        describeCode(context.Rip, frames[frame], sizeof(frames[frame]));
+        DWORD64 imageBase = 0;
+        auto* function = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
+        if (function == nullptr) {
+            context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+            context.Rsp += 8;
+        } else {
+            void* handlerData = nullptr;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, function, &context, &handlerData, &establisher, nullptr);
+        }
+        if (context.Rip == 0) break;
+    }
+    std::fprintf(stderr, "[edge-watch] %s 0x%llx (range 0x%llx+0x%llx, offset 0x%llx) old qword 0x%016llx, thread %lu, code %02x %02x %02x %02x %02x %02x %02x %02x, frames %s < %s < %s < %s < %s < %s\n",
+        record->ExceptionInformation[0] == 1 ? "write" : "access", static_cast<unsigned long long>(address), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<unsigned long long>(address - begin),
+        static_cast<unsigned long long>(before), GetCurrentThreadId(), code[0], code[1], code[2], code[3], code[4], code[5], code[6], code[7], frames[0], frames[1], frames[2], frames[3], frames[4], frames[5]);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+}
+
+void ArmEdgeWatch(std::uint64_t address, std::size_t bytes) {
+    static const PVOID handler = AddVectoredExceptionHandler(1, edgeWatchHandler);
+    (void)handler;
+    const auto begin = static_cast<std::uintptr_t>(address) & ~std::uintptr_t{0xfff};
+    const auto end = (static_cast<std::uintptr_t>(address + bytes) + 0xfff) & ~std::uintptr_t{0xfff};
+    if (end <= begin || edgeWatchBegin.load(std::memory_order_acquire) != 0) return;
+    edgeWatchEnd.store(end, std::memory_order_release);
+    edgeWatchBegin.store(begin, std::memory_order_release);
+    DWORD old = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(begin), end - begin, PAGE_READONLY, &old)) edgeWatchBegin.store(0, std::memory_order_release);
+}
+#else
+void ArmEdgeWatch(std::uint64_t, std::size_t) {}
+#endif
 
 std::uint64_t TrackerGeneration() {
     auto& tracker = Tracker();

@@ -4323,6 +4323,84 @@ void sharedViewGuardTests() {
 #endif
 }
 
+// Fine write tracking of shared views (APS5_FIX_BOOT_STRIP, WindowsMappings::TrackParts): a store
+// into a 16 KiB view page reports the whole page; once the page is tracked fine a store opens and
+// reports only its own 4 KiB part, the others staying armed, and a collect arms the part again; a
+// page written when made fine reports every part once; TrackEdgeParts makes fine only the view
+// pages a range covers in part.
+void sharedViewFineTrackingTests() {
+#ifdef _WIN32
+    if (!AgcDriver::GuestMemory::WriteWatched()) {
+        std::cout << "no write-watched guest arena: fine shared view tracking not tested\n";
+        return;
+    }
+    constexpr std::size_t viewPage = 16384;
+    constexpr std::size_t part = 4096;
+    constexpr std::size_t bytes = 4 * viewPage;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, static_cast<DWORD>(bytes), nullptr);
+    Require(section != nullptr, "cannot create the fine tracking test section");
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    Require(block != nullptr, "cannot reserve the fine tracking test range");
+    GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    auto* guest = static_cast<volatile unsigned char*>(block);
+    const auto base = reinterpret_cast<std::uintptr_t>(block);
+    const auto protection = [](std::uintptr_t at) {
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) == sizeof(info), "cannot query a fine tracking test page");
+        return info.Protect;
+    };
+    // The 4 KiB pages (bit i: [base + i * 4 KiB, + 4 KiB)) a collect of the range reports.
+    const auto collect = [&](bool clear) {
+        std::array<void*, 16> pages{};
+        std::size_t count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(base, bytes, pages.data(), &count, clear), "the fine tracking test range could not be collected");
+        std::uint32_t mask = 0;
+        for (std::size_t i = 0; i < count; ++i) mask |= 1u << ((reinterpret_cast<std::uintptr_t>(pages[i]) - base) / part);
+        return mask;
+    };
+    collect(true);
+    Require(collect(true) == 0, "an armed range nobody wrote reported writes");
+    guest[3 * part + 5] = 1;
+    Require(collect(true) == 0xf, "a store into a coarse view page did not report the whole page");
+    Require(GuestArena::GuestArenaTrackWriteParts_nid_postfix(base, part) == 1, "the first view page was not made fine");
+    Require(GuestArena::GuestArenaTrackWriteParts_nid_postfix(base, viewPage) == 0, "a fine view page was made fine again");
+    Require(collect(true) == 0, "making an armed, unwritten view page fine reported writes");
+    guest[3 * part + 5] = 2;
+    Require(protection(base + 3 * part) == PAGE_READWRITE && protection(base) == PAGE_READONLY && protection(base + 2 * part) == PAGE_READONLY, "a store into a fine view page opened more than its part");
+    guest[3 * part + 6] = 3;
+    Require(collect(true) == 0x8, "a store into a fine view page reported other parts");
+    Require(protection(base + 3 * part) == PAGE_READONLY, "the collect did not arm the written part again");
+    guest[5] = 4;
+    guest[part + 5] = 5;
+    Require(collect(false) == 0x3, "two parts' stores were not told apart");
+    Require(collect(true) == 0x3, "a collect without clearing forgot the stores");
+    Require(collect(true) == 0, "collected parts reported again");
+    // Every part written: the page is open as a whole, reports every part, and is armed again by part.
+    for (std::size_t at = 0; at < viewPage; at += part) guest[at + 9] = 6;
+    Require(protection(base) == PAGE_READWRITE && protection(base + 3 * part) == PAGE_READWRITE, "a view page with every part written is not open");
+    Require(collect(true) == 0xf, "a view page with every part written did not report them");
+    Require(protection(base) == PAGE_READONLY && protection(base + 3 * part) == PAGE_READONLY, "the collect did not arm a wholly written fine page again");
+    guest[2 * part + 1] = 7;
+    Require(collect(true) == 0x4, "a fine page armed again after every part was written lost its fine tracking");
+    // A page written (coarse) before it was made fine reports every part once, then by part.
+    guest[viewPage + 3 * part] = 8;
+    Require(GuestArena::GuestArenaTrackWriteParts_nid_postfix(base + viewPage, viewPage) == 1, "the second view page was not made fine");
+    Require(collect(true) == 0xf0, "a page written before it was made fine did not report every part");
+    guest[viewPage + 3 * part + 1] = 9;
+    Require(collect(true) == 0x80, "a page made fine while written did not track by part afterwards");
+    // TrackEdgeParts: a range on view page boundaries makes none fine; one starting and ending
+    // inside view pages makes those two fine, a store next to it reporting its own part alone.
+    Require(GuestArena::GuestArenaTrackEdgeWriteParts_nid_postfix(base + 2 * viewPage, base + 4 * viewPage) == 0, "a range on view page boundaries made a page fine");
+    Require(GuestArena::GuestArenaTrackEdgeWriteParts_nid_postfix(base + 2 * viewPage + part, base + 4 * viewPage - part) == 2, "the pages a range covers in part were not made fine");
+    guest[2 * viewPage + 7] = 10;
+    guest[4 * viewPage - part + 7] = 11;
+    Require(collect(true) == ((1u << 8) | (1u << 15)), "stores next to a surface's edges were reported over the surface");
+    GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+    CloseHandle(section);
+#endif
+}
+
 // The fast ring's reclaim without a GPU wait (ReclaimFastRing; the fast draw and the fast dispatch
 // share one ring): under the GPU mutex a reaped batch's kept retirement is released only at this
 // thread's unlock, so a reap alone leaves the ring full; the reclaim completes the serials of the
@@ -5820,6 +5898,7 @@ int main() {
         narrowCopyBackTests(device, recorder);
         pageGuardTests();
         sharedViewGuardTests();
+        sharedViewFineTrackingTests();
         residentBufferTests(device, recorder);
         residentSharedViewTests(device, recorder);
         residentReadTests(device, recorder);
