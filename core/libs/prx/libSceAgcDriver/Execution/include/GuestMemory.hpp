@@ -264,6 +264,20 @@ std::uint64_t DropFreedRun(FreedStoreKind kind, std::uint32_t clock, std::uint64
 std::uint64_t DropFreedRuns(FreedStoreKind kind, std::uint32_t clock, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs);
 // The [guestmem] line's part: releases, and the stores into freed pages dropped (or would drop) by kind.
 std::string FreedStoreSummary();
+// Late stores over the CPU's (APS5_KEEP_CPU_STORES; on by default, =0 stores as before): a store of
+// GPU-produced bytes decided at one tracker generation and landed later (a unit shadow publish the
+// CPU lands, a storage write-back's CPU store) leaves out the 4 KiB pages a CPU store reached since
+// that decision, re-checked as it lands, so the game's store made in between wins over the older
+// GPU result. Off, the pages are only counted ("would keep" on the [guestmem] line).
+bool KeepCpuStores();
+void SetKeepCpuStores(bool keep);
+enum class LateStoreKind : std::uint8_t { WriteBack, ShadowPublish, Count };
+// Appends to `out` the parts of [begin, end) to store: with the switch on, without the parts
+// CpuStoredRuns lists since `generation` (the caller collects the range first), else the whole run.
+// Returns the bytes of those parts (counted per kind); nothing for a generation of 0.
+std::uint64_t KeepCpuStoredRun(LateStoreKind kind, std::uint64_t generation, std::uint64_t begin, std::uint64_t end, std::vector<std::pair<std::uint64_t, std::uint64_t>>& out);
+// The [guestmem] line's part: the late stores' parts kept for the CPU (or would keep) by kind.
+std::string KeptCpuStoreSummary();
 // Page queries (Accessible, DescribeCommitted, CheckRange, ...) that found pages a resident buffer's
 // page guard holds and answered them as the guest maps them (APS5_RESIDENT_BUFFERS; total since start).
 std::uint64_t GuardedPageQueries();

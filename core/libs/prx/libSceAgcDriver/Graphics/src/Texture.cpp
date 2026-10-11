@@ -3920,6 +3920,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // satisfy it); the unselected layers keep their own generations and are collected by their
     // own refreshes. One tracker lock then reads the span's stamps against the layers' generations.
     GuestMemory::CollectWritesUncached(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+    // The generation the decision is made at: a CPU stamp newer than it is a store made after it,
+    // which the CPU store below leaves out (APS5_KEEP_CPU_STORES).
+    const auto decided = GuestMemory::TrackerGeneration();
     std::vector<std::uint64_t> generations(spanBlocks, 0);
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (!layers[layer]) continue;
@@ -4338,12 +4341,28 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     }
     // Store only the kept ranges' blocks that changed, so concurrent CPU writes to untouched texels
     // survive; `original` follows for the stored layers (the others' guest bytes are unchanged).
+    // APS5_KEEP_CPU_STORES: the pages a CPU store reached since the decision (the GPU work above ran
+    // meanwhile) are left out too, walked first; their layers stay stale there, as for a kept block.
+    // Off, they are only counted after the store's own walk (settle below).
     const auto current = host.Bytes();
+    const bool keepCpu = GuestMemory::KeepCpuStores();
+    if (keepCpu) GuestMemory::CollectWritesUncached(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+    const auto layerAt = [&](std::uint64_t address) { return std::min<std::uint32_t>(trackedLayers - 1, static_cast<std::uint32_t>((address - descriptor.baseAddress) / std::max<std::uint64_t>(trackedLayerBytes, 1))); };
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> pieces;
     for (const auto& [from, to] : keep) {
-        const auto offset = static_cast<std::size_t>(from - descriptor.baseAddress);
-        const auto length = static_cast<std::size_t>(to - from);
-        GuestMemory::WriteChangedCommitted(from, current.subspan(offset, length), std::span<const std::byte>(original).subspan(offset, length));
-        std::memcpy(original.data() + offset, current.data() + offset, length);
+        pieces.clear();
+        if (!keepCpu) {
+            pieces.emplace_back(from, to);
+        } else if (GuestMemory::KeepCpuStoredRun(GuestMemory::LateStoreKind::WriteBack, decided, from, to, pieces) != 0) {
+            skippedAny = true;
+            for (auto layer = layerAt(from); layer <= layerAt(to - 1); ++layer) skippedLayer[layer] = true;
+        }
+        for (const auto& [pieceFrom, pieceTo] : pieces) {
+            const auto offset = static_cast<std::size_t>(pieceFrom - descriptor.baseAddress);
+            const auto length = static_cast<std::size_t>(pieceTo - pieceFrom);
+            GuestMemory::WriteChangedCommitted(pieceFrom, current.subspan(offset, length), std::span<const std::byte>(original).subspan(offset, length));
+            std::memcpy(original.data() + offset, current.data() + offset, length);
+        }
     }
     // The texels now hold the whole image, so later reads must see them rather than a fast clear
     // (the keys may be host-imported although the texels were not: then a recorded fill, else a CPU store).
@@ -4351,13 +4370,19 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     storeKeys("cpu write-back", layers);
     uploadedKeys = DccKeys::Uncompressed;
     // The store above is the only write to these pages, so `original` is current at a fresh
-    // generation, unless blocks were kept for the CPU: then the image is stale there.
+    // generation, unless blocks or pages were kept for the CPU: then the image is stale there.
     originalValid = !skippedAny && (wasValid || std::all_of(layers.begin(), layers.end(), [](bool selected) { return selected; }));
     // As in the GPU-direct path, but the store's memcpy dirtied this surface's pages in the write
     // watch: a memoized collect would leave them for the next walk to stamp newer than this value
     // (the shared edge block included, undoing the advance), so the walk is made here and
     // consumes them.
     settle(false);
+    if (!keepCpu) {
+        for (const auto& [from, to] : keep) {
+            pieces.clear();
+            GuestMemory::KeepCpuStoredRun(GuestMemory::LateStoreKind::WriteBack, decided, from, to, pieces);
+        }
+    }
     if (profile) Profile().storageStore += timer.lap();
 }
 

@@ -353,7 +353,7 @@ public:
         std::fprintf(stderr, " collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
         std::fprintf(stderr, " collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
         std::fprintf(stderr, " | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
-        std::fprintf(stderr, " %s", FreedStoreSummary().c_str());
+        std::fprintf(stderr, " %s | %s", FreedStoreSummary().c_str(), KeptCpuStoreSummary().c_str());
         {
             std::lock_guard lock(state.callersMutex);
             std::fprintf(stderr, " | read callers:");
@@ -2933,6 +2933,69 @@ std::string FreedStoreSummary() {
     auto used = static_cast<std::size_t>(std::snprintf(text, sizeof(text), "releases %llu (%.0f MiB, clock %u) | stores into freed pages: %s %llu (%llu KiB) by kind", static_cast<unsigned long long>(log.releases.load(std::memory_order_relaxed)), log.releasedBytes.load(std::memory_order_relaxed) / 1048576.0, log.clock.load(std::memory_order_relaxed), DropFreedStores() ? "dropped" : "would drop", static_cast<unsigned long long>(count), static_cast<unsigned long long>(bytes / 1024)));
     for (std::size_t k = 0; k < FreedKindCount && used < sizeof(text); ++k) {
         used += static_cast<std::size_t>(std::snprintf(text + used, sizeof(text) - used, " %s %llu (%llu KiB)", FreedKindNames[k], static_cast<unsigned long long>(log.stores[k].load(std::memory_order_relaxed)), static_cast<unsigned long long>(log.storeBytes[k].load(std::memory_order_relaxed) / 1024)));
+    }
+    return text;
+}
+
+namespace {
+
+constexpr std::size_t LateKindCount = static_cast<std::size_t>(LateStoreKind::Count);
+constexpr const char* LateKindNames[LateKindCount] = {"write-back", "shadow"};
+// APS5_KEEP_CPU_STORES: -1 until read from the environment (SetKeepCpuStores overrides it).
+std::atomic<int> keepCpuStores{-1};
+std::array<std::atomic<std::uint64_t>, LateKindCount> keptStores{};
+std::array<std::atomic<std::uint64_t>, LateKindCount> keptStoreBytes{};
+
+}
+
+bool KeepCpuStores() {
+    auto value = keepCpuStores.load(std::memory_order_relaxed);
+    if (value < 0) {
+        const char* text = std::getenv("APS5_KEEP_CPU_STORES");
+        value = text == nullptr || std::strcmp(text, "0") != 0 ? 1 : 0;
+        keepCpuStores.store(value, std::memory_order_relaxed);
+    }
+    return value != 0;
+}
+
+void SetKeepCpuStores(bool keep) {
+    keepCpuStores.store(keep ? 1 : 0, std::memory_order_relaxed);
+}
+
+std::uint64_t KeepCpuStoredRun(LateStoreKind kind, std::uint64_t generation, std::uint64_t begin, std::uint64_t end, std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) {
+    if (end <= begin) return 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> stored;
+    const auto kept = CpuStoredRuns(begin, static_cast<std::size_t>(end - begin), generation, stored);
+    if (kept == 0 || !KeepCpuStores()) {
+        out.emplace_back(begin, end);
+    } else {
+        // The runs are clipped to the range, merged and in address order: the gaps are stored.
+        auto at = begin;
+        for (const auto& [from, to] : stored) {
+            if (from > at) out.emplace_back(at, from);
+            at = to;
+        }
+        if (at < end) out.emplace_back(at, end);
+    }
+    if (kept != 0) {
+        const auto index = static_cast<std::size_t>(kind);
+        keptStores[index].fetch_add(1, std::memory_order_relaxed);
+        keptStoreBytes[index].fetch_add(kept, std::memory_order_relaxed);
+    }
+    return kept;
+}
+
+std::string KeptCpuStoreSummary() {
+    std::uint64_t count = 0;
+    std::uint64_t bytes = 0;
+    for (std::size_t k = 0; k < LateKindCount; ++k) {
+        count += keptStores[k].load(std::memory_order_relaxed);
+        bytes += keptStoreBytes[k].load(std::memory_order_relaxed);
+    }
+    char text[256];
+    auto used = static_cast<std::size_t>(std::snprintf(text, sizeof(text), "late stores over CPU-stored pages: %s %llu (%llu KiB) by kind", KeepCpuStores() ? "kept" : "would keep", static_cast<unsigned long long>(count), static_cast<unsigned long long>(bytes / 1024)));
+    for (std::size_t k = 0; k < LateKindCount && used < sizeof(text); ++k) {
+        used += static_cast<std::size_t>(std::snprintf(text + used, sizeof(text) - used, " %s %llu (%llu KiB)", LateKindNames[k], static_cast<unsigned long long>(keptStores[k].load(std::memory_order_relaxed)), static_cast<unsigned long long>(keptStoreBytes[k].load(std::memory_order_relaxed) / 1024)));
     }
     return text;
 }

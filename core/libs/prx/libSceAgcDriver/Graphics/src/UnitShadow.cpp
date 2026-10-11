@@ -310,17 +310,71 @@ void verifyPublished(const UnitShadow& shadow, const std::vector<SlabCopies>& co
     }
 }
 
+// APS5_KEEP_CPU_STORES: the CPU lands `copies` (see publishUnits), the caller having waited for the
+// work that filled the slabs. Their bytes are read back; each piece is then stored without the 4 KiB
+// pages a CPU store reached since the publish was decided at `decided` (walked just before), so a
+// store the game made in between wins over the slab's older bytes. Stamped as the driver's own
+// store; only the committed writable parts (the GPU copy wrote through the guest's protection, the
+// CPU cannot).
+void landOnCpu(const UnitShadow& shadow, const std::vector<SlabCopies>& copies, std::uint64_t decided) {
+    const auto& context = shadow.context;
+    VkDeviceSize total = 0;
+    for (const auto& entry : copies) {
+        for (const auto& region : entry.regions) total += region.size;
+    }
+    Buffer host(context, static_cast<std::size_t>(total), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    CommandBatch batch(context);
+    RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    VkDeviceSize at = 0;
+    for (const auto& entry : copies) {
+        for (const auto& region : entry.regions) {
+            CopyBuffer(context, batch.Handle(), entry.slab->buffer, region.srcOffset, host.Handle(), at, region.size);
+            at += region.size;
+        }
+    }
+    RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    batch.SubmitAndWait();
+    host.Invalidate();
+    const auto landed = host.Bytes();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> pieces;
+    at = 0;
+    for (const auto& entry : copies) {
+        for (const auto& region : entry.regions) {
+            const auto begin = shadow.importBase + region.dstOffset;
+            GuestMemory::CollectWritesUncached(begin, static_cast<std::size_t>(region.size));
+            pieces.clear();
+            GuestMemory::KeepCpuStoredRun(GuestMemory::LateStoreKind::ShadowPublish, decided, begin, begin + region.size, pieces);
+            for (const auto& piece : pieces) {
+                for (const auto& [from, to] : GuestMemory::CommittedRanges(piece.first, static_cast<std::size_t>(piece.second - piece.first), true)) {
+                    auto* destination = reinterpret_cast<void*>(from);
+                    const auto* source = landed.data() + (at + (from - begin));
+                    const auto length = static_cast<std::size_t>(to - from);
+                    GuestMemory::StoreOwnBytes(from, length, [destination, source, length] { std::memcpy(destination, source, length); });
+                }
+            }
+            at += region.size;
+        }
+    }
+}
+
 // The publish of one shadow: `selected[k]` (k = unit - first) names the units the scope chose.
 std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_t first, std::uint64_t last, const std::vector<std::uint8_t>& selected, PublishReason reason) {
     auto& registry = Registry();
     std::vector<SlabCopies> copies;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    // APS5_KEEP_CPU_STORES: the pieces the CPU lands (landOnCpu); with the switch off, the ones it
+    // would land, counted when the batch holding their copy finishes.
+    std::vector<SlabCopies> cpuCopies;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> cpuRanges, wouldLand;
     std::uint64_t bytes = 0;
     std::size_t units = 0;
     // For the write-back range trace: the oldest generation among the copied units, the import's
     // last retile.
     std::uint64_t oldest = ~0ull;
     std::uint64_t markedMs = 0;
+    // The generation the decisions below are made at (after the walk): a CPU stamp newer than it is
+    // a store the game made after them.
+    std::uint64_t decided = 0;
     {
         // The stamps judged below see every CPU store into the live selected units up to now: a
         // store no collect walked yet would read as fresh and the copy would land over it. Every
@@ -338,21 +392,26 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         const auto walkBegin = std::max(shadow->UnitBegin(walkFirst), shadow->importBase);
         const auto walkEnd = std::min(shadow->UnitBegin(walkLast + 1), shadow->ImportEnd());
         if (walkEnd > walkBegin) GuestMemory::CollectWritesUncached(walkBegin, static_cast<std::size_t>(walkEnd - walkBegin));
+        decided = GuestMemory::TrackerGeneration();
     }
     {
         std::lock_guard lock(registry.mutex);
         std::vector<std::uint8_t> changed, cpu;
         changedUnits(*shadow, first, last, changed, cpu);
-        const auto addPiece = [&](const std::shared_ptr<ShadowSlab>& slab, std::uint64_t unit, std::uint64_t begin, std::uint64_t end) {
+        const auto addPiece = [&](const std::shared_ptr<ShadowSlab>& slab, std::uint64_t unit, std::uint64_t begin, std::uint64_t end, bool late) {
+            const bool onCpu = late && GuestMemory::KeepCpuStores();
+            auto& into = onCpu ? cpuCopies : copies;
+            auto& intoRanges = onCpu ? cpuRanges : ranges;
             const VkBufferCopy region{(unit - slab->firstUnit) * UnitBytes + (begin - shadow->UnitBegin(unit)), begin - shadow->importBase, end - begin};
-            if (!copies.empty() && copies.back().slab == slab && copies.back().regions.back().dstOffset + copies.back().regions.back().size == region.dstOffset) {
-                copies.back().regions.back().size += region.size;
-                ranges.back().second = end;
+            if (!into.empty() && into.back().slab == slab && into.back().regions.back().dstOffset + into.back().regions.back().size == region.dstOffset) {
+                into.back().regions.back().size += region.size;
+                intoRanges.back().second = end;
             } else {
-                if (copies.empty() || copies.back().slab != slab) copies.push_back({slab, {}});
-                copies.back().regions.push_back(region);
-                ranges.emplace_back(begin, end);
+                if (into.empty() || into.back().slab != slab) into.push_back({slab, {}});
+                into.back().regions.push_back(region);
+                intoRanges.emplace_back(begin, end);
             }
+            if (late && !onCpu) wouldLand.emplace_back(begin, end);
             slab->lastUse = Recorder::Presents();
             bytes += end - begin;
             oldest = std::min(oldest, shadow->generation[unit]);
@@ -360,11 +419,19 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         // APS5_DROP_FREED_STORES: the unit's pages the game released since it went live hold another
         // allocation's bytes; the copy leaves them out (the unit is done with either way).
         std::vector<std::pair<std::uint64_t, std::uint64_t>> pieces;
-        const auto addCopy = [&](const std::shared_ptr<ShadowSlab>& slab, std::uint64_t unit, std::uint64_t begin, std::uint64_t end) {
+        const auto addCopy = [&](const std::shared_ptr<ShadowSlab>& slab, std::uint64_t unit, std::uint64_t begin, std::uint64_t end, bool late) {
             pieces.clear();
             GuestMemory::DropFreedRun(GuestMemory::FreedStoreKind::ShadowPublish, shadow->freeClock[unit], begin, end, pieces);
-            for (const auto& [from, to] : pieces) addPiece(slab, unit, from, to);
+            for (const auto& [from, to] : pieces) addPiece(slab, unit, from, to, late);
         };
+        // APS5_KEEP_CPU_STORES: a copy recorded now lands when its batch runs, over any store the game
+        // makes meanwhile. A stale unit's kept pages sit in a block the game is writing, so the CPU
+        // lands them instead after a re-check (landOnCpu); a whole unit (no store since its retile)
+        // keeps the copy. Only where a sync is safe at this point (where the flush hook may sync: its
+        // own publishes, a resource build's region and indirect reads); the others (an upload inside
+        // a write-back, an eviction or a retire inside a retile, a fill or a copy beside its own
+        // recording) keep the copy.
+        const bool keptLate = reason == PublishReason::Hook || reason == PublishReason::Scanout || reason == PublishReason::Region || reason == PublishReason::Indirect;
         for (auto unit = first; unit <= last; ++unit) {
             const auto k = static_cast<std::size_t>(unit - first);
             if (!selected[k] || !shadow->Live(unit)) continue;
@@ -388,7 +455,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
                         }
                         auto stop = run;
                         while (stop < UnitBytes / page && (kept >> stop & 1u) != 0) ++stop;
-                        addCopy(keptSlab, unit, std::max(unitBegin, blockBegin + run * page), std::min(unitEnd, blockBegin + stop * page));
+                        addCopy(keptSlab, unit, std::max(unitBegin, blockBegin + run * page), std::min(unitEnd, blockBegin + stop * page), keptLate);
                         run = stop;
                     }
                     ++units;
@@ -407,21 +474,44 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
             }
             const auto [begin, end] = shadow->UnitRange(unit);
             if (end <= begin) continue;
-            addCopy(slab, unit, begin, end);
+            addCopy(slab, unit, begin, end, false);
             shadow->published[unit] = 1;
             ++units;
         }
         shadow->Recount();
         markedMs = shadow->markedMs;
     }
-    if (units == 0 || ranges.empty()) return 0;
+    if (units == 0 || (ranges.empty() && cpuRanges.empty())) return 0;
     Stats().published[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     Stats().publishedBytes[static_cast<std::size_t>(reason)].fetch_add(bytes, std::memory_order_relaxed);
     if (tracePublishesLeft.load(std::memory_order_relaxed) > 0 && tracePublishesLeft.fetch_sub(1, std::memory_order_relaxed) > 0) {
         const auto packet = GuestMemory::CurrentPacket();
-        std::fprintf(stderr, "[shadow] publish %s: 0x%llx+0x%llx, %zu units, %.2f MiB, %zu slabs (packet 0x%x queue 0x%x)\n", ReasonNames[static_cast<std::size_t>(reason)], static_cast<unsigned long long>(ranges.front().first), static_cast<unsigned long long>(ranges.back().second - ranges.front().first), units, bytes / 1048576.0, copies.size(), packet.opcode, packet.queue);
+        const auto& shown = ranges.empty() ? cpuRanges : ranges;
+        std::fprintf(stderr, "[shadow] publish %s: 0x%llx+0x%llx, %zu units, %.2f MiB, %zu slabs (packet 0x%x queue 0x%x)\n", ReasonNames[static_cast<std::size_t>(reason)], static_cast<unsigned long long>(shown.front().first), static_cast<unsigned long long>(shown.back().second - shown.front().first), units, bytes / 1048576.0, copies.size() + cpuCopies.size(), packet.opcode, packet.queue);
     }
+    if (!cpuCopies.empty()) {
+        // The work that filled the slabs first (its completions store under their own names), then
+        // the crash report's store ring names the publish for the CPU's stores (StoreOwnBytes).
+        if (auto* recorder = Recorder::Active()) {
+            Recorder::CountSync(4);
+            recorder->Sync();
+        }
+        const GuestMemory::StoreSubject subject{shadow->importBase, shadow->importBytes, 0, 0, 0, oldest != ~0ull ? oldest : 0, markedMs, 0};
+        const GuestMemory::StoreTag tag("unit shadow (cpu)", ReasonNames[static_cast<std::size_t>(reason)], shadow->importBase, &subject);
+        landOnCpu(*shadow, cpuCopies, decided);
+    }
+    if (ranges.empty()) return units;
     recordCopies(*shadow, copies, ranges, bytes);
+    if (!wouldLand.empty()) {
+        // APS5_KEEP_CPU_STORES=0: what the CPU would have kept of the late pieces, counted ("would
+        // keep") from the stamps collected by the time their copy's batch finishes (no walk here).
+        auto count = [decided, late = std::move(wouldLand)] {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> stored;
+            for (const auto& [begin, end] : late) GuestMemory::KeepCpuStoredRun(GuestMemory::LateStoreKind::ShadowPublish, decided, begin, end, stored);
+        };
+        if (auto* recorder = Recorder::Active()) recorder->OnComplete(std::move(count));
+        else count();
+    }
     if (GuestMemory::CrashResourcesEnabled() || GuestMemory::WriteBackRangeTraced(ranges.front().first, ranges.back().second - ranges.front().first)) {
         // The crash report's store ring and the write-back range trace: the slab copies land in
         // the import (no MarkWritten). The subject's age is the import's last retile (a lower

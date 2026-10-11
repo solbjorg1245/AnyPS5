@@ -277,6 +277,44 @@ void CheckCpuStoredRuns() {
     Require(CpuStoredRuns(base, 2 * Block, 0, runs) == 0 && runs.empty(), "a generation of 0 lists stores");
 }
 
+// The late store re-check (APS5_KEEP_CPU_STORES): a store decided at a generation leaves out the
+// 4 KiB pages a CPU store reached since (not the driver's own stores, not older ones) and stores
+// the rest in address order; with the switch off it stores the run whole and counts the pages
+// ("would keep" on the digest).
+void CheckKeepCpuStores() {
+    using Runs = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    constexpr std::uint64_t page = 4096;
+    void* memory = AllocateWatched(Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, Block);
+    CollectWritesUncached(base, Block);
+    const auto decided = TrackerGeneration();
+    Require(decided != 0, "the late store block is not collected");
+    bytes[2 * page + 8] = 0x22;
+    MarkWritten(base + 6 * page, 64);
+    CollectWritesUncached(base, Block);
+    SetKeepCpuStores(true);
+    Runs out;
+    if (std::getenv("APS5_NO_EDGE_PAGE_KEEP") != nullptr) {
+        Require(KeepCpuStoredRun(LateStoreKind::ShadowPublish, decided, base, base + 8 * page, out) == 8 * page && out.empty(), "a CPU-stamped block is not kept whole with APS5_NO_EDGE_PAGE_KEEP");
+        return;
+    }
+    Require(KeepCpuStoredRun(LateStoreKind::ShadowPublish, decided, base, base + 8 * page, out) == page && out == Runs{{base, base + 2 * page}, {base + 3 * page, base + 8 * page}}, "the CPU's page since the decision is not left out alone");
+    Require(KeptCpuStoreSummary().find("late stores over CPU-stored pages: kept 1 (4 KiB)") != std::string::npos && KeptCpuStoreSummary().find("shadow 1 (4 KiB)") != std::string::npos, "the digest does not count the kept page by kind");
+    out.clear();
+    Require(KeepCpuStoredRun(LateStoreKind::WriteBack, decided, base + 2 * page + 100, base + 2 * page + 200, out) == 100 && out.empty(), "a run inside the CPU's page was stored");
+    out.clear();
+    Require(KeepCpuStoredRun(LateStoreKind::WriteBack, TrackerGeneration(), base, base + 8 * page, out) == 0 && out == Runs{{base, base + 8 * page}}, "a store decided after the CPU's lost bytes");
+    out.clear();
+    Require(KeepCpuStoredRun(LateStoreKind::WriteBack, 0, base, base + 8 * page, out) == 0 && out == Runs{{base, base + 8 * page}}, "a generation of 0 left bytes out");
+    SetKeepCpuStores(false);
+    out.clear();
+    Require(KeepCpuStoredRun(LateStoreKind::ShadowPublish, decided, base, base + 8 * page, out) == page && out == Runs{{base, base + 8 * page}}, "APS5_KEEP_CPU_STORES=0 did not store the run whole, or did not count it");
+    Require(KeptCpuStoreSummary().find("late stores over CPU-stored pages: would keep") != std::string::npos, "the digest does not say 'would keep' with the switch off");
+    SetKeepCpuStores(true);
+}
+
 // The write-back range trace's switch (APS5_TRACE_WRITEBACK_RANGE=<lo>-<hi>, hex): the range is
 // [lo, hi), and a store is traced only when one of its bytes lies inside it.
 void CheckRangeTraceFilter() {
@@ -414,6 +452,7 @@ int main() {
         CheckOwnStore();
         CheckEqualsSince();
         CheckCpuStoredRuns();
+        CheckKeepCpuStores();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;
