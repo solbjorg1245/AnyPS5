@@ -36,6 +36,8 @@
 //   NativeAspect = off        APS5_NATIVE_ASPECT    on (1): render at Resolution's aspect, wider view (Hor+)
 //                             APS5_NATIVE_ASPECT_RENDER=1 / APS5_NATIVE_ASPECT_UI=1 (environment only,
 //                             experimental): shared render targets / display buffer at the output's shape
+//                             APS5_NO_NATIVE_ASPECT_UI_RECT=1 (environment only): the 16:9 UI stretched
+//                             with the 3D instead of kept in a centred 16:9 region
 //   Upscaler = off            APS5_UPSCALER         reserved: fsr, dlss (UpscalerQuality and FrameGeneration: file only, reserved)
 // The title takes one fixed physics step of 1/refresh per rendered frame (59.94 Hz in its 60 FPS mode,
 // 29.97 Hz in its 30 FPS mode), so any other limit, and any frame rate below the limit, changes the game
@@ -474,6 +476,19 @@ inline NativeAspectPlan PlanNativeAspect(const Settings& settings) {
         }
     }
     return plan;
+}
+
+// Native aspect's UI rect (libSceAgcDriver DepthSurface.cpp, s59-s61): the 16:9 UI is moved into a
+// centred 16:9 region of the display buffer at its composite, so the HUD, menus and movies keep their
+// proportions while the 3D fills the window. On wherever native aspect is planned and the display
+// buffer keeps its 16:9 shape (with APS5_NATIVE_ASPECT_UI it has the window's shape: nothing to move).
+// `noUiRect` (APS5_NO_NATIVE_ASPECT_UI_RECT) other than empty or 0 turns it off (part 1: the UI
+// stretched with the 3D); `uiRect` (APS5_NATIVE_ASPECT_UI_RECT) forces it on (any value but 0) or off.
+inline bool NativeAspectUiRect(const Settings& settings, const char* uiRect, const char* noUiRect) {
+    if (noUiRect != nullptr && noUiRect[0] != '\0' && std::string_view(noUiRect) != "0") return false;
+    if (uiRect != nullptr && uiRect[0] != '\0') return std::string_view(uiRect) != "0";
+    const auto plan = PlanNativeAspect(settings);
+    return plan.Active() && !plan.DisplayNative();
 }
 
 // The title's tier table in the supported build (PE VA 0x14251eb48, read by FUN_14091ab90): render width,

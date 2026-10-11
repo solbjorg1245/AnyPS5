@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
 #include "prx/libc/include/HostMutex.hpp"
+#include "prx/libc/include/PortSettings.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -653,6 +654,9 @@ struct DisplayWriteWindow {
     std::uint64_t uiPhases = 0;
     std::uint64_t uiFragCoord = 0;
     std::uint64_t moved = 0;
+    // Moves whose margins took the UI target's clear colour, or transparent black (none seen yet).
+    std::uint64_t marginsCleared = 0;
+    std::uint64_t marginsTransparent = 0;
     std::uint64_t notMoved = 0;
     std::array<MoveRefusal, 8> refusals{};
     std::uint64_t phaseUnlisted = 0;
@@ -665,18 +669,17 @@ DisplayWriteWindow& displayWindow() {
     return *window;
 }
 
-// APS5_NATIVE_ASPECT_UI_RECT=1 (experimental, native aspect only: nothing happens without a
-// presentation aspect): the blended draws into the UI target are drawn into the part of it that the
-// presenter shows undistorted (ComputeUndistortedRect), so the 16:9 UI keeps its proportions in a
-// centred 16:9 region of a wider (or taller) window. The UI target is the one texture at the display
-// buffer's size that the display buffer's composite samples (learned from the first composite; until
-// then, or when that is not one texture, nothing is remapped), or APS5_NATIVE_ASPECT_UI_TARGET=<hex
-// address>. The composite and every other write of the display buffer keep their state.
+// APS5_NATIVE_ASPECT_UI_RECT (on by default inside NativeAspect = on, PortSettings::NativeAspectUiRect:
+// APS5_NO_NATIVE_ASPECT_UI_RECT=1 goes back to part 1, the 16:9 UI stretched with the 3D; =1 or =0
+// forces it on or off; nothing happens without a presentation aspect): the blended draws into the UI
+// target are drawn into the part of it that the presenter shows undistorted (ComputeUndistortedRect),
+// so the 16:9 UI keeps its proportions in a centred 16:9 region of a wider (or taller) window. The UI
+// target is the one texture at the display buffer's size that the display buffer's composite samples
+// (learned from the first composite; until then, or when that is not one texture, nothing is
+// remapped), or APS5_NATIVE_ASPECT_UI_TARGET=<hex address>. The composite and every other write of
+// the display buffer keep their state.
 bool uiRectOn() {
-    static const bool on = [] {
-        const char* value = std::getenv("APS5_NATIVE_ASPECT_UI_RECT");
-        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-    }();
+    static const bool on = PortSettings::NativeAspectUiRect(GetPortSettings_nid_no_patch(), std::getenv("APS5_NATIVE_ASPECT_UI_RECT"), std::getenv("APS5_NO_NATIVE_ASPECT_UI_RECT"));
     return on;
 }
 
@@ -691,6 +694,22 @@ bool uiBlitOn() {
         if (!uiRectOn()) return false;
         const char* value = std::getenv("APS5_NO_NATIVE_ASPECT_UI_BLIT");
         return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0;
+    }();
+    return on;
+}
+
+// APS5_NATIVE_ASPECT_UI_EDGE_STRETCH=1 (part 3's margins): the move stretches the UI target's edge
+// columns (rows) over the margins, so a full-screen dim reaches the window's edges. Off by default: a
+// movie drawn through the UI target (the intro's Bink, t583) smears its edge columns across the
+// margins as streaks, and a UI line touching the rect's edge (the menu's separator) is drawn out to
+// the window's edges. The margins instead take the UI target's own clear colour (the last fixed DCC
+// clear it was key-filled or uploaded with; transparent black until one is seen): "no UI" in the
+// game's own alpha convention, so the composite shows what lies under the UI there, the 3D beside the
+// HUD and the empty scene (black) beside a movie.
+bool uiEdgeStretchOn() {
+    static const bool on = [] {
+        const char* value = std::getenv("APS5_NATIVE_ASPECT_UI_EDGE_STRETCH");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
     }();
     return on;
 }
@@ -793,13 +812,13 @@ void learnComposite(DisplayWriteWindow& window, std::span<const CompiledShader> 
     static const bool named = uiTarget().load(std::memory_order_relaxed) != 0;
     static bool reported = false;
     if (named) {
-        if (!reported) std::fprintf(stderr, "[aspect] UI rect (APS5_NATIVE_ASPECT_UI_RECT, experimental): UI target 0x%llx from APS5_NATIVE_ASPECT_UI_TARGET\n", static_cast<unsigned long long>(uiTarget().load(std::memory_order_relaxed)));
+        if (!reported) std::fprintf(stderr, "[aspect] UI rect (APS5_NATIVE_ASPECT_UI_RECT): UI target 0x%llx from APS5_NATIVE_ASPECT_UI_TARGET\n", static_cast<unsigned long long>(uiTarget().load(std::memory_order_relaxed)));
     } else if (window.displaySized == 1) {
         // Followed from composite to composite: a change (a menu or movie composite) is printed.
         if (uiTarget().exchange(candidate, std::memory_order_relaxed) == candidate) return;
-        std::fprintf(stderr, "[aspect] UI rect (APS5_NATIVE_ASPECT_UI_RECT, experimental): UI target 0x%llx %ux%u learned from the display buffer's composite\n", static_cast<unsigned long long>(candidate), extent.width, extent.height);
+        std::fprintf(stderr, "[aspect] UI rect (APS5_NATIVE_ASPECT_UI_RECT): UI target 0x%llx %ux%u learned from the display buffer's composite\n", static_cast<unsigned long long>(candidate), extent.width, extent.height);
     } else if (!reported) {
-        std::fprintf(stderr, "[aspect] UI rect (APS5_NATIVE_ASPECT_UI_RECT, experimental): a composite samples %zu textures at the display buffer's %ux%u: no UI target from it (APS5_NATIVE_ASPECT_UI_TARGET=<hex> names one)\n", window.displaySized, extent.width, extent.height);
+        std::fprintf(stderr, "[aspect] UI rect (APS5_NATIVE_ASPECT_UI_RECT): a composite samples %zu textures at the display buffer's %ux%u: no UI target from it (APS5_NATIVE_ASPECT_UI_TARGET=<hex> names one)\n", window.displaySized, extent.width, extent.height);
     } else {
         return;
     }
@@ -941,6 +960,10 @@ VkImageBlit blitRegion(const AspectFitBlit& blit) {
 void moveUiTarget(UiMove move) {
     AspectFitRect rect{};
     std::uint32_t blitCount = 0;
+    // The margins: 's' edge stretch (APS5_NATIVE_ASPECT_UI_EDGE_STRETCH), 'c' filled with the UI
+    // target's clear colour, 't' transparent black (no clear colour seen).
+    char margins = 's';
+    VkClearColorValue fill{};
     if (move.refusal == nullptr) {
         try {
             const auto aspect = PresentationAspect_nid_postfix();
@@ -963,7 +986,9 @@ void moveUiTarget(UiMove move) {
                         regions[index] = blitRegion(blits[index]);
                         filters[index] = blits[index].nearest ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
                     }
-                    static_cast<void>(image->BlitSelf(std::span<const VkImageBlit>(regions.data(), blitCount), std::span<const VkFilter>(filters.data(), blitCount), move.refusal));
+                    // The margin blits (all after the first) carry the fill once the copy is cleared to it.
+                    if (!uiEdgeStretchOn()) margins = image->LastClearColor(fill) ? 'c' : 't';
+                    static_cast<void>(image->BlitSelf(std::span<const VkImageBlit>(regions.data(), blitCount), std::span<const VkFilter>(filters.data(), blitCount), move.refusal, margins == 's' ? nullptr : &fill, 1));
                 }
             }
         } catch (const std::exception&) {
@@ -975,14 +1000,23 @@ void moveUiTarget(UiMove move) {
     {
         std::lock_guard lock(probeMutex());
         auto& window = displayWindow();
-        if (move.refusal == nullptr) ++window.moved;
-        else noteMoveRefusal(window, move.refusal);
-        first = reported->insert(move.refusal == nullptr ? "" : move.refusal).second;
+        if (move.refusal == nullptr) {
+            ++window.moved;
+            if (margins == 'c') ++window.marginsCleared;
+            else if (margins == 't') ++window.marginsTransparent;
+        } else {
+            noteMoveRefusal(window, move.refusal);
+        }
+        first = reported->insert(move.refusal == nullptr ? std::string(1, margins) : std::string(move.refusal)).second;
     }
     if (!first) return;
     if (move.refusal == nullptr) {
-        std::fprintf(stderr, "[aspect] UI move (APS5_NATIVE_ASPECT_UI_BLIT): UI target 0x%llx %ux%u moved into %d,%d %ux%u before the display buffer's composite (%u blits: the target linear, its edge columns or rows stretched over the margins)\n",
-            static_cast<unsigned long long>(move.address), move.extent.width, move.extent.height, rect.x, rect.y, rect.width, rect.height, blitCount);
+        char how[160];
+        if (margins == 's') std::snprintf(how, sizeof(how), "its edge columns or rows stretched over the margins, APS5_NATIVE_ASPECT_UI_EDGE_STRETCH");
+        else if (margins == 'c') std::snprintf(how, sizeof(how), "the margins filled with its clear colour %g,%g,%g,%g", fill.float32[0], fill.float32[1], fill.float32[2], fill.float32[3]);
+        else std::snprintf(how, sizeof(how), "the margins transparent black, no clear colour seen");
+        std::fprintf(stderr, "[aspect] UI move (APS5_NATIVE_ASPECT_UI_BLIT): UI target 0x%llx %ux%u moved into %d,%d %ux%u before the display buffer's composite (%u blits: the target linear, %s)\n",
+            static_cast<unsigned long long>(move.address), move.extent.width, move.extent.height, rect.x, rect.y, rect.width, rect.height, blitCount, how);
     } else {
         std::fprintf(stderr, "[aspect] UI move (APS5_NATIVE_ASPECT_UI_BLIT): UI target 0x%llx %ux%u not moved: %s\n", static_cast<unsigned long long>(uiTarget().load(std::memory_order_relaxed)), move.extent.width, move.extent.height, move.refusal);
     }
@@ -997,7 +1031,7 @@ std::string displayWriteDigest() {
         window = live;
         live.presents = live.frameWork = live.draws = live.dispatches = live.uiDraws = live.uiDispatches = live.remapped = live.unlisted = 0;
         live.writes.clear();
-        live.phaseWrites = live.uiPhases = live.uiFragCoord = live.moved = live.notMoved = live.phaseUnlisted = 0;
+        live.phaseWrites = live.uiPhases = live.uiFragCoord = live.moved = live.marginsCleared = live.marginsTransparent = live.notMoved = live.phaseUnlisted = 0;
         live.refusals = {};
         live.phaseTargets.clear();
         live.uiSamples.clear();
@@ -1034,6 +1068,9 @@ std::string displayWriteDigest() {
         std::snprintf(text, sizeof(text), " (%s: %llu)", refusal.why, static_cast<unsigned long long>(refusal.count));
         result += text;
     }
+    std::snprintf(text, sizeof(text), "; UI margins (APS5_NATIVE_ASPECT_UI_EDGE_STRETCH %s): %llu the UI target's clear colour, %llu transparent black", uiEdgeStretchOn() ? "on" : "off",
+        static_cast<unsigned long long>(window.marginsCleared), static_cast<unsigned long long>(window.marginsTransparent));
+    result += text;
     std::snprintf(text, sizeof(text), "; UI draws reading FragCoord %llu of %llu; UI phase in %llu frames, %llu other storage writes of the UI extent in it; targets written", static_cast<unsigned long long>(window.uiFragCoord),
         static_cast<unsigned long long>(window.uiDraws), static_cast<unsigned long long>(window.uiPhases), static_cast<unsigned long long>(window.phaseWrites));
     result += text;

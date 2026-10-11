@@ -325,6 +325,23 @@ static void TestNativeAspect() {
         if (entry != 2 && entry != 7 && entry != 12 && entry != 17) Require(displayTable[entry] == PortSettings::TierTable[entry], "other entries untouched");
     }
     Require(PortSettings::Describe(FromText("NativeAspect = on\nResolution = 2560x1080")).find("(shared targets 2560x1440, display buffer 3840x2160)") != std::string::npos, "describe: part 1 by default");
+
+    // The UI rect: on inside NativeAspect, off without it or with the display half; the environment
+    // turns it off (APS5_NO_NATIVE_ASPECT_UI_RECT) or forces it (APS5_NATIVE_ASPECT_UI_RECT).
+    const auto wideSettings = FromText("NativeAspect = on\nResolution = 2560x1080");
+    const auto plainSettings = FromText("Resolution = 2560x1080");
+    Require(PortSettings::NativeAspectUiRect(wideSettings, nullptr, nullptr), "UI rect on inside NativeAspect");
+    Require(PortSettings::NativeAspectUiRect(FromText("NativeAspect = on\nResolution = 1280x800"), nullptr, ""), "UI rect on at 16:10; an empty APS5_NO_NATIVE_ASPECT_UI_RECT is unset");
+    Require(!PortSettings::NativeAspectUiRect(plainSettings, nullptr, nullptr), "UI rect off without NativeAspect");
+    Require(!PortSettings::NativeAspectUiRect(wideSettings, nullptr, "1"), "APS5_NO_NATIVE_ASPECT_UI_RECT=1");
+    Require(PortSettings::NativeAspectUiRect(wideSettings, nullptr, "0"), "APS5_NO_NATIVE_ASPECT_UI_RECT=0 keeps it");
+    Require(!PortSettings::NativeAspectUiRect(wideSettings, "0", nullptr), "APS5_NATIVE_ASPECT_UI_RECT=0");
+    Require(PortSettings::NativeAspectUiRect(plainSettings, "1", nullptr), "APS5_NATIVE_ASPECT_UI_RECT=1 forces it as before");
+    Require(!PortSettings::NativeAspectUiRect(wideSettings, "1", "1"), "APS5_NO_NATIVE_ASPECT_UI_RECT wins");
+    auto uiHalf = PortSettings::Parse("NativeAspect = on\nResolution = 2560x1080\n", "test.ini");
+    PortSettings::ApplyEnvironment(uiHalf, [](const char* name) -> const char* { return std::string(name) == "APS5_NATIVE_ASPECT_UI" ? "1" : nullptr; });
+    PortSettings::Normalize(uiHalf);
+    Require(!PortSettings::NativeAspectUiRect(uiHalf, nullptr, nullptr), "the display half leaves nothing to move");
 }
 
 int main() {
