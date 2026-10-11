@@ -301,6 +301,7 @@ void Driver::runRecordPipe() noexcept {
     PinWorkerThread("recording pipe");
     // Batches name queue 0 (G/Recorder.cpp): B's items are queue 0's.
     GuestMemory::TagGpuLockThread(0);
+    GuestMemory::MarkRecordPipeThread();
     auto& pipe = recordPipe();
     static const auto hold = pipeMicros("APS5_RECORD_PIPE_HOLD_US", 200);
     const bool profile = recordPipeProfile();

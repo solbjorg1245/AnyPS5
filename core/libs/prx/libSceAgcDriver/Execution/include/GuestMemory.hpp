@@ -212,6 +212,9 @@ void TagGpuLockThread(std::uint32_t queue);
 // The presenter stays untagged (its tag is a queue id to the recorder) but takes its own column
 // of the [lock] holder matrix, apart from the game threads.
 void MarkPresenterThread();
+// The queue-0 recording pipe's thread (APS5_RECORD_PIPE): tagged queue 0 for batches, its [lock]
+// line reads "queue 0x0 (recording pipe)" beside the queue-0 worker's.
+void MarkRecordPipeThread();
 // The queue tag of the calling thread (0xffffffff when untagged), for reports that name the thread.
 std::uint32_t GpuLockThreadTag();
 // Lock sites (APS5_PROFILE_DRAW): a caller names the site of its next lock() so the [lock] line
