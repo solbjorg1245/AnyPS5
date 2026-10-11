@@ -3,12 +3,14 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
@@ -124,6 +126,39 @@ struct RecordPipeStale {
     void Finish(std::uint64_t serial) {
         raised.store(0, std::memory_order_relaxed);
         redone.store(serial, std::memory_order_release);
+    }
+};
+
+// APS5_RECORD_PIPE_VERIFY=1 (with APS5_RECORD_PIPE=1; default off): the guest ranges the device calls
+// of the last Depth recorded items noted as GPU writes (GuestMemory::recordedWrites), by serial. Before
+// B records item s it checks s's captures against the items unrecorded when s's draw began, all
+// recorded by then (A checks a draw it drained for the same way): an overlap is a write the overlay
+// estimate missed (else the draw would have drained and run again).
+struct RecordPipeWriteLog {
+    struct Item {
+        std::uint64_t serial = 0;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    };
+    std::array<Item, RecordPipeRing::Depth> items;
+
+    // B, before item s's device call: the list its writes (and A's redo's, if it turns stale) join.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>>& Begin(std::uint64_t serial) {
+        auto& item = items[RecordPipeRing::Slot(serial)];
+        item.serial = serial;
+        item.ranges.clear();
+        return item.ranges;
+    }
+    // The newest item in (after, before) whose writes overlap [begin, end), or 0 (items older than
+    // the log are not known).
+    std::uint64_t Writer(std::uint64_t after, std::uint64_t before, std::uint64_t begin, std::uint64_t end) const {
+        for (auto serial = before; serial > after + 1;) {
+            const auto& item = items[RecordPipeRing::Slot(--serial)];
+            if (item.serial != serial) continue;
+            for (const auto& [from, to] : item.ranges) {
+                if (begin < to && from < end) return serial;
+            }
+        }
+        return 0;
     }
 };
 

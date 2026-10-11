@@ -595,11 +595,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (recordPipe && !gpuLock.owns_lock()) {
         const auto verdict = RecordPipeDrawVerdict(retry.level != 0 ? PipeCensusLock::Stale : lockedPrepare ? PipeCensusLock::Other : PipeCensusLock::Direct, !deferredLabels().labels.empty());
         if (verdict.eligible && scratch.Slot() && localDevice->Window() != nullptr) {
-            handOverDraw(*scratch, {decode, entry, localDevice, recipe, drawParameters, drawKey.key, (packet[0] >> 8u) & 0xffu, retryable, drawHit || hits.partial, packet, &submission}, queue);
+            handOverDraw(*scratch, {decode, entry, localDevice, recipe, drawParameters, drawKey.key, (packet[0] >> 8u) & 0xffu, retryable, drawHit || hits.partial, packet, &submission, pipeConsumed}, queue);
             timing.Mark("draw_and_resource_release");
             return drawn();
         }
         drainRecordPipe(verdict.drain.value_or(PipeCensusDrain::Other));
+        verifyRecordPipeDrained(memory, pipeConsumed, (packet[0] >> 8u) & 0xffu, drawKey.key);
     }
     lockForDraw();
     noteDrawWriters(stages, submission.queue);

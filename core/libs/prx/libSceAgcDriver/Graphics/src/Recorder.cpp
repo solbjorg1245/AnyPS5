@@ -3860,6 +3860,7 @@ void Recorder::OnComplete(std::function<void()> action) {
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, WriteKind kind) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
+    if (!ownLabel) GuestMemory::NoteRecordedWrite(address, address + bytes);
     // Resident read-only copies over the range are stale from here on (GuestBufferMemory.cpp,
     // "Resident reads"): every GPU write into guest memory is noted here.
     if (ResidentReadsLive()) NoteResidentReadsWrite(address, address + bytes);
@@ -3898,6 +3899,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // moves as well, so a poller re-consults the label table for a completion label.
     if (ResidentReadsLive()) NoteResidentReadsWrite(address, address + bytes);
     if (ResidentWritesLive()) NoteResidentWritesWrite(address, address + bytes);
+    if (!ownLabel) GuestMemory::NoteRecordedWrite(address, address + bytes);
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
     markPendingBlocks(address, address + bytes, batch.serial);

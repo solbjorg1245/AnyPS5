@@ -201,6 +201,7 @@ private:
     static DrawScratch* recordPipeScratch();
     static std::uint64_t recordPipeConsumed();
     bool recordPipeOverlaps(std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t consumed);
+    static void verifyRecordPipeDrained(std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t consumed, std::uint32_t opcode, std::uint64_t key);
     void handOverDraw(DrawScratch& scratch, RecordPipeDraw&& draw, const QueueState& queue);
     void serviceRecordPipe();
     void recordPipeWaitRound();

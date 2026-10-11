@@ -4432,6 +4432,7 @@ void ShaderResources::noteFrameTrace() {
 void ShaderResources::WriteBack() {
     // A synchronous draw publishes no pending writes (MarkGpuWrites): its note is taken here.
     if (AgcDriver::FrameTrace::Noting()) noteFrameTrace();
+    if (GuestMemory::recordedWrites != nullptr) GuestMemory::recordedWrites->insert(GuestMemory::recordedWrites->end(), guestMemory.Writes().begin(), guestMemory.Writes().end());
     WriteBackBuffers();
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {

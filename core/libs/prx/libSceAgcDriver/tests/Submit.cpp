@@ -598,6 +598,16 @@ void testRecordPipe() {
     handshake = handshake && stale.Pending() == 9 && !stale.Redone(9);
     stale.Finish(9);
     check(handshake && stale.Redone(9) && !stale.Redone(7) && stale.Pending() == 0, "record pipe: a stale item is raised by B, redone and finished by A, then released to B");
+
+    // APS5_RECORD_PIPE_VERIFY: the write log names the newest item in (consumed at the check, item)
+    // whose actual writes a capture overlaps; a slot reused by a later item forgets the older one.
+    RecordPipeWriteLog log;
+    log.Begin(3).push_back({0x1000, 0x2000});
+    log.Begin(4).push_back({0x3000, 0x3100});
+    log.Begin(5).push_back({0x1800, 0x1900});
+    log.Begin(4 + Ring::Depth).push_back({0x8000, 0x9000});
+    check(log.Writer(2, 6, 0x1fff, 0x2000) == 3 && log.Writer(2, 6, 0x1800, 0x1801) == 5 && log.Writer(3, 6, 0x1000, 0x1800) == 0 && log.Writer(2, 5, 0x1800, 0x1801) == 3 && log.Writer(2, 3, 0, ~0ull) == 0 && log.Writer(0, 1, 0, ~0ull) == 0, "record pipe verify: only the items between the check and the item count, the newest first");
+    check(log.Writer(2, 6, 0x3000, 0x3100) == 0 && log.Writer(Ring::Depth, 5 + Ring::Depth, 0x8fff, 0x9000) == 4 + Ring::Depth && log.Writer(2, 6, 0x2000, 0x3000) == 0, "record pipe verify: a reused slot answers for its new item only, and ranges are half-open");
 }
 
 // The fast dispatch (F5): the compare its verify mode makes between the old path's capture and the

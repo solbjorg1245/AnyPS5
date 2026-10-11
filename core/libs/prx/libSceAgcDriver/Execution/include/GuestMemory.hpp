@@ -304,6 +304,14 @@ struct PacketTag {
 constexpr std::uint32_t NoPacket = 0xfffffffeu;
 void SetCurrentPacket(std::uint32_t opcode, std::uint32_t queue);
 PacketTag CurrentPacket();
+// APS5_RECORD_PIPE_VERIFY (RecordPipe.cpp): while a thread points this at a list, each guest range its
+// recording notes as a GPU write (Recorder::noteWrite but labels, StorageTexture::markLayersPending)
+// or a synchronous draw writes back (its buffers and color targets) is appended to it. Null elsewhere:
+// one thread-local test per note.
+inline thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* recordedWrites = nullptr;
+inline void NoteRecordedWrite(std::uint64_t begin, std::uint64_t end) {
+    if (recordedWrites != nullptr) recordedWrites->emplace_back(begin, end);
+}
 
 // Store: a CPU write (Write/WriteChanged) rather than a read; a hook sync made for one orders a
 // write after a pending GPU write, so whether the bytes change says nothing about its necessity.

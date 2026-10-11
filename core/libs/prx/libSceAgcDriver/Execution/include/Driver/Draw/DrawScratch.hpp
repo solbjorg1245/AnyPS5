@@ -64,6 +64,8 @@ struct RecordPipeDraw {
     bool retryable = false, hit = false;
     std::span<const std::uint32_t> packet;
     const Submission* submission = nullptr;
+    // `consumed` as the draw began: the items after it were in the overlay its captures were checked against.
+    std::uint64_t consumed = 0;
 };
 
 // Lends the calling thread its DrawScratch while no other lease on this thread holds it; `slot`, the
