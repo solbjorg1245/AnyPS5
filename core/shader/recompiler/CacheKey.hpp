@@ -37,6 +37,10 @@ public:
         if (DebugProbeActive()) append(key, DebugProbeKey());
         append(key, RayTracingStrict());
         append(key, RayTracingMiss());
+        // The legacy float rules change the translation (APS5_NO_*_RULE, Recompiler.hpp).
+        append(key, LegacyMadRule());
+        append(key, MullitRule());
+        append(key, ClampNanRule());
     }
 
     // A hash over every field Build appends except the code, the target and the probe flag: the

@@ -26,6 +26,11 @@ bool Driver::verifyDrawEntries() {
     return verify;
 }
 
+bool Driver::drawEntryRunsCheck() {
+    static const bool check = std::getenv("APS5_DRAW_ENTRY_RUNS_CHECK") != nullptr;
+    return check;
+}
+
 bool Driver::registerKeyEnabled() {
     static const bool registerKey = std::getenv("APS5_NO_DRAW_KEY") == nullptr;
     return registerKey;

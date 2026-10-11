@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageMemoryPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TexelStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -13,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -37,6 +39,10 @@ bool StorageFormatAvailable(const Context& context, std::uint32_t guestFormat);
 // Whether a storage image of the guest format takes DCC clear `keys` as a GPU clear (see
 // StorageTexture::upload); false for integer formats and non-clear keys.
 bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, DccKeys keys);
+// The 32-bit word APS5_POISON_RETILE_SCRATCH fills a GPU-direct write-back's tiled scratch with,
+// for an image of `format`: magenta at 1.0 for UNORM formats and at 4.0 for float ones where a
+// repeated word can hold it, 4.0 in every channel for 32-bit float formats, all ones otherwise.
+std::uint32_t RetileScratchPoisonWord(VkFormat format);
 
 // A sampled texture's own VkImage with its memory, shared with the recorder while a recorded upload
 // still writes it (see the snapshot constructor), so the texture may go before the batch completes.
@@ -223,7 +229,9 @@ public:
     // The pending image whose surface starts at `address` and covers at least `bytes` (a mip chain
     // contains a descriptor of its first mips), if any; the caller decides whether the geometry fits
     // (Texture::CanCopyFrom, ResidentPresentable).
-    static std::shared_ptr<StorageTexture> FindPending(std::uint64_t address, std::uint64_t bytes);
+    // `swizzleSlice` (when given) must match the image's descriptor: a slice-k color view and a plain
+    // 2D surface at one address are tiled apart and never stand for each other.
+    static std::shared_ptr<StorageTexture> FindPending(std::uint64_t address, std::uint64_t bytes, std::optional<std::uint32_t> swizzleSlice = std::nullopt);
     // How a buffer fill of [address, address + bytes) (Driver.cpp's fill HLE) meets the storage
     // images alive: none of them; a whole surface (Exact) or one array layer of a surface (Layer),
     // `image` and `layer` naming it, whatever other images lie over the range (`others`, of which
@@ -267,7 +275,8 @@ public:
     bool FillClear(std::span<const std::uint32_t, 4> pattern, std::uint32_t layer, const char*& refusal);
     // The cached, live image whose surface is exactly [address, address + bytes), if any (the newest
     // of several: see ClassifyFill).
-    static std::shared_ptr<StorageTexture> FindLive(std::uint64_t address, std::uint64_t bytes);
+    // `swizzleSlice` as for FindPending.
+    static std::shared_ptr<StorageTexture> FindLive(std::uint64_t address, std::uint64_t bytes, std::optional<std::uint32_t> swizzleSlice = std::nullopt);
     // Whether the two surfaces differ in nothing but their address (and DCC metadata).
     bool SameSurfaceShape(const StorageTexture& other) const;
     // The copy HLE's buffer copy of one whole surface into another (VulkanDevice::CopyBuffer,
@@ -283,6 +292,11 @@ public:
     // <prefix><address>_<width>x<height>_a<layers>_l<layer>.raw (u32 row pitch in texels, u32 height,
     // u32 VkFormat, then the rows). The GPU must be idle. Returns the number of files written.
     static std::size_t DumpLive(const Context& context, const std::string& prefix, std::span<const std::uint64_t> addresses = {});
+    // Debug aid (APS5_PASS_DUMP, see Execution/include/Driver/PassDump.hpp): reads back mip `level` of
+    // layers [firstLayer, firstLayer + layerCount) (clamped to the image, and to 256 MiB) of every
+    // live, unreleased image at `address`, each handed to `consume`. The GPU must be idle. Returns
+    // the number of images read.
+    static std::size_t ReadBack(const Context& context, std::uint64_t address, std::uint32_t level, std::uint32_t firstLayer, std::uint32_t layerCount, const std::function<void(const ImageReadback&)>& consume);
     // Debug aid (APS5_CAPTURE_DIR, see VulkanDevice::CaptureTargets): sets every live image at
     // `address` to zero on the device (all mips and layers). The GPU must be idle. Returns the number
     // of images cleared.

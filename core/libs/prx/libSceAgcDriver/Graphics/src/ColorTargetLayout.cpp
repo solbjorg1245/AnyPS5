@@ -28,7 +28,7 @@ ColorTileMode DecodeColorTileMode(std::uint32_t attrib3) {
     return static_cast<ColorTileMode>(mode);
 }
 
-ColorTargetLayout::ColorTargetLayout(std::uint32_t width, std::uint32_t height, ColorTileMode mode, std::uint32_t bytesPerElement) : width(width), height(height), pitch(width), mode(mode), bytes(0), elementBytes(bytesPerElement) {
+ColorTargetLayout::ColorTargetLayout(std::uint32_t width, std::uint32_t height, ColorTileMode mode, std::uint32_t bytesPerElement, std::uint32_t swizzleSlice) : width(width), height(height), pitch(width), mode(mode), bytes(0), elementBytes(bytesPerElement) {
     require(width != 0 && height != 0 && width <= 16384 && height <= 16384, "AGC graphics: invalid color surface extent");
     require(std::has_single_bit(bytesPerElement) && bytesPerElement <= 16u, "AGC graphics: unsupported color element size");
     std::uint32_t paddedHeight = height;
@@ -77,6 +77,8 @@ ColorTargetLayout::ColorTargetLayout(std::uint32_t width, std::uint32_t height, 
             require(!table.x.empty(), "AGC graphics: no SW_64KB_R_X equation for the color element size");
             xOffsets = table.x;
             yOffsets = table.y;
+            const auto* equation = FindTextureSwizzleEquation(27u, bytesPerElement);
+            for (std::uint32_t bit = 0; bit < 16u; ++bit) sliceOffset |= parity((swizzleSlice << 24u) & equation->bits[bit] & 0xff000000u) << bit;
             break;
         }
         default: throw std::runtime_error("AGC graphics: unsupported color tile mode");
@@ -89,7 +91,7 @@ ColorTargetLayout::ColorTargetLayout(std::uint32_t width, std::uint32_t height, 
 std::size_t ColorTargetLayout::offset(std::uint32_t x, std::uint32_t y) const {
     if (mode == ColorTileMode::Linear) return (static_cast<std::size_t>(y) * pitch + x) * elementBytes;
     const auto block = static_cast<std::size_t>(y / blockHeight) * (pitch / blockWidth) + x / blockWidth;
-    return block * 65536u + (xOffsets[x % blockWidth] ^ yOffsets[y % blockHeight]);
+    return block * 65536u + (xOffsets[x % blockWidth] ^ yOffsets[y % blockHeight] ^ sliceOffset);
 }
 
 std::size_t ColorTargetLayout::Offset(std::uint32_t x, std::uint32_t y) const {

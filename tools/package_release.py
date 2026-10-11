@@ -225,6 +225,7 @@ def player_entries(platform, build, source, libraries, runtime, relinker):
         (f"{root}README.md", source / "docs/user/DEMONS_SOULS.md"),
         (f"{root}INPUT_MAPPING.md", source / "docs/user/INPUT_MAPPING.md"),
         (f"{root}anyps5-input.ini.example", player / "anyps5-input.ini.example"),
+        (f"{root}anyps5-settings.ini.example", player / "anyps5-settings.ini.example"),
         (f"{root}tools/ds_patch.py", source / "tools/ds_patch.py"),
         (f"{root}tools/{relinker.name}", relinker),
     ]

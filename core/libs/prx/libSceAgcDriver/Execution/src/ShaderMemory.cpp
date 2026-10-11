@@ -899,6 +899,40 @@ bool WordsEqualIgnoring(std::span<const std::uint32_t> a, std::span<const std::u
     return true;
 }
 
+std::vector<std::uint64_t> DeferredFlatAddresses(std::span<const ShaderRecompiler::DescriptorBinding> bindings) {
+    std::vector<std::uint64_t> addresses;
+    for (const auto& binding : bindings) {
+        for (const auto& [slot, address] : binding.deferredWords) addresses.push_back(address);
+    }
+    std::sort(addresses.begin(), addresses.end());
+    return addresses;
+}
+
+bool RunsEqualBesideDeferred(std::span<const std::pair<std::uint64_t, std::uint64_t>> storedRuns, std::span<const std::uint32_t> storedWords, std::span<const std::pair<std::uint64_t, std::uint64_t>> freshRuns, std::span<const std::uint32_t> freshWords, std::span<const std::uint64_t> deferred, std::span<const std::pair<std::uint32_t, std::uint32_t>> ignored) {
+    // Each side's words in address order as (address, position), the deferred addresses left out;
+    // runs that do not cover their words exactly compare unequal.
+    const auto collect = [&](std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::uint32_t> words, std::vector<std::pair<std::uint64_t, std::uint32_t>>& kept) {
+        std::size_t position = 0;
+        for (const auto& [begin, end] : runs) {
+            for (auto address = begin; address < end; address += sizeof(std::uint32_t), ++position) {
+                if (position >= words.size()) return false;
+                if (!std::binary_search(deferred.begin(), deferred.end(), address)) kept.emplace_back(address, static_cast<std::uint32_t>(position));
+            }
+        }
+        return position == words.size();
+    };
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> stored, fresh;
+    if (!collect(storedRuns, storedWords, stored) || !collect(freshRuns, freshWords, fresh) || stored.size() != fresh.size()) return false;
+    for (std::size_t i = 0; i < stored.size(); ++i) {
+        const auto [address, position] = stored[i];
+        if (address != fresh[i].first) return false;
+        const auto left = storedWords[position];
+        const auto right = freshWords[fresh[i].second];
+        if (left != right && ((left ^ right) & ~IgnoredMaskAt(ignored, position)) != 0) return false;
+    }
+    return true;
+}
+
 bool SameDescriptorIgnoringTsharpBits(const ShaderRecompiler::DescriptorBinding& binding, std::span<const std::uint32_t> left, std::span<const std::uint32_t> right) {
     if (left.size() != right.size()) return false;
     const bool sampled = binding.role == ShaderRecompiler::DescriptorRole::GuestImages && binding.kind == ShaderRecompiler::DescriptorKind::SampledImage;

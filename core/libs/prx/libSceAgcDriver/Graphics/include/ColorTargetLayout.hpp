@@ -17,7 +17,9 @@ ColorTileMode DecodeColorTileMode(std::uint32_t attrib3);
 
 class ColorTargetLayout {
 public:
-    ColorTargetLayout(std::uint32_t width, std::uint32_t height, ColorTileMode mode, std::uint32_t bytesPerElement = 4);
+    // `swizzleSlice` is the array slice the XOR swizzle takes (CB_COLOR_VIEW SLICE_START of a slice view,
+    // whose surface already starts at the slice's own address); 0 for a plain surface and ignored by Linear.
+    ColorTargetLayout(std::uint32_t width, std::uint32_t height, ColorTileMode mode, std::uint32_t bytesPerElement = 4, std::uint32_t swizzleSlice = 0);
     std::size_t Bytes() const { return bytes; }
     std::size_t LinearBytes() const { return static_cast<std::size_t>(width) * height * elementBytes; }
     std::size_t Alignment() const { return mode == ColorTileMode::Linear ? 256u : 65536u; }
@@ -40,6 +42,8 @@ private:
     // of tables shared by every layout of the element size.
     std::span<const std::uint32_t> xOffsets;
     std::span<const std::uint32_t> yOffsets;
+    // The slice term of the equations (a constant XOR into every offset of the surface).
+    std::uint32_t sliceOffset = 0;
 };
 
 }

@@ -1,5 +1,9 @@
 #include "GraphicsTests.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
+#include <array>
+#include <cstdint>
+#include <cstring>
 #include <string>
 #include <string_view>
 
@@ -45,6 +49,28 @@ void RunTextureFormatTests() {
 
     Require(ResolveTextureFormat(34) == ResolveTextureFormat(20), "format 34 must remap to format 20");
     Require(BytesPerElement(34) == BytesPerElement(20), "remapped format 34 must share the width of format 20");
+
+    // APS5_POISON_RETILE_SCRATCH's fill word reads as magenta in the formats of the title's color
+    // and HDR targets: 1.0 in UNORM channels, 4.0 in float ones, all ones for integer formats.
+    const auto bytesOf = [](std::uint32_t word) {
+        std::array<std::uint8_t, 4> bytes{};
+        std::memcpy(bytes.data(), &word, bytes.size());
+        return bytes;
+    };
+    constexpr std::array<std::uint8_t, 4> magenta{0xff, 0x00, 0xff, 0xff};
+    Require(bytesOf(RetileScratchPoisonWord(VK_FORMAT_R8G8B8A8_UNORM)) == magenta, "RGBA8 scratch poison must be opaque magenta");
+    Require(bytesOf(RetileScratchPoisonWord(VK_FORMAT_B8G8R8A8_SRGB)) == magenta, "BGRA8 scratch poison must be opaque magenta");
+    const auto packed = RetileScratchPoisonWord(VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+    Require((packed & 0x3ffu) == 0x3ffu && ((packed >> 10) & 0x3ffu) == 0 && ((packed >> 20) & 0x3ffu) == 0x3ffu && (packed >> 30) == 3u, "RGB10A2 scratch poison must be opaque magenta");
+    const auto small = RetileScratchPoisonWord(VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+    Require((small & 0x7ffu) == (17u << 6) && ((small >> 11) & 0x7ffu) == 0 && (small >> 22) == (17u << 5), "R11G11B10 scratch poison must hold red and blue at 4.0 and green at 0");
+    const auto half = RetileScratchPoisonWord(VK_FORMAT_R16G16B16A16_SFLOAT);
+    Require((half & 0xffffu) == 0x4400u && (half >> 16) == 0, "RGBA16F scratch poison must hold red and blue at 4.0 and green and alpha at 0");
+    const float four = 4.0f;
+    std::uint32_t fourBits = 0;
+    std::memcpy(&fourBits, &four, sizeof(fourBits));
+    Require(RetileScratchPoisonWord(VK_FORMAT_R32G32B32A32_SFLOAT) == fourBits, "32-bit float scratch poison must be 4.0");
+    Require(RetileScratchPoisonWord(VK_FORMAT_R32_UINT) == 0xffffffffu, "integer scratch poison must be all ones");
 
     reject([] { ResolveTextureFormat(0); }, "unsupported guest texture format");
     reject([] { ResolveTextureFormat(183); }, "unsupported guest texture format");

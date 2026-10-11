@@ -1633,6 +1633,18 @@ void verifyFlatTsharpFeedbackCopy() {
     require(!AgcDriver::FlatTsharpFeedbackCopy(std::span(old).first(1), walked, 0x000000b0u, 0x020000b0u), "bindings of different counts were compared");
 }
 
+// APS5_LOOP_TABLE_FIT: the span loop-counter tables are cut to so that the image slots fit. The
+// pc 0x258 screen pass: three images, two of them loop tables of the default span (32), needed
+// 3 + 2 x 31 = 65 image slots of 64.
+void verifyLoopTableSpan() {
+    using ShaderRecompiler::ResourceMaterializer;
+    require(ResourceMaterializer::LoopTableSpan(3u, {32u, 32u}, 64u) == 31u, "loop table span: two default-span tables beside one image were not cut to 31");
+    require(ResourceMaterializer::LoopTableSpan(3u, {3u, 3u}, 64u) == 3u, "loop table span: tables that fit were cut");
+    require(ResourceMaterializer::LoopTableSpan(40u, {32u, 4u}, 64u) == 22u, "loop table span: the cut did not keep the smaller table whole");
+    require(ResourceMaterializer::LoopTableSpan(64u, {32u}, 64u) == 1u, "loop table span: a table was not cut to its root slot");
+    require(ResourceMaterializer::LoopTableSpan(65u, {2u}, 64u) == 0u, "loop table span: images past the limit were fitted");
+}
+
 int main() {
     // The loop-counter table keys are opt-in in the driver; verifyLoopCounterTable covers them.
     // Set before the first plan reads it (ResourceTracker caches it).
@@ -1649,6 +1661,7 @@ int main() {
         verifyLoopCounterRange();
         verifyBindlessTable();
         verifyLoopCounterTable();
+        verifyLoopTableSpan();
         verifyDescriptorPhis();
         verifyProgramCounterRelativeData();
         verifyMeshConfiguration();

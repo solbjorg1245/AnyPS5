@@ -47,6 +47,9 @@ struct ColorTarget {
     std::uint32_t mip = 0;
     bool mipTail = false;
     std::array<std::uint32_t, 2> clearWords{};
+    // The array slice the draw renders into (CB_COLOR_VIEW SLICE_START); `address` is already that
+    // slice's 2D surface, whose XOR swizzle still takes the slice index (see SurfaceForTarget).
+    std::uint32_t slice = 0;
 };
 
 struct DepthTarget {

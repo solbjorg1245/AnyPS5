@@ -260,7 +260,14 @@ void reportTextureCounters() {
     const auto direct = taken(NullBoundImage::Undecodable);
     const auto tableBits = taken(NullBoundImage::TableUndecodable);
     const auto tableUnreadable = taken(NullBoundImage::TableUnreadable);
-    std::fprintf(stderr, "[draws] undecodable image elements bound as null (10 s%s): capture %llu (T# words 5-6), table entries %llu (words 5-6) + %llu (unreadable), driver decode %llu\n", ResourceMaterializer::NullUndecodable() ? "" : ", off: set APS5_NULL_UNDECODABLE=1", direct, tableBits, tableUnreadable, static_cast<unsigned long long>(sampledNullBound.exchange(0, std::memory_order_relaxed)));
+    // APS5_ARRAY_PITCH: rejected T# words 4-7 decoded from an intact copy (or a 3D view bit read)
+    // instead of throwing, and those left to throw.
+    char repairs[192] = "";
+    if (UpperHalfRepairEnabled()) {
+        const auto repairsOf = [](UpperHalfRepair kind) { return static_cast<unsigned long long>(TakeUpperHalfRepairs(kind)); };
+        std::snprintf(repairs, sizeof(repairs), "; T# words 4-7 served instead of thrown (APS5_ARRAY_PITCH): %llu from an intact copy, %llu 3D views, %llu not repaired", repairsOf(UpperHalfRepair::Copied), repairsOf(UpperHalfRepair::View3D), repairsOf(UpperHalfRepair::Unrepaired));
+    }
+    std::fprintf(stderr, "[draws] undecodable image elements bound as null (10 s%s): capture %llu (T# words 5-6), table entries %llu (words 5-6) + %llu (unreadable), driver decode %llu%s\n", ResourceMaterializer::NullUndecodable() ? "" : ", off: set APS5_NULL_UNDECODABLE=1", direct, tableBits, tableUnreadable, static_cast<unsigned long long>(sampledNullBound.exchange(0, std::memory_order_relaxed)), repairs);
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -487,7 +494,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // A storage image whose results for this surface (or for a mip chain containing it) are still on
     // the GPU supplies the texture by a view of it; anything else needs those results in guest
     // memory first.
-    auto source = StorageTexture::FindPending(address, guestBytes);
+    auto source = StorageTexture::FindPending(address, guestBytes, resource.swizzleSlice);
     if (source != nullptr && (depthCompare || !Texture::CanCopyFrom(*source, resource) || MetadataMoved(*source, resource))) source.reset();
     std::optional<DccKeys> keys;
     bool clearThroughKeys = false;
@@ -822,10 +829,13 @@ void evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::i
 }
 
 // Storage images are shared by every descriptor of one surface (address, extent, layers, format, tile
-// mode): the image holds the whole mip chain, and render targets in the same memory attach to it.
+// mode): the image holds the whole mip chain, and render targets in the same memory attach to it. A
+// color array slice's surface (swizzleSlice) is tiled apart from a 2D surface at the same address.
 std::array<std::uint32_t, 8> SurfaceKey(const Context& context, const GuestTextureResource& resource) {
+    // The packed words below give baseArray and swizzleSlice 16 bits each; a larger value would collide silently.
+    if (resource.baseArray > 0xffffu || resource.swizzleSlice > 0xffffu) throw std::runtime_error("AGC graphics: texture array base or swizzle slice exceeds the surface key");
     // Guest formats that store in the same Vulkan format share the image (views carry the difference).
-    return {static_cast<std::uint32_t>(resource.baseAddress), static_cast<std::uint32_t>(resource.baseAddress >> 32u), resource.width, resource.height, (resource.depthOrLastArray << 16u) | (resource.mipCount & 0xffffu), (static_cast<std::uint32_t>(resource.tileMode) << 12u) | (static_cast<std::uint32_t>(resource.dimension) << 20u), resource.baseArray, static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format))};
+    return {static_cast<std::uint32_t>(resource.baseAddress), static_cast<std::uint32_t>(resource.baseAddress >> 32u), resource.width, resource.height, (resource.depthOrLastArray << 16u) | (resource.mipCount & 0xffffu), (static_cast<std::uint32_t>(resource.tileMode) << 12u) | (static_cast<std::uint32_t>(resource.dimension) << 20u), resource.baseArray | (resource.swizzleSlice << 16u), static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format))};
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
@@ -2169,7 +2179,7 @@ bool ShaderResources::fastRevalidateEach() {
         // A view made under fast-clear keys stays one only while its image still has results pending
         // over the surface (the lookup prefers them to the clear); once they are flushed the clear
         // the image cannot see wins and the lookup makes a snapshot (cachedTexture's hit rule).
-        if (surface.source != nullptr && surface.keys != DccKeys::Uncompressed && StorageTexture::FindPending(address, surface.bytes).get() != surface.source) return false;
+        if (surface.source != nullptr && surface.keys != DccKeys::Uncompressed && StorageTexture::FindPending(address, surface.bytes, surface.resource.swizzleSlice).get() != surface.source) return false;
     }
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
         if (storageTextures[i] != nullptr && (i >= storageKeys.size() || (storageKeys[i] != 0 && storageKeys[i] != storageTextures[i]->Descriptor().dccAddress))) return false;
@@ -2221,7 +2231,7 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         const bool imported = SampledFromStorageEligible(context, surface.resource, surface.bytes);
         overlap.sourceEligible = imported && SurfaceKey(context, source->Descriptor()) == SurfaceKey(context, surface.resource);
-        auto found = StorageTexture::FindPending(address, surface.bytes);
+        auto found = StorageTexture::FindPending(address, surface.bytes, surface.resource.swizzleSlice);
         if (found != nullptr && !Texture::CanCopyFrom(*found, surface.resource)) found.reset();
         if (found != nullptr) {
             if (found != source) return OwnRefreshFallback::ForeignView;
@@ -3861,7 +3871,7 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
         if (record.resource.dccAddress != 0 && IsDccClear(record.source->FilledKeys())) return nullptr;
         // Under fast-clear keys the view holds only while its image's results are still pending over
         // the surface; flushed, the clear the image cannot see makes the lookup take a snapshot.
-        if (keys != DccKeys::Uncompressed && StorageTexture::FindPending(address, record.guestBytes) != record.source) return nullptr;
+        if (keys != DccKeys::Uncompressed && StorageTexture::FindPending(address, record.guestBytes, record.resource.swizzleSlice) != record.source) return nullptr;
     } else if (keys == DccKeys::Uncompressed && !GuestMemory::UnchangedSince(address, bytes, record.entryGeneration)) {
         return nullptr;
     }
@@ -4398,7 +4408,26 @@ bool SkipWriteBack() {
 }
 }
 
+void ShaderResources::noteFrameTrace() {
+    std::string text;
+    char item[128];
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        if (!storageWritten[index] || storageTextures[index] == nullptr) continue;
+        const auto& written = storageTextures[index]->Descriptor();
+        std::snprintf(item, sizeof(item), " w=0x%llx/%ux%u/f%u/m%u", static_cast<unsigned long long>(written.baseAddress), written.width, written.height, written.format, index < storageMips.size() ? storageMips[index] : 0u);
+        text += item;
+    }
+    for (const auto& [begin, end] : guestMemory.Writes()) {
+        std::snprintf(item, sizeof(item), " wb=0x%llx+0x%llx", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
+        text += item;
+    }
+    // The bound resources (textures with their surfaces, storage images, buffers).
+    AgcDriver::FrameTrace::NoteWrites(text + " |" + Describe());
+}
+
 void ShaderResources::WriteBack() {
+    // A synchronous draw publishes no pending writes (MarkGpuWrites): its note is taken here.
+    if (AgcDriver::FrameTrace::Noting()) noteFrameTrace();
     WriteBackBuffers();
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
@@ -4452,22 +4481,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     part(timing.marksWritesMs);
     guestMemory.MarkDirectWrites();
     part(timing.marksDirectMs);
-    if (AgcDriver::FrameTrace::Active()) {
-        std::string text;
-        char item[96];
-        for (std::size_t index = 0; index < storageTextures.size(); ++index) {
-            if (!storageWritten[index] || storageTextures[index] == nullptr) continue;
-            const auto& written = storageTextures[index]->Descriptor();
-            std::snprintf(item, sizeof(item), " w=0x%llx/%ux%u/f%u", static_cast<unsigned long long>(written.baseAddress), written.width, written.height, written.format);
-            text += item;
-        }
-        for (const auto& [begin, end] : guestMemory.Writes()) {
-            std::snprintf(item, sizeof(item), " wb=0x%llx+0x%llx", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
-            text += item;
-        }
-        // The bound resources (textures with their surfaces, storage images, buffers).
-        AgcDriver::FrameTrace::NoteWrites(text + " |" + Describe());
-    }
+    if (AgcDriver::FrameTrace::Noting()) noteFrameTrace();
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();
     // Recorded uses only (dispatches and recorded draws): a synchronous draw writes back in

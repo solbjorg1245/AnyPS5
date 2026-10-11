@@ -1528,6 +1528,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
             const auto chain = recorder.Commands();
             const auto copyBuffer = context.Resolved(&Graphics::DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
             const VkBufferCopy first{0, 0, 16};
+            Graphics::PoisonPooled(context, chain, *patternBuffer, Graphics::PoisonSite::Pattern);
             copyBuffer(chain, seed->Handle(), patternBuffer->Handle(), 1, &first);
             for (std::size_t done = 16; done < PatternBufferBytes; done *= 2) {
                 Graphics::RecordMemoryBarrier(context, chain, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -1621,7 +1622,7 @@ bool AliasCopy(const Graphics::Context& context, std::uint64_t destination, std:
         copyAliasNoSource.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    auto to = Graphics::StorageTexture::FindLive(destination, bytes);
+    auto to = Graphics::StorageTexture::FindLive(destination, bytes, from->Descriptor().swizzleSlice);
     if (to != nullptr && !to->SameSurfaceShape(*from)) {
         copyAliasShape.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -2051,6 +2052,14 @@ void VulkanDevice::CaptureImages(const std::string& prefix, std::span<const std:
         }
     }
     std::fprintf(stderr, "[capture] %s: %zu storage image files, %zu depth surface files and %zu buffers\n", prefix.c_str(), images, depths, buffers);
+}
+
+std::size_t VulkanDevice::ReadBackImage(std::uint64_t address, std::uint32_t level, std::uint32_t firstLayer, std::uint32_t layers, const std::function<void(const Graphics::ImageReadback&)>& consume) {
+    return Graphics::StorageTexture::ReadBack(graphicsContext(), address, level, firstLayer, layers, consume);
+}
+
+std::size_t VulkanDevice::ReadBackDepth(std::uint64_t address, std::uint32_t slice, const std::function<void(const Graphics::ImageReadback&)>& consume) {
+    return Graphics::ReadBackDepthSurface(graphicsContext(), address, slice, consume);
 }
 
 void VulkanDevice::CaptureTargets() {
@@ -3658,6 +3667,11 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             }, FlushReason::Dispatch);
         }
     }
+    // APS5_DISPATCH_OVERLAP (Graphics::Recorder::DispatchOverlap): a direct dispatch with known
+    // ranges, recorded for a DISPATCH_DIRECT packet, defers its trailing barrier; the next one of
+    // the same guest order span (only register writes between the packets) runs alongside it.
+    const auto guestOrder = Graphics::Recorder::DispatchOverlap() && argumentImport == nullptr && !resources.HoldsLease() ? Graphics::Recorder::GuestOrder() : Graphics::Recorder::GuestOrderKey{};
+    const bool holdsTrail = recorder.HoldDispatchTrail(guestOrder);
     VkAccessFlags covered = 0;
     const auto commands = keepCopyBacks ? recorder.CommandsKeepingCopyBacks(&covered) : recorder.Commands(&covered);
     recordStep(PhaseRecordCommands);
@@ -3701,7 +3715,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             record.refreshed = true;
         } else if (forkOutcome == ForkOutcome::Same || forkOutcome == ForkOutcome::Reused) {
             ++d.templateSameWords;
-        } else if (differs && resources.RefreshData(commands, *record.shader, &recorder)) {
+        } else if (differs && (recorder.RecordDispatchTrail(), resources.RefreshData(commands, *record.shader, &recorder))) {
+            // (A held-over dispatch may still read the template's buffers: its trailing barrier goes
+            // in before the update.)
             covered = 0;
             ++d.templateRefreshed;
             d.templateRevalidateMs += record.revalidateMs;
@@ -3713,6 +3729,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     // ForkData adopts words into this template only once the batch recording this use finished.
     if (TemplateRefreshRing()) resources.NoteRecorded(recorder);
+    // Nothing recorded since the held-over dispatch: this one overlaps it (its leading barrier is
+    // covered by the mask the deferral marked).
+    if (holdsTrail) recorder.ElideDispatchTrail();
     record.forked = forkedSet != VK_NULL_HANDLE;
     using CommandClass = Graphics::Recorder::CommandClass;
     if (Graphics::Recorder::BarrierValidate()) {
@@ -3764,12 +3783,16 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         const auto inPlace = resources.InPlaceReads();
         recorder.NoteInPlace(gpuTiming, Graphics::Recorder::InPlaceUseOf(inPlace, resources.GpuWrites(), {}, resources.HoldsLease()));
     }
-    const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
     constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
-    Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
-    recorder.EndGpuTiming(trailingTiming);
-    recorder.MarkCovered(dispatchedAccess);
+    if (guestOrder.span != 0) {
+        recorder.DeferDispatchTrail(guestOrder, dispatchedAccess);
+    } else {
+        const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
+        Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
+        recorder.EndGpuTiming(trailingTiming);
+        recorder.MarkCovered(dispatchedAccess);
+    }
     recordStep(PhaseRecordBind);
     // The marks' parts (ShaderResources::MarkGpuWrites' timing) as rows splitting "record: marks".
     const auto marksBefore = timer.profile ? resources.Timing() : Graphics::ShaderResources::BuildTiming{};

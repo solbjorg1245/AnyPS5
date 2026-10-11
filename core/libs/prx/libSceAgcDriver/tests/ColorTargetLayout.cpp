@@ -59,6 +59,28 @@ void RunColorTargetLayoutTests() {
     }
     reject([&] { layout.Detile(std::span(tiled).first(4), restored); });
     reject([&] { layout.Tile(std::span(linear).first(4), tiled); });
+    // A slice view's swizzle takes the slice index: a constant XOR (bit 11 = s0, bit 10 = s1 for 4 byte R_X).
+    {
+        const std::uint32_t xor4[4] = {0u, 0x800u, 0x400u, 0xc00u};
+        for (std::uint32_t slice = 0; slice < 4; ++slice) {
+            const ColorTargetLayout sliced(257, 129, ColorTileMode::RenderTarget, 4, slice);
+            Require(sliced.Bytes() == layout.Bytes(), "slice swizzle changed the layout size");
+            for (std::uint32_t y = 0; y < 129; y += 7) {
+                for (std::uint32_t x = 0; x < 257; x += 5) Require(sliced.Offset(x, y) == (layout.Offset(x, y) ^ xor4[slice]), "slice swizzle is not the slice 0 offset xor the slice term");
+            }
+        }
+        const ColorTargetLayout slice1(257, 129, ColorTileMode::RenderTarget, 4, 1);
+        std::vector<bool> seen(slice1.Bytes() / 4);
+        for (std::uint32_t y = 0; y < 129; ++y) {
+            for (std::uint32_t x = 0; x < 257; ++x) {
+                const auto address = slice1.Offset(x, y);
+                Require(address + 4 <= slice1.Bytes() && !seen[address / 4], "slice swizzle aliases pixels");
+                seen[address / 4] = true;
+            }
+        }
+        const ColorTargetLayout linearSlice(63, 2, ColorTileMode::Linear, 4, 3);
+        Require(linearSlice.Offset(5, 1) == padded.Offset(5, 1), "linear layouts must ignore the slice");
+    }
     static std::vector<std::byte> storage(2 * 65536);
     const std::span guest(reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(storage.data()) + 0xffffu) & ~std::uintptr_t{0xffffu}), 65536);
     std::fill(guest.begin(), guest.end(), std::byte{0x6b});

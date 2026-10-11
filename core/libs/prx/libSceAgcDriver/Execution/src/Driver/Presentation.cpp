@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/PassDump.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -90,6 +91,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                     timing.Mark("device_idle_wait");
                 }
                 presenting->CaptureTargets();
+                if (PassDump::Enabled()) PassDump::AtPresent(*presenting, buffer->address);
                 submitted = presenting->PresentDisplayBuffer(*buffer);
                 timing.Mark("present_display_buffer");
             } else {

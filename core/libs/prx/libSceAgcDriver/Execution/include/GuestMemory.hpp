@@ -90,6 +90,31 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries);
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes);
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std::function<void()>& store);
 bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
+// The pages of [address, address + bytes), a range inside one 64 KiB tracker block, that no store
+// since `generation` reached: bit p for the block's bytes [p * UnstoredPageBytes, (p + 1) *
+// UnstoredPageBytes), from the CPU's dirty pages and the driver's partial stores by page. 0 when
+// the block's bookkeeping cannot tell (a whole-block driver store since, a newer stamp no page
+// record explains, APS5_NO_EDGE_PAGE_KEEP), outside the watched arena, for a generation of 0, and
+// with APS5_FIX_BOOT_STRIP=0 (a write-back then leaves a stamped edge block to the CPU whole, the
+// unit shadow drops a whole stale unit). `cause`, when given, names what stored the range's other
+// pages: the CPU's pages, the driver's, a whole-block driver store, or nothing known (Unknown).
+constexpr std::size_t UnstoredPageBytes = 4096;
+enum class PageStoreCause : std::uint8_t { None, CpuPages, DriverPages, DriverWhole, Unknown };
+std::uint32_t PagesUnstoredSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, PageStoreCause* cause = nullptr, std::uint32_t* cpuPages = nullptr, std::uint32_t* driverPages = nullptr);
+// Debug aid (APS5_TRACE_EDGE_WATCH): makes [address, address + bytes) read-only until the next CPU
+// write into it, which is reported once on stderr ([edge-watch]: the writer's code address, module
+// offsets of a few unwound frames, the old bytes); a range is armed only while none is. Windows only.
+void ArmEdgeWatch(std::uint64_t address, std::size_t bytes);
+// APS5_FIX_BOOT_STRIP: CPU stores into the 16 KiB shared-view pages over the range are told apart
+// per 4 KiB page from now on (GuestArenaTrackWriteParts), for an edge block whose surface pages a
+// coarse 16 KiB stamp covered (the Bink planes' table neighbours). APS5_NO_FINE_EDGE_TRACKING=1 =
+// off. Returns the view pages made fine (0 off, or when they already were).
+std::size_t TrackEdgeParts(std::uint64_t address, std::size_t bytes);
+// The same, ahead of any merge, for the view pages a GPU-written surface [address, address + bytes)
+// covers only in part (its first and last, when it starts or ends inside one): called when the
+// surface's image is made, so the first frame's CPU stores next door stamp only their own pages.
+// Off with TrackEdgeParts, or alone with APS5_NO_EARLY_EDGE_TRACKING=1.
+std::size_t TrackSurfaceEdgeParts(std::uint64_t address, std::size_t bytes);
 // Collect epoch: within one epoch a range already collected is not walked again, CollectWrites
 // returns the current generation instead. A guest write landing between two collects of the same
 // epoch is seen by the next epoch, which is the ordering real hardware gives a CPU write made while a

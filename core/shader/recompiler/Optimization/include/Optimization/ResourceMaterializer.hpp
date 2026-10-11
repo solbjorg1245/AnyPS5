@@ -84,6 +84,14 @@ public:
     // not map it anyway (an invalid T#, another shape) and fails the draw where it would, as the
     // driver's decode did (APS5_NO_STRICT_TABLE_ENTRIES unset; set: every such entry binds null).
     static bool StrictTableEntries();
+    // Whether loop-counter tables that overflow the image slots are cut to fit instead of failing
+    // the draw (APS5_LOOP_TABLE_FIT set; off by default). It also turns on the loop keys.
+    static bool LoopTableFit();
+    // The span every loop-counter table may bind so that `fixedSlots` (the plan's images and the
+    // other tables' extra slots) plus each table's extra slots, min(its slots, span) - 1, fit
+    // `limit`: the largest such span, at least 1; 0 when even one slot each does not fit. A span
+    // at or above every table's slots cuts nothing.
+    static std::uint32_t LoopTableSpan(std::uint32_t fixedSlots, const std::vector<std::uint32_t>& loopSlots, std::uint32_t limit);
     // The elements bound as null for `reason` since the last call (the APS5_PROFILE_DRAW digest).
     static std::uint64_t TakeNullBound(NullBoundImage reason);
 };

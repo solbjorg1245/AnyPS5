@@ -293,10 +293,11 @@ private:
     // loop's immediate bound, else by APS5_TABLE_LOOP_LIMIT entries (default 32, at most the bindless
     // slots: a key past it misses the mapping and samples zeros). Before, such a T# failed the whole
     // draw ("GetImageResource dword 0 is not a valid runtime value"), and still does by default:
-    // the loop keys are opt-in (APS5_LOOP_TABLE_KEYS=1).
+    // the loop keys are on with ResourceMaterializer::LoopTableFit (default on; it also fits the
+    // tables into the image slots: LoopTableSpan), or with APS5_LOOP_TABLE_KEYS=1 alone.
     static std::uint32_t LoopTableLimit() {
         static const std::uint32_t limit = [] {
-            if (std::getenv("APS5_LOOP_TABLE_KEYS") == nullptr) {
+            if (std::getenv("APS5_LOOP_TABLE_KEYS") == nullptr && !ResourceMaterializer::LoopTableFit()) {
                 return 0u;
             }
             const char* text = std::getenv("APS5_TABLE_LOOP_LIMIT");
