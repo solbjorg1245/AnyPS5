@@ -1,5 +1,6 @@
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <exception>
@@ -16,16 +17,49 @@
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
+#include "prx/libSceVideoOut/include/TimestepPatch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
+#include "prx/libc/include/PreciseWait.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 
 namespace {
 
 void require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(std::string("VideoOut: ") + reason);
+}
+
+// The vblank rate, 0 for the default 59.94 Hz (60000/1001 exactly). APS5_VBLANK_HZ=119.88 pairs with
+// patch_game.py --fps120, which turns the title's 60 FPS mode into 120: the title steps physics once
+// per frame by 1/refresh, so it must flip at the refresh it was patched for. A value within 0.01 of an
+// NTSC rate (29.97, 59.94, 119.88) snaps to its exact n*1000/1001; a whole number is taken as is
+// (below 10 Hz every integer lies within 0.01 of n/1.001). Unset, an FpsLimit other than the title's 30
+// or 60 (player settings, with Timestep = variable) sets it: the title flips once per vblank.
+double vblankHz() {
+    const char* value = std::getenv("APS5_VBLANK_HZ");
+    if (value == nullptr) {
+        const double limit = PortSettings::VblankHz(GetPortSettings_nid_no_patch());
+        if (limit != 0.0) std::fprintf(stderr, "[videoout] vblank at %.4f Hz (FpsLimit)\n", limit);
+        return limit;
+    }
+    char* end = nullptr;
+    double hz = std::strtod(value, &end);
+    if (end == value || *end != '\0' || !(hz >= 1.0 && hz <= 1000.0)) {
+        std::fprintf(stderr, "[videoout] APS5_VBLANK_HZ=%s refused (1 to 1000 Hz); using 59.94\n", value);
+        return 0.0;
+    }
+    const double ntsc = std::round(hz * 1.001);
+    if (hz != std::round(hz) && std::abs(hz * 1.001 - ntsc) < 0.01) hz = ntsc / 1.001;
+    std::fprintf(stderr, "[videoout] vblank at %.4f Hz (APS5_VBLANK_HZ=%s)\n", hz, value);
+    return hz;
+}
+
+// vblankHz() once: the vblank thread and the timestep patch share it.
+double vblankRate() {
+    static const double hz = vblankHz();
+    return hz;
 }
 
 void checkConfig(const VideoOutConfig& cfg) {
@@ -107,6 +141,7 @@ public:
         ++cfg->flipStatus.flipPendingNum;
         if (info.index >= 0) ++cfg->bufferPending[info.index];
         request->reserved = true;
+        TimestepPatch::Get().Flip(vblankRate());
         return request;
     }
 
@@ -199,6 +234,12 @@ VideoOutDriver& VideoOutDriver::Get() {
 }
 
 VideoOutDriver::VideoOutDriver() {
+    // Resolution sizes the window in physical pixels (PortSettings::DpiAwareWindow); SDL reads the hint
+    // when its video starts, Windows only.
+    if (PortSettings::DpiAwareWindow(GetPortSettings_nid_no_patch(), std::getenv("APS5_DPI_AWARE"))) {
+        SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+        std::fprintf(stderr, "[videoout] per-monitor DPI aware: the window's client area is Resolution in physical pixels (APS5_DPI_AWARE=0 turns this off)\n");
+    }
     if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {
         throw std::runtime_error(std::string("SDL_InitSubSystem(VIDEO | GAMECONTROLLER) failed: ") + SDL_GetError());
     }
@@ -536,11 +577,21 @@ void VideoOutDriver::presentLoop(std::stop_token token) {
 
 void VideoOutDriver::vblankLoop(std::stop_token token) {
     using Frame = std::chrono::duration<int64_t, std::ratio<1001, 60000>>;
-    const auto start = std::chrono::steady_clock::now();
+    using Clock = std::chrono::steady_clock;
+    const double hz = vblankRate();
+    // APS5_NO_PRECISE_VBLANK=1 restores the condition-variable wait_until, which winpthreads ends on a
+    // 15.6 ms tick (vblank intervals of 2-34 ms instead of 16.68 ms).
+    static const bool precise = std::getenv("APS5_NO_PRECISE_VBLANK") == nullptr;
+    const auto start = Clock::now();
     try {
         for (int64_t frame = 1; !token.stop_requested(); ++frame) {
-            const auto next = start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(Frame(frame));
-            {
+            const auto next = start + (hz == 0.0 ? std::chrono::duration_cast<Clock::duration>(Frame(frame)) : std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(static_cast<double>(frame) / hz)));
+            if (precise) {
+                const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(next - Clock::now()).count();
+                if (remaining > 0) PreciseSleepUs(static_cast<unsigned long long>(remaining));
+                std::lock_guard lock(flipQueue->mutex);
+                if (token.stop_requested() || flipQueue->failure) return;
+            } else {
                 std::unique_lock lock(flipQueue->mutex);
                 flipQueue->changed.wait_until(lock, next, [&] { return token.stop_requested() || flipQueue->failure; });
                 if (token.stop_requested() || flipQueue->failure) return;

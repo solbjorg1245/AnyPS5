@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #ifdef _WIN32
@@ -9,8 +10,10 @@
 #else
 #include <sys/mman.h>
 #endif
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -84,11 +87,108 @@ void CheckSharedBlock() {
     const auto beforeCpu = CollectWrites(base, 3 * Block);
     static_cast<volatile std::uint8_t*>(memory)[Block + 8] = 0x22;
     CollectWritesUncached(base, 3 * Block);
-    Require(StoredOver(boundary, static_cast<std::size_t>(sharedSecond), beforeCpu), "a CPU store in the shared block is not seen");
+    // APS5_NO_EDGE_PAGE_KEEP=1 restores the whole-block answer: the store anywhere in the block counts.
+    if (std::getenv("APS5_NO_EDGE_PAGE_KEEP") != nullptr) {
+        Require(StoredOver(boundary, static_cast<std::size_t>(sharedSecond), beforeCpu), "a CPU store in the shared block is not seen with APS5_NO_EDGE_PAGE_KEEP");
+    } else {
+        Require(!StoredOver(boundary, static_cast<std::size_t>(sharedSecond), beforeCpu), "a CPU store outside the shared range counts for it");
+    }
 
     std::array<std::uint8_t, 64> unwatched{};
     const auto outside = reinterpret_cast<std::uint64_t>(unwatched.data());
     if (!Watched(outside, unwatched.size())) Require(StoredOver(outside, unwatched.size(), TrackerGeneration()), "an unwatched range reads as not stored over");
+}
+
+// APS5_FIX_BOOT_STRIP: a store into one page of a block leaves the block's other pages to a
+// surface sharing it (the Bink chroma plane's last 14 pages and the CPU's table after them).
+void CheckUnstoredPages() {
+    void* memory = AllocateWatched(2 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, 2 * Block);
+    const auto synced = CollectWrites(base, 2 * Block);
+    Require(synced != 0, "the unstored-pages block is not collected");
+    const char* fix = std::getenv("APS5_FIX_BOOT_STRIP");
+    const bool off = (fix != nullptr && std::string(fix) == "0") || std::getenv("APS5_NO_EDGE_PAGE_KEEP") != nullptr;
+    constexpr std::uint32_t all = 0xffff;
+    constexpr std::uint32_t surface = 0x3fff;
+    constexpr std::size_t surfaceBytes = 14 * 4096;
+    Require(PagesUnstoredSince(base, surfaceBytes, synced) == (off ? 0u : surface), "pages of an unwritten block read as stored");
+
+    bytes[14 * 4096 + 8] = 0x22;
+    CollectWritesUncached(base, 2 * Block);
+    std::array<std::uint64_t, 1> generations{synced};
+    std::array<std::uint8_t, 1> changed{};
+    Require(ChangedBlocks(base, Block, generations, changed) && changed[0] == BlockWritten, "the table store does not mark its block written");
+    if (off) {
+        Require(PagesUnstoredSince(base, surfaceBytes, synced) == 0, "pages are kept with APS5_FIX_BOOT_STRIP=0 or APS5_NO_EDGE_PAGE_KEEP");
+        return;
+    }
+    Require(PagesUnstoredSince(base, surfaceBytes, synced) == surface, "a CPU store into the table's page drops the surface's pages");
+    Require(PagesUnstoredSince(base, Block, synced) == (all & ~(1u << 14)), "the table's stored page reads as unstored");
+
+    MarkWritten(base + 2 * 4096 + 16, 32);
+    Require(PagesUnstoredSince(base, surfaceBytes, synced) == (surface & ~(1u << 2)), "a driver piece in the surface is not seen");
+    Require(PagesUnstoredSince(base + 4096, 4096, synced) == (1u << 1), "a one-page range answers for other pages");
+    Require(PagesUnstoredSince(base, Block, TrackerGeneration()) == all, "stores older than the generation are seen");
+
+    // A whole-block driver store into a noted block, a piece after it, and a ring overflow.
+    const auto beforeNotedWhole = TrackerGeneration();
+    MarkWritten(base, Block);
+    Require(PagesUnstoredSince(base, surfaceBytes, beforeNotedWhole) == 0, "a whole-block driver store into a noted block is missed");
+    const auto afterNotedWhole = TrackerGeneration();
+    MarkWritten(base + 3 * 4096 + 8, 8);
+    Require(PagesUnstoredSince(base, surfaceBytes, afterNotedWhole) == (surface & ~(1u << 3)), "a piece after a whole-block store is taken for the whole block");
+    // More small driver stores than the pieces ring holds are still told apart by page.
+    const auto beforeRing = TrackerGeneration();
+    for (int store = 0; store < 4; ++store) MarkWritten(base + 4 * 4096 + static_cast<std::uint64_t>(store) * 64, 4);
+    Require(PagesUnstoredSince(base, surfaceBytes, beforeRing) == (surface & ~(1u << 4)), "four pieces in one page are not told apart");
+    for (int store = 0; store < 8; ++store) MarkWritten(base + 14 * 4096 + static_cast<std::uint64_t>(store) * 512, 8);
+    PageStoreCause cause = PageStoreCause::None;
+    Require(PagesUnstoredSince(base, surfaceBytes, beforeRing, &cause) == (surface & ~(1u << 4)) && cause == PageStoreCause::DriverPages, "driver stores pushed out of the ring are taken for the surface's pages");
+
+    const auto beforeWhole = TrackerGeneration();
+    MarkWritten(base + Block, Block);
+    bytes[Block + 15 * 4096] = 0x33;
+    CollectWritesUncached(base, 2 * Block);
+    Require(PagesUnstoredSince(base + Block, surfaceBytes, beforeWhole) == 0, "a whole-block driver store into an unnoted block is missed");
+    Require(PagesUnstoredSince(base + Block - 4096, 2 * 4096, synced) == 0, "a range across two blocks is answered");
+}
+
+// APS5_FIX_BOOT_STRIP: a mixed edge block, the surface's tail and a table the CPU and the driver
+// both write, some of the CPU's stores landing in the surface's pages too: the write-back's
+// per-page merge stores exactly the surface pages no store reached; a whole-block driver store
+// since leaves nothing to merge.
+void CheckMixedEdge() {
+    void* memory = AllocateWatched(2 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, 2 * Block);
+    const auto synced = CollectWrites(base, 2 * Block);
+    Require(synced != 0, "the mixed edge block is not collected");
+    const char* fix = std::getenv("APS5_FIX_BOOT_STRIP");
+    const bool off = (fix != nullptr && std::string(fix) == "0") || std::getenv("APS5_NO_EDGE_PAGE_KEEP") != nullptr;
+    constexpr std::size_t surfaceBytes = 14 * 4096;
+    bytes[14 * 4096 + 8] = 0x22;
+    bytes[13 * 4096 + 100] = 0x22;
+    for (int store = 0; store < 6; ++store) MarkWritten(base + 15 * 4096 + static_cast<std::uint64_t>(store) * 256, 16);
+    MarkWritten(base + 6 * 4096 + 32, 16);
+    CollectWritesUncached(base, 2 * Block);
+    Require(StoredOver(base, surfaceBytes, synced), "the mixed block's surface part does not read as stored over");
+    PageStoreCause cause = PageStoreCause::None;
+    const auto gpu = PagesUnstoredSince(base, surfaceBytes, synced, &cause);
+    if (off) {
+        Require(gpu == 0 && cause == PageStoreCause::None, "a mixed block merges with APS5_FIX_BOOT_STRIP=0 or APS5_NO_EDGE_PAGE_KEEP");
+        return;
+    }
+    Require(gpu == (0x3fffu & ~(1u << 13) & ~(1u << 6)) && cause == PageStoreCause::CpuPages, "the mixed block's unstored surface pages are wrong");
+    const auto beforeWhole = TrackerGeneration();
+    MarkWritten(base, Block);
+    bytes[15 * 4096] = 0x33;
+    CollectWritesUncached(base, 2 * Block);
+    Require(PagesUnstoredSince(base, surfaceBytes, beforeWhole, &cause) == 0 && cause == PageStoreCause::DriverWhole, "a whole-block driver store leaves pages to merge");
+    const auto later = TrackerGeneration();
+    Require(PagesUnstoredSince(base + Block, surfaceBytes, later, &cause) == 0x3fffu && cause == PageStoreCause::None, "an unwritten block has stored pages");
 }
 
 void CheckOwnStore() {
@@ -143,17 +243,216 @@ void CheckEqualsSince() {
     Require(EqualsCommittedSince(base + Block / 2, partial, synced), "a store outside the compared range is compared");
     Require(!EqualsCommittedSince(base, snapshot, synced), "a driver store into a stamped block is not seen");
 }
+
+// The DCC key store guard's question (DccMetadata.cpp): the CPU's stores into a range since a
+// generation by 4 KiB page, without the driver's own stores, merged across a block boundary and
+// clipped to the range.
+void CheckCpuStoredRuns() {
+    void* memory = AllocateWatched(2 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, 2 * Block);
+    const auto synced = CollectWrites(base, 2 * Block);
+    Require(synced != 0, "the CPU-stored runs block is not collected");
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    Require(CpuStoredRuns(base, 2 * Block, synced, runs) == 0 && runs.empty(), "CPU stores older than the generation are listed");
+    bytes[Block - 4096 + 8] = 0x22;
+    bytes[Block + 8] = 0x22;
+    bytes[Block + 3 * 4096 + 8] = 0x22;
+    MarkWritten(base + 4096, 64);
+    Write(base + 2 * 4096, std::array<std::byte, 16>{});
+    CollectWritesUncached(base, 2 * Block);
+    const auto stored = CpuStoredRuns(base + 100, 2 * Block - 200, synced, runs);
+    // APS5_NO_EDGE_PAGE_KEEP=1 keeps no page records: a CPU-stamped block counts whole.
+    if (std::getenv("APS5_NO_EDGE_PAGE_KEEP") != nullptr) {
+        Require(stored == 2 * Block - 200 && runs.size() == 1, "CPU-stamped blocks do not count whole with APS5_NO_EDGE_PAGE_KEEP");
+        return;
+    }
+    Require(stored == 3 * 4096 && runs.size() == 2, "the CPU's pages are not listed alone (" + std::to_string(stored) + " bytes in " + std::to_string(runs.size()) + " runs)");
+    Require(runs[0].first == base + Block - 4096 && runs[0].second == base + Block + 4096, "CPU pages on both sides of a block boundary are not one run");
+    Require(runs[1].first == base + Block + 3 * 4096 && runs[1].second == base + Block + 4 * 4096, "a lone CPU page is not listed");
+    Require(CpuStoredRuns(base + Block - 100, 50, synced, runs) == 50 && runs.size() == 1 && runs[0].first == base + Block - 100 && runs[0].second == base + Block - 50, "a run is not clipped to the range");
+    Require(CpuStoredRuns(base, 3 * 4096, synced, runs) == 0 && runs.empty(), "the driver's own stores are listed as the CPU's");
+    Require(CpuStoredRuns(base, 2 * Block, TrackerGeneration(), runs) == 0 && runs.empty(), "CPU stores older than a later generation are listed");
+    Require(CpuStoredRuns(base, 2 * Block, 0, runs) == 0 && runs.empty(), "a generation of 0 lists stores");
+}
+
+// The late store re-check (APS5_KEEP_CPU_STORES): a store decided at a generation leaves out the
+// 4 KiB pages a CPU store reached since (not the driver's own stores, not older ones) and stores
+// the rest in address order; with the switch off it stores the run whole and counts the pages
+// ("would keep" on the digest).
+void CheckKeepCpuStores() {
+    using Runs = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    constexpr std::uint64_t page = 4096;
+    void* memory = AllocateWatched(Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, Block);
+    CollectWritesUncached(base, Block);
+    const auto decided = TrackerGeneration();
+    Require(decided != 0, "the late store block is not collected");
+    bytes[2 * page + 8] = 0x22;
+    MarkWritten(base + 6 * page, 64);
+    CollectWritesUncached(base, Block);
+    SetKeepCpuStores(true);
+    Runs out;
+    if (std::getenv("APS5_NO_EDGE_PAGE_KEEP") != nullptr) {
+        Require(KeepCpuStoredRun(LateStoreKind::ShadowPublish, decided, base, base + 8 * page, out) == 8 * page && out.empty(), "a CPU-stamped block is not kept whole with APS5_NO_EDGE_PAGE_KEEP");
+        return;
+    }
+    Require(KeepCpuStoredRun(LateStoreKind::ShadowPublish, decided, base, base + 8 * page, out) == page && out == Runs{{base, base + 2 * page}, {base + 3 * page, base + 8 * page}}, "the CPU's page since the decision is not left out alone");
+    Require(KeptCpuStoreSummary().find("late stores over CPU-stored pages: kept 1 (4 KiB)") != std::string::npos && KeptCpuStoreSummary().find("shadow 1 (4 KiB)") != std::string::npos, "the digest does not count the kept page by kind");
+    out.clear();
+    Require(KeepCpuStoredRun(LateStoreKind::WriteBack, decided, base + 2 * page + 100, base + 2 * page + 200, out) == 100 && out.empty(), "a run inside the CPU's page was stored");
+    out.clear();
+    Require(KeepCpuStoredRun(LateStoreKind::WriteBack, TrackerGeneration(), base, base + 8 * page, out) == 0 && out == Runs{{base, base + 8 * page}}, "a store decided after the CPU's lost bytes");
+    out.clear();
+    Require(KeepCpuStoredRun(LateStoreKind::WriteBack, 0, base, base + 8 * page, out) == 0 && out == Runs{{base, base + 8 * page}}, "a generation of 0 left bytes out");
+    SetKeepCpuStores(false);
+    out.clear();
+    Require(KeepCpuStoredRun(LateStoreKind::ShadowPublish, decided, base, base + 8 * page, out) == page && out == Runs{{base, base + 8 * page}}, "APS5_KEEP_CPU_STORES=0 did not store the run whole, or did not count it");
+    Require(KeptCpuStoreSummary().find("late stores over CPU-stored pages: would keep") != std::string::npos, "the digest does not say 'would keep' with the switch off");
+    SetKeepCpuStores(true);
+}
+
+// The write-back range trace's switch (APS5_TRACE_WRITEBACK_RANGE=<lo>-<hi>, hex): the range is
+// [lo, hi), and a store is traced only when one of its bytes lies inside it.
+void CheckRangeTraceFilter() {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    Require(ParseTraceRange("0x3c0000000-0x3e0000000", begin, end) && begin == 0x3c0000000ull && end == 0x3e0000000ull, "the range switch is not parsed");
+    Require(ParseTraceRange("1000-2000", begin, end) && begin == 0x1000 && end == 0x2000, "a range without 0x is not parsed as hex");
+    for (const char* bad : {"", "0x1000", "0x1000-", "-0x1000", "0x2000-0x1000", "0x1000-0x1000", "0x1000--0x2000", "0x1000-0x2000x", " 0x1000-0x2000", "0x1000-0x2000 ", "0x-0x10"}) {
+        Require(!ParseTraceRange(bad, begin, end), std::string("the range switch '") + bad + "' is accepted");
+    }
+    Require(!ParseTraceRange(nullptr, begin, end), "an unset range switch is accepted");
+    constexpr std::uint64_t low = 0x1000;
+    constexpr std::uint64_t high = 0x2000;
+    Require(TraceRangeHits(low, high, low, 1) && TraceRangeHits(low, high, high - 1, 1), "the range's first or last byte is not traced");
+    Require(!TraceRangeHits(low, high, high, 16), "a store at the range's end is traced (exclusive)");
+    Require(!TraceRangeHits(low, high, low - 16, 16), "a store ending at the range's begin is traced");
+    Require(TraceRangeHits(low, high, low - 16, 17) && TraceRangeHits(low, high, 0, ~0ull), "a store over the range's begin is not traced");
+    Require(!TraceRangeHits(low, high, low, 0), "an empty store is traced");
+    Require(!TraceRangeHits(low, high, ~0ull - 4, 4), "a store at the top of the address space is traced");
+}
+
+// The crash report's store ring (APS5_CRASH_RESOURCES=1, set by main): the driver's stores of 16
+// bytes or more over an address, newest first, with the thread's StoreTag and the stored span.
+void CheckStoreRing() {
+    Require(CrashResourcesEnabled(), "the store ring is off with APS5_CRASH_RESOURCES=1");
+    void* memory = AllocateWatched(Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0, Block);
+    CollectWrites(base, Block);
+    std::array<std::byte, 256> bytes{};
+    bytes.fill(std::byte{0x5a});
+    {
+        const StoreTag tag("test image", "test reason", base);
+        Write(base + 512, bytes);
+    }
+    MarkWritten(base + 4096, 64);
+    Write(base + 8192, std::array<std::byte, 8>{});
+    std::vector<std::byte> original(1024, std::byte{0});
+    std::vector<std::byte> current(original);
+    std::fill(current.begin() + 100, current.begin() + 300, std::byte{1});
+    WriteChanged(base + 16384, current, original);
+
+    std::array<GuestStoreRecord, 8> found{};
+    auto count = RecentGuestStores(base + 600, 16, found);
+    Require(count == 1 && found[0].begin == base + 512 && found[0].end == base + 768, "the ring does not hold the store over the address");
+    Require(found[0].tag != nullptr && std::strcmp(found[0].tag, "test image") == 0 && found[0].reason != nullptr && std::strcmp(found[0].reason, "test reason") == 0 && found[0].tagAddress == base, "the store's tag is not recorded");
+    Require(found[0].kind != nullptr && std::strcmp(found[0].kind, "driver memcpy") == 0, "a Write is not recorded as a driver memcpy");
+    count = RecentGuestStores(base, Block, found);
+    Require(count == 3, "the ring holds " + std::to_string(count) + " stores over the block, not 3 (an 8-byte store is below the recorded size)");
+    Require(found[0].begin == base + 16384 + 100 && found[0].end == base + 16384 + 300, "WriteChanged is not recorded as its changed span");
+    Require(found[1].begin == base + 4096 && found[1].end == base + 4096 + 64 && found[1].kind != nullptr && std::strcmp(found[1].kind, "gpu (MarkWritten)") == 0 && found[1].tag == nullptr, "MarkWritten is not recorded untagged after the tag's scope");
+    Require(found[2].begin == base + 512, "the stores are not listed newest first");
+    Require(RecentGuestStores(base + 768, 4096 - 768, found) == 0, "a store is listed outside its range");
+}
+
+// The free log (APS5_DROP_FREED_STORES): a store whose source clock predates a release of its pages
+// leaves those pages out, one whose source followed the release keeps them, and with the switch off
+// every store is kept whole (and counted). A registry Remove releases, less what the same mutation
+// registers again; a new registration or a protection change does not.
+void CheckFreedStores() {
+    using Runs = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    constexpr std::uint64_t page = 4096;
+    void* memory = AllocateWatched(Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    SetDropFreedStores(true);
+    const auto before = FreeClock();
+    Runs runs{{base, base + 4 * page}};
+    Require(DropFreedRuns(FreedStoreKind::WriteBack, before, runs) == 0 && runs == Runs{{base, base + 4 * page}}, "a store with no release since its source lost bytes");
+    NoteReleased(base + page + 100, 50);
+    const auto released = FreeClock();
+    if (released == before) {
+        std::cout << "free log: the test block is outside the guest arena, skipped\n";
+        return;
+    }
+    Require(DropFreedRuns(FreedStoreKind::WriteBack, before, runs) == page && runs == Runs{{base, base + page}, {base + 2 * page, base + 4 * page}}, "the page released after the store's source was stored");
+    runs = {{base + page - 96, base + page + 32}};
+    Require(DropFreedRuns(FreedStoreKind::ShadowPublish, before, runs) == 32 && runs == Runs{{base + page - 96, base + page}}, "a run is not cut at the released page's bound");
+    runs = {{base, base + 4 * page}};
+    Require(DropFreedRuns(FreedStoreKind::WriteBack, released, runs) == 0 && runs == Runs{{base, base + 4 * page}}, "a store whose source followed the release lost bytes");
+    Require(DropFreedRuns(FreedStoreKind::WriteBack, NoFreeClock, runs) == 0 && runs.size() == 1, "a store of unknown age lost bytes");
+    SetDropFreedStores(false);
+    Require(DropFreedRuns(FreedStoreKind::KeyStore, before, runs) == page && runs == Runs{{base, base + 4 * page}}, "APS5_DROP_FREED_STORES=0 did not store the run whole, or did not count it");
+    Require(FreedStoreSummary().find("would drop") != std::string::npos, "the digest does not say 'would drop' with the switch off");
+    SetDropFreedStores(true);
+    Require(FreedStoreSummary().find("stores into freed pages: dropped") != std::string::npos, "the digest does not count dropped stores");
+    void* piece = reinterpret_cast<void*>(base + 8 * page);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(piece, 4 * page, true, true);
+    }
+    const auto added = FreeClock();
+    Require(added == released, "a new registration moved the free clock");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Protect(piece, page, true, false, [] {});
+    }
+    Require(FreeClock() == added, "a protection change moved the free clock");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(piece);
+        mutation.Add(piece, 2 * page, true, true);
+    }
+    const auto shrunk = FreeClock();
+    Require(shrunk > added, "a shrinking re-registration did not move the free clock");
+    runs = {{base + 8 * page, base + 12 * page}};
+    Require(DropFreedRuns(FreedStoreKind::CopyBack, added, runs) == 2 * page && runs == Runs{{base + 8 * page, base + 10 * page}}, "a re-registration released the pages it kept, or kept those it gave back");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(piece);
+    }
+    Require(FreeClock() > shrunk, "a registry Remove did not move the free clock");
+    runs = {{base + 8 * page, base + 12 * page}};
+    Require(DropFreedRuns(FreedStoreKind::CopyBack, shrunk, runs) == 2 * page && runs == Runs{{base + 10 * page, base + 12 * page}}, "the removed allocation's pages were stored");
+}
 }
 
 int main() {
+    // Before the first store: the ring is made then (CheckStoreRing).
+#ifdef _WIN32
+    _putenv_s("APS5_CRASH_RESOURCES", "1");
+#else
+    setenv("APS5_CRASH_RESOURCES", "1", 1);
+#endif
     try {
         if (!WriteWatched()) {
             std::cout << "no write watching: skipped\n";
             return 77;
         }
+        CheckRangeTraceFilter();
+        CheckStoreRing();
+        CheckFreedStores();
         CheckSharedBlock();
+        CheckUnstoredPages();
+        CheckMixedEdge();
         CheckOwnStore();
         CheckEqualsSince();
+        CheckCpuStoredRuns();
+        CheckKeepCpuStores();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;

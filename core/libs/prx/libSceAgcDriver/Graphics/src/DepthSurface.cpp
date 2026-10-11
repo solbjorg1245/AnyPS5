@@ -120,6 +120,7 @@ public:
         VkBufferImageCopy region{};
         region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         region.imageExtent = {target.extent.width, target.extent.height, 1};
+        PoisonPooled(context, commands.handle, *buffer, PoisonSite::Depth);
         context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands.handle, source->Image(), VK_IMAGE_LAYOUT_GENERAL, buffer->Handle(), 1, &region);
         RecordMemoryBarrier(context, commands.handle, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -200,7 +201,7 @@ private:
     struct Commands {
         explicit Commands(const Context& context) : recorder(Recorder::Active()) {
             if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
-            handle = recorder != nullptr ? recorder->Commands() : batch->Handle();
+            handle = recorder != nullptr ? recorder->CommandsTouchingNothing(Recorder::CommandSite::Depth) : batch->Handle();
         }
         void Finish(std::uint32_t barriers) {
             if (batch) batch->SubmitAndWait();
@@ -244,7 +245,7 @@ private:
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory depth target");
+        Check(AllocateDeviceMemory(context, allocation, &memory, VramClass::Targets), "vkAllocateMemory depth target");
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory depth");
         layers = count;
     }
@@ -306,7 +307,7 @@ private:
             old.textures.clear();
             for (const auto& [layer, view] : old.views) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
             if (old.image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, old.image, nullptr);
-            if (old.memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, old.memory, nullptr);
+            if (old.memory) FreeDeviceMemory(context, old.memory);
         };
         Retired current{image, memory, std::move(layerViews), std::move(textures)};
         discard(current);
@@ -466,6 +467,43 @@ std::size_t DumpDepthSurfaces(const Context& context, const std::string& prefix,
         }
     }
     return written;
+}
+
+std::size_t ReadBackDepthSurface(const Context& context, std::uint64_t address, std::uint32_t slice, const std::function<void(const ImageReadback&)>& consume) {
+    std::lock_guard lock(surfacesMutex());
+    const auto matches = [&](const std::unique_ptr<DepthSurface>& surface) { return surface->context.device == context.device && address != 0 && surface->target.address == address && slice < surface->layers; };
+    const auto aliases = static_cast<std::uint32_t>(std::count_if(surfaces().begin(), surfaces().end(), matches));
+    std::size_t read = 0;
+    for (const auto& surface : surfaces()) {
+        if (!matches(surface)) continue;
+        const auto& target = surface->target;
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const std::uint32_t texelBytes = d16 ? 2u : 4u;
+        Buffer buffer(context, static_cast<std::size_t>(target.extent.width) * target.extent.height * texelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, slice, 1};
+        region.imageExtent = {target.extent.width, target.extent.height, 1};
+        CommandBatch batch(context);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(batch.Handle(), surface->image, VK_IMAGE_LAYOUT_GENERAL, buffer.Handle(), 1, &region);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+        ImageReadback readback;
+        readback.address = address;
+        readback.guestBytes = static_cast<std::uint64_t>(target.extent.width) * target.extent.height * texelBytes;
+        readback.format = d16 ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT;
+        readback.width = target.extent.width;
+        readback.height = target.extent.height;
+        readback.firstLayer = slice;
+        readback.rowTexels = target.extent.width;
+        readback.texelBytes = texelBytes;
+        readback.alias = static_cast<std::uint32_t>(read);
+        readback.aliases = aliases;
+        readback.bytes = buffer.Bytes();
+        consume(readback);
+        ++read;
+    }
+    return read;
 }
 
 std::uint64_t DepthSurfaceSerial() {

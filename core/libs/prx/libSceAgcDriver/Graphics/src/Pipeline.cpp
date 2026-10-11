@@ -1,6 +1,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libc/include/HostMutex.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/KeyedMemo.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastLayouts.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -8,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <list>
 #include <mutex>
 #include <type_traits>
@@ -43,7 +47,11 @@ void ValidateViewport(const Context& context, const VkViewport& viewport) {
     Require(std::min(viewport.y, viewport.y + viewport.height) >= context.limits.viewportBoundsRange[0] && std::max(viewport.y, viewport.y + viewport.height) <= context.limits.viewportBoundsRange[1], "viewport Y exceeds device bounds");
 }
 
-Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size() + (state.depth ? 1u : 0u)), colorAttachments(state.colors.size()) {
+Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : Pipeline(context, state, vertexInput, resources.Layout(), VK_NULL_HANDLE, shaders, attachmentLayout) {}
+
+Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, VkPipelineLayout layout, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : Pipeline(context, state, vertexInput, VK_NULL_HANDLE, layout, shaders, attachmentLayout) {}
+
+Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, VkDescriptorSetLayout setLayout, VkPipelineLayout sharedLayout, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size() + (state.depth ? 1u : 0u)), colorAttachments(state.colors.size()) {
     // A cached pipeline may outlive its device's teardown (see ClearCachedPipelines); it must not keep
     // the buffer pool, which is reset with the device, alive past it.
     this->context.bufferPool.reset();
@@ -81,14 +89,16 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         }
         // A descriptor set layout with the same bindings as this one is compatible with the pipeline
         // layout, so later draws bind their own ShaderResources' set under it.
-        const auto setLayout = resources.Layout();
         const VkPushConstantRange push{pushStages, 0, PipelinePushConstantBytes};
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layoutInfo.setLayoutCount = 1;
         layoutInfo.pSetLayouts = &setLayout;
         layoutInfo.pushConstantRangeCount = pushStages != 0 ? 1 : 0;
         layoutInfo.pPushConstantRanges = pushStages != 0 ? &push : nullptr;
-        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout graphics");
+        // A shared layout (the fast path's push layout) stays its owner's.
+        ownsLayout = sharedLayout == VK_NULL_HANDLE;
+        if (!ownsLayout) layout = sharedLayout;
+        else Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout graphics");
         std::vector<VkAttachmentDescription> colors;
         std::vector<VkAttachmentReference> references;
         for (std::uint32_t index = 0; index < state.colors.size(); ++index) {
@@ -205,7 +215,7 @@ void Pipeline::release() noexcept {
     framebuffers.clear();
     if (pipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
     if (renderPass) context.Function<PFN_vkDestroyRenderPass>("vkDestroyRenderPass")(context.device, renderPass, nullptr);
-    if (layout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
+    if (layout && ownsLayout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
     for (auto module : _modules) {
         if (module) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
     }
@@ -305,24 +315,31 @@ namespace {
 template<typename TValue>
 void append(std::vector<std::byte>& key, const TValue& value) {
     static_assert(std::is_trivially_copyable_v<TValue>);
-    const auto bytes = std::as_bytes(std::span(&value, 1));
-    key.insert(key.end(), bytes.begin(), bytes.end());
+    const auto at = key.size();
+    key.resize(at + sizeof(TValue));
+    std::memcpy(key.data() + at, &value, sizeof(TValue));
 }
 
 // Everything the Pipeline objects are built from, or empty when a stage's result has no variant id
 // (the recompiler could not identify it, so nothing else may share its pipeline). The rect-list
 // control and evaluation stages are generated from the vertex and fragment results, which the key
-// already names, so they carry no id of their own.
-std::vector<std::byte> pipelineKey(const Context& context, const State& state, const VertexInputLayout& input, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+// already names, so they carry no id of their own. `layoutKey` is the descriptor set layout key
+// (ShaderResources::LayoutKey, or the fast path's FastBindings::LayoutKey); `pushLayout` the fast
+// path's push layout id (FastLayout::id), 0 for a pipeline on a ShaderResources set.
+// Built into `key`, cleared first (a reused vector keeps its storage).
+void pipelineKeyInto(const Context& context, const State& state, const VertexInputLayout& input, std::span<const std::uint32_t> layoutKey, std::uint32_t pushLayout, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, std::vector<std::byte>& key) {
     using Stage = ShaderRecompiler::ShaderStage;
-    std::vector<std::byte> key;
+    key.clear();
     append(key, context.device);
     append(key, attachmentLayout);
     append(key, shaders.size());
     for (const auto& shader : shaders) {
         Require(shader.program != nullptr, "missing compiled shader");
         const bool generated = state.rectList && (shader.stage == Stage::TessellationControl || shader.stage == Stage::TessellationEvaluation);
-        if (!generated && shader.program->variantId == 0) return {};
+        if (!generated && shader.program->variantId == 0) {
+            key.clear();
+            return;
+        }
         append(key, shader.stage);
         append(key, generated ? std::uint64_t{0} : shader.program->variantId);
         // Where the stage's push constants sit in the block (AssemblePushConstants).
@@ -342,8 +359,9 @@ std::vector<std::byte> pipelineKey(const Context& context, const State& state, c
         append(key, attribute.format);
         append(key, attribute.offset);
     }
-    append(key, resources.LayoutKey().size());
-    for (const auto word : resources.LayoutKey()) append(key, word);
+    append(key, layoutKey.size());
+    for (const auto word : layoutKey) append(key, word);
+    append(key, pushLayout);
     append(key, state.hasColorTarget);
     append(key, state.rectList);
     append(key, state.topology);
@@ -394,6 +412,11 @@ std::vector<std::byte> pipelineKey(const Context& context, const State& state, c
         append(key, tessellation.partitioning);
         append(key, tessellation.outputTopology);
     }
+}
+
+std::vector<std::byte> pipelineKey(const Context& context, const State& state, const VertexInputLayout& input, std::span<const std::uint32_t> layoutKey, std::uint32_t pushLayout, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    std::vector<std::byte> key;
+    pipelineKeyInto(context, state, input, layoutKey, pushLayout, shaders, attachmentLayout, key);
     return key;
 }
 
@@ -424,6 +447,14 @@ struct PipelineStore {
     std::uint64_t misses = 0;
     std::uint64_t uncached = 0;
     std::uint64_t evicted = 0;
+    // Bumped (under the mutex) for every entry dropped: the fast pipeline memo's validity
+    // (KeyedMemo), read without the lock.
+    std::atomic<std::uint64_t> removals{0};
+    // CachedFastPipeline lookups its memo answered (the [pipecache] line).
+    std::atomic<std::uint64_t> memoHits{0};
+    // Ticks once per lookup that answers a stored pipeline (store hit, insert, memo hit): the
+    // pipelines' storeUse stamps, by which the eviction picks the least recently used entry.
+    std::atomic<std::uint64_t> useClock{0};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
@@ -432,6 +463,13 @@ struct PipelineStore {
 PipelineStore& Pipelines() {
     static auto* store = new PipelineStore();
     return *store;
+}
+
+// Marks `pipeline` as used now (PipelineStore::useClock). Under the store's mutex for its own hits
+// and inserts, in the order it splices them, so the stamps rank the entries as the list does; a
+// memo hit stamps without the lock and so ranks its entry as recent as a store hit would.
+void touch(PipelineStore& store, const Pipeline& pipeline) {
+    pipeline.storeUse.store(store.useClock.fetch_add(1, std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 }
 
 // Whether the entry's objects belong to the device the context names. A context without a buffer
@@ -444,6 +482,7 @@ bool alive(const PipelineStore::Entry& entry, const Context& context) {
 // Drops an entry of a device that is gone: its objects went with the device, so they are forgotten,
 // not destroyed.
 std::list<PipelineStore::Entry>::iterator abandon(PipelineStore& store, std::list<PipelineStore::Entry>::iterator it) {
+    store.removals.fetch_add(1, std::memory_order_release);
     it->pipeline->Abandon();
     store.index.erase(it->hash);
     return store.entries.erase(it);
@@ -456,22 +495,27 @@ void reportPipelines(PipelineStore& store) {
     if (now - store.lastReport < std::chrono::seconds(10)) return;
     store.lastReport = now;
     const auto lookups = store.hits + store.misses + store.uncached;
-    std::fprintf(stderr, "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached; %llu framebuffers made\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size(), static_cast<unsigned long long>(framebuffersMade.exchange(0, std::memory_order_relaxed)));
+    std::fprintf(stderr, "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached; %llu framebuffers made; %llu fast lookups answered by the thread memo (not counted above)\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size(), static_cast<unsigned long long>(framebuffersMade.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(store.memoHits.exchange(0, std::memory_order_relaxed)));
     store.hits = store.misses = store.uncached = store.evicted = 0;
 }
 
+bool pipelineCacheDisabled() {
+    static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
+    return disabled;
 }
 
-std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
-    static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
-    if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+// The store's pipeline for `key`, made by `make` on a miss (or privately: an empty key, a hash
+// collision); CachedPipeline and CachedFastPipeline. `stored`: whether the store holds the
+// returned pipeline under `key` (false for a private one).
+template<typename TMake>
+std::shared_ptr<Pipeline> cachedPipeline(const Context& context, const std::vector<std::byte>& key, TMake&& make, bool* stored = nullptr) {
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);
     reportPipelines(store);
-    const auto key = pipelineKey(context, state, vertexInput, resources, shaders, attachmentLayout);
+    if (stored != nullptr) *stored = false;
     if (key.empty()) {
         ++store.uncached;
-        return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+        return make();
     }
     const auto hash = hashKey(key);
     if (const auto found = store.index.find(hash); found != store.index.end()) {
@@ -482,13 +526,15 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
             if (alive(*it, context)) {
                 ++store.hits;
                 store.entries.splice(store.entries.end(), store.entries, it);
+                touch(store, *it->pipeline);
+                if (stored != nullptr) *stored = true;
                 return it->pipeline;
             }
             abandon(store, it);
         } else {
             // A different configuration with the same hash keeps the resident entry; this one stays private.
             ++store.uncached;
-            return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+            return make();
         }
     }
     ++store.misses;
@@ -497,9 +543,11 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     for (auto it = store.entries.begin(); it != store.entries.end();) {
         it = alive(*it, context) ? std::next(it) : abandon(store, it);
     }
-    auto pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+    auto pipeline = make();
+    touch(store, *pipeline);
     store.entries.push_back({context.device, context.bufferPool, hash, key, pipeline});
     store.index[hash] = std::prev(store.entries.end());
+    if (stored != nullptr) *stored = true;
     // A gameplay frame uses more than a thousand pipelines: at the old bound of 256 every frame
     // evicted and recreated ~1300 of them (~1 ms each). APS5_PIPELINE_CACHE_ENTRIES sets the bound.
     static const std::size_t bound = [] {
@@ -508,14 +556,88 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         return parsed != 0 ? static_cast<std::size_t>(parsed) : std::size_t{8192};
     }();
     while (store.entries.size() > bound) {
-        // Only an entry no recorded draw still holds may go (Kept keeps its shared_ptr until the fence).
-        const auto victim = std::find_if(store.entries.begin(), store.entries.end(), [](const PipelineStore::Entry& entry) { return entry.pipeline.use_count() == 1; });
+        // The least recently used entry no recorded draw still holds (Kept keeps its shared_ptr
+        // until the fence). Recency is the pipeline's stamp (touch): store hits and inserts stamp
+        // in list order, so without memo hits this is the first such entry of the list, as
+        // before; a memo hit (CachedFastPipeline) stamps without moving its entry in the list.
+        auto victim = store.entries.end();
+        std::uint64_t oldest = 0;
+        for (auto it = store.entries.begin(); it != store.entries.end(); ++it) {
+            if (it->pipeline.use_count() != 1) continue;
+            const auto used = it->pipeline->storeUse.load(std::memory_order_relaxed);
+            if (victim == store.entries.end() || used < oldest) {
+                victim = it;
+                oldest = used;
+            }
+        }
         if (victim == store.entries.end()) break;
+        store.removals.fetch_add(1, std::memory_order_release);
         store.index.erase(victim->hash);
         store.entries.erase(victim);
         ++store.evicted;
     }
     return pipeline;
+}
+
+}
+
+std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    const auto make = [&] { return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout); };
+    if (pipelineCacheDisabled()) return make();
+    return cachedPipeline(context, pipelineKey(context, state, vertexInput, resources.LayoutKey(), 0, shaders, attachmentLayout), make);
+}
+
+namespace {
+
+// APS5_NO_PIPELINE_MEMO=1: CachedFastPipeline builds a fresh key and asks the store per draw, as
+// before.
+bool pipelineMemoEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_PIPELINE_MEMO") == nullptr;
+    return enabled;
+}
+
+// CachedFastPipeline's per-thread key buffer (no allocation per draw) and memo of the last
+// pipelines the store answered (s53-fastdraw-diag step 2d).
+struct FastPipelineScratch {
+    std::vector<std::byte> key;
+    KeyedMemo<Pipeline, 8> memo;
+};
+struct FastPipelineScratchTag {};
+
+}
+
+std::shared_ptr<Pipeline> CachedFastPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const FastLayout& layout, std::span<const std::uint32_t> layoutKey, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    const auto make = [&] { return std::make_shared<Pipeline>(context, state, vertexInput, layout.pipeline, shaders, attachmentLayout); };
+    if (pipelineCacheDisabled()) return make();
+    if (!pipelineMemoEnabled()) return cachedPipeline(context, pipelineKey(context, state, vertexInput, layoutKey, layout.id, shaders, attachmentLayout), make);
+    auto& scratch = HostThreadLocal<FastPipelineScratch, FastPipelineScratchTag>();
+    pipelineKeyInto(context, state, vertexInput, layoutKey, layout.id, shaders, attachmentLayout, scratch.key);
+    // No variant id: a private pipeline, as the store makes it.
+    if (scratch.key.empty()) return cachedPipeline(context, scratch.key, make);
+    auto& store = Pipelines();
+    const auto hash = KeyHash(scratch.key);
+    // The device instance the store tells entries apart by (alive): its buffer pool, or none.
+    const void* owner = context.bufferPool.get();
+    // Read before the store answers: a removal from here on makes the noted entry miss.
+    const auto removals = store.removals.load(std::memory_order_acquire);
+    if (auto pipeline = scratch.memo.Find(scratch.key, hash, removals, owner)) {
+        ++scratch.memo.hits;
+        // As recent as the store's hit would have made it (the eviction's order).
+        touch(store, *pipeline);
+        // Counted for the APS5_PROFILE_DRAW line only (the stamp above is the one shared write per hit).
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (profile) store.memoHits.fetch_add(1, std::memory_order_relaxed);
+        return pipeline;
+    }
+    ++scratch.memo.misses;
+    bool stored = false;
+    auto pipeline = cachedPipeline(context, scratch.key, make, &stored);
+    if (stored) scratch.memo.Note(scratch.key, hash, removals, owner, std::weak_ptr<const void>(context.bufferPool), pipeline);
+    return pipeline;
+}
+
+void FastPipelineKey(const Context& context, const State& state, const VertexInputLayout& vertexInput, std::uint32_t pushLayout, std::span<const std::uint32_t> layoutKey, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, std::vector<std::byte>& key) {
+    pipelineKeyInto(context, state, vertexInput, layoutKey, pushLayout, shaders, attachmentLayout, key);
 }
 
 void ClearCachedPipelines(VkDevice device) {
@@ -526,6 +648,7 @@ void ClearCachedPipelines(VkDevice device) {
             ++it;
             continue;
         }
+        store.removals.fetch_add(1, std::memory_order_release);
         store.index.erase(it->hash);
         it = store.entries.erase(it);
     }

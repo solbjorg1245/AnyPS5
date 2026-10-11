@@ -109,6 +109,9 @@ private:
         VkDeviceMemory memory;
         std::uint32_t type;
         RangeAllocator ranges;
+        // In the video-memory budget's heap: its free space is accounted as slack, its used part
+        // as textures (VramBudget).
+        bool budgeted = false;
     };
     VkDevice device;
     const Context context;

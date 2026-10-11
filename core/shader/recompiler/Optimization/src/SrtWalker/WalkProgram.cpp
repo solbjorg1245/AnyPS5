@@ -548,8 +548,10 @@ WalkOutcome ExecuteWalkProgram(const WalkProgram& program, const IrResourcePlan&
     done.assign(program.ops.size(), 0);
     const Execution execution {program, runtime, values, done};
 
-    // EvaluateRuntimeSourcesImpl's control-flow activity.
-    std::vector<std::uint8_t> active(plan.descriptorSources.size(), 1u);
+    // EvaluateRuntimeSourcesImpl's control-flow activity. The outputs are written in place: the
+    // fast walk's (expressOnly) are per-thread vectors that keep their capacity.
+    auto& active = activeSources;
+    active.assign(plan.descriptorSources.size(), 1u);
     if (!plan.controlFlow.empty()) {
         for (const auto& block : plan.controlFlow) {
             for (const auto source : block.sources) {
@@ -584,7 +586,8 @@ WalkOutcome ExecuteWalkProgram(const WalkProgram& program, const IrResourcePlan&
         }
     }
 
-    std::vector<DescriptorValue> evaluated;
+    auto& evaluated = results;
+    evaluated.clear();
     evaluated.reserve(program.sources.size());
     for (std::size_t i = 0; i < program.sources.size(); ++i) {
         const auto sourceIndex = plan.materializationSources[i];
@@ -604,7 +607,8 @@ WalkOutcome ExecuteWalkProgram(const WalkProgram& program, const IrResourcePlan&
         evaluated.push_back(value);
     }
 
-    std::vector<std::uint32_t> flattened(plan.srtReads.size());
+    auto& flattened = flat;
+    flattened.assign(plan.srtReads.size(), 0u);
     for (std::size_t i = 0; i < plan.srtReads.size(); ++i) {
         const auto& read = plan.srtReads[i];
         const auto& root = program.flat[i];
@@ -617,9 +621,6 @@ WalkOutcome ExecuteWalkProgram(const WalkProgram& program, const IrResourcePlan&
         flattened[read.flatOffset] = static_cast<std::uint32_t>(values[root.op]);
     }
 
-    results = std::move(evaluated);
-    flat = std::move(flattened);
-    activeSources = std::move(active);
     return finish(WalkOutcome::Ran);
 }
 

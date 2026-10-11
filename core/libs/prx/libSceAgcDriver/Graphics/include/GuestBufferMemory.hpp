@@ -2,10 +2,15 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_GUESTBUFFERMEMORY_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include <array>
 #include <memory>
+#include <cstdint>
 #include <optional>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -19,6 +24,27 @@ struct GuestMemorySnapshot {
     std::span<const std::byte> bytes;
 };
 
+// AddSnapshot's mismatch, with the old text: a captured region disagrees with the region serving
+// it. `live`: the owner reads guest memory in place, so the memory changed since the capture (made
+// before the device lock); otherwise two snapshots of one snapshot-backed range disagree.
+// `pending`: recorded GPU work or a label still writes the range. Driver::draw catches it and runs
+// the packet again (Draw.cpp, snapshotRetry); APS5_NO_SNAPSHOT_RETRY=1 drops the draw as before.
+struct SnapshotStale : std::runtime_error {
+    SnapshotStale(bool live, bool pending) : std::runtime_error("AGC graphics: guest snapshot differs from registered memory"), live(live), pending(pending) {}
+    bool live;
+    bool pending;
+};
+
+// Set on a thread, its AddSnapshot binds a mismatching range as it is (the live region, or the
+// range's first snapshot) instead of throwing SnapshotStale: Driver::draw's last retry, which
+// renders with the memory as it is, as hardware would.
+bool& ThreadServesStaleSnapshots();
+
+// APS5_PROFILE_DRAW: a draw packet run again after SnapshotStale, by the retry's level (1 a fresh
+// capture, 2 the capture under the GPU mutex, 3 the mismatch served); `hit` when the attempt that
+// threw bound a draw-cache hit's stage bytes. Counted on the [address-sync] line.
+void CountSnapshotRetry(std::uint32_t level, bool hit);
+
 // A guest allocation imported with VK_EXT_external_memory_host, usable by the GPU in place.
 struct HostImport {
     std::uint64_t base;
@@ -27,12 +53,15 @@ struct HostImport {
     VkDeviceMemory memory;
     VkDeviceAddress address;
     void* alias = nullptr;
+    std::weak_ptr<const GuestAllocations::Range> range {};
     // Identity for the life of this import (see HostImportSerial); 0 until first asked for.
     std::uint64_t serial = 0;
     bool unwatched = false;
     // A span import (over several adjoining registered ranges): not in the per-range registry, so
     // no serial names it and recipes do not key on it.
     bool span = false;
+    // The memory type it was imported into (~0u: unknown; the [retile] line names it).
+    std::uint32_t memoryType = ~0u;
 };
 
 enum class ImportWatch : std::uint8_t { Watch, Unwatch };
@@ -53,14 +82,82 @@ void SetImportWatch(const Context& context, ImportWatch watch);
 // (alignment and budget permitting), or null. Bytes at `address` are at `address - import->base` in
 // the import's buffer.
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
+// HostImportFor of each [begin, end) of `ranges` in order. The leading ranges an existing import
+// answers (registry unchanged since the last reconcile) are looked up under one hold of the import
+// registry's lock, with no other thread's lookup, reconcile or retire between two of them; from the
+// first miss or stale registry on, each range takes HostImportFor itself (its own hold, so a
+// reconcile or an import's creation holds the lock as long as before). `visit(user, index, import)`
+// receives what HostImportFor would return for range `index` and returns whether to go on: no range
+// after the one it stops at is looked up (or imported). The visitor may run under the registry's
+// lock, so it must not take it (no HostImport* call) and should be short.
+using HostImportVisitor = bool (*)(void* user, std::size_t index, const HostImport* import);
+void HostImportsFor(const Context& context, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, HostImportVisitor visit, void* user);
+
+// A thread's memo of the imports HostImportFor answered it last (docs/design/draw-fastpath.md 2.5,
+// s53-fastdraw-diag step 2c). An entry answers a range inside its import while the registry is as
+// it was when the entry was noted: the same device, the same registry generation
+// (GuestAllocationsGeneration) and the same import epoch (bumped by every retire and by a device
+// change). HostImportFor would then find that very import without reconciling: the imports of one
+// generation are of disjoint registered ranges (an import whose range changed was retired when
+// the generation was reconciled) and none was dropped since. Entries are noted only after a
+// lookup that left the registry reconciled for the device.
+struct HostImportMemo {
+    struct Entry {
+        VkDevice device = VK_NULL_HANDLE;
+        std::uint64_t generation = 0;
+        std::uint64_t epoch = 0;
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        const HostImport* import = nullptr;
+    };
+    static constexpr std::size_t Entries = 4;
+    std::array<Entry, Entries> entries{};
+    std::size_t next = 0;
+    std::uint64_t hits = 0;
+    std::uint64_t misses = 0;
+    // The noted import holding [address, address + bytes) under exactly (device, generation,
+    // epoch), or null.
+    const HostImport* Find(VkDevice device, std::uint64_t generation, std::uint64_t epoch, std::uint64_t address, std::uint64_t bytes) const;
+    // Remembers `import` as found under (device, generation, epoch), over the oldest entry.
+    void Note(VkDevice device, std::uint64_t generation, std::uint64_t epoch, const HostImport& import);
+};
+HostImportMemo& ThreadHostImportMemo();
+// HostImportFor through the calling thread's HostImportMemo: a hit takes no registry mutex. The
+// fast draw (its bindings through HostImportResolver, its in-place inputs and indirect records
+// through CopyDrawInput's and indirectPathFor's flags) and the fast dispatch's records (and its
+// elements with APS5_FAST_DISPATCH_PER_ELEMENT=1; batched, they take HostImportsFor) use it; Draw
+// keeps HostImportFor. APS5_NO_IMPORT_MEMO=1 calls HostImportFor.
+// A hit reads the registry generation and the published epoch without the registry mutex, so a
+// caller must be serialized with every reconcile and retire (GuestMemory::GpuMutex, held by every
+// caller), as any user of a HostImportFor pointer already must be: an epoch bump that follows an
+// erase on another thread would not stop a hit on the erased import.
+const HostImport* HostImportMemoized(const Context& context, std::uint64_t address, std::size_t bytes);
+
 // Whether an existing import covers [address, address + bytes), without reconciling the imports
 // with the registry or making one (HostImportFor may take a registry lease): a hint for choices
 // made outside the device lock (a sampled texture's path, a dispatch's pre-sync); the path taken
 // re-checks with HostImportFor when it binds the import.
 bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t bytes);
+// The existing import covering the range, as HostImportCovers finds it (nothing reconciled or
+// made): its buffer and base, copied under the registry lock.
+bool HostImportExisting(const Context& context, std::uint64_t address, std::size_t bytes, VkBuffer& buffer, std::uint64_t& base);
+// The import registry's epoch, bumped by every retire (an atomic load, no lock).
+std::uint64_t HostImportsEpoch();
 // Whether a readable registered allocation contains [address, address + bytes) right now (one
 // registry lease): a storage image whose memory was freed or re-registered has nothing to store to.
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes);
+// Whether a dispatch build would stage a written (or atomic) element of `bytes` in device-local
+// memory (the written-shadow window, the atomic cap; see GuestBufferMemory.cpp) instead of binding
+// it in place: what the fast dispatch declines until it stages itself (docs/design/draw-fastpath.md
+// 2.9). A merged region's size can differ from one element's, so this is the element's answer.
+bool DeviceStagingWanted(std::uint64_t bytes, bool atomic);
+
+// The [inplace-writes] census (APS5_PROFILE_DRAW, off with APS5_NO_INPLACE_WRITE_CENSUS=1; see
+// GuestBufferMemory.cpp): whether it is on (one static check), and one written element the fast
+// dispatch bound in place, `program` keying the dispatch as [gputime] does (a build's use notes its
+// regions through GuestBufferMemory::NoteInPlaceWrites).
+bool InPlaceWriteCensusOn();
+void NoteInPlaceWrite(std::uint64_t begin, std::uint64_t end, bool atomic, std::uint64_t program);
 
 // A persistent device copy of one registered range of the main guest image (which cannot be host
 // imported); see GuestBufferMemory.cpp.
@@ -74,6 +171,146 @@ class Recorder;
 // range changed are dropped first, as an upload does; without it (right after an upload, before the
 // work using the import is recorded) the imports are left as they are.
 std::uint64_t HostImportSerial(const Context& context, std::uint64_t address, std::size_t bytes, bool reconcile);
+
+// Resident read-only copies (Recorder::KeepsResidentReads, APS5_RESIDENT_READS=1; see
+// GuestBufferMemory.cpp "Resident reads"). A copy stands for its range while nothing wrote the
+// range since its last refresh: no CPU store (write watch, CollectWrites/UnchangedSince; a failed
+// collect counts as one), no driver or GPU write stamped (MarkWritten), no GPU write the recorder
+// noted (every shader write, fill, copy/DMA, label, texture store, shadow publish and DCC key
+// store: the hook below) and no address-based use still in flight that may store through its BDA
+// table over it (the writer list; once its batch finished, its stores are stamped).
+struct ResidentCopy;
+struct ResidentReadStatistics {
+    // Uses of a resident region; served by the copy as it stood, or after a refresh by reason
+    // (`refreshUnwatched`: the range's write-watch collect failed, so a CPU store may be unseen).
+    std::uint64_t uses = 0, hits = 0;
+    std::uint64_t refreshFirst = 0, refreshStamp = 0, refreshNoted = 0, refreshImport = 0, refreshWriter = 0, refreshUnwatched = 0;
+    std::uint64_t refreshedBytes = 0, servedBytes = 0;
+    // Copies made, evicted from the cache (a holder keeps using its own), refused by the device or
+    // the cap, regions left in place (demoted ranges whose copies were refreshed far more often
+    // than used as they stood); noted GPU writes and address-based uses that staled a copy.
+    std::uint64_t made = 0, madeBytes = 0, evicted = 0, refused = 0, demoted = 0, inPlace = 0;
+    std::uint64_t notedStale = 0, notedVisited = 0, writerUses = 0, rebuiltDemoted = 0;
+    // Checks made again because the batch changed between a build's check and its dispatch's
+    // record (a sync in between, RecheckResidentReads), and the refreshes they recorded.
+    std::uint64_t rechecks = 0, recheckRefreshes = 0;
+    // APS5_RESIDENT_READS_VERIFY: uses compared on completion, and those whose copy differed
+    // from the import.
+    std::uint64_t verified = 0, mismatched = 0;
+    // The video memory guard (VideoMemory, APS5_VRAM_GUARD): copies refused for the budget, copies
+    // evicted by its trims that no build held (and their bytes) and that builds held (their builds
+    // are rebuilt), cached copies made before its last recycle and made anew, and reused builds
+    // rebuilt over a recycled copy, over a trimmed one, and after an episode ended that refused
+    // them a copy.
+    std::uint64_t refusedBudget = 0, trimmed = 0, trimmedBytes = 0, trimmedHeld = 0, trimmedHeldBytes = 0, recycled = 0;
+    std::uint64_t rebuiltRecycled = 0, rebuiltTrimmed = 0, rebuiltRefused = 0;
+    // The cache now: copies and their allocated bytes (BufferPool::Capacity); the bytes of every
+    // live copy (cached, or evicted and still held by a build); address-based writers in flight.
+    std::uint64_t entries = 0, bytes = 0, liveBytes = 0, writers = 0;
+};
+ResidentReadStatistics ResidentReadCounts();
+// Whether any resident copy was made (one relaxed load): the recorder's write notes call
+// NoteResidentReadsWrite only then.
+bool ResidentReadsLive();
+// A GPU write over [begin, end) the recorder noted: every cached copy over it is stale.
+void NoteResidentReadsWrite(std::uint64_t begin, std::uint64_t end);
+// An address-based use, recorded by `recorder` into its open batch (serial Submissions() + 1),
+// that may store anywhere in `ranges` (sorted, disjoint [begin, end); null: anywhere). Its stores
+// are stamped only when that batch's completions ran (BdaResources::CheckFault), so until then a
+// copy over the ranges is refreshed at its next use (after it, in queue order); the note is
+// dropped when the batch finished (NoteResidentReadsFinished). Kept by reference: the same list
+// of the same recorder again updates its entry.
+void NoteResidentReadsAddressWriter(std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> ranges, const Recorder* recorder);
+// Recorder::finish: every batch of recorder `recorderId` up to `serial` finished, completions
+// included, so the address-based writers recorded into them are stamped.
+void NoteResidentReadsFinished(std::uint64_t recorderId, std::uint64_t serial);
+// Drops every cached copy (a holder keeps its own): tests, and the device teardown. Returns the
+// copies still alive (held by builds).
+std::size_t ClearResidentReads();
+// Video-memory budget ("resident" reclaimer, a safe point): drops the cached copies nothing else
+// holds (no build), least recently used first, until about `want` bytes went; by try_lock.
+VkDeviceSize TrimResidentReads(VkDeviceSize want, std::uint64_t& evicted);
+// Video-memory budget ("shadows" reclaimer, any thread): drops staging-chain registry entries
+// whose shadow nothing else holds (no build, no batch, no queued copy-back), so the shadow goes
+// back to the pool; the next use of such a range copies from its import, as after the registry's
+// own reset. By try_lock.
+VkDeviceSize TrimStagedShadows(VkDeviceSize want, std::uint64_t& evicted);
+VramCacheCensus StagedShadowCensus();
+// The device teardown: drops the staging-chain registry's entries whose shadows belong to
+// `device` (they go back to its pool before the pool and the device go).
+void ClearStagedShadows(VkDevice device);
+// Tests: the resident checks take every write-watch collect as failed.
+void ResidentReadsFailCollectForTests(bool fail);
+// The video memory guard's trim (VideoMemory::SetResidentTrimmer, registered with the first copy):
+// see VideoMemory::ResidentTrimmer. A held copy it evicts is marked trimmed, so a reused build
+// holding it is rebuilt (RecordResidentReads) and its memory goes with the last holder.
+VideoMemory::ResidentTrim TrimResidentReads(std::uint64_t bytes);
+
+// Resident written ranges (Recorder::KeepsResidentWrites, on by default, APS5_NO_RESIDENT_WRITES=1
+// turns them off; see
+// GuestBufferMemory.cpp "Resident written ranges"): the range of a written element too large to
+// stage binds a device copy D in its dispatch builds, and its writes reach the import by a land.
+struct ResidentWrite;
+struct ResidentWriteStatistics {
+    // Ranges promoted and refused (another range overlaps it, the video-memory budget or the
+    // device, the cap, a span or unwatched import); uses bound to D; refreshes of D from the import
+    // by reason (the promotion's fill, a stamp: a collected CPU store or a driver store, a GPU write
+    // noted that is not the use's own, an address-based use) and their bytes; changes a CPU store
+    // made while a land was queued (both sides wrote); ranges demoted (a changed import); reused
+    // builds rebuilt over a changed registry; fast-dispatch elements declined; collects and their
+    // time; APS5_RESIDENT_WRITES_VERIFY's compares and mismatches; the live ranges and their bytes;
+    // address-based uses that may store through BDA whose writable ranges overlap a live range (or
+    // are unknown) and those that miss every one (they owe no refresh).
+    std::uint64_t promoted = 0, refusedOverlap = 0, refusedVram = 0, refusedCap = 0, refusedSpan = 0, uses = 0;
+    std::uint64_t refreshFirst = 0, refreshStamp = 0, refreshNoted = 0, refreshAddress = 0, refreshedBytes = 0;
+    std::uint64_t both = 0, demoted = 0, rebuilt = 0, declines = 0, collects = 0, collectUs = 0, verified = 0, mismatched = 0;
+    std::uint64_t live = 0, liveBytes = 0;
+    std::uint64_t addressOver = 0, addressElsewhere = 0;
+    // Address spaces built mapping a range to its device copy, and address-based uses reading it
+    // there (each checked as a use bound to D).
+    std::uint64_t spacesMapped = 0, mappedUses = 0;
+    // S7c (APS5_RESIDENT_WRITES_WRITABLE, default on): spaces mapping a range to its device copy
+    // with the Write permission, address-based uses that may store through BDA and so queue its
+    // land (they write D), and the pages such uses stored to inside it, stamped at their
+    // completion and taken as D's own (not a change of the import D lacks).
+    std::uint64_t spacesWritable = 0, mappedWriters = 0, mappedPages = 0;
+    // APS5_RESIDENT_WRITES_DEMOTE (S11): ranges demoted by reason (cold: fewer uses bound to D in a
+    // whole 10 s window than promote one; cpu: refreshed for a change of the import at more than
+    // half its uses; both: both sides wrote it; vram: the "resident-writes" reclaimer; retired: its
+    // import retired or changed), each also counted in `demoted`; ranges barred from promotion for
+    // the session; promotions refused for a cool-down or a bar.
+    std::uint64_t demotedCold = 0, demotedCpu = 0, demotedBoth = 0, demotedVram = 0, demotedRetired = 0, blacklisted = 0, retryWaits = 0;
+};
+ResidentWriteStatistics ResidentWriteCounts();
+// Whether a range lives (one relaxed load).
+bool ResidentWritesLive();
+// Under GuestMemory::GpuMutex: a GPU write the recorder noted over [begin, end) (Recorder::
+// noteWrite: the ranges over it refresh D before their next use, unless the note is that use's
+// own), and an address-based use that may store through its BDA table to `ranges` (sorted and
+// merged; the ranges overlapping them refresh; null: every range), except the ranges `inDevice`
+// its table maps to their device copy (it stores those into D, which its land carries).
+void NoteResidentWritesWrite(std::uint64_t begin, std::uint64_t end);
+void NoteResidentWritesAddressWriter(const std::vector<std::pair<std::uint64_t, std::uint64_t>>* ranges, const std::vector<std::shared_ptr<ResidentWrite>>* inDevice = nullptr);
+// Any thread: whether a live range overlaps [begin, end) (the fast dispatch declines the element).
+bool ResidentWritesOverlap(std::uint64_t begin, std::uint64_t end);
+// The device teardown and tests: drops every range (their lands were recorded already).
+void ClearResidentWrites();
+// Video-memory budget ("resident-writes" reclaimer, APS5_RESIDENT_WRITES_DEMOTE): under
+// GuestMemory::GpuMutex, with an active recorder that demotes, lands and drops the coldest live
+// ranges (fewest uses bound to D in this window and the last, then the largest) until about `want`
+// bytes went; their memory goes with the last build or batch holding them. 0 otherwise.
+VkDeviceSize TrimResidentWrites(VkDeviceSize want, std::uint64_t& evicted);
+// Tests: moves the clock of S11's demotion windows and cool-downs forward by `ms`.
+void ResidentWritesAdvanceClockForTests(std::int64_t ms);
+// Tests: APS5_RESIDENT_WRITES_WRITABLE as if set to `writable` (-1: the environment's); the
+// registry epoch moves, so the cached address space is built again.
+void ResidentWritesWritableForTests(int writable);
+// Under GuestMemory::GpuMutex, at the completion of an address-based use whose table maps `mapped`
+// to their device copy with the Write permission (BdaResources::CheckFault): stamps the 4 KiB pages
+// it stored to (their guest addresses) and takes those inside a range as D's own (W4): the use
+// queued the range's land, which its batch recorded, so the import holds them by now. The range's
+// sync moves past them unless it changed since (a CPU store meanwhile owes a refresh, as both).
+void MarkResidentMappedPages(const std::vector<std::shared_ptr<ResidentWrite>>& mapped, std::span<const std::uint64_t> pages);
 
 // The import table's identity (the fast Revalidate): serials proved under one identity stand
 // while the table still has it, i.e. the same device, the same epoch (bumped by every retire)
@@ -156,6 +393,7 @@ struct MirrorStats {
     std::uint64_t heapRefills = 0;
 };
 MirrorStats MirrorCounters();
+void ClearImageMirrors(VkDevice device);
 
 struct AddressCopy {
     std::uint64_t begin;
@@ -175,6 +413,14 @@ public:
     // copied blocks) are timed by AcquireRegistered on the calling thread; the caller adds the
     // snapshot compares it made after it (ShaderResources::prepareAddressBindings).
     static void CountAddressBuild(double snapshotsUs);
+    // Narrow copy-backs' baselines (APS5_NARROW_COPY_BACKS; counted under APS5_PROFILE_DRAW), totals
+    // since start: refreshed at a copy-in from the import, inherited along the staging chain (and
+    // of those untrusted), copy-backs recorded narrow and whole, and trust lost to a claim broken
+    // since the chain (Recorder::ClaimBreaks).
+    struct NarrowTrustStatistics {
+        std::uint64_t refreshed = 0, inherited = 0, inheritedUntrusted = 0, narrow = 0, whole = 0, claimBroken = 0;
+    };
+    static NarrowTrustStatistics NarrowTrustCounts();
     // A guest range bound through a descriptor. Both read live guest memory at upload and bind the
     // same way (a storage buffer); AddWritable also notes the range in Writes(), so it gets the
     // write-back's reference copy, a write-back, the recorder's pending-write note and the
@@ -194,6 +440,43 @@ public:
     // were confirmed unchanged): the previous use's copy-back left the shadow behind, and the next
     // RecordCopyBacks copies it back again. Nothing to do without staged regions.
     void RecordStagingCopies(Recorder& recorder);
+    // Resident read-only copies (Recorder::KeepsResidentReads): checks every region this upload
+    // binds from a resident copy for another use (ShaderResources::Revalidate, after the imports
+    // were confirmed unchanged, under GuestMemory::GpuMutex) and records the refresh of each stale
+    // one from its import into the open batch, ahead of the work. Nothing without such regions.
+    // False (nothing recorded) when a copy it binds was demoted since: the caller rebuilds, and
+    // the new build binds that range in place.
+    bool RecordResidentReads(Recorder& recorder);
+    // The work is about to be recorded (VulkanDevice::recordDispatch): when `recorder` submitted
+    // since the last check (a sync between the build or proof and the record, as an indirect
+    // dispatch's CPU path makes, whose completions may have stored into a range), every resident
+    // region is checked again and a stale copy refreshed into the open batch. Nothing otherwise.
+    void RecheckResidentReads(Recorder& recorder);
+    // An address-based use is about to be recorded by `recorder` (ShaderResources::Bind): the
+    // ranges its BDA table lets it store to stale the resident copies over them while it is in
+    // flight (NoteResidentReadsAddressWriter). The list is built once per build.
+    void NoteAddressWriter(const Recorder* recorder) const;
+    // The same use for the resident written ranges (APS5_RESIDENT_WRITES): the live ranges that
+    // list overlaps refresh D before their next use (NoteResidentWritesAddressWriter).
+    void NoteResidentWritesWriter() const;
+    // The program may store through its BDA table (ShaderResources, after UploadFinish): each use
+    // writes the ranges the table maps to their device copy with the Write permission and queues
+    // their lands (RecordCopyBacks).
+    void NoteAddressStores();
+    // Those ranges, for the build's BdaResources (MarkResidentMappedPages at its completion): none
+    // when the table maps none (unsplit, no space, APS5_RESIDENT_WRITES_WRITABLE=0).
+    std::vector<std::shared_ptr<ResidentWrite>> ResidentWritesMappedWritable() const;
+    // Whether the region owning `address` is bound from a resident read-only copy.
+    bool ServedResident(std::uint64_t address) const;
+    // Whether a region binds the device copy of the resident written range `key` (VulkanDevice::
+    // recordDispatch leaves that range's queued land queued past the use).
+    bool BindsResidentLand(const void* key) const;
+    // An address-based build that may leave resident written ranges' lands queued (a space, no
+    // descriptor over a live range: not residentUnsplit), and whether it may for the range `key`:
+    // its table maps the range only to its device copy or not at all, no region of its own over it
+    // (VulkanDevice::recordDispatch's lease flush leaves that land queued past the use).
+    bool MapsResidentLands() const;
+    bool MapsResidentLand(const void* key) const;
     void AddSnapshot(const GuestMemorySnapshot& snapshot);
     // Upload is the two stages below back to back. UploadPrepare needs no device lock: it merges the
     // regions, binds the image mirrors and host imports that already serve them (an import pointer is
@@ -206,6 +489,9 @@ public:
     void UploadPrepare(bool addressable);
     void UploadFinish(bool addressable);
     VkDescriptorBufferInfo Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const;
+    // Whether the region owning `address` is read in place from its host import (Descriptor binds
+    // the import), not a copy or a mirror.
+    bool ServedInPlace(std::uint64_t address) const;
     std::vector<ShaderRecompiler::BdaAbi::Range> AddressRanges() const;
     // The BDA table of the cached address space when it serves this upload alone (an address-based
     // build with no region outside it): its ranges, immutable while the space lives, and the
@@ -229,6 +515,10 @@ public:
     // Reports writes into host-imported memory (made by the GPU in place, or copied back into it by
     // RecordCopyBacks) to the write tracking now.
     void MarkDirectWrites() const;
+    // The [inplace-writes] census of this use, after its marks (VulkanDevice::recordDispatch): each
+    // written region bound in place with why it was not staged, and an address-based build's
+    // storable ranges as one use; `program` keys the dispatch as [gputime] does.
+    void NoteInPlaceWrites(std::uint64_t program) const;
     // Records, into the recorder's open batch, the copy of every written sub-range of a region the
     // GPU copied out of a host import (see Region::gpuCopy) back into the import: what the shader
     // wrote lands in guest memory by the GPU, ordered after the recorded work, so the region needs
@@ -279,6 +569,10 @@ public:
     // ranges (an address-based build: sorted and merged, immutable, the same list for every build
     // of the space) returned by reference, or null without a space. Nothing once committed.
     std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> InPlaceReadSet(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
+    // The device-local bytes of the regions' staging shadows: alone, those nothing but this
+    // object holds; shared, those one other holder also holds (see
+    // ShaderResources::DeviceBytesHeldAlone).
+    VramHeld DeviceBytesHeldAlone() const;
 
 private:
     struct Region {
@@ -335,10 +629,36 @@ private:
         // The device refused the shadow (memory or allocations exhausted): the region takes the
         // path it would take without staging, in both upload stages.
         bool unstaged = false;
+        // Narrow copy-backs (Recorder::NarrowsCopyBacks): a staging shadow made with the switch on
+        // keeps a baseline of its range `baselineDelta` bytes behind its first byte (0: none), which
+        // stands for what the import holds of the range: refreshed from the shadow after every
+        // copy-in from the import, copied along with a chained shadow, and kept so by every copy-back
+        // (the compare pass, or a whole copy that mirrors its bytes into it). `baselineTrusted` while
+        // it does (a chained shadow passes its trust on); `baselineInherited` when it came with a
+        // chained shadow of another buffer whose copies this use claimed at `claimBreaks`
+        // (Recorder::ClaimBreaks): a claimed copy recorded meanwhile updated that buffer's baseline,
+        // not this one's, so the copy-back then copies whole and the trust is gone until the next
+        // copy-in from the import. `copySourceAddress`: the import's device address of
+        // `copySourceBase` (0: unknown, copied whole).
+        VkDeviceSize baselineDelta = 0;
+        bool baselineTrusted = false;
+        bool baselineInherited = false;
+        std::uint64_t claimBreaks = 0;
+        VkDeviceAddress copySourceAddress = 0;
         // A descriptor crossing back-to-back imported ranges of the address space (see spannable):
         // it overlaps the space's base ranges, so it stays out of the BDA table (the base imports
         // serve those addresses) and binds one span import over the same host pages.
         bool span = false;
+        // Resident reads (Recorder::KeepsResidentReads): the device-local copy Descriptor binds in
+        // the import's place (`direct` stays the import: the copy's source, and the identity the
+        // region is reused under), the import's serial when it was taken, and its VkBuffer and
+        // base in `copySource`/`copySourceBase`.
+        std::shared_ptr<ResidentCopy> resident {};
+        std::uint64_t residentSerial = 0;
+        // Resident written ranges (Recorder::KeepsResidentWrites): the range whose device copy
+        // Descriptor binds in the import's place (`direct` stays the import: the land's target and
+        // the identity the region is reused under).
+        std::shared_ptr<ResidentWrite> residentWrite {};
     };
 
     // How [begin, end) lies against the space's base regions.
@@ -373,6 +693,9 @@ private:
     // Gives a region a buffer of its own with its bytes (guest memory for host-backed and writable
     // ranges, plus the write-back's reference copy for a range a descriptor writes; else its snapshot).
     void copyRegion(Region& region, bool addressable);
+    // A staged region's device-local shadow (null when the device refuses it), with a baseline
+    // behind its bytes when the active recorder narrows copy-backs (Region::baselineDelta).
+    std::shared_ptr<Buffer> stagingShadow(Region& region, bool addressable) const;
     // Whether a region inside a host import that cannot be bound in place is copied by the GPU
     // instead of the CPU (see Region::gpuCopy): live guest bytes, not sparse, at most the size
     // APS5_GPU_COPY_MAX_KIB allows, and APS5_CPU_COPIES unset.
@@ -385,6 +708,31 @@ private:
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
     void recordGpuCopies(std::span<Region* const> copies, bool addressable);
+    // Resident reads: whether a region UploadFinish binds in place from `entry` may take a
+    // resident copy instead (switch on, a dispatch build (AllowDeviceStaging) not address-based,
+    // no descriptor of the build writes it, a watched non-span import, within the size window; the
+    // caller checked the alignment and the write watch), and the check-and-refresh of the given
+    // resident regions (RecordResidentReads).
+    bool residentEligible(const Region& region, const HostImport& entry, bool addressable, const Recorder* recorder) const;
+    void recordResidentReads(Recorder& recorder, std::span<Region* const> resident, bool recheck = false);
+    // Resident written ranges (see GuestBufferMemory.cpp): UploadFinish's pass (promotion, binding,
+    // the check of each range bound), the promotion's use of the build's in-place regions, a
+    // reused build's pass (false: rebuilt), the check of the ranges bound, a use's lands
+    // (RecordCopyBacks) and its own writes taken as D's (MarkDirectWrites).
+    void bindResidentWrites(Recorder& recorder, std::vector<Region*>& residentWanted);
+    bool noteResidentCandidates(Recorder& recorder);
+    bool recordResidentWrites(Recorder& recorder);
+    void checkResidentWrites(Recorder& recorder);
+    void queueResidentLands(Recorder& recorder, bool defer);
+    void absorbResidentWrites() const;
+    // Whether [begin, end) overlaps a range the space maps to its device copy; the check of those
+    // ranges before an address-based use reading them there (RecheckResidentReads).
+    bool residentHoleOver(std::uint64_t begin, std::uint64_t end) const;
+    // That, or a live range (checked under residentSpaceEpochAt's registry).
+    bool residentImportOver(std::uint64_t begin, std::uint64_t end) const;
+    void checkMappedResidentWrites(Recorder& recorder);
+    // NoteAddressWriter's list (addressWriterRanges), made at the first ask per upload and space.
+    const std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>>& addressWriterList() const;
     void allocateRegionBuffer(Region& region, bool addressable);
     void takeHeapReferences();
     Context context;
@@ -400,6 +748,34 @@ private:
     // Whether `regions` is in ascending address order (true right after AcquireRegistered, whose
     // regions follow the registry's order), so AddSnapshot can search instead of scanning.
     bool regionsSorted = false;
+    // Some region is bound from a resident read-only copy (RecordResidentReads has work), and the
+    // recorder and its submission count at the last check (RecheckResidentReads).
+    bool residentRegions = false;
+    // A resident copy was refused for the video memory budget: VideoMemory::Rounds() + 1 at the
+    // refusal (0: none). Once an episode ended since, the reused build is rebuilt to take copies.
+    std::uint64_t residentBudgetRound = 0;
+    const Recorder* residentCheckedBy = nullptr;
+    std::uint64_t residentCheckedAt = 0;
+    // Some region binds a resident written range; the registry epoch the build's bindings stand
+    // for (0: it never took the pass), and the recorder's submissions at the last check.
+    bool residentWriteRegions = false;
+    // The space maps resident written ranges to their device copy, but this build reads one
+    // through the import (a draw build, a descriptor inside or a span over one): it binds the
+    // space's import table (AddressSpace::importRanges) and notes those ranges as read in place.
+    bool residentUnsplit = false;
+    // NoteAddressStores: the table maps resident written ranges writable and the program may store
+    // through it (each use queues their lands).
+    bool residentMappedStores = false;
+    // The resident write registry's epoch at AcquireRegistered (0: none configured, or APS5_RESIDENT_
+    // WRITES_SPACE=0): its descriptors were checked against the ranges live then.
+    std::uint64_t residentSpaceEpochAt = 0;
+    std::uint64_t residentWriteEpoch = 0;
+    std::uint64_t residentWritesCheckedAt = 0;
+    // NoteAddressWriter's list for this build (the space's writable ranges, merged with the
+    // build's own when it has any), made at its first use after an upload, for the space it held.
+    mutable std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> addressWriterRanges;
+    mutable const AddressSpace* addressWriterSpace = nullptr;
+    mutable bool addressWriterKnown = false;
     // Some region of `regions` is a span (Region::span): owner() prefers the span holding an address
     // over the base range that starts later, so a view or write-back crossing base ranges finds it.
     bool spansHeld = false;

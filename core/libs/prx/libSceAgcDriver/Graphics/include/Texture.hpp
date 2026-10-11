@@ -5,13 +5,16 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageMemoryPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TexelStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -36,6 +39,10 @@ bool StorageFormatAvailable(const Context& context, std::uint32_t guestFormat);
 // Whether a storage image of the guest format takes DCC clear `keys` as a GPU clear (see
 // StorageTexture::upload); false for integer formats and non-clear keys.
 bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, DccKeys keys);
+// The 32-bit word APS5_POISON_RETILE_SCRATCH fills a GPU-direct write-back's tiled scratch with,
+// for an image of `format`: magenta at 1.0 for UNORM formats and at 4.0 for float ones where a
+// repeated word can hold it, 4.0 in every channel for 32-bit float formats, all ones otherwise.
+std::uint32_t RetileScratchPoisonWord(VkFormat format);
 
 // A sampled texture's own VkImage with its memory, shared with the recorder while a recorded upload
 // still writes it (see the snapshot constructor), so the texture may go before the batch completes.
@@ -46,7 +53,7 @@ struct OwnedImage {
     ~OwnedImage() {
         if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
         if (pool) pool->Release(allocation);
-        else if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+        else if (memory) FreeDeviceMemory(context, memory);
     }
     Context context;
     VkImage image;
@@ -82,6 +89,8 @@ public:
     // The layout the image is kept in while sampled.
     VkImageLayout Layout() const { return layout; }
     VkDeviceSize AllocationBytes() const { return allocationBytes; }
+    // Its image lives in a block of the image pool (freeing it leaves a hole there, see VramBudget).
+    bool PooledMemory() const { return owned != nullptr && owned->allocation.pooled; }
     // Whether this texture is a view of a storage image (no snapshot of its own).
     bool ViewsStorageImage() const { return storageSource != nullptr; }
     const StorageTexture* StorageSource() const { return storageSource.get(); }
@@ -220,7 +229,9 @@ public:
     // The pending image whose surface starts at `address` and covers at least `bytes` (a mip chain
     // contains a descriptor of its first mips), if any; the caller decides whether the geometry fits
     // (Texture::CanCopyFrom, ResidentPresentable).
-    static std::shared_ptr<StorageTexture> FindPending(std::uint64_t address, std::uint64_t bytes);
+    // `swizzleSlice` (when given) must match the image's descriptor: a slice-k color view and a plain
+    // 2D surface at one address are tiled apart and never stand for each other.
+    static std::shared_ptr<StorageTexture> FindPending(std::uint64_t address, std::uint64_t bytes, std::optional<std::uint32_t> swizzleSlice = std::nullopt);
     // How a buffer fill of [address, address + bytes) (Driver.cpp's fill HLE) meets the storage
     // images alive: none of them; a whole surface (Exact) or one array layer of a surface (Layer),
     // `image` and `layer` naming it, whatever other images lie over the range (`others`, of which
@@ -264,7 +275,8 @@ public:
     bool FillClear(std::span<const std::uint32_t, 4> pattern, std::uint32_t layer, const char*& refusal);
     // The cached, live image whose surface is exactly [address, address + bytes), if any (the newest
     // of several: see ClassifyFill).
-    static std::shared_ptr<StorageTexture> FindLive(std::uint64_t address, std::uint64_t bytes);
+    // `swizzleSlice` as for FindPending.
+    static std::shared_ptr<StorageTexture> FindLive(std::uint64_t address, std::uint64_t bytes, std::optional<std::uint32_t> swizzleSlice = std::nullopt);
     // Whether the two surfaces differ in nothing but their address (and DCC metadata).
     bool SameSurfaceShape(const StorageTexture& other) const;
     // The copy HLE's buffer copy of one whole surface into another (VulkanDevice::CopyBuffer,
@@ -280,10 +292,19 @@ public:
     // <prefix><address>_<width>x<height>_a<layers>_l<layer>.raw (u32 row pitch in texels, u32 height,
     // u32 VkFormat, then the rows). The GPU must be idle. Returns the number of files written.
     static std::size_t DumpLive(const Context& context, const std::string& prefix, std::span<const std::uint64_t> addresses = {});
+    // Debug aid (APS5_PASS_DUMP, see Execution/include/Driver/PassDump.hpp): reads back mip `level` of
+    // layers [firstLayer, firstLayer + layerCount) (clamped to the image, and to 256 MiB) of every
+    // live, unreleased image at `address`, each handed to `consume`. The GPU must be idle. Returns
+    // the number of images read.
+    static std::size_t ReadBack(const Context& context, std::uint64_t address, std::uint32_t level, std::uint32_t firstLayer, std::uint32_t layerCount, const std::function<void(const ImageReadback&)>& consume);
     // Debug aid (APS5_CAPTURE_DIR, see VulkanDevice::CaptureTargets): sets every live image at
     // `address` to zero on the device (all mips and layers). The GPU must be idle. Returns the number
     // of images cleared.
     static std::size_t DebugClear(const Context& context, std::uint64_t address);
+    // Crash-time resource report (APS5_CRASH_RESOURCES=1, GuestMemory::AddCrashDescriber): the live
+    // images whose guest range, its 64 KiB edge blocks or its DCC key range hold `address`, with their
+    // pending state and last write-back. Try-locks the live registry; at most 8 lines.
+    static void DescribeForCrash(std::uint64_t address, void (*print)(const char* text));
     VkImage Image() const { return image; }
     const GuestTextureResource& Descriptor() const { return descriptor; }
     std::uint32_t ImageLayers() const { return geometry.imageLayers; }
@@ -362,6 +383,9 @@ private:
     void markLayersPending(std::uint32_t first, std::uint32_t count);
     // Registers or unregisters the image as its pending layers say (after a write-back).
     void reconcilePending();
+    // APS5_TRACE_WRITEBACK_RANGE: one [wb-range] line for a lifetime event of the image ("create",
+    // "refresh", "dirty", "evict", "destroy") when its surface or its DCC keys intersect the range.
+    void traceRange(const char* event) const;
     // Pending images whose surface shares one of the 64 KiB write-stamp blocks firstBlock..lastBlock
     // (the span a write-back stamps) without overlapping this one: the tracked layer of theirs
     // holding the shared block, when its memory is unchanged since its generation (see writeBack),
@@ -405,6 +429,8 @@ private:
     std::uint64_t borrowUnits(StorageTexture& source, const std::vector<bool>& units);
     void forgetBorrowed(std::uint32_t first, std::uint32_t count);
     bool clearByKeysFill(DccKeys keys, std::uint8_t key);
+    KeyStoreGuard keyStoreGuard(const char* caller, const std::vector<bool>& layers) const;
+    void storeKeys(const char* caller, const std::vector<bool>& layers);
     bool overlaps(std::uint64_t address, std::size_t bytes) const;
     bool pendingUnitInside(std::uint64_t address, std::size_t bytes) const;
     VkImageView createView(std::uint32_t mip, bool firstLayer = false) const;
@@ -423,6 +449,11 @@ private:
     DccKeys uploadedKeys = DccKeys::Uncompressed;
     DccKeys filledKeys = DccKeys::Uncompressed;
     mutable DccKeyProof keyProof;
+    // The tracker generation after this image last took its key range into account: the upload's
+    // key scan (collected just before), or a write-back's key store that left no key page to the
+    // CPU. The key store guard counts only CPU stores newer than it (and than the stored units'
+    // generations): earlier ones are the keys the image was uploaded under. 0 before either.
+    std::uint64_t keysSeen = 0;
     struct ForeignKeyProof {
         std::uint64_t dccAddress = 0;
         DccKeyProof proof;
@@ -438,6 +469,9 @@ private:
     std::uint64_t trackedLayerBytes = 0;
     std::vector<std::uint64_t> layerGeneration;
     std::vector<bool> layerPending;
+    // Per tracked layer: the free clock (GuestMemory::FreeClock) at its last GPU write
+    // (markLayersPending); a write-back leaves out the pages released since (APS5_DROP_FREED_STORES).
+    std::vector<std::uint32_t> layerFreeClock;
     bool blockUnits = false;
     // Write-back hysteresis (block units, see writeBack): partial stores in the current window of
     // presents, its first present, and the present until which every pending unit is stored.
@@ -454,6 +488,8 @@ private:
     bool lent = false;
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    // The memory type the image was allocated from (the [retile] line names it).
+    std::uint32_t memoryType = ~0u;
     VkImageView view = VK_NULL_HANDLE;
     std::uint32_t defaultMip = 0;
     std::map<std::uint32_t, VkImageView> extraViews;
@@ -469,6 +505,18 @@ private:
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;
+    // The last write-back that stored anything (DescribeForCrash): when (GuestMemory::StoreClockMs),
+    // why, the span of its stored ranges, whether it stored the DCC keys, and how many there were.
+    std::uint64_t lastWriteBackMs = 0;
+    const char* lastWriteBackReason = nullptr;
+    std::uint64_t lastStoredBegin = 0;
+    std::uint64_t lastStoredEnd = 0;
+    bool lastKeysStored = false;
+    std::uint32_t writeBacks = 0;
+    // APS5_TRACE_WRITEBACK_RANGE (kept only while it is on): when the image was last written on the
+    // GPU (markLayersPending) and last uploaded from guest memory (GuestMemory::StoreClockMs).
+    std::uint64_t gpuWriteMs = 0;
+    std::uint64_t refreshMs = 0;
     std::atomic<bool> cached{false};
     // The present a consumer last proved the image current at (NoteProved).
     mutable std::atomic<std::uint64_t> provedPresent{0};

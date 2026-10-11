@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_PIPELINE_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include <atomic>
 #include <set>
 
 namespace AgcDriver::Graphics {
@@ -36,6 +37,9 @@ public:
     // before, during and after the pass (GENERAL for resident targets, which then need no
     // transitions).
     Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    // The same on a pipeline layout the caller owns and keeps alive (FastLayouts: a push-descriptor
+    // set and the push range of PushConstantStages(shaders)); the pipeline does not destroy it.
+    Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, VkPipelineLayout layout, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     ~Pipeline();
     Pipeline(const Pipeline&) = delete;
     Pipeline& operator=(const Pipeline&) = delete;
@@ -49,6 +53,11 @@ public:
     void PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
     // Forgets the Vulkan objects without destroying them: for entries of a device that is already gone.
     void Abandon() noexcept;
+    // The pipeline store's recency stamp (Pipeline.cpp): the store's use clock at the last lookup
+    // that answered this pipeline, by the store or by a thread's memo (CachedFastPipeline, which
+    // takes no lock), so the store evicts the least recently used entry as if every lookup had
+    // reached it.
+    mutable std::atomic<std::uint64_t> storeUse{0};
 
 private:
     struct CachedFramebuffer {
@@ -57,10 +66,14 @@ private:
         VkExtent2D extent;
         std::shared_ptr<Framebuffer> framebuffer;
     };
+    // Both public constructors: a layout of `setLayout` and the push range is made and owned when
+    // `sharedLayout` is null.
+    Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, VkDescriptorSetLayout setLayout, VkPipelineLayout sharedLayout, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout);
     void release() noexcept;
     Context context;
     std::vector<VkShaderModule> _modules;
     VkPipelineLayout layout = VK_NULL_HANDLE;
+    bool ownsLayout = true;
     VkRenderPass renderPass = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     std::size_t attachments = 0;
@@ -75,6 +88,16 @@ private:
 // only evicted once no recorded draw holds them. Debug aid: APS5_NO_PIPELINE_CACHE=1 builds one per
 // draw as before.
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+// The same for the fast draw path (FastDraw.cpp): on the push layout `layout` of `layoutKey` (the
+// set layout key ShaderResources would make), keyed apart from the set-layout pipelines by the push
+// layout id, which the pipelines share with the FastLayouts that keeps them.
+struct FastLayout;
+std::shared_ptr<Pipeline> CachedFastPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const FastLayout& layout, std::span<const std::uint32_t> layoutKey, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+// The store key CachedFastPipeline looks the pipeline of push layout `pushLayout` up by, built into
+// `key` (cleared first; empty when a stage has no variant id, which gets a private pipeline). Its
+// per-thread memo (APS5_NO_PIPELINE_MEMO=1: off) answers a key equal to one it noted while the store
+// dropped nothing since, the device instance is the same and the pipeline lives.
+void FastPipelineKey(const Context& context, const State& state, const VertexInputLayout& vertexInput, std::uint32_t pushLayout, std::span<const std::uint32_t> layoutKey, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, std::vector<std::byte>& key);
 // Destroys the cached pipelines of a device; to be called before the device goes away. Without it,
 // entries of a gone device are recognised by their buffer pool (made and reset with the device, so
 // it tells device instances apart when the loader reuses a VkDevice handle) and forgotten unused.

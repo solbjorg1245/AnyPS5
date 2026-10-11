@@ -159,6 +159,7 @@ private:
     bool vCvtPknormF16(const RdnaInstruction& inst, bool signedValue);
     bool vSatPkU8I16(const RdnaInstruction& inst);
     bool vMulLegacyF32(const RdnaInstruction& inst, bool accumulate);
+    bool vMadLegacyF32(const RdnaInstruction& inst, IrOpcode opcode);
     void emitFloat16ClassCompare(const RdnaInstruction& inst, bool cmpx);
     bool vDot2cF32F16(const RdnaInstruction& inst);
     bool vCubeidF32(const RdnaInstruction& inst);

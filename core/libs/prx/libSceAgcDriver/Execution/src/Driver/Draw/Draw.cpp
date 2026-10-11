@@ -1,6 +1,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawScratch.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastDraw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastWalk.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/PassDump.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -17,6 +22,39 @@ struct DrawScratchTag {};
 bool drawScratchEnabled() {
     static const bool enabled = std::getenv("APS5_NO_DRAW_SCRATCH") == nullptr;
     return enabled;
+}
+
+// A draw whose captured regions no longer agree with the memory serving them (AddSnapshot's
+// Graphics::SnapshotStale, ~95 G-buffer draws per 10 s in t360) was dropped: the packet runs again
+// instead, each retry stricter. APS5_NO_SNAPSHOT_RETRY=1: dropped as before.
+bool snapshotRetryEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_SNAPSHOT_RETRY") == nullptr;
+    return enabled;
+}
+
+// The retry of the packet this thread draws: 1 captures every stage fresh (no draw-cache entry,
+// so no stored stage bytes) with every word a recorded write covers read through the hook
+// (Driver::forcedSyncReads), 2 also captures under the GPU mutex (nothing records between the
+// capture and the draw), 3 also binds a range that still differs as it is (the memory the GPU
+// reads, as on hardware). The CPU-indirect records before `resumeRecord` were drawn already.
+struct SnapshotRetry {
+    std::uint32_t level = 0;
+    std::uint32_t resumeRecord = 0;
+};
+
+constexpr std::uint32_t SnapshotRetryLevels = 3;
+
+// APS5_NO_SNAPSHOT_SERVE=1: no last retry; a draw still differing after the locked capture is
+// dropped as before, so serving the mismatch (words the recompiler baked from the capture beside
+// live memory) can be A/B'd apart from the recaptures.
+std::uint32_t snapshotRetryLimit() {
+    static const std::uint32_t limit = std::getenv("APS5_NO_SNAPSHOT_SERVE") == nullptr ? SnapshotRetryLevels : SnapshotRetryLevels - 1;
+    return limit;
+}
+
+SnapshotRetry& snapshotRetry() {
+    static thread_local SnapshotRetry retry;
+    return retry;
 }
 
 }
@@ -68,7 +106,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     static const std::uint64_t dumpSlot1 = [] { const char* text = std::getenv("APS5_DUMP_DRAW_SLOT1"); return text ? std::strtoull(text, nullptr, 16) : 0ull; }();
 
-    static const bool lockedPrepare = std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr;
+    static const bool lockedPrepareAlways = std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr;
+    auto& retry = snapshotRetry();
+    const auto resumeRecord = retry.resumeRecord;
+    const bool lockedPrepare = lockedPrepareAlways || retry.level >= 2;
+    // APS5_FAST_DRAW (FastDraw.cpp): the fast path takes the draw, or declines it to the path below.
+    if (FastDrawEnabled()) {
+        if (const auto verdict = fastDraw(queue, submission, drawParameters, rejected, traceIndirect, retry.level != 0 || lockedPrepare, ShaderRecompiler::DebugProbeActive() || dumpTarget != 0 || dumpSlot1 != 0 || PassDump::FrameActive(), phaseTiming)) return *verdict == DrawVerdict::Drawn ? drawn() : *verdict;
+    }
+    // A comparison the fast path armed for this draw (APS5_FAST_DRAW_VERIFY) ends with it.
+    const FastDrawVerifyScope verifyScope;
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
     std::shared_ptr<VulkanDevice> localDevice;
     if (lockedPrepare) {
@@ -91,7 +138,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("device_setup");
     phaseTiming.Phase(DrawRowVectors);
 
-    const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
+    const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0 && retry.level == 0;
     const bool registerKey = useDrawEntries && registerKeyEnabled();
     DrawKey drawKey;
     std::shared_ptr<DrawEntry> entry;
@@ -100,7 +147,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     relocation.Reset();
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial());
+        drawKey = fastState() ? fastDrawKey(queue, submission, localDevice->Serial()) : drawRegisterKey(queue, *submission.shaders, localDevice->Serial());
         std::lock_guard cacheLock(drawCacheMutex);
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
@@ -143,6 +190,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
     }
 
+    // APS5_FAST_STATE: a key without an entry takes its draw state's decode with the live user words.
+    if (registerKey && decode == nullptr && fastState() && !verifyDrawRecipe()) decode = fastDrawDecode(queue, submission);
     resolveDrawDecode(queue, submission, decode, registerKey, drawKey.key, profile);
     const auto& graphics = decode->state;
     const auto& pixel = decode->pixel;
@@ -307,8 +356,19 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes});
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
+    // APS5_FAST_WALK=N (FastWalk.cpp): the fast walk in shadow mode, compared with the results
+    // bound above; its time is reported on its own line, not in the phase rows.
+    if (FastWalkEvery() != 0) {
+        phaseTiming.Phase(DrawRowVectors);
+        ShadowWalkDraw({programs, roles, graphics, pixel, vertexInfos, linked, drawParameters, *localDevice, programResults, pushOffsets, (drawHit || hits.partial) && (hits.data || hits.partial || relocating != nullptr)});
+        if (profile) phaseLap = std::chrono::steady_clock::now();
+    }
+    // APS5_FAST_DRAW_VERIFY: the results bound above against the fast path's for this draw.
+    if (FastDrawVerifyPending()) VerifyFastDrawStages(programResults, (drawHit || hits.partial) && (hits.data || hits.partial || relocating != nullptr), memory);
 
     cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, hits, fresh, drawKey, registerKey, decode, phaseTiming, relocating);
+    // APS5_FAST_CENSUS: what the fast path would decline on, committed when the packet ends (F0).
+    if (FastCensusActive()) NoteFastCensusDraw(queue, graphics, roles, programs, programResults, recompiled, stageCaptures, matchedRegions, decodeReads, drawParameters.indirect.has_value(), indirectCpu, ShaderRecompiler::DebugProbeActive() || dumpTarget != 0 || dumpSlot1 != 0);
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
@@ -316,6 +376,44 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(queue, packet, submission, rejected);
+
+    // The device's draw, true when it threw SnapshotStale and the packet is to run again
+    // (retryStale); the last retry serves the mismatch, so it never gets here.
+    const bool retryable = snapshotRetryEnabled() && retry.level < snapshotRetryLimit();
+    const auto stale = [&](auto&& work) {
+        try {
+            work();
+        } catch (const Graphics::SnapshotStale&) {
+            if (!retryable) throw;
+            return true;
+        }
+        return false;
+    };
+    const auto retryStale = [&](std::uint32_t resume) {
+        struct Restore {
+            SnapshotRetry& retry;
+            SnapshotRetry state;
+            bool& sync;
+            bool syncBefore;
+            bool& serves;
+            bool servesBefore;
+            ~Restore() {
+                retry = state;
+                sync = syncBefore;
+                serves = servesBefore;
+            }
+        };
+        auto& sync = forcedSyncReads();
+        auto& serves = Graphics::ThreadServesStaleSnapshots();
+        const Restore restore{retry, retry, sync, sync, serves, serves};
+        retry.level = restore.state.level + 1;
+        retry.resumeRecord = resume;
+        sync = true;
+        serves = retry.level >= SnapshotRetryLevels;
+        Graphics::CountSnapshotRetry(retry.level, drawHit || hits.partial);
+        if (gpuLock.owns_lock()) gpuLock.unlock();
+        return draw(queue, packet, submission, rejected);
+    };
 
     bool rectListBuilt = false;
 
@@ -389,7 +487,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto baseVertexWord = locate(indirect.baseVertexLocation);
         const auto startInstanceWord = locate(indirect.startInstanceLocation);
         const auto drawIndexWord = indirect.drawIndexEnabled ? locate(indirect.drawIndexLocation) : std::nullopt;
-        for (std::uint32_t record = 0; record < records.size(); ++record) {
+        for (std::uint32_t record = resumeRecord; record < records.size(); ++record) {
             const auto& arguments = records[record];
             if (traceIndirect) std::fprintf(stderr, "[draw]   record %u: count %u instances %u first %u vertexOffset %u startInstance %u\n", record, arguments.count, arguments.instances, arguments.firstVertexOrIndex, arguments.vertexOffset, arguments.firstInstance);
             if (arguments.count == 0 || arguments.instances == 0) continue;
@@ -438,7 +536,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             lockForDraw();
             noteDrawWriters(stages, submission.queue);
             phaseTiming.Phase(DrawRowVectors);
-            localDevice->Draw(graphics, direct, stages, snapshots);
+            if (stale([&] { localDevice->Draw(graphics, direct, stages, snapshots); })) return retryStale(record);
             phaseTiming.Phase(DrawRowGraphics);
         }
         timing.Mark("draw_and_resource_release");
@@ -454,7 +552,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();
     }
     std::shared_ptr<const DrawRecipe> recipe;
-    if (drawHit && !recipeStages.empty()) {
+    // A draw compared with the fast path (APS5_FAST_DRAW_VERIFY) builds its resources: no recipe.
+    if (drawHit && !recipeStages.empty() && !Graphics::ThreadFastVerifyArmed()) {
         recipe = findDrawRecipe(drawKey.key, recipeStages);
         if (recipe == nullptr) VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
     }
@@ -468,7 +567,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     noteDrawWriters(stages, submission.queue);
     phaseTiming.Phase(DrawRowVectors);
     if (recipe != nullptr) {
-        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe) == RecipeOutcome::Recorded) {
+        bool recorded = false;
+        if (stale([&] { recorded = localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe) == RecipeOutcome::Recorded; })) return retryStale(0);
+        if (recorded) {
             phaseTiming.Phase(DrawRowGraphics);
             timing.Mark("draw_and_resource_release");
             return drawn();
@@ -477,7 +578,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);
+    if (stale([&] { localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built); })) return retryStale(0);
     phaseTiming.Phase(DrawRowGraphics);
     if (built != nullptr) attachDrawRecipe(drawKey.key, recipeStages, std::move(built));
     timing.Mark("draw_and_resource_release");

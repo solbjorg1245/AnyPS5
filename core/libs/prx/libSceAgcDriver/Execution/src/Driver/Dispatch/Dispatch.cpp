@@ -64,6 +64,20 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         localDevice->Target(),
         {0, 0, 0, 128}
     };
+    if (fastDispatchEnabled()) {
+        // The group counts the old path dispatches (below), for the fast path's record.
+        std::array<std::uint32_t, 3> groups{packet[1], packet[2], packet[3]};
+        if (indirectArguments == 0 && (packet[4] & 0x20u) != 0) {
+            for (std::uint32_t axis = 0; axis < 3; ++axis) {
+                const auto threads = std::max(readRegister(queue.shader, 0x207 + axis) & 0xffffu, 1u);
+                groups[axis] = (groups[axis] + threads - 1) / threads;
+            }
+        }
+        if (fastDispatch(submission, snapshot, codeOffset, request, memory, localDevice, address, groups, indirectArguments)) {
+            pendingDispatchPhases().outcome = DispatchOutcome::Fast;
+            return;
+        }
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static double captureMs = 0, keyMs = 0, recompileMs = 0, deviceMs = 0;
     static std::uint64_t cacheHits = 0;

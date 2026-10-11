@@ -153,6 +153,11 @@ struct DrawEntryCounters {
     // an entry: the same pipeline state and shaders at a new SRT pointer.
     std::array<std::uint64_t, 6> absentEvicted{};
     std::uint64_t absentNew = 0, absentNewBaseKnown = 0;
+    // APS5_DRAW_ENTRY_RUNS_CHECK: stage variants that compared equal but were passed over because a
+    // deferred flat word of theirs is no longer under a pending GPU write (the stage is captured
+    // again unless a later variant matches), and verified stages whose stored and fresh captures
+    // differ only by deferred words (equal by design: those words are copied per draw).
+    std::uint64_t runsCheckRecaptures = 0, verifyDeferred = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 

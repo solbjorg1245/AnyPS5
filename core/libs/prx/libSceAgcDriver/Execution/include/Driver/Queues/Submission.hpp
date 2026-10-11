@@ -42,6 +42,9 @@ struct QueueWorker {
     std::atomic<std::uint64_t> queued{0};
     std::unordered_map<std::uint64_t, std::uint32_t> unfinishedWrites;
     HostThread thread;
+    // The worker's wake event (PollWakeEvent) while it sleeps between completion reaps, else
+    // nullptr; under Driver::mutex. enqueue signals it, so a submission ends that sleep at once.
+    void* pollWake = nullptr;
 };
 
 }

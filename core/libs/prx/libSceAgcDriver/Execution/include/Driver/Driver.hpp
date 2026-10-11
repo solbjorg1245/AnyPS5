@@ -85,6 +85,9 @@ private:
     // A dispatch lookup tries the front variant's relocation before the stored variants
     // (DispatchLookup.cpp); APS5_NO_RELOCATION_FIRST=1 compares the stored variants first.
     static bool relocationFirst();
+    // The validate path's copy counters and sub-step timers (APS5_PROFILE_DRAW, DispatchLookup.cpp);
+    // APS5_NO_VARIANT_COPY_COUNT=1 leaves them out.
+    static bool variantCopyCount();
     static RelocationVerdict learnRelocation(const DispatchVariant& old, DispatchVariant& fresh, std::uint64_t externalDelta = 0);
     static void traceFailedRelocation(std::uint64_t program, const DispatchVariant& candidate);
     static std::shared_ptr<DispatchVariant> relocateVariant(const DispatchVariant& variant, std::uint64_t& counterUnordered);
@@ -120,9 +123,22 @@ private:
     void relocateByUserPointer(std::uint64_t address, const Submission& submission, std::uint64_t key, std::uint64_t baseKey, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::vector<UserPointerCandidate>& candidates, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::vector<ShaderRecompiler::MemoryRegion>& captured, bool& cached, std::shared_ptr<DispatchVariant>& relocated);
     static bool sameInstance(const DispatchVariant& old, const DispatchVariant& fresh, std::uint64_t delta);
     void dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments = 0);
+    // F5 of the draw fast path (FastDispatch.cpp, docs/design/draw-fastpath.md 2.9; APS5_FAST_DISPATCH=1,
+    // default off): after the HLE checks, the dispatch walked with the direct reader, its variant
+    // populated from the walk, and recorded with push descriptors without capture, dispatch-cache
+    // lookup or ShaderResources. False (a decline, counted on the [fastpath] dispatches line) leaves
+    // the dispatch to the old path; true means it was recorded. APS5_FAST_DISPATCH_VERIFY=1 also
+    // captures each one as the old path would (dry) and declines on any difference.
+    static bool fastDispatchEnabled();
+    static bool fastDispatchVerify();
+    bool fastDispatch(const Submission& submission, const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<VulkanDevice>& localDevice, std::uint64_t address, const std::array<std::uint32_t, 3>& groups, std::uint64_t indirectArguments);
     void verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffset, std::uint64_t deviceSerial, ShaderRecompiler::RecompileRequest request, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint64_t address, const DispatchVariant& variant, std::span<const std::uint32_t> liveWords, const ShaderRecompiler::RecompileResult& patched);
     static bool drawEntries();
     static bool verifyDrawEntries();
+    // APS5_DRAW_ENTRY_RUNS_CHECK=1 (DrawLookup.cpp): a stage variant captured with flat words left
+    // to the GPU misses once none of them is under a pending GPU write any more, and the verify
+    // modes count a difference made only of such words apart (DrawCapture.cpp). Off by default.
+    static bool drawEntryRunsCheck();
     static bool registerKeyEnabled();
     static bool verifyDrawRecipe();
     static std::size_t drawCacheEntries();
@@ -146,6 +162,29 @@ private:
     void cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const DrawStageHits& hits, std::vector<std::shared_ptr<DispatchVariant>>& fresh, const DrawKey& drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, DrawRelocation* relocation);
     static bool drawPrecheck();
     std::optional<DrawVerdict> precheckDraw(const QueueState& queue, const Submission& submission, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect);
+    std::optional<DrawVerdict> precheckRegisters(const QueueState& queue, bool indexed, std::uint32_t indexSize, std::string& rejected);
+    // The draw state key and its memo (APS5_FAST_STATE, FastState.cpp): the precheck verdict, the
+    // draw key from the state key and the live user words, and the decode of a key without an entry.
+    static bool fastState();
+    static bool fastStateVerify();
+    FastStateEntry& fastStateEntry(const QueueState& queue, const Submission& submission);
+    std::optional<DrawVerdict> fastPrecheckRegisters(const QueueState& queue, const Submission& submission, const Pm4::DrawParameters& drawParameters, std::string& rejected);
+    DrawKey fastDrawKey(const QueueState& queue, const Submission& submission, std::uint64_t deviceSerial);
+    std::shared_ptr<const DrawDecode> fastDrawDecode(const QueueState& queue, const Submission& submission);
+    // fastDrawDecode for the state entry fastStateEntry already found (one lookup per draw).
+    std::shared_ptr<const DrawDecode> fastDrawDecodeFor(FastStateEntry& entry, const QueueState& queue, const Submission& submission);
+    // fastDrawDecode for a caller that keeps nothing of the decode past the draw (the fast draw):
+    // the state's template with the live user words is copied into `scratch` in place (its vectors
+    // keep their storage) instead of into a new shared object; a state's first decode, which
+    // becomes the template, comes back through `held` as fastDrawDecode returns it.
+    // APS5_NO_DECODE_REUSE=1: always fastDrawDecode.
+    const DrawDecode& fastDrawDecodeInto(const QueueState& queue, const Submission& submission, DrawDecode& scratch, std::shared_ptr<const DrawDecode>& held);
+    // The draw fast path (APS5_FAST_DRAW, FastDraw.cpp, draw-fastpath.md F3b): the draw's verdict
+    // when the fast path took it (Drawn, or Rejected by a known validation failure), nullopt when it
+    // declined and Driver::draw goes on with the packet (nothing recorded). `retrying` (a snapshot
+    // retry or the locked prepare) and `debugMode` (a probe or dump) decline at once.
+    std::optional<DrawVerdict> fastDraw(QueueState& queue, const Submission& submission, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool traceIndirect, bool retrying, bool debugMode, DrawPhaseTiming& phaseTiming);
+    static void reportFastState();
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);
     std::optional<Graphics::IndirectDrawPath> classifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect);
     DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected);
@@ -180,6 +219,9 @@ private:
     static void countIndirect(int path, double readMs);
     void dispatchIndirect(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission);
     static bool& sampledRead();
+    // Set while a draw packet runs again after a SnapshotStale (Draw.cpp): queryPendingWrite answers
+    // Sync for every word a recorded write still covers, so the capture waits for the writer.
+    static bool& forcedSyncReads();
     static bool writeEvidenceEnabled();
     static bool writerKeyedEvidence();
     static bool foreignWriters();
@@ -199,8 +241,15 @@ private:
     void observeRange(std::uint64_t address, std::span<const std::byte> before);
     static void observePendingWrite(std::uint64_t address, bool unchanged, std::uint32_t value);
     static bool knownValueCurrent(const WrittenBuffer& writer);
-    ShaderMemory::PendingWrite classifyPendingWrite(std::uint64_t address, std::size_t bytes, std::uint64_t ValidateCounters::*& reason, const PendingView& pending, std::span<std::byte> known = {});
+    // `writers`: the newest writer is looked up through these memos (the fast reader's query)
+    // instead of the plain ring scan; the answer is the same.
+    ShaderMemory::PendingWrite classifyPendingWrite(std::uint64_t address, std::size_t bytes, std::uint64_t ValidateCounters::*& reason, const PendingView& pending, std::span<std::byte> known = {}, NewestWriterMemos* writers = nullptr);
     static ShaderMemory::PendingWrite queryPendingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known);
+    // The fast reader's query (FastPendingQuery, installed by the constructor; FastRead.cpp): the
+    // answer queryPendingWrite gives for the 4-byte word at `address`, classified over `view` (the
+    // reader's pending snapshot) with this thread's newest-writer memos, and for a KnownValue
+    // whose writer's range holds as a whole, that range (FastPendingAnswer).
+    static void fastPendingWord(std::uint64_t address, const PendingView& view, FastPendingAnswer& answer);
     template<typename TVisit>
     static void forEachWrittenBuffer(const ShaderRecompiler::RecompileResult& compiled, TVisit&& visit);
     void noteWrittenBuffers(std::uint64_t program, std::uint32_t queue, const ShaderRecompiler::RecompileResult& compiled);
@@ -208,6 +257,7 @@ private:
     void noteDrawWriters(std::span<const Graphics::CompiledShader> stages, std::uint32_t queue);
     std::optional<WrittenBuffer> newestWriterLocked(std::uint64_t begin, std::uint64_t end) const;
     std::optional<WrittenBuffer> newestWriter(std::uint64_t begin, std::uint64_t end);
+    std::optional<WrittenBuffer> newestWriterMemoized(std::uint64_t begin, std::uint64_t end, NewestWriterMemos& memos);
     std::string describeWriters(std::uint64_t begin, std::uint64_t end);
     static std::string describeSelf(const ShaderRecompiler::RecompileResult& compiled, std::uint64_t begin, std::uint64_t end);
     static bool traceBudget();

@@ -213,6 +213,8 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             // Per stage, the live words of the leaves a data hit refreshed (validateVariant).
             std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> liveData(programs.size());
             const bool dataAllowed = dataHits() && !verifyDrawEntries();
+            const bool runsCheck = drawEntryRunsCheck();
+            std::uint64_t runsLapsed = 0;
             std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0;
             std::uint64_t relocatedStages = 0, relocatedInPlace = 0, relocationNoRule = 0, relocationDiffering = 0, relocationUnordered = 0;
             double compareUs = 0, patchUs = 0;
@@ -262,6 +264,18 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         const auto waitedAtCompare = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
                         auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
                         if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
+                        // APS5_DRAW_ENTRY_RUNS_CHECK: a variant captured with flat words left to the GPU
+                        // relies on runs without them; once no pending GPU write overlaps one of
+                        // them, a capture of this draw reads it into one more run, so the variant
+                        // differs and the stage is captured again (a later variant may still match).
+                        if (runsCheck && stored->deferredFlat && (result == EntryOutcome::Equal || result == EntryOutcome::EqualData)) {
+                            PendingView pending;
+                            pending.Load();
+                            if (DeferredWordLapsed(variant->compiled->bindings, [&](std::uint64_t address, std::size_t bytes) { return pending.Overlaps(address, bytes); })) {
+                                result = EntryOutcome::Differing;
+                                ++runsLapsed;
+                            }
+                        }
                         if (profile) {
                             // Without the GPU waits inside (the phase books them as "validate GPU wait").
                             compareUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - compareStart).count() - (Graphics::Recorder::ThreadWaitedMs() - waitedAtCompare) * 1000.0;
@@ -377,6 +391,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             counters.variantsCompared += compared;
             counters.compareUs += compareUs;
             counters.compareCalls += compareCalls;
+            counters.runsCheckRecaptures += runsLapsed;
             counters.patchUs += patchUs;
             counters.patchedMade += patchedMade;
             counters.patchedReused += patchedReused;

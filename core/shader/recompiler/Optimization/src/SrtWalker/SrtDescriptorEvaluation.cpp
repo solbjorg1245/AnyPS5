@@ -37,6 +37,13 @@ bool Fail(std::string reason) {
     return false;
 }
 
+// A fixed reason (the fast walk's declines, every draw that meets a pending block): assigned into
+// the thread's string, no allocation once it has the capacity.
+bool Fail(const char* reason) {
+    failureReason().assign(reason);
+    return false;
+}
+
 const DescriptorSource* Source(const IrResourcePlan& program, std::uint32_t source) {
     if (source >= program.descriptorSources.size()) {
         return nullptr;
@@ -158,15 +165,24 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
     const bool standard = runtime.walk != nullptr && runtime.expressRead != nullptr && evaluateFlat && runtime.readMemory == runtime.readSpecializationMemory && sources.data() == program.materializationSources.data() && sources.size() == program.materializationSources.size() && cleanFlatSlots.data() == program.cleanFlatSlots.data() && cleanFlatSlots.size() == program.cleanFlatSlots.size();
     if (!standard) {
         NoteWalkOutcome(WalkOutcome::NoProgram);
+        if (runtime.expressOnly) return Fail("the express walk does not cover this evaluation");
         return evaluateInterpreted(program, sources, runtime, results, flat, evaluateFlat, cleanFlatSlots, activeSources);
     }
     static const bool verify = std::getenv("APS5_VERIFY_EXPRESS") != nullptr;
-    std::vector<DescriptorValue> expressResults;
-    std::vector<std::uint32_t> expressFlat;
-    std::vector<std::uint8_t> expressActive;
     SrtRuntime express = runtime;
     // Under verification the interpreter's walk alone traces the reads.
     if (verify) express.readTrace = nullptr;
+    // The fast walk (expressOnly) neither falls back nor verifies (the interpreter reading through
+    // its declining reader could fail where the express walk ran, which aborts): the walk writes
+    // the outputs in place, the caller's per-thread vectors keeping their capacity; a walk that
+    // does not complete leaves them unspecified.
+    if (runtime.expressOnly) {
+        if (ExecuteWalkProgram(*runtime.walk, program, express, results, flat, activeSources) != WalkOutcome::Ran) return Fail("the express walk did not complete");
+        return true;
+    }
+    std::vector<DescriptorValue> expressResults;
+    std::vector<std::uint32_t> expressFlat;
+    std::vector<std::uint8_t> expressActive;
     if (ExecuteWalkProgram(*runtime.walk, program, express, expressResults, expressFlat, expressActive) != WalkOutcome::Ran) {
         return evaluateInterpreted(program, sources, runtime, results, flat, evaluateFlat, cleanFlatSlots, activeSources);
     }

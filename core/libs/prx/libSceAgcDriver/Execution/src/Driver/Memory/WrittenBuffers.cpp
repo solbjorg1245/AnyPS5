@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
+#include <algorithm>
 
 namespace AgcDriver::DriverDetail {
 
@@ -20,11 +21,17 @@ void Driver::forEachWrittenBuffer(const ShaderRecompiler::RecompileResult& compi
     }
 }
 
+std::atomic<std::uint64_t>& WrittenBufferPushes() {
+    static std::atomic<std::uint64_t> pushes{0};
+    return pushes;
+}
+
 void Driver::noteWrittenBuffers(std::uint64_t program, std::uint32_t queue, const ShaderRecompiler::RecompileResult& compiled) {
     std::lock_guard lock(writtenBuffersMutex);
     const auto serial = ++writtenBufferSerial;
     forEachWrittenBuffer(compiled, [&](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool atomic) {
         writtenBuffers.push_back({program, begin, end, serial, queue, atomic});
+        WrittenBufferPushes().fetch_add(1, std::memory_order_release);
     });
     while (writtenBuffers.size() > WrittenBufferRing) writtenBuffers.pop_front();
 }
@@ -33,6 +40,7 @@ void Driver::noteForeignWriter(std::uint64_t begin, std::uint64_t end, std::uint
     if (!foreignWriters() || !(writeEvidenceEnabled() || traceCapSync()) || end <= begin) return;
     std::lock_guard lock(writtenBuffersMutex);
     writtenBuffers.push_back({0, begin, end, ++writtenBufferSerial, queue, false});
+    WrittenBufferPushes().fetch_add(1, std::memory_order_release);
     while (writtenBuffers.size() > WrittenBufferRing) writtenBuffers.pop_front();
 }
 
@@ -52,6 +60,62 @@ std::optional<WrittenBuffer> Driver::newestWriterLocked(std::uint64_t begin, std
 std::optional<WrittenBuffer> Driver::newestWriter(std::uint64_t begin, std::uint64_t end) {
     std::lock_guard lock(writtenBuffersMutex);
     return newestWriterLocked(begin, end);
+}
+
+std::optional<WrittenBuffer> Driver::newestWriterMemoized(std::uint64_t begin, std::uint64_t end, NewestWriterMemos& memos) {
+    std::lock_guard lock(writtenBuffersMutex);
+    return memos.Lookup(writtenBuffers, WrittenBufferPushes().load(std::memory_order_relaxed), begin, end);
+}
+
+std::optional<WrittenBuffer> NewestWriterMemos::Lookup(const std::deque<WrittenBuffer>& ring, std::uint64_t pushes, std::uint64_t begin, std::uint64_t end) {
+    for (auto& memo : entries) {
+        if (memo.wholeRange && begin < end && memo.writer.begin <= begin && end <= memo.writer.end && memo.Holds(ring, pushes)) {
+            last = &memo;
+            return memo.writer;
+        }
+    }
+    auto& slot = entries[next];
+    next = (next + 1) % entries.size();
+    auto found = slot.Lookup(ring, pushes, begin, end);
+    last = found ? &slot : nullptr;
+    return found;
+}
+
+bool NewestWriterMemo::Holds(const std::deque<WrittenBuffer>& ring, std::uint64_t pushes) {
+    // The ring holds the pushes (pushes - size, pushes]: the writer left it, or the count went
+    // back (another ring), and newestWriterLocked would no longer find it.
+    if (!wholeRange || pushes < checked || pushed > pushes || pushes - pushed >= ring.size()) {
+        wholeRange = false;
+        return false;
+    }
+    const auto fresh = static_cast<std::size_t>(pushes - checked);
+    for (auto it = ring.rbegin(); it != ring.rbegin() + static_cast<std::ptrdiff_t>(fresh); ++it) {
+        if (writer.begin < it->end && it->begin < writer.end) {
+            wholeRange = false;
+            return false;
+        }
+    }
+    checked = pushes;
+    return true;
+}
+
+std::optional<WrittenBuffer> NewestWriterMemo::Lookup(const std::deque<WrittenBuffer>& ring, std::uint64_t pushes, std::uint64_t begin, std::uint64_t end) {
+    // A range inside the writer's, which no entry newer than the writer overlaps: the newest entry
+    // overlapping the range is the writer itself.
+    if (wholeRange && begin < end && writer.begin <= begin && end <= writer.end && Holds(ring, pushes)) return writer;
+    wholeRange = false;
+    std::size_t newer = 0;
+    for (auto it = ring.rbegin(); it != ring.rend(); ++it, ++newer) {
+        if (!(begin < it->end && it->begin < end)) continue;
+        writer = *it;
+        pushed = pushes - newer;
+        checked = pushes;
+        // The entries newer than the writer (scanned above, none overlapping the range) against
+        // the writer's whole range.
+        wholeRange = std::none_of(ring.rbegin(), it, [&](const WrittenBuffer& entry) { return writer.begin < entry.end && entry.begin < writer.end; });
+        return writer;
+    }
+    return std::nullopt;
 }
 
 std::string Driver::describeWriters(std::uint64_t begin, std::uint64_t end) {

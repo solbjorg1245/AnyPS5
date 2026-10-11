@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBC_INCLUDE_GUESTARENA_HPP
 #define CORE_LIBS_PRX_LIBC_INCLUDE_GUESTARENA_HPP
 
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include <cstddef>
 #include <cstdint>
 
@@ -22,12 +23,21 @@ bool GuestArenaWriteWatched_nid_postfix();
 #ifdef _WIN32
 void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint32_t protection);
 bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address);
+void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes);
+void GuestArenaUnpinWritable_nid_postfix(const void* pointer, std::size_t bytes);
 bool GuestArenaProtection_nid_postfix(std::uintptr_t address, std::uint32_t* protection);
 bool GuestArenaCollectWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear);
 // Debug aid: the page's shared-view and clean/fresh range state (WindowsMappings::Describe).
 void GuestArenaDescribePage_nid_postfix(std::uintptr_t address, char* text, std::size_t size);
+// The same without waiting (the crash report): false while the mappings are busy.
+bool GuestArenaTryDescribePage_nid_postfix(std::uintptr_t address, char* text, std::size_t size);
 // Bumped by every commit over a placeholder, shared map and release of guest memory.
 std::uint64_t GuestArenaMappingSerial_nid_postfix();
+// Fine (4 KiB) write tracking for the shared views over the range (WindowsMappings::TrackParts);
+// returns the 16 KiB view pages made fine.
+std::size_t GuestArenaTrackWriteParts_nid_postfix(std::uintptr_t address, std::size_t bytes);
+// The same for the view pages [begin, end) covers only in part (WindowsMappings::TrackEdgeParts).
+std::size_t GuestArenaTrackEdgeWriteParts_nid_postfix(std::uintptr_t begin, std::uintptr_t end);
 bool GuestArenaHostRegionOverlaps_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_t protection, std::size_t granule);
 void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes);
@@ -43,9 +53,12 @@ void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 
 }
 
+// A host write into guest memory (file reads): resident buffers' guards over the range land first
+// and none is taken there until the write ended (`hold`), since the host's write fails on a guarded
+// page instead of faulting.
 class HostWrite {
 public:
-    HostWrite(void* pointer, std::size_t bytes) : pointer(pointer), bytes(bytes), open(GuestArenaBeginHostWrite_nid_postfix(pointer, bytes)) {}
+    HostWrite(void* pointer, std::size_t bytes) : hold(pointer, bytes), pointer(pointer), bytes(bytes), open(GuestArenaBeginHostWrite_nid_postfix(pointer, bytes)) {}
     ~HostWrite() {
         if (open) GuestArenaEndHostWrite_nid_postfix(pointer, bytes);
     }
@@ -54,6 +67,7 @@ public:
     bool Open() const { return open; }
 
 private:
+    GuestWriteWatch::PageGuardHold hold;
     void* pointer;
     std::size_t bytes;
     bool open;

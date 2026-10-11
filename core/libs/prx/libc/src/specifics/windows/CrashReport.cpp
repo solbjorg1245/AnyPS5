@@ -1,5 +1,6 @@
 #ifdef _WIN32
 #include <windows.h>
+#include "prx/libc/include/CrashResources.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include <atomic>
 #include <chrono>
@@ -26,6 +27,15 @@ void Report(const char* format, ...) {
     if (length > static_cast<int>(sizeof(buffer)) - 1) length = sizeof(buffer) - 1;
     DWORD written = 0;
     WriteFile(GetStdHandle(STD_ERROR_HANDLE), buffer, static_cast<DWORD>(length), &written, nullptr);
+}
+
+// The GPU driver's describer of the guest addresses a FATAL dumped (CrashResources.hpp), and whether
+// this thread runs it (a fault inside it ends the report instead of waiting on itself).
+std::atomic<CrashResources::Describer> g_resourceDescriber{nullptr};
+thread_local bool t_describingResources = false;
+
+void PrintRaw(const char* text) {
+    Report("%s", text);
 }
 
 void DescribeAddress(std::uint64_t address, char* buffer, std::size_t size) {
@@ -322,7 +332,13 @@ LONG WINAPI ReportUncaught(EXCEPTION_POINTERS* info) {
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
     const auto* fault = info->ExceptionRecord;
-    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
+    const bool guestWrite = fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1;
+    // A write into the watched page (APS5_WATCH_ADDR) on a shared view the driver's write tracking
+    // armed is a tracked write as well: the tracking takes it first (its stamp is what the driver's
+    // write-backs read), then the watch reports and single-steps it. The tracking used to consume
+    // such a fault, so the watch never fired on those pages.
+    const bool watchedWrite = guestWrite && g_watchPage != 0 && fault->ExceptionInformation[1] >= g_watchPage && fault->ExceptionInformation[1] < g_watchPage + 0x1000;
+    if (guestWrite && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1]) && !watchedWrite) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleSse4a(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleDebugBreak(info)) return EXCEPTION_CONTINUE_EXECUTION;
@@ -332,6 +348,11 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static const bool traceThrows = GetEnvironmentVariableA("APS5_TRACE_THROWS", nullptr, 0) != 0;
     if (traceThrows && record->ExceptionCode == GccCxxException) ReportCxxException(info, "[throw]");
     if (!IsFatal(record->ExceptionCode)) return EXCEPTION_CONTINUE_SEARCH;
+    if (t_describingResources) {
+        Report("  fault 0x%08lx inside the resource report at rip 0x%llx: report ends here\n", record->ExceptionCode, static_cast<unsigned long long>(info->ContextRecord->Rip));
+        std::fflush(stderr);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     if (reported.exchange(true)) {
         // Another thread is already reporting; let it finish before this fault ends the process.
         Sleep(INFINITE);
@@ -362,6 +383,12 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     Report("  rsi %016llx rdi %016llx rbp %016llx rsp %016llx\n", context->Rsi, context->Rdi, context->Rbp, context->Rsp);
     Report("  r8  %016llx r9  %016llx r10 %016llx r11 %016llx\n", context->R8, context->R9, context->R10, context->R11);
     Report("  r12 %016llx r13 %016llx r14 %016llx r15 %016llx\n", context->R12, context->R13, context->R14, context->R15);
+    // The guest addresses for the driver's resource report below: the fault address, the registers
+    // and the words they point at.
+    std::uint64_t described[1 + 16 + 10 * 8];
+    std::size_t describedCount = 0;
+    if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) described[describedCount++] = record->ExceptionInformation[1];
+    for (const auto value : {context->Rax, context->Rbx, context->Rcx, context->Rdx, context->Rsi, context->Rdi, context->Rbp, context->Rsp, context->R8, context->R9, context->R10, context->R11, context->R12, context->R13, context->R14, context->R15}) described[describedCount++] = value;
     // The words each register points at, to recognise which structure a bad pointer came from.
     {
         const std::pair<const char*, std::uint64_t> pointers[] = {{"rax", context->Rax}, {"rbx", context->Rbx}, {"rcx", context->Rcx}, {"rdx", context->Rdx}, {"rsi", context->Rsi}, {"rdi", context->Rdi}, {"r12", context->R12}, {"r13", context->R13}, {"r14", context->R14}, {"r15", context->R15}};
@@ -369,7 +396,15 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
             if (value < 0x10000 || (value & 7) != 0 || !IsReadable(value) || !IsReadable(value + 0x38)) continue;
             const auto* words = reinterpret_cast<const std::uint64_t*>(value);
             Report("  [%s] %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n", name, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+            for (int word = 0; word < 8; ++word) described[describedCount++] = words[word];
         }
+    }
+    // APS5_CRASH_RESOURCES=1: the GPU driver names what it tracks over those addresses (its resources
+    // and its recent stores into guest memory).
+    if (const auto describer = g_resourceDescriber.load(std::memory_order_acquire)) {
+        t_describingResources = true;
+        describer(described, describedCount, &PrintRaw);
+        t_describingResources = false;
     }
     Report("  frame pointer chain:\n");
     std::uint64_t frame = context->Rbp;
@@ -484,5 +519,9 @@ const bool g_crashReportInstalled = [] {
     return true;
 }();
 
+}
+
+void CrashResources::CrashResourcesSetDescriber_nid_postfix(Describer describer) {
+    g_resourceDescriber.store(describer, std::memory_order_release);
 }
 #endif

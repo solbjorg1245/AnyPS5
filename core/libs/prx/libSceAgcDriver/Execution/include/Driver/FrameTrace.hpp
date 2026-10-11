@@ -32,6 +32,10 @@ Entry Record(const std::string& line);
 // while a trace runs; the dispatch's trace line takes them (TakeWrites).
 void NoteWrites(const std::string& text);
 std::string TakeWrites();
+// Whether uses note their writes: while a trace runs, or while another reader of the notes asks
+// for them (SetNoting: APS5_PASS_DUMP's frame, see PassDump.hpp).
+bool Noting();
+void SetNoting(bool noting);
 // "buffer <address hex> <bytes hex>" lines of after.txt: guest memory ranges saved with every dump
 // as <prefix>buffer_<address>.bin (after the drain, so GPU writes to host imports have landed).
 std::vector<std::pair<std::uint64_t, std::uint64_t>> DumpBuffers();

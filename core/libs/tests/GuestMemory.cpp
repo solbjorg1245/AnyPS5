@@ -3,6 +3,7 @@
 #include "prx/libc/include/GuestHeap.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libc/include/CommitBudget.hpp"
 #include "prx/libkernel/File/include/FileFlags.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include <array>
@@ -26,6 +27,9 @@
 #include <string>
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
+#ifdef _WIN32
+#include <windows.h>
 #endif
 
 extern "C" {
@@ -163,6 +167,29 @@ static void CheckDirectMemoryFollowsPhysicalPages() {
     Require(sceKernelReleaseDirectMemory(again, page * 2) == 0);
 }
 
+static void CheckReleaseDirectMemoryClearsMappings() {
+    constexpr std::size_t page = 0x4000;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * 2, 0, 0, &phys) == 0);
+    void* mapped = nullptr;
+    Require(sceKernelMapDirectMemory(&mapped, page * 2, 3, 0, phys, 0) == 0);
+    VirtualQueryInfo before{};
+    Require(sceKernelVirtualQuery(mapped, 0, &before, sizeof(before)) == 0);
+    Require(before.is_direct && before.offset == static_cast<std::uint64_t>(phys));
+    Require(sceKernelReleaseDirectMemory(phys + page, page) == 0);
+    VirtualQueryInfo split{};
+    Require(sceKernelVirtualQuery(mapped, 0, &split, sizeof(split)) == 0);
+    Require(split.is_direct && split.offset == static_cast<std::uint64_t>(phys));
+    VirtualQueryInfo dropped{};
+    Require(sceKernelVirtualQuery(static_cast<unsigned char*>(mapped) + page, 0, &dropped, sizeof(dropped)) == 0);
+    Require(!dropped.is_direct && dropped.offset == 0);
+    Require(sceKernelReleaseDirectMemory(phys, page) == 0);
+    VirtualQueryInfo cleared{};
+    Require(sceKernelVirtualQuery(mapped, 0, &cleared, sizeof(cleared)) == 0);
+    Require(!cleared.is_direct && cleared.offset == 0);
+    Require(sceKernelMunmap(mapped, page * 2) == 0);
+}
+
 static void CheckFixedVirtualReservation() {
     constexpr std::size_t page = 0x4000;
     void* probe = nullptr;
@@ -178,6 +205,29 @@ static void CheckFixedVirtualReservation() {
     Require(pooled == requested);
     Require(sceKernelMunmap(pooled, page * 2) == 0);
 }
+
+#ifdef _WIN32
+static void CheckNoOverwriteRejectsHostOccupiedMapping() {
+    constexpr std::size_t page = 0x4000;
+    void* reservation = nullptr;
+    Require(sceKernelReserveVirtualRange(&reservation, page * 4, 0, 0) == 0);
+    Require(sceKernelMunmap(reservation, page * 4) == 0);
+    void* target = static_cast<unsigned char*>(reservation) + page;
+    GuestArena::GuestArenaCommit_nid_postfix(target, page, PAGE_READWRITE, page);
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page, 0, 0, &phys) == 0);
+    void* fixed = target;
+    bool rejected = false;
+    try {
+        rejected = sceKernelMapDirectMemory(&fixed, page, 3, 0x90, phys, 0) != 0;
+    } catch (const std::exception&) {
+        rejected = true;
+    }
+    Require(rejected);
+    GuestArena::GuestArenaReset_nid_postfix(target, page);
+    Require(sceKernelReleaseDirectMemory(phys, page) == 0);
+}
+#endif
 
 static void CheckSharedDirectMemoryLifecycle() {
     constexpr std::size_t page = 0x4000;
@@ -613,14 +663,70 @@ static void CheckDirectMemoryWriteWatch() {
 }
 #endif
 
+static void CheckCommitBudgetScale() {
+    Require(CommitBudget::Scale(4096, 0) == 4096);
+    Require(CommitBudget::Scale(4096, 65 * 1024) == 4096);
+    Require(CommitBudget::Scale(4096, 48 * 1024) == 4096);
+    Require(CommitBudget::Scale(4096, 36 * 1024) == 2048);
+    Require(CommitBudget::Scale(4096, 28 * 1024) == 2048);
+    Require(CommitBudget::Scale(16384, 20 * 1024) == 4096);
+    Require(CommitBudget::LimitMiB() > 0);
+}
+
+#ifdef _WIN32
+static std::uint64_t SystemCommitBytes() {
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    Require(GlobalMemoryStatusEx(&status) != 0);
+    return status.ullTotalPageFile - status.ullAvailPageFile;
+}
+
+// With SEC_RESERVE (APS5_NO_SEC_RESERVE unset) allocating direct memory charges no system commit;
+// mapping commits the mapped 64 KiB chunks, and every later view of those pages sees them committed
+// and holding what was written through the first.
+static void CheckDirectMemoryCommitsOnMap() {
+    constexpr std::size_t page = 0x4000;
+    constexpr std::size_t bytes = std::size_t{2} << 30;
+    const auto before = SystemCommitBytes();
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, 0, 0, &phys) == 0);
+    if (std::getenv("APS5_NO_SEC_RESERVE") == nullptr) Require(SystemCommitBytes() < before + bytes / 2);
+    void* first = nullptr;
+    Require(sceKernelMapDirectMemory(&first, page, 3, 0, phys + page * 5, 0) == 0);
+    MEMORY_BASIC_INFORMATION memory{};
+    Require(VirtualQuery(first, &memory, sizeof(memory)) == sizeof(memory) && memory.State == MEM_COMMIT);
+    auto* firstBytes = static_cast<volatile unsigned char*>(first);
+    Require(firstBytes[0] == 0);
+    firstBytes[7] = 91;
+    void* second = nullptr;
+    Require(sceKernelMapDirectMemory(&second, page * 8, 3, 0, phys, 0) == 0);
+    Require(VirtualQuery(second, &memory, sizeof(memory)) == sizeof(memory) && memory.State == MEM_COMMIT);
+    auto* secondBytes = static_cast<volatile unsigned char*>(second);
+    Require(secondBytes[page * 5 + 7] == 91 && secondBytes[0] == 0);
+    secondBytes[page * 7 + 3] = 5;
+    Require(secondBytes[page * 7 + 3] == 5);
+    Require(sceKernelMunmap(second, page * 8) == 0);
+    Require(sceKernelMunmap(first, page) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, bytes) == 0);
+}
+#endif
+
 int main() {
+    CheckCommitBudgetScale();
+#ifdef _WIN32
+    CheckDirectMemoryCommitsOnMap();
+#endif
     CheckNamedAndHintedMappings();
     CheckInternalNamedFlexibleMapping();
     CheckDirectMemoryFollowsPhysicalPages();
+    CheckReleaseDirectMemoryClearsMappings();
     CheckFixedVirtualReservation();
     CheckSharedDirectMemoryLifecycle();
     CheckReservedHolesAreUncommitted();
     CheckHeapAfterMappingReuse();
+#ifdef _WIN32
+    CheckNoOverwriteRejectsHostOccupiedMapping();
+#endif
     CheckSharedWriteTracking();
     CheckPlaceholderCollect();
     CheckReadsIntoSharedWriteTracking();

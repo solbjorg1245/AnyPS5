@@ -37,6 +37,8 @@ PacketTimer::~PacketTimer() {
     const auto suspendUs = suspends != 0 ? static_cast<double>(costs.suspendNs.exchange(0)) / 1000.0 / static_cast<double>(suspends) : 0.0;
     std::string outcomes;
     for (std::size_t i = 0; i < profile.dispatchOutcomes.size(); ++i) {
+        // The fast dispatch's row only once it took one: with APS5_FAST_DISPATCH off the line reads as before.
+        if (i == static_cast<std::size_t>(DispatchOutcome::Fast) && profile.dispatchOutcomes[i].first == 0) continue;
         char text[64];
         std::snprintf(text, sizeof(text), " %s %llu %.0fms", DispatchOutcomeNames[i], static_cast<unsigned long long>(profile.dispatchOutcomes[i].first), profile.dispatchOutcomes[i].second);
         outcomes += text;

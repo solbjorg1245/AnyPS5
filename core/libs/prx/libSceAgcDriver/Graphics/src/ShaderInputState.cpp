@@ -59,6 +59,37 @@ template <typename T> void _readHeaderArray(std::span<const std::byte> header, s
     std::memcpy(destination, header.data() + offset, bytes);
 }
 
+// One input semantic's resource from its attribute word and V#: the word's format and offset are
+// applied to the V# (DecodeVertexStageInfo and ResolveVertexFetch).
+void applyVertexAttribute(ShaderRecompiler::ShaderVertexStageInfo& info, std::int32_t hardwareMapping, std::int32_t sizeInElements, std::uint32_t semantic, std::uint32_t attribWord, const std::array<std::uint32_t, 4>& sharp) {
+    const auto format = (attribWord >> 5u) & 0x1ffu;
+    const auto offset = (attribWord >> 14u) & 0xfffu;
+    const auto fetchIndex = (attribWord >> 26u) & 0x1u;
+    if (info.resourcesNum >= ShaderRecompiler::ShaderVertexStageInfo::MaxResources) throw std::runtime_error("AGC graphics: vertex resource count exceeds the supported domain");
+    auto& resource = info.resources[info.resourcesNum];
+    auto& destination = info.resourcesDst[info.resourcesNum];
+    resource.fields = sharp;
+    destination.registerStart = hardwareMapping;
+    destination.registersNum = sizeInElements;
+    destination.attrId = static_cast<std::int32_t>(semantic);
+    destination.fetchIndex = fetchIndex;
+    if (format != 0u) {
+        const auto bufferFormat = format >> 2u;
+        const auto channels = (format & 0x3u) + 1u;
+        const auto dstSelY = channels > 1u ? 5u : 0u;
+        const auto dstSelZ = channels > 2u ? 6u : 0u;
+        const auto dstSelW = channels > 3u ? 7u : 1u;
+        const auto dstSel = 4u | (dstSelY << 3u) | (dstSelZ << 6u) | (dstSelW << 9u);
+        resource.fields[3] = (resource.fields[3] & ~((0x7fu << 12u) | 0xfffu)) | (bufferFormat << 12u) | dstSel;
+    }
+    if (offset != 0u) {
+        const auto base = ((static_cast<std::uint64_t>(resource.fields[0]) | (static_cast<std::uint64_t>(resource.fields[1]) << 32u)) & 0xffffffffffffull) + offset;
+        resource.fields[0] = static_cast<std::uint32_t>(base & 0xffffffffu);
+        resource.fields[1] = (resource.fields[1] & 0xffff0000u) | static_cast<std::uint32_t>((base >> 32u) & 0xffffu);
+    }
+    ++info.resourcesNum;
+}
+
 }
 
 ShaderRecompiler::ShaderComputeStageInfo DecodeComputeStageInfo(const Registers& shader) {
@@ -194,9 +225,6 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const st
         std::uint32_t attribWord;
         std::memcpy(&attribWord, attribWordBytes.data(), 4);
         const auto index = attribWord & 0x1fu;
-        const auto format = (attribWord >> 5u) & 0x1ffu;
-        const auto offset = (attribWord >> 14u) & 0xfffu;
-        const auto fetchIndex = (attribWord >> 26u) & 0x1u;
         if (index >= ShaderRecompiler::ShaderVertexStageInfo::MaxResources) throw std::runtime_error("AGC graphics: vertex buffer index exceeds the supported domain");
         std::array<std::byte, 16> sharpBytes{};
         const auto sharpAddress = bufferTableAddr + static_cast<std::uint64_t>(index) * 16u;
@@ -204,31 +232,72 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const st
         if (reads != nullptr) reads->push_back({sharpAddress, {sharpBytes.begin(), sharpBytes.end()}});
         std::array<std::uint32_t, 4> sharp{};
         std::memcpy(sharp.data(), sharpBytes.data(), 16);
-        if (info.resourcesNum >= ShaderRecompiler::ShaderVertexStageInfo::MaxResources) throw std::runtime_error("AGC graphics: vertex resource count exceeds the supported domain");
-        auto& resource = info.resources[info.resourcesNum];
-        auto& destination = info.resourcesDst[info.resourcesNum];
-        resource.fields = sharp;
-        destination.registerStart = static_cast<std::int32_t>(semantic.hardware_mapping);
-        destination.registersNum = static_cast<std::int32_t>(semantic.size_in_elements);
-        destination.attrId = static_cast<std::int32_t>(semantic.semantic);
-        destination.fetchIndex = fetchIndex;
-        if (format != 0u) {
-            const auto bufferFormat = format >> 2u;
-            const auto channels = (format & 0x3u) + 1u;
-            const auto dstSelY = channels > 1u ? 5u : 0u;
-            const auto dstSelZ = channels > 2u ? 6u : 0u;
-            const auto dstSelW = channels > 3u ? 7u : 1u;
-            const auto dstSel = 4u | (dstSelY << 3u) | (dstSelZ << 6u) | (dstSelW << 9u);
-            resource.fields[3] = (resource.fields[3] & ~((0x7fu << 12u) | 0xfffu)) | (bufferFormat << 12u) | dstSel;
-        }
-        if (offset != 0u) {
-            const auto base = ((static_cast<std::uint64_t>(resource.fields[0]) | (static_cast<std::uint64_t>(resource.fields[1]) << 32u)) & 0xffffffffffffull) + offset;
-            resource.fields[0] = static_cast<std::uint32_t>(base & 0xffffffffu);
-            resource.fields[1] = (resource.fields[1] & 0xffff0000u) | static_cast<std::uint32_t>((base >> 32u) & 0xffffu);
-        }
-        ++info.resourcesNum;
+        applyVertexAttribute(info, static_cast<std::int32_t>(semantic.hardware_mapping), static_cast<std::int32_t>(semantic.size_in_elements), semantic.semantic, attribWord, sharp);
     }
     return info;
+}
+
+VertexFetchPlan DecodeVertexFetchPlan(std::span<const std::byte> header, std::uint64_t headerAddress) {
+    if (header.size() < sizeof(Shader)) throw std::runtime_error("AGC graphics: shader header is smaller than the fixed AGC header");
+    Shader shader;
+    std::memcpy(&shader, header.data(), sizeof(Shader));
+    VertexFetchPlan plan;
+    if (shader.user_data == nullptr) throw std::runtime_error("AGC graphics: missing AGC user-data header");
+    const auto userDataHeader = _readHeaderPod<ShaderUserData>(header, headerAddress, shader.user_data);
+    if (userDataHeader.direct_resource_count > ShaderRegs::AGC_DIRECT_RESOURCE_TYPE_COUNT) throw std::runtime_error("AGC graphics: AGC direct-resource count exceeds the known resource domain");
+    std::array<std::uint16_t, ShaderRegs::AGC_DIRECT_RESOURCE_TYPE_COUNT> directOffsets{};
+    directOffsets.fill(ShaderRegs::AGC_ILLEGAL_DIRECT_OFFSET);
+    if (userDataHeader.direct_resource_count != 0) _readHeaderArray(header, headerAddress, userDataHeader.direct_resource_offset, userDataHeader.direct_resource_count, directOffsets.data());
+    std::int32_t vertexBufferReg = -1;
+    std::int32_t vertexAttribReg = -1;
+    for (std::uint32_t type = 0; type < userDataHeader.direct_resource_count; ++type) {
+        const auto reg = directOffsets[type];
+        if (reg == ShaderRegs::AGC_ILLEGAL_DIRECT_OFFSET) continue;
+        if (type == static_cast<std::uint32_t>(ShaderRegs::AgcDirectResourceType::PtrVertexBufferTable)) vertexBufferReg = reg;
+        if (type == static_cast<std::uint32_t>(ShaderRegs::AgcDirectResourceType::PtrVertexAttribDescTable)) vertexAttribReg = reg;
+    }
+    if (vertexAttribReg < 0) return plan;
+    if (vertexBufferReg < 0) throw std::runtime_error("AGC graphics: vertex attribute table requires a vertex buffer table");
+    if (shader.num_input_semantics == 0 || shader.num_input_semantics > ShaderRecompiler::ShaderVertexStageInfo::MaxResources) throw std::runtime_error("AGC graphics: vertex semantic count is outside the supported domain");
+    if (shader.input_semantics == nullptr) throw std::runtime_error("AGC graphics: missing vertex input semantics");
+    std::array<ShaderSemantic, ShaderRecompiler::ShaderVertexStageInfo::MaxResources> semantics{};
+    _readHeaderArray(header, headerAddress, shader.input_semantics, shader.num_input_semantics, semantics.data());
+    plan.fetch = true;
+    plan.attribReg = static_cast<std::uint32_t>(vertexAttribReg);
+    plan.bufferReg = static_cast<std::uint32_t>(vertexBufferReg);
+    plan.semantics.reserve(shader.num_input_semantics);
+    for (std::uint32_t i = 0; i < shader.num_input_semantics; ++i) {
+        const auto& semantic = semantics[i];
+        if (semantic.static_vb_index == 1 || semantic.static_attribute == 1) throw std::runtime_error("AGC graphics: statically bound vertex attributes are not implemented");
+        plan.semantics.push_back({semantic.semantic, static_cast<std::int32_t>(semantic.hardware_mapping), static_cast<std::int32_t>(semantic.size_in_elements)});
+    }
+    return plan;
+}
+
+bool ResolveVertexFetch(const VertexFetchPlan& plan, std::span<const std::uint32_t> userData, VertexFetchRead read, void* context, ShaderRecompiler::ShaderVertexStageInfo& info) {
+    info = {};
+    if (!plan.fetch) return true;
+    if (plan.bufferReg + 1u >= userData.size()) throw std::runtime_error("AGC graphics: vertex buffer table pointer exceeds the user-SGPR domain");
+    if (plan.attribReg + 1u >= userData.size()) throw std::runtime_error("AGC graphics: vertex attribute table pointer exceeds the user-SGPR domain");
+    const auto attribTableAddr = static_cast<std::uint64_t>(userData[plan.attribReg]) | (static_cast<std::uint64_t>(userData[plan.attribReg + 1u]) << 32u);
+    const auto bufferTableAddr = static_cast<std::uint64_t>(userData[plan.bufferReg]) | (static_cast<std::uint64_t>(userData[plan.bufferReg + 1u]) << 32u);
+    if (attribTableAddr == 0) throw std::runtime_error("AGC graphics: null vertex attribute table address");
+    if (bufferTableAddr == 0) throw std::runtime_error("AGC graphics: null vertex buffer table address");
+    info.fetchEmbedded = true;
+    info.fetchAttribReg = plan.attribReg;
+    info.fetchBufferReg = plan.bufferReg;
+    for (const auto& semantic : plan.semantics) {
+        std::uint32_t attribWord = 0;
+        if (!read(context, attribTableAddr + static_cast<std::uint64_t>(semantic.semantic) * 4u, &attribWord)) return false;
+        const auto index = attribWord & 0x1fu;
+        if (index >= ShaderRecompiler::ShaderVertexStageInfo::MaxResources) throw std::runtime_error("AGC graphics: vertex buffer index exceeds the supported domain");
+        std::array<std::uint32_t, 4> sharp{};
+        for (std::uint32_t word = 0; word < sharp.size(); ++word) {
+            if (!read(context, bufferTableAddr + static_cast<std::uint64_t>(index) * 16u + word * 4u, &sharp[word])) return false;
+        }
+        applyVertexAttribute(info, semantic.hardwareMapping, semantic.sizeInElements, semantic.semantic, attribWord, sharp);
+    }
+    return true;
 }
 
 }

@@ -1,6 +1,7 @@
 target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/Export.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/General.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/PortSettings.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/gcc/StackGuard.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/windows/CrashReport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/linux/DlIteratePhdr.cpp
@@ -75,6 +76,15 @@ if(BUILD_TESTING)
     add_test(NAME guest_working_directory COMMAND guest_working_directory_tests)
     if(WIN32)
         set_tests_properties(guest_working_directory PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test_executable(guest_path_case_tests ${LIBS_INCLUDE_DIR}/tests/GuestPathCase.cpp)
+    target_include_directories(guest_path_case_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_path_case_tests PRIVATE libc libkernel)
+    configure_windows_unwind(guest_path_case_tests)
+    add_test(NAME guest_path_case COMMAND guest_path_case_tests)
+    if(WIN32)
+        set_tests_properties(guest_path_case PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test_executable(guest_directory_tests ${LIBS_INCLUDE_DIR}/tests/GuestDirectory.cpp)
@@ -167,6 +177,17 @@ if(BUILD_TESTING)
         set_tests_properties(guest_strings PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test_executable(unwind_stack_tests ${LIBS_INCLUDE_DIR}/tests/UnwindStack.cpp)
+    target_include_directories(unwind_stack_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(unwind_stack_tests PRIVATE libc)
+    configure_windows_unwind(unwind_stack_tests)
+    add_test(NAME unwind_stack COMMAND unwind_stack_tests)
+    add_test(NAME unwind_stack_rules_on_stack COMMAND unwind_stack_tests)
+    set_tests_properties(unwind_stack_rules_on_stack PROPERTIES ENVIRONMENT "APS5_UNWIND_STACK_RULES=1")
+    if(WIN32)
+        set_tests_properties(unwind_stack unwind_stack_rules_on_stack PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     if(UNIX)
         add_test_executable(exception_runtime_tests ${LIBS_INCLUDE_DIR}/tests/ExceptionRuntime.cpp)
         target_include_directories(exception_runtime_tests PRIVATE ${LIBS_INCLUDE_DIR})
@@ -177,6 +198,10 @@ if(BUILD_TESTING)
         set_source_files_properties(${LIBS_INCLUDE_DIR}/tests/ExceptionCCleanup.c PROPERTIES COMPILE_OPTIONS -fexceptions)
         target_link_libraries(exception_c_cleanup_tests PRIVATE libc)
         add_test(NAME exception_c_cleanup COMMAND exception_c_cleanup_tests)
+        add_test_executable(guest_image_anonymous_tests ${LIBS_INCLUDE_DIR}/tests/GuestImageAnonymous.cpp)
+        target_include_directories(guest_image_anonymous_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(guest_image_anonymous_tests PRIVATE libc)
+        add_test(NAME guest_image_anonymous COMMAND guest_image_anonymous_tests)
     endif()
 endif()
 
@@ -194,6 +219,11 @@ if(BUILD_TESTING)
         set_tests_properties(application_heap_replacement application_heap_invalid_metadata application_heap_default
             PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test_executable(cpu_topology_tests ${LIBS_INCLUDE_DIR}/tests/CpuTopology.cpp)
+        target_include_directories(cpu_topology_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        add_test(NAME cpu_topology COMMAND cpu_topology_tests)
+    endif()
 endif()
 
 add_test_executable(guest_locale_tests EXCLUDE_FROM_ALL ${LIBS_INCLUDE_DIR}/tests/GuestLocale.cpp)
@@ -201,6 +231,20 @@ target_include_directories(guest_locale_tests PRIVATE ${LIBS_INCLUDE_DIR})
 set_target_properties(guest_locale_tests PROPERTIES CXX_EXTENSIONS OFF)
 target_link_libraries(guest_locale_tests PRIVATE libc)
 configure_windows_unwind(guest_locale_tests)
+
+add_test_executable(port_settings_tests EXCLUDE_FROM_ALL ${LIBS_INCLUDE_DIR}/tests/PortSettings.cpp)
+target_include_directories(port_settings_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(port_settings_tests PRIVATE libc libkernel)
+set_target_properties(port_settings_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(port_settings_tests)
+if(BUILD_TESTING)
+    set_target_properties(port_settings_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME port_settings COMMAND port_settings_tests)
+    if(WIN32)
+        set_tests_properties(port_settings PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
 
 if(MINGW)
     foreach(runtimeLinkFlag IN ITEMS -static-libgcc -static-libstdc++ -static)

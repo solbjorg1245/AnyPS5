@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/FrameTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/PassDump.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -85,10 +87,14 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
     }
 }
 
-// Logs a dispatch of a traced frame (FrameTrace); a dump after it saves every live image.
+// Logs a dispatch of a traced frame (FrameTrace); a dump after it saves every live image. A pass
+// dump's frame (PassDump) reads back what it wrote.
 void Driver::traceDispatch(const QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t queueId) {
+    if (!FrameTrace::Noting()) return;
+    const auto writes = FrameTrace::TakeWrites();
+    if (PassDump::FrameActive()) PassDump::AfterDispatch(device.Load().get(), queue, queueId, writes);
     if (!FrameTrace::Active()) return;
-    const auto line = describeDispatch(queue, packet, queueId) + FrameTrace::TakeWrites();
+    const auto line = describeDispatch(queue, packet, queueId) + writes;
     const auto entry = FrameTrace::Record(line);
     if (!entry.dump) return;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
@@ -179,11 +185,16 @@ void Driver::execute(const Submission& submission) {
     PacketHistory recent{submission.commands};
 
     static const bool profilePackets = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    // APS5_FAST_CENSUS (with APS5_PROFILE_DRAW): each packet's effect on a run of fast-eligible draws (F0).
+    static const bool fastCensus = FastCensusActive();
 
     thread_local PacketProfile packetProfile;
     ++packetProfile.submissions;
 
     bumpEpoch(&EpochBumps::submissions);
+    // APS5_DISPATCH_OVERLAP: the guest order spans (Graphics::Recorder::NoteGuestPacket).
+    static const bool guestOrder = Graphics::Recorder::DispatchOverlap();
+    if (guestOrder) Graphics::Recorder::NoteGuestSubmission();
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
         CheckFailure();
@@ -196,6 +207,7 @@ void Driver::execute(const Submission& submission) {
         if (opcode != 0x3c && opcode != 0x93 && header != RenderingWaitPacketHeader && header != FlipPacketHeader) deviceUse.lock();
 
         GuestMemory::SetCurrentPacket(header == FlipPacketHeader ? 0xffffu : opcode, submission.queue);
+        if (guestOrder) Graphics::Recorder::NoteGuestPacket(opcode, header == FlipPacketHeader || header == RenderingWaitPacketHeader);
         CaptureTrace::Log("packet submission=%llu queue=%x offset=%zu header=%08x words=%zu", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, header, packet.size());
 
         const auto flushStart = profilePackets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -273,6 +285,7 @@ void Driver::execute(const Submission& submission) {
                 if (localDevice != nullptr) localDevice->FlipBatches(batchesAtFlip, unsignaledAtFlip);
             }
             ++flipsCounted;
+            if (PassDump::Enabled()) PassDump::AtFlip(device.Load().get(), submission.queue);
             if (batchesAtFlip != 0) flipSerial = batchesAtFlip;
             flipBatchesUnsignaled += unsignaledAtFlip;
 
@@ -287,11 +300,15 @@ void Driver::execute(const Submission& submission) {
             // A dispatch the driver cannot run is skipped and reported, as a draw is, instead of
             // ending the process: Demon's Souls issues compute work whose resource tables are not
             // filled yet (a null SRT, a null texture), which the GPU tolerates.
+            const PassDump::Serial passSerial;
+            if (PassDump::FrameActive()) PassDump::BeforeWork(device.Load().get(), submission.queue);
             timed(&WorkerProfile::dispatchMs, [&] { tolerate("dispatch", [&] { dispatch(queue, packet, submission); }); });
             traceDispatch(queue, packet, submission.queue);
             Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(false);
         } else if (opcode == 0x16) {
+            const PassDump::Serial passSerial;
+            if (PassDump::FrameActive()) PassDump::BeforeWork(device.Load().get(), submission.queue);
             timed(&WorkerProfile::dispatchMs, [&] { tolerate("dispatch", [&] { dispatchIndirect(queue, packet, submission); }); });
             traceDispatch(queue, packet, submission.queue);
             Graphics::Recorder::CountRecordedWork();
@@ -313,6 +330,10 @@ void Driver::execute(const Submission& submission) {
                 }
             }
         } else if (drawPacket) {
+            // APS5_PASS_DUMP: the dumped frame's draws run one at a time; a change of targets ends
+            // the open pass, read back before this draw.
+            const PassDump::Serial passSerial;
+            if (PassDump::FrameActive()) PassDump::BeforeDraw(device.Load().get(), queue, submission.queue);
             bool drawn = false;
             timed(&WorkerProfile::drawMs, [&] { tolerate("draw", [&] {
                 static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
@@ -370,17 +391,22 @@ void Driver::execute(const Submission& submission) {
                     skipped(error.what());
                     countSkip(Graphics::DrawSkip::Thrown, error.what());
                 }
-                if (FrameTrace::Active()) {
-                    std::vector<std::uint64_t> targets;
-                    const auto entry = FrameTrace::Record(describeDraw(queue, header, submission.queue, traceVerdict, traceReason, targets) + FrameTrace::TakeWrites());
-                    if (entry.dump) {
-                        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
-                        std::lock_guard gpuLock(GuestMemory::GpuMutex());
-                        if (const auto localDevice = device.Load()) localDevice->CaptureImages(entry.prefix, entry.all ? std::span<const std::uint64_t>() : std::span<const std::uint64_t>(targets));
+                if (FrameTrace::Noting()) {
+                    const auto writes = FrameTrace::TakeWrites();
+                    if (PassDump::FrameActive()) PassDump::AfterDraw(queue, submission.queue, drawn, writes);
+                    if (FrameTrace::Active()) {
+                        std::vector<std::uint64_t> targets;
+                        const auto entry = FrameTrace::Record(describeDraw(queue, header, submission.queue, traceVerdict, traceReason, targets) + writes);
+                        if (entry.dump) {
+                            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+                            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                            if (const auto localDevice = device.Load()) localDevice->CaptureImages(entry.prefix, entry.all ? std::span<const std::uint64_t>() : std::span<const std::uint64_t>(targets));
+                        }
                     }
                 }
             }); });
             finishDrawPacket(drawn);
+            if (fastCensus && !drawn) NoteFastCensusDropped();
         } else if (sampleDump) {
             dumpSampleCounters(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u));
         } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
@@ -393,8 +419,10 @@ void Driver::execute(const Submission& submission) {
             if (endOfPipeInterrupt && !interruptDeferred) AgcDriverDeliverEopInterrupt(submission.queue);
         }
         if (drawPacket) Graphics::Recorder::CountRecordedWork();
+        if (fastCensus) NoteFastCensusPacket(submission.queue, header, drawPacket, header == FlipPacketHeader, header == RenderingWaitPacketHeader, wroteOnGpu);
         cursor += count;
     }
+    if (fastCensus) NoteFastCensusSubmissionEnd(submission.queue);
 
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;
     if (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value() || Graphics::Recorder::RecordedWorkSinceSubmit() != 0) {

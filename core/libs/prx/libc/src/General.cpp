@@ -1,21 +1,24 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 #include <filesystem>
 #include <optional>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
+#include "prx/libc/include/PortSettings.hpp"
 
 namespace {
 // Guest prefixes (without leading slashes) mapped to host directories, e.g. save-data mount points:
 // the PS5 hands the title a short mount point ("/savedata0") whose files live under _sd/<dir name>.
 struct PathAliases {
     std::mutex mutex;
-    std::vector<std::pair<std::string, std::string>> entries;
+    std::vector<std::pair<std::string, std::filesystem::path>> entries;
 };
 
 PathAliases& Aliases() {
@@ -36,15 +39,67 @@ std::string TrimSlashes(const char* path) {
     return s.substr(start, end - start);
 }
 
+// APS5_NO_PATH_CASE_FOLD=1: guest names and mount prefixes match the host's exactly, as before the
+// ASCII case-insensitive fallback (no extra existence check or directory scan per resolution).
+bool CaseFold() {
+    static const bool fold = std::getenv("APS5_NO_PATH_CASE_FOLD") == nullptr;
+    return fold;
+}
+
+bool SameName(std::string_view left, std::string_view right) {
+    if (!CaseFold()) return left == right;
+    if (left.size() != right.size()) return false;
+    const auto fold = [](unsigned char value) { return value >= 'A' && value <= 'Z' ? value + ('a' - 'A') : value; };
+    for (std::size_t i = 0; i < left.size(); ++i) if (fold(left[i]) != fold(right[i])) return false;
+    return true;
+}
+
+bool HasPrefix(const std::string& path, const std::string& prefix) {
+    return path.size() >= prefix.size() && SameName(std::string_view(path).substr(0, prefix.size()), prefix) &&
+           (path.size() == prefix.size() || path[prefix.size()] == '/');
+}
+
+std::filesystem::path ResolveHostPath(std::filesystem::path root, const std::filesystem::path& relative) {
+    const auto direct = root / relative;
+#ifdef _WIN32
+    // Windows' own lookup already ignores case (NTFS and FAT; only a folder made case-sensitive per
+    // directory differs), so every name the scan below could match, the host opens directly: there
+    // the fallback would only add an existence check per resolution and a directory scan per missing
+    // name, all under the callers' path locks. Mount prefixes still fold (SameName/HasPrefix).
+    return direct;
+#else
+    if (!CaseFold()) return direct;
+    std::error_code error;
+    if (std::filesystem::exists(direct, error)) return direct;
+    for (const auto& part : relative) {
+        const auto candidate = root / part;
+        const auto status = std::filesystem::symlink_status(candidate, error);
+        if (std::filesystem::exists(status) || (error && error != std::errc::no_such_file_or_directory)) {
+            root = candidate;
+            continue;
+        }
+        std::optional<std::filesystem::path> matched;
+        const auto name = part.string();
+        std::filesystem::directory_iterator entry(root, error), end;
+        for (; !error && entry != end; entry.increment(error)) {
+            if (!SameName(entry->path().filename().string(), name)) continue;
+            if (matched) throw std::runtime_error("Ambiguous case-insensitive guest path: " + candidate.string());
+            matched = entry->path();
+        }
+        root = !error && matched ? *matched : candidate;
+    }
+    return root;
+#endif
+}
+
 std::optional<std::filesystem::path> ResolveAlias(const std::string& guestPath) {
     const auto relative = TrimSlashes(guestPath.c_str());
     auto& aliases = Aliases();
     std::lock_guard lock(aliases.mutex);
     for (const auto& [prefix, host] : aliases.entries) {
-        if (relative.size() < prefix.size() || relative.compare(0, prefix.size(), prefix) != 0) continue;
+        if (!HasPrefix(relative, prefix)) continue;
         if (relative.size() == prefix.size()) return std::filesystem::path(host).make_preferred();
-        if (relative[prefix.size()] != '/') continue;
-        std::filesystem::path result = std::filesystem::path(host) / std::filesystem::path(relative.substr(prefix.size() + 1));
+        std::filesystem::path result = ResolveHostPath(host, relative.substr(prefix.size() + 1));
         return result.make_preferred();
     }
     return std::nullopt;
@@ -67,7 +122,7 @@ std::filesystem::path Resolve(WorkingDirectory& state, const char* path) {
     auto guest = (std::filesystem::path("/") / state.current.lexically_relative(state.root));
     guest = (input.is_absolute() ? input : guest / input).lexically_normal();
     if (auto aliased = ResolveAlias(guest.relative_path().generic_string())) return *aliased;
-    return (state.root / guest.relative_path()).make_preferred();
+    return ResolveHostPath(state.root, guest.relative_path()).make_preferred();
 }
 int DirectoryFailure(const std::error_code& error) {
     if (error == std::errc::permission_denied) return 13;
@@ -79,20 +134,27 @@ int DirectoryFailure(const std::error_code& error) {
 }
 }
 
-extern "C" void AddPathAlias_nid_no_patch(const char* guestPrefix, const char* hostPath) {
-    if (guestPrefix == nullptr || hostPath == nullptr) {
+void AddPathAliasHost_nid_no_patch(const char* guestPrefix, const std::filesystem::path& hostPath) {
+    if (guestPrefix == nullptr || hostPath.empty()) {
         APS5_INVALID_ARG_EX;
     }
     auto& aliases = Aliases();
     std::lock_guard lock(aliases.mutex);
     const auto prefix = TrimSlashes(guestPrefix);
     for (auto& entry : aliases.entries) {
-        if (entry.first == prefix) {
+        if (SameName(entry.first, prefix)) {
             entry.second = hostPath;
             return;
         }
     }
     aliases.entries.emplace_back(prefix, hostPath);
+}
+
+extern "C" void AddPathAlias_nid_no_patch(const char* guestPrefix, const char* hostPath) {
+    if (guestPrefix == nullptr || hostPath == nullptr) {
+        APS5_INVALID_ARG_EX;
+    }
+    AddPathAliasHost_nid_no_patch(guestPrefix, std::filesystem::path(hostPath));
 }
 
 extern "C" void RemovePathAlias_nid_no_patch(const char* guestPrefix) {
@@ -102,12 +164,21 @@ extern "C" void RemovePathAlias_nid_no_patch(const char* guestPrefix) {
     auto& aliases = Aliases();
     std::lock_guard lock(aliases.mutex);
     const auto prefix = TrimSlashes(guestPrefix);
-    std::erase_if(aliases.entries, [&](const auto& entry) { return entry.first == prefix; });
+    std::erase_if(aliases.entries, [&](const auto& entry) { return SameName(entry.first, prefix); });
 }
 
 extern "C" std::filesystem::path ResolvePath_nid_no_patch(const char* path) {
     if (!path) { APS5_INVALID_ARG_EX; }
     auto& state = Directories();
+    // The player settings' title arguments alias the command-line and render-config files to merged
+    // copies before the first guest path resolves (PortSettings.cpp); without settings nothing changes.
+    static std::once_flag settingsOverlay;
+    std::call_once(settingsOverlay, [&state] {
+        InstallPortSettingsOverlay([&state](const char* guest) {
+            std::lock_guard lock(state.mutex);
+            return Resolve(state, guest);
+        });
+    });
     std::lock_guard lock(state.mutex);
     return Resolve(state, path);
 }

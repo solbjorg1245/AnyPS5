@@ -45,6 +45,11 @@ std::uint64_t GuestAllocationsGeneration_nid_postfix();
 // range whose mapping or protection changed (registry mutations and guest heap decommits).
 void GuestAllocationsSetInvalidator_nid_postfix(void (*callback)(std::uintptr_t address, std::size_t bytes));
 void GuestAllocationsInvalidate_nid_postfix(std::uintptr_t address, std::size_t bytes);
+// Releases among those changes: a range unmapped, freed or mapped anew (registry Add, Remove and
+// Unmap, a guest heap decommit), never a protection change. The listener (the GPU driver's free log)
+// runs after the invalidator; GuestAllocationsReleased reports a release made outside a mutation.
+void GuestAllocationsSetReleaseListener_nid_postfix(void (*callback)(std::uintptr_t address, std::size_t bytes));
+void GuestAllocationsReleased_nid_postfix(std::uintptr_t address, std::size_t bytes);
 // A mutation of a range that GPU work still leases waits for the lease (RequireUnpinned). The
 // waiter, set by the GPU driver, is called on the mutating thread with the registry lock released
 // and finishes the GPU work that holds leases; it returns whether it finished any (a round that found

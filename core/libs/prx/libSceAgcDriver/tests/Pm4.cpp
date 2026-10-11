@@ -122,6 +122,55 @@ void testRegisterFile() {
     check(threw, "register file read an unset register");
 }
 
+// The draw state serial (APS5_FAST_STATE): only a changed state register, CLEAR_STATE and a context
+// push or pop bump it, and a bump comes with a changed state hash where a register changed.
+void testStateSerial() {
+    AgcDriver::QueueState state;
+    const auto fresh = AgcDriver::StateRegisterHash(AgcDriver::QueueState{});
+    auto serial = state.stateSerial;
+    auto hash = AgcDriver::StateRegisterHash(state);
+    check(hash == fresh, "equal register states hash differently");
+    execute(state, makePacket(0x69, {0x1e0, 0x20010001}));
+    check(state.stateSerial == serial && AgcDriver::StateRegisterHash(state) == hash, "a store of the same value bumped the state serial");
+    execute(state, makePacket(0x76, {0x8c, 0x1234, 0x5678}));
+    execute(state, makePacket(0x76, {0x0c, 7}));
+    execute(state, makePacket(0x76, {0x82, 0x1000, 0}));
+    execute(state, makePacket(0x76, {0x10c, 9}));
+    check(state.stateSerial == serial && AgcDriver::StateRegisterHash(state) == hash, "a user-word or user-pointer store bumped the state serial");
+    execute(state, makePacket(0x69, {0x2e4, 7}));
+    execute(state, makePacket(0x76, {0x20c, 3}));
+    check(state.stateSerial == serial && AgcDriver::StateRegisterHash(state) == hash, "a store outside the state registers bumped the state serial");
+    execute(state, makePacket(0x69, {0x1e0, 0x20010002}));
+    check(state.stateSerial == serial + 1 && AgcDriver::StateRegisterHash(state) != hash, "a blend store did not bump the state serial and change the state key");
+    serial = state.stateSerial;
+    hash = AgcDriver::StateRegisterHash(state);
+    execute(state, makePacket(0x69, {0x103, 0xffffffffu}));
+    check(state.stateSerial == serial + 1 && AgcDriver::StateRegisterHash(state) != hash, "a new precheck register did not bump the state serial");
+    serial = state.stateSerial;
+    hash = AgcDriver::StateRegisterHash(state);
+    execute(state, makePacket(0x76, {0x8a, 0x40}));
+    check(state.stateSerial == serial + 1 && AgcDriver::StateRegisterHash(state) != hash, "a program RSRC store did not bump the state serial");
+    serial = state.stateSerial;
+    std::array<std::uint32_t, 2> pairs{0x1e1, 5};
+    execute(state, makePacket(0x9f, {low(pairs.data()), high(pairs.data()), 0x80000000, 1}));
+    check(state.stateSerial == serial + 1, "an indirect blend store did not bump the state serial");
+    serial = state.stateSerial;
+    execute(state, makePacket(0x12, {0}));
+    check(state.stateSerial > serial, "CLEAR_STATE did not bump the state serial");
+    serial = state.stateSerial;
+    execute(state, makePacket(0x10, {1, 0}, 0x68));
+    check(state.stateSerial > serial, "a context push did not bump the state serial");
+    serial = state.stateSerial;
+    execute(state, makePacket(0x69, {0x1e0, 0x20010003}));
+    check(state.stateSerial == serial + 1, "a blend store under a pushed context did not bump the state serial");
+    serial = state.stateSerial;
+    execute(state, makePacket(0x10, {2, 0}, 0x68));
+    check(state.stateSerial > serial && state.context.at(0x1e0) == 0x20010001, "a context pop did not bump the state serial");
+    check(AgcDriver::StateRegisterHash(state) != fresh, "the program RSRC store left the state hash of a fresh queue");
+    state.shader.erase(0x8a);
+    check(AgcDriver::StateRegisterHash(state) == fresh, "the state hash depends on user words");
+}
+
 void testContextAndBases() {
     AgcDriver::QueueState state;
     execute(state, makePacket(0x69, {0x10, 17}));
@@ -564,6 +613,7 @@ int main(int argc, char** argv) {
         testWriteChangedKeepsUntouchedBytes();
         testRegisters();
         testRegisterFile();
+        testStateSerial();
         testContextAndBases();
         testIndexedDraw();
         testAutoDraw();

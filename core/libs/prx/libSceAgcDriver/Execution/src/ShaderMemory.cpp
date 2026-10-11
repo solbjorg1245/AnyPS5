@@ -899,6 +899,40 @@ bool WordsEqualIgnoring(std::span<const std::uint32_t> a, std::span<const std::u
     return true;
 }
 
+std::vector<std::uint64_t> DeferredFlatAddresses(std::span<const ShaderRecompiler::DescriptorBinding> bindings) {
+    std::vector<std::uint64_t> addresses;
+    for (const auto& binding : bindings) {
+        for (const auto& [slot, address] : binding.deferredWords) addresses.push_back(address);
+    }
+    std::sort(addresses.begin(), addresses.end());
+    return addresses;
+}
+
+bool RunsEqualBesideDeferred(std::span<const std::pair<std::uint64_t, std::uint64_t>> storedRuns, std::span<const std::uint32_t> storedWords, std::span<const std::pair<std::uint64_t, std::uint64_t>> freshRuns, std::span<const std::uint32_t> freshWords, std::span<const std::uint64_t> deferred, std::span<const std::pair<std::uint32_t, std::uint32_t>> ignored) {
+    // Each side's words in address order as (address, position), the deferred addresses left out;
+    // runs that do not cover their words exactly compare unequal.
+    const auto collect = [&](std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::uint32_t> words, std::vector<std::pair<std::uint64_t, std::uint32_t>>& kept) {
+        std::size_t position = 0;
+        for (const auto& [begin, end] : runs) {
+            for (auto address = begin; address < end; address += sizeof(std::uint32_t), ++position) {
+                if (position >= words.size()) return false;
+                if (!std::binary_search(deferred.begin(), deferred.end(), address)) kept.emplace_back(address, static_cast<std::uint32_t>(position));
+            }
+        }
+        return position == words.size();
+    };
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> stored, fresh;
+    if (!collect(storedRuns, storedWords, stored) || !collect(freshRuns, freshWords, fresh) || stored.size() != fresh.size()) return false;
+    for (std::size_t i = 0; i < stored.size(); ++i) {
+        const auto [address, position] = stored[i];
+        if (address != fresh[i].first) return false;
+        const auto left = storedWords[position];
+        const auto right = freshWords[fresh[i].second];
+        if (left != right && ((left ^ right) & ~IgnoredMaskAt(ignored, position)) != 0) return false;
+    }
+    return true;
+}
+
 bool SameDescriptorIgnoringTsharpBits(const ShaderRecompiler::DescriptorBinding& binding, std::span<const std::uint32_t> left, std::span<const std::uint32_t> right) {
     if (left.size() != right.size()) return false;
     const bool sampled = binding.role == ShaderRecompiler::DescriptorRole::GuestImages && binding.kind == ShaderRecompiler::DescriptorKind::SampledImage;
@@ -909,6 +943,47 @@ bool SameDescriptorIgnoringTsharpBits(const ShaderRecompiler::DescriptorBinding&
         if (((left[i] ^ right[i]) & ~mask) != 0) return false;
     }
     return true;
+}
+
+bool FlatTsharpFeedbackCopy(std::span<const ShaderRecompiler::DescriptorBinding> left, std::span<const ShaderRecompiler::DescriptorBinding> right, std::uint32_t leftWord, std::uint32_t rightWord) {
+    constexpr std::size_t TsharpWords = 8;
+    if (leftWord == rightWord || left.size() != right.size()) return false;
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        const auto& a = left[index];
+        const auto& b = right[index];
+        const auto sampled = [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::GuestImages && binding.kind == ShaderRecompiler::DescriptorKind::SampledImage; };
+        if (!sampled(a) || !sampled(b) || a.guestDescriptor.size() != b.guestDescriptor.size()) continue;
+        for (std::size_t element = 0; element + TsharpWords <= a.guestDescriptor.size(); element += TsharpWords) {
+            for (const auto& [word, mask] : {std::pair{std::size_t{5}, TsharpWord5IgnoredBits}, std::pair{std::size_t{6}, TsharpWord6IgnoredBits}}) {
+                if (a.guestDescriptor[element + word] == leftWord && b.guestDescriptor[element + word] == rightWord && ((leftWord ^ rightWord) & ~mask) == 0) return true;
+            }
+        }
+    }
+    return false;
+}
+
+CopyCost ResultCopyCost(const ShaderRecompiler::RecompileResult& result) {
+    CopyCost cost;
+    const auto add = [&](std::size_t bytes) {
+        cost.bytes += bytes;
+        if (bytes != 0) ++cost.allocations;
+    };
+    const auto bits = [](const std::vector<bool>& flags) { return (flags.size() + 7) / 8; };
+    add(result.bindings.size() * sizeof(ShaderRecompiler::DescriptorBinding));
+    for (const auto& binding : result.bindings) {
+        add(binding.guestDescriptor.size() * sizeof(std::uint32_t));
+        add(bits(binding.samplerDepthCompare));
+        add(bits(binding.imageWritten));
+        add(bits(binding.imageDepthCompare));
+        add(bits(binding.bufferAtomic));
+        add(bits(binding.bufferWritten));
+        add(binding.deferredWords.size() * sizeof(std::pair<std::uint32_t, std::uint64_t>));
+    }
+    add(result.pushConstants.size());
+    add(result.vertexAttributes.size() * sizeof(ShaderRecompiler::VertexAttribute));
+    add(result.parameterExports.size() * sizeof(std::uint32_t));
+    add(result.fragmentParameters.size() * sizeof(ShaderRecompiler::FragmentParameter));
+    return cost;
 }
 
 }

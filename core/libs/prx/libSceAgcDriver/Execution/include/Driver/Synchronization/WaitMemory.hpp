@@ -46,6 +46,14 @@ struct EpochBumps {
 };
 
 void PollSleep();
+// Windows: the calling thread's auto-reset wake event (made on first use, closed at the thread's
+// exit); nullptr elsewhere or when it cannot be made.
+void* PollWakeEvent();
+// Windows: sleeps `interval` on a high-resolution timer (a winpthreads timed wait ends on a 15.6 ms
+// tick instead), returning early once PollWake(wake) is called. False, without sleeping, where
+// there is no such timer or no wake event: the caller falls back to its own wait.
+bool PollSleepOrWake(void* wake, std::chrono::microseconds interval);
+void PollWake(void* wake);
 
 }
 

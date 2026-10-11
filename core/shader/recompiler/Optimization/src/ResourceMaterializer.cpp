@@ -1,5 +1,6 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "prx/libc/include/HostMutex.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
@@ -12,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -125,6 +127,28 @@ bool imageAddressBelowUserLimit(const DescriptorValue& descriptor) {
     return baseAddress < MaxImageAddress;
 }
 
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(NullBoundImage::Count)> nullBoundCounts{};
+
+void countNullBound(NullBoundImage reason) {
+    nullBoundCounts[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+// The fields of words 5-6 the driver's T# decoder rejects as unimplemented (GuestTextureResource:
+// array pitch, corner sampling, a partially resident default color, MSAA depth). The ones seen in
+// Demon's Souls are no T#: the last element of a T# array whose words 4-7 the walk read from the
+// struct after it (a pointer or floats). Bound as null they sample zeros where the draw used to be
+// dropped; a 128-bit T# has no such words.
+bool undecodableImageBits(const DescriptorValue& descriptor, bool r128) {
+    if (r128 || !ResourceMaterializer::NullUndecodable()) {
+        return false;
+    }
+    const auto arrayPitch = descriptor.dwords[5] & 0xfu;
+    const bool cornerSample = ((descriptor.dwords[5] >> 23u) & 1u) != 0u;
+    const bool prtDefColor = ((descriptor.dwords[5] >> 26u) & 1u) != 0u;
+    const bool msaaDepth = ((descriptor.dwords[6] >> 10u) & 1u) != 0u;
+    return arrayPitch != 0u || cornerSample || prtDefColor || msaaDepth;
+}
+
 bool validImageDescriptor(const DescriptorValue& descriptor, bool r128) {
     const auto type = rawImageType(descriptor);
     const auto format = rawImageFormat(descriptor);
@@ -223,6 +247,21 @@ std::uint32_t MaterialScanLimit() {
     return limit;
 }
 
+// The slots a bindless image table binds: the bindless slots, or for a loop-counter table
+// (APS5_LOOP_TABLE_KEYS=1) no more than its loop's bound, since no key reaches past it. At 48
+// slots a draw sampling two such tables needed 97 image slots of 64 and was dropped before its
+// tables were read (t386: "loop-counter 0" on every [bindless] line, the loop-table draws
+// thrown as "need 97 image slots"). APS5_NO_LOOP_TABLE_SLOTS=1 binds the bindless slots.
+bool loopTableSlotsBounded() {
+    static const bool bounded = std::getenv("APS5_NO_LOOP_TABLE_SLOTS") == nullptr;
+    return bounded;
+}
+
+std::uint32_t tableSlotCount(const DescriptorSource::IndirectImage& table) {
+    const auto slots = ResourceMaterializer::BindlessSlots();
+    return loopTableSlotsBounded() && table.loopKey && table.entryLimit != 0u ? std::min(slots, table.entryLimit) : slots;
+}
+
 bool BindlessTraced() {
     static const bool traced = std::getenv("APS5_TRACE_BINDLESS") != nullptr;
     return traced;
@@ -231,11 +270,15 @@ bool BindlessTraced() {
 struct BindlessCounters {
     std::atomic<std::uint64_t> tablesMaterial{0};
     std::atomic<std::uint64_t> tablesWhole{0};
+    std::atomic<std::uint64_t> tablesLoop{0};
     std::atomic<std::uint64_t> keys{0};
     std::atomic<std::uint64_t> paddedNull{0};
     std::atomic<std::uint64_t> paddedShape{0};
     std::atomic<std::uint64_t> paddedConversion{0};
     std::atomic<std::uint64_t> outOfRange{0};
+    // APS5_LOOP_TABLE_FIT: loop-counter tables cut to fit the image slots, and the entries cut.
+    std::atomic<std::uint64_t> loopFitted{0};
+    std::atomic<std::uint64_t> loopEntriesCut{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(BindlessRejection::Count)> rejected{};
     std::atomic<long long> lastReport{0};
 };
@@ -271,10 +314,17 @@ void reportBindless() {
     }
     if (material + whole + rejections == 0) return;
     const auto tables = material + whole;
-    std::fprintf(stderr, "[bindless] (10 s): tables bound %llu (mode M %llu, mode T %llu), slots %u, keys avg %.1f, entries unmapped (sample zeros): null/invalid %llu, shape %llu, conversion %llu, out of range %llu; rejected: capacity %llu, material scan %llu, no entry %llu, storage %llu, non-uniform %llu, image slots %llu\n",
-        static_cast<unsigned long long>(tables), static_cast<unsigned long long>(material), static_cast<unsigned long long>(whole), ResourceMaterializer::BindlessSlots(), tables != 0 ? static_cast<double>(keys) / static_cast<double>(tables) : 0.0,
+    // APS5_LOOP_TABLE_FIT: the loop tables cut to fit the image slots (served instead of thrown as
+    // "need N image slots"); keys at or past the cut sample zeros.
+    char fitted[128] = "";
+    if (ResourceMaterializer::LoopTableFit()) {
+        std::snprintf(fitted, sizeof(fitted), "; loop tables fitted to the image slots %llu (entries cut %llu)", static_cast<unsigned long long>(counters.loopFitted.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.loopEntriesCut.exchange(0, std::memory_order_relaxed)));
+    }
+    std::fprintf(stderr, "[bindless] (10 s): tables bound %llu (mode M %llu, mode T %llu; loop-counter %llu), slots %u, keys avg %.1f, entries unmapped (sample zeros): null/invalid %llu, shape %llu, conversion %llu, out of range %llu; rejected: capacity %llu, material scan %llu, no entry %llu, storage %llu, non-uniform %llu, image slots %llu, loop entry %llu, table entry %llu%s%s%s\n",
+        static_cast<unsigned long long>(tables), static_cast<unsigned long long>(material), static_cast<unsigned long long>(whole), static_cast<unsigned long long>(counters.tablesLoop.exchange(0, std::memory_order_relaxed)), ResourceMaterializer::BindlessSlots(), tables != 0 ? static_cast<double>(keys) / static_cast<double>(tables) : 0.0,
         static_cast<unsigned long long>(counters.paddedNull.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.paddedShape.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.paddedConversion.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.outOfRange.exchange(0, std::memory_order_relaxed)),
-        static_cast<unsigned long long>(rejected[0]), static_cast<unsigned long long>(rejected[1]), static_cast<unsigned long long>(rejected[2]), static_cast<unsigned long long>(rejected[3]), static_cast<unsigned long long>(rejected[4]), static_cast<unsigned long long>(rejected[5]));
+        static_cast<unsigned long long>(rejected[0]), static_cast<unsigned long long>(rejected[1]), static_cast<unsigned long long>(rejected[2]), static_cast<unsigned long long>(rejected[3]), static_cast<unsigned long long>(rejected[4]), static_cast<unsigned long long>(rejected[5]), static_cast<unsigned long long>(rejected[6]), static_cast<unsigned long long>(rejected[7]),
+        ResourceMaterializer::StrictLoopTables() ? "" : " (off: APS5_NO_STRICT_LOOP_TABLES)", ResourceMaterializer::StrictTableEntries() ? "" : " (off: APS5_NO_STRICT_TABLE_ENTRIES)", fitted);
 }
 
 // A bindless image table's bound slots and its (key, slot) mapping, keys ascending. Slots the
@@ -315,7 +365,7 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     if (image.resourceClass != ImageResourceClass::Sampled) {
         rejectTable(BindlessRejection::Storage, "bindless storage image tables are unsupported");
     }
-    const auto slots = ResourceMaterializer::BindlessSlots();
+    const auto slots = tableSlotCount(table);
     DescriptorValue heapValue;
     walker.EvaluateDescriptorSource(plan, table.heapSource, runtime, heapValue);
     // A table behind a raw address has no size: the key's range bounds it, and a null address
@@ -399,8 +449,39 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         auto& candidate = candidates[i];
         candidate.dwordCount = 8u;
         const std::uint64_t address = heapBase + table.entryOffset + static_cast<std::uint64_t>(keys[i]) * TableEntryBytes;
-        for (std::uint32_t dword = 0; dword < (image.r128 ? 4u : 8u); dword++) {
-            readWord(address + dword * sizeof(std::uint32_t), candidate.dwords[dword]);
+        // An entry in unreadable memory (a table bounded past its end) is a null entry rather than
+        // the end of the draw.
+        bool readable = true;
+        for (std::uint32_t dword = 0; dword < (image.r128 ? 4u : 8u) && readable; dword++) {
+            if (!ResourceMaterializer::NullUndecodable()) {
+                readWord(address + dword * sizeof(std::uint32_t), candidate.dwords[dword]);
+            } else {
+                readable = runtime.readMemory(runtime.userContext, address + dword * sizeof(std::uint32_t), &candidate.dwords[dword]);
+            }
+        }
+        if (!readable) {
+            candidate.dwords.fill(0u);
+            countNullBound(NullBoundImage::TableUnreadable);
+            paddedNull++;
+            continue;
+        }
+        // Words 5-6 the driver does not decode. A keyed table's entry goes through the checks
+        // below like any other (StrictTableEntries): most such entries are no T# at all (their
+        // words 0-3 are invalid too) and stay unmapped as they were with APS5_NULL_UNDECODABLE
+        // unset; t386 counted ~3k of them per 10 s as nulled, with the same unmapped totals and
+        // keys as t385. Only one the table would map reaches the driver's decoder (below).
+        const bool undecodable = !nullImageDescriptor(candidate) && undecodableImageBits(candidate, image.r128);
+        if (undecodable && (table.loopKey || !ResourceMaterializer::StrictTableEntries())) {
+            // A loop-counter table's loop samples every entry from its start up to its count, so
+            // such an entry is no key the draw leaves unselected: bound null, the loop sampled zeros
+            // in its place (t378: a white blob and blue splotches). The draw fails as before WP7
+            // (t379); APS5_NO_STRICT_LOOP_TABLES=1 binds it null.
+            if (table.loopKey && ResourceMaterializer::StrictLoopTables()) {
+                rejectTable(BindlessRejection::LoopEntry, "bindless loop-counter table entry uses T# words 5-6 the driver does not decode (its loop samples every entry)");
+            }
+            countNullBound(NullBoundImage::TableUndecodable);
+            paddedNull++;
+            continue;
         }
         DecodedImage decoded;
         bool usable = !nullImageDescriptor(candidate) && validImageDescriptor(candidate, image.r128) && imageAddressBelowUserLimit(candidate);
@@ -423,6 +504,13 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
             paddedShape++;
             continue;
         }
+        // A texture (words 0-3) the table would map, with words 5-6 the driver rejects: bound
+        // null, the key the material selects sampled zeros where the texture is (a black or
+        // garbage surface). The draw fails as the driver's decode failed it before
+        // (APS5_NULL_UNDECODABLE unset); APS5_NO_STRICT_TABLE_ENTRIES=1 binds it null.
+        if (undecodable) {
+            rejectTable(BindlessRejection::TableEntry, "bindless table entry is a texture whose T# words 5-6 the driver does not decode (bound null, its key would sample zeros)");
+        }
         if (!shape.has_value()) shape = decoded;
         valid[i] = 1u;
     }
@@ -444,6 +532,7 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     resolved = resolution.slots[0];
 
     (materialMode ? counters.tablesMaterial : counters.tablesWhole).fetch_add(1, std::memory_order_relaxed);
+    if (table.loopKey) counters.tablesLoop.fetch_add(1, std::memory_order_relaxed);
     counters.keys.fetch_add(resolution.mapping.size(), std::memory_order_relaxed);
     counters.paddedNull.fetch_add(paddedNull, std::memory_order_relaxed);
     counters.paddedShape.fetch_add(paddedShape, std::memory_order_relaxed);
@@ -451,15 +540,59 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     if (BindlessTraced()) traceTable(plan, image, table, heapBase, materialBase, {materialMode, entries, materialEntries, static_cast<std::uint32_t>(resolution.mapping.size())});
 }
 
-void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, SrtWalker& walker, ResourceSnapshot& snapshot, std::vector<TableResolution>& tables) {
-    snapshot = ResourceSnapshot{};
+// The working vectors of one materialization; TryMaterialize's live per thread, their capacity
+// reused from walk to walk.
+struct MaterializeScratch {
+    std::vector<DescriptorValue> values;
+    std::vector<std::uint8_t> activeSources;
+    std::vector<TableResolution> tables;
+};
+struct MaterializeScratchTag {};
+
+// Moves `from`'s storage, emptied, into `to` (a member of a fresh object): its capacity is kept.
+template<typename TVector>
+void keepCapacity(TVector& from, TVector& to) {
+    from.clear();
+    to = std::move(from);
+}
+
+// A fresh snapshot and specialization, but their vectors keep the capacity they had.
+void resetSnapshot(ResourceSnapshot& snapshot) {
+    ResourceSnapshot fresh;
+    keepCapacity(snapshot.buffers, fresh.buffers);
+    keepCapacity(snapshot.images, fresh.images);
+    keepCapacity(snapshot.samplers, fresh.samplers);
+    keepCapacity(snapshot.flattenedSrt, fresh.flattenedSrt);
+    keepCapacity(snapshot.userData, fresh.userData);
+    keepCapacity(snapshot.deferredFlat, fresh.deferredFlat);
+    snapshot = std::move(fresh);
+}
+
+void resetSpecialization(ResourceSpecialization& specialization) {
+    ResourceSpecialization fresh;
+    keepCapacity(specialization.buffers, fresh.buffers);
+    keepCapacity(specialization.images, fresh.images);
+    keepCapacity(specialization.boundDescriptors, fresh.boundDescriptors);
+    specialization = std::move(fresh);
+}
+
+// quiet (TryMaterialize): an SRT or uniform-fill evaluation that fails (the fast walk's declined
+// read) returns false instead of throwing; every other failure throws either way.
+bool materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, SrtWalker& walker, bool quiet, MaterializeScratch& scratch, ResourceSnapshot& snapshot) {
+    resetSnapshot(snapshot);
+    auto& tables = scratch.tables;
     if (plan.uniformFill.fill.kind != UniformFillKind::None) {
         const auto words = plan.uniformFill.fill.words;
         if (words == 0u || words > plan.uniformFill.values.size()) {
             throw std::runtime_error("uniform fill plan has an invalid word count");
         }
         std::array<std::uint32_t, 4> stored{};
-        walker.EvaluateUniformValues(plan, std::span(plan.uniformFill.values).first(words), runtime, std::span(stored).first(words));
+        const auto fillValues = std::span(plan.uniformFill.values).first(words);
+        if (quiet) {
+            if (!walker.TryEvaluateUniformValues(plan, fillValues, runtime, std::span(stored).first(words))) return false;
+        } else {
+            walker.EvaluateUniformValues(plan, fillValues, runtime, std::span(stored).first(words));
+        }
         for (std::uint32_t i = 1; i < words; i++) {
             if (stored[i] != stored[0]) {
                 throw std::runtime_error("uniform fill values diverge at runtime");
@@ -473,9 +606,13 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
     }
     snapshot.userData.assign(runtime.userData.begin(), runtime.userData.begin() + plan.userDataCount);
 
-    std::vector<DescriptorValue> values;
-    std::vector<std::uint8_t> activeSources;
-    walker.EvaluateRuntimeSources(plan, plan.materializationSources, runtime, values, snapshot.flattenedSrt, plan.cleanFlatSlots, activeSources);
+    auto& values = scratch.values;
+    auto& activeSources = scratch.activeSources;
+    if (quiet) {
+        if (!walker.TryEvaluateRuntimeSources(plan, plan.materializationSources, runtime, values, snapshot.flattenedSrt, plan.cleanFlatSlots, activeSources)) return false;
+    } else {
+        walker.EvaluateRuntimeSources(plan, plan.materializationSources, runtime, values, snapshot.flattenedSrt, plan.cleanFlatSlots, activeSources);
+    }
 
     std::size_t cursor = 0;
     if (values.size() < plan.info.buffers.size()) {
@@ -487,17 +624,57 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
     snapshot.images.resize(plan.info.images.size());
     tables.assign(plan.info.images.size(), {});
     std::uint32_t activeTables = 0;
+    std::size_t imageSlots = plan.info.images.size();
     for (std::uint32_t i = 0; i < plan.info.images.size(); i++) {
         const auto& image = plan.info.images[i];
         if (image.source >= plan.descriptorSources.size()) {
             throw std::runtime_error("image resource references an unknown descriptor source");
         }
         const bool active = image.source >= activeSources.size() || activeSources[image.source] != 0u;
-        if (plan.descriptorSources[image.source].indirectImage.has_value() && active) activeTables++;
+        const auto& indirect = plan.descriptorSources[image.source].indirectImage;
+        if (indirect.has_value() && active) {
+            activeTables++;
+            imageSlots += tableSlotCount(*indirect) - 1u;
+        }
     }
-    const auto tableSlots = ResourceMaterializer::BindlessSlots();
-    if (activeTables != 0u && plan.info.images.size() + static_cast<std::size_t>(tableSlots - 1u) * activeTables > ShaderInfo::MaxImages) {
-        rejectTable(BindlessRejection::ImageSlots, "bindless image tables need " + std::to_string(plan.info.images.size() + static_cast<std::size_t>(tableSlots - 1u) * activeTables) + " image slots, limit " + std::to_string(ShaderInfo::MaxImages));
+    // APS5_LOOP_TABLE_FIT: loop-counter tables whose loop has no immediate exit bound span the
+    // default limit (32): the pc 0x258 screen pass samples two of them and needs 65 image slots of
+    // 64 (t390, "need 65 image slots", 8-16 per 10 s; "GetImageResource dword 0" with the loop keys
+    // off). Cut every loop table to the largest span that fits; keys at or past it sample zeros,
+    // which a loop whose count stays below the span never reads.
+    std::uint32_t loopSpan = 0;
+    if (activeTables != 0u && imageSlots > ShaderInfo::MaxImages && ResourceMaterializer::LoopTableFit() && loopTableSlotsBounded()) {
+        std::vector<std::uint32_t> loopSlots;
+        std::size_t fixedSlots = plan.info.images.size();
+        for (const auto& image : plan.info.images) {
+            const auto& indirect = plan.descriptorSources[image.source].indirectImage;
+            if (!indirect.has_value() || (image.source < activeSources.size() && activeSources[image.source] == 0u)) continue;
+            if (indirect->loopKey) {
+                loopSlots.push_back(tableSlotCount(*indirect));
+            } else {
+                fixedSlots += tableSlotCount(*indirect) - 1u;
+            }
+        }
+        if (!loopSlots.empty() && fixedSlots <= ShaderInfo::MaxImages) {
+            loopSpan = ResourceMaterializer::LoopTableSpan(static_cast<std::uint32_t>(fixedSlots), loopSlots, ShaderInfo::MaxImages);
+        }
+        if (loopSpan != 0u) {
+            imageSlots = fixedSlots;
+            std::uint64_t fittedTables = 0;
+            std::uint64_t entriesCut = 0;
+            for (const auto slots : loopSlots) {
+                imageSlots += std::min(slots, loopSpan) - 1u;
+                if (slots > loopSpan) {
+                    fittedTables++;
+                    entriesCut += slots - loopSpan;
+                }
+            }
+            bindlessCounters().loopFitted.fetch_add(fittedTables, std::memory_order_relaxed);
+            bindlessCounters().loopEntriesCut.fetch_add(entriesCut, std::memory_order_relaxed);
+        }
+    }
+    if (activeTables != 0u && imageSlots > ShaderInfo::MaxImages) {
+        rejectTable(BindlessRejection::ImageSlots, "bindless image tables need " + std::to_string(imageSlots) + " image slots, limit " + std::to_string(ShaderInfo::MaxImages));
     }
     for (std::uint32_t i = 0; i < plan.info.images.size(); i++) {
         const auto& image = plan.info.images[i];
@@ -505,6 +682,13 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         if (source.indirectImage.has_value()) {
             if (image.source < activeSources.size() && activeSources[image.source] == 0u) {
                 snapshot.images[i].dwordCount = 8u;
+                continue;
+            }
+            if (loopSpan != 0u && source.indirectImage->loopKey && tableSlotCount(*source.indirectImage) > loopSpan) {
+                // The span bounds the table's slots and, behind a raw address, its entries.
+                auto fitted = *source.indirectImage;
+                fitted.entryLimit = loopSpan;
+                resolveTableImage(plan, i, fitted, runtime, walker, snapshot.images[i], tables[i]);
                 continue;
             }
             resolveTableImage(plan, i, *source.indirectImage, runtime, walker, snapshot.images[i], tables[i]);
@@ -522,7 +706,11 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         // walk's last four come from whatever follows it (Demon's Souls: a pointer or floats, read
         // as an array pitch or corner sampling).
         if (image.r128) std::fill(descriptor.dwords.begin() + 4, descriptor.dwords.end(), 0u);
-        if ((!validImageDescriptor(descriptor, image.r128) || !plausibleImageAddress(descriptor)) && !nullImageDescriptor(descriptor)) {
+        // Sampled only: a storage image bound as null would drop its writes silently, so the driver
+        // keeps failing the draw on one.
+        const bool undecodable = image.resourceClass == ImageResourceClass::Sampled && !nullImageDescriptor(descriptor) && undecodableImageBits(descriptor, image.r128);
+        if (undecodable) countNullBound(NullBoundImage::Undecodable);
+        if ((!validImageDescriptor(descriptor, image.r128) || !plausibleImageAddress(descriptor) || undecodable) && !nullImageDescriptor(descriptor)) {
             static std::atomic<int> reports{0};
             if (reports.fetch_add(1, std::memory_order_relaxed) < 32) {
                 const auto& w = descriptor.dwords;
@@ -537,10 +725,13 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         throw std::runtime_error("materialization sources are missing sampler descriptors");
     }
     snapshot.samplers.assign(values.begin() + cursor, values.begin() + cursor + plan.info.samplers.size());
+    return true;
 }
 
 void buildResourceSpecialization(const IrResourcePlan& plan, ResourceSnapshot& snapshot, const std::vector<TableResolution>& tables, ResourceSpecialization& specialization) {
-    ResourceSpecialization result;
+    // Built in place (TryMaterialize's per-thread specialization keeps its capacity).
+    auto& result = specialization;
+    resetSpecialization(result);
     result.buffers.reserve(plan.info.buffers.size());
     for (std::uint32_t i = 0; i < plan.info.buffers.size(); i++) {
         const ShaderBufferResource decoded = decodeBufferDescriptor(snapshot.buffers[i]);
@@ -624,7 +815,56 @@ void buildResourceSpecialization(const IrResourcePlan& plan, ResourceSnapshot& s
     for (std::uint32_t index = 0; index < result.images.size(); index++) {
         result.boundDescriptors.push_back(index);
     }
-    specialization = std::move(result);
+}
+
+// APS5_NO_WALK_REUSE=1: TryMaterialize builds into fresh objects as Materialize does (the A/B of
+// the in-place build).
+bool walkReuse() {
+    static const bool reuse = std::getenv("APS5_NO_WALK_REUSE") == nullptr;
+    return reuse;
+}
+
+// Materialize (quiet false) and TryMaterialize (quiet: false returned for a failed SRT or
+// uniform-fill evaluation, with the same [bindless] report a throw makes on its way out).
+// Materialize builds into fresh objects, moved out once complete (a throw leaves the outputs as
+// they were); TryMaterialize, the fast walk's, builds in place, so the caller's per-thread
+// snapshot and specialization and this thread's scratch keep their capacity (no allocation for
+// them on a walked draw), and a false return or a throw leaves the outputs unspecified.
+bool materialize(const IrResourcePlan& plan, const SrtRuntime& runtime, bool quiet, ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+    if (!plan.resourceTrackingComplete) {
+        throw std::runtime_error("ResourceMaterializer::Materialize requires a completed resource plan");
+    }
+    if (plan.requiresSpecializationMemory && runtime.readMemory == nullptr) {
+        throw std::runtime_error("ResourceMaterializer::Materialize requires runtime memory access for indirect images");
+    }
+    SrtWalker walker;
+    MaterializeScratch localScratch;
+    ResourceSnapshot nextSnapshot;
+    ResourceSpecialization nextSpecialization;
+    const bool inPlace = quiet && walkReuse();
+    auto& scratch = inPlace ? HostThreadLocal<MaterializeScratch, MaterializeScratchTag>() : localScratch;
+    auto& snapshotOut = inPlace ? snapshot : nextSnapshot;
+    auto& specializationOut = inPlace ? specialization : nextSpecialization;
+    bool evaluated = false;
+    try {
+        evaluated = materializeSnapshot(plan, runtime, walker, quiet, scratch, snapshotOut);
+    } catch (...) {
+        reportBindless();
+        throw;
+    }
+    if (!evaluated) {
+        reportBindless();
+        return false;
+    }
+    const auto started = MaterializeProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    buildResourceSpecialization(plan, snapshotOut, scratch.tables, specializationOut);
+    if (MaterializeProfiled()) specializationNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
+    if (!inPlace) {
+        snapshot = std::move(nextSnapshot);
+        specialization = std::move(nextSpecialization);
+    }
+    reportBindless();
+    return true;
 }
 
 }
@@ -890,29 +1130,16 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
 }
 
 void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, ResourceSpecialization& specialization) const {
-    const IrResourcePlan& plan = program;
-    if (!plan.resourceTrackingComplete) {
-        throw std::runtime_error("ResourceMaterializer::Materialize requires a completed resource plan");
+    static_cast<void>(materialize(program, runtime, false, snapshot, specialization));
+}
+
+bool ResourceMaterializer::TryMaterialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, ResourceSpecialization& specialization) const {
+    // Quiet is the express walk's decline only: over the interpreter a false evaluation is a
+    // genuine failure, which Materialize reports.
+    if (!runtime.expressOnly) {
+        throw std::logic_error("ResourceMaterializer::TryMaterialize requires an express-only runtime");
     }
-    if (plan.requiresSpecializationMemory && runtime.readMemory == nullptr) {
-        throw std::runtime_error("ResourceMaterializer::Materialize requires runtime memory access for indirect images");
-    }
-    SrtWalker walker;
-    ResourceSnapshot nextSnapshot;
-    std::vector<TableResolution> tables;
-    try {
-        materializeSnapshot(plan, runtime, walker, nextSnapshot, tables);
-    } catch (...) {
-        reportBindless();
-        throw;
-    }
-    ResourceSpecialization nextSpecialization;
-    const auto started = MaterializeProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    buildResourceSpecialization(plan, nextSnapshot, tables, nextSpecialization);
-    if (MaterializeProfiled()) specializationNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
-    snapshot = std::move(nextSnapshot);
-    specialization = std::move(nextSpecialization);
-    reportBindless();
+    return materialize(program, runtime, true, snapshot, specialization);
 }
 
 std::uint64_t ResourceMaterializer::SpecializationNanoseconds() {
@@ -930,6 +1157,49 @@ std::uint32_t ResourceMaterializer::BindlessSlots() {
 
 void ResourceMaterializer::CountBindlessRejection(BindlessRejection reason) {
     if (reason < BindlessRejection::Count) bindlessCounters().rejected[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+bool ResourceMaterializer::NullUndecodable() {
+    static const bool enabled = std::getenv("APS5_NULL_UNDECODABLE") != nullptr;
+    return enabled;
+}
+
+bool ResourceMaterializer::StrictLoopTables() {
+    static const bool enabled = std::getenv("APS5_NO_STRICT_LOOP_TABLES") == nullptr;
+    return enabled;
+}
+
+bool ResourceMaterializer::StrictTableEntries() {
+    static const bool enabled = std::getenv("APS5_NO_STRICT_TABLE_ENTRIES") == nullptr;
+    return enabled;
+}
+
+// Default on since t447/t448 (the R3 thrown draws served, picture clean): APS5_LOOP_TABLE_FIT=0 or
+// APS5_NO_LOOP_TABLE_FIT=1 restores the opt-in loop keys (off unless APS5_LOOP_TABLE_KEYS=1).
+bool ResourceMaterializer::LoopTableFit() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_LOOP_TABLE_FIT");
+        if (value != nullptr && *value != '\0') return std::strcmp(value, "0") != 0;
+        const char* off = std::getenv("APS5_NO_LOOP_TABLE_FIT");
+        return off == nullptr || *off == '\0' || std::strcmp(off, "0") == 0;
+    }();
+    return enabled;
+}
+
+std::uint32_t ResourceMaterializer::LoopTableSpan(std::uint32_t fixedSlots, const std::vector<std::uint32_t>& loopSlots, std::uint32_t limit) {
+    if (fixedSlots > limit) return 0u;
+    std::uint32_t span = 1u;
+    for (const auto slots : loopSlots) span = std::max(span, slots);
+    for (; span >= 1u; span--) {
+        std::uint64_t needed = fixedSlots;
+        for (const auto slots : loopSlots) needed += std::min(slots, span) - 1u;
+        if (needed <= limit) return span;
+    }
+    return 0u;
+}
+
+std::uint64_t ResourceMaterializer::TakeNullBound(NullBoundImage reason) {
+    return reason < NullBoundImage::Count ? nullBoundCounts[static_cast<std::size_t>(reason)].exchange(0, std::memory_order_relaxed) : 0u;
 }
 
 bool ResourceSpecialization::Buffer::operator==(const Buffer& other) const {

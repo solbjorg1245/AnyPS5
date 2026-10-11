@@ -85,6 +85,7 @@ std::uint64_t ExpressWalkNanoseconds();
 // EvaluateRuntimeSourcesImpl does for them, reading memory through runtime.expressRead
 // (a reader that returns false to decline the read: ReadBailed). Ran means results, flat and
 // activeSources hold what the interpreter computes; any other outcome leaves them unspecified.
+// They are written in place (the fast walk's per-thread vectors keep their capacity).
 WalkOutcome ExecuteWalkProgram(const WalkProgram& program, const IrResourcePlan& plan, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources);
 
 }

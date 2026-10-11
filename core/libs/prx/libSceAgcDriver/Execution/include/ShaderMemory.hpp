@@ -161,6 +161,39 @@ bool WordsEqualIgnoring(std::span<const std::uint32_t> a, std::span<const std::u
 // Whether two guest descriptors of `binding` are equal apart from the T# don't-care bits of a
 // sampled-image binding's elements (any other binding: exactly).
 bool SameDescriptorIgnoringTsharpBits(const ShaderRecompiler::DescriptorBinding& binding, std::span<const std::uint32_t> left, std::span<const std::uint32_t> right);
+// Whether a FlattenedSrt word `leftWord` of the `left` bindings and `rightWord` at the same place
+// of the `right` bindings (the same layout) differ only as the flat copy of a sampled T#'s
+// don't-care bits: some sampled-image element (a GuestImages / SampledImage binding of both) holds
+// leftWord on the left and rightWord on the right as its word 5 or 6, and the two differ only in
+// that word's mask (TsharpWord5IgnoredBits / TsharpWord6IgnoredBits). A shader that reads a T# as
+// data too gets its words in the flat SRT; a hit the stage compare accepted through the mask binds
+// the stored copy there (DispatchVariant::ignoredBits), a fresh walk the live one.
+bool FlatTsharpFeedbackCopy(std::span<const ShaderRecompiler::DescriptorBinding> left, std::span<const ShaderRecompiler::DescriptorBinding> right, std::uint32_t leftWord, std::uint32_t rightWord);
+
+// Deferred flat words and the run layout (APS5_DRAW_ENTRY_RUNS_CHECK). A capture leaves a pure
+// flat leaf on a page with a pending GPU write to the GPU (ShaderMemory::deferPureLeaf: the word
+// is copied per draw), so the word lies in no run of its variant; a later capture of the same
+// draw, once nothing pending overlaps the word, reads it and holds one more run (vertex program
+// 0x249376600: 2 runs / 16 words stored, 3 / 17-18 fresh, t264 and t453). The key and the stage
+// compare see only the runs, so they cannot tell. The sorted guest addresses of the deferred
+// words of `bindings`.
+std::vector<std::uint64_t> DeferredFlatAddresses(std::span<const ShaderRecompiler::DescriptorBinding> bindings);
+// Whether two captures' runs and words hold the same words at the same addresses once the words
+// at `deferred` (sorted) are left out of both, apart from the stored side's `ignored` bits
+// (positions in `storedWords`): their layouts differ only by words one of them left to the GPU.
+bool RunsEqualBesideDeferred(std::span<const std::pair<std::uint64_t, std::uint64_t>> storedRuns, std::span<const std::uint32_t> storedWords, std::span<const std::pair<std::uint64_t, std::uint64_t>> freshRuns, std::span<const std::uint32_t> freshWords, std::span<const std::uint64_t> deferred, std::span<const std::pair<std::uint32_t, std::uint32_t>> ignored);
+// Whether some deferred word of `bindings` is no longer under a pending GPU write (`pending`:
+// (address, bytes) -> whether a pending write overlaps): a capture now reads that word into a
+// run, so the variant's runs are not the layout a capture of the draw produces.
+template <class Pending>
+bool DeferredWordLapsed(std::span<const ShaderRecompiler::DescriptorBinding> bindings, Pending&& pending) {
+    for (const auto& binding : bindings) {
+        for (const auto& [slot, address] : binding.deferredWords) {
+            if (!pending(address, sizeof(std::uint32_t))) return true;
+        }
+    }
+    return false;
+}
 
 // Buffer base slots of a variant's stored words: for each read-only guest-buffer V# (a 4-word
 // element of a GuestBuffers binding the shader proves it never stores to) whose base is located
@@ -200,6 +233,16 @@ inline std::uint32_t PatchMaskAt(std::span<const WordPatchSlot> slots, std::uint
     const auto it = std::lower_bound(slots.begin(), slots.end(), position, [](const WordPatchSlot& slot, std::uint32_t value) { return slot.position < value; });
     return it != slots.end() && it->position == position ? it->mask : 0u;
 }
+
+// What a deep copy of a compiled result copies: the bytes of its bindings and of every vector they
+// and the result hold (a vector<bool> at a bit per element, rounded up to bytes), and one
+// allocation per non-empty vector; the SPIR-V words are shared (SharedSpirv) and count nowhere.
+// For the dispatch cache's validate-path copy counters (Driver::lookupDispatch, APS5_PROFILE_DRAW).
+struct CopyCost {
+    std::uint64_t bytes = 0;
+    std::uint64_t allocations = 0;
+};
+CopyCost ResultCopyCost(const ShaderRecompiler::RecompileResult& result);
 
 }
 

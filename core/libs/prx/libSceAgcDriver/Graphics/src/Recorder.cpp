@@ -1,20 +1,25 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/shaders/CopyBackDiff_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4Opcodes.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -33,12 +38,41 @@ namespace {
 
 Recorder* activeRecorder = nullptr;
 
+// Pending blocks (Recorder::BlockPending): one slot per 64 KiB block, hashed over 2^18 slots
+// (16 GiB of distinct blocks), allocated on the first TrackPendingBlocks(true).
+constexpr unsigned PendingBlockShift = 16;
+constexpr std::size_t PendingBlockSlots = std::size_t{1} << 18;
+std::atomic<bool> pendingBlocksOn{false};
+std::atomic<std::atomic<std::uint64_t>*> pendingBlockTable{nullptr};
+std::atomic<std::uint64_t> completedBlockSerial{0};
+// Some recorder was made with APS5_RESIDENT_READS (Recorder::ResidentReadsConfigured).
+std::atomic<bool> residentReadsConfigured{false};
+// Some recorder was made with resident written ranges on (APS5_RESIDENT_WRITES, on by default;
+// Recorder::ResidentWritesConfigured).
+std::atomic<bool> residentWritesConfigured{false};
+
+void trackPendingBlocksFromEnvironment() {
+    static const bool tracked = [] {
+        const char* every = std::getenv("APS5_FAST_WALK");
+        // The fast draw (APS5_FAST_DRAW, F3b) binds what its walk reads: it needs the same guard.
+        const char* fastDraw = std::getenv("APS5_FAST_DRAW");
+        if ((every != nullptr && std::strtoul(every, nullptr, 0) != 0) || (fastDraw != nullptr && std::strcmp(fastDraw, "0") != 0)) Recorder::TrackPendingBlocks(true);
+        // The fast dispatch (F5) walks with the same reader.
+        const char* dispatch = std::getenv("APS5_FAST_DISPATCH");
+        if (dispatch != nullptr && std::strcmp(dispatch, "0") != 0) Recorder::TrackPendingBlocks(true);
+        return true;
+    }();
+    static_cast<void>(tracked);
+}
+
 bool DrawProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return profiled;
 }
 
 std::uint64_t syncCounts[5] = {};
+// What BoundKeptBytes did (Recorder::KeptBoundTotals), under the GpuMutex like syncCounts.
+Recorder::KeptBoundCounts keptBound;
 // Fence wait time by sync source (APS5_PROFILE_DRAW), and the source CountSync announced for the
 // Sync/SyncThrough that follows it on this thread.
 double syncWaitedMs[5] = {};
@@ -94,6 +128,13 @@ void CountSiteWait(double ms) {
     ++entry.batches;
     entry.waitedMs += ms;
 }
+
+// Restores the thread's active sync-site entry on every exit path (a Check throw on a lost device
+// included), so the next sync on the thread is not attributed to this one's site.
+struct RestoreSyncSite {
+    std::size_t site;
+    ~RestoreSyncSite() { activeSyncSite = site; }
+};
 
 // The sites by wait, longest first, as "source@+offset syncs/batches/wait" (offsets symbolize with
 // nm against the driver's image like the [guestmem] callers; +0x0 is the overflow entry).
@@ -285,6 +326,14 @@ struct DeferredBatch {
 };
 struct DeferredBatchesTag {};
 auto& DeferredBatches() { return HostThreadLocal<std::vector<DeferredBatch>, DeferredBatchesTag>(); }
+struct DeferredBytesTag {};
+auto& DeferredBytes() { return HostThreadLocal<std::size_t, DeferredBytesTag>(); }
+std::vector<DeferredBatch> TakeDeferred() {
+    auto taken = std::move(DeferredBatches());
+    DeferredBatches().clear();
+    DeferredBytes() = 0;
+    return taken;
+}
 std::atomic<std::uint64_t> deferredPending{0};
 // APS5_PROFILE_DRAW, for the [recorder] line: batches and objects released after an unlock and the
 // time that took, on the release thread and inline (on the unlocking thread: the kill switch, a
@@ -403,8 +452,7 @@ void ReleaseDeferredKeeps() {
     if (DeferredBatches().empty()) return;
     // Taken off the thread's list first: a destructor that took and released the mutex (none is
     // known to) would re-enter here and must find nothing.
-    auto releasing = std::move(DeferredBatches());
-    DeferredBatches().clear();
+    auto releasing = TakeDeferred();
     if (ReleaseOnUnlock()) {
         DestroyDeferred(std::move(releasing), false);
         return;
@@ -505,6 +553,112 @@ bool LateTrustEnabled() {
 // Store-run and queued-label counters (Recorder::StoreCounts), relaxed: they are only reported.
 std::atomic<std::uint64_t> storeCount{0}, storeRuns{0}, storesJoined{0}, storesReplaced{0}, storeWawBarriers{0}, storeJoinsRefused{0};
 std::atomic<std::uint64_t> keyStoreCount{0}, keyStoreRuns{0}, keyStoreRunsForWriter{0}, keyStoresJoined{0};
+// Deferred copy-back counters (Recorder::CopyBackCounts), relaxed likewise.
+std::atomic<std::uint64_t> copyBacksDeferred{0}, copyBackBytesDeferred{0}, copyBacksOverwritten{0}, copyBackBytesOverwritten{0}, copyBacksRecorded{0}, copyBackBytesRecorded{0}, copyBackPasses{0};
+// Dispatch overlap (Recorder::DispatchOverlap): the order spans handed out, this thread's span,
+// packet count and whether its current packet is DISPATCH_DIRECT; the trails deferred, elided
+// and recorded late by reason (TrailReason).
+std::atomic<std::uint64_t> guestOrderSpans{0};
+struct GuestOrderState {
+    std::uint64_t span = 0;
+    std::uint64_t packet = 0;
+    bool dispatch = false;
+};
+thread_local GuestOrderState guestOrderState;
+std::atomic<std::uint64_t> trailsDeferred{0}, trailsElided{0};
+std::array<std::atomic<std::uint64_t>, 4> trailsRecorded{};
+// Narrow copy-backs (Recorder::NarrowsCopyBacks): copies recorded with a baseline, the spans they
+// made (back-to-back copies of one shadow joined) and the bytes compared, spans copied whole, the
+// compare dispatches, and the dwords the passes stored (counted under profiling only).
+std::atomic<std::uint64_t> copyBacksNarrow{0}, copyBackNarrowSpans{0}, copyBackBytesNarrow{0}, copyBacksNarrowWhole{0}, copyBackNarrowDispatches{0}, copyBackNarrowStoredWords{0};
+// APS5_NARROW_VERIFY: dwords the compare passes found stale (import != shadow == baseline).
+std::atomic<std::uint64_t> copyBackNarrowStaleWords{0};
+// Resident written ranges' lands recorded (Recorder::ResidentLandCounts): by reason, then bytes.
+std::array<std::atomic<std::uint64_t>, 9> residentLands{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Recorder::FlushReason::Count)> copyBackFlushes{};
+// Command passes by CommandSite, and the aware commands' counters (Recorder::CopyBackCounts): the
+// commands that left copies queued, the copies and bytes they left, the copies they recorded.
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Recorder::CommandSite::Count)> commandPasses{};
+std::atomic<std::uint64_t> awareCommandsKeeping{0}, awareCopiesKept{0}, awareBytesKept{0}, awareCopiesFlushed{0};
+std::atomic<bool> awareCommandsUsed{false};
+// Resident buffers (Recorder::KeepsResidentBuffers): counters (relaxed, on the [barriers] line),
+// the bytes kept resident at the last decision, and the live guards by sequence, which the fault
+// path searches (a guard's last holder may be a completed batch, released without the GPU mutex).
+std::atomic<std::uint64_t> residentMade{0}, residentMadeBytes{0}, residentSkipped{0}, residentRefused{0}, residentRemapFlushes{0}, residentFaults{0}, residentUnderLock{0}, residentResolved{0}, residentLanded{0}, residentForced{0}, residentWaitedLanding{0};
+// Resident copies recorded at a decision because a forced release took their guard; the time
+// faulting threads spent in the resolver (queue and GPU mutex included), and the part of it spent
+// landing (Submit first, waits for running batches, the landing submission and its wait).
+std::atomic<std::uint64_t> residentUnguarded{0}, residentFaultNanos{0}, residentLandNanos{0};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Recorder::FlushReason::Count)> residentRecorded{};
+std::atomic<std::uint64_t> residentKeptBytes{0};
+std::atomic<bool> residentUsed{false};
+HostMutex residentMutex;
+std::map<std::uint64_t, Recorder::ResidentGuard*> residentGuards;
+std::uint64_t residentSequence = 0;
+constexpr std::uint64_t ResidentPageBytes = 4096;
+
+// The resident fault resolver. A fault arrives on the stack that faulted, a title's 16 KiB job fiber
+// among them (docs/research/loading-deaths-2.md), too small for a submission and its wait in the
+// Vulkan driver: a thread that does not hold the GPU mutex queues the fault here and waits. One
+// thread for the process, started with the first resident recorder and leaked like the release
+// queue; a request lives on the waiter's stack until it is done.
+struct ResidentResolver {
+    struct Request {
+        std::uintptr_t address = 0;
+        bool done = false;
+        bool result = false;
+        Request* next = nullptr;
+    };
+    std::mutex mutex;
+    std::condition_variable wake, finished;
+    Request* first = nullptr;
+    Request* last = nullptr;
+};
+
+void ResidentResolverMain(ResidentResolver& resolver) {
+    CpuTopology::PinHelperThread("resident resolver");
+    std::unique_lock lock(resolver.mutex);
+    for (;;) {
+        resolver.wake.wait(lock, [&] { return resolver.first != nullptr; });
+        auto* request = resolver.first;
+        resolver.first = request->next;
+        if (resolver.first == nullptr) resolver.last = nullptr;
+        lock.unlock();
+        const bool result = Recorder::ResolveResidentFaultHere(request->address);
+        lock.lock();
+        request->result = result;
+        request->done = true;
+        resolver.finished.notify_all();
+    }
+}
+
+ResidentResolver& ResidentResolverQueue() {
+    static ResidentResolver* const resolver = [] {
+        auto* made = new ResidentResolver;
+        HostThread thread([made] { ResidentResolverMain(*made); });
+        thread.detach();
+        return made;
+    }();
+    return *resolver;
+}
+
+// APS5_RESIDENT_BUFFER_MIB (256): what resident copies may hold back at once;
+// APS5_RESIDENT_BUFFER_BATCHES (16): the batches after its use's past which one is recorded.
+std::uint64_t ResidentCapBytes() {
+    static const std::uint64_t cap = [] {
+        const char* value = std::getenv("APS5_RESIDENT_BUFFER_MIB");
+        return (value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : 256ull) << 20;
+    }();
+    return cap;
+}
+
+std::uint64_t ResidentMaxBatches() {
+    static const std::uint64_t batches = [] {
+        const char* value = std::getenv("APS5_RESIDENT_BUFFER_BATCHES");
+        return value != nullptr && *value != '\0' ? std::max<std::uint64_t>(1, std::strtoull(value, nullptr, 10)) : 16ull;
+    }();
+    return batches;
+}
 
 // Debug aid: APS5_DCC_KEYS_EACH=1 records every DCC key store at once (see Recorder::QueueKeyStore).
 bool KeyStoresEach() {
@@ -1102,6 +1256,82 @@ const char* Recorder::WriteKindName(WriteKind kind) {
 }
 
 Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)) {
+    trackPendingBlocksFromEnvironment();
+    blockSerialBase = (id + 1) << 40u;
+    // Per recorder (not a static): a test makes one with the switch set. Coalescing and narrow
+    // copy-backs are on by default: APS5_<name>=0 or APS5_NO_<name>=1 turns one off, APS5_<name>=1
+    // forces it on (over the opt-out); unset or empty leaves the default.
+    const auto defaultOn = [](const char* name, const char* optOut) {
+        const char* value = std::getenv(name);
+        if (value != nullptr && *value != '\0') return std::strcmp(value, "0") != 0;
+        const char* off = std::getenv(optOut);
+        return off == nullptr || *off == '\0' || std::strcmp(off, "0") == 0;
+    };
+    coalesceCopyBacks = defaultOn("APS5_COALESCE_COPY_BACKS", "APS5_NO_COALESCE_COPY_BACKS");
+    // Resident buffers build on coalescing, which they turn on.
+    const char* resident = std::getenv("APS5_RESIDENT_BUFFERS");
+    residentBuffers = resident != nullptr && *resident != '\0' && std::strcmp(resident, "0") != 0;
+    // Narrow copy-backs: with coalescing (disjoint queued copies) or no deferral at all (each use's
+    // own merged ranges); not with the old deferral alone, whose queued copies may overlap.
+    narrowCopyBacks = defaultOn("APS5_NARROW_COPY_BACKS", "APS5_NO_NARROW_COPY_BACKS");
+    const char* verify = std::getenv("APS5_NARROW_VERIFY");
+    narrowVerify = verify != nullptr && *verify != '\0' && std::strcmp(verify, "0") != 0;
+    // A CPU device (lavapipe) lands a kept copy with CPU stores into the guarded pages: the fault
+    // would wait for the very batch that faulted. Resident buffers need a device whose writes into
+    // host imports pass host page protection (a real GPU's DMA).
+    if (residentBuffers && context.softwareDevice) {
+        residentBuffers = false;
+        static std::once_flag warned;
+        std::call_once(warned, [] { std::fprintf(stderr, "[gpu] APS5_RESIDENT_BUFFERS ignored: a CPU Vulkan device writes host imports through page protection\n"); });
+    }
+    // Resident read-only copies (KeepsResidentReads): plain GPU copies, independent of the
+    // copy-back switches above.
+    const char* residentReadsSwitch = std::getenv("APS5_RESIDENT_READS");
+    residentReads.enabled = residentReadsSwitch != nullptr && *residentReadsSwitch != '\0' && std::strcmp(residentReadsSwitch, "0") != 0;
+    if (residentReads.enabled) {
+        residentReadsConfigured.store(true, std::memory_order_relaxed);
+        const auto kib = [](const char* name, std::uint64_t fallback) {
+            const char* value = std::getenv(name);
+            return (value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : fallback) << 10u;
+        };
+        const char* verifyReads = std::getenv("APS5_RESIDENT_READS_VERIFY");
+        residentReads.verifyEvery = verifyReads != nullptr && *verifyReads != '\0' ? static_cast<std::uint32_t>(std::strtoul(verifyReads, nullptr, 10)) : 0;
+        residentReads.limitBytes = kib("APS5_RESIDENT_READS_MIB", 1024) << 10u;
+        residentReads.minBytes = kib("APS5_RESIDENT_READS_MIN_KIB", 4);
+        residentReads.maxBytes = kib("APS5_RESIDENT_READS_MAX_KIB", 16384);
+    }
+    if (residentBuffers) {
+        coalesceCopyBacks = true;
+        residentGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        residentUsed.store(true, std::memory_order_relaxed);
+        static_cast<void>(ResidentResolverQueue());
+        GuestWriteWatch::GuestPageGuardInstall_nid_postfix(&Recorder::ResolveResidentFault);
+    }
+    // Resident written ranges (KeepsResidentWrites): their lands are queued narrow copy-backs
+    // (coalescing; narrow copy-backs are checked when asked), never kept resident past a batch.
+    // On by default (S12), as are S11's demotion and the aware commands below: APS5_<name>=0 or
+    // APS5_NO_<name>=1 turns one off (APS5_NO_RESIDENT_WRITES=1 takes the demotion with it),
+    // APS5_<name>=1 forces it on (over the opt-out); unset or empty leaves the default.
+    residentWrites.enabled = coalesceCopyBacks && !residentBuffers && defaultOn("APS5_RESIDENT_WRITES", "APS5_NO_RESIDENT_WRITES");
+    if (residentWrites.enabled) {
+        residentWritesConfigured.store(true, std::memory_order_relaxed);
+        const auto number = [](const char* name, std::uint64_t fallback) {
+            const char* value = std::getenv(name);
+            return value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : fallback;
+        };
+        residentWrites.uses = static_cast<std::uint32_t>(std::max<std::uint64_t>(number("APS5_RESIDENT_WRITES_USES", 8), 1));
+        residentWrites.limitBytes = number("APS5_RESIDENT_WRITES_MIB", 512) << 20u;
+        const auto verify = number("APS5_RESIDENT_WRITES_VERIFY", 0);
+        residentWrites.verifyEvery = static_cast<std::uint32_t>(verify == 1 ? 16 : verify);
+        residentWrites.roundOut = number("APS5_RESIDENT_WRITES_ROUND", 1) != 0;
+        residentWrites.demote = defaultOn("APS5_RESIDENT_WRITES_DEMOTE", "APS5_NO_RESIDENT_WRITES_DEMOTE");
+        residentWrites.retrySeconds = static_cast<std::uint32_t>(std::min<std::uint64_t>(number("APS5_RESIDENT_WRITES_RETRY_S", 30), 86400));
+    }
+    // Aware commands (CommandsTouching): on coalescing's disjoint queue (resident buffers' too).
+    awareCommands = coalesceCopyBacks && defaultOn("APS5_AWARE_COMMANDS", "APS5_NO_AWARE_COMMANDS");
+    if (awareCommands) awareCommandsUsed.store(true, std::memory_order_relaxed);
+    // The compare pass and the shadows' baselines are addressed by buffer device address.
+    if (narrowCopyBacks && ((!coalesceCopyBacks && DeferCopyBacks()) || !context.bufferDeviceAddress)) narrowCopyBacks = false;
     {
         std::lock_guard lock(liveRecordersMutex);
         liveRecorders.push_back(id);
@@ -1136,6 +1366,8 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
 
 Recorder::~Recorder() {
     try {
+        // Resident copies outlive Submit: recorded now, so Sync lands them before their guards go.
+        if (residentBuffers && HasDeferredCopies()) flushDeferredCopies(true, FlushReason::Submit);
         Sync();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[gpu] recorder teardown: %s\n", error.what());
@@ -1169,11 +1401,7 @@ Recorder::~Recorder() {
     // other threads (an unlock hook that found the queue stopping or full) are waited for before
     // the caller destroys the device. The count is global: a newer recorder's batches (device
     // replacement) are waited for too, which only prolongs the spin.
-    if (!DeferredBatches().empty()) {
-        auto own = std::move(DeferredBatches());
-        DeferredBatches().clear();
-        DestroyDeferred(std::move(own), false);
-    }
+    if (!DeferredBatches().empty()) DestroyDeferred(TakeDeferred(), false);
     JoinReleaseThread();
     while (deferredPending.load(std::memory_order_acquire) != 0) std::this_thread::yield();
     {
@@ -1191,6 +1419,12 @@ Recorder::~Recorder() {
     // Sync() above waited for every batch, so no submission still signals the timeline.
     if (timeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, timeline, nullptr);
     timeline = VK_NULL_HANDLE;
+    // The narrow copy-backs' compare pass, recorded only into batches Sync() completed.
+    if (narrowPipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, narrowPipeline, nullptr);
+    if (narrowLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, narrowLayout, nullptr);
+    narrowPipeline = VK_NULL_HANDLE;
+    narrowLayout = VK_NULL_HANDLE;
+    narrowStored.reset();
 }
 
 std::optional<std::chrono::steady_clock::time_point> Recorder::PendingLabelSince() {
@@ -1229,6 +1463,9 @@ Recorder* Recorder::Active() {
 
 void Recorder::Activate() {
     activeRecorder = this;
+    // Marks of earlier recorders (lower offsets) read completed from here on; a recorder activated
+    // again restores its own completed serial, below a later recorder's marks (they read pending).
+    if (PendingBlocksTracked()) completedBlockSerial.store(blockSerialBase + blocksFinished, std::memory_order_release);
     {
         std::lock_guard tableLock(labelTableMutex);
         labelTableOwner = this;
@@ -1246,6 +1483,24 @@ std::optional<std::uint64_t> Recorder::LookupLabelValue(std::uint64_t address, s
     const auto hit = LookupLabel(address, bytes, afterStamp);
     if (!hit.has_value()) return std::nullopt;
     return hit->value;
+}
+
+bool Recorder::LabelValueIn(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes) return bytes != 0;
+    const auto first = address & ~std::uint64_t{3};
+    const auto limit = address + bytes;
+    std::lock_guard tableLock(labelTableMutex);
+    if (labelTableOwner == nullptr) return false;
+    const auto& owner = *labelTableOwner;
+    // A dword no table tracks has no value; each tracked one is looked up as LookupLabelValue does
+    // (its own queue's queued entry first, then the recorded one, with the same refusals).
+    for (const auto* table : {&owner.labels, &owner.queuedLabels}) {
+        for (auto it = table->lower_bound(first); it != table->end() && it->first < limit; ++it) {
+            if (it->first % 4 != 0) continue;
+            if (owner.lookupLabel(it->first, 4, 0, nullptr, false).has_value()) return true;
+        }
+    }
+    return false;
 }
 
 bool Recorder::LateTrust() {
@@ -1330,10 +1585,77 @@ bool Recorder::SnapshotWriteOverlaps(std::uint64_t address, std::size_t bytes) {
     return AgcDriver::Graphics::SnapshotOverlaps(address, bytes);
 }
 
+void Recorder::TrackPendingBlocks(bool enabled) {
+    static HostMutex mutex;
+    std::lock_guard lock(mutex);
+    if (enabled && pendingBlockTable.load(std::memory_order_acquire) == nullptr) {
+        auto* table = new std::atomic<std::uint64_t>[PendingBlockSlots];
+        for (std::size_t slot = 0; slot < PendingBlockSlots; ++slot) table[slot].store(0, std::memory_order_relaxed);
+        pendingBlockTable.store(table, std::memory_order_release);
+    }
+    pendingBlocksOn.store(enabled, std::memory_order_release);
+}
+
+bool Recorder::PendingBlocksTracked() {
+    return pendingBlocksOn.load(std::memory_order_acquire);
+}
+
+bool Recorder::BlockPending(std::uint64_t address) {
+    if (!PendingBlocksTracked()) return false;
+    const auto* table = pendingBlockTable.load(std::memory_order_acquire);
+    if (table == nullptr) return false;
+    const auto completed = completedBlockSerial.load(std::memory_order_acquire);
+    return table[(address >> PendingBlockShift) & (PendingBlockSlots - 1)].load(std::memory_order_acquire) > completed;
+}
+
+std::uint64_t Recorder::CompletedSerial() {
+    return completedBlockSerial.load(std::memory_order_acquire);
+}
+
+bool Recorder::ResidentReadsConfigured() {
+    return residentReadsConfigured.load(std::memory_order_relaxed);
+}
+
+bool Recorder::ResidentWritesConfigured() {
+    return residentWritesConfigured.load(std::memory_order_relaxed);
+}
+
+void Recorder::markPendingBlocks(std::uint64_t address, std::uint64_t end, std::uint64_t serial) const {
+    if (!PendingBlocksTracked() || activeRecorder != this || end <= address) return;
+    auto* table = pendingBlockTable.load(std::memory_order_acquire);
+    if (table == nullptr) return;
+    const auto value = blockSerialBase + serial;
+    const auto first = address >> PendingBlockShift;
+    // A range over more blocks than slots marks every slot once.
+    const auto count = std::min<std::uint64_t>(((end - 1) >> PendingBlockShift) - first + 1, PendingBlockSlots);
+    for (std::uint64_t block = first; block < first + count; ++block) {
+        auto& slot = table[block & (PendingBlockSlots - 1)];
+        auto seen = slot.load(std::memory_order_relaxed);
+        while (seen < value && !slot.compare_exchange_weak(seen, value, std::memory_order_release, std::memory_order_relaxed)) {
+        }
+    }
+}
+
+void Recorder::noteBlocksFinished(std::uint64_t serial) {
+    if (!PendingBlocksTracked() || serial == 0) return;
+    // A completion that finished later batches (a nested sync) must not clear this batch's blocks
+    // while its completions run: only serials with every earlier batch finished count.
+    for (const auto* other : finishing) {
+        if (other->serial != 0 && other->serial < serial) serial = other->serial - 1;
+    }
+    if (serial <= blocksFinished) return;
+    blocksFinished = serial;
+    if (activeRecorder == this) completedBlockSerial.store(blockSerialBase + serial, std::memory_order_release);
+}
+
 bool Recorder::QueuedLabelOverlapsThisThread(std::uint64_t address, std::size_t bytes) {
     if (QueuedLabelRanges().empty() || !QueuedLabelOverlaps(address, bytes)) return false;
     queuedLabelPageQueries.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+bool Recorder::QueuedLabelOverlapsThisThreadUncounted(std::uint64_t address, std::size_t bytes) {
+    return !QueuedLabelRanges().empty() && QueuedLabelOverlaps(address, bytes);
 }
 
 std::shared_ptr<const Recorder::WriteRanges> Recorder::PendingWriteSnapshot() {
@@ -1363,13 +1685,55 @@ std::uint64_t Recorder::ReapsWithWork() {
     return holdCounters.reapsWithWork;
 }
 
-VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
+VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess, CommandSite site) {
+    commandSite = static_cast<std::uint8_t>(site);
+    return commandsFor(coveredAccess, false);
+}
+
+VkCommandBuffer Recorder::CommandsKeepingCopyBacks(VkAccessFlags* coveredAccess) {
+    commandSite = static_cast<std::uint8_t>(CommandSite::Other);
+    return commandsFor(coveredAccess, coalesceCopyBacks);
+}
+
+VkCommandBuffer Recorder::commandsTouching(const std::function<bool(std::uint64_t, std::uint64_t)>* touches, CommandSite site, VkAccessFlags* coveredAccess) {
+    commandSite = static_cast<std::uint8_t>(site);
     ensureOpen();
-    flushDeferredCopies();
+    if (HasDeferredCopies()) {
+        // The queued copies over the caller's ranges first (resident and land copies alike), and
+        // every claimed one, as Commands() records them (the claims of a build still recording
+        // keep its rule): a command pass of its site. Only those over the ranges count as flushed
+        // (the predicate runs once per copy).
+        std::uint64_t over = 0;
+        FlushDeferredWhere([&](const DeferredCopy& copy, bool claimed) {
+            const bool touched = touches != nullptr && (*touches)(copy.address, copy.address + copy.bytes);
+            if (touched) ++over;
+            return touched || claimed;
+        }, FlushReason::Command);
+        awareCopiesFlushed.fetch_add(over, std::memory_order_relaxed);
+        // The others stay queued, whole and in order (the queue stays disjoint).
+        if (HasDeferredCopies()) {
+            awareCommandsKeeping.fetch_add(1, std::memory_order_relaxed);
+            awareCopiesKept.fetch_add(deferredCopies.size() + claimedCopies.size(), std::memory_order_relaxed);
+            awareBytesKept.fetch_add(DeferredCopyBytes(), std::memory_order_relaxed);
+        }
+    }
+    return commandsFor(coveredAccess, true);
+}
+
+VkCommandBuffer Recorder::commandsFor(VkAccessFlags* coveredAccess, bool keepCopyBacks) {
+    ensureOpen();
+    // Coalescing: a caller that checks nothing may touch any queued copy's bytes, claimed or not.
+    if (!keepCopyBacks) flushDeferredCopies(coalesceCopyBacks, FlushReason::Command);
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
     // for a caller whose ranges overlap a queued store: FlushStores).
     if (open->renderPass.open) endOpenRenderPass();
+    // A dispatch's pending trailing barrier goes in first, except for the one call its holder
+    // (a dispatch of the same order span) makes.
+    if (open->trail.pending) {
+        if (open->trail.held) open->trail.held = false;
+        else recordDispatchTrail(TrailReason::Command);
+    }
     if (open->run.open && !LabelRunsPerBatch()) closeStoreRun();
     if (coveredAccess != nullptr) *coveredAccess = open->coveredAccess;
     open->coveredAccess = 0;
@@ -1381,19 +1745,194 @@ bool Recorder::DeferCopyBacks() {
     return enabled;
 }
 
-void Recorder::DeferCopies(std::vector<DeferredCopy> copies) {
-    if (copies.empty()) return;
-    ensureOpen();
-    deferredCopies.insert(deferredCopies.end(), std::make_move_iterator(copies.begin()), std::make_move_iterator(copies.end()));
-}
+// A resident copy's guard (Recorder::KeepsResidentBuffers): the copy of the whole pages a fault
+// lands, the recorder that made it (its buffers are that device's), the page guard's id, the serials of the batch holding the use that wrote the shadow and
+// of the batch recording the copy (0 until recorded), and whether a fault landed it. The fields
+// change under the GPU mutex; residentGuards lets the fault path find the live guards.
+struct Recorder::ResidentGuard {
+    ResidentGuard() = default;
+    ResidentGuard(const ResidentGuard&) = delete;
+    ResidentGuard& operator=(const ResidentGuard&) = delete;
+    ~ResidentGuard() {
+        {
+            std::lock_guard lock(residentMutex);
+            residentGuards.erase(sequence);
+        }
+        GuestWriteWatch::GuestPageGuardRelease_nid_postfix(id);
+    }
+    DeferredCopy copy;
+    const Recorder* owner = nullptr;
+    std::uint64_t id = 0;
+    std::uint64_t sequence = 0;
+    std::uint64_t useSerial = 0;
+    std::uint64_t landingSerial = 0;
+    bool resolved = false;
+};
 
 namespace {
+// Restores the lands' reason (Recorder::landReason) when a scope ends.
+struct RestoreLandReason {
+    std::uint8_t& slot;
+    std::uint8_t saved;
+    ~RestoreLandReason() { slot = saved; }
+};
+
 // Moves the copies of `from` whose source is `sourceKey` to the end of `to`.
 void moveCopies(std::vector<Recorder::DeferredCopy>& from, std::vector<Recorder::DeferredCopy>& to, const std::function<bool(const Recorder::DeferredCopy&)>& selected) {
     const auto kept = std::stable_partition(from.begin(), from.end(), [&](const Recorder::DeferredCopy& copy) { return !selected(copy); });
     to.insert(to.end(), std::make_move_iterator(kept), std::make_move_iterator(from.end()));
     from.erase(kept, from.end());
 }
+
+// Coalescing: drops the guest bytes [begin, end), which a later copy stores again, from the queued
+// copies: one inside goes, one across an edge keeps the part outside (both offsets moved alike),
+// one around it splits in two.
+void dropOverwritten(std::vector<Recorder::DeferredCopy>& copies, std::uint64_t begin, std::uint64_t end) {
+    const auto count = copies.size();
+    bool emptied = false;
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto from = copies[index].address;
+        const auto to = from + copies[index].bytes;
+        if (to <= begin || end <= from) continue;
+        copyBackBytesOverwritten.fetch_add(std::min(to, end) - std::max(from, begin), std::memory_order_relaxed);
+        if (to > end) {
+            auto tail = copies[index];
+            const auto moved = end - from;
+            tail.address = end;
+            tail.sourceOffset += moved;
+            tail.destinationOffset += moved;
+            tail.bytes = to - end;
+            copies.push_back(std::move(tail));
+        }
+        auto& copy = copies[index];
+        copy.bytes = from < begin ? begin - from : 0;
+        if (copy.bytes == 0 && to <= end) copyBacksOverwritten.fetch_add(1, std::memory_order_relaxed);
+        emptied = emptied || copy.bytes == 0;
+    }
+    if (emptied) copies.erase(std::remove_if(copies.begin(), copies.end(), [](const Recorder::DeferredCopy& copy) { return copy.bytes == 0; }), copies.end());
+}
+}
+
+void Recorder::DeferCopies(std::vector<DeferredCopy> copies) {
+    if (copies.empty()) return;
+    ensureOpen();
+    const auto freeClock = GuestMemory::FreeClock();
+    for (auto& copy : copies) {
+        copyBacksDeferred.fetch_add(1, std::memory_order_relaxed);
+        copyBackBytesDeferred.fetch_add(copy.bytes, std::memory_order_relaxed);
+        copy.freeClock = std::min(copy.freeClock, freeClock);
+    }
+    if (coalesceCopyBacks) {
+        // The bytes a copy stores again lose their earlier queued copy (in program order: within
+        // `copies` too), so the queued copies stay disjoint.
+        // Resident buffers: a resident copy under a newer one is recorded first, so none is ever
+        // trimmed (its guard lands the whole range it was made with).
+        if (residentBuffers) {
+            FlushDeferredWhere([&](const DeferredCopy& queued, bool) {
+                return queued.guard != nullptr && std::any_of(copies.begin(), copies.end(), [&](const DeferredCopy& copy) { return copy.address < queued.address + queued.bytes && queued.address < copy.address + copy.bytes; });
+            }, FlushReason::CopyIn);
+        }
+        for (auto& copy : copies) {
+            dropOverwritten(deferredCopies, copy.address, copy.address + copy.bytes);
+            dropOverwritten(claimedCopies, copy.address, copy.address + copy.bytes);
+            deferredCopies.push_back(std::move(copy));
+        }
+        return;
+    }
+    deferredCopies.insert(deferredCopies.end(), std::make_move_iterator(copies.begin()), std::make_move_iterator(copies.end()));
+}
+
+const char* Recorder::FlushReasonName(FlushReason reason) {
+    switch (reason) {
+    case FlushReason::Submit: return "submit";
+    case FlushReason::StoreRun: return "store-run";
+    case FlushReason::Command: return "command";
+    case FlushReason::Dispatch: return "dispatch";
+    case FlushReason::DispatchLease: return "dispatch-lease";
+    case FlushReason::CopyIn: return "copy-in";
+    default: return "?";
+    }
+}
+
+const char* Recorder::CommandSiteName(CommandSite site) {
+    switch (site) {
+    case CommandSite::Other: return "other";
+    case CommandSite::Draw: return "draw";
+    case CommandSite::DrawOther: return "draw-other";
+    case CommandSite::Fill: return "fill";
+    case CommandSite::Copy: return "copy";
+    case CommandSite::Dispatch: return "dispatch";
+    case CommandSite::Texture: return "texture";
+    case CommandSite::TextureWriteBack: return "texture-write-back";
+    case CommandSite::UnitShadow: return "unit-shadow";
+    case CommandSite::Depth: return "depth";
+    case CommandSite::CopyBack: return "copy-back";
+    case CommandSite::KeyStore: return "key-store";
+    default: return "?";
+    }
+}
+
+void Recorder::FlushDeferredWhere(const std::function<bool(const DeferredCopy&, bool claimed)>& selected, FlushReason reason) {
+    // Resident copies outlive their batch: recording them opens one.
+    if ((open == nullptr && !residentBuffers) || !HasDeferredCopies()) return;
+    std::vector<DeferredCopy> copies;
+    moveCopies(deferredCopies, copies, [&](const DeferredCopy& copy) { return selected(copy, false); });
+    const auto unclaimed = copies.size();
+    moveCopies(claimedCopies, copies, [&](const DeferredCopy& copy) { return selected(copy, true); });
+    if (copies.size() != unclaimed) ++claimBreaks;
+    recordDeferredCopies(std::move(copies), reason);
+}
+
+void Recorder::FlushDeferredOverlapping(std::uint64_t address, std::size_t bytes, const void* exceptSource, FlushReason reason) {
+    if (!HasDeferredCopies() || bytes == 0) return;
+    const auto end = address + bytes;
+    FlushDeferredWhere([&](const DeferredCopy& copy, bool claimed) { return copy.address < end && address < copy.address + copy.bytes && !(claimed && exceptSource != nullptr && copy.sourceKey == exceptSource); }, reason);
+}
+
+std::uint64_t Recorder::DeferredCopyBytes() const {
+    std::uint64_t bytes = 0;
+    for (const auto& copy : deferredCopies) bytes += copy.bytes;
+    for (const auto& copy : claimedCopies) bytes += copy.bytes;
+    return bytes;
+}
+
+bool Recorder::WouldRecordCopies(const std::function<bool(std::uint64_t, std::uint64_t)>& touches) const {
+    return !claimedCopies.empty() || std::any_of(deferredCopies.begin(), deferredCopies.end(), [&](const DeferredCopy& copy) { return touches(copy.address, copy.address + copy.bytes); });
+}
+
+bool Recorder::ResidentLandQueued(const void* key) const {
+    const auto lands = [key](const DeferredCopy& copy) { return copy.land && copy.sourceKey == key; };
+    return std::any_of(deferredCopies.begin(), deferredCopies.end(), lands) || std::any_of(claimedCopies.begin(), claimedCopies.end(), lands);
+}
+
+void Recorder::FlushResidentLand(const void* key, bool demote) {
+    if (!ResidentLandQueued(key)) return;
+    const RestoreLandReason restore{landReason, std::exchange(landReason, demote ? std::uint8_t{7} : landReason)};
+    FlushDeferredWhere([key](const DeferredCopy& copy, bool) { return copy.land && copy.sourceKey == key; }, FlushReason::CopyIn);
+}
+
+std::array<std::uint64_t, 9> Recorder::ResidentLandCounts() {
+    std::array<std::uint64_t, 9> counts{};
+    for (std::size_t index = 0; index < counts.size(); ++index) counts[index] = residentLands[index].load(std::memory_order_relaxed);
+    return counts;
+}
+
+Recorder::CopyBackStatistics Recorder::CopyBackCounts() {
+    CopyBackStatistics counts{copyBacksDeferred.load(std::memory_order_relaxed), copyBackBytesDeferred.load(std::memory_order_relaxed), copyBacksOverwritten.load(std::memory_order_relaxed), copyBackBytesOverwritten.load(std::memory_order_relaxed), copyBacksRecorded.load(std::memory_order_relaxed), copyBackBytesRecorded.load(std::memory_order_relaxed), copyBackPasses.load(std::memory_order_relaxed), {}};
+    for (std::size_t i = 0; i < counts.flushes.size(); ++i) counts.flushes[i] = copyBackFlushes[i].load(std::memory_order_relaxed);
+    counts.narrow = copyBacksNarrow.load(std::memory_order_relaxed);
+    counts.narrowSpans = copyBackNarrowSpans.load(std::memory_order_relaxed);
+    counts.narrowBytes = copyBackBytesNarrow.load(std::memory_order_relaxed);
+    counts.narrowWhole = copyBacksNarrowWhole.load(std::memory_order_relaxed);
+    counts.narrowDispatches = copyBackNarrowDispatches.load(std::memory_order_relaxed);
+    counts.narrowStoredBytes = copyBackNarrowStoredWords.load(std::memory_order_relaxed) * 4u;
+    counts.narrowStale = copyBackNarrowStaleWords.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < counts.sites.size(); ++i) counts.sites[i] = commandPasses[i].load(std::memory_order_relaxed);
+    counts.awareKeeping = awareCommandsKeeping.load(std::memory_order_relaxed);
+    counts.awareKept = awareCopiesKept.load(std::memory_order_relaxed);
+    counts.awareKeptBytes = awareBytesKept.load(std::memory_order_relaxed);
+    counts.awareFlushed = awareCopiesFlushed.load(std::memory_order_relaxed);
+    return counts;
 }
 
 void Recorder::ClaimDeferredCopies(const void* sourceKey) {
@@ -1405,11 +1944,21 @@ std::vector<Recorder::DeferredCopy> Recorder::TakeClaimedCopies(const void* sour
     std::vector<DeferredCopy> taken;
     if (sourceKey == nullptr) return taken;
     moveCopies(claimedCopies, taken, [&](const DeferredCopy& copy) { return copy.sourceKey == sourceKey; });
+    if (residentBuffers) {
+        // The taker's copy-back holds the union; a copy a fault landed already is not copied again.
+        std::vector<std::shared_ptr<ResidentGuard>> guards;
+        for (const auto& copy : taken) {
+            if (copy.guard != nullptr) guards.push_back(copy.guard);
+        }
+        keepGuards(std::move(guards));
+        taken.erase(std::remove_if(taken.begin(), taken.end(), [](const DeferredCopy& copy) { return copy.guard != nullptr && copy.guard->resolved; }), taken.end());
+    }
     return taken;
 }
 
 void Recorder::ReleaseClaims() {
     if (claimedCopies.empty()) return;
+    ++claimBreaks;
     deferredCopies.insert(deferredCopies.end(), std::make_move_iterator(claimedCopies.begin()), std::make_move_iterator(claimedCopies.end()));
     claimedCopies.clear();
 }
@@ -1418,43 +1967,664 @@ void Recorder::FlushClaimedOverlapping(std::uint64_t address, std::size_t bytes)
     const auto end = address + bytes;
     const auto overlapping = [&](const DeferredCopy& copy) { return copy.address < end && address < copy.address + copy.bytes; };
     if (std::none_of(claimedCopies.begin(), claimedCopies.end(), overlapping)) return;
+    ++claimBreaks;
     // Back to the unclaimed list (their order among themselves kept), recorded now.
     moveCopies(claimedCopies, deferredCopies, overlapping);
-    flushDeferredCopies();
+    flushDeferredCopies(false, FlushReason::CopyIn);
 }
 
-void Recorder::flushDeferredCopies(bool claimed) {
-    if (open == nullptr || (deferredCopies.empty() && (!claimed || claimedCopies.empty()))) return;
+void Recorder::keepGuards(std::vector<std::shared_ptr<ResidentGuard>> guards) {
+    for (auto& guard : guards) {
+        ensureOpen();
+        // By the time this batch completed, the newer copy landed or holds a guard of its own.
+        if (guard->landingSerial == 0) guard->landingSerial = submissions + 1;
+        open->kept.push_back(std::move(guard));
+    }
+}
+
+void Recorder::flushKeepingResident(FlushReason reason, const std::function<bool(std::uint64_t, std::uint64_t)>& stored) {
+    if (!HasDeferredCopies()) return;
+    if (!claimedCopies.empty()) ++claimBreaks;
+    // Claimed copies belong to a build still recording: as before.
+    auto recorded = std::move(claimedCopies);
+    claimedCopies.clear();
+    // A mapping changed: an import a resident copy stores into may retire with the open batch
+    // (retireImport keeps it until that batch completed), so every copy is recorded into it.
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const bool remapped = generation != residentGeneration;
+    residentGeneration = generation;
+    if (remapped) residentRemapFlushes.fetch_add(1, std::memory_order_relaxed);
+    std::uint64_t residentBytes = 0;
+    std::vector<DeferredCopy> kept;
+    for (auto& copy : deferredCopies) {
+        const auto end = copy.address + copy.bytes;
+        if (copy.guard != nullptr) {
+            // Resident already: recorded at a changed mapping, under a label store, or once old; one
+            // a fault landed is dropped there (it only held the cap). One whose guard a fault
+            // released by force (the resolver gave up: an owner fault on a guard of the open batch,
+            // or a failure) is recorded too: unguarded, its pages would read the import's old bytes
+            // without a fault once this batch's labels land.
+            const bool unguarded = !copy.guard->resolved && !GuestWriteWatch::GuestPageGuardLive_nid_postfix(copy.guard->id);
+            if (unguarded) residentUnguarded.fetch_add(1, std::memory_order_relaxed);
+            if (copy.guard->resolved || unguarded || remapped || stored(copy.address, end) || copy.guard->useSerial + ResidentMaxBatches() <= submissions + 1) {
+                recorded.push_back(std::move(copy));
+            } else {
+                residentBytes += copy.bytes;
+                kept.push_back(std::move(copy));
+            }
+            continue;
+        }
+        // The whole pages stay; the partial ones at either end are recorded now (a guard there
+        // would fault on bytes the copy does not store).
+        const auto first = (copy.address + ResidentPageBytes - 1) & ~(ResidentPageBytes - 1);
+        const auto last = end & ~(ResidentPageBytes - 1);
+        if (remapped || last <= first || stored(copy.address, end) || residentBytes + (last - first) > ResidentCapBytes()) {
+            recorded.push_back(std::move(copy));
+            continue;
+        }
+        auto guard = std::make_shared<ResidentGuard>();
+        guard->owner = this;
+        guard->copy = copy;
+        guard->copy.address = first;
+        guard->copy.sourceOffset += first - copy.address;
+        guard->copy.destinationOffset += first - copy.address;
+        guard->copy.bytes = last - first;
+        guard->id = GuestWriteWatch::GuestPageGuardProtect_nid_postfix(first, last);
+        if (guard->id == 0) {
+            residentRefused.fetch_add(1, std::memory_order_relaxed);
+            recorded.push_back(std::move(copy));
+            continue;
+        }
+        guard->useSerial = submissions + 1;
+        {
+            std::lock_guard lock(residentMutex);
+            guard->sequence = ++residentSequence;
+            residentGuards.emplace(guard->sequence, guard.get());
+        }
+        if (first > copy.address) {
+            auto head = copy;
+            head.bytes = first - copy.address;
+            recorded.push_back(std::move(head));
+        }
+        if (end > last) {
+            auto tail = copy;
+            tail.address = last;
+            tail.sourceOffset += last - copy.address;
+            tail.destinationOffset += last - copy.address;
+            tail.bytes = end - last;
+            recorded.push_back(std::move(tail));
+        }
+        residentMade.fetch_add(1, std::memory_order_relaxed);
+        residentMadeBytes.fetch_add(last - first, std::memory_order_relaxed);
+        residentBytes += last - first;
+        auto interior = guard->copy;
+        interior.guard = std::move(guard);
+        kept.push_back(std::move(interior));
+    }
+    deferredCopies = std::move(kept);
+    residentKeptBytes.store(residentBytes, std::memory_order_relaxed);
+    recordDeferredCopies(std::move(recorded), reason);
+}
+
+std::uint64_t Recorder::ResidentCopyBytes() const {
+    std::uint64_t bytes = 0;
+    for (const auto& copy : deferredCopies) bytes += copy.guard != nullptr ? copy.bytes : 0;
+    for (const auto& copy : claimedCopies) bytes += copy.guard != nullptr ? copy.bytes : 0;
+    return bytes;
+}
+
+Recorder::ResidentStatistics Recorder::ResidentCounts() {
+    ResidentStatistics counts{residentMade.load(std::memory_order_relaxed), residentMadeBytes.load(std::memory_order_relaxed), 0, residentSkipped.load(std::memory_order_relaxed), residentRefused.load(std::memory_order_relaxed), residentRemapFlushes.load(std::memory_order_relaxed), residentFaults.load(std::memory_order_relaxed), residentUnderLock.load(std::memory_order_relaxed), residentResolved.load(std::memory_order_relaxed), residentLanded.load(std::memory_order_relaxed), residentForced.load(std::memory_order_relaxed)};
+    counts.waitedLanding = residentWaitedLanding.load(std::memory_order_relaxed);
+    counts.unguarded = residentUnguarded.load(std::memory_order_relaxed);
+    counts.faultNanos = residentFaultNanos.load(std::memory_order_relaxed);
+    counts.landNanos = residentLandNanos.load(std::memory_order_relaxed);
+    for (const auto& recorded : residentRecorded) counts.recorded += recorded.load(std::memory_order_relaxed);
+    return counts;
+}
+
+bool Recorder::ResolveResidentFault(std::uintptr_t address) {
+    // From the fault handler, on any thread (the title's too): nothing may escape.
+    const auto start = std::chrono::steady_clock::now();
+    struct Timed {
+        std::chrono::steady_clock::time_point start;
+        ~Timed() { residentFaultNanos.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed); }
+    } timed{start};
+    try {
+        // A holder of the GPU mutex resolves here (the resolver would wait for the mutex).
+        if (GuestMemory::GpuMutex().HeldByThisThread()) return ResolveResidentFaultHere(address);
+        auto& resolver = ResidentResolverQueue();
+        ResidentResolver::Request request;
+        request.address = address;
+        std::unique_lock lock(resolver.mutex);
+        (resolver.last != nullptr ? resolver.last->next : resolver.first) = &request;
+        resolver.last = &request;
+        resolver.wake.notify_one();
+        resolver.finished.wait(lock, [&] { return request.done; });
+        return request.result;
+    } catch (...) {
+        residentForced.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+}
+
+bool Recorder::ResolveResidentFaultHere(std::uintptr_t address) {
+    try {
+        const bool owner = GuestMemory::GpuMutex().HeldByThisThread();
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        auto* recorder = Active();
+        return recorder != nullptr && recorder->resolveResident(address, owner);
+    } catch (...) {
+        residentForced.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+}
+
+bool Recorder::resolveResident(std::uintptr_t address, bool owner) {
+    residentFaults.fetch_add(1, std::memory_order_relaxed);
+    if (owner) residentUnderLock.fetch_add(1, std::memory_order_relaxed);
+    const auto page = static_cast<std::uint64_t>(address) & ~(ResidentPageBytes - 1);
+    struct Found {
+        std::uint64_t sequence, id, useSerial, landingSerial;
+        DeferredCopy copy;
+    };
+    std::vector<Found> found;
+    {
+        std::lock_guard lock(residentMutex);
+        for (const auto& [sequence, guard] : residentGuards) {
+            if (guard->owner == this && !guard->resolved && guard->copy.address <= page && page < guard->copy.address + guard->copy.bytes) found.push_back({sequence, guard->id, guard->useSerial, guard->landingSerial, guard->copy});
+        }
+    }
+    // A guard made at a label of the open batch holds bytes its use has not produced yet: the batch
+    // goes first, unless this thread holds the mutex (it may be recording into it): given up (the
+    // forced release leaves the copy queued; the next decision records it, flushKeepingResident).
+    const bool ofOpenBatch = std::any_of(found.begin(), found.end(), [&](const Found& entry) { return entry.useSerial > submissions; });
+    if (ofOpenBatch && (owner || open == nullptr)) {
+        residentForced.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const auto landStart = std::chrono::steady_clock::now();
+    if (ofOpenBatch) Submit();
+    // Oldest first, so a newer guard's bytes win; a copy whose recording batch completed landed.
+    std::sort(found.begin(), found.end(), [](const Found& left, const Found& right) { return left.sequence < right.sequence; });
+    std::vector<DeferredCopy> copies;
+    for (const auto& entry : found) {
+        if (entry.landingSerial != 0 && entry.landingSerial <= submissions) {
+            // Recorded into a submitted batch, which lands it. One still running is waited for, not
+            // copied again: a copy from this guard's shadow after that batch could undo the newer
+            // bytes the build that took the shadow over copied there from a shadow of its own.
+            if (unsignaled(entry.landingSerial)) {
+                waitBatch(entry.landingSerial);
+                residentWaitedLanding.fetch_add(1, std::memory_order_relaxed);
+            }
+            continue;
+        }
+        copies.push_back(entry.copy);
+    }
+    if (copies.empty()) residentLanded.fetch_add(1, std::memory_order_relaxed);
+    else landResident(copies);
+    residentLandNanos.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - landStart).count()), std::memory_order_relaxed);
+    {
+        std::lock_guard lock(residentMutex);
+        for (const auto& entry : found) {
+            if (const auto it = residentGuards.find(entry.sequence); it != residentGuards.end()) it->second->resolved = true;
+        }
+    }
+    for (const auto& entry : found) GuestWriteWatch::GuestPageGuardRelease_nid_postfix(entry.id);
+    residentResolved.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void Recorder::landResident(const std::vector<DeferredCopy>& copies) {
+    VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocation.commandPool = context.pool;
+    allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocation.commandBufferCount = 1;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &commands), "vkAllocateCommandBuffers resident");
+    VkFence fence = VK_NULL_HANDLE;
+    const auto cleanup = [&] {
+        if (fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
+        context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
+    };
+    try {
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        Check(function(beginCommandBuffer, "vkBeginCommandBuffer")(commands, &begin), "vkBeginCommandBuffer resident");
+        // Every batch submitted before (the uses that wrote the shadows) precedes the copies; the
+        // open batch is not touched (nothing in it reads or writes a resident range: that records it).
+        recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const auto copy = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
+        for (std::size_t i = 0; i < copies.size(); ++i) {
+            if (i != 0) recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            const VkBufferCopy region{copies[i].sourceOffset, copies[i].destinationOffset, copies[i].bytes};
+            copy(commands, copies[i].source, copies[i].destination, 1, &region);
+            if (copies[i].baselineOffset != 0) {
+                // Narrow copy-backs: the baseline keeps standing for what the import holds.
+                const VkBufferCopy mirror{copies[i].sourceOffset, copies[i].sourceOffset + copies[i].baselineOffset, copies[i].bytes};
+                copy(commands, copies[i].source, copies[i].source, 1, &mirror);
+            }
+        }
+        recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        Check(function(endCommandBuffer, "vkEndCommandBuffer")(commands), "vkEndCommandBuffer resident");
+        VkFenceCreateInfo info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        Check(context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &info, nullptr, &fence), "vkCreateFence resident");
+        VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submission.commandBufferCount = 1;
+        submission.pCommandBuffers = &commands;
+        Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit resident");
+        Check(function(waitForFences, "vkWaitForFences")(context.device, 1, &fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()), "vkWaitForFences resident");
+    } catch (...) {
+        cleanup();
+        throw;
+    }
+    cleanup();
+}
+
+void Recorder::flushDeferredCopies(bool claimed, FlushReason reason) {
+    if ((open == nullptr && !residentBuffers) || (deferredCopies.empty() && (!claimed || claimedCopies.empty()))) return;
     auto copies = std::move(deferredCopies);
     deferredCopies.clear();
+    if (claimed && !claimedCopies.empty()) ++claimBreaks;
     if (claimed) {
         copies.insert(copies.end(), std::make_move_iterator(claimedCopies.begin()), std::make_move_iterator(claimedCopies.end()));
         claimedCopies.clear();
     }
-    if (copies.empty()) return;
-    if (open->renderPass.open) endOpenRenderPass();
-    const auto commands = open->commands;
-    const auto timing = beginTiming(ClassKey(CommandClass::StagingOut));
-    // The shaders' stores into the shadows (whichever stage made them) precede the copies.
-    recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    CountBarriers(CommandClass::StagingOut);
-    std::uint64_t bytes = 0;
-    for (const auto& copy : copies) {
-        const VkBufferCopy region{copy.sourceOffset, copy.destinationOffset, copy.bytes};
-        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, copy.source, copy.destination, 1, &region);
-        bytes += copy.bytes;
+    recordDeferredCopies(std::move(copies), reason);
+}
+
+void Recorder::recordDeferredCopies(std::vector<DeferredCopy> copies, FlushReason reason) {
+    if (residentBuffers && !copies.empty()) {
+        // A resident copy a fault landed is dropped (the CPU may have written the bytes since); the
+        // others' pages stay guarded until this batch completed.
+        ensureOpen();
+        const auto landed = std::remove_if(copies.begin(), copies.end(), [](const DeferredCopy& copy) { return copy.guard != nullptr && copy.guard->resolved; });
+        residentSkipped.fetch_add(static_cast<std::uint64_t>(copies.end() - landed), std::memory_order_relaxed);
+        copies.erase(landed, copies.end());
+        for (const auto& copy : copies) {
+            if (copy.guard == nullptr) continue;
+            residentRecorded[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+            copy.guard->landingSerial = submissions + 1;
+            open->kept.push_back(copy.guard);
+        }
     }
+    // APS5_DROP_FREED_STORES: the bytes of a queued copy the game released since it was queued are
+    // left out (offsets move as in dropOverwritten, the order stays: queued copies may overlap
+    // without coalescing); resident copies and lands are guarded whole.
+    if (!copies.empty() && std::any_of(copies.begin(), copies.end(), [now = GuestMemory::FreeClock()](const DeferredCopy& copy) { return copy.freeClock < now; })) {
+        std::vector<DeferredCopy> live;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> pieces;
+        for (auto& copy : copies) {
+            pieces.clear();
+            if (copy.guard != nullptr || copy.land || GuestMemory::DropFreedRun(GuestMemory::FreedStoreKind::CopyBack, copy.freeClock, copy.address, copy.address + copy.bytes, pieces) == 0) {
+                live.push_back(std::move(copy));
+                continue;
+            }
+            for (const auto& [from, to] : pieces) {
+                auto piece = copy;
+                piece.address = from;
+                piece.sourceOffset += from - copy.address;
+                piece.destinationOffset += from - copy.address;
+                piece.bytes = to - from;
+                live.push_back(std::move(piece));
+            }
+        }
+        copies.swap(live);
+    }
+    if (copies.empty()) return;
+    if (residentWrites.enabled) {
+        // Resident written ranges' lands, by why they are recorded (a reader's sync, a demotion apart).
+        const std::size_t slot = landReason != 0xff ? landReason : static_cast<std::size_t>(reason);
+        for (const auto& copy : copies) {
+            if (!copy.land) continue;
+            residentLands[slot].fetch_add(1, std::memory_order_relaxed);
+            residentLands[8].fetch_add(copy.bytes, std::memory_order_relaxed);
+        }
+    }
+    copyBackPasses.fetch_add(1, std::memory_order_relaxed);
+    copyBackFlushes[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+    if (reason == FlushReason::Command) commandPasses[commandSite].fetch_add(1, std::memory_order_relaxed);
+    copyBacksRecorded.fetch_add(copies.size(), std::memory_order_relaxed);
+    if (open->renderPass.open) endOpenRenderPass();
+    if (open->trail.pending) recordDispatchTrail(TrailReason::Other);
+    copyBackBytesRecorded.fetch_add(recordCopyPass(open->commands, std::move(copies)), std::memory_order_relaxed);
+}
+
+void Recorder::RecordCopyBacksNow(std::vector<DeferredCopy> copies) {
+    if (copies.empty()) return;
+    // Commands() records what it must first (queued copies, an open render pass's end); aware
+    // commands, only the queued copies over the bytes these store.
+    const auto commands = CommandsTouching([&](std::uint64_t begin, std::uint64_t end) {
+        return std::any_of(copies.begin(), copies.end(), [&](const DeferredCopy& copy) { return begin < copy.address + copy.bytes && copy.address < end; });
+    }, CommandSite::CopyBack);
+    static_cast<void>(recordCopyPass(commands, std::move(copies)));
+}
+
+std::uint64_t Recorder::recordCopyPass(VkCommandBuffer commands, std::vector<DeferredCopy> copies) {
+    const auto timing = beginTiming(ClassKey(CommandClass::StagingOut), TimingKind::Class);
+    // Narrow copies run a compute pass that reads the shadows and baselines and writes the imports
+    // and baselines; their edges and the plain copies are transfers.
+    const bool narrow = std::any_of(copies.begin(), copies.end(), [](const DeferredCopy& copy) { return copy.baselineOffset != 0; });
+    const VkPipelineStageFlags copyStages = VK_PIPELINE_STAGE_TRANSFER_BIT | (narrow ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0u);
+    const VkAccessFlags copyReads = VK_ACCESS_TRANSFER_READ_BIT | (narrow ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : 0u);
+    // The shaders' stores into the shadows (whichever stage made them) precede the copies.
+    recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, copyStages, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, copyReads);
+    CountBarriers(CommandClass::StagingOut);
+    const auto bytes = recordCopyCommands(commands, std::move(copies));
     // As a GPU label store or fill: visible to everything recorded after (shaders, transfers, an
     // indirect dispatch's arguments) and to the host once the batch completed.
     constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
-    recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, copiedAccess);
+    recordBarrier(commands, copyStages, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | (narrow ? VK_ACCESS_SHADER_WRITE_BIT : 0u), copiedAccess);
     CountBarriers(CommandClass::StagingOut);
     open->coveredAccess = copiedAccess;
     EndGpuTiming(timing, bytes);
+    return bytes;
+}
+
+std::uint64_t Recorder::recordCopyCommands(VkCommandBuffer commands, std::vector<DeferredCopy> copies) {
+    // The narrow copies apart (none without the switch: the plain ones below are the old pass).
+    const auto narrowFirst = std::stable_partition(copies.begin(), copies.end(), [](const DeferredCopy& copy) { return copy.baselineOffset == 0; });
+    std::vector<DeferredCopy> narrow(std::make_move_iterator(narrowFirst), std::make_move_iterator(copies.end()));
+    copies.erase(narrowFirst, copies.end());
+    std::uint64_t bytes = 0;
+    if (coalesceCopyBacks) {
+        // Disjoint destinations (DeferCopies): one vkCmdCopyBuffer per (source, destination) pair.
+        std::sort(copies.begin(), copies.end(), [](const DeferredCopy& left, const DeferredCopy& right) { return std::tie(left.source, left.destination, left.address) < std::tie(right.source, right.destination, right.address); });
+        const auto copy = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
+        std::vector<VkBufferCopy> regions;
+        for (std::size_t first = 0; first < copies.size();) {
+            regions.clear();
+            auto last = first;
+            for (; last < copies.size() && copies[last].source == copies[first].source && copies[last].destination == copies[first].destination; ++last) {
+                regions.push_back({copies[last].sourceOffset, copies[last].destinationOffset, copies[last].bytes});
+                bytes += copies[last].bytes;
+            }
+            copy(commands, copies[first].source, copies[first].destination, static_cast<std::uint32_t>(regions.size()), regions.data());
+            first = last;
+        }
+    } else {
+        for (const auto& copy : copies) {
+            const VkBufferCopy region{copy.sourceOffset, copy.destinationOffset, copy.bytes};
+            context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, copy.source, copy.destination, 1, &region);
+            bytes += copy.bytes;
+        }
+    }
+    if (!narrow.empty()) bytes += recordNarrowCopies(commands, narrow);
+    return bytes;
+}
+
+namespace {
+// CopyBackDiff.comp's push constants: the shadow's, the baseline's and the import's addresses of
+// the first dword, the counters' (Recorder::narrowStored), the dword count, the flags (count
+// stored dwords, verify) and the guest address of the first dword (verify's description).
+struct NarrowPush {
+    VkDeviceAddress shadow;
+    VkDeviceAddress baseline;
+    VkDeviceAddress target;
+    VkDeviceAddress stored;
+    std::uint32_t words;
+    std::uint32_t flags;
+    std::uint32_t guestLow;
+    std::uint32_t guestHigh;
+};
+static_assert(sizeof(NarrowPush) == 48, "CopyBackDiff.comp's push constants are 48 bytes");
+constexpr std::uint32_t NarrowCount = 1;
+constexpr std::uint32_t NarrowVerify = 2;
+constexpr std::uint32_t NarrowGroupSize = 256;
+constexpr std::uint32_t NarrowMaxGroups = 4096;
+// One compare dispatch moves at most this many dwords (a span past it is split).
+constexpr VkDeviceSize NarrowMaxWords = VkDeviceSize{1} << 30u;
+
+bool narrowCounted() {
+    static const bool counted = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_GPU") != nullptr;
+    return counted;
+}
+
+// APS5_NARROW_VERIFY as the digest reads it (each recorder reads it when made).
+bool narrowVerifyRequested() {
+    const char* value = std::getenv("APS5_NARROW_VERIFY");
+    return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+}
+}
+
+std::vector<Recorder::DeferredCopy> Recorder::NarrowSpans(std::vector<DeferredCopy> copies) {
+    // Back to back in both buffers (one written range after another of one shadow: two V#s over
+    // adjacent sub-ranges, a copy-back and the copies it took over) with the same baseline.
+    std::sort(copies.begin(), copies.end(), [](const DeferredCopy& left, const DeferredCopy& right) { return std::tie(left.source, left.destination, left.baselineOffset, left.sourceOffset) < std::tie(right.source, right.destination, right.baselineOffset, right.sourceOffset); });
+    std::vector<DeferredCopy> spans;
+    spans.reserve(copies.size());
+    for (auto& copy : copies) {
+        if (!spans.empty()) {
+            auto& last = spans.back();
+            if (last.source == copy.source && last.destination == copy.destination && last.baselineOffset == copy.baselineOffset && last.sourceAddress == copy.sourceAddress && last.destinationAddress == copy.destinationAddress && last.sourceOffset + last.bytes == copy.sourceOffset && last.destinationOffset + last.bytes == copy.destinationOffset && last.address + last.bytes == copy.address) {
+                last.bytes += copy.bytes;
+                continue;
+            }
+        }
+        spans.push_back(std::move(copy));
+    }
+    return spans;
+}
+
+void Recorder::noteNarrowStored(bool complete) {
+    if (narrowStored == nullptr) return;
+    // Written by the compare passes of completed batches (coherent memory); a pass still running
+    // is counted at a later look.
+    const auto* words = reinterpret_cast<const volatile std::uint32_t*>(narrowStored->Bytes().data());
+    const std::uint32_t now = words[0];
+    copyBackNarrowStoredWords.fetch_add(static_cast<std::uint32_t>(now - narrowStoredSeen), std::memory_order_relaxed);
+    narrowStoredSeen = now;
+    const std::uint32_t stale = words[1];
+    copyBackNarrowStaleWords.fetch_add(static_cast<std::uint32_t>(stale - narrowStaleSeen), std::memory_order_relaxed);
+    narrowStaleSeen = stale;
+    if (complete && stale != 0 && !narrowStaleDescribed) {
+        narrowStaleDescribed = true;
+        const auto guest = ((static_cast<std::uint64_t>(words[4]) << 32u) | words[3]) + static_cast<std::uint64_t>(words[2]) * 4u;
+        std::fprintf(stderr, "[gpu] narrow verify: first stale dword at guest 0x%llx: the import held 0x%08x, the shadow and its baseline 0x%08x (stored)\n", static_cast<unsigned long long>(guest), static_cast<unsigned>(words[5]), static_cast<unsigned>(words[6]));
+    }
+}
+
+std::uint64_t Recorder::recordNarrowCopies(VkCommandBuffer commands, const std::vector<DeferredCopy>& copies) {
+    const auto copy = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
+    const bool compare = ensureNarrowPipeline();
+    noteNarrowStored();
+    bool bound = false;
+    std::uint64_t bytes = 0;
+    // [at, at + count) of a copy whole, and the same bytes into its baseline: it keeps standing
+    // for what the import holds.
+    const auto whole = [&](const DeferredCopy& item, VkDeviceSize at, VkDeviceSize count) {
+        const VkBufferCopy out{item.sourceOffset + at, item.destinationOffset + at, count};
+        copy(commands, item.source, item.destination, 1, &out);
+        const VkBufferCopy mirror{item.sourceOffset + at, item.sourceOffset + item.baselineOffset + at, count};
+        copy(commands, item.source, item.source, 1, &mirror);
+    };
+    for (const auto& item : copies) bytes += item.bytes;
+    copyBacksNarrow.fetch_add(copies.size(), std::memory_order_relaxed);
+    const auto spans = NarrowSpans(copies);
+    copyBackNarrowSpans.fetch_add(spans.size(), std::memory_order_relaxed);
+    for (const auto& item : spans) {
+        const auto source = item.sourceAddress + item.sourceOffset;
+        const auto destination = item.destinationAddress + item.destinationOffset;
+        // The pass moves whole dwords: source and destination must agree modulo 4.
+        if (!compare || item.sourceAddress == 0 || item.destinationAddress == 0 || ((source ^ destination) & 3u) != 0) {
+            whole(item, 0, item.bytes);
+            copyBacksNarrowWhole.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        const VkDeviceSize head = std::min<VkDeviceSize>((4u - (destination & 3u)) & 3u, item.bytes);
+        const VkDeviceSize words = (item.bytes - head) / 4u;
+        const VkDeviceSize tail = item.bytes - head - words * 4u;
+        // The partial dwords at either end are copied whole (the pass would store bytes outside).
+        if (head != 0) whole(item, 0, head);
+        if (tail != 0) whole(item, item.bytes - tail, tail);
+        for (VkDeviceSize done = 0; done < words;) {
+            const auto count = std::min(words - done, NarrowMaxWords);
+            if (!bound) {
+                context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, narrowPipeline);
+                bound = true;
+            }
+            const auto at = head + done * 4u;
+            const auto guest = item.address + at;
+            const std::uint32_t flags = narrowStored == nullptr ? 0u : (narrowCounted() ? NarrowCount : 0u) | (narrowVerify ? NarrowVerify : 0u);
+            const NarrowPush push{source + at, source + item.baselineOffset + at, destination + at, narrowStored != nullptr ? narrowStored->DeviceAddress() : 0, static_cast<std::uint32_t>(count), flags, static_cast<std::uint32_t>(guest), static_cast<std::uint32_t>(guest >> 32u)};
+            context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, narrowLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            const auto groups = static_cast<std::uint32_t>(std::min<VkDeviceSize>((count + NarrowGroupSize - 1) / NarrowGroupSize, NarrowMaxGroups));
+            context.Resolved(&DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, groups, 1, 1);
+            copyBackNarrowDispatches.fetch_add(1, std::memory_order_relaxed);
+            done += count;
+        }
+        copyBackBytesNarrow.fetch_add(item.bytes, std::memory_order_relaxed);
+    }
+    return bytes;
+}
+
+bool Recorder::ensureNarrowPipeline() {
+    if (narrowPipeline != VK_NULL_HANDLE) return true;
+    if (narrowFailed.load(std::memory_order_relaxed)) return false;
+    VkShaderModule module = VK_NULL_HANDLE;
+    try {
+        Require(context.bufferDeviceAddress, "the device has no buffer device addresses");
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(NarrowPush)};
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &push;
+        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &narrowLayout), "vkCreatePipelineLayout narrow copy-back");
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = sizeof(COPY_BACK_DIFF_SPV);
+        moduleInfo.pCode = COPY_BACK_DIFF_SPV;
+        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule narrow copy-back");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = module;
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.layout = narrowLayout;
+        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &narrowPipeline), "vkCreateComputePipelines narrow copy-back");
+        context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        module = VK_NULL_HANDLE;
+        // Profiling and APS5_NARROW_VERIFY: the counters the passes add to (none: they count
+        // nothing and verify nothing). Device-local where the device maps such memory for the
+        // host, so a workgroup's atomic stays off PCIe (in host memory it would slow the very
+        // pass a timing run measures); host memory otherwise.
+        if (narrowCounted() || narrowVerify) {
+            constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+            constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            try {
+                try {
+                    narrowStored = std::make_shared<Buffer>(context, 256, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | host);
+                } catch (const std::exception&) {
+                    narrowStored = std::make_shared<Buffer>(context, 256, usage, host);
+                }
+                std::memset(narrowStored->Bytes().data(), 0, narrowStored->Bytes().size());
+                narrowStoredSeen = 0;
+                narrowStaleSeen = 0;
+            } catch (const std::exception& error) {
+                narrowStored.reset();
+                std::fprintf(stderr, "[gpu] narrow copy-backs: no counters (%s): stored bytes not counted%s\n", error.what(), narrowVerify ? ", APS5_NARROW_VERIFY off" : "");
+            }
+        }
+        return true;
+    } catch (const std::exception& error) {
+        if (module != VK_NULL_HANDLE) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        if (narrowLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, narrowLayout, nullptr);
+        narrowLayout = VK_NULL_HANDLE;
+        narrowPipeline = VK_NULL_HANDLE;
+        narrowFailed.store(true, std::memory_order_relaxed);
+        std::fprintf(stderr, "[gpu] narrow copy-backs unavailable (%s): staged regions copy back whole\n", error.what());
+        return false;
+    }
+}
+
+void Recorder::waitBatch(std::uint64_t serial) {
+    for (const auto& batch : inFlight) {
+        if (batch->serial != serial) continue;
+        Check(function(waitForFences, "vkWaitForFences")(context.device, 1, &batch->fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()), "vkWaitForFences resident landing");
+        return;
+    }
 }
 
 void Recorder::MarkCovered(VkAccessFlags access) {
     if (open != nullptr) open->coveredAccess = access;
+}
+
+bool Recorder::DispatchOverlap() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_DISPATCH_OVERLAP");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }() && MergeBarriers();
+    return enabled;
+}
+
+void Recorder::NoteGuestSubmission() {
+    auto& state = guestOrderState;
+    state.span = guestOrderSpans.fetch_add(1, std::memory_order_relaxed) + 1;
+    state.dispatch = false;
+}
+
+void Recorder::NoteGuestPacket(std::uint32_t opcode, bool special) {
+    auto& state = guestOrderState;
+    ++state.packet;
+    state.dispatch = opcode == 0x15u && !special;
+    if (!KeepsGuestOrder(opcode, special) || state.span == 0) state.span = guestOrderSpans.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+Recorder::GuestOrderKey Recorder::GuestOrder() {
+    const auto& state = guestOrderState;
+    if (!state.dispatch) return {};
+    return {state.span, state.packet};
+}
+
+void Recorder::DeferDispatchTrail(GuestOrderKey order, VkAccessFlags access) {
+    ensureOpen();
+    if (open->trail.pending) recordDispatchTrail(TrailReason::Other);
+    open->trail.pending = true;
+    open->trail.held = false;
+    open->trail.order = order;
+    open->trail.access = access;
+    // Covered as after the barrier: whoever reads the mask (Commands()) records the barrier first,
+    // except the holder, which elides it (or records it before its own transfer and clears the mask).
+    open->coveredAccess = access;
+    trailsDeferred.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool Recorder::HoldDispatchTrail(GuestOrderKey order) {
+    if (open == nullptr || !open->trail.pending || order.span == 0 || order.span != open->trail.order.span || order.packet == open->trail.order.packet) return false;
+    open->trail.held = true;
+    return true;
+}
+
+void Recorder::RecordDispatchTrail() {
+    if (open != nullptr && open->trail.pending) recordDispatchTrail(TrailReason::Refresh);
+}
+
+bool Recorder::ElideDispatchTrail() {
+    if (open == nullptr || !open->trail.pending) return false;
+    open->trail = {};
+    trailsElided.fetch_add(1, std::memory_order_relaxed);
+    CountMerged(CommandClass::DispatchTrailing);
+    return true;
+}
+
+void Recorder::recordDispatchTrail(TrailReason reason) {
+    const auto access = open->trail.access;
+    open->trail = {};
+    const auto timing = beginTiming(ClassKey(CommandClass::DispatchTrailing), TimingKind::Class);
+    recordBarrier(open->commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, access);
+    CountBarriers(CommandClass::DispatchTrailing);
+    EndGpuTiming(timing);
+    trailsRecorded[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+Recorder::DispatchTrailStatistics Recorder::DispatchTrailCounts() {
+    DispatchTrailStatistics counts;
+    counts.deferred = trailsDeferred.load(std::memory_order_relaxed);
+    counts.elided = trailsElided.load(std::memory_order_relaxed);
+    counts.command = trailsRecorded[0].load(std::memory_order_relaxed);
+    counts.refresh = trailsRecorded[1].load(std::memory_order_relaxed);
+    counts.submit = trailsRecorded[2].load(std::memory_order_relaxed);
+    counts.other = trailsRecorded[3].load(std::memory_order_relaxed);
+    return counts;
 }
 
 bool Recorder::ContinuesRenderPass(std::uint64_t key) const {
@@ -1535,8 +2705,8 @@ void Recorder::recordKeyStores(bool forWriter) {
     auto stores = std::move(open->keyStores);
     open->keyStores.clear();
     if (stores.empty()) return;
-    const auto commands = Commands();
-    const auto timing = beginTiming(ClassKey(CommandClass::DccKeyStore));
+    const auto commands = Commands(nullptr, CommandSite::KeyStore);
+    const auto timing = beginTiming(ClassKey(CommandClass::DccKeyStore), TimingKind::Class);
     // Ordered behind every earlier recorded read or write of the ranges (the title's DCC clear or
     // decompress kernel storing keys through a V#), and visible to the work after and to the host.
     recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
@@ -1567,8 +2737,8 @@ void Recorder::recordKeyStores(bool forWriter) {
 void Recorder::RecordCopies(std::span<const DeferredCopy> copies, CommandClass which) {
     if (copies.empty()) return;
     // Outside any render pass, in the open batch.
-    const auto commands = Commands();
-    const auto timing = beginTiming(ClassKey(which));
+    const auto commands = Commands(nullptr, CommandSite::DrawOther);
+    const auto timing = beginTiming(ClassKey(which), TimingKind::Class);
     // Behind every earlier recorded write of the sources (a shader's stores through a V# bound in
     // place, a transfer, a label), and visible to the work after.
     recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -1625,7 +2795,7 @@ void Recorder::ensureOpen() {
         open = std::move(batch);
         // The whole-batch range: its start stamp waits for the previous batches like any
         // bottom-of-pipe stamp, so it marks when this batch's execution began.
-        if (BatchStampsEnabled()) open->batchTiming = beginTiming(BatchTimingKey);
+        if (BatchStampsEnabled()) open->batchTiming = beginTiming(BatchTimingKey, TimingKind::Batch);
     }
 }
 
@@ -1657,15 +2827,17 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
         return;
     }
     // A label says the work before it is done: the queued key stores and the deferred copy-backs
-    // (results of that work) land ahead of every store of the run.
-    flushDeferredCopies(true);
+    // (results of that work) land ahead of every store of the run (resident ones only under it).
+    if (residentBuffers) flushKeepingResident(FlushReason::StoreRun, [&](std::uint64_t begin, std::uint64_t finish) { return address == 0 || (address < finish && begin < address + bytes.size()); });
+    else flushDeferredCopies(true, FlushReason::StoreRun);
     if (!open->keyStores.empty()) recordKeyStores(true);
     if (open->renderPass.open) endOpenRenderPass();
+    if (open->trail.pending) recordDispatchTrail(TrailReason::Other);
     open->coveredAccess = 0;
     // Two transfers to the same bytes have no order of their own within the run.
     const auto overlapsRecorded = [&] { return std::any_of(run.recorded.begin(), run.recorded.end(), [&](const auto& store) { return std::get<0>(store) == buffer && offset < std::get<2>(store) && std::get<1>(store) < end; }); };
     if (!run.open) {
-        run.timing = beginTiming(ClassKey(CommandClass::LabelRun));
+        run.timing = beginTiming(ClassKey(CommandClass::LabelRun), TimingKind::Class);
         run.storedBytes = 0;
         // The run's leading barrier: every earlier write of the range (a shader's, a transfer's, a
         // color attachment's) lands before the stores of the run.
@@ -1728,13 +2900,20 @@ bool Recorder::closeStoreRun(bool atSubmit) {
         auto stores = std::move(run.queued);
         run.queued.clear();
         if (stores.empty()) return false;
-        flushDeferredCopies(true);
+        if (residentBuffers) {
+            flushKeepingResident(FlushReason::StoreRun, [&](std::uint64_t begin, std::uint64_t finish) {
+                return std::any_of(stores.begin(), stores.end(), [&](const Batch::StoreRun::Queued& store) { return store.address == 0 || (store.address < finish && begin < store.address + store.bytes.size()); });
+            });
+        } else {
+            flushDeferredCopies(true, FlushReason::StoreRun);
+        }
         // A label says the work before it is done: the queued key stores (results of that work)
         // land ahead of every store of the run, and the pass a draw left open ends.
         if (!open->keyStores.empty()) recordKeyStores(true);
         if (open->renderPass.open) endOpenRenderPass();
+        if (open->trail.pending) recordDispatchTrail(TrailReason::Other);
         const auto commands = open->commands;
-        run.timing = beginTiming(ClassKey(CommandClass::LabelRun));
+        run.timing = beginTiming(ClassKey(CommandClass::LabelRun), TimingKind::Class);
         if (BarrierValidate()) {
             std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
             for (const auto& store : stores) ranges.emplace_back(store.address, store.address + store.bytes.size());
@@ -1805,9 +2984,8 @@ void Recorder::FlushStores() {
 
 namespace {
 
-constexpr std::uint32_t MaxTimedRanges = 512;
 constexpr std::size_t CommandClasses = static_cast<std::size_t>(Recorder::CommandClass::Count);
-constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh", "deferred-flat"};
+constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh", "deferred-flat", "storage-retile", "storage-store"};
 // [barriers] counters by class (relaxed: only reported) and the [gputime] totals, which the
 // presenter's thread adds to without the GPU mutex (AddGpuTiming).
 std::atomic<std::uint64_t> classBarriers[CommandClasses]{};
@@ -1826,11 +3004,10 @@ std::atomic<std::int64_t> traceBarriersLeft{[] {
 std::atomic<std::uint64_t> timingPresents{0};
 std::atomic<std::uint64_t> presentSerial{0};
 std::atomic<std::uint64_t> timingDropped{0};
-struct TimingTotals { std::uint64_t count = 0; double ms = 0; std::uint64_t bytes = 0; };
+std::atomic<std::uint64_t> timingRefusedInPass{0};
+std::uint64_t timingRefusedReported = 0;
 HostMutex timingMutex;
-std::map<std::uint64_t, TimingTotals> timingByKey;
-double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
-std::uint64_t timingBatches = 0;
+GpuTimingDigest timingDigest;
 
 bool DrawOrGpuProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr || Recorder::GpuTimingEnabled();
@@ -1866,6 +3043,13 @@ void reportBarriers() {
         mergedLine += text;
     }
     std::fprintf(stderr, "[barriers] %llu recorded (10 s) by class:%s; merged %llu:%s; dispatch path (lead, trail, indirect, staging; dispatch merges %s): %llu recorded, %llu merged", static_cast<unsigned long long>(total), line.c_str(), static_cast<unsigned long long>(merged), mergedLine.c_str(), Recorder::MergeDispatchBarriers() ? "on" : "off", static_cast<unsigned long long>(pathRecorded), static_cast<unsigned long long>(pathMerged));
+    // APS5_DISPATCH_OVERLAP: trailing barriers left pending, dropped for an overlapping dispatch,
+    // and recorded late by what recorded them.
+    if (const auto trails = Recorder::DispatchTrailCounts(); trails.deferred != 0) {
+        static Recorder::DispatchTrailStatistics last{};
+        std::fprintf(stderr, "; dispatch overlap: %llu trails deferred, %llu elided, recorded late by command %llu, refresh %llu, submit %llu, other %llu", static_cast<unsigned long long>(trails.deferred - last.deferred), static_cast<unsigned long long>(trails.elided - last.elided), static_cast<unsigned long long>(trails.command - last.command), static_cast<unsigned long long>(trails.refresh - last.refresh), static_cast<unsigned long long>(trails.submit - last.submit), static_cast<unsigned long long>(trails.other - last.other));
+        last = trails;
+    }
     if (Recorder::BarrierValidate()) {
         std::uint64_t emitted = 0, skipped = 0;
         std::string classes, kinds;
@@ -1885,6 +3069,84 @@ void reportBarriers() {
             kinds += text;
         }
         std::fprintf(stderr, "; validate: would emit %llu (%s) + %llu batch ends, would skip %llu; emitted/skipped by class:%s", static_cast<unsigned long long>(emitted), kinds.c_str() + 1, static_cast<unsigned long long>(validateBatchEnds.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(skipped), classes.c_str());
+    }
+    // Deferred copy-backs (APS5_DEFER_COPY_BACK, APS5_COALESCE_COPY_BACKS): the passes that
+    // recorded queued copies (two staging-out barriers each) by reason, and the copies recorded.
+    // Narrow copy-backs (APS5_NARROW_COPY_BACKS, deferred or not): copies with a baseline, the
+    // spans and bytes compared, the bytes stored over PCIe, the spans copied whole.
+    if (const auto counts = Recorder::CopyBackCounts(); counts.deferred != 0 || counts.narrow != 0) {
+        static Recorder::CopyBackStatistics last{};
+        if (counts.deferred != 0) {
+            std::string reasons;
+            for (std::size_t i = 0; i < counts.flushes.size(); ++i) {
+                char text[48];
+                std::snprintf(text, sizeof(text), " %s %llu", Recorder::FlushReasonName(static_cast<Recorder::FlushReason>(i)), static_cast<unsigned long long>(counts.flushes[i] - last.flushes[i]));
+                reasons += text;
+            }
+            std::fprintf(stderr, "; copy-back passes %llu by reason:%s, %llu copies (%.0f MiB) recorded", static_cast<unsigned long long>(counts.passes - last.passes), reasons.c_str(), static_cast<unsigned long long>(counts.recorded - last.recorded), (counts.recordedBytes - last.recordedBytes) / 1048576.0);
+            // The command passes by the caller's site (CommandSite); aware commands
+            // (APS5_AWARE_COMMANDS): those that left copies queued, the copies and MiB they left
+            // (summed per command), and the copies they recorded as over their ranges.
+            std::string sites;
+            for (std::size_t i = 0; i < counts.sites.size(); ++i) {
+                char text[48];
+                std::snprintf(text, sizeof(text), " %s %llu", Recorder::CommandSiteName(static_cast<Recorder::CommandSite>(i)), static_cast<unsigned long long>(counts.sites[i] - last.sites[i]));
+                sites += text;
+            }
+            std::fprintf(stderr, "; command passes by site:%s", sites.c_str());
+            if (awareCommandsUsed.load(std::memory_order_relaxed)) std::fprintf(stderr, "; aware: %llu commands kept %llu queued copies (%.1f MiB), %llu flushed overlapping", static_cast<unsigned long long>(counts.awareKeeping - last.awareKeeping), static_cast<unsigned long long>(counts.awareKept - last.awareKept), (counts.awareKeptBytes - last.awareKeptBytes) / 1048576.0, static_cast<unsigned long long>(counts.awareFlushed - last.awareFlushed));
+        }
+        if (counts.narrow != 0) std::fprintf(stderr, "; narrow copy-backs %llu in %llu spans, %.0f MiB compared in %llu dispatches, %.1f MiB stored, %llu spans copied whole", static_cast<unsigned long long>(counts.narrow - last.narrow), static_cast<unsigned long long>(counts.narrowSpans - last.narrowSpans), (counts.narrowBytes - last.narrowBytes) / 1048576.0, static_cast<unsigned long long>(counts.narrowDispatches - last.narrowDispatches), (counts.narrowStoredBytes - last.narrowStoredBytes) / 1048576.0, static_cast<unsigned long long>(counts.narrowWhole - last.narrowWhole));
+        // APS5_NARROW_VERIFY: must stay 0 (a CPU store racing a running dispatch can count).
+        if (counts.narrow != 0 && narrowVerifyRequested()) std::fprintf(stderr, ", verify: %llu stale dwords (%llu since start)", static_cast<unsigned long long>(counts.narrowStale - last.narrowStale), static_cast<unsigned long long>(counts.narrowStale));
+        last = counts;
+    }
+    // Resident buffers (APS5_RESIDENT_BUFFERS): copies kept past a Submit or label, those recorded
+    // later by the reason that recorded them, and the CPU faults on guarded pages.
+    if (residentUsed.load(std::memory_order_relaxed)) {
+        static Recorder::ResidentStatistics last{};
+        static std::array<std::uint64_t, static_cast<std::size_t>(Recorder::FlushReason::Count)> lastRecorded{};
+        static std::uint64_t lastPageFaults = 0, lastPageForced = 0;
+        const auto counts = Recorder::ResidentCounts();
+        std::string reasons;
+        for (std::size_t i = 0; i < residentRecorded.size(); ++i) {
+            const auto recorded = residentRecorded[i].load(std::memory_order_relaxed);
+            char text[48];
+            std::snprintf(text, sizeof(text), " %s %llu", Recorder::FlushReasonName(static_cast<Recorder::FlushReason>(i)), static_cast<unsigned long long>(recorded - lastRecorded[i]));
+            reasons += text;
+            lastRecorded[i] = recorded;
+        }
+        std::uint64_t pageFaults = 0, pageForced = 0, guards = 0;
+        GuestWriteWatch::GuestPageGuardCounts_nid_postfix(&pageFaults, &pageForced, &guards);
+        // Why the page guard refused, by reason (the libc side's counts, all recorders).
+        constexpr std::size_t refusalKinds = 16;
+        static std::array<std::uint64_t, refusalKinds> lastRefusals{};
+        std::array<std::uint64_t, refusalKinds> refusals{};
+        GuestWriteWatch::GuestPageGuardRefusals_nid_postfix(refusals.data(), refusals.size());
+        std::string refusedBy;
+        for (std::size_t i = 0; i < refusals.size(); ++i) {
+            const char* name = GuestWriteWatch::GuestPageGuardRefusalName_nid_postfix(i);
+            if (name == nullptr) break;
+            if (refusals[i] == lastRefusals[i]) continue;
+            char text[64];
+            std::snprintf(text, sizeof(text), "%s%s %llu", refusedBy.empty() ? "" : ", ", name, static_cast<unsigned long long>(refusals[i] - lastRefusals[i]));
+            refusedBy += text;
+        }
+        lastRefusals = refusals;
+        std::fprintf(stderr, "; resident copies %llu made (%.1f MiB), %.1f MiB kept in %llu guards, recorded later by reason:%s, %llu dropped after a fault, %llu refused%s%s%s, %llu remap flushes; page faults %llu (%llu resolved, %llu landed already, %llu under the GPU lock, %llu forced, %llu waited for an in-flight landing)", static_cast<unsigned long long>(counts.made - last.made), (counts.madeBytes - last.madeBytes) / 1048576.0, residentKeptBytes.load(std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(guards), reasons.c_str(), static_cast<unsigned long long>(counts.skipped - last.skipped), static_cast<unsigned long long>(counts.refused - last.refused), refusedBy.empty() ? "" : " (", refusedBy.c_str(), refusedBy.empty() ? "" : ")", static_cast<unsigned long long>(counts.remapFlushes - last.remapFlushes), static_cast<unsigned long long>(pageFaults - lastPageFaults), static_cast<unsigned long long>(counts.resolved - last.resolved), static_cast<unsigned long long>(counts.landed - last.landed), static_cast<unsigned long long>(counts.underLock - last.underLock), static_cast<unsigned long long>(pageForced - lastPageForced), static_cast<unsigned long long>(counts.waitedLanding - last.waitedLanding));
+        // Page queries that met a guarded page and answered it as the guest maps it (GuestMemory
+        // guardedRun; before, such pages read as holes: zeros, skipped write-backs, refused imports).
+        static std::uint64_t lastGuardedQueries = 0;
+        const auto guardedQueries = GuestMemory::GuardedPageQueries();
+        std::fprintf(stderr, "; page queries over guards %llu", static_cast<unsigned long long>(guardedQueries - lastGuardedQueries));
+        lastGuardedQueries = guardedQueries;
+        // Copies whose guard a forced release took (recorded at the next decision; with 'forced'
+        // above, a CPU read saw the import's bytes before the copy landed), and what the faults
+        // cost the threads that took them (each landing waits for every earlier submission).
+        std::fprintf(stderr, "; %llu recorded after a forced release; fault time %.1f ms (%.1f ms landing)", static_cast<unsigned long long>(counts.unguarded - last.unguarded), (counts.faultNanos - last.faultNanos) / 1e6, (counts.landNanos - last.landNanos) / 1e6);
+        last = counts;
+        lastPageFaults = pageFaults;
+        lastPageForced = pageForced;
     }
     std::fputc('\n', stderr);
 }
@@ -1978,27 +3240,72 @@ std::uint64_t Recorder::Presents() {
 }
 
 void Recorder::AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_t bytes) {
+    const auto queue = GuestMemory::GpuLockThreadTag();
     std::lock_guard lock(timingMutex);
-    auto& totals = timingByKey[ClassKey(which)];
-    ++totals.count;
-    totals.ms += nanoseconds / 1e6;
-    totals.bytes += bytes;
-    timingClassMs += nanoseconds / 1e6;
+    timingDigest.AddClass(which, nanoseconds, bytes, queue);
+}
+
+GpuTimingDigest Recorder::GpuTimingTotals() {
+    std::lock_guard lock(timingMutex);
+    return timingDigest;
+}
+
+bool Recorder::GpuTimingFlushes() {
+    static const bool flushes = std::getenv("APS5_PROFILE_GPU_FLUSHES") != nullptr;
+    return flushes;
+}
+
+std::uint32_t Recorder::GpuTimingRangeCap() {
+    // 512 (the old cap) held at BATCH_CAP 64 (t373: ~80 ranges per batch); uncapped batches hold
+    // several times that. Every profiled pool has this size, so they are recycled like the
+    // unprofiled 2-query ones (release).
+    static const std::uint32_t cap = [] {
+        const char* text = std::getenv("APS5_PROFILE_GPU_RANGES");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+        return value == 0 ? 8192u : static_cast<std::uint32_t>(std::clamp<unsigned long long>(value, 64, 65536));
+    }();
+    return cap;
+}
+
+std::uint64_t Recorder::GpuTimingRefusedInPass() {
+    return timingRefusedInPass.load(std::memory_order_relaxed);
 }
 
 std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
-    if (!GpuTimingEnabled()) return NoTiming;
-    Commands();
-    return beginTiming(key);
+    return startGpuTiming(key, TimingKind::Program);
 }
 
-std::uint32_t Recorder::beginTiming(std::uint64_t key) {
+std::uint32_t Recorder::BeginTransferTiming(std::uint64_t programAddress) {
+    return startGpuTiming(programAddress, TimingKind::Transfer);
+}
+
+std::uint32_t Recorder::startGpuTiming(std::uint64_t key, TimingKind kind) {
+    if (!GpuTimingEnabled()) return NoTiming;
+    // The old form: Commands() records the queued copy-backs (every one under coalescing, so a
+    // profiled run hid coalescing's gain) and clears the barrier-merge state at every range.
+    if (GpuTimingFlushes()) {
+        Commands();
+    } else {
+        ensureOpen();
+        // Every caller takes its command buffer first, which ends an open pass. A range begun
+        // inside one would nest in the pass's draw range (counted twice in the rows) and, with no
+        // pool yet, reset the pool inside the pass: not timed, counted.
+        if (open->renderPass.open) {
+            timingRefusedInPass.fetch_add(1, std::memory_order_relaxed);
+            return NoTiming;
+        }
+    }
+    return beginTiming(key, kind);
+}
+
+std::uint32_t Recorder::beginTiming(std::uint64_t key, TimingKind kind) {
     const bool full = GpuTimingEnabled();
     if (!full && !(key == BatchTimingKey && DrawProfiled())) return NoTiming;
     const auto commands = open->commands;
-    const std::uint32_t queryCount = full ? MaxTimedRanges * 2 : 2;
+    const std::uint32_t queryCount = full ? GpuTimingRangeCap() * 2 : 2;
     if (open->queries == VK_NULL_HANDLE) {
-        if (!full && !sparePools.empty()) {
+        // Every pool of the process has queryCount queries (both switches are read once).
+        if (!sparePools.empty()) {
             open->queries = sparePools.back();
             sparePools.pop_back();
         } else {
@@ -2012,23 +3319,104 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
         }
         context.Function<PFN_vkCmdResetQueryPool>("vkCmdResetQueryPool")(commands, open->queries, 0, queryCount);
     }
-    if (open->timedKeys.size() >= queryCount / 2) {
+    if (open->timed.size() >= queryCount / 2) {
         timingDropped.fetch_add(1, std::memory_order_relaxed);
         return NoTiming;
     }
-    const auto index = static_cast<std::uint32_t>(open->timedKeys.size());
-    open->timedKeys.push_back(key);
-    open->timedBytes.push_back(0);
+    const auto index = static_cast<std::uint32_t>(open->timed.size());
+    auto& range = open->timed.emplace_back();
+    range.key = key;
+    range.kind = kind;
+    // The queue split ([gputime] by queue): the batch range belongs to the thread that opened it.
+    range.queue = full ? (kind == TimingKind::Batch ? open->queue : GuestMemory::GpuLockThreadTag()) : 0xffffffffu;
     // Both stamps wait for everything before them to complete, so the range is the timed work alone
     // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
     return index;
 }
 
+std::uint32_t Recorder::ContinueGpuTiming(std::uint32_t index, std::uint64_t bytes, CommandClass next) {
+    if (index == NoTiming) return NoTiming;
+    EndGpuTiming(index, bytes);
+    if (open == nullptr || open->renderPass.open) return NoTiming;
+    return beginTiming(ClassKey(next), TimingKind::Class);
+}
+
 void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
-    if (index == NoTiming || open == nullptr || open->queries == VK_NULL_HANDLE) return;
-    if (index < open->timedBytes.size()) open->timedBytes[index] += bytes;
+    if (index == NoTiming || open == nullptr || open->queries == VK_NULL_HANDLE || index >= open->timed.size()) return;
+    auto& range = open->timed[index];
+    range.bytes += bytes;
+    // A query is written once per batch (a second stamp into an available query is invalid).
+    if (range.ended) return;
+    range.ended = true;
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(open->commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2 + 1);
+}
+
+namespace {
+// Sorted and merged copy of `ranges` (empty ones dropped).
+std::vector<std::pair<std::uint64_t, std::uint64_t>> mergedRanges(Recorder::GuestRanges ranges) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+    merged.reserve(ranges.size());
+    for (const auto& range : ranges) {
+        if (range.second > range.first) merged.push_back(range);
+    }
+    std::sort(merged.begin(), merged.end());
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < merged.size(); ++i) {
+        if (kept != 0 && merged[i].first <= merged[kept - 1].second) merged[kept - 1].second = std::max(merged[kept - 1].second, merged[i].second);
+        else merged[kept++] = merged[i];
+    }
+    merged.resize(kept);
+    return merged;
+}
+
+std::uint64_t mergedBytes(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& merged) {
+    std::uint64_t bytes = 0;
+    for (const auto& [begin, end] : merged) bytes += end - begin;
+    return bytes;
+}
+}
+
+Recorder::InPlaceUse Recorder::InPlaceUseOf(GuestRanges reads, GuestRanges writes, GuestRanges inputs, bool leased) {
+    InPlaceUse use;
+    use.leased = leased;
+    use.inputs = mergedBytes(mergedRanges(inputs));
+    if (leased) return use;
+    const auto read = mergedRanges(reads);
+    use.read = mergedBytes(read);
+    // Both lists are sorted and disjoint: one sweep finds the written bytes inside the reads.
+    const auto written = mergedRanges(writes);
+    std::size_t at = 0;
+    for (const auto& [begin, end] : written) {
+        while (at < read.size() && read[at].second <= begin) ++at;
+        for (auto other = at; other < read.size() && read[other].first < end; ++other) {
+            const auto from = std::max(begin, read[other].first);
+            const auto to = std::min(end, read[other].second);
+            if (to > from) use.written += to - from;
+        }
+    }
+    return use;
+}
+
+void Recorder::NoteInPlace(std::uint32_t index, const InPlaceUse& use) {
+    if (index == NoTiming || open == nullptr || index >= open->timed.size()) return;
+    auto& range = open->timed[index];
+    range.inPlaceRead += use.read;
+    range.inPlaceWritten += use.written;
+    range.inPlaceInputs += use.inputs;
+    if (use.leased) ++range.leased;
+}
+
+void Recorder::NoteDrawInPass(std::uint32_t index, std::uint64_t target, const InPlaceUse& use) {
+    if (index == NoTiming || open == nullptr || index >= open->timed.size()) return;
+    NoteInPlace(index, use);
+    auto& range = open->timed[index];
+    ++range.draws;
+    if (range.target == 0) range.target = target;
+}
+
+std::uint32_t Recorder::OpenRenderPassTiming() const {
+    return open != nullptr && open->renderPass.open ? open->renderPass.timing : NoTiming;
 }
 
 void Recorder::CountSamples() {
@@ -2036,6 +3424,7 @@ void Recorder::CountSamples() {
     countingSamples = true;
     if (open == nullptr || open->samples != VK_NULL_HANDLE) return;
     if (open->renderPass.open) endOpenRenderPass();
+    if (open->trail.pending) recordDispatchTrail(TrailReason::Other);
     beginSamples(*open);
 }
 
@@ -2060,8 +3449,8 @@ void Recorder::readSamples(Batch& batch) {
 }
 
 void Recorder::readGpuTiming(Batch& batch) {
-    if (batch.queries == VK_NULL_HANDLE || batch.timedKeys.empty()) return;
-    std::vector<std::uint64_t> stamps(batch.timedKeys.size() * 2);
+    if (batch.queries == VK_NULL_HANDLE || batch.timed.empty()) return;
+    std::vector<std::uint64_t> stamps(batch.timed.size() * 2);
     const auto result = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, batch.queries, 0, static_cast<std::uint32_t>(stamps.size()), stamps.size() * sizeof(std::uint64_t), stamps.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
     if (result != VK_SUCCESS) return;
     const auto period = context.limits.timestampPeriod;
@@ -2072,64 +3461,267 @@ void Recorder::readGpuTiming(Batch& batch) {
         }
         return;
     }
+    for (std::size_t i = 0; i < batch.timed.size(); ++i) {
+        batch.timed[i].begin = stamps[i * 2];
+        batch.timed[i].end = stamps[i * 2 + 1];
+    }
+    if (batch.batchTiming < batch.timed.size()) {
+        // The whole batch: apart from the per-program totals it contains.
+        batch.gpuStartNs = static_cast<double>(batch.timed[batch.batchTiming].begin) * period;
+        batch.gpuEndNs = static_cast<double>(batch.timed[batch.batchTiming].end) * period;
+    }
     static auto lastReport = std::chrono::steady_clock::now();
-    // The union of the timed ranges (class ranges nest program ranges: a copy's transfer inside
-    // its class range) against the batch span gives what no range covers.
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> intervals;
-    intervals.reserve(batch.timedKeys.size());
     std::unique_lock lock(timingMutex);
-    for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {
-        const auto ns = static_cast<double>(stamps[i * 2 + 1] - stamps[i * 2]) * period;
-        if (i == batch.batchTiming) {
-            // The whole batch: apart from the per-program totals it contains.
-            batch.gpuStartNs = static_cast<double>(stamps[i * 2]) * period;
-            batch.gpuEndNs = static_cast<double>(stamps[i * 2 + 1]) * period;
-            timingBatchMs += ns / 1e6;
-            continue;
-        }
-        const auto key = batch.timedKeys[i];
-        auto& totals = timingByKey[key];
-        ++totals.count;
-        totals.ms += ns / 1e6;
-        totals.bytes += batch.timedBytes[i];
-        (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? timingClassMs : timingProgramMs) += ns / 1e6;
-        intervals.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
-    }
-    std::sort(intervals.begin(), intervals.end());
-    std::uint64_t coveredTicks = 0, unionEnd = 0;
-    for (const auto& [begin, end] : intervals) {
-        const auto from = std::max(begin, unionEnd);
-        if (end > from) coveredTicks += end - from;
-        unionEnd = std::max(unionEnd, end);
-    }
-    timingUnionMs += static_cast<double>(coveredTicks) * period / 1e6;
-    ++timingBatches;
+    timingDigest.AddBatch(batch.timed, period);
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport < std::chrono::seconds(10)) return;
     lastReport = now;
     const auto presents = timingPresents.exchange(0, std::memory_order_relaxed);
-    const double perPresent = presents != 0 ? 1.0 / static_cast<double>(presents) : 0.0;
-    std::vector<std::pair<std::uint64_t, TimingTotals>> hot;
-    std::string classes;
-    for (const auto& [key, totals] : timingByKey) {
-        if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) {
-            char text[160];
-            std::snprintf(text, sizeof(text), " %s x%llu %.1fms %.1fMiB (per present x%.1f %.2fms %.2fMiB)", CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)], static_cast<unsigned long long>(totals.count), totals.ms, totals.bytes / 1048576.0, static_cast<double>(totals.count) * perPresent, totals.ms * perPresent, totals.bytes / 1048576.0 * perPresent);
-            classes += text;
-        } else {
-            hot.emplace_back(key, totals);
-        }
-    }
-    std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
-    // The first field stays the program sum: the measure scripts match on it.
-    std::fprintf(stderr, "[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
-    for (std::size_t i = 0; i < hot.size() && i < 12; ++i) std::fprintf(stderr, " 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
-    std::fprintf(stderr, "; by class:%s\n", classes.c_str());
-    timingByKey.clear();
-    timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
-    timingBatches = 0;
+    const auto refused = timingRefusedInPass.load(std::memory_order_relaxed);
+    const auto refusedNow = refused - timingRefusedReported;
+    timingRefusedReported = refused;
+    for (const auto& line : timingDigest.Report(presents, timingDropped.exchange(0, std::memory_order_relaxed), GpuTimingRangeCap(), refusedNow)) std::fprintf(stderr, "%s\n", line.c_str());
+    timingDigest.Clear();
     lock.unlock();
     reportBarriers();
+}
+
+namespace {
+void appendFormat(std::string& out, const char* format, ...) {
+    char text[512];
+    va_list arguments;
+    va_start(arguments, format);
+    const int written = std::vsnprintf(text, sizeof(text), format, arguments);
+    va_end(arguments);
+    if (written > 0) out.append(text, std::min<std::size_t>(static_cast<std::size_t>(written), sizeof(text) - 1));
+}
+
+void addTotals(GpuTimingDigest::Totals& totals, const Recorder::TimedRange& range, double ms) {
+    ++totals.count;
+    totals.ms += ms;
+    totals.bytes += range.bytes;
+    totals.read += range.inPlaceRead;
+    totals.written += range.inPlaceWritten;
+    totals.inputs += range.inPlaceInputs;
+    totals.leased += range.leased;
+    totals.draws += range.draws;
+}
+
+const char* queueName(std::uint32_t queue, char (&text)[16]) {
+    if (queue == 0xffffffffu) return "untagged";
+    std::snprintf(text, sizeof(text), "0x%x", queue);
+    return text;
+}
+}
+
+void GpuTimingDigest::AddBatch(std::span<const Recorder::TimedRange> ranges, double period) {
+    using Kind = Recorder::TimingKind;
+    struct Interval {
+        std::uint32_t queue;
+        std::uint64_t begin;
+        std::uint64_t end;
+    };
+    std::vector<Interval> intervals;
+    intervals.reserve(ranges.size());
+    ++batches;
+    const auto firstClass = Recorder::ClassKey(CommandClass::DispatchLeading);
+    for (const auto& range : ranges) {
+        const double ms = range.end > range.begin ? static_cast<double>(range.end - range.begin) * period / 1e6 : 0.0;
+        if (range.leftOpen) {
+            // Ended by Submit: its span is not its work. In no total and not in the union (its
+            // work stays in "untimed").
+            ++leftOpen;
+            continue;
+        }
+        auto& queue = queues[range.queue];
+        if (range.kind == Kind::Batch) {
+            batchMs += ms;
+            queue.batchMs += ms;
+            ++queue.batches;
+            continue;
+        }
+        ++queue.ranges;
+        if (range.kind == Kind::Class && range.key >= firstClass && range.key < firstClass + Classes) {
+            const auto which = static_cast<CommandClass>(range.key - firstClass);
+            addTotals(classes[range.key - firstClass], range, ms);
+            classMs += ms;
+            queue.classMs += ms;
+            // A draw range is a render pass (its first draw to the pass's trailing barrier).
+            if (which == CommandClass::Draw) addTotals(passes[range.target], range, ms);
+        } else {
+            // Programs keyed by guest address: dispatches and the guest copies' transfers (nested
+            // in their copy class range), as the [gputime] line always summed them.
+            addTotals(programs[range.key], range, ms);
+            programMs += ms;
+            if (range.kind == Kind::Transfer) {
+                addTotals(transfers, range, ms);
+            } else {
+                addTotals(dispatches, range, ms);
+                dispatchMs += ms;
+                queue.programMs += ms;
+            }
+        }
+        if (range.end > range.begin) intervals.push_back({range.queue, range.begin, range.end});
+    }
+    // The union of the timed ranges (class ranges nest program ranges: a copy's transfer inside
+    // its class range) against the batch span gives what no range covers; per queue likewise.
+    const auto unionTicks = [](auto first, auto last) {
+        std::uint64_t covered = 0, reached = 0;
+        for (auto at = first; at != last; ++at) {
+            const auto from = std::max(at->begin, reached);
+            if (at->end > from) covered += at->end - from;
+            reached = std::max(reached, at->end);
+        }
+        return covered;
+    };
+    std::sort(intervals.begin(), intervals.end(), [](const Interval& a, const Interval& b) { return a.begin < b.begin; });
+    unionMs += static_cast<double>(unionTicks(intervals.begin(), intervals.end())) * period / 1e6;
+    std::stable_sort(intervals.begin(), intervals.end(), [](const Interval& a, const Interval& b) { return a.queue < b.queue; });
+    for (auto first = intervals.begin(); first != intervals.end();) {
+        auto last = first;
+        while (last != intervals.end() && last->queue == first->queue) ++last;
+        queues[first->queue].timedMs += static_cast<double>(unionTicks(first, last)) * period / 1e6;
+        first = last;
+    }
+}
+
+void GpuTimingDigest::AddClass(CommandClass which, double nanoseconds, std::uint64_t bytes, std::uint32_t queue) {
+    auto& totals = classes[static_cast<std::size_t>(which)];
+    ++totals.count;
+    totals.ms += nanoseconds / 1e6;
+    totals.bytes += bytes;
+    classMs += nanoseconds / 1e6;
+    auto& queueTotals = queues[queue];
+    ++queueTotals.ranges;
+    queueTotals.classMs += nanoseconds / 1e6;
+    queueTotals.timedMs += nanoseconds / 1e6;
+}
+
+std::vector<std::string> GpuTimingDigest::Report(std::uint64_t presents, std::uint64_t dropped, std::uint32_t cap, std::uint64_t refusedInPass) const {
+    using Count = unsigned long long;
+    std::vector<std::string> lines;
+    const double per = presents != 0 ? 1.0 / static_cast<double>(presents) : 0.0;
+    const auto mib = [](std::uint64_t bytes) { return static_cast<double>(bytes) / 1048576.0; };
+    // 1. Programs and classes (the first field stays the program sum).
+    std::string line;
+    appendFormat(line, "[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap; %llu left open, ended at submit and not counted; %llu refused inside a render pass); by program (MiB bound in place read/written, L address-based):", programMs, Count(batches), batchMs, classMs, unionMs, batchMs - unionMs, Count(presents), Count(dropped), cap, Count(leftOpen), Count(refusedInPass));
+    std::vector<std::pair<std::uint64_t, const Totals*>> hot;
+    hot.reserve(programs.size());
+    for (const auto& [key, totals] : programs) hot.emplace_back(key, &totals);
+    std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second->ms > b.second->ms; });
+    for (std::size_t i = 0; i < hot.size() && i < 20; ++i) {
+        const auto& totals = *hot[i].second;
+        appendFormat(line, " 0x%llx x%llu %.0fms", Count(hot[i].first), Count(totals.count), totals.ms);
+        if (totals.read != 0 || totals.written != 0) appendFormat(line, " r%.1f/w%.1fMiB", mib(totals.read), mib(totals.written));
+        if (totals.leased != 0) appendFormat(line, " L%llu", Count(totals.leased));
+    }
+    line += "; by class:";
+    for (std::size_t i = 0; i < Classes; ++i) {
+        const auto& totals = classes[i];
+        if (totals.count == 0) continue;
+        appendFormat(line, " %s x%llu %.1fms %.1fMiB (per present x%.1f %.2fms %.2fMiB)", CommandClassNames[i], Count(totals.count), totals.ms, mib(totals.bytes), static_cast<double>(totals.count) * per, totals.ms * per, mib(totals.bytes) * per);
+    }
+    lines.push_back(std::move(line));
+    // 2. The rows: where the batch spans went, per present.
+    const auto sum = [&](std::initializer_list<CommandClass> which) {
+        Totals total;
+        for (const auto one : which) {
+            const auto& totals = Class(one);
+            total.count += totals.count;
+            total.ms += totals.ms;
+            total.bytes += totals.bytes;
+        }
+        return total;
+    };
+    const auto parts = [&](std::initializer_list<CommandClass> which) {
+        std::string text = " (";
+        bool first = true;
+        for (const auto one : which) {
+            appendFormat(text, "%s%s %.2f", first ? "" : ", ", CommandClassNames[static_cast<std::size_t>(one)], Class(one).ms * per);
+            first = false;
+        }
+        return text + ")";
+    };
+    struct Row {
+        const char* name;
+        Totals totals;
+        std::string detail;
+    };
+    std::vector<Row> rows;
+    {
+        std::string detail;
+        appendFormat(detail, "; bound in place read %.1f MiB, written %.1f MiB; x%.1f address-based", mib(dispatches.read) * per, mib(dispatches.written) * per, static_cast<double>(dispatches.leased) * per);
+        rows.push_back({"programs", dispatches, detail});
+    }
+    {
+        const auto& draws = Class(CommandClass::Draw);
+        std::string detail;
+        appendFormat(detail, " (x = passes); %.1f draws, bound in place inputs %.1f MiB, resources %.1f MiB (written %.1f); x%.1f address-based", static_cast<double>(draws.draws) * per, mib(draws.inputs) * per, mib(draws.read) * per, mib(draws.written) * per, static_cast<double>(draws.leased) * per);
+        rows.push_back({"draws", draws, detail});
+    }
+    rows.push_back({"copy-back", Class(CommandClass::StagingOut), " (staged regions back to their imports)"});
+    rows.push_back({"staging-in", Class(CommandClass::StagingIn), " (imports into staged regions)"});
+    rows.push_back({"detile", Class(CommandClass::StorageUpload), " (storage image uploads)"});
+    {
+        // The write-back's three stages (ContinueGpuTiming); counted once, by its first stage, and
+        // its bytes are the stored ones (the first stage's alone when not split).
+        const auto& read = Class(CommandClass::StorageWriteBack);
+        const auto& retile = Class(CommandClass::StorageRetile);
+        const auto& store = Class(CommandClass::StorageStore);
+        Totals total;
+        total.count = read.count;
+        total.ms = read.ms + retile.ms + store.ms;
+        total.bytes = store.count != 0 ? store.bytes : read.bytes;
+        std::string detail = " (storage image write-backs";
+        if (retile.count != 0 || store.count != 0) appendFormat(detail, ": image->linear %.2f ms %.2f MiB, retile %.2f ms %.2f MiB, store %.2f ms", read.ms * per, mib(read.bytes) * per, retile.ms * per, mib(retile.bytes) * per, store.ms * per);
+        if (read.count != 0) appendFormat(detail, "; %.3f ms and %.2f MiB stored per write-back", total.ms / static_cast<double>(read.count), mib(total.bytes) / static_cast<double>(read.count));
+        detail += ")";
+        rows.push_back({"retile", total, detail});
+    }
+    rows.push_back({"barriers", sum({CommandClass::DispatchLeading, CommandClass::DispatchTrailing, CommandClass::IndirectArguments}), parts({CommandClass::DispatchLeading, CommandClass::DispatchTrailing, CommandClass::IndirectArguments})});
+    rows.push_back({"guest-transfers", sum({CommandClass::Copy, CommandClass::Fill, CommandClass::LabelRun}), parts({CommandClass::Copy, CommandClass::Fill, CommandClass::LabelRun})});
+    rows.push_back({"other-emulator", sum({CommandClass::TemplateDataRefresh, CommandClass::FillClear, CommandClass::DccClear, CommandClass::DccKeyStore, CommandClass::ShadowPublish, CommandClass::DeferredFlat}), parts({CommandClass::TemplateDataRefresh, CommandClass::FillClear, CommandClass::DccClear, CommandClass::DccKeyStore, CommandClass::ShadowPublish, CommandClass::DeferredFlat})});
+    const double untimed = batchMs - unionMs;
+    double rowsMs = untimed;
+    for (const auto& row : rows) rowsMs += row.totals.ms;
+    const double busy = batchMs > 0 ? batchMs : 1.0;
+    line.clear();
+    appendFormat(line, "[gputime] row busy: %.2f ms per present (batch spans, x%.1f batches, %llu presents); the rows sum to %.2f (ranges nested in others %.2f); untimed holds the work of x%.1f ranges dropped at the %u cap and x%.1f left open", batchMs * per, static_cast<double>(batches) * per, Count(presents), rowsMs * per, (rowsMs - batchMs) * per, static_cast<double>(dropped) * per, cap, static_cast<double>(leftOpen) * per);
+    lines.push_back(std::move(line));
+    for (const auto& row : rows) {
+        line.clear();
+        appendFormat(line, "[gputime] row %s: %.2f ms per present (%.1f%% of busy), x%.1f, %.2f MiB", row.name, row.totals.ms * per, 100.0 * row.totals.ms / busy, static_cast<double>(row.totals.count) * per, mib(row.totals.bytes) * per);
+        line += row.detail;
+        lines.push_back(std::move(line));
+    }
+    line.clear();
+    appendFormat(line, "[gputime] row untimed: %.2f ms per present (%.1f%% of busy; batch spans outside every range)", untimed * per, 100.0 * untimed / busy);
+    lines.push_back(std::move(line));
+    line.clear();
+    appendFormat(line, "[gputime] row present-blit: %.2f ms per present, x%.1f (its own submission, outside busy); the guest copies' transfers %.2f ms are inside guest-transfers", Class(CommandClass::PresentBlit).ms * per, static_cast<double>(Class(CommandClass::PresentBlit).count) * per, transfers.ms * per);
+    lines.push_back(std::move(line));
+    // 3. By guest queue: the union of the ranges each queue's threads recorded.
+    line = "[gputime] by queue (ms per present; timed = the union of its ranges):";
+    for (const auto& [queue, totals] : queues) {
+        char name[16];
+        appendFormat(line, " %s timed %.2f (dispatches %.2f, classes %.2f, x%.1f ranges), batches opened %.2f x%.1f;", queueName(queue, name), totals.timedMs * per, totals.programMs * per, totals.classMs * per, static_cast<double>(totals.ranges) * per, totals.batchMs * per, static_cast<double>(totals.batches) * per);
+    }
+    lines.push_back(std::move(line));
+    // 4. Draw passes by target.
+    std::vector<std::pair<std::uint64_t, const Totals*>> targets;
+    targets.reserve(passes.size());
+    for (const auto& [target, totals] : passes) targets.emplace_back(target, &totals);
+    std::sort(targets.begin(), targets.end(), [](const auto& a, const auto& b) { return a.second->ms > b.second->ms; });
+    line.clear();
+    appendFormat(line, "[gputime] draw passes by target (per present; top 16 of %zu; ms, x passes, d draws, MiB bound in place inputs/resources):", targets.size());
+    for (std::size_t i = 0; i < targets.size() && i < 16; ++i) {
+        const auto& totals = *targets[i].second;
+        if (targets[i].first == 0) line += " unnamed";
+        else appendFormat(line, " 0x%llx", Count(targets[i].first));
+        appendFormat(line, " %.2fms x%.1f %.1fd %.1f/%.1fMiB;", totals.ms * per, static_cast<double>(totals.count) * per, static_cast<double>(totals.draws) * per, mib(totals.inputs) * per, mib(totals.read) * per);
+    }
+    lines.push_back(std::move(line));
+    return lines;
 }
 
 bool Recorder::FlipReadCheck() {
@@ -2160,9 +3752,53 @@ std::size_t Recorder::UnsignaledBatches() const {
     return static_cast<std::size_t>(std::count_if(inFlight.begin(), inFlight.end(), [&](const auto& batch) { return !signaled(*batch); }));
 }
 
-void Recorder::Keep(std::shared_ptr<void> object) {
+void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
     ensureOpen();
     open->kept.push_back(std::move(object));
+    open->keptBytes += bytes;
+}
+
+std::size_t Recorder::KeptBytesBudget() {
+    static const std::size_t budget = [] {
+        if (std::getenv("APS5_NO_KEPT_BYTES_BOUND") != nullptr) return std::size_t{0};
+        const char* text = std::getenv("APS5_KEPT_BYTES_MIB");
+        if (text == nullptr || *text == '\0') return std::size_t{512} << 20u;
+        // At most 1 TiB, so neither the shift nor the doubled in-flight bound can overflow.
+        return static_cast<std::size_t>(std::min<unsigned long long>(std::strtoull(text, nullptr, 10), 1ull << 20u)) << 20u;
+    }();
+    return budget;
+}
+
+Recorder::KeptBoundCounts Recorder::KeptBoundTotals() {
+    return keptBound;
+}
+
+void Recorder::BoundKeptBytes() {
+    const auto budget = KeptBytesBudget();
+    if (budget == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return;
+    if (open != nullptr && open->keptBytes >= budget) {
+        ++keptBound.submits;
+        Submit();
+    }
+    if (DeferredBytes() != 0 && inFlightKeptBytes + DeferredBytes() > 2 * budget) {
+        ++keptBound.deferredFlushes;
+        DestroyDeferred(TakeDeferred(), false);
+    }
+    if (inFlight.empty() || inFlightKeptBytes <= 2 * budget) return;
+    // An "other" sync charged to the texture lookup that called this, so the [recorder] source and
+    // site tables carry the bound's waits (finish adds their time; one still unsignaled is also a
+    // [lock] locked GPU wait), and the kept-bytes line counts them apart.
+    ++syncCounts[4];
+    ++keptBound.waits;
+    const RestoreSyncSite restoreSite{BeginSyncSite(4, __builtin_return_address(0))};
+    const auto start = std::chrono::steady_clock::now();
+    while (!inFlight.empty() && inFlightKeptBytes > 2 * budget) {
+        auto batch = std::move(inFlight.front());
+        inFlight.pop_front();
+        ++keptBound.waitedBatches;
+        finish(std::move(batch), true, 4, true);
+    }
+    keptBound.waitedMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
 namespace {
@@ -2224,10 +3860,15 @@ void Recorder::OnComplete(std::function<void()> action) {
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, WriteKind kind) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
+    // Resident read-only copies over the range are stale from here on (GuestBufferMemory.cpp,
+    // "Resident reads"): every GPU write into guest memory is noted here.
+    if (ResidentReadsLive()) NoteResidentReadsWrite(address, address + bytes);
+    if (ResidentWritesLive()) NoteResidentWritesWrite(address, address + bytes);
     ensureOpen();
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
+    markPendingBlocks(address, end, submissions + 1);
     // The writer's tag for the [hooksync] attribution: the packet the noting thread executes and
     // the note's kind (a label when the caller marked the range as its own and named no kind).
     const auto packet = GuestMemory::CurrentPacket();
@@ -2255,8 +3896,11 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // An in-flight batch: its range joins the snapshot at once (the completion that stores it runs
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
+    if (ResidentReadsLive()) NoteResidentReadsWrite(address, address + bytes);
+    if (ResidentWritesLive()) NoteResidentWritesWrite(address, address + bytes);
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
+    markPendingBlocks(address, address + bytes, batch.serial);
     const auto packet = GuestMemory::CurrentPacket();
     batch.writeTags.push_back(Batch::WriteTag{packet.queue, packet.opcode, ownLabel && kind == WriteKind::Unknown ? WriteKind::CompletionLabel : kind});
     if (!ownLabel) markOverwritten(address, address + bytes);
@@ -2624,7 +4268,7 @@ bool Recorder::PendingLabelIn(std::uint64_t address, std::size_t bytes) const {
     return false;
 }
 
-std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) const {
+std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal, bool countHits) const {
     if (refusal != nullptr) *refusal = LabelRefusal::None;
     if ((labels.empty() && queuedLabels.empty()) || (bytes != 4 && bytes != 8) || address % 4 != 0) return std::nullopt;
     LabelHit hit{0, 0, 0, false, std::numeric_limits<std::uint64_t>::max()};
@@ -2670,7 +4314,7 @@ std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, s
         }
     }
     if (!hit.late) hit.generation = 0;
-    if (queued) queuedLabelHits.fetch_add(1, std::memory_order_relaxed);
+    if (queued && countHits) queuedLabelHits.fetch_add(1, std::memory_order_relaxed);
     return hit;
 }
 
@@ -2782,9 +4426,11 @@ void Recorder::Submit() {
     if (activeRecorder == this) workSinceSubmit.store(0, std::memory_order_relaxed);
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
-    flushDeferredCopies(true);
+    if (residentBuffers) flushKeepingResident(FlushReason::Submit, [](std::uint64_t, std::uint64_t) { return false; });
+    else flushDeferredCopies(true, FlushReason::Submit);
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
+    if (open->trail.pending) recordDispatchTrail(TrailReason::Submit);
     if (open->samples != VK_NULL_HANDLE) context.Function<PFN_vkCmdEndQuery>("vkCmdEndQuery")(open->commands, open->samples, 0);
     const bool hostReadCovered = (open->run.open || !open->run.queued.empty()) && closeStoreRun(true);
     if (BarrierValidate()) validateBatchEnds.fetch_add(1, std::memory_order_relaxed);
@@ -2793,6 +4439,15 @@ void Recorder::Submit() {
         // its own) get the batch's one here.
         recordBarrier(open->commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
         CountBarriers(CommandClass::Draw);
+    }
+    // A range begun and never ended (a throw between its Begin and End) is ended here: the reap
+    // waits for every query of the batch (vkGetQueryPoolResults with WAIT_BIT), and an unwritten
+    // one would hold it forever.
+    // Its span runs to here, not to its end, so the digest counts it apart (TimedRange::leftOpen).
+    for (std::uint32_t index = 0; index < open->timed.size(); ++index) {
+        if (index == open->batchTiming || open->timed[index].ended) continue;
+        open->timed[index].leftOpen = true;
+        EndGpuTiming(index);
     }
     EndGpuTiming(open->batchTiming);
     if (!GpuTimingEnabled()) reportBarriers();
@@ -2838,7 +4493,13 @@ void Recorder::Submit() {
         newestSubmittedAt = batch->submittedAt;
     }
     inFlight.push_back(std::move(batch));
+    inFlightKeptBytes += inFlight.back()->keptBytes;
+    keptBound.peakInFlight = std::max(keptBound.peakInFlight, inFlightKeptBytes);
+    keptBound.peakBatch = std::max(keptBound.peakBatch, inFlight.back()->keptBytes);
     if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
+    // The video memory guard's sample and actions (rate-limited; nothing with it and the
+    // profiles off): after the submit, so a trim never touches the batch just recorded.
+    VideoMemory::Poll(context);
 }
 
 std::uint64_t Recorder::SubmitAndEpoch() {
@@ -2857,13 +4518,6 @@ struct UnlockedWaiter {
     ~UnlockedWaiter() { count.fetch_sub(1, std::memory_order_acq_rel); }
     UnlockedWaiter(const UnlockedWaiter&) = delete;
     UnlockedWaiter& operator=(const UnlockedWaiter&) = delete;
-};
-
-// Restores the thread's active sync-site entry on every exit path (a Check throw on a lost device
-// included), so the next sync on the thread is not attributed to this one's site.
-struct RestoreSyncSite {
-    std::size_t site;
-    ~RestoreSyncSite() { activeSyncSite = site; }
 };
 
 // The timeline wait itself, on handles copied out of the recorder: the caller holds no mutex, and
@@ -2927,6 +4581,9 @@ void Recorder::Sync() {
         finish(std::move(batch), true, source);
     }
     activeSyncSite = previousSite;
+    // Every compare pass completed: its stored (and stale) dwords count now (profiling, verify;
+    // nothing otherwise).
+    noteNarrowStored(true);
 }
 
 void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked) {
@@ -2972,6 +4629,8 @@ void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUn
         if (announcedSite == nullptr) announcedSite = __builtin_return_address(0);
         // The open batch's work has not run; without one the newest in flight is the target.
         if (open != nullptr || (!inFlight.empty() && unsignaled(inFlight.back()->serial))) ++hookRealWaits;
+        // Resident written ranges: the lands this sync records are a CPU reader's.
+        const RestoreLandReason reader{landReason, std::exchange(landReason, std::uint8_t{6})};
         Sync();
         return;
     }
@@ -3066,6 +4725,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     // SyncThrough disabled everything is the target as well.
     std::uint64_t targetSerial = 0;
     if (!SyncThroughEnabled() || (open != nullptr && overlaps(*open, address, end))) {
+        const RestoreLandReason reader{landReason, std::exchange(landReason, std::uint8_t{6})};
         Submit();
         targetSerial = submissions;
     } else {
@@ -3206,7 +4866,8 @@ bool Recorder::Reap() {
     return inFlight.empty();
 }
 
-void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
+void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
+    inFlightKeptBytes -= batch->keptBytes;
     // The batch's writes stay published until its completions ran, on every exit path.
     struct Finishing {
         Recorder& recorder;
@@ -3259,6 +4920,10 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
                     std::fprintf(stderr, "[recorder] %llu syncs waited %.1f s for the GPU in total (sources, count/wait: idle %llu/%.1fs, pending write %llu/%.1fs, recorded store %llu/%.1fs, address-based %llu/%.1fs, other %llu/%.1fs); hook %llu calls, %llu locked; %llu targeted syncs left %llu batches in flight; snapshot %llu rebuilds (%llu incremental) %.0f ms, %llu notes covered; %llu unlocked timeline waits %.1f s; %llu submissions, %zu label entries, %llu completion labels pending; fence waits by thread (count/wait):%s; top sync sites (source@caller syncs/batches/wait):%s; under holds (cumulative): %llu completions ran %.0f ms (kept objects released %.0f ms), pending-write syncs from completions: %llu skipped, %llu waited %.0f ms; %llu reaps (%llu with work) retired %llu batches in %.0f ms; hook waits unlocked %llu / %.0f ms GPU (pending write %llu / %.0f ms, recorded store %llu / %.0f ms) + %.0f ms relock (%llu found the recorder torn down), locked %llu; deferred releases: on the release thread %llu batches (%llu objects) in %.0f ms, inline %llu batches (%llu objects) in %.0f ms (%llu batches over the queue bound of %zu), queue max %llu batches, %llu pending\n",static_cast<unsigned long long>(waits), waitedMs / 1000, static_cast<unsigned long long>(syncCounts[0]), syncWaitedMs[0] / 1000, static_cast<unsigned long long>(syncCounts[1]), syncWaitedMs[1] / 1000, static_cast<unsigned long long>(syncCounts[2]), syncWaitedMs[2] / 1000, static_cast<unsigned long long>(syncCounts[3]), syncWaitedMs[3] / 1000, static_cast<unsigned long long>(syncCounts[4]), syncWaitedMs[4] / 1000, static_cast<unsigned long long>(hookCalls.load()), static_cast<unsigned long long>(hookLocks.load()), static_cast<unsigned long long>(targetedSyncs.load()), static_cast<unsigned long long>(batchesLeftInFlight.load()), static_cast<unsigned long long>(snapshotRebuilds), static_cast<unsigned long long>(snapshotIncremental), snapshotRebuildMs, static_cast<unsigned long long>(snapshotCovered), static_cast<unsigned long long>(unlockedWaits.load()), unlockedWaitedUs.load() / 1e6, static_cast<unsigned long long>(recorder.submissions), recorder.PendingLabels(), static_cast<unsigned long long>(completionLabels.load()), ThreadSyncReport().c_str(), SyncSiteReport().c_str(), static_cast<unsigned long long>(h.completions), h.completionMs, h.keptReleaseMs, static_cast<unsigned long long>(h.completionSyncsSkipped), static_cast<unsigned long long>(h.completionSyncsWaited), h.completionSyncWaitMs, static_cast<unsigned long long>(h.reaps), static_cast<unsigned long long>(h.reapsWithWork), static_cast<unsigned long long>(h.reapBatches), h.reapMs, static_cast<unsigned long long>(h.hookUnlockedWaits), h.hookUnlockedWaitMs, static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[1]), h.hookUnlockedWaitMsBySource[1], static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[2]), h.hookUnlockedWaitMsBySource[2], h.hookRelockMs, static_cast<unsigned long long>(h.hookUnlockedTornDown), static_cast<unsigned long long>(h.hookLockedWaits), static_cast<unsigned long long>(threadReleases.load()), static_cast<unsigned long long>(threadObjects.load()), threadReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineReleases.load()), static_cast<unsigned long long>(inlineObjects.load()), inlineReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineOverBound.load()), ReleaseQueueBound(), static_cast<unsigned long long>(releaseQueueMax.load()), static_cast<unsigned long long>(deferredPending.load()));
                     std::fprintf(stderr, "[recorder] completion label stores: %llu run, %llu skipped (no CPU write-back overlapped them); %llu counted pending at a write-back; %llu write-backs over a tracked label; %llu write-back completions pending\n", static_cast<unsigned long long>(completionStoresRun.load()), static_cast<unsigned long long>(completionStoresSkipped.load()), static_cast<unsigned long long>(completionLabelsCountedLate.load()), static_cast<unsigned long long>(writeBacksOverLabels.load()), static_cast<unsigned long long>(writeBackCompletions.load()));
                     std::fprintf(stderr, "[recorder] submits %llu, vkQueueSubmit mean %.1f us, max %.1f us\n", static_cast<unsigned long long>(submitCount), submitCount != 0 ? submitUs / static_cast<double>(submitCount) : 0.0, submitMaxUs);
+                    if (const auto budget = Recorder::KeptBytesBudget(); budget != 0) {
+                        const auto& kept = keptBound;
+                        std::fprintf(stderr, "[recorder] kept-bytes bound (budget %zu MiB, %zu MiB in flight now): %llu open batches submitted, %llu waits for %llu batches %.1f ms, %llu early deferred releases; peaks: %.1f MiB kept in flight, %.1f MiB in one batch\n", budget >> 20u, recorder.InFlightKeptBytes() >> 20u, static_cast<unsigned long long>(kept.submits), static_cast<unsigned long long>(kept.waits), static_cast<unsigned long long>(kept.waitedBatches), kept.waitedMs, static_cast<unsigned long long>(kept.deferredFlushes), kept.peakInFlight / 1048576.0, kept.peakBatch / 1048576.0);
+                    }
                     const auto reads = Recorder::ReadCounts();
                     std::fprintf(stderr, "[recorder] in-place reads: %llu noted, %llu queries, hits by reader: dispatch element %llu, gpu copy %llu, address-based %llu, indirect %llu, storage upload %llu, copy source %llu; %llu hits on signaled batches ignored; read sets: %llu referenced, %llu repeat notes skipped (%llu ranges)\n", static_cast<unsigned long long>(reads.noted), static_cast<unsigned long long>(reads.queries), static_cast<unsigned long long>(reads.hits[0]), static_cast<unsigned long long>(reads.hits[1]), static_cast<unsigned long long>(reads.hits[2]), static_cast<unsigned long long>(reads.hits[3]), static_cast<unsigned long long>(reads.hits[4]), static_cast<unsigned long long>(reads.hits[5]), static_cast<unsigned long long>(reads.staleIgnored), static_cast<unsigned long long>(reads.setsNoted), static_cast<unsigned long long>(reads.setNotesSkipped), static_cast<unsigned long long>(reads.setRangesSkipped));
                 }
@@ -3316,10 +4981,22 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
         }
     }
     if (profile) holdCounters.completions += batch->completions.size();
+    noteBlocksFinished(batch->serial);
+    if (ResidentReadsLive() && batch->serial != 0) {
+        // Resident read-only copies: the address-based uses recorded into this batch and every
+        // earlier one stored their pages as stamps (the completions above), so their writer
+        // notes go. A batch whose completions still run (a nested sync from one) holds back the
+        // later ones' notes until a later finish.
+        auto finished = batch->serial;
+        for (const auto* other : finishing) {
+            if (other->serial != 0 && other->serial < finished) finished = other->serial - 1;
+        }
+        if (finished != 0) NoteResidentReadsFinished(id, finished);
+    }
     const auto keptStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // Deferred only from inside a hold: the unlock that releases the list is this thread's own, and
     // a caller finishing batches without the mutex (a test) might never make one.
-    if (ReleaseUnderLock() || !GuestMemory::GpuMutex().HeldByThisThread()) {
+    if (releaseNow || ReleaseUnderLock() || !GuestMemory::GpuMutex().HeldByThisThread()) {
         batch->completions.clear();
         batch->kept.clear();
     } else {
@@ -3330,6 +5007,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
         try {
             DeferredBatches().push_back({std::move(batch->kept), std::move(batch->completions)});
             deferredPending.fetch_add(1, std::memory_order_acq_rel);
+            DeferredBytes() += batch->keptBytes;
         } catch (...) {
         }
         batch->completions.clear();
@@ -3356,7 +5034,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
 
 void Recorder::release(Batch& batch) noexcept {
     if (batch.queries != VK_NULL_HANDLE) {
-        if (!GpuTimingEnabled() && sparePools.size() < 64) {
+        if (sparePools.size() < 64) {
             try {
                 sparePools.push_back(batch.queries);
                 batch.queries = VK_NULL_HANDLE;

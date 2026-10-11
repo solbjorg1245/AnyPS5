@@ -10,6 +10,7 @@
 #include <utility>
 #include <map>
 #include <array>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -87,6 +88,20 @@ public:
         mark(offset) = value;
         return {const_iterator{this, offset}, true};
     }
+    // Stores like insert_or_assign and reports whether the register file changed: a register that
+    // was absent, or a different value (Pm4's writeRegister bumps QueueState::stateSerial on it).
+    bool assign(std::uint32_t offset, std::uint32_t value) {
+        if (contains(offset)) {
+            auto& stored = values[offset];
+            if (stored == value) return false;
+            stored = value;
+            return true;
+        }
+        mark(offset) = value;
+        return true;
+    }
+    // The value of a present register, or null: one bounds and presence test (the state hash's read).
+    const std::uint32_t* Find(std::uint32_t offset) const { return contains(offset) ? &values[offset] : nullptr; }
     std::uint32_t& operator[](std::uint32_t offset) {
         if (contains(offset)) return values[offset];
         return mark(offset) = 0;
@@ -167,6 +182,65 @@ inline Registers InitialContextRegisters() {
     return result;
 }
 
+// The draw state registers (APS5_FAST_STATE, Execution/src/Driver/Draw/FastState.cpp), as
+// [first, first + count) per bank (0 context, 1 shader, 2 user config): Graphics::DrawKeyRegisters
+// without the shader user words and the merged-stage user-data pointers (StateUserRegisters, which
+// change from draw to draw), plus the registers the draw precheck reads beyond that table
+// (StateExtraRegisters: VGT_MULTI_PRIM_IB_RESET_INDX). FastState.cpp checks at compile time that
+// the tables split DrawKeyRegisters exactly.
+struct StateRegisterRange {
+    std::uint8_t bank;
+    std::uint32_t first;
+    std::uint32_t count;
+};
+inline constexpr std::array<StateRegisterRange, 46> StateKeyRegisters{{
+    {0, 0x000, 1}, {0, 0x002, 1}, {0, 0x005, 1}, {0, 0x007, 1}, {0, 0x00a, 4}, {0, 0x010, 6}, {0, 0x01a, 5},
+    {0, 0x080, 4}, {0, 0x08c, 4}, {0, 0x090, 2}, {0, 0x094, 2}, {0, 0x0b4, 2}, {0, 0x103, 1}, {0, 0x105, 4}, {0, 0x10b, 3}, {0, 0x10f, 6},
+    {0, 0x191, 32}, {0, 0x1b3, 2}, {0, 0x1b6, 1}, {0, 0x1c3, 3}, {0, 0x1e0, 8}, {0, 0x1ff, 1},
+    {0, 0x200, 8}, {0, 0x292, 2}, {0, 0x29b, 1}, {0, 0x2ab, 1}, {0, 0x2ce, 1}, {0, 0x2d5, 2}, {0, 0x2db, 2}, {0, 0x2de, 6}, {0, 0x2f8, 2}, {0, 0x30e, 2}, {0, 0x313, 1},
+    {0, 0x318, 0x78}, {0, 0x390, 8}, {0, 0x3a8, 0x18},
+    // The program addresses and RSRC words of the pixel, geometry-back, vertex/geometry-front, hull
+    // and local programs.
+    {1, 0x008, 4}, {1, 0x088, 2}, {1, 0x08a, 2}, {1, 0x0c8, 2}, {1, 0x108, 2}, {1, 0x10b, 1}, {1, 0x148, 2},
+    {2, 0x242, 1}, {2, 0x24b, 1}, {2, 0x25b, 1},
+}};
+// The pixel user words, the geometry-back user pointer, the vertex/geometry-front user words, the
+// hull user pointer and the hull/local user words: the draw key mixes them per draw.
+inline constexpr std::array<StateRegisterRange, 5> StateUserRegisters{{{1, 0x00c, 32}, {1, 0x082, 2}, {1, 0x08c, 32}, {1, 0x102, 2}, {1, 0x10c, 32}}};
+inline constexpr std::array<StateRegisterRange, 1> StateExtraRegisters{{{0, 0x103, 1}}};
+
+// One bit per register offset below 1024, per bank.
+using StateRegisterMask = std::array<std::array<std::uint64_t, 16>, 3>;
+template<std::size_t N>
+constexpr StateRegisterMask MakeStateRegisterMask(const std::array<StateRegisterRange, N>& ranges) {
+    StateRegisterMask mask{};
+    for (const auto& range : ranges) {
+        for (std::uint32_t offset = range.first; offset < range.first + range.count; ++offset) mask[range.bank][offset / 64] |= std::uint64_t{1} << (offset % 64);
+    }
+    return mask;
+}
+inline constexpr StateRegisterMask StateKeyMask = MakeStateRegisterMask(StateKeyRegisters);
+inline bool StateKeyRegister(std::uint32_t bank, std::uint32_t offset) {
+    return bank < 3 && offset < 1024 && ((StateKeyMask[bank][offset / 64] >> (offset % 64)) & 1u) != 0;
+}
+
+inline std::uint64_t StateMix(std::uint64_t hash, std::uint64_t value) {
+    hash = (hash ^ value) * 0x9fb21c651e98df25ull;
+    return hash ^ (hash >> 28u);
+}
+
+namespace DriverDetail {
+struct FastStateEntry;
+}
+
+// FastState.cpp's memo of a queue's draw state at one stateSerial: the shader registry its key
+// looked the programs up in, and the state's entry.
+struct QueueStateMemo {
+    std::uint64_t serial = ~std::uint64_t{0};
+    std::shared_ptr<const void> registry;
+    std::shared_ptr<DriverDetail::FastStateEntry> entry;
+};
+
 struct QueueState {
     Registers shader;
     Registers context = InitialContextRegisters();
@@ -180,11 +254,32 @@ struct QueueState {
     std::uint32_t indexType = 0;
     std::uint32_t instanceCount = 1;
     std::vector<std::string> markers;
+    // Bumped by every store that changes a StateKeyRegisters register (Pm4's writeRegister), by
+    // CLEAR_STATE and by every context push or pop: an unchanged serial means unchanged state
+    // registers. The memo travels with the registers it describes, so a copied or reset queue
+    // state never takes another one's.
+    std::uint64_t stateSerial = 0;
+    mutable QueueStateMemo fastState;
 
     void ClearContext() {
         context = InitialContextRegisters();
+        ++stateSerial;
     }
 };
+
+// The hash of the present StateKeyRegisters registers with their banks and offsets (an absent
+// register is left out, so presence counts): equal register states give equal hashes.
+inline std::uint64_t StateRegisterHash(const QueueState& queue) {
+    const std::array<const Registers*, 3> banks{&queue.context, &queue.shader, &queue.userConfig};
+    std::uint64_t hash = 0x9e3779b97f4a7c15ull;
+    for (const auto& range : StateKeyRegisters) {
+        const auto& bank = *banks[range.bank];
+        for (std::uint32_t offset = range.first; offset < range.first + range.count; ++offset) {
+            if (const auto* value = bank.Find(offset)) hash = StateMix(hash, (static_cast<std::uint64_t>(range.bank) << 48u) | (static_cast<std::uint64_t>(offset) << 32u) | *value);
+        }
+    }
+    return hash;
+}
 
 }
 

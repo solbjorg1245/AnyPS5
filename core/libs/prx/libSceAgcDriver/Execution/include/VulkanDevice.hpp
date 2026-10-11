@@ -8,6 +8,8 @@
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastDraw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastDispatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <functional>
 #include <memory>
@@ -17,6 +19,7 @@ namespace AgcDriver {
 
 namespace Graphics {
 class StorageTexture;
+struct ImageReadback;
 }
 
 // Stage A of a dispatch's resource build (see VulkanDevice::PrepareDispatch); opaque to callers.
@@ -197,6 +200,11 @@ public:
     // Drains the device (the caller holds GuestMemory::GpuMutex) and saves the live images and depth
     // surfaces at `addresses` (every one when empty) under `prefix`.
     void CaptureImages(const std::string& prefix, std::span<const std::uint64_t> addresses);
+    // Debug aid (APS5_PASS_DUMP, see Driver/PassDump.hpp): StorageTexture::ReadBack and
+    // ReadBackDepthSurface on this device. The caller holds GuestMemory::GpuMutex and has drained
+    // the device (WaitIdle).
+    std::size_t ReadBackImage(std::uint64_t address, std::uint32_t level, std::uint32_t firstLayer, std::uint32_t layers, const std::function<void(const Graphics::ImageReadback&)>& consume);
+    std::size_t ReadBackDepth(std::uint64_t address, std::uint32_t slice, const std::function<void(const Graphics::ImageReadback&)>& consume);
     double FinishPresent();
     void QueuePresent();
     // At the flip packet (under the mutex): the recorder's submissions so far and, under
@@ -283,6 +291,19 @@ public:
     // (`shader` carries live flat-SRT words the recipe's hash does not name), so the template's
     // data refresh is decided by the per-word compare instead of the hash.
     RecipeOutcome DispatchRecipe(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, const std::shared_ptr<RecipeHit>& hit, IndirectOutcome& outcome, const std::shared_ptr<PreparedDispatch>& verify = nullptr, bool refreshByWords = false);
+    // F5 of the draw fast path (docs/design/draw-fastpath.md 2.9; the driver's FastDispatch.cpp,
+    // APS5_FAST_DISPATCH), in two halves. PrepareFastDispatch, without GuestMemory::GpuMutex:
+    // `shader` is the variant populated from the fast walk; the declines that need no lock
+    // (Graphics::FastDispatchPrecheck), then its pipeline on the push layout of its bindings, made
+    // once per variant outside the mutex every queue takes; fills `call`. FastDispatch(call), under
+    // the mutex after the packet's labels: an indirect dispatch whose arguments DispatchIndirect
+    // would read on the CPU (results pending over them, a label pending on them, a copied writer
+    // over them) declines without side effects; then Graphics::RecordFastDispatch binds and
+    // records. The decline leaves the dispatch to the old path; nothing (none) means it was
+    // recorded. The overload taking the shader runs both halves (callers already under the mutex).
+    std::optional<Graphics::FastDispatchDecline> PrepareFastDispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, Graphics::FastDispatchCall& call);
+    std::optional<Graphics::FastDispatchDecline> FastDispatch(const Graphics::FastDispatchCall& call, Graphics::FastDispatchTiming& timing);
+    std::optional<Graphics::FastDispatchDecline> FastDispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, Graphics::FastDispatchTiming& timing);
     // Whether dispatch-cache hits use recipes (APS5_NO_DISPATCH_RECIPE unset) and whether every
     // hit is verified (APS5_VERIFY_RECIPE=1).
     static bool DispatchRecipes();
@@ -290,6 +311,19 @@ public:
     // Whether compute templates refresh their data buffers with a hit's words instead of keying
     // them (APS5_NO_TEMPLATE_DATA_REFRESH unset); the driver's data-only hits require it.
     static bool TemplateDataRefresh();
+    // The template hits' data refresh outcomes so far (all devices): refreshed (in-stream, through
+    // the ring or adopted), of which through the ring (APS5_TEMPLATE_REFRESH_RING, ShaderResources::
+    // ForkData's Forked), the hits whose words were the template's already or the batch's last
+    // fork's (sameWords), of which bound that fork again (reused), and the refreshes an idle template
+    // took on the CPU (adopted, of `refreshed`). For tests and the [rescache] line.
+    struct TemplateRefreshCounts {
+        std::uint64_t refreshed = 0;
+        std::uint64_t throughRing = 0;
+        std::uint64_t sameWords = 0;
+        std::uint64_t reused = 0;
+        std::uint64_t adopted = 0;
+    };
+    static TemplateRefreshCounts TemplateRefreshes();
     // The driver's recipe events for the [recipe] line: a restart after Rebuild, an attach; the
     // rows are the dispatch, indirect and draw kinds. NoteDrawRecipeMiss files a draw hit's
     // pre-check miss made in the driver (no recipe for the matched variants, or a device mismatch).
@@ -303,6 +337,9 @@ public:
     // built for its draw-cache entry (design_cpu_final M8); null otherwise.
     void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;
+    // The fast draw path's record (Graphics::DrawFast, APS5_FAST_DRAW), under the mutex after the
+    // packet's labels; a decline records nothing and the caller runs Draw.
+    Graphics::FastDrawOutcome FastDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders);
     void ColorMetadataPass(const Graphics::ColorMetadataPass& pass);
     // A draw-cache hit recorded from its recipe (Graphics::DrawWithRecipe), under the mutex after
     // the packet's labels; Rebuild when the recipe's device is not this one or DrawWithRecipe

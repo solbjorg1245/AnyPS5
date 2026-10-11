@@ -4,7 +4,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <cstdlib>
+#include <mutex>
+#include <set>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -12,9 +15,18 @@
 
 namespace AgcDriver::DriverDetail {
 
+#ifdef _WIN32
+namespace {
+HANDLE PollTimer() {
+    thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    return timer;
+}
+}
+#endif
+
 void PollSleep() {
 #ifdef _WIN32
-    thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    const HANDLE timer = PollTimer();
     if (timer != nullptr) {
         LARGE_INTEGER due{};
         due.QuadPart = -2000;
@@ -25,6 +37,47 @@ void PollSleep() {
     }
 #endif
     std::this_thread::sleep_for(std::chrono::microseconds(200));
+}
+
+void* PollWakeEvent() {
+#ifdef _WIN32
+    // In a fiber-local slot, not a thread_local (MinGW emutls), like the recorder's per-thread state.
+    struct Event {
+        HANDLE handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        ~Event() {
+            if (handle != nullptr) CloseHandle(handle);
+        }
+    };
+    struct EventTag {};
+    return HostThreadLocal<Event, EventTag>().handle;
+#else
+    return nullptr;
+#endif
+}
+
+bool PollSleepOrWake(void* wake, std::chrono::microseconds interval) {
+#ifdef _WIN32
+    const HANDLE timer = PollTimer();
+    if (timer == nullptr || wake == nullptr) return false;
+    LARGE_INTEGER due{};
+    due.QuadPart = -static_cast<LONGLONG>(interval.count()) * 10;
+    if (!SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) return false;
+    const HANDLE handles[2] = {static_cast<HANDLE>(wake), timer};
+    if (WaitForMultipleObjects(2, handles, FALSE, INFINITE) == WAIT_OBJECT_0) CancelWaitableTimer(timer);
+    return true;
+#else
+    static_cast<void>(wake);
+    static_cast<void>(interval);
+    return false;
+#endif
+}
+
+void PollWake(void* wake) {
+#ifdef _WIN32
+    if (wake != nullptr) SetEvent(static_cast<HANDLE>(wake));
+#else
+    static_cast<void>(wake);
+#endif
 }
 
 int Driver::waitTimeoutMs() {
@@ -281,10 +334,14 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (!warned && std::chrono::steady_clock::now() - start > std::chrono::milliseconds(waitTimeoutMs())) {
             warned = true;
             ++outcomes.timedOut;
-            static std::set<std::uint64_t> reported;
-            static std::uint64_t timeouts = 0;
-            if (++timeouts % 20 == 0) std::fprintf(stderr, "[gpu] %llu GPU waits have timed out\n", static_cast<unsigned long long>(timeouts));
-            if (!reported.insert(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u)).second) return;
+            {
+                static std::mutex reportedMutex;
+                static std::set<std::uint64_t> reported;
+                static std::uint64_t timeouts = 0;
+                const std::lock_guard lock(reportedMutex);
+                if (++timeouts % 20 == 0) std::fprintf(stderr, "[gpu] %llu GPU waits have timed out\n", static_cast<unsigned long long>(timeouts));
+                if (!reported.insert(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u)).second) return;
+            }
             const bool wide = ((packet[0] >> 8u) & 0xffu) == 0x93u;
             const std::uint64_t reference = wide ? packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u) : packet[4];
             const std::uint64_t mask = wide ? packet[6] | (static_cast<std::uint64_t>(packet[7]) << 32u) : packet[5];

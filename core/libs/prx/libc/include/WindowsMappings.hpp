@@ -65,8 +65,13 @@ public:
                     mapped->second.armed = false;
                     invalidate(*mapped->second.page);
                 }
-                DWORD previous;
-                if (!VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
+                // A page guard's parts keep their no-access (Unguard gives them this protection).
+                if (mapped != views.end() && mapped->second.guarded != 0) {
+                    protectUnguarded(mapped->first, mapped->second.guarded, protection, "protect guest memory", cursor, stop);
+                } else {
+                    DWORD previous;
+                    if (!VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
+                }
                 cursor = stop;
             }
         }
@@ -100,6 +105,7 @@ public:
             const auto base = cursor + done;
             shared->aliases.push_back(base);
             views.emplace(base, View{shared, protection, 0, false, owned, offset + done, 0});
+            if (const auto pinned = pinnedPages.find(base); pinned != pinnedPages.end()) shared->pins += pinned->second;
             invalidate(*shared);
         }
         mappingSerial.fetch_add(1, std::memory_order_release);
@@ -114,17 +120,108 @@ public:
         }
     }
 
+    // Pins follow the guest address (pinnedPages): a view mapped there later, such as a fixed remap of
+    // the range, takes the pin over, and a view unmapped from it gives its page's pin back (Map/reset).
+    void Pin(std::uintptr_t address, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        for (auto base = address & ~(pageBytes - 1); base < address + bytes; base += pageBytes) {
+            ++pinnedPages[base];
+            const auto found = views.find(base);
+            if (found == views.end()) continue;
+            auto& page = *found->second.page;
+            ++page.pins;
+            for (const auto alias : page.aliases) {
+                auto& view = views.at(alias);
+                if (!view.armed) continue;
+                protectUnguarded(alias, view.guarded, view.protection, "pin shared guest page writable");
+                view.armed = false;
+            }
+            invalidate(page);
+        }
+    }
+
+    void Unpin(std::uintptr_t address, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        for (auto base = address & ~(pageBytes - 1); base < address + bytes; base += pageBytes) {
+            const auto pinned = pinnedPages.find(base);
+            if (pinned == pinnedPages.end()) continue;
+            if (--pinned->second == 0) pinnedPages.erase(pinned);
+            const auto found = views.find(base);
+            if (found == views.end()) continue;
+            auto& page = *found->second.page;
+            if (page.pins != 0) --page.pins;
+            invalidate(page);
+        }
+    }
+
     bool HandleWrite(std::uintptr_t address) {
         std::lock_guard lock(mutex);
         const auto base = address & ~(pageBytes - 1);
         const auto found = views.find(base);
         if (found == views.end() || !writable(found->second.protection)) return false;
         auto& view = found->second;
+        // A part a page guard holds faults for the guard, which resolves it first (its vectored
+        // handler runs ahead of this one): not a tracked write.
+        if ((view.guarded & guardPartBit(address - base)) != 0) return false;
+        if (view.page->fine && view.armed) {
+            // Fine tracking: only the faulting part opens and is stamped; the others stay armed.
+            auto& page = *view.page;
+            const auto part = (address - base) / guardPartBytes;
+            page.partGeneration[part] = ++page.generation;
+            for (const auto alias : page.aliases) forgetClean(alias, alias + pageBytes);
+            DWORD previous;
+            if (!VirtualProtect(reinterpret_cast<void*>(base + part * guardPartBytes), guardPartBytes, view.protection, &previous)) fail("resume shared memory write (part)");
+            view.openParts = static_cast<std::uint8_t>(view.openParts | (1u << part));
+            if (static_cast<std::uint8_t>(view.openParts | view.guarded) == static_cast<std::uint8_t>((1u << guardParts) - 1)) {
+                // Every part is open or guarded: the view is unarmed, so a guarded part Unguard
+                // releases now turns writable untracked; it counts as written, as the whole page
+                // does on the coarse path.
+                for (std::size_t other = 0; other < guardParts; ++other) {
+                    if ((view.guarded & (1u << other)) != 0) page.partGeneration[other] = page.generation;
+                }
+                view.armed = false;
+                view.openParts = 0;
+            }
+            return true;
+        }
         invalidate(*view.page);
-        DWORD previous;
-        if (!VirtualProtect(reinterpret_cast<void*>(base), pageBytes, view.protection, &previous)) fail("resume shared memory write");
+        protectUnguarded(base, view.guarded, view.protection, "resume shared memory write");
         view.armed = false;
+        view.openParts = 0;
         return true;
+    }
+
+    // Fine write tracking for the view pages over [address, address + bytes) (APS5_FIX_BOOT_STRIP:
+    // the driver's edge blocks where a GPU surface shares a 16 KiB page with CPU data). From the
+    // page's next arming on, a write opens and reports only its own 4 KiB part. Pages already fine
+    // and memory that is no shared view are left as they are; returns the pages made fine.
+    std::size_t TrackParts(std::uintptr_t address, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        std::size_t made = 0;
+        for (auto base = address & ~(pageBytes - 1); base < address + bytes; base += pageBytes) {
+            const auto found = views.find(base);
+            if (found == views.end() || found->second.page->fine) continue;
+            auto& page = *found->second.page;
+            page.fine = true;
+            for (auto& part : page.partGeneration) part = page.generation;
+            for (const auto alias : page.aliases) {
+                auto& view = views.at(alias);
+                for (auto& seen : view.partSeen) seen = view.seen;
+                view.openParts = 0;
+            }
+            ++made;
+        }
+        return made;
+    }
+
+    // Fine write tracking for the view pages [begin, end) covers only in part: its first and last
+    // page when the range starts or ends inside one (a surface sharing them with other data).
+    std::size_t TrackEdgeParts(std::uintptr_t begin, std::uintptr_t end) {
+        std::size_t made = 0;
+        if (end <= begin) return 0;
+        if ((begin & (pageBytes - 1)) != 0) made += TrackParts(begin, 1);
+        if ((end & (pageBytes - 1)) != 0) made += TrackParts(end - 1, 1);
+        return made;
     }
 
     bool BeginHostWrite(std::uintptr_t address, std::size_t bytes) {
@@ -139,8 +236,7 @@ public:
             ++view.hostWrites;
             invalidate(*view.page);
             if (!view.armed) continue;
-            DWORD previous;
-            if (!VirtualProtect(reinterpret_cast<void*>(it->first), pageBytes, view.protection, &previous)) fail("open shared memory to a host write");
+            protectUnguarded(it->first, view.guarded, view.protection, "open shared memory to a host write");
             view.armed = false;
         }
         return true;
@@ -251,6 +347,20 @@ public:
     // Debug aid: the write-tracking state of the page holding `address`, as one line.
     void Describe(std::uintptr_t address, char* text, std::size_t size) {
         std::lock_guard lock(mutex);
+        describe(address, text, size);
+    }
+
+    // Describe without waiting (the crash report's resource lines): false while another thread
+    // holds the mappings.
+    bool TryDescribe(std::uintptr_t address, char* text, std::size_t size) {
+        std::unique_lock lock(mutex, std::try_to_lock);
+        if (!lock.owns_lock()) return false;
+        describe(address, text, size);
+        return true;
+    }
+
+private:
+    void describe(std::uintptr_t address, char* text, std::size_t size) {
         const auto base = address & ~(pageBytes - 1);
         const bool clean = rangeAt(cleanRanges, address) != cleanRanges.end();
         const bool fresh = rangeAt(freshRanges, address) != freshRanges.end();
@@ -260,7 +370,76 @@ public:
             return;
         }
         const auto& view = found->second;
-        std::snprintf(text, size, "view protection 0x%lx seen %llu generation %llu armed %d host writes %u aliases %zu section offset 0x%llx (clean %d fresh %d)", view.protection, static_cast<unsigned long long>(view.seen), static_cast<unsigned long long>(view.page->generation), view.armed ? 1 : 0, view.hostWrites, view.page->aliases.size(), static_cast<unsigned long long>(view.offset), clean ? 1 : 0, fresh ? 1 : 0);
+        // Fine tracking (TrackParts): the 4 KiB parts written since this view last collected them.
+        unsigned unseen = 0;
+        for (std::size_t part = 0; part < guardParts; ++part) unseen |= view.partSeen[part] != view.page->partGeneration[part] ? 1u << part : 0u;
+        std::snprintf(text, size, "view protection 0x%lx seen %llu generation %llu armed %d host writes %u aliases %zu pins %u guarded parts 0x%x section offset 0x%llx (clean %d fresh %d) fine %d open parts 0x%x unseen parts 0x%x", view.protection, static_cast<unsigned long long>(view.seen), static_cast<unsigned long long>(view.page->generation), view.armed ? 1 : 0, view.hostWrites, view.page->aliases.size(), view.page->pins, static_cast<unsigned>(view.guarded), static_cast<unsigned long long>(view.offset), clean ? 1 : 0, fresh ? 1 : 0, view.page->fine ? 1 : 0, static_cast<unsigned>(view.openParts), unseen);
+    }
+
+public:
+
+    // Page guards over shared views (GuestWriteWatch's PageGuard, APS5_GUARD_SHARED_VIEWS=1). The
+    // write tracking re-protects a view's 16 KiB page as a whole (Collect arms it read-only,
+    // HandleWrite, Pin and BeginHostWrite open it again), which would lift a guard's no-access:
+    // instead each view keeps the 4 KiB parts guards hold (`guarded`), every such re-protection
+    // leaves them alone, and Unguard gives a released part what the tracking wants by then (read-only
+    // while armed, else the guest's protection), so a write after the release still faults into
+    // HandleWrite and is tracked. Refused: a page mapped at several guest addresses (a read through
+    // another alias would not fault), one a host write holds open, a pinned one (a fiber stack) and
+    // one the guest made inaccessible.
+    enum class GuardFit { Private, Views, Mixed, Aliased, HostWrite, Pinned, Inaccessible };
+    // How [begin, end) (whole 4 KiB parts) lies against the views: none (Private), only views that
+    // may be guarded (Views), both (Mixed), or the first reason a view may not be.
+    GuardFit FitGuard(std::uintptr_t begin, std::uintptr_t end) {
+        std::lock_guard lock(mutex);
+        return fitGuard(begin, end);
+    }
+
+    // Makes the parts of [begin, end) no-access and remembers them as guarded; false (nothing
+    // changed) unless every page is a view FitGuard admits.
+    bool Guard(std::uintptr_t begin, std::uintptr_t end) {
+        std::lock_guard lock(mutex);
+        if (fitGuard(begin, end) != GuardFit::Views) return false;
+        std::vector<std::pair<std::uintptr_t, std::uint8_t>> done;
+        for (auto base = begin & ~(pageBytes - 1); base < end; base += pageBytes) {
+            auto& view = views.at(base);
+            const auto parts = partsWithin(base, begin, end) & static_cast<std::uint8_t>(~view.guarded);
+            if (parts != 0 && !protectParts(base, parts, PAGE_NOACCESS)) {
+                // This page's runs that did turn no-access, and the pages before it.
+                protectParts(base, parts, view.armed ? armedProtection(view.protection) : view.protection);
+                for (const auto& [undone, mask] : done) {
+                    auto& other = views.at(undone);
+                    other.guarded = static_cast<std::uint8_t>(other.guarded & ~mask);
+                    protectParts(undone, mask, other.armed ? armedProtection(other.protection) : other.protection);
+                }
+                return false;
+            }
+            view.guarded = static_cast<std::uint8_t>(view.guarded | parts);
+            done.emplace_back(base, parts);
+        }
+        return true;
+    }
+
+    // Releases the guarded parts of [begin, end): each gets the protection the write tracking wants
+    // now. Pages that are no views any more (unmapped or mapped again since) are left alone.
+    void Unguard(std::uintptr_t begin, std::uintptr_t end) {
+        std::lock_guard lock(mutex);
+        for (auto base = begin & ~(pageBytes - 1); base < end; base += pageBytes) {
+            const auto found = views.find(base);
+            if (found == views.end()) continue;
+            auto& view = found->second;
+            const auto parts = static_cast<std::uint8_t>(partsWithin(base, begin, end) & view.guarded);
+            if (parts == 0) continue;
+            view.guarded = static_cast<std::uint8_t>(view.guarded & ~parts);
+            protectParts(base, parts, view.armed ? armedProtection(view.protection) : view.protection);
+        }
+    }
+
+    // Whether a shared view lies in [address, address + bytes).
+    bool HasView(std::uintptr_t address, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        const auto found = views.lower_bound(address & ~(pageBytes - 1));
+        return found != views.end() && found->first < address + bytes;
     }
 
     bool Protection(std::uintptr_t address, std::uint32_t* protection) {
@@ -291,7 +470,16 @@ public:
                 auto& view = found->second;
                 const auto stop = std::min(end, base + pageBytes);
                 if (view.protection == PAGE_NOACCESS) return false;
-                if (view.seen != view.page->generation) {
+                const bool pinned = view.page->pins != 0;
+                if (view.page->fine && !pinned) {
+                    // Fine tracking: only the parts written since this view last collected them.
+                    for (auto at = cursor; at < stop; at += 4096) {
+                        const auto part = (at - base) / guardPartBytes;
+                        if (view.partSeen[part] == view.page->partGeneration[part]) continue;
+                        if (*count == capacity) return true;
+                        pages[(*count)++] = reinterpret_cast<void*>(at);
+                    }
+                } else if (pinned || view.seen != view.page->generation) {
                     const auto needed = (stop - cursor + 4095) / 4096;
                     if (needed > capacity - *count) {
                         for (auto at = cursor; *count < capacity; at += 4096) pages[(*count)++] = reinterpret_cast<void*>(at);
@@ -299,16 +487,23 @@ public:
                     }
                     for (auto at = cursor; at < stop; at += 4096) pages[(*count)++] = reinterpret_cast<void*>(at);
                 }
-                if (clear) {
+                if (clear && !pinned) {
                     for (const auto alias : view.page->aliases) {
                         auto& other = views.at(alias);
+                        if (other.armed && other.openParts != 0 && writable(other.protection) && other.hostWrites == 0) {
+                            // Fine tracking: the parts a write opened are armed again.
+                            protectParts(alias, static_cast<std::uint8_t>(other.openParts & ~other.guarded), armedProtection(other.protection));
+                            other.openParts = 0;
+                            continue;
+                        }
                         if (!writable(other.protection) || other.armed || other.hostWrites != 0) continue;
-                        DWORD previous;
-                        const DWORD protection = other.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
-                        if (!VirtualProtect(reinterpret_cast<void*>(alias), pageBytes, protection, &previous)) fail("arm shared memory write tracking");
+                        // A page guard's parts stay no-access; Unguard arms them once released.
+                        protectUnguarded(alias, other.guarded, armedProtection(other.protection), "arm shared memory write tracking");
                         other.armed = true;
+                        other.openParts = 0;
                     }
                     view.seen = view.page->generation;
+                    for (std::size_t part = 0; part < guardParts; ++part) view.partSeen[part] = view.page->partGeneration[part];
                     rememberClean(base, base + pageBytes);
                 }
                 cursor = stop;
@@ -356,6 +551,12 @@ private:
     struct SharedPage {
         std::uint64_t generation = 1;
         std::vector<std::uintptr_t> aliases;
+        std::uint32_t pins = 0;
+        // Fine tracking (TrackParts): a write opens and stamps only its own 4 KiB part, so a CPU
+        // store into one part is not reported over its neighbours (a GPU surface's edge sharing the
+        // page with CPU data). partGeneration: each part's newest write (whole-page events too).
+        bool fine = false;
+        std::uint64_t partGeneration[4] = {1, 1, 1, 1};
     };
     struct Section {
         HANDLE handle;
@@ -372,7 +573,99 @@ private:
         std::shared_ptr<Section> section;
         std::uint64_t offset;
         std::uint32_t hostWrites;
+        // The 4 KiB parts (bit i: [i * 4 KiB, (i + 1) * 4 KiB) of the page) a page guard holds
+        // no-access (Guard/Unguard).
+        std::uint8_t guarded = 0;
+        // Fine tracking: the parts a write opened while the view stays armed over the others, and
+        // the part generations this view last collected.
+        std::uint8_t openParts = 0;
+        std::uint64_t partSeen[4] = {};
     };
+
+    static constexpr std::size_t guardPartBytes = 0x1000;
+    static constexpr std::size_t guardParts = pageBytes / guardPartBytes;
+    static_assert(guardParts <= 8, "a view's guarded parts must fit its mask");
+    static_assert(guardParts == sizeof(SharedPage::partGeneration) / sizeof(std::uint64_t), "fine tracking keeps one generation per guard part");
+
+    static std::uint8_t guardPartBit(std::uintptr_t offset) {
+        return static_cast<std::uint8_t>(1u << (offset / guardPartBytes));
+    }
+
+    // The parts of the view page at `base` that [begin, end) covers.
+    static std::uint8_t partsWithin(std::uintptr_t base, std::uintptr_t begin, std::uintptr_t end) {
+        std::uint8_t parts = 0;
+        for (std::size_t part = 0; part < guardParts; ++part) {
+            const auto from = base + part * guardPartBytes;
+            if (from >= begin && from + guardPartBytes <= end) parts = static_cast<std::uint8_t>(parts | (1u << part));
+        }
+        return parts;
+    }
+
+    static DWORD armedProtection(DWORD protection) {
+        return protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
+    }
+
+    // VirtualProtect over the parts of the view page at `base` set in `parts`, run by run.
+    static bool protectParts(std::uintptr_t base, std::uint8_t parts, DWORD protection) {
+        bool changed = true;
+        for (std::size_t part = 0; part < guardParts;) {
+            if ((parts & (1u << part)) == 0) {
+                ++part;
+                continue;
+            }
+            auto last = part;
+            while (last < guardParts && (parts & (1u << last)) != 0) ++last;
+            DWORD previous;
+            changed = VirtualProtect(reinterpret_cast<void*>(base + part * guardPartBytes), (last - part) * guardPartBytes, protection, &previous) != 0 && changed;
+            part = last;
+        }
+        return changed;
+    }
+
+    // VirtualProtect over [from, to) of the view page at `base` (the whole page by default) less the
+    // parts a page guard holds; throws as the plain call it replaces did.
+    static void protectUnguarded(std::uintptr_t base, std::uint8_t guarded, DWORD protection, const char* what, std::uintptr_t from = 0, std::uintptr_t to = ~std::uintptr_t{0}) {
+        from = std::max(from, base);
+        to = std::min(to, base + pageBytes);
+        if (guarded == 0) {
+            DWORD previous;
+            if (!VirtualProtect(reinterpret_cast<void*>(from), to - from, protection, &previous)) fail(what);
+            return;
+        }
+        for (auto cursor = from; cursor < to;) {
+            const auto part = (cursor - base) / guardPartBytes;
+            const auto partEnd = std::min(to, base + (part + 1) * guardPartBytes);
+            if ((guarded & (1u << part)) == 0) {
+                // Up to the next guarded part (or the end), in one call.
+                auto stop = partEnd;
+                while (stop < to && (guarded & (1u << ((stop - base) / guardPartBytes))) == 0) stop = std::min(to, stop + guardPartBytes);
+                DWORD previous;
+                if (!VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail(what);
+                cursor = stop;
+            } else {
+                cursor = partEnd;
+            }
+        }
+    }
+
+    GuardFit fitGuard(std::uintptr_t begin, std::uintptr_t end) const {
+        bool view = false;
+        bool other = false;
+        for (auto base = begin & ~(pageBytes - 1); base < end; base += pageBytes) {
+            const auto found = views.find(base);
+            if (found == views.end()) {
+                other = true;
+                continue;
+            }
+            view = true;
+            const auto& entry = found->second;
+            if (entry.page->aliases.size() != 1) return GuardFit::Aliased;
+            if (entry.hostWrites != 0) return GuardFit::HostWrite;
+            if (entry.page->pins != 0) return GuardFit::Pinned;
+            if (entry.protection == PAGE_NOACCESS) return GuardFit::Inaccessible;
+        }
+        return view && other ? GuardFit::Mixed : view ? GuardFit::Views : GuardFit::Private;
+    }
     static void forgetRange(std::map<std::uintptr_t, std::uintptr_t>& ranges, std::uintptr_t start, std::uintptr_t end) {
         auto it = ranges.lower_bound(start);
         if (it != ranges.begin() && std::prev(it)->second > start) --it;
@@ -414,6 +707,7 @@ private:
 
     void invalidate(SharedPage& page) {
         ++page.generation;
+        for (auto& part : page.partGeneration) part = page.generation;
         for (const auto alias : page.aliases) forgetClean(alias, alias + pageBytes);
     }
 
@@ -518,7 +812,9 @@ private:
                 if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(cursor), MEM_PRESERVE_PLACEHOLDER)) fail("unmap shared guest page");
                 const auto found = views.find(cursor);
                 if (found != views.end()) {
-                    std::erase(found->second.page->aliases, cursor);
+                    auto& page = *found->second.page;
+                    if (const auto pinned = pinnedPages.find(cursor); pinned != pinnedPages.end()) page.pins -= std::min(page.pins, pinned->second);
+                    std::erase(page.aliases, cursor);
                     views.erase(found);
                 }
             } else if (memory.Type == MEM_PRIVATE) {
@@ -541,6 +837,8 @@ private:
     // as unwritten (nothing can store there), so the commit that makes it memory (zeros, unseen by the
     // write watch) is reported as a write once.
     std::map<std::uintptr_t, std::uintptr_t> freshRanges;
+    // Pin counts by shared page address (Pin/Unpin), carried onto the view mapped there.
+    std::map<std::uintptr_t, std::uint32_t> pinnedPages;
     std::map<std::uintptr_t, View> views;
     // MapSpanAlias's reservations: base -> the pieces mapped into it.
     std::map<void*, std::vector<void*>> spanAliases;

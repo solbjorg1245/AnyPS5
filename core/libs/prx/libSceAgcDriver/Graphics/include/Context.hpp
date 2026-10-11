@@ -24,6 +24,8 @@ class Recorder;
 class DescriptorCache;
 class SamplerCache;
 class ShaderResources;
+class FastLayouts;
+class FastRing;
 
 inline void Require(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error("AGC graphics: " + reason);
@@ -71,6 +73,8 @@ struct DeviceFunctions {
     PFN_vkUpdateDescriptorSets updateDescriptorSets = nullptr;
     PFN_vkAllocateDescriptorSets allocateDescriptorSets = nullptr;
     PFN_vkGetFenceStatus getFenceStatus = nullptr;
+    // VK_KHR_push_descriptor (Context::pushDescriptors; null without it).
+    PFN_vkCmdPushDescriptorSetKHR cmdPushDescriptorSet = nullptr;
 };
 
 // Per-thread count of vkGetDeviceProcAddr lookups made through Context::Function (the [vk] line).
@@ -109,6 +113,9 @@ struct Context {
     bool depthClamp = false;
     // Nonzero when VK_EXT_external_memory_host is enabled: the required host pointer alignment.
     VkDeviceSize hostImportAlignment = 0;
+    // A CPU implementation (lavapipe): its "device" reaches host imports with CPU loads and stores,
+    // which host page protection stops (resident buffers' guards would fault its own copies).
+    bool softwareDevice = false;
     RenderCache* renderCache = nullptr;
     DrawQueue* drawQueue = nullptr;
     GraphicsPipelineCache* graphicsPipelines = nullptr;
@@ -136,6 +143,17 @@ struct Context {
     bool descriptorIndexing = false;
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
+    // VK_KHR_push_descriptor enabled (debug aid APS5_NO_PUSH_DESCRIPTORS=1 leaves it off) and its
+    // maxPushDescriptors; the fast path's push layouts (with the extension) and data ring (only
+    // when APS5_FAST_DRAW asks for one), owned by the device. Off and null in tests.
+    bool pushDescriptors = false;
+    std::uint32_t maxPushDescriptors = 0;
+    FastLayouts* fastLayouts = nullptr;
+    FastRing* fastRing = nullptr;
+    // VK_EXT_memory_budget supported and asked for (VideoMemory::Wanted), with the instance's
+    // vkGetPhysicalDeviceMemoryProperties2: the video memory guard's sample. Off and null in tests.
+    bool memoryBudget = false;
+    PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

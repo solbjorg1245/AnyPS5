@@ -7,6 +7,8 @@
 #include "prx/libScePad/include/PadState.hpp"
 #include <array>
 #include <chrono>
+#include <cstdint>
+#include <string>
 #include <vector>
 
 class DisplayWindow;
@@ -27,6 +29,8 @@ private:
     PadInputState sampleController() const;
     void applyOutput();
     void enableSensors();
+    void openScript();
+    bool pollScript(std::chrono::steady_clock::time_point now);
 
     std::vector<Pad::InputBinding> bindings;
     std::vector<bool> pressed;
@@ -40,6 +44,13 @@ private:
     PadOutputState outputState{};
     bool outputPending = false;
     std::chrono::steady_clock::time_point nextRumbleRefresh{};
+    // Scripted input (APS5_INPUT_FILE): the file, how far it was read, the unfinished line, and when
+    // each binding's scripted press ends.
+    std::string scriptPath;
+    std::uint64_t scriptOffset = 0;
+    std::string scriptLine;
+    std::chrono::steady_clock::time_point nextScriptPoll{};
+    std::vector<std::chrono::steady_clock::time_point> scriptReleaseTimes;
 };
 
 #endif

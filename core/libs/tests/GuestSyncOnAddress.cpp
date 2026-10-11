@@ -136,7 +136,8 @@ static void RejectsInvalidArguments() {
     Require(Rejects([&] { sceKernelSyncOnAddressWait(nullptr, 1, nullptr, nullptr); }));
     Require(Rejects([&] { sceKernelSyncOnAddressWait(misaligned, 1, nullptr, nullptr); }));
     Require(Rejects([&] { sceKernelSyncOnAddressWake(nullptr, 1); }));
-    Require(Rejects([&] { sceKernelSyncOnAddressWake(misaligned, 1); }));
+    // A wake takes any address: sceKernelSyncOnAddressWait8/16 waiters sit on unaligned ones.
+    Require(sceKernelSyncOnAddressWake(misaligned, 1) == SCE_OK);
     Require(Rejects([&] { sceKernelSyncOnAddressWake(words, -1); }));
 }
 

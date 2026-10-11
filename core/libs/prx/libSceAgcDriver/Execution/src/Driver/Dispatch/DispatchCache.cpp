@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include <cstdlib>
+#include "prx/libc/include/CommitBudget.hpp"
 
 namespace AgcDriver::DriverDetail {
 
@@ -17,6 +18,13 @@ bool Driver::dataHits() {
 bool Driver::verifyDataHits() {
     static const bool verify = std::getenv("APS5_VERIFY_DATA_HITS") != nullptr;
     return verify;
+}
+
+// The [dispatch-cache] validate copies line: the validate path's copies and sub-steps, counted
+// under APS5_PROFILE_DRAW (DispatchLookup.cpp); APS5_NO_VARIANT_COPY_COUNT=1 leaves them out.
+bool Driver::variantCopyCount() {
+    static const bool count = std::getenv("APS5_PROFILE_DRAW") != nullptr && std::getenv("APS5_NO_VARIANT_COPY_COUNT") == nullptr;
+    return count;
 }
 
 // Draw-cache variants ignore the sampled-image T#s' texture-streaming feedback bits in their stage
@@ -55,7 +63,9 @@ std::size_t Driver::dispatchCacheEntries() {
         const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
         if (parsed != 0) return static_cast<std::size_t>(parsed);
         if (stampValidate()) return std::size_t{4096};
-        return dispatchVariants() > 2 ? std::size_t{8192} : std::size_t{16384};
+        // Cached resources pin textures and buffers: 32768 entries ran a 65 GB machine out of
+        // commit (t334), so a smaller machine gets fewer (CommitBudget.hpp).
+        return CommitBudget::Scaled(dispatchVariants() > 2 ? std::size_t{8192} : std::size_t{16384});
     }();
     return entries;
 }

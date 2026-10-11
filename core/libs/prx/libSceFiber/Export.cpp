@@ -18,6 +18,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include "prx/libc/include/GuestArena.hpp"
 #endif
 
 static constexpr int32_t SCE_OK = 0;
@@ -416,6 +417,24 @@ static void SetBounds(const StackBounds& bounds) {
     *reinterpret_cast<void**>(teb + 0x1478) = bounds.deallocation;
 }
 
+// Fiber contexts stay writable for their lifetime under write tracking: a push into a protected shared
+// page cannot be dispatched (the exception frame lands on the same page). APS5_NO_FIBER_PIN=1 restores
+// the unpinned behaviour; read once so every pin is matched by its unpin.
+static bool PinFibers() {
+    static const bool enabled = std::getenv("APS5_NO_FIBER_PIN") == nullptr;
+    return enabled;
+}
+
+static void PinStack(const void* context, std::uint64_t bytes) {
+    if (!PinFibers()) return;
+    GuestArena::GuestArenaPinWritable_nid_postfix(context, static_cast<std::size_t>(bytes));
+}
+
+static void UnpinStack(const void* context, std::uint64_t bytes) {
+    if (!PinFibers()) return;
+    GuestArena::GuestArenaUnpinWritable_nid_postfix(context, static_cast<std::size_t>(bytes));
+}
+
 #else
 
 extern "C" void Aps5FiberSwitchStack_nid_no_patch(void** save, void* load);
@@ -473,6 +492,10 @@ static StackBounds CurrentBounds() {
 }
 
 static void SetBounds(const StackBounds&) {}
+
+static void PinStack(const void*, std::uint64_t) {}
+
+static void UnpinStack(const void*, std::uint64_t) {}
 
 #endif
 
@@ -575,6 +598,7 @@ int32_t APS5_VABI _sceFiberInitializeImpl_nid_postfix(FiberObject* object, const
         std::fill(words, words + size_context / sizeof(std::uint64_t), FIBER_CONTEXT_FILL);
     }
     NoteEvent(fiber, 'N');
+    PinStack(addr_context, size_context);
     if (TraceFibers()) std::fprintf(stderr, "[fiber] init %s object=%p context=%p+0x%llx entry=%p\n", fiber->name, static_cast<void*>(object), addr_context, static_cast<unsigned long long>(size_context), reinterpret_cast<void*>(entry));
     return SCE_OK;
 }
@@ -587,6 +611,7 @@ int32_t APS5_VABI sceFiberFinalize(FiberObject* object) {
     if (state == FiberState::Suspended) UnparkFiber(fiber);
     NoteEvent(fiber, 'F');
     fiber->magic = 0;
+    UnpinStack(fiber->context, fiber->contextSize);
     return SCE_OK;
 }
 

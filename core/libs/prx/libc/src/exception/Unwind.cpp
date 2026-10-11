@@ -1,6 +1,11 @@
 #include "prx/libc/include/exceptions/Unwind.hpp"
 #include "prx/libc/include/specifics/linux/ElfTypes.hpp"
 #include "prx/libc/src/specifics/x86_64/RegisterContext.cpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
+
+#include <atomic>
+#include <cstdio>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -198,7 +203,9 @@ bool DecodeFrame(_Unwind_Context& context, Frame& frame) {
 #endif
 }
 
-struct Rule { unsigned kind {}; std::intptr_t value {}; const Byte* expression {}; };
+// value serves kinds 1, 2 and 4, expression kinds 3 and 6: one union keeps a Rule at 16 B.
+struct Rule { unsigned kind {}; union { std::intptr_t value {}; const Byte* expression; }; };
+static_assert(sizeof(Rule) == 16);
 #ifdef _WIN32
 constexpr unsigned RuleCount = 33;
 #else
@@ -206,11 +213,58 @@ constexpr unsigned RuleCount = 17;
 #endif
 
 struct Rules { Rule registers[RuleCount] {}; unsigned cfaRegister {7}; std::intptr_t cfaOffset {}; const Byte* cfaExpression {}; };
+constexpr Rules EmptyRules {};
 
-bool Instructions(const Byte* p, const Byte* end, const Frame& frame, Word target, Rules& state, const Rules& initial) {
-    Word location = frame.start;
+// The remember-state stack of the CFA interpreter (DW_CFA_remember_state / restore_state). It was
+// `Rules saved[16]` in Instructions' frame: 13 KiB, value-initialized on each of the four calls per
+// unwound frame. A 16 KiB guest job fiber cannot hold that plus the rest of the unwinder, and the
+// overflow wrote into the fiber context below it (docs/research/loading-deaths-2.md). The states now
+// live in a host-thread vector that grows on the first remember_state: Instructions is not
+// re-entrant and switches no fiber, so fibers sharing a host thread never interleave in it.
+// APS5_UNWIND_STACK_RULES=1 restores the on-stack array.
+static bool UnwindStackRules() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_UNWIND_STACK_RULES");
+        return value != nullptr && *value == '1';
+    }();
+    return enabled;
+}
+
+struct RememberedRulesTag;
+
+class HostRememberedRules {
+public:
+    ~HostRememberedRules() { if (_stack) _stack->resize(_base); }
+    bool Push(const Rules& state) {
+        if (!_stack) {
+            _stack = &HostThreadLocal<std::vector<Rules>, RememberedRulesTag>();
+            _base = _stack->size();
+        }
+        if (_stack->size() - _base == 16) return false;
+        _stack->push_back(state);
+        return true;
+    }
+    bool Pop(Rules& state) {
+        if (!_stack || _stack->size() == _base) return false;
+        state = _stack->back();
+        _stack->pop_back();
+        return true;
+    }
+private:
+    std::vector<Rules>* _stack = nullptr;
+    std::size_t _base = 0;
+};
+
+struct StackRememberedRules {
     Rules saved[16];
     unsigned depth = 0;
+    bool Push(const Rules& state) { if (depth == 16) return false; saved[depth++] = state; return true; }
+    bool Pop(Rules& state) { if (!depth) return false; state = saved[--depth]; return true; }
+};
+
+template<typename TRemembered>
+bool Interpret(const Byte* p, const Byte* end, const Frame& frame, Word target, Rules& state, const Rules& initial, TRemembered& remembered) {
+    Word location = frame.start;
     while (p < end && location <= target) {
         Byte opcode = *p++;
         unsigned reg;
@@ -239,10 +293,10 @@ bool Instructions(const Byte* p, const Byte* end, const Frame& frame, Word targe
             break;
         }
         case 6: reg = Uleb(p); if (reg < RuleCount) state.registers[reg] = initial.registers[reg]; break;
-        case 7: case 8: reg = Uleb(p); if (reg < RuleCount) state.registers[reg] = {unsigned(opcode == 7 ? 5 : 0)}; break;
+        case 7: case 8: reg = Uleb(p); if (reg < RuleCount) state.registers[reg] = {unsigned(opcode == 7 ? 5 : 0), 0}; break;
         case 9: { reg = Uleb(p); auto other = Uleb(p); if (reg < RuleCount) state.registers[reg] = {2, std::intptr_t(other)}; break; }
-        case 10: if (depth == 16) return false; saved[depth++] = state; break;
-        case 11: if (!depth) return false; state = saved[--depth]; break;
+        case 10: if (!remembered.Push(state)) return false; break;
+        case 11: if (!remembered.Pop(state)) return false; break;
         case 12: case 18:
             state.cfaExpression = nullptr; state.cfaRegister = Uleb(p);
             state.cfaOffset = opcode == 18 ? Sleb(p) * frame.dataAlign : Uleb(p); break;
@@ -251,7 +305,7 @@ bool Instructions(const Byte* p, const Byte* end, const Frame& frame, Word targe
         case 15: { state.cfaExpression = p; auto size = Uleb(p); p += size; break; }
         case 16: case 22: {
             reg = Uleb(p); const Byte* expr = p; auto size = Uleb(p); p += size;
-            if (reg < RuleCount) state.registers[reg] = {unsigned(opcode == 16 ? 3 : 6), 0, expr};
+            if (reg < RuleCount) { state.registers[reg] = {unsigned(opcode == 16 ? 3 : 6), 0}; state.registers[reg].expression = expr; }
             break;
         }
         case 46: Uleb(p); break;
@@ -259,6 +313,19 @@ bool Instructions(const Byte* p, const Byte* end, const Frame& frame, Word targe
         }
     }
     return true;
+}
+
+// The old path keeps its array (8.6 KiB on Windows with 16 B rules) in a frame of its own, so the
+// default path does not carry it.
+[[gnu::noinline]] bool InstructionsOnStack(const Byte* p, const Byte* end, const Frame& frame, Word target, Rules& state, const Rules& initial) {
+    StackRememberedRules remembered;
+    return Interpret(p, end, frame, target, state, initial, remembered);
+}
+
+bool Instructions(const Byte* p, const Byte* end, const Frame& frame, Word target, Rules& state, const Rules& initial) {
+    if (UnwindStackRules()) return InstructionsOnStack(p, end, frame, target, state, initial);
+    HostRememberedRules remembered;
+    return Interpret(p, end, frame, target, state, initial, remembered);
 }
 
 bool Expression(const Byte* p, const _Unwind_Context& context, Word cfa, Word& result) {
@@ -316,7 +383,7 @@ bool Expression(const Byte* p, const _Unwind_Context& context, Word cfa, Word& r
 bool GetRules(_Unwind_Context& context, Frame& frame, Rules& rules) {
     if (!DecodeFrame(context, frame)) return false;
     Rules initial;
-    if (!Instructions(frame.cieBegin, frame.cieEnd, frame, ~Word(0), initial, {})) return false;
+    if (!Instructions(frame.cieBegin, frame.cieEnd, frame, ~Word(0), initial, EmptyRules)) return false;
 #ifdef _WIN32
     if (frame.returnRegister == 32) {
         initial.registers[16] = initial.registers[32];
@@ -409,10 +476,51 @@ _Unwind_Reason_Code PhaseTwo(_Unwind_Context context, _Unwind_Exception* excepti
     }
     return _URC_FATAL_PHASE2_ERROR;
 }
+
+// Debug aid APS5_FIBER_CHECK: an unwinder entry with less than 20 KiB of stack below its caller
+// (down to TEB.DeallocationStack, which libSceFiber sets to the running fiber's context base) is
+// reported once per caller, naming the guest code that throws or walks the stack on a small fiber.
+#ifdef _WIN32
+[[gnu::noinline]] void NoteHeadroom(const char* api, const void* frame, const void* caller) {
+    static const bool enabled = std::getenv("APS5_FIBER_CHECK") != nullptr;
+    if (!enabled) return;
+    const auto* teb = reinterpret_cast<const unsigned char*>(NtCurrentTeb());
+    const auto bottom = reinterpret_cast<std::uintptr_t>(*reinterpret_cast<void* const*>(teb + 0x1478));
+    const auto sp = reinterpret_cast<std::uintptr_t>(frame);
+    if (!bottom || sp <= bottom || sp - bottom >= 20 * 1024) return;
+    static std::atomic<std::uintptr_t> seen[256];
+    const auto key = reinterpret_cast<std::uintptr_t>(caller);
+    bool claimed = false;
+    for (std::size_t probe = 0, slot = (key >> 4) & 255; probe < 256 && !claimed; ++probe, slot = (slot + 1) & 255) {
+        auto expected = seen[slot].load(std::memory_order_relaxed);
+        if (expected == key) return;
+        if (expected == 0) {
+            claimed = seen[slot].compare_exchange_strong(expected, key);
+            if (!claimed && expected == key) return;
+        }
+    }
+    if (!claimed) return;
+    HMODULE module = nullptr;
+    char path[MAX_PATH] = "?";
+    std::uintptr_t offset = key;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(caller), &module) && module) {
+        GetModuleFileNameA(module, path, sizeof(path));
+        offset = key - reinterpret_cast<std::uintptr_t>(module);
+    }
+    const char* name = path;
+    for (const char* cursor = path; *cursor; ++cursor) if (*cursor == '\\' || *cursor == '/') name = cursor + 1;
+    std::fprintf(stderr, "[unwind] %s from %p %s+0x%llx on t%lu (stack %p..%p) with 0x%llx bytes of stack left\n", api, caller, name,
+        static_cast<unsigned long long>(offset), GetCurrentThreadId(), reinterpret_cast<void*>(bottom), reinterpret_cast<const NT_TIB*>(teb)->StackBase,
+        static_cast<unsigned long long>(sp - bottom));
+}
+#else
+inline void NoteHeadroom(const char*, const void*, const void*) {}
+#endif
 }
 
 extern "C" {
 _Unwind_Reason_Code APS5_VABI _Unwind_RaiseException_nid_postfix(_Unwind_Exception* exception) {
+    LibcUnwind::NoteHeadroom("_Unwind_RaiseException", __builtin_frame_address(0), __builtin_return_address(0));
     _Unwind_Context start;
     LibcCaptureRegisters(start.registers);
     if (!LibcUnwind::Step(start)) return _URC_FATAL_PHASE1_ERROR;
@@ -435,6 +543,7 @@ _Unwind_Reason_Code APS5_VABI _Unwind_RaiseException_nid_postfix(_Unwind_Excepti
 }
 
 [[noreturn]] void APS5_VABI _Unwind_Resume_nid_postfix(_Unwind_Exception* exception) {
+    LibcUnwind::NoteHeadroom("_Unwind_Resume", __builtin_frame_address(0), __builtin_return_address(0));
     _Unwind_Context context;
     LibcCaptureRegisters(context.registers);
     if (!LibcUnwind::Step(context)) std::abort();
@@ -470,6 +579,7 @@ _Unwind_Ptr APS5_VABI _Unwind_GetTextRelBase_nid_postfix(_Unwind_Context* contex
 
 _Unwind_Reason_Code APS5_VABI _Unwind_ForcedUnwind_nid_postfix(_Unwind_Exception* exception, _Unwind_Stop_Fn stop, void* argument) {
     if (!stop) return _URC_FATAL_PHASE2_ERROR;
+    LibcUnwind::NoteHeadroom("_Unwind_ForcedUnwind", __builtin_frame_address(0), __builtin_return_address(0));
     _Unwind_Context context;
     LibcCaptureRegisters(context.registers);
     if (!LibcUnwind::Step(context)) return _URC_FATAL_PHASE2_ERROR;
@@ -479,6 +589,7 @@ _Unwind_Reason_Code APS5_VABI _Unwind_ForcedUnwind_nid_postfix(_Unwind_Exception
 }
 
 _Unwind_Reason_Code APS5_VABI _Unwind_Backtrace_nid_postfix(_Unwind_Trace_Fn trace, void* argument) {
+    LibcUnwind::NoteHeadroom("_Unwind_Backtrace", __builtin_frame_address(0), __builtin_return_address(0));
     _Unwind_Context context;
     LibcCaptureRegisters(context.registers);
     if (!LibcUnwind::Step(context)) return _URC_END_OF_STACK;

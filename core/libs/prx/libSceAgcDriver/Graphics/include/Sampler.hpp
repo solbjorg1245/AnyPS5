@@ -5,6 +5,7 @@
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestSamplerResource.hpp"
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -21,6 +22,10 @@ public:
     Sampler& operator=(const Sampler&) = delete;
 
     VkSampler Handle() const;
+    // The sampler cache's recency stamp (SamplerCache): the cache's clock at the last lookup that
+    // answered this sampler, by Get or by a thread's memo (GetMemoized, which takes no lock), so the
+    // cache evicts the least recently used sampler as if every lookup had reached Get.
+    mutable std::atomic<std::uint64_t> cacheUse{0};
 
 private:
     void release() noexcept;
@@ -40,21 +45,35 @@ public:
     SamplerCache(const SamplerCache&) = delete;
     SamplerCache& operator=(const SamplerCache&) = delete;
     std::shared_ptr<Sampler> Get(const Context& context, std::span<const std::uint32_t> words, bool compareEnable);
-    // APS5_PROFILE_DRAW counters: lookups served by an existing sampler, and samplers created.
-    std::uint64_t Hits() const { return hits; }
+    // Get through the calling thread's memo of the samplers this cache answered it last (the fast
+    // paths' S# memo, docs/design/draw-fastpath.md 2.6, F4): an entry answers an equal key while
+    // this cache dropped no entry since it answered (Removals) and the sampler lives, i.e. while
+    // Get would return the same object; a hit takes no lock. APS5_NO_SAMPLER_MEMO=1 calls Get.
+    std::shared_ptr<Sampler> GetMemoized(const Context& context, std::span<const std::uint32_t> words, bool compareEnable);
+    // APS5_PROFILE_DRAW counters: lookups served by an existing sampler (memo hits included), and
+    // samplers created.
+    std::uint64_t Hits() const { return hits + memoHits.load(std::memory_order_relaxed); }
     std::uint64_t Misses() const { return misses; }
+    // Entries evicted so far (the memo's validity), and this cache's identity among every cache
+    // the process made (a cache made at a destroyed one's address is another instance).
+    std::uint64_t Removals() const { return removals.load(std::memory_order_acquire); }
+    std::uint64_t Instance() const { return instance; }
 
 private:
     struct Entry {
+        // Its last use is the sampler's cacheUse.
         std::shared_ptr<Sampler> sampler;
-        std::uint64_t lastUse;
     };
     HostMutex mutex;
     std::map<std::array<std::uint32_t, 5>, Entry> entries;
-    std::uint64_t clock = 0;
+    // Ticks once per lookup (Get, under the mutex; a memo hit, without it).
+    std::atomic<std::uint64_t> clock{0};
     std::size_t capacity;
     std::uint64_t hits = 0;
     std::uint64_t misses = 0;
+    std::atomic<std::uint64_t> memoHits{0};
+    std::atomic<std::uint64_t> removals{0};
+    const std::uint64_t instance;
 };
 
 }

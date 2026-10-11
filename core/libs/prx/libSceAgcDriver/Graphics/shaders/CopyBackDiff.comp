@@ -1,0 +1,68 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+
+// Narrow copy-backs (Recorder::NarrowsCopyBacks, APS5_NARROW_COPY_BACKS=1): a staged region's
+// copy-back stores into its host import only the dwords its shadow changed. `baseline` holds what
+// the import holds of the range (GuestBufferMemory refreshes it at each copy-in from the import and
+// every copy-back keeps it so), so a dword equal to its baseline is in the import already and is
+// not sent over PCIe; one that differs is stored and becomes the baseline. The three ranges are
+// `words` dwords long and do not overlap. `flags`:
+// - bit 0 (profiling): `stored.word[0]` counts the dwords stored, one atomic per workgroup (it
+//   wraps; the reader takes differences);
+// - bit 1 (APS5_NARROW_VERIFY): a dword equal to its baseline is read back from the import too;
+//   one the import holds otherwise (a stale baseline) is stored, as a whole copy would store it,
+//   and counted in `stored.word[1]`; the first such dword is described in words 2-6 (its index,
+//   the span's guest address `guestLow`/`guestHigh`, the import's and the shadow's value).
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+    uint word[];
+};
+
+layout(push_constant, std430) uniform Parameters {
+    Words shadow;
+    Words baseline;
+    Words target;
+    Words stored;
+    uint words;
+    uint flags;
+    uint guestLow;
+    uint guestHigh;
+} parameters;
+
+shared uint groupStored;
+
+void main() {
+    // Uniform: every invocation counts or none does (the barriers below).
+    const bool counting = (parameters.flags & 1u) != 0u;
+    const bool verifying = (parameters.flags & 2u) != 0u;
+    if (counting && gl_LocalInvocationIndex == 0u) groupStored = 0u;
+    uint changed = 0u;
+    const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    for (uint index = gl_GlobalInvocationID.x; index < parameters.words; index += stride) {
+        const uint value = parameters.shadow.word[index];
+        if (value != parameters.baseline.word[index]) {
+            parameters.target.word[index] = value;
+            parameters.baseline.word[index] = value;
+            ++changed;
+        } else if (verifying) {
+            const uint held = parameters.target.word[index];
+            if (held != value) {
+                parameters.target.word[index] = value;
+                ++changed;
+                if (atomicAdd(parameters.stored.word[1], 1u) == 0u) {
+                    parameters.stored.word[2] = index;
+                    parameters.stored.word[3] = parameters.guestLow;
+                    parameters.stored.word[4] = parameters.guestHigh;
+                    parameters.stored.word[5] = held;
+                    parameters.stored.word[6] = value;
+                }
+            }
+        }
+    }
+    if (!counting) return;
+    barrier();
+    if (changed != 0u) atomicAdd(groupStored, changed);
+    barrier();
+    if (gl_LocalInvocationIndex == 0u && groupStored != 0u) atomicAdd(parameters.stored.word[0], groupStored);
+}

@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -25,6 +26,15 @@ class Recorder;
 
 void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
+// Video-memory budget ("textures" reclaimer, a safe point): evicts sampled texture cache entries
+// held by the cache alone (no build, no batch references them) and not used for the budget's
+// MinAge epochs, least recently used first, until about `want` bytes of images went; by try_lock
+// (0 when the cache is busy). Images in the image pool's blocks only while the pool's slack is
+// below VramBudget::SlackRoom (their eviction leaves a hole, not free memory). The textures are
+// appended to `victims` (the caller disposes of them); `dedicated` gets the bytes of those with
+// memory of their own. Returns the bytes of all of them.
+VkDeviceSize EvictColdTextures(VkDeviceSize want, std::vector<std::shared_ptr<void>>& victims, VkDeviceSize& dedicated);
+VramCacheCensus SampledTextureCensus();
 
 // The cached storage image of a surface (render targets use it as their resident image); brought up
 // to date with guest memory before it is returned.
@@ -33,10 +43,47 @@ std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, con
 // would return); a true answer counts as a use for the cache's eviction order, as a lookup would.
 bool StorageImageCached(const Context& context, const StorageTexture* image);
 bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddress);
+// The fast draw path's sampled-image lookup (FastDraw.cpp, draw-fastpath.md 2.6 F3): a sampled
+// element as resolveImageBinding binds it (a null T# takes the null texture's words, the shape
+// check, cachedTexture) without a ShaderResources object. Null when the old path decides the
+// element instead: a T# DecodeTextureResource refuses (`undecodable`; resolveImageBinding reports
+// it and binds the null texture under APS5_NULL_UNDECODABLE=1, else throws) or a dimension the
+// shape does not allow. `firstLayer`: the view to bind is FirstLayerView (2D binding, 2D array).
+std::shared_ptr<Texture> FastSampledTexture(const Context& context, std::span<const std::uint32_t> words, ShaderRecompiler::DescriptorImageShape shape, bool depthCompare, bool& firstLayer, bool& undecodable);
+
+// One element of a shader's image bindings resolved without a ShaderResources build, for the fast
+// paths (docs/design/draw-fastpath.md 2.6, 2.9): what a build's stage B binds for it
+// (resolveImageBinding without the stage-A records). A sampled element: null T# words bind the null
+// texture, undecodable words throw (bind the null texture under APS5_NULL_UNDECODABLE=1), a
+// dimension the image shape rejects throws, and the texture is the texture cache's; `firstLayer`
+// says the descriptor binds FirstLayerView() (a 2D shape over an array) instead of View(). Under
+// GuestMemory::GpuMutex (the lookups may record uploads and wait for recorded work). `nullBound`:
+// an undecodable element bound as null is counted there instead of in the [draws] "driver decode"
+// count (the caller adds it with NoteSampledNullBound once its work is recorded).
+std::shared_ptr<Texture> ResolveSampledImage(const Context& context, const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t element, bool& firstLayer, std::uint32_t* nullBound = nullptr);
+// Adds undecodable sampled elements bound as null to the [draws] "driver decode" count.
+void NoteSampledNullBound(std::uint64_t count);
+// A storage element: the storage cache's image of the surface (brought up to date) at the mip the
+// element addresses; consecutive identical elements address successive mips of one image, so
+// `previous` is the same binding's previous element (null for element 0). A written element notes
+// a depth surface write, as a build does; its image is marked dirty once the work is recorded.
+struct StorageImageElement {
+    std::shared_ptr<StorageTexture> image;
+    std::uint32_t mip = 0;
+    std::uint32_t mipOffset = 0;
+    bool firstLayer = false;
+    bool written = false;
+};
+StorageImageElement ResolveStorageImage(const Context& context, const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t element, const StorageImageElement* previous);
 
 // Defined in Texture.cpp beside the pending-results registry, for the fast Revalidate below: whether
 // a storage image other than `except` has results pending in [address, address + bytes).
 bool PendingStorageOverlaps(std::uint64_t address, std::size_t bytes, const StorageTexture* except);
+// Resident read-only copies (GuestBufferMemory.cpp "Resident reads"): whether a SPIR-V module may
+// store through a physical storage buffer pointer (a BDA store), by its instructions alone: an
+// OpStore, OpCopyMemory or atomic whose pointer is typed PhysicalStorageBuffer, or comes from an
+// instruction the scan does not type. Independent of debug names (an inlined lookup keeps it).
+bool SpirvMayStoreThroughBda(std::span<const std::uint32_t> words);
 
 // Per-device descriptor objects shared by ShaderResources builds: set layouts by their binding list
 // (immutable; kept until the device is torn down, which Vulkan allows even for pipeline layouts made
@@ -74,8 +121,29 @@ public:
         std::uint64_t pools = 0;
     };
     Stats Counters() const;
+    // A set that lives for the recorder's open batch alone (ShaderResources::ForkData): taken from
+    // a pool that belongs to that batch, which the batch keeps and which is reset whole and reused
+    // once the batch completed (no set is freed one by one; the chain pools above are untouched;
+    // past TransientIdlePools reset pools waiting, a returned pool is destroyed). A null set when
+    // `sizes` exceed what one such pool holds, or when the device cannot make a pool or a set (out
+    // of host or device memory): the caller takes its old path, it never throws for those.
+    // Called by the recording thread under GuestMemory::GpuMutex.
+    VkDescriptorSet AllocateTransient(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, Recorder& recorder);
+    // APS5_PROFILE_DRAW counters of AllocateTransient: sets made, pools created, pools reset for
+    // reuse after their batch, sets refused (needs over one pool, or a pool or set the device could
+    // not make), pools destroyed on their return (more than a few reset ones waiting).
+    struct TransientStats {
+        std::uint64_t sets = 0;
+        std::uint64_t pools = 0;
+        std::uint64_t resets = 0;
+        std::uint64_t refused = 0;
+        std::uint64_t destroyed = 0;
+    };
+    TransientStats TransientCounters() const;
 
 private:
+    struct TransientPools;
+    struct TransientReturn;
     Context context;
     PFN_vkDestroyDescriptorSetLayout destroyLayout;
     PFN_vkDestroyDescriptorPool destroyPool;
@@ -84,6 +152,11 @@ private:
     std::map<std::vector<std::uint32_t>, VkDescriptorSetLayout> layouts;
     std::vector<VkDescriptorPool> pools;
     Stats stats;
+    // AllocateTransient's pools (shared with the batches that keep them) and the open batch's pool
+    // with that batch's serial (Recorder::Submissions() + 1 when it was taken).
+    std::shared_ptr<TransientPools> transient;
+    VkDescriptorPool transientPool = VK_NULL_HANDLE;
+    std::uint64_t transientSerial = 0;
 };
 
 class ShaderResources {
@@ -104,6 +177,8 @@ public:
     ShaderResources& operator=(const ShaderResources&) = delete;
     VkDescriptorSetLayout Layout() const;
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
+    // Binds `set` in place of this object's own: a set of the same layout (ForkData's).
+    void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, VkDescriptorSet set) const;
     struct DrawBindings {
         DrawBindings() = default;
         DrawBindings(const DrawBindings&) = delete;
@@ -176,11 +251,20 @@ public:
     void WriteBackBuffers();
     // Whether WriteBackBuffers has anything the CPU must see (copied written buffers, BDA faults).
     bool NeedsCompletion() const { return bda != nullptr || guestMemory.HasCopiedWrites(); }
+    // Resident read-only copies: the dispatch is about to be recorded; a batch submitted since the
+    // build's or proof's check makes it check them again (GuestBufferMemory::RecheckResidentReads).
+    void RecheckResidentReads(Recorder& recorder) { guestMemory.RecheckResidentReads(recorder); }
     // Whether a written buffer was copied (its results reach guest memory by the CPU write-back).
     bool HasCopiedWrites() const { return guestMemory.HasCopiedWrites(); }
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
+    // The [inplace-writes] census of this use (GuestBufferMemory::NoteInPlaceWrites).
+    void NoteInPlaceWrites(std::uint64_t program) const { guestMemory.NoteInPlaceWrites(program); }
     int LeaseShape() const { return guestMemory.LeaseShape(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
+    // Whether a region binds the device copy of the resident written range `key` (APS5_RESIDENT_WRITES).
+    bool BindsResidentLand(const void* key) const { return guestMemory.BindsResidentLand(key); }
+    bool MapsResidentLands() const { return guestMemory.MapsResidentLands(); }
+    bool MapsResidentLand(const void* key) const { return guestMemory.MapsResidentLand(key); }
     // Whether a region the recorded work reads in place through a host import overlaps the range.
     bool ReadsOverlap(std::uint64_t address, std::size_t bytes) const;
     // The recorder's hazard tracker inputs (Recorder::NoteAccess): the written elements' guest
@@ -196,8 +280,31 @@ public:
     bool WritesMemory() const;
     bool ReadsImage(const StorageTexture* image) const;
     const std::vector<std::uint32_t>& LayoutKey() const { return layoutKey; }
+    // APS5_FAST_DRAW_VERIFY (FastDraw.cpp VerifyFastBindings): what the set binds, binding by
+    // binding in plan order (the layout key's): per element the buffer view (a data buffer's bytes
+    // too), the image view or the sampler. The address roles (BDA table, fault buffer) list zeros.
+    struct BoundElement {
+        VkDescriptorBufferInfo buffer{};
+        // A guest buffer element (GuestBufferMemory::Descriptor), and whether its region is read
+        // in place from a host import rather than copied or mirrored (fast draw verification).
+        bool guest = false;
+        bool inPlace = false;
+        std::span<const std::byte> data;
+        VkImageView view = VK_NULL_HANDLE;
+        VkSampler sampler = VK_NULL_HANDLE;
+    };
+    struct BoundBinding {
+        std::uint32_t binding = 0;
+        VkDescriptorType type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        std::vector<BoundElement> elements;
+    };
+    std::vector<BoundBinding> BoundDescriptors() const;
     // Debug aid: each bound guest resource with the fraction of sampled bytes that are nonzero.
     std::string Describe() const;
+    // Debug aid for a dispatch bound to a ForkData set (Forked, Reused): the words its data
+    // bindings read, patched as the ring holds them (Describe shows this object's buffers, which a
+    // fork leaves alone), as " forked data[...]" per data binding.
+    std::string DescribeForkedWords(const CompiledShader& shader) const;
 
     // Reuse across dispatches of identical content (see the resource cache in VulkanDevice): the
     // key is everything a compute build consumes from its compiled shader (variant, and per binding
@@ -218,10 +325,60 @@ public:
     // buffer already holding the words is left alone). Returns whether anything was recorded. With
     // `recorder` the updates are one [gputime] range of class TemplateDataRefresh.
     bool RefreshData(VkCommandBuffer commands, const CompiledShader& shader, Recorder* recorder = nullptr);
+    // The data refresh without a transfer (APS5_TEMPLATE_REFRESH_RING=1, VulkanDevice::
+    // recordDispatch; default off, RefreshData stays the fallback): when the shader's ShaderData /
+    // FlattenedSrt words differ from what this object's data buffers hold, a copy of this object's
+    // set for the recorder's open batch (DescriptorCache::AllocateTransient) whose differing data
+    // bindings read the shader's words (patched like the buffers) from the device's fast ring
+    // (FastRing, written by the CPU now, its region retired with the batch); every other binding is
+    // copied from this object's set (VkCopyDescriptorSet). Nothing is recorded, so the dispatch
+    // needs no transfer before it and no leading barrier for one: RefreshData's vkCmdUpdateBuffer
+    // between two dispatches measured ~6.6 us of GPU time each under copy-back coalescing (t415:
+    // 2.3k per present, 15 ms, for 0.6 MiB). This object keeps its words and DataWordsHash. The
+    // outcome: Forked (bind `set` with Bind(..., set)); Same (nothing differs: bind this object's
+    // set); otherwise nothing was made and the caller refreshes with RefreshData: NoRing (no ring,
+    // descriptor cache or set), RingFull (no room in the ring: regions free as their batches are
+    // released), NoSet (a set over one transient pool), Unsupported (deferred flat words, more than
+    // MaxForkedBindings differing data bindings, a data buffer of another size).
+    // Two outcomes keep a template that settles on new words from forking on every hit (the old
+    // path refreshed once, then its hits had the same words):
+    // - Reused (APS5_TEMPLATE_REFRESH_REUSE, default on with the ring): every data word equals the
+    //   last fork's, made in the recorder's open batch, and no RefreshData, adoption or rebase
+    //   touched this object since: bind that fork's set again (`set`); nothing is made.
+    // - Adopted (APS5_TEMPLATE_REFRESH_ADOPT, default on with the ring): this object is idle (its
+    //   last recorded use, NoteRecorded, is in a batch that finished: serial <= Submissions() -
+    //   InFlightBatches() of the same recorder): the differing words, patched, are written into
+    //   its host-coherent data buffers by the CPU (visible at the batch's submit, read by no
+    //   unfinished batch), its words and DataWordsHash become the shader's, as after RefreshData;
+    //   bind this object's set. Nothing is recorded.
+    enum class ForkOutcome : std::uint8_t { Forked, Reused, Adopted, Same, NoRing, RingFull, NoSet, Unsupported, Count };
+    static constexpr std::size_t MaxForkedBindings = 4;
+    struct DataFork {
+        ForkOutcome outcome = ForkOutcome::Same;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        // The words placed in the ring (Forked) or written into this object's buffers (Adopted).
+        std::uint64_t bytes = 0;
+    };
+    DataFork ForkData(const CompiledShader& shader, Recorder& recorder);
+    // The recorder's open batch binds this object's set or a fork of it (VulkanDevice::
+    // recordDispatch, after ForkData; every use of a compute template is recorded there): ForkData
+    // adopts words only once that batch finished. Under GuestMemory::GpuMutex.
+    void NoteRecorded(const Recorder& recorder);
     // Walks the write watch over every image surface of a completed object (no device lock: the
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces() const;
     bool Reusable() const { return reusable; }
+    // What destroying this object gives back (VramBudget): alone, the staging shadows and buffers
+    // nothing else references; shared, the textures only it and one other holder reference (then
+    // the texture cache's entry, for the "textures" reclaimer) and the shadows one other holder
+    // references (the staging registry, for the "shadows" reclaimer, or a batch). Only for an
+    // object no other thread can reach (the cache's alone).
+    VramHeld DeviceBytesHeldAlone() const;
+    // The resource cache's epoch of its last use (Find, Touch, Insert; VramBudget::Aged).
+    void NoteCacheUse(std::uint64_t epoch) { cacheUsedAt.store(epoch, std::memory_order_relaxed); }
+    std::uint64_t CacheUsedAt() const { return cacheUsedAt.load(std::memory_order_relaxed); }
+    // Tests: device-local bytes this object counts as holding alone (no shadow of its own).
+    void HoldDeviceBytesForTests(VkDeviceSize bytes) { testDeviceBytes = bytes; }
     // Lease templates (default with the rebased ones; APS5_NO_LEASE_REBASE=1 none): an address-based build over the cached space
     // alone (LeaseShape 0) is kept in the resource cache, though not Reusable (its fault buffer and
     // lease are per use), and serves a later dispatch of the same content key once its previous
@@ -296,6 +453,10 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> PresyncSurfaces() const;
 
 private:
+    // The FrameTrace note of this use (FrameTrace::NoteWrites): the written storage images
+    // (" w=0x<address>/<width>x<height>/f<format>/m<mip>"), the written buffer ranges
+    // (" wb=0x<address>+0x<bytes>"), then " |" and Describe().
+    void noteFrameTrace();
     struct DescribedRange {
         const char* kind;
         std::uint64_t address;
@@ -335,6 +496,10 @@ private:
         std::uint32_t adjustment;
     };
     void writeDataWords(VkCommandBuffer commands, std::size_t allocation, std::span<const std::uint32_t> words) const;
+    // The data patches of `allocation` (a data buffer) applied to `bytes`, its words: each patch's
+    // byte below bytes.size() takes the patch's adjustment. The one patch rule of writeDataWords,
+    // ForkData and PrepareDrawBindings.
+    void patchDataWords(std::size_t allocation, std::span<std::byte> bytes) const;
 
     struct Binding {
         VkDescriptorSetLayoutBinding layout;
@@ -474,6 +639,9 @@ private:
     GuestBufferMemory guestMemory;
     std::unique_ptr<BdaResources> bda;
     bool usesBda = false;
+    // An address-based program that may store through its BDA table (prepareAddressBindings): its
+    // uses stale the resident read-only copies over the table's writable ranges (Bind).
+    bool bdaStores = false;
     bool usesFaultBuffer = false;
     VkDescriptorSetLayout _layout = VK_NULL_HANDLE;
     // Whether the layout is this object's own (no cache) and destroyed with it.
@@ -497,6 +665,9 @@ private:
     std::vector<bool> storageFirstLayer;
     std::vector<bool> storageWritten;
     std::vector<std::shared_ptr<Sampler>> samplers;
+    // NoteCacheUse, HoldDeviceBytesForTests.
+    std::atomic<std::uint64_t> cacheUsedAt{0};
+    VkDeviceSize testDeviceBytes = 0;
     bool reusable = false;
     bool leaseTemplate = false;
     // The cached space's serial the template was built over (LeaseTemplate).
@@ -520,6 +691,19 @@ private:
     void rehashDataWords();
     std::vector<std::pair<std::uint32_t, std::uint32_t>> pushPatches;
     std::vector<DataPatch> dataPatches;
+    // ForkData's state (APS5_TEMPLATE_REFRESH_RING), under GuestMemory::GpuMutex: the batch that
+    // last recorded a use of this object (NoteRecorded: its recorder and serial; none, never
+    // adopt), and the last fork (its recorder, batch serial, set and every data binding's words in
+    // binding order; a null set: none), dropped by RefreshData, an adoption and rebaseLease.
+    const Recorder* recordedBy = nullptr;
+    std::uint64_t recordedSerial = 0;
+    struct ForkMemo {
+        const Recorder* recorder = nullptr;
+        std::uint64_t serial = 0;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        std::vector<std::uint32_t> words;
+    };
+    ForkMemo lastFork;
     BuildTiming timing;
     // Build state carried from stage A to stage B: the bindings in plan order, the image bindings
     // still to look up (index into `bindings`; the DescriptorBinding lives in the compiled shader),
@@ -574,6 +758,16 @@ public:
     // Moves the entry to the front of the LRU (a recipe hit uses its template without Find, and a
     // hot template must not age out under the recipes that depend on it); false when no entry.
     bool Touch(const Key& key);
+    // Video-memory budget ("builds" reclaimer, a safe point): moves into `victims` the least
+    // recently used entries the cache alone holds (no batch, recipe or caller references them),
+    // not used for the budget's MinAge epochs and holding device-local memory
+    // (DeviceBytesHeldAlone not empty: evicting one that holds none frees nothing and costs a
+    // rebuild), until their bytes reach `want` (at most 256 per call, 4096 entries looked at); by
+    // try_lock (nothing when busy). Returns their bytes.
+    VramHeld EvictCold(VkDeviceSize want, std::vector<std::shared_ptr<ShaderResources>>& victims);
+    // The entries, and of the 4096 least recently used the ones EvictCold could take and their
+    // DeviceBytesHeldAlone (the [vram] line), by try_lock.
+    VramCacheCensus ColdCensus();
     // Find and Touch calls so far (the [rescache] line: a recipe hit touches instead of finding).
     static std::uint64_t Finds();
     static std::uint64_t Touches();

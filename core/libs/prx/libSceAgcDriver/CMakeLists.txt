@@ -46,18 +46,31 @@ add_custom_command(
         VERBATIM
 )
 
+# Narrow copy-backs' compare pass (Recorder::NarrowsCopyBacks): buffer device addresses only.
+set(agcCopyBackDiffShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/CopyBackDiff.comp)
+set(agcCopyBackDiffShaderSpv ${agcTextureDetileGeneratedDir}/CopyBackDiff.spv)
+set(agcCopyBackDiffShaderHeader ${agcTextureDetileGeneratedDir}/CopyBackDiff_spv.h)
+add_custom_command(
+        OUTPUT "${agcCopyBackDiffShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcCopyBackDiffShaderSpv}" "${agcCopyBackDiffShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcCopyBackDiffShaderSpv} -DOUTPUT=${agcCopyBackDiffShaderHeader}
+        -DSYMBOL=COPY_BACK_DIFF_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcCopyBackDiffShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FastClock.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FastEmutls.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/OperatorNew.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/DeviceAccess.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Diagnostics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/FrameTrace.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/PassDump.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DataHitVerification.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/Dispatch.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/FastDispatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchCacheStatistics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchInsert.cpp
@@ -75,7 +88,12 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRelocation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawPrecheck.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRegisterKey.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/FastState.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawTiming.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/FastCensus.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/FastWalk.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/FastDraw.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/FastRead.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/IndirectDraw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/EntryPoints.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lifecycle.cpp
@@ -115,11 +133,16 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ColorTargetLayout.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ColorTargetTransfer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Pipeline.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/FastLayouts.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/FastRing.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/FastDraw.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/FastDispatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderInputState.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderResources.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/VramReclaimers.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderAddressResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GuestBufferMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BdaResources.cpp
@@ -129,6 +152,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GuestTextureResource.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GuestSamplerResource.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureFormat.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TexelStats.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DccMetadata.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureTiling.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureDetiler.cpp
@@ -136,6 +160,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
+        ${agcCopyBackDiffShaderHeader}
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Event.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Query.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Resource/src/Lifecycle.cpp
@@ -146,6 +171,21 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Submit/src/CommandBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Submit/src/Dcb.cpp
 )
+
+# The host replacements below work around MinGW's runtime (winpthreads' clock_gettime, emulated TLS,
+# the msvcrt-style heap) through Win32 and PE import tricks; on Linux glibc does all three natively,
+# and HostStubs.cpp supplies the counters the profile lines read from them.
+if(MINGW)
+    list(APPEND agcDriverSources
+            ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FastClock.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FastEmutls.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/OperatorNew.cpp
+    )
+else()
+    list(APPEND agcDriverSources
+            ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HostStubs.cpp
+    )
+endif()
 
 add_library(libSceAgcDriver SHARED EXCLUDE_FROM_ALL
         ${agcDriverSources}
@@ -200,6 +240,8 @@ add_test_executable(agc_driver_tests EXCLUDE_FROM_ALL
 
 target_include_directories(agc_driver_tests PRIVATE
         ${LIBS_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler
+        ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include
 )
 
 target_link_libraries(agc_driver_tests PRIVATE
@@ -236,6 +278,12 @@ target_include_directories(agc_shader_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_shader_memory_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_memory_tests)
+# The fast walk's decline must not throw: tests/ShaderMemory.cpp counts every C++ throw of the
+# test's objects and static libraries through a __cxa_throw wrapper (GNU ld and lld --wrap).
+if(MINGW OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(agc_shader_memory_tests PRIVATE -Wl,--wrap=__cxa_throw)
+    target_compile_definitions(agc_shader_memory_tests PRIVATE APS5_COUNT_CXX_THROWS=1)
+endif()
 
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
@@ -289,6 +337,13 @@ if(BUILD_TESTING)
     endif()
 endif()
 
+# The [inplace-writes] census's aggregator (Graphics/include/InPlaceWriteCensus.hpp): header only, no device.
+add_test_executable(agc_inplace_write_census_tests EXCLUDE_FROM_ALL tests/InPlaceWriteCensus.cpp)
+target_include_directories(agc_inplace_write_census_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_inplace_write_census_tests PRIVATE libc)
+set_target_properties(agc_inplace_write_census_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_inplace_write_census_tests)
+
 add_test_executable(agc_shader_disk_cache_tests EXCLUDE_FROM_ALL tests/ShaderDiskCache.cpp)
 target_include_directories(agc_shader_disk_cache_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_shader_disk_cache_tests PRIVATE shader_recompiler_agc_driver libc)
@@ -333,10 +388,25 @@ add_custom_command(
         VERBATIM
 )
 
+# tests/Recorder.cpp templateRefreshRingTests: results[words[1]] = words[0] through two data buffers.
+set(agcDataSlotShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/DataSlot.comp)
+set(agcDataSlotShaderSpv ${agcTestShaderGeneratedRoot}/DataSlot.spv)
+set(agcDataSlotShaderHeader ${agcTestShaderGeneratedRoot}/DataSlot_spv.h)
+add_custom_command(
+        OUTPUT "${agcDataSlotShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTestShaderGeneratedRoot}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcDataSlotShaderSpv}" "${agcDataSlotShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcDataSlotShaderSpv} -DOUTPUT=${agcDataSlotShaderHeader}
+        -DSYMBOL=DATA_SLOT_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcDataSlotShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
         tests/Recorder.cpp
         tests/ResidentPresent.cpp
         ${agcSampleLodShaderHeader}
+        ${agcDataSlotShaderHeader}
 )
 
 target_include_directories(agc_driver_recorder_tests PRIVATE
@@ -344,6 +414,8 @@ target_include_directories(agc_driver_recorder_tests PRIVATE
         ${agcTestShaderGeneratedRoot}
         ${CMAKE_SOURCE_DIR}/core/shader/recompiler
         ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include
+        # The fast reader's known-value test walks a shader (Optimization/ResourceProgram.hpp).
+        $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
 )
 
 target_link_libraries(agc_driver_recorder_tests PRIVATE
@@ -354,6 +426,20 @@ target_link_libraries(agc_driver_recorder_tests PRIVATE
 
 set_target_properties(agc_driver_recorder_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_recorder_tests)
+
+add_test_executable(agc_recorder_kept_bytes_tests EXCLUDE_FROM_ALL tests/RecorderKeptBytes.cpp)
+target_include_directories(agc_recorder_kept_bytes_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
+target_link_libraries(agc_recorder_kept_bytes_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_recorder_kept_bytes_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_recorder_kept_bytes_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_recorder_kept_bytes_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_recorder_kept_bytes COMMAND agc_recorder_kept_bytes_tests)
+    if(WIN32)
+        set_tests_properties(agc_recorder_kept_bytes PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
 
 add_test_executable(agc_driver_pm4_tests EXCLUDE_FROM_ALL
         tests/Pm4.cpp
@@ -378,6 +464,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         tests/GuestAllocations.cpp
         tests/LiveStack.cpp
         tests/TextureFormat.cpp
+        tests/TexelStats.cpp
         tests/TextureTiling.cpp
         tests/ImageMemoryPool.cpp
         tests/GuestTextureResource.cpp
@@ -386,6 +473,9 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/Draw.cpp
         Graphics/src/DepthSurface.cpp
         Graphics/src/Pipeline.cpp
+        Graphics/src/FastLayouts.cpp
+        Graphics/src/FastRing.cpp
+        Graphics/src/FastDraw.cpp
         Graphics/src/State.cpp
         Graphics/src/ColorTargetLayout.cpp
         Graphics/src/ColorTargetTransfer.cpp
@@ -399,6 +489,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/GuestTextureResource.cpp
         Graphics/src/GuestSamplerResource.cpp
         Graphics/src/TextureFormat.cpp
+        Graphics/src/TexelStats.cpp
         Graphics/src/DccMetadata.cpp
         Graphics/src/TextureTiling.cpp
         Graphics/src/TextureDetiler.cpp
@@ -408,6 +499,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/Recorder.cpp
         Graphics/src/ShaderInputState.cpp
         ${agcTextureDetileShaderHeader}
+        ${agcCopyBackDiffShaderHeader}
         Execution/src/GuestMemory.cpp
         Execution/src/ShaderMemory.cpp
         Execution/src/Pm4.cpp
@@ -490,8 +582,59 @@ if(BUILD_TESTING)
         set_target_properties(${agcTest} PROPERTIES EXCLUDE_FROM_ALL OFF)
         add_test(NAME ${agcTestName} COMMAND ${agcTest})
         set_tests_properties(${agcTestName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77)
+        # Tests that open a Vulkan device carry the gpu label (ctest -LE gpu runs the rest).
+        if(agcTest STREQUAL "agc_driver_graphics_tests" OR agcTest IN_LIST agcExecutionTests)
+            set_tests_properties(${agcTestName} PROPERTIES LABELS gpu)
+        endif()
         if(WIN32)
             set_tests_properties(${agcTestName} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    # Narrow copy-backs again under APS5_PROFILE_GPU (timing ranges record queued copies, the
+    # compare pass among them, at every range), with APS5_NARROW_VERIFY=1 and with
+    # APS5_RESIDENT_BUFFERS=1.
+    foreach(agcNarrowVariant IN ITEMS profile-gpu verify resident)
+        string(REPLACE "-" "_" agcNarrowVariantName "${agcNarrowVariant}")
+        add_test(NAME agc_driver_narrow_copy_back_${agcNarrowVariantName} COMMAND agc_driver_narrow_copy_back_tests --${agcNarrowVariant})
+        set_tests_properties(agc_driver_narrow_copy_back_${agcNarrowVariantName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 LABELS gpu)
+        if(WIN32)
+            set_tests_properties(agc_driver_narrow_copy_back_${agcNarrowVariantName} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    # Test binaries again with a fast-path switch set (latched once per process), so each fallback
+    # the switch restores stays covered:
+    # - agc_shader_memory_no_walk_reuse: the fast walk's in-place build off (APS5_NO_WALK_REUSE=1):
+    #   TryMaterialize's fresh-object form;
+    # - agc_shader_memory_no_variant_memo: PopulateVariant's memo off (APS5_NO_VARIANT_MEMO=1): its
+    #   scan and fresh result;
+    # - agc_driver_no_memos, agc_driver_fast_dispatch_no_memos: every s53-fast-cost-b memo off (the
+    #   import, pipeline, sampler and variant memos, the in-place decode).
+    # (agc_driver_recorder_tests is not built by BUILD_TESTING, so its APS5_NO_OOM_RECLAIM=1 variant is
+    #  run by hand: APS5_NO_OOM_RECLAIM=1 agc_driver_recorder_tests.)
+    # Fields: name|target|environment (comma-separated, no list separators inside one entry).
+    set(agcFastCostMemosOff "APS5_NO_IMPORT_MEMO=1,APS5_NO_PIPELINE_MEMO=1,APS5_NO_SAMPLER_MEMO=1,APS5_NO_VARIANT_MEMO=1,APS5_NO_DECODE_REUSE=1")
+    set(agcSwitchedTests
+        "agc_shader_memory_no_walk_reuse|agc_shader_memory_tests|APS5_NO_WALK_REUSE=1"
+        "agc_shader_memory_no_variant_memo|agc_shader_memory_tests|APS5_NO_VARIANT_MEMO=1"
+        "agc_driver_no_memos|agc_driver_tests|${agcFastCostMemosOff}")
+    if(TARGET agc_driver_fast_dispatch_tests)
+        list(APPEND agcSwitchedTests "agc_driver_fast_dispatch_no_memos|agc_driver_fast_dispatch_tests|${agcFastCostMemosOff}")
+    endif()
+    foreach(agcSwitchedTest IN LISTS agcSwitchedTests)
+        string(REPLACE "|" ";" agcSwitchedFields "${agcSwitchedTest}")
+        list(GET agcSwitchedFields 0 agcSwitchedName)
+        list(GET agcSwitchedFields 1 agcSwitchedTarget)
+        list(GET agcSwitchedFields 2 agcSwitchedEnvironment)
+        string(REPLACE "," ";" agcSwitchedEnvironment "${agcSwitchedEnvironment}")
+        add_test(NAME ${agcSwitchedName} COMMAND ${agcSwitchedTarget})
+        set_tests_properties(${agcSwitchedName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;${agcSwitchedEnvironment}" SKIP_RETURN_CODE 77)
+        if(agcSwitchedTarget IN_LIST agcExecutionTests)
+            set_tests_properties(${agcSwitchedName} PROPERTIES LABELS gpu)
+        endif()
+        if(WIN32)
+            set_tests_properties(${agcSwitchedName} PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
@@ -537,9 +680,13 @@ if(AGC_BUILD_VISUAL_TEST)
             Graphics/src/ColorTargetLayout.cpp
             Graphics/src/ColorTargetTransfer.cpp
             Graphics/src/Pipeline.cpp
+            Graphics/src/FastLayouts.cpp
+            Graphics/src/FastRing.cpp
+            Graphics/src/FastDraw.cpp
             Graphics/src/PipelineCache.cpp
             Graphics/src/Resources.cpp
             Graphics/src/ShaderResources.cpp
+            Graphics/src/VramReclaimers.cpp
             Graphics/src/ShaderAddressResources.cpp
             Graphics/src/GuestBufferMemory.cpp
             Graphics/src/BdaResources.cpp
@@ -548,6 +695,7 @@ if(AGC_BUILD_VISUAL_TEST)
             Graphics/src/GuestTextureResource.cpp
             Graphics/src/GuestSamplerResource.cpp
             Graphics/src/TextureFormat.cpp
+            Graphics/src/TexelStats.cpp
             Graphics/src/DccMetadata.cpp
             Graphics/src/TextureTiling.cpp
             Graphics/src/TextureDetiler.cpp

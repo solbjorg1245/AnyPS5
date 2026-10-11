@@ -28,6 +28,9 @@ struct Commitment {
     bool whole = false;
 };
 Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writable = false);
+// DescribeCommitted(...).whole without building the ranges (no allocation): the same walk, the
+// same page queries, the same throws.
+bool CommittedWhole(std::uint64_t address, std::size_t bytes, bool writable = false);
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment = 1);
 // Variants for resources in heaps the guest commits on demand (partially resident textures, GPU
 // scratch heaps): uncommitted pages read as zeros, are not compared, and are never stored.
@@ -50,6 +53,11 @@ Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes);
 // `out` (Equal), or Unmapped as CompareMapped answers it (the dispatch-cache validation's masked
 // re-read of a differing run).
 Compare CopyMapped(std::uint64_t address, std::span<std::byte> out);
+// Whether the dword at `address` (4-aligned) is readable: from the page-state table CompareMapped
+// consults when it knows the page (no VirtualQuery), else by one query that also records the page
+// (`queried` set). The fast walk's direct reader (docs/design/draw-fastpath.md F2) checks each
+// page it reads with it.
+bool ReadableWord(std::uint64_t address, bool* queried = nullptr);
 void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original);
 void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t alignment = 1);
 // Stores the parts of `current` that differ from `original` (the guest bytes the GPU started from), so
@@ -82,6 +90,42 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries);
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes);
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std::function<void()>& store);
 bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
+// The pages of [address, address + bytes), a range inside one 64 KiB tracker block, that no store
+// since `generation` reached: bit p for the block's bytes [p * UnstoredPageBytes, (p + 1) *
+// UnstoredPageBytes), from the CPU's dirty pages and the driver's partial stores by page. 0 when
+// the block's bookkeeping cannot tell (a whole-block driver store since, a newer stamp no page
+// record explains, APS5_NO_EDGE_PAGE_KEEP), outside the watched arena, for a generation of 0, and
+// with APS5_FIX_BOOT_STRIP=0 (a write-back then leaves a stamped edge block to the CPU whole, the
+// unit shadow drops a whole stale unit). `cause`, when given, names what stored the range's other
+// pages: the CPU's pages, the driver's, a whole-block driver store, or nothing known (Unknown).
+constexpr std::size_t UnstoredPageBytes = 4096;
+enum class PageStoreCause : std::uint8_t { None, CpuPages, DriverPages, DriverWhole, Unknown };
+std::uint32_t PagesUnstoredSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, PageStoreCause* cause = nullptr, std::uint32_t* cpuPages = nullptr, std::uint32_t* driverPages = nullptr);
+// The parts of [address, address + bytes) whose 4 KiB pages a CPU store (a collect's dirty page,
+// never the driver's own Write or MarkWritten) reached since `generation`, as [begin, end) runs
+// clipped to the range and merged, in address order, into `runs`; returns their bytes. The range
+// may span blocks. A block with a newer CPU stamp and no page record (APS5_NO_EDGE_PAGE_KEEP=1)
+// counts whole. Nothing for a generation of 0 or outside the watched arena. Walks nothing: the
+// caller collects the range first (the DCC key store guard, DccMetadata.cpp).
+std::uint64_t CpuStoredRuns(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs);
+// Debug aid (APS5_TRACE_EDGE_WATCH): makes [address, address + bytes) read-only until the next CPU
+// write into it, which is reported once on stderr ([edge-watch]: the writer's code address, module
+// offsets of a few unwound frames, the old bytes); a range is armed only while none is. Windows only.
+void ArmEdgeWatch(std::uint64_t address, std::size_t bytes);
+// APS5_FIX_BOOT_STRIP: CPU stores into the 16 KiB shared-view pages over the range are told apart
+// per 4 KiB page from now on (GuestArenaTrackWriteParts), for an edge block whose surface pages a
+// coarse 16 KiB stamp covered (the Bink planes' table neighbours). APS5_NO_FINE_EDGE_TRACKING=1 =
+// off. Returns the view pages made fine (0 off, or when they already were).
+std::size_t TrackEdgeParts(std::uint64_t address, std::size_t bytes);
+// The same, ahead of any merge, for the view pages a GPU-written surface [address, address + bytes)
+// covers only in part (its first and last, when it starts or ends inside one): called when the
+// surface's image is made, so the first frame's CPU stores next door stamp only their own pages.
+// OPT-IN (APS5_EARLY_EDGE_TRACKING=1; off with TrackEdgeParts too): on for every GPU surface it went
+// with a broken, unstreamed-looking world (t511) and a crash on 0xff-filled game data (t513), while
+// the merge-time tracking alone stayed clean (t509, t514). Suspect: a surface whose extent runs past
+// its allocation, so the write-back's per-page merge now stores into neighbours' 4 KiB parts the
+// CPU did not write since (the 16 KiB stamp used to keep them). The trace names the surfaces.
+std::size_t TrackSurfaceEdgeParts(std::uint64_t address, std::size_t bytes);
 // Collect epoch: within one epoch a range already collected is not walked again, CollectWrites
 // returns the current generation instead. A guest write landing between two collects of the same
 // epoch is seen by the next epoch, which is the ordering real hardware gives a CPU write made while a
@@ -120,6 +164,11 @@ constexpr std::uint8_t BlockUnchanged = 0;
 constexpr std::uint8_t BlockWritten = 1;
 constexpr std::uint8_t BlockMaybeWritten = 2;
 bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu = {});
+// Diagnostics (the [inplace-writes] census), read-only: walks, stamps and bumps nothing. The bytes
+// of [address, address + bytes) in 64 KiB blocks a collect stamped after `generation` (CPU stores
+// some collect saw since; one no collect walked yet is not seen), 0 for a generation of 0; `now`
+// gets the tracker's generation (0 outside the watched arena), a later call's `generation`.
+std::uint64_t CpuStampedBytes(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t& now);
 // Debug aid: the page's mapping (VirtualQuery) and its tracker block's stamps, as one line.
 std::string DescribePage(std::uint64_t address);
 
@@ -195,6 +244,48 @@ void FlushGpuWrites(std::uint64_t address, std::size_t bytes);
 // value before consulting the page states and reading directly, and the same value after, knows
 // the states it consulted were current and no page it read changed its mapping meanwhile.
 std::uint64_t ForgetSerial();
+// Free log (APS5_DROP_FREED_STORES; on by default, =0 stores as before): each 4 KiB page of the guest
+// arena keeps the free clock of the last release over it, a release being a range libc reports as
+// unmapped, freed or mapped anew (GuestAllocationsSetReleaseListener), never a protection change.
+// A store of GPU-produced bytes into guest memory (a storage write-back, a unit shadow publish, DCC
+// key stores of a write-back, a queued copy-back) carries the clock read when its source was written
+// on the GPU: the pages released since hold another owner's bytes, and DropFreedRun leaves them out.
+// Off, the pages are only counted ("would drop" on the [guestmem] line). NoFreeClock: a source of
+// unknown age, never dropped. NoteReleased is the listener (the libc mutation's thread: atomics only).
+constexpr std::uint32_t NoFreeClock = 0xffffffffu;
+std::uint32_t FreeClock();
+void NoteReleased(std::uintptr_t address, std::size_t bytes);
+bool DropFreedStores();
+void SetDropFreedStores(bool drop);
+enum class FreedStoreKind : std::uint8_t { WriteBack, KeyStore, ShadowPublish, CopyBack, Count };
+// Appends to `out` the parts of [begin, end) to store: with the switch on, without the 4 KiB pages
+// released after `clock`, else the whole run. Returns the bytes of those pages (counted per kind).
+std::uint64_t DropFreedRun(FreedStoreKind kind, std::uint32_t clock, std::uint64_t begin, std::uint64_t end, std::vector<std::pair<std::uint64_t, std::uint64_t>>& out);
+std::uint64_t DropFreedRuns(FreedStoreKind kind, std::uint32_t clock, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs);
+// The [guestmem] line's part: releases, and the stores into freed pages dropped (or would drop) by kind.
+std::string FreedStoreSummary();
+// Late stores over the CPU's (APS5_KEEP_CPU_STORES; on by default, =0 stores as before): a store of
+// GPU-produced bytes decided at one tracker generation and landed later (a unit shadow publish the
+// CPU lands, a storage write-back's CPU store) leaves out the 4 KiB pages a CPU store reached since
+// that decision, re-checked as it lands, so the game's store made in between wins over the older
+// GPU result. Off, the pages are only counted ("would keep" on the [guestmem] line).
+bool KeepCpuStores();
+void SetKeepCpuStores(bool keep);
+enum class LateStoreKind : std::uint8_t { WriteBack, ShadowPublish, Count };
+// Appends to `out` the parts of [begin, end) to store: with the switch on, without the parts
+// CpuStoredRuns lists since `generation` (the caller collects the range first), else the whole run.
+// Returns the bytes of those parts (counted per kind); nothing for a generation of 0.
+std::uint64_t KeepCpuStoredRun(LateStoreKind kind, std::uint64_t generation, std::uint64_t begin, std::uint64_t end, std::vector<std::pair<std::uint64_t, std::uint64_t>>& out);
+// The [guestmem] line's part: the late stores' parts kept for the CPU (or would keep) by kind.
+std::string KeptCpuStoreSummary();
+// Page queries (Accessible, DescribeCommitted, CheckRange, ...) that found pages a resident buffer's
+// page guard holds and answered them as the guest maps them (APS5_RESIDENT_BUFFERS; total since start).
+std::uint64_t GuardedPageQueries();
+// Debug aid, APS5_GUARD_PAGES_AS_HOLES=1: the answers before the fix (t419): guarded pages read as
+// unmapped (holes) by the page queries, and an import over one is refused for good. For an A/B only.
+// Read from the environment at the first use; SetGuardedPagesAsHoles (tests) overrides it.
+bool GuardedPagesAsHoles();
+void SetGuardedPagesAsHoles(bool holes);
 
 // Attribution of guest memory accesses (the [hooksync] line in Recorder.cpp and the read-site
 // counts of the [guestmem] line, APS5_PROFILE_DRAW): a sync the flush hook makes for an access has
@@ -240,6 +331,112 @@ private:
 // is written as 0), newest first, skipping `skip` frames above the caller; returns how many were
 // written. Stack unwinding, so only for rare, profiled events.
 std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned skip);
+
+// Crash-time resource report (APS5_CRASH_RESOURCES=1, Windows; off by default). The crash report
+// (libc CrashResources.hpp) hands the driver every guest address a FATAL dumped; for each one the
+// driver prints its page's tracking state, the recent driver stores over it (a ring of the last
+// 32768 stores of 16 bytes or more: Write, WriteChanged's changed span, StoreOwnBytes, MarkWritten's
+// reported GPU stores, NoteGuestStore) and what the registries added with AddCrashDescriber hold
+// there. Everything at crash time takes try-locks only and prints a bounded number of lines.
+bool CrashResourcesEnabled();
+// The store ring's clock (steady, milliseconds; the [watch] lines use the same).
+std::uint64_t StoreClockMs();
+struct GuestStoreRecord {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::uint64_t milliseconds = 0;
+    // The tracker generation the store was stamped at (MarkWritten, NoteGuestStore: the one after the
+    // current generation when it was noted).
+    std::uint32_t generation = 0;
+    std::uint32_t thread = 0;
+    const char* kind = nullptr;
+    // The thread's StoreTag then: what stored (a storage write-back, a unit shadow publish), why, and
+    // the resource's base address.
+    const char* tag = nullptr;
+    const char* reason = nullptr;
+    std::uint64_t tagAddress = 0;
+    // Driver frames above the store, as CaptureCallerOffsets writes them.
+    unsigned long long callers[6] = {};
+};
+// The recorded stores overlapping [address, address + bytes), newest first (at most out.size());
+// lock-free, so the crash report may call it.
+std::size_t RecentGuestStores(std::uint64_t address, std::size_t bytes, std::span<GuestStoreRecord> out);
+// A store into guest memory the driver makes outside the paths above (a unit shadow's slab copy).
+void NoteGuestStore(std::uint64_t address, std::size_t bytes, const char* kind);
+// What a store belongs to, for the write-back range trace (APS5_TRACE_WRITEBACK_RANGE): the
+// resource's guest extent and shape, the write generation its content was current at, and when it
+// was last written on the GPU and last refreshed from guest memory (StoreClockMs; 0 = not known).
+// Set with a StoreTag; the caller keeps it alive for the tag's scope.
+struct StoreSubject {
+    std::uint64_t base = 0;
+    std::uint64_t bytes = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t format = 0;
+    std::uint64_t generation = 0;
+    std::uint64_t gpuWriteMs = 0;
+    std::uint64_t refreshMs = 0;
+};
+// Names this thread's stores into guest memory for the ring until the scope ends (and, with a
+// subject, for the write-back range trace).
+class StoreTag {
+public:
+    StoreTag(const char* tag, const char* reason, std::uint64_t address, const StoreSubject* subject = nullptr);
+    ~StoreTag();
+    StoreTag(const StoreTag&) = delete;
+    StoreTag& operator=(const StoreTag&) = delete;
+
+private:
+    const char* previousTag;
+    const char* previousReason;
+    std::uint64_t previousAddress;
+    const StoreSubject* previousSubject;
+};
+using CrashPrint = void (*)(const char* text);
+// A registry's part of the report: prints (try-locks only, at most 8 lines) what it tracks over
+// `address`. Up to 8 describers; registered at static initialization.
+using CrashDescriber = void (*)(std::uint64_t address, CrashPrint print);
+void AddCrashDescriber(CrashDescriber describer);
+
+// Write-back range trace (APS5_TRACE_WRITEBACK_RANGE=<lo>-<hi>, hex, the range [lo, hi); off by
+// default): one [wb-range] line on stderr per driver store intersecting the range (Write,
+// WriteChanged's changed span, StoreOwnBytes, MarkWritten's GPU stores, DCC key stores, unit shadow
+// publishes) with the thread's StoreTag and StoreSubject, and one per lifetime event of a storage
+// image or unit shadow over it (Texture.cpp, UnitShadow.cpp). A capped kind prints at most
+// RangeTraceCap lines; lifetime events, stores made more than 2 s after their subject's last GPU
+// write, and stores of unknown age once the trace is 60 s old are never capped. A [wb-range] totals
+// line (at the next line 10 s after the last one) counts every kind printed and dropped. Off: one
+// static test per store; on: a store outside the range pays one interval check. Never capped either:
+// "forget" (every libc mapping or protection change over the range: ForgetPages), "release" (the
+// free log's releases, with the clock) and "freed-store" (a store's pages released after its source
+// clock, dropped or not; see DropFreedRun).
+enum class RangeTraceKind : std::uint8_t { Write, WriteChanged, StoreOwnBytes, MarkWritten, KeyStore, ShadowPublish, Image, ImageRefresh, ImageDirty, Shadow, ShadowMarked, Forget, Release, FreedStore, Count };
+constexpr std::uint64_t RangeTraceCap = 20000;
+// Parses "<lo>-<hi>" (hex digits, 0x optional) into [begin, end); false for anything else or an
+// empty range.
+bool ParseTraceRange(const char* text, std::uint64_t& begin, std::uint64_t& end);
+// Whether [address, address + bytes) intersects [begin, end); never for 0 bytes.
+constexpr bool TraceRangeHits(std::uint64_t begin, std::uint64_t end, std::uint64_t address, std::uint64_t bytes) {
+    return bytes != 0 && address < end && (address >= begin || begin - address < bytes);
+}
+bool WriteBackRangeTraceOn();
+bool WriteBackRangeTraced(std::uint64_t address, std::uint64_t bytes);
+// One [wb-range] line of `kind`: its name, the formatted body, then the clock, the tracker
+// generation and the thread; dropped (and counted) when `capped` and the kind's cap is spent.
+void WriteBackRangeLine(RangeTraceKind kind, bool capped, const char* format, ...);
+// The range trace names this thread's stores inside the DCC key range [begin, end) as key stores
+// until the scope ends (the store ring keeps their own kind).
+class KeyStoreScope {
+public:
+    KeyStoreScope(std::uint64_t begin, std::uint64_t end);
+    ~KeyStoreScope();
+    KeyStoreScope(const KeyStoreScope&) = delete;
+    KeyStoreScope& operator=(const KeyStoreScope&) = delete;
+
+private:
+    std::uint64_t previousBegin;
+    std::uint64_t previousEnd;
+};
 
 }
 

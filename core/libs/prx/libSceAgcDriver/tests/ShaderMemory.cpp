@@ -1,11 +1,15 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
+#include "Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/ResourceTracker.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
+#include "Optimization/SrtWalker/SrtDescriptorEvaluation.hpp"
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
+#include "Optimization/SrtWalker/WalkProgram.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
@@ -14,6 +18,7 @@
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <iostream>
@@ -24,13 +29,41 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <typeinfo>
 #include <utility>
 #include <vector>
+
+// APS5_COUNT_CXX_THROWS (CMakeLists.txt: the test links with --wrap=__cxa_throw): every C++ throw
+// of the test's objects and static libraries (the recompiler) passes this wrapper, which counts
+// it per thread. A rethrow (__cxa_rethrow) is not counted. Without it nothing is counted.
+#ifndef APS5_COUNT_CXX_THROWS
+#define APS5_COUNT_CXX_THROWS 0
+#endif
+#if APS5_COUNT_CXX_THROWS
+namespace ShaderMemoryTests {
+thread_local std::uint64_t cxxThrows = 0;
+}
+extern "C" [[noreturn]] void __real___cxa_throw(void* object, std::type_info* type, void (*destructor)(void*));
+extern "C" [[noreturn]] void __wrap___cxa_throw(void* object, std::type_info* type, void (*destructor)(void*)) {
+    ++ShaderMemoryTests::cxxThrows;
+    __real___cxa_throw(object, type, destructor);
+}
+#endif
 
 namespace {
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+// The C++ throws on this thread so far (APS5_COUNT_CXX_THROWS; 0 without it).
+constexpr bool CountsThrows = APS5_COUNT_CXX_THROWS != 0;
+std::uint64_t thrownSoFar() {
+#if APS5_COUNT_CXX_THROWS
+    return ShaderMemoryTests::cxxThrows;
+#else
+    return 0;
+#endif
 }
 
 template<typename TAction>
@@ -53,6 +86,476 @@ void verifyResult(const ShaderRecompiler::RecompileResult& first, const ShaderRe
         const auto& right = second.bindings[index];
         require(left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly, "replayed binding differs");
     }
+}
+
+// A pending block (the driver's FastSrtRead declining a read) at the walk's first and last read:
+// the fast walk declines with ReadDeclined and without a C++ exception (a throw cost about 1.6 ms
+// per declined draw in the game, port/reports/s53-fastdraw-diag.md), with the counters the
+// throwing form kept: the reads up to the declined one and the walk outcome the driver's decline
+// reason follows (ReadBailed). Materialize over the same express-only runtime still throws its
+// message and leaves its outputs as they were; TryMaterialize returns false. A walk into the
+// outputs the declines left half written (the fast path's per-thread scratch, reused in place)
+// then materializes exactly the capture's snapshot and specialization.
+void verifyWalkDeclineWithoutThrow(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::ResourceCapture& capture, const ShaderRecompiler::SourceHandle& handle, std::uint32_t walkReads) {
+    using namespace ShaderRecompiler;
+    struct Reader {
+        std::uint32_t reads = 0;
+        std::uint32_t declineAt = 0;
+    } reader;
+    const SrtMemoryReader pending = +[](void* context, std::uint64_t address, std::uint32_t* value) {
+        auto& self = *static_cast<Reader*>(context);
+        if (++self.reads >= self.declineAt) return false;
+        std::memcpy(value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), sizeof(*value));
+        return true;
+    };
+    SrtRuntime runtime;
+    runtime.userContext = &reader;
+    runtime.readMemory = pending;
+    runtime.readSpecializationMemory = pending;
+    runtime.expressRead = pending;
+    // The runtime WalkResources hands the materializer (Recompiler.cpp), for its two forms.
+    const auto walk = Detail::CompileWalkProgram(*capture.plan);
+    require(walk != nullptr, "the plan compiled no walk program");
+    SrtRuntime fast = runtime;
+    fast.userData = request.context.userData;
+    fast.shaderBase = request.shader.codeAddress;
+    fast.walk = walk.get();
+    fast.expressOnly = true;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    for (const auto declineAt : {1u, walkReads}) {
+        // The throwing form, as WalkResources called it before: the decline is an exception.
+        reader = {0, declineAt};
+        Detail::NoteWalkOutcome(Detail::WalkOutcome::Count);
+        auto kept = capture.snapshot;
+        auto keptSpecialization = capture.specialization;
+        auto before = thrownSoFar();
+        expectFailure([&] { ResourceMaterializer{}.Materialize(*capture.plan, fast, kept, keptSpecialization); }, "SrtWalker::EvaluateRuntimeSources failed to evaluate runtime sources: the express walk did not complete", "Materialize did not throw for a declined read");
+        require(!CountsThrows || thrownSoFar() == before + 1, "the throw counter did not count Materialize's one exception");
+        require(kept.flattenedSrt == capture.snapshot.flattenedSrt && kept.userData == capture.snapshot.userData && keptSpecialization == capture.specialization, "Materialize changed its outputs before it threw");
+        const auto thrownReads = reader.reads;
+        const auto thrownOutcome = Detail::LastWalkOutcome();
+        require(thrownReads == declineAt && thrownOutcome == Detail::WalkOutcome::ReadBailed, "Materialize did not stop at the declined read");
+
+        // The non-throwing form: false, the same reads and outcome, no exception.
+        reader = {0, declineAt};
+        Detail::NoteWalkOutcome(Detail::WalkOutcome::Count);
+        before = thrownSoFar();
+        require(!ResourceMaterializer{}.TryMaterialize(*capture.plan, fast, snapshot, specialization), "TryMaterialize completed a walk whose read was declined");
+        require(thrownSoFar() == before, "TryMaterialize threw for a declined read");
+        require(reader.reads == thrownReads && Detail::LastWalkOutcome() == thrownOutcome, "TryMaterialize's reads or walk outcome differ from Materialize's");
+
+        // The fast walk: ReadDeclined (the driver's "walk: pending block"), no exception.
+        reader = {0, declineAt};
+        before = thrownSoFar();
+        require(WalkResources(handle, request.context.userData, request.shader.codeAddress, runtime, snapshot, specialization) == WalkStatus::ReadDeclined, "a pending block did not decline the fast walk as a declined read");
+        require(thrownSoFar() == before, "the fast walk threw for a pending block");
+        require(reader.reads == thrownReads && Detail::LastWalkOutcome() == thrownOutcome, "the fast walk's reads or walk outcome differ from Materialize's");
+    }
+    // Left-overs a reused scratch could carry reach no later walk.
+    snapshot.flattenedSrt.push_back(0xdeadbeefu);
+    snapshot.deferredFlat.emplace_back(0u, 0x1000u);
+    snapshot.uniformFill.value = 0xdeadbeefu;
+    specialization.boundDescriptors.push_back(99u);
+    reader = {0, ~0u};
+    const auto before = thrownSoFar();
+    require(WalkResources(handle, request.context.userData, request.shader.codeAddress, runtime, snapshot, specialization) == WalkStatus::Walked, "the fast walk declined after declines into the same snapshot");
+    require(thrownSoFar() == before && reader.reads == walkReads, "a completed fast walk threw or read differently");
+    const auto sameValues = [](const std::vector<DescriptorValue>& left, const std::vector<DescriptorValue>& right) {
+        if (left.size() != right.size()) return false;
+        for (std::size_t i = 0; i < left.size(); ++i) {
+            if (left[i].dwordCount != right[i].dwordCount || !std::equal(left[i].dwords.begin(), left[i].dwords.begin() + left[i].dwordCount, right[i].dwords.begin())) return false;
+        }
+        return true;
+    };
+    const auto& captured = capture.snapshot;
+    require(sameValues(snapshot.buffers, captured.buffers) && sameValues(snapshot.images, captured.images) && sameValues(snapshot.samplers, captured.samplers), "a walk into a reused snapshot has other descriptors than the capture");
+    require(snapshot.flattenedSrt == captured.flattenedSrt && snapshot.userData == captured.userData && snapshot.uniformFill == captured.uniformFill && snapshot.deferredFlat.empty(), "a walk into a reused snapshot kept words of an earlier one");
+    require(specialization == capture.specialization && specialization.boundDescriptors == capture.specialization.boundDescriptors, "a walk into a reused specialization differs from the capture's");
+}
+
+// The capture's plan with a uniform fill whose one value is `value` (IrResourcePlan owns its
+// values and does not copy: ExtractPlan's fields are copied, the IR staying the capture plan's).
+ShaderRecompiler::IrResourcePlan withUniformFill(const ShaderRecompiler::IrResourcePlan& from, ShaderRecompiler::IrValue& value) {
+    using namespace ShaderRecompiler;
+    IrResourcePlan plan;
+    plan.stage = from.stage;
+    plan.shaderHash = from.shaderHash;
+    plan.userDataBase = from.userDataBase;
+    plan.userDataCount = from.userDataCount;
+    plan.memoryInfo = from.memoryInfo;
+    plan.descriptorSources = from.descriptorSources;
+    plan.controlFlow = from.controlFlow;
+    plan.materializationSources = from.materializationSources;
+    plan.srtReads = from.srtReads;
+    plan.cleanFlatSlots = from.cleanFlatSlots;
+    plan.pureFlatSlots = from.pureFlatSlots;
+    plan.requiresSpecializationMemory = from.requiresSpecializationMemory;
+    plan.srtPlanComplete = from.srtPlanComplete;
+    plan.resourceTrackingComplete = from.resourceTrackingComplete;
+    plan.info = from.info;
+    plan.uniformFill.fill.kind = UniformFillKind::Buffer;
+    plan.uniformFill.fill.words = 1;
+    plan.uniformFill.values[0] = &value;
+    return plan;
+}
+
+// TryMaterialize's other quiet declines, besides the express walk's declined read: they too
+// return false without a C++ exception, with the walk outcome WalkResources maps to the driver's
+// decline reason, where Materialize throws its message. (1) The uniform fill's evaluation, before
+// the walk (outcome Count: WalkStatus::Failed); a fill that evaluates stores the word it read. (2)
+// An evaluation the express walk does not cover (no express reader: NoProgram). (3) A runtime that
+// is not express-only is misuse (the interpreter's failure is a genuine one): std::logic_error.
+void verifyQuietDeclines(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::ResourceCapture& capture) {
+    using namespace ShaderRecompiler;
+    struct Reader {
+        std::uint32_t reads = 0;
+        std::uint32_t declineAt = 0;
+    } reader;
+    const SrtMemoryReader pending = +[](void* context, std::uint64_t address, std::uint32_t* value) {
+        auto& self = *static_cast<Reader*>(context);
+        if (++self.reads >= self.declineAt) return false;
+        std::memcpy(value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), sizeof(*value));
+        return true;
+    };
+    const auto& capturePlan = *capture.plan;
+    require(!capturePlan.srtReads.empty(), "the capture's plan has no SRT read for a uniform fill to read");
+    // (1) The uniform fill reads the plan's first SRT slot (ReadConst of slot 0) through the
+    // specialization reader.
+    std::vector<std::unique_ptr<IrValue>> values;
+    auto& resource = *values.emplace_back(std::make_unique<IrValue>(IrOpcode::GetSrtResource, IrType::SrtResource, 0x7fff0000u));
+    auto& slot = *values.emplace_back(std::make_unique<IrValue>(IrOpcode::Void, IrType::U32, 0x7fff0001u));
+    slot.SetImmediateU32(0);
+    auto& fillValue = *values.emplace_back(std::make_unique<IrValue>(IrOpcode::ReadConst, IrType::U32, 0x7fff0002u));
+    fillValue.AddArgument(&resource);
+    fillValue.AddArgument(&slot);
+    const auto plan = withUniformFill(capturePlan, fillValue);
+    const auto walk = Detail::CompileWalkProgram(plan);
+    require(walk != nullptr, "the uniform-fill plan compiled no walk program");
+    SrtRuntime fast;
+    fast.userContext = &reader;
+    fast.readMemory = pending;
+    fast.readSpecializationMemory = pending;
+    fast.expressRead = pending;
+    fast.userData = request.context.userData;
+    fast.shaderBase = request.shader.codeAddress;
+    fast.walk = walk.get();
+    fast.expressOnly = true;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    reader = {0, 1};
+    Detail::NoteWalkOutcome(Detail::WalkOutcome::Count);
+    auto before = thrownSoFar();
+    require(!ResourceMaterializer{}.TryMaterialize(plan, fast, snapshot, specialization), "TryMaterialize completed a uniform fill whose read was declined");
+    require(thrownSoFar() == before, "TryMaterialize threw for a declined uniform-fill read");
+    require(reader.reads == 1 && Detail::LastWalkOutcome() == Detail::WalkOutcome::Count, "a declined uniform-fill read did not stop before the walk (outcome Count, the fast walk's Failed)");
+    reader = {0, 1};
+    before = thrownSoFar();
+    {
+        ResourceSnapshot thrownSnapshot;
+        ResourceSpecialization thrownSpecialization;
+        expectFailure([&] { ResourceMaterializer{}.Materialize(plan, fast, thrownSnapshot, thrownSpecialization); }, "SrtWalker::EvaluateUniformValues failed to evaluate a uniform value", "Materialize did not throw for a declined uniform-fill read");
+    }
+    require(!CountsThrows || thrownSoFar() == before + 1, "the throw counter did not count Materialize's uniform-fill exception");
+    require(reader.reads == 1 && Detail::LastWalkOutcome() == Detail::WalkOutcome::Count, "Materialize's declined uniform fill read or reached more than TryMaterialize's");
+    // The fill evaluates: the word it stores is the one the walk reads for slot 0, as Materialize
+    // stores it, and the rest of the materialization is Materialize's.
+    reader = {0, ~0u};
+    before = thrownSoFar();
+    require(ResourceMaterializer{}.TryMaterialize(plan, fast, snapshot, specialization), "TryMaterialize declined a uniform fill it could read");
+    require(thrownSoFar() == before, "TryMaterialize threw for a uniform fill it could read");
+    const auto flatOffset = plan.srtReads[0].flatOffset;
+    require(flatOffset < snapshot.flattenedSrt.size() && snapshot.uniformFill.kind == UniformFillKind::Buffer && snapshot.uniformFill.words == 1 && snapshot.uniformFill.value == snapshot.flattenedSrt[flatOffset], "TryMaterialize's uniform fill is not the word of the slot it reads");
+    ResourceSnapshot expected;
+    ResourceSpecialization expectedSpecialization;
+    reader = {0, ~0u};
+    ResourceMaterializer{}.Materialize(plan, fast, expected, expectedSpecialization);
+    require(snapshot.uniformFill == expected.uniformFill && snapshot.flattenedSrt == expected.flattenedSrt && snapshot.userData == expected.userData && specialization == expectedSpecialization, "TryMaterialize's uniform-fill materialization differs from Materialize's");
+
+    // (2) No express reader: the express walk does not cover the evaluation.
+    const auto captureWalk = Detail::CompileWalkProgram(capturePlan);
+    require(captureWalk != nullptr, "the plan compiled no walk program");
+    auto uncovered = fast;
+    uncovered.walk = captureWalk.get();
+    uncovered.expressRead = nullptr;
+    reader = {0, ~0u};
+    Detail::NoteWalkOutcome(Detail::WalkOutcome::Count);
+    before = thrownSoFar();
+    require(!ResourceMaterializer{}.TryMaterialize(capturePlan, uncovered, snapshot, specialization), "TryMaterialize completed an evaluation the express walk does not cover");
+    require(thrownSoFar() == before, "TryMaterialize threw for an evaluation the express walk does not cover");
+    require(reader.reads == 0 && Detail::LastWalkOutcome() == Detail::WalkOutcome::NoProgram && Detail::RuntimeSourceFailureReason() == "the express walk does not cover this evaluation", "an uncovered evaluation did not decline as NoProgram before any read");
+    before = thrownSoFar();
+    {
+        ResourceSnapshot thrownSnapshot;
+        ResourceSpecialization thrownSpecialization;
+        expectFailure([&] { ResourceMaterializer{}.Materialize(capturePlan, uncovered, thrownSnapshot, thrownSpecialization); }, "SrtWalker::EvaluateRuntimeSources failed to evaluate runtime sources: the express walk does not cover this evaluation", "Materialize did not throw for an evaluation the express walk does not cover");
+    }
+    require(!CountsThrows || thrownSoFar() == before + 1, "the throw counter did not count Materialize's uncovered-evaluation exception");
+
+    // (3) A runtime that may fall back to the interpreter.
+    auto interpreted = fast;
+    interpreted.walk = captureWalk.get();
+    interpreted.expressOnly = false;
+    reader = {0, 1};
+    bool refused = false;
+    try {
+        static_cast<void>(ResourceMaterializer{}.TryMaterialize(capturePlan, interpreted, snapshot, specialization));
+    } catch (const std::logic_error& error) {
+        refused = std::string_view(error.what()).find("requires an express-only runtime") != std::string_view::npos;
+    }
+    require(refused && reader.reads == 0, "TryMaterialize accepted a runtime that is not express-only");
+}
+
+// Every field of two results, cacheHit aside (PopulateVariant against the old path's result).
+bool sameResult(const ShaderRecompiler::RecompileResult& left, const ShaderRecompiler::RecompileResult& right) {
+    if (!(left.spirv == right.spirv) || left.pushConstants != right.pushConstants || left.memoryOffsetDword != right.memoryOffsetDword || left.bdaAbiVersion != right.bdaAbiVersion || left.variantId != right.variantId) return false;
+    if (left.vertexOffsetSgpr != right.vertexOffsetSgpr || left.instanceOffsetSgpr != right.instanceOffsetSgpr || left.vertexOffsetShared != right.vertexOffsetShared || left.instanceOffsetShared != right.instanceOffsetShared || left.vertexOffsetConflict != right.vertexOffsetConflict || left.instanceOffsetConflict != right.instanceOffsetConflict) return false;
+    if (left.parameterExports != right.parameterExports || left.bindings.size() != right.bindings.size() || left.vertexAttributes.size() != right.vertexAttributes.size() || left.fragmentParameters.size() != right.fragmentParameters.size()) return false;
+    for (std::size_t i = 0; i < left.bindings.size(); ++i) {
+        const auto& a = left.bindings[i];
+        const auto& b = right.bindings[i];
+        if (a.kind != b.kind || a.role != b.role || a.descriptorSet != b.descriptorSet || a.binding != b.binding || a.count != b.count || a.guestDescriptor != b.guestDescriptor || a.readOnly != b.readOnly || a.imageShape != b.imageShape) return false;
+        if (a.samplerDepthCompare != b.samplerDepthCompare || a.imageWritten != b.imageWritten || a.imageDepthCompare != b.imageDepthCompare || a.bufferAtomic != b.bufferAtomic || a.bufferWritten != b.bufferWritten || a.deferredWords != b.deferredWords) return false;
+    }
+    for (std::size_t i = 0; i < left.vertexAttributes.size(); ++i) {
+        const auto& a = left.vertexAttributes[i];
+        const auto& b = right.vertexAttributes[i];
+        if (a.location != b.location || a.components != b.components || a.resource.fields != b.resource.fields || a.fetchIndex != b.fetchIndex) return false;
+    }
+    for (std::size_t i = 0; i < left.fragmentParameters.size(); ++i) {
+        const auto& a = left.fragmentParameters[i];
+        const auto& b = right.fragmentParameters[i];
+        if (a.location != b.location || a.sourceLocation != b.sourceLocation || a.flat != b.flat || a.perVertex != b.perVertex || a.custom != b.custom) return false;
+    }
+    return true;
+}
+
+// A result as another draw's populate may leave the fast path's per-thread one: `bindings`
+// bindings full of foreign words and flags, foreign push constants, attributes and parameters.
+void dirtyResult(ShaderRecompiler::RecompileResult& result, std::size_t bindings) {
+    using namespace ShaderRecompiler;
+    result.bindings.resize(bindings);
+    for (auto& binding : result.bindings) {
+        binding.kind = DescriptorKind::SampledImage;
+        binding.role = DescriptorRole::GuestSamplers;
+        binding.descriptorSet = 9;
+        binding.binding = 9;
+        binding.count = 9;
+        binding.guestDescriptor.assign(13, 0xdeadbeefu);
+        binding.readOnly = true;
+        binding.imageShape = DescriptorImageShape::Image3D;
+        binding.samplerDepthCompare.assign(3, true);
+        binding.imageWritten.assign(2, true);
+        binding.imageDepthCompare.assign(2, true);
+        binding.bufferAtomic.assign(5, true);
+        binding.bufferWritten.assign(5, true);
+        binding.deferredWords.assign(2, {1u, 0x20000u});
+    }
+    result.pushConstants.assign(200, std::byte{0x5a});
+    result.vertexAttributes.assign(3, VertexAttribute{1, 2, {}, 3});
+    result.parameterExports.assign(4, 7u);
+    result.fragmentParameters.assign(2, FragmentParameter{1, 2, true, true, true});
+    result.memoryOffsetDword = 77;
+    result.bdaAbiVersion = 5;
+    result.vertexOffsetSgpr = 3;
+    result.instanceOffsetSgpr = 4;
+    result.vertexOffsetShared = true;
+    result.instanceOffsetConflict = true;
+    result.variantId = 12345;
+    result.cacheHit = true;
+}
+
+// DescriptorBindingBuilder::PopulateInto, the in-place populate behind PopulateVariant: over the
+// vectors another populate left (more bindings than the layout's, full of foreign words and flags,
+// then fewer; foreign push constants and shader-data scratch), every binding role (guest buffers,
+// a sampled and a storage image, samplers with the point-filter patch, the flattened SRT with a
+// deferred word, the shader data) comes out exactly as Populate makes it, and so do the push
+// constants of a push-data layout.
+void verifyPopulateInto() {
+    using namespace ShaderRecompiler;
+    const auto value = [](std::uint32_t words, std::uint32_t base) {
+        DescriptorValue result;
+        result.dwordCount = words;
+        for (std::uint32_t i = 0; i < words; ++i) result.dwords[i] = base + i;
+        return result;
+    };
+    IrBindingLayout layout;
+    layout.memoryOffsetDword = 2;
+    layout.memoryOffsetCount = 4;
+    layout.userDataRegisters = {8, 9};
+    layout.descriptors = {
+        {DescriptorBindingKind::Buffers, {0, 1}},
+        {static_cast<DescriptorBindingKind>(FirstImageBinding), {0}},
+        {static_cast<DescriptorBindingKind>(FirstStorageImageBinding), {1}},
+        {DescriptorBindingKind::Samplers, {0, 1}},
+        {DescriptorBindingKind::FlattenedSrt, {}},
+        {DescriptorBindingKind::ShaderData, {}},
+    };
+    ShaderInfo info;
+    info.buffers.resize(2);
+    info.buffers[1].written = true;
+    info.images.resize(2);
+    info.images[0].dimension = RdnaImageDimension::Dim2D;
+    info.images[0].depthCompare = true;
+    info.images[1].dimension = RdnaImageDimension::Dim2DArray;
+    info.images[1].written = true;
+    info.samplers.resize(2);
+    info.samplers[0].forcePointFiltering = true;
+    info.samplers[1].depthCompare = true;
+    ResourceSnapshot snapshot;
+    snapshot.buffers = {value(4, 0x100), value(4, 0x200)};
+    snapshot.images = {value(8, 0x300), value(8, 0x400)};
+    snapshot.samplers = {value(4, 0x500), value(4, 0x600)};
+    snapshot.samplers[0].dwords[2] = 0x0ff00000u | (1u << 26u);
+    snapshot.flattenedSrt = {1, 2, 3};
+    snapshot.deferredFlat = {{1u, 0x1234u}};
+    snapshot.userData = {0xau, 0xbu};
+    const std::array<std::uint32_t, 3> threads{};
+    const auto check = [&](const IrBindingLayout& checked, std::size_t dirtyBindings, RecompileResult& reused, const char* message) {
+        BindingAllocationResult fresh;
+        fresh.layout = checked;
+        DescriptorBindingBuilder{}.Populate(fresh, info, IrShaderStage::Pixel, 8, snapshot, threads);
+        require(fresh.bindings.size() == checked.descriptors.size(), "PopulateInto check: Populate made the wrong number of bindings");
+        dirtyResult(reused, dirtyBindings);
+        std::vector<std::uint32_t> shaderData(7, 0xffffffffu);
+        DescriptorBindingBuilder{}.PopulateInto(checked, info, IrShaderStage::Pixel, 8, snapshot, threads, reused.bindings, reused.pushConstants, shaderData);
+        RecompileResult expected = reused;
+        expected.bindings = fresh.bindings;
+        expected.pushConstants = fresh.pushConstants;
+        require(sameResult(reused, expected), message);
+    };
+    RecompileResult reused;
+    check(layout, layout.descriptors.size() + 3, reused, "PopulateInto over more dirty bindings differs from Populate");
+    check(layout, 2, reused, "PopulateInto over fewer dirty bindings differs from Populate");
+    // Push data: no ShaderData binding, the words go to the push constants.
+    auto pushLayout = layout;
+    pushLayout.pushDataStartDword = 0;
+    pushLayout.descriptors.pop_back();
+    check(pushLayout, pushLayout.descriptors.size(), reused, "PopulateInto's push-data layout differs from Populate");
+    require(!reused.pushConstants.empty(), "PopulateInto check: the push-data layout made no push constants");
+    require(reused.bindings[0].deferredWords.empty() && reused.bindings[4].deferredWords == snapshot.deferredFlat, "PopulateInto check: deferred words outside the flattened SRT");
+}
+
+// PopulateVariant's per-thread memo and in-place result (s53-fast-cost-b, the fast paths' step 2b):
+// - a result left dirty by other draws (more bindings than the variant's, then fewer) is rewritten
+//   to exactly the old path's result;
+// - the same walk again is a memo hit;
+// - a walked specialization the source never compiled (the state moved on) is no hit and leaves
+//   the result alone: the memo answers only what the scan of the source's variants finds;
+// - a variant compiled later (another layout) is found once compiled and remembered beside the
+//   first one, and both are hits after;
+// - another source with the same specialization is not answered by the first source's entry.
+// APS5_NO_VARIANT_MEMO=1 (the second ctest) checks the same results without the counts.
+void verifyVariantMemo(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::RecompileResult& compiled) {
+    using namespace ShaderRecompiler;
+    const bool memo = std::getenv("APS5_NO_VARIANT_MEMO") == nullptr;
+    const auto handle = ResolveSource(request);
+    require(handle != nullptr, "variant memo: the cached request has no source handle");
+    const SrtMemoryReader live = +[](void*, std::uint64_t address, std::uint32_t* value) {
+        std::memcpy(value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), sizeof(*value));
+        return true;
+    };
+    SrtRuntime runtime;
+    runtime.readMemory = live;
+    runtime.readSpecializationMemory = live;
+    runtime.expressRead = live;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    require(WalkResources(*handle, request.context.userData, request.shader.codeAddress, runtime, snapshot, specialization) == WalkStatus::Walked, "variant memo: the walk declined");
+
+    // (1) In place over dirty results, then a hit.
+    RecompileResult result;
+    dirtyResult(result, compiled.bindings.size() + 3);
+    require(PopulateVariant(*handle, request, snapshot, specialization, result), "variant memo: the walk's specialization selected no variant");
+    require(sameResult(result, compiled), "variant memo: a result populated over a dirty one differs from the compiled result");
+    const auto first = ThreadVariantMemoCounts();
+    dirtyResult(result, 1);
+    require(PopulateVariant(*handle, request, snapshot, specialization, result) && sameResult(result, compiled), "variant memo: a result populated over a smaller dirty one differs from the compiled result");
+    const auto second = ThreadVariantMemoCounts();
+    require(!memo || (second.hits == first.hits + 1 && second.misses == first.misses), "variant memo: the same walk again was not a memo hit");
+    require(memo || (second.hits == 0 && second.misses == 0), "variant memo: APS5_NO_VARIANT_MEMO=1 still used the memo");
+
+    // (2) A specialization the source never compiled.
+    auto changed = specialization;
+    changed.buffers.push_back({});
+    const auto kept = result;
+    require(!PopulateVariant(*handle, request, snapshot, changed, result), "variant memo: a specialization never compiled selected a variant");
+    require(sameResult(result, kept), "variant memo: a declined populate changed the result");
+    const auto third = ThreadVariantMemoCounts();
+    require(!memo || (third.hits == second.hits && third.misses == second.misses + 1), "variant memo: a specialization never compiled was answered by the memo");
+
+    // (3) A variant compiled later, then both remembered.
+    auto later = request;
+    later.layout.pushConstantSizeBytes = 96;
+    require(!PopulateVariant(*handle, later, snapshot, specialization, result), "variant memo: a layout never compiled selected a variant");
+    const auto laterCompiled = Recompile(later);
+    require(laterCompiled.variantId != compiled.variantId, "variant memo: the second layout reused the first variant");
+    require(PopulateVariant(*handle, later, snapshot, specialization, result) && sameResult(result, laterCompiled), "variant memo: the variant compiled later was not found or differs from its compiled result");
+    const auto fourth = ThreadVariantMemoCounts();
+    require(PopulateVariant(*handle, later, snapshot, specialization, result) && result.variantId == laterCompiled.variantId, "variant memo: the later variant's repeat selected another variant");
+    require(PopulateVariant(*handle, request, snapshot, specialization, result) && sameResult(result, compiled), "variant memo: the first variant was lost to the later one");
+    const auto fifth = ThreadVariantMemoCounts();
+    require(!memo || (fifth.hits == fourth.hits + 2 && fifth.misses == fourth.misses), "variant memo: the two remembered variants were not both hits");
+
+    // (4) Another source (another target) with the same walk.
+    auto otherTarget = request;
+    otherTarget.target.subgroupSize = 32;
+    const auto otherHandle = ResolveSource(otherTarget);
+    require(otherHandle != nullptr && otherHandle->source != handle->source, "variant memo: another target shares the source entry");
+    require(!PopulateVariant(*otherHandle, otherTarget, snapshot, specialization, result), "variant memo: another source's walk was answered by the first source's variant");
+    require(sameResult(result, compiled), "variant memo: another source's declined populate changed the result");
+}
+
+// The fast walk (WalkResources, docs/design/draw-fastpath.md F2) with a direct reader of live
+// memory materializes what the capture did, and the variant it selects populates to the result the
+// capture compiled; a reader declining a read declines the walk.
+void verifyWalkResources(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::ResourceCapture& capture, const ShaderRecompiler::RecompileResult& compiled) {
+    using namespace ShaderRecompiler;
+    const auto handle = ResolveSource(request);
+    require(handle != nullptr, "the cached request has no source handle");
+    struct Reader {
+        std::uint32_t reads = 0;
+        bool decline = false;
+    } reader;
+    const SrtMemoryReader live = +[](void* context, std::uint64_t address, std::uint32_t* value) {
+        auto& self = *static_cast<Reader*>(context);
+        ++self.reads;
+        if (self.decline) return false;
+        std::memcpy(value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), sizeof(*value));
+        return true;
+    };
+    SrtRuntime runtime;
+    runtime.userContext = &reader;
+    runtime.readMemory = live;
+    runtime.readSpecializationMemory = live;
+    runtime.expressRead = live;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    require(WalkResources(*handle, request.context.userData, request.shader.codeAddress, runtime, snapshot, specialization) == WalkStatus::Walked, "the fast walk declined a request the capture walked");
+    require(reader.reads != 0, "the fast walk read nothing through its reader");
+    const auto walkReads = reader.reads;
+    const auto sameValues = [](const std::vector<DescriptorValue>& left, const std::vector<DescriptorValue>& right) {
+        if (left.size() != right.size()) return false;
+        for (std::size_t i = 0; i < left.size(); ++i) {
+            if (left[i].dwordCount != right[i].dwordCount || !std::equal(left[i].dwords.begin(), left[i].dwords.begin() + left[i].dwordCount, right[i].dwords.begin())) return false;
+        }
+        return true;
+    };
+    const auto& captured = capture.snapshot;
+    require(sameValues(snapshot.buffers, captured.buffers) && sameValues(snapshot.images, captured.images) && sameValues(snapshot.samplers, captured.samplers), "the fast walk's descriptors differ from the capture's");
+    require(snapshot.flattenedSrt == captured.flattenedSrt && snapshot.userData == captured.userData, "the fast walk's flattened SRT or user data differ from the capture's");
+    require(specialization == capture.specialization, "the fast walk's specialization differs from the capture's");
+    RecompileResult walked;
+    require(PopulateVariant(*handle, request, snapshot, specialization, walked), "the walk's specialization did not select the compiled variant");
+    require(walked.variantId == compiled.variantId && walked.pushConstants == compiled.pushConstants && walked.bindings.size() == compiled.bindings.size(), "the walk's populated variant differs from the compiled result");
+    for (std::size_t i = 0; i < walked.bindings.size(); ++i) require(walked.bindings[i].guestDescriptor == compiled.bindings[i].guestDescriptor && walked.bindings[i].role == compiled.bindings[i].role, "a binding of the walk's populated variant differs from the compiled result");
+    auto otherLayout = request;
+    otherLayout.layout.pushConstantSizeBytes = 32;
+    require(!PopulateVariant(*handle, otherLayout, snapshot, specialization, walked), "a layout never compiled selected a variant");
+    reader.decline = true;
+    require(WalkResources(*handle, request.context.userData, request.shader.codeAddress, runtime, snapshot, specialization) == WalkStatus::ReadDeclined, "a declined read did not decline the fast walk");
+    verifyWalkDeclineWithoutThrow(request, capture, *handle, walkReads);
+    verifyQuietDeclines(request, capture);
 }
 
 void verifyRegisterSources() {
@@ -101,6 +604,93 @@ void verifyEvaluatedValues() {
     require(table.Find(values[7].get(), found) && found == 21u, "evaluated values: a second insert replaced the first value");
     IrValue absent(IrOpcode::Void, IrType::U32, 1000u);
     require(!table.Find(&absent, found), "evaluated values: a value that was never inserted was found");
+}
+
+// A bindless table key that is a loop counter (Detail::LoopCounterRange): counting up, the loop's
+// exit test against an immediate bounds it (either side, negated or not), else the limit does;
+// counting down, its start does. A test in another block, an invariant phi, a step that is no
+// immediate and a key that is no phi are no counter or no bound.
+void verifyLoopCounterRange() {
+    using namespace ShaderRecompiler;
+    std::vector<std::unique_ptr<IrValue>> values;
+    std::vector<std::unique_ptr<IrBlock>> blocks;
+    std::uint32_t ids = 0;
+    const auto make = [&](IrOpcode opcode, IrType type) -> IrValue& {
+        values.push_back(std::make_unique<IrValue>(opcode, type, ids++));
+        return *values.back();
+    };
+    const auto constant = [&](std::uint32_t value) -> IrValue& {
+        auto& immediate = make(IrOpcode::Void, IrType::U32);
+        immediate.SetImmediateU32(value);
+        return immediate;
+    };
+    const auto block = [&]() -> IrBlock& {
+        blocks.push_back(std::make_unique<IrBlock>(static_cast<std::uint32_t>(blocks.size())));
+        return *blocks.back();
+    };
+    const auto binary = [&](IrOpcode opcode, IrType type, IrValue& first, IrValue& second) -> IrValue& {
+        auto& value = make(opcode, type);
+        value.AddArgument(&first);
+        value.AddArgument(&second);
+        return value;
+    };
+    const auto branch = [&](IrBlock& at, IrValue& condition) {
+        auto& inst = make(IrOpcode::BranchConditional, IrType::Void);
+        inst.AddArgument(&condition);
+        at.AppendInstruction(&inst);
+    };
+    struct Loop {
+        IrValue* key;
+        IrValue* next;
+        IrBlock* header;
+    };
+    // A single-block do-while: key = phi(start, next), next = key + step.
+    const auto loop = [&](std::uint32_t start, IrValue& step) {
+        auto& entry = block();
+        auto& header = block();
+        auto& key = make(IrOpcode::Phi, IrType::U32);
+        header.AppendInstruction(&key);
+        auto& next = binary(IrOpcode::IAdd32, IrType::U32, key, step);
+        header.AppendInstruction(&next);
+        key.AddPhiOperand(&entry, &constant(start));
+        key.AddPhiOperand(&header, &next);
+        return Loop{&key, &next, &header};
+    };
+    constexpr std::uint32_t limit = 20;
+
+    auto below = loop(0u, constant(1u));
+    branch(*below.header, binary(IrOpcode::ULessThan32, IrType::U1, *below.next, constant(6u)));
+    require(Detail::LoopCounterRange(below.key, limit) == 6u, "loop counter: next < 6 does not bound the key by 6");
+
+    auto negated = loop(0u, constant(1u));
+    auto& swapped = binary(IrOpcode::ULessThan32, IrType::U1, constant(7u), *negated.key);
+    auto& inverse = make(IrOpcode::LogicalNot, IrType::U1);
+    inverse.AddArgument(&swapped);
+    branch(*negated.header, inverse);
+    require(Detail::LoopCounterRange(negated.key, limit) == 8u, "loop counter: !(7 < key) does not bound the key by 8");
+
+    auto unbounded = loop(0u, constant(1u));
+    require(Detail::LoopCounterRange(unbounded.key, limit) == limit, "loop counter: a loop without an immediate exit test does not take the limit");
+
+    auto inBody = loop(0u, constant(1u));
+    auto& body = block();
+    branch(body, binary(IrOpcode::IEqual32, IrType::U1, *inBody.key, constant(2u)));
+    require(Detail::LoopCounterRange(inBody.key, limit) == limit, "loop counter: a test outside the exit blocks bounded the key");
+
+    auto down = loop(5u, constant(0xffffffffu));
+    require(Detail::LoopCounterRange(down.key, limit) == 6u, "loop counter: a count-down from 5 does not cover 6 values");
+
+    auto& invariantEntry = block();
+    auto& invariantHeader = block();
+    auto& invariant = make(IrOpcode::Phi, IrType::U32);
+    invariantHeader.AppendInstruction(&invariant);
+    invariant.AddPhiOperand(&invariantEntry, &constant(0u));
+    invariant.AddPhiOperand(&invariantHeader, &invariant);
+    require(Detail::LoopCounterRange(&invariant, limit) == 0u, "loop counter: an invariant phi was taken for a counter");
+
+    auto runtimeStep = loop(0u, make(IrOpcode::GetUserData, IrType::U32));
+    require(Detail::LoopCounterRange(runtimeStep.key, limit) == 0u, "loop counter: a step that is no immediate was taken for a counter");
+    require(Detail::LoopCounterRange(&constant(3u), limit) == 0u, "loop counter: an immediate was taken for a counter");
 }
 
 // The pure flat slots of a hand-built plan (Detail::ComputePureFlatSlots): a slot is pure unless
@@ -371,6 +961,37 @@ void verifyBindlessTable() {
     const auto nullMapping = mappingOf(nullCapture->snapshot);
     require(std::vector<std::uint32_t>(nullMapping.begin(), nullMapping.begin() + 5) == std::vector<std::uint32_t>{2u, 0u, 0u, 1u, 1u}, "bindless: a null entry's key was mapped");
     require(nullCapture->snapshot.images[direct + 1u].dwords == heap[0], "bindless: a null entry's slot is not the pad");
+    // Entries whose words 5-6 ask for what the driver does not decode (an array pitch: the walk
+    // read past a T# array into the next struct), with APS5_NULL_UNDECODABLE=1 (opt-in). One whose
+    // words 0-3 are no T# either (type 0) stays unmapped as without the switch, and is no null
+    // the switch bound (StrictTableEntries; counted as one with APS5_NO_STRICT_TABLE_ENTRIES=1).
+    // One the table maps (a texture in words 0-3) fails the capture as the driver's decode did,
+    // or binds null with APS5_NO_STRICT_TABLE_ENTRIES=1.
+    if (ResourceMaterializer::NullUndecodable()) {
+        heap[2] = heap[1];
+        heap[2][3] &= 0x0fffffffu;
+        heap[2][5] = 1u;
+        static_cast<void>(ResourceMaterializer::TakeNullBound(NullBoundImage::TableUndecodable));
+        AgcDriver::ShaderMemory invalidMemory({});
+        const auto invalidCapture = invalidMemory.Capture(request);
+        const auto invalidMapping = mappingOf(invalidCapture->snapshot);
+        require(std::vector<std::uint32_t>(invalidMapping.begin(), invalidMapping.begin() + 5) == std::vector<std::uint32_t>{2u, 0u, 0u, 1u, 1u}, "bindless: an invalid entry with undecodable words 5-6 was mapped");
+        require(invalidCapture->snapshot.images[direct + 1u].dwords == heap[0], "bindless: an invalid entry's slot is not the pad");
+        require((ResourceMaterializer::TakeNullBound(NullBoundImage::TableUndecodable) == 0u) == ResourceMaterializer::StrictTableEntries(), "bindless: an entry the table never maps was counted as bound null");
+
+        heap[2] = heap[1];
+        heap[2][5] = 1u;
+        AgcDriver::ShaderMemory pitchMemory({});
+        if (ResourceMaterializer::StrictTableEntries()) {
+            expectFailure([&] { static_cast<void>(pitchMemory.Capture(request)); }, "bindless table entry is a texture", "bindless: a mapped texture with undecodable words 5-6 was bound null");
+        } else {
+            const auto pitchCapture = pitchMemory.Capture(request);
+            const auto pitchMapping = mappingOf(pitchCapture->snapshot);
+            require(std::vector<std::uint32_t>(pitchMapping.begin(), pitchMapping.begin() + 5) == std::vector<std::uint32_t>{2u, 0u, 0u, 1u, 1u}, "bindless: an undecodable entry's key was mapped");
+            require(pitchCapture->snapshot.images[direct + 1u].dwords == heap[0], "bindless: an undecodable entry's slot is not the pad");
+        }
+        heap[2] = {};
+    }
     materials[2][1] = 3u;
 
     // Mode T: every entry keeps its slot; the null entry's slot holds the pad and its key is
@@ -397,6 +1018,105 @@ void verifyBindlessTable() {
     fillSrt(4u);
 }
 
+
+// A compute program sampling, in a counted loop (`for (i = 0; i < 3; i++)`), the T# at `i * 32`
+// behind an SRT pointer: a loop-counter table bounded by the loop's exit test, which the translator
+// keeps in the block metadata (APS5_NO_LOOP_EXIT_BOUND=1: the default limit). Every key below the
+// bound is sampled, so an entry the driver cannot decode (an array pitch) fails the capture rather
+// than binding null (ResourceMaterializer::StrictLoopTables; nulled with
+// APS5_NO_STRICT_LOOP_TABLES=1), while an entry past the bound is never read. The table binds
+// its bound's 3 slots, not the bindless slots (APS5_NO_LOOP_TABLE_SLOTS=1: those). The loop keys
+// are opt-in (APS5_LOOP_TABLE_KEYS=1, which main sets); skipped without them (the plan rejects the
+// key) or with fewer than 3 bindless slots.
+void verifyLoopCounterTable() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t Format8888UNorm = 56;
+    constexpr std::uint32_t Type2D = 9;
+    const std::uint32_t slots = ResourceMaterializer::BindlessSlots();
+    if (slots < 3u || std::getenv("APS5_LOOP_TABLE_KEYS") == nullptr) return;
+
+    struct alignas(256) Texture { std::array<std::uint8_t, 256> bytes{}; };
+    static Texture textures[3];
+    std::array<std::array<std::uint32_t, 8>, 4> table{};
+    const auto makeTexture = [&](std::uint32_t entry, const Texture& texture) {
+        const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texture.bytes.data()));
+        table[entry] = {static_cast<std::uint32_t>(base >> 8u), static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (Format8888UNorm << 20u) | (3u << 30u), 3u << 14u, 0xfacu | (Type2D << 28u), 0u, 0u, 0u, 0u};
+    };
+    for (std::uint32_t entry = 0; entry < 3u; entry++) makeTexture(entry, textures[entry]);
+    // Past the loop's bound: no T# (words 4-7 a tagged pointer, as Demon's Souls' captures read).
+    table[3] = table[0];
+    table[3][4] = 0x3860d730u;
+    table[3][5] = 0x00500005u;
+    std::array<std::uint32_t, 4> output{};
+    const auto tableAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(table.data()));
+    const auto outputAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
+    std::array<std::uint32_t, 12> srt{static_cast<std::uint32_t>(tableAddress), static_cast<std::uint32_t>(tableAddress >> 32u), 0u, 0u, 0u, 0u, 0u, 0u, static_cast<std::uint32_t>(outputAddress), static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu), 16u, 0xfacu};
+    const auto srtAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(srt.data()));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(srtAddress), static_cast<std::uint32_t>(srtAddress >> 32u)};
+    const std::array<std::uint32_t, 1> capabilities{29u};
+
+    // s_load_dwordx2 s[2:3], s[0:1], 0; s_load_dwordx4 s[8:11], s[0:1], 0x10 (S#);
+    // s_load_dwordx4 s[28:31], s[0:1], 0x20 (output V#); s_mov_b32 s16, 0;
+    // loop: s_lshl_b32 s17, s16, 5; s_load_dwordx8 s[20:27], s[2:3], s17; s_waitcnt lgkmcnt(0);
+    // image_sample_lz v[4:7], v[0:1], s[20:27], s[8:11]; s_waitcnt vmcnt(0);
+    // buffer_store_dword v4, off, s[28:31], 0; s_add_i32 s16, s16, 1; s_cmp_lt_u32 s16, 3;
+    // s_cbranch_scc1 loop; s_endpgm.
+    const std::vector<std::uint32_t> code{0xf4040080u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000020u, 0xbe900380u, 0x8f118510u, 0xf40c0501u, 0x22000000u, 0xbf8cc07fu, 0xf09c0f08u, 0x00450400u, 0xbf8c3f70u, 0xe0700000u, 0x80070400u, 0x81108110u, 0xbf0a8310u, 0xbf85fff4u, 0xbf810000u};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Compute, 0x20000u, code, 0, {}};
+    request.context.waveSize = 64;
+    request.context.userDataBaseRegister = 0;
+    request.context.userData = userData;
+    request.context.compute = ShaderComputeStageInfo{{64u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 32;
+    request.target.supportedCapabilities = capabilities;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+
+    const auto plan = GetResourcePlan(request);
+    std::size_t tables = 0;
+    for (const auto& source : plan->descriptorSources) {
+        if (!source.indirectImage.has_value()) continue;
+        ++tables;
+        const auto& indirect = *source.indirectImage;
+        require(indirect.heapAddress && indirect.loopKey && !indirect.hasMaterial && indirect.entryOffset == 0u, "loop table: the counter table was not planned");
+        require(indirect.entryLimit == (std::getenv("APS5_NO_LOOP_EXIT_BOUND") == nullptr ? 3u : std::min(slots, 32u)), "loop table: the table does not span the loop's bound (the exit test in the block metadata)");
+    }
+    require(tables == 1, "loop table: the table source was not planned");
+    // Spanning the default limit, the capture reads the entry past the loop's bound too.
+    if (std::getenv("APS5_NO_LOOP_EXIT_BOUND") != nullptr) return;
+    const std::uint32_t tableSlots = std::getenv("APS5_NO_LOOP_TABLE_SLOTS") == nullptr ? 3u : slots;
+    const auto mappingOf = [&](const ResourceSnapshot& snapshot) {
+        require(snapshot.flattenedSrt.size() >= 1u + 2u * tableSlots, "loop table: the mapping block is missing from the flattened SRT");
+        return std::vector<std::uint32_t>(snapshot.flattenedSrt.end() - static_cast<std::ptrdiff_t>(1u + 2u * tableSlots), snapshot.flattenedSrt.end());
+    };
+
+    // Every key below the bound is mapped; the entry past it is never read. The table holds the
+    // bound's slots: a draw sampling two loop tables at 48 slots needed 97 image slots of 64.
+    AgcDriver::ShaderMemory memory({});
+    const auto capture = memory.Capture(request);
+    const auto direct = static_cast<std::uint32_t>(plan->info.images.size());
+    require(capture->specialization.images.size() == direct + tableSlots - 1u && capture->snapshot.images.size() == direct + tableSlots - 1u, "loop table: the table does not bind its bound's slots");
+    const auto mapping = mappingOf(capture->snapshot);
+    require(std::vector<std::uint32_t>(mapping.begin(), mapping.begin() + 7) == std::vector<std::uint32_t>{3u, 0u, 0u, 1u, 1u, 2u, 2u}, "loop table: the keys below the loop's bound are not mapped in order");
+    const auto regions = memory.Regions();
+    request.context.memory = regions;
+    require(!Recompile(request, *capture)->spirv.empty(), "loop table: the loop-counter table did not compile");
+    request.context.memory = {};
+
+    // An entry the loop reaches whose words 5-6 the driver cannot decode.
+    table[1][5] = 1u;
+    AgcDriver::ShaderMemory pitchMemory({});
+    if (ResourceMaterializer::NullUndecodable() && ResourceMaterializer::StrictLoopTables()) {
+        expectFailure([&] { static_cast<void>(pitchMemory.Capture(request)); }, "loop-counter table entry", "loop table: an undecodable entry the loop samples was bound");
+    } else if (ResourceMaterializer::NullUndecodable()) {
+        const auto pitchMapping = mappingOf(pitchMemory.Capture(request)->snapshot);
+        require(std::vector<std::uint32_t>(pitchMapping.begin(), pitchMapping.begin() + 5) == std::vector<std::uint32_t>{2u, 0u, 0u, 2u, 2u}, "loop table: APS5_NO_STRICT_LOOP_TABLES did not bind the entry null");
+    }
+    table[1][5] = 0u;
+}
 
 void verifyDescriptorPhis() {
     using namespace ShaderRecompiler;
@@ -877,13 +1597,71 @@ void verifyTwoLaneUniformValues() {
     require(multiplies(32u) == oneLane, "two-lane uniform values: a two-lane invocation computes a scalar value once per lane");
 }
 
+// The fast walk's shadow compare (FastWalk.cpp) excuses a flattened SRT word that differs from the
+// old result's only as the flat copy of a sampled T#'s don't-care bits (FlatTsharpFeedbackCopy);
+// t387: binding 2 word 11 old 000000b0, walk 020000b0 and word 12 old 00000038, walk 000000e1.
+void verifyFlatTsharpFeedbackCopy() {
+    using namespace ShaderRecompiler;
+    const auto bindings = [](std::uint32_t word5, std::uint32_t word6, DescriptorKind kind) {
+        std::vector<DescriptorBinding> result(2);
+        result[0].kind = kind;
+        result[0].role = DescriptorRole::GuestImages;
+        result[0].count = 2;
+        result[0].guestDescriptor = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x1000, 0x2000, 0x3000, 0x4000, 0x5000, word5, word6, 0x8000};
+        result[1].kind = DescriptorKind::StorageBuffer;
+        result[1].role = DescriptorRole::FlattenedSrt;
+        result[1].count = 1;
+        result[1].guestDescriptor = {0x1000, 0x2000, 0x3000, 0x4000, 0x5000, word5, word6, 0x8000};
+        return result;
+    };
+    const auto old = bindings(0x000000b0u, 0x00000038u, DescriptorKind::SampledImage);
+    const auto walked = bindings(0x020000b0u, 0x000000e1u, DescriptorKind::SampledImage);
+    require(AgcDriver::FlatTsharpFeedbackCopy(old, walked, 0x000000b0u, 0x020000b0u), "a flat T# word 5 differing in bit 25 was not excused");
+    require(AgcDriver::FlatTsharpFeedbackCopy(old, walked, 0x00000038u, 0x000000e1u), "a flat T# word 6 differing in bits 0-7 was not excused");
+    require(!AgcDriver::FlatTsharpFeedbackCopy(old, walked, 0x000000b0u, 0x030000b0u), "a flat word differing beyond the mask was excused");
+    require(!AgcDriver::FlatTsharpFeedbackCopy(old, walked, 0x000000b0u, 0x000000b0u), "equal words were reported as a feedback copy");
+    require(!AgcDriver::FlatTsharpFeedbackCopy(old, walked, 0x00000040u, 0x02000040u), "a flat word no image element holds was excused");
+    // Word 4 of the T# carries no don't-care bits.
+    const auto oldWord4 = bindings(0x000000b0u, 0x00000038u, DescriptorKind::SampledImage);
+    auto walkedWord4 = oldWord4;
+    walkedWord4[0].guestDescriptor[12] = 0x02005000u;
+    require(!AgcDriver::FlatTsharpFeedbackCopy(oldWord4, walkedWord4, 0x5000u, 0x02005000u), "a T# word 4 difference was excused");
+    // A storage image has no feedback fields, and a layout that differs is never excused.
+    const auto storageOld = bindings(0x000000b0u, 0x00000038u, DescriptorKind::StorageImage);
+    const auto storageWalked = bindings(0x020000b0u, 0x000000e1u, DescriptorKind::StorageImage);
+    require(!AgcDriver::FlatTsharpFeedbackCopy(storageOld, storageWalked, 0x000000b0u, 0x020000b0u), "a storage image's word 5 was excused");
+    require(!AgcDriver::FlatTsharpFeedbackCopy(std::span(old).first(1), walked, 0x000000b0u, 0x020000b0u), "bindings of different counts were compared");
+}
+
+// APS5_LOOP_TABLE_FIT: the span loop-counter tables are cut to so that the image slots fit. The
+// pc 0x258 screen pass: three images, two of them loop tables of the default span (32), needed
+// 3 + 2 x 31 = 65 image slots of 64.
+void verifyLoopTableSpan() {
+    using ShaderRecompiler::ResourceMaterializer;
+    require(ResourceMaterializer::LoopTableSpan(3u, {32u, 32u}, 64u) == 31u, "loop table span: two default-span tables beside one image were not cut to 31");
+    require(ResourceMaterializer::LoopTableSpan(3u, {3u, 3u}, 64u) == 3u, "loop table span: tables that fit were cut");
+    require(ResourceMaterializer::LoopTableSpan(40u, {32u, 4u}, 64u) == 22u, "loop table span: the cut did not keep the smaller table whole");
+    require(ResourceMaterializer::LoopTableSpan(64u, {32u}, 64u) == 1u, "loop table span: a table was not cut to its root slot");
+    require(ResourceMaterializer::LoopTableSpan(65u, {2u}, 64u) == 0u, "loop table span: images past the limit were fitted");
+}
+
 int main() {
+    // The loop-counter table keys are opt-in in the driver; verifyLoopCounterTable covers them.
+    // Set before the first plan reads it (ResourceTracker caches it).
+#ifdef _WIN32
+    _putenv_s("APS5_LOOP_TABLE_KEYS", "1");
+#else
+    setenv("APS5_LOOP_TABLE_KEYS", "1", 1);
+#endif
     try {
         using namespace ShaderRecompiler;
         verifyRegisterSources();
         verifyEvaluatedValues();
         verifyPureFlatSlots();
+        verifyLoopCounterRange();
         verifyBindlessTable();
+        verifyLoopCounterTable();
+        verifyLoopTableSpan();
         verifyDescriptorPhis();
         verifyProgramCounterRelativeData();
         verifyMeshConfiguration();
@@ -892,6 +1670,8 @@ int main() {
         verifyComputedTexelOffsets();
         verifyWaveUniformValues();
         verifyTwoLaneUniformValues();
+        verifyFlatTsharpFeedbackCopy();
+        verifyPopulateInto();
 #if ANYPS5_ENABLE_SPIRV_TOOLS
         const std::vector<std::uint32_t> minimalSpirv{
             0x07230203u, 0x00010000u, 0u, 5u, 0u,
@@ -957,6 +1737,8 @@ int main() {
         const auto cached = Recompile(request);
         require(cached.cacheHit, "unchanged shader did not hit the cache");
         verifyResult(first, cached);
+        verifyWalkResources(request, *capture, first);
+        verifyVariantMemo(request, first);
         auto relocated = request;
         relocated.shader.codeAddress += 0x1000;
         require(Recompile(relocated).cacheHit, "shader relocation caused recompilation");
@@ -1001,6 +1783,7 @@ int main() {
         updated.context.memory = updatedRegions;
         const auto updatedCached = Recompile(updated);
         require(updatedCached.cacheHit, "dynamic shader data caused recompilation");
+        verifyWalkResources(updated, *updatedCapture, updatedCached);
         updated.useCache = false;
         verifyResult(updatedCached, Recompile(updated));
         bool changedData = updatedCached.pushConstants != first.pushConstants;

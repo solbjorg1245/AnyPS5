@@ -33,7 +33,8 @@ struct DrawInputCopy {
     VkDeviceSize importOffset = 0;
 };
 // `inPlace`: bind the host import instead of copying when one covers the range (APS5_NO_INPLACE_INPUTS=1: never).
-DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, bool inPlace = false);
+// `memoizedImport` (DrawFast): that import through the thread's memo (HostImportMemoized).
+DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, bool inPlace = false, bool memoizedImport = false);
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived);
 
 std::array<std::uint32_t, 4> MeshIndexBufferDescriptor(const Pm4::DrawParameters& draw, std::uint64_t unreadAddress);
@@ -72,6 +73,29 @@ bool DrawRecipes();
 enum class IndirectDrawPath : std::uint8_t { Gpu, NotFolded, FetchUnknown, NonVertexPath, IndxOffset, DrawIndex, VertexRange, FeatureGap, PendingImage, PendingLabelOrCopy, NotImported, Disabled, Count };
 void CountIndirectDraw(IndirectDrawPath path, double readMs, bool rewritten = false);
 const char* IndirectDrawPathName(IndirectDrawPath path);
+
+// APS5_FAST_CENSUS=1 with APS5_PROFILE_DRAW (docs/design/draw-fastpath.md F0): what Draw learned
+// about the calling thread's last draw that the fast path would decline on, read and cleared by the
+// driver's census when the packet ends (Execution/src/Driver/Draw/FastCensus.cpp); Draw and
+// DrawWithRecipe fill it. A draw that ended early (nothing to draw, empty indirect records) leaves
+// it unseen.
+struct DrawCensusNote {
+    bool seen = false;
+    // A color target without its resident storage image (copied in and out per draw).
+    bool notResident = false;
+    // A bound image is one of the draw's targets (a pass of its own).
+    bool readsTarget = false;
+    bool copiedWrites = false;
+    // An address-based build's lease.
+    bool lease = false;
+    bool indirect = false;
+    IndirectDrawPath path = IndirectDrawPath::Gpu;
+    bool rewritesRecords = false;
+};
+// Whether the census runs (APS5_FAST_CENSUS and APS5_PROFILE_DRAW set).
+bool FastCensus();
+// The calling thread's note; null while the census is off.
+DrawCensusNote* ThreadDrawCensusNote();
 
 // Draw packets that drew nothing, for the [draws] line: Nothing (an empty count, or no color writes
 // and no pixel shader), Prechecked (State.hpp's DrawRejection refused it before the decode) and

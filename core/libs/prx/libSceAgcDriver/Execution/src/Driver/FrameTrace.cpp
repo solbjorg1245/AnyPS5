@@ -113,6 +113,21 @@ std::string TakeWrites() {
     return std::exchange(threadWrites(), {});
 }
 
+namespace {
+std::atomic<bool>& notingWanted() {
+    static std::atomic<bool> wanted{false};
+    return wanted;
+}
+}
+
+bool Noting() {
+    return Active() || notingWanted().load(std::memory_order_relaxed);
+}
+
+void SetNoting(bool noting) {
+    notingWanted().store(noting, std::memory_order_relaxed);
+}
+
 Entry Record(const std::string& line) {
     auto& trace = Trace();
     std::lock_guard lock(trace.mutex);

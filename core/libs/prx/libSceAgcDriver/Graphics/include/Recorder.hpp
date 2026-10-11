@@ -16,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -23,6 +24,7 @@
 namespace AgcDriver::Graphics {
 
 class Buffer;
+class GpuTimingDigest;
 
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the
 // copies that feed them record into one open batch; Submit sends it to the queue without waiting and
@@ -54,11 +56,84 @@ public:
     // so a dispatch, fill or copy whose leading barrier asks for a subset of them may skip it
     // (the [barriers] line counts the merges). The call clears the mask (whatever the caller
     // records is assumed uncovered until it marks); a new batch starts uncovered.
-    VkCommandBuffer Commands(VkAccessFlags* coveredAccess = nullptr);
+    // `site`: where the call is made, for the [barriers] census of the passes that recorded queued
+    // copy-backs ("command passes by site").
+    enum class CommandSite : std::uint8_t { Other = 0, Draw, DrawOther, Fill, Copy, Dispatch, Texture, TextureWriteBack, UnitShadow, Depth, CopyBack, KeyStore, Count };
+    static const char* CommandSiteName(CommandSite site);
+    VkCommandBuffer Commands(VkAccessFlags* coveredAccess = nullptr, CommandSite site = CommandSite::Other);
+    // Aware commands (on by default: APS5_NO_AWARE_COMMANDS=1 or APS5_AWARE_COMMANDS=0 turns them
+    // off; with copy-back coalescing; read when the recorder is made): Commands() for a caller that
+    // knows every guest range it reads or writes through the host imports, `touches(begin, end)`
+    // telling whether it does so in [begin, end).
+    // Only the queued copy-backs whose bytes it touches are recorded first (resident and land
+    // copies alike), and every claimed one (the claims of a build still recording keep Commands()'
+    // rule); the others stay queued, whole and in order, for the next point that records them
+    // (nothing reads or writes their bytes before: C1). A caller whose ranges are not all known
+    // calls Commands(). Turned off: Commands().
+    bool AwareCommands() const { return awareCommands; }
+    template <typename Touches>
+    VkCommandBuffer CommandsTouching(const Touches& touches, CommandSite site, VkAccessFlags* coveredAccess = nullptr) {
+        if (!awareCommands) return Commands(coveredAccess, site);
+        const std::function<bool(std::uint64_t, std::uint64_t)> selected = std::cref(touches);
+        return commandsTouching(&selected, site, coveredAccess);
+    }
+    // An aware caller that reads and writes no host import (images, buffers of its own).
+    VkCommandBuffer CommandsTouchingNothing(CommandSite site, VkAccessFlags* coveredAccess = nullptr) { return awareCommands ? commandsTouching(nullptr, site, coveredAccess) : Commands(coveredAccess, site); }
+    // Whether CommandsTouching(touches) would record queued copy-backs first: a claimed one, or one
+    // storing bytes `touches` holds for.
+    bool WouldRecordCopies(const std::function<bool(std::uint64_t, std::uint64_t)>& touches) const;
     // After a trailing barrier with ALL_COMMANDS as its destination stage: `access` is its
     // destination access mask.
     void MarkCovered(VkAccessFlags access);
     void MarkShaderReadsCovered() { MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT); }
+    // Dispatch overlap (APS5_DISPATCH_OVERLAP=1, default off; needs barrier elision): the guest
+    // orders two compute dispatches of one queue only through packets between them (a partial
+    // flush, ACQUIRE_MEM, RELEASE_MEM, a wait, a label); with nothing but register writes between
+    // two DISPATCH_DIRECT packets the GPU runs them concurrently. Such a pair may overlap here
+    // too: the first's trailing barrier waits (DeferDispatchTrail) and the second, holding the
+    // same order span, takes the command buffer without it (HoldDispatchTrail, then
+    // ElideDispatchTrail when it records no transfer of its own first). Anything else recorded
+    // after the first records the barrier first: Commands(), the copy passes, store runs, key
+    // stores, Submit. Old path: every dispatch records its trailing barrier at once.
+    static bool DispatchOverlap();
+    // The guest order: a span ends at every packet that may order work (KeepsGuestOrder false)
+    // and at every submission; spans are unique across threads. Called by the packet loop of the
+    // thread that records the packet's work. `special`: the flip or rendering-wait NOP.
+    struct GuestOrderKey {
+        std::uint64_t span = 0;
+        std::uint64_t packet = 0;
+    };
+    static constexpr bool KeepsGuestOrder(std::uint32_t opcode, bool special) {
+        if (special) return false;
+        switch (opcode) {
+            case 0x10: case 0x15: case 0x63: case 0x64: case 0x69: case 0x76: case 0x79: return true;
+            default: return false;
+        }
+    }
+    static void NoteGuestSubmission();
+    static void NoteGuestPacket(std::uint32_t opcode, bool special);
+    // This thread's order key while it runs a DISPATCH_DIRECT packet (span 0 otherwise).
+    static GuestOrderKey GuestOrder();
+    // Instead of a dispatch's trailing barrier (COMPUTE -> ALL_COMMANDS, shader writes to
+    // `access`, which it marks covered): kept pending for `order` until the next command.
+    void DeferDispatchTrail(GuestOrderKey order, VkAccessFlags access);
+    // A dispatch of the same span (a later packet) about to call Commands(): that one call leaves
+    // the pending trail out. False (nothing held) otherwise.
+    bool HoldDispatchTrail(GuestOrderKey order);
+    // The pending trail now, if any (a holder that records a transfer before its dispatch).
+    void RecordDispatchTrail();
+    // Drops the pending trail (the holder's dispatch overlaps the earlier one); false if none.
+    bool ElideDispatchTrail();
+    bool DispatchTrailPending() const { return open != nullptr && open->trail.pending; }
+    struct DispatchTrailStatistics {
+        std::uint64_t deferred = 0;
+        std::uint64_t elided = 0;
+        std::uint64_t command = 0;
+        std::uint64_t refresh = 0;
+        std::uint64_t submit = 0;
+        std::uint64_t other = 0;
+    };
+    static DispatchTrailStatistics DispatchTrailCounts();
     // A recorded draw's render pass (Draw.cpp) is left open after the draw: the next draw of the
     // same attachments (`key`: the views and the extent) continues it when nothing was recorded in
     // between and the earlier draw allowed it (`continuable`: it wrote nothing but its
@@ -102,6 +177,7 @@ public:
     // (t175: 5 of 7 runs lost the device ~2 min into gameplay with it, none of 3 without); the
     // default records every copy-back at once, as before. It saves GPU time only (t166: staging
     // class time 1400 -> 870 ms per 10 s), and the frame is CPU-bound.
+    struct ResidentGuard;
     struct DeferredCopy {
         std::shared_ptr<void> keep;
         const void* sourceKey = nullptr;
@@ -112,8 +188,196 @@ public:
         VkDeviceSize bytes = 0;
         // The guest range the copy stores.
         std::uint64_t address = 0;
+        // A resident copy's guard over its host pages (KeepsResidentBuffers); empty otherwise.
+        std::shared_ptr<ResidentGuard> guard {};
+        // Narrow copy-backs (NarrowsCopyBacks): the device addresses of the source's and the
+        // destination's first bytes, and the distance from a source byte to its baseline in the
+        // same buffer (0: no baseline, a plain copy). A copy with a baseline stores only the dwords
+        // whose source differs from the baseline, and sets the baseline to them (see
+        // GuestBufferMemory's staging shadows); trimming moves both offsets alike, so the baseline
+        // follows.
+        VkDeviceAddress sourceAddress = 0;
+        VkDeviceAddress destinationAddress = 0;
+        VkDeviceSize baselineOffset = 0;
+        // A resident written range's land (KeepsResidentWrites): `sourceKey` is the range.
+        bool land = false;
+        // GuestMemory::FreeClock when the copy was first queued (DeferCopies; a claimed copy keeps
+        // its own): the pages released since are not copied back (APS5_DROP_FREED_STORES).
+        std::uint32_t freeClock = 0xffffffffu;
     };
     static bool DeferCopyBacks();
+    // Copy-back coalescing (on by default; APS5_NO_COALESCE_COPY_BACKS=1 or APS5_COALESCE_COPY_BACKS=0
+    // turns it off, read when the recorder is made; without it everything here behaves as above).
+    // Copy-backs are deferred, and the queued ones stay queued past the commands that do not touch their bytes, so only the last copy of a guest byte per
+    // epoch (up to the next point that records them) lands: a copy deferred over bytes an earlier
+    // queued copy stores drops them from that one (nothing read them in between, or the reader
+    // would have recorded it first), so queued copies never overlap and record in any order.
+    // What records them (docs/design/resident-memory.md, "Copy-back coalescing"):
+    // - every queued copy, claimed ones too: Commands() (a caller that checks nothing), a label
+    //   store or store run, a key-store run, Submit (before the batch's host barrier);
+    // - those a dispatch reads or writes through the imports (bound in place, its indirect
+    //   arguments; every one for an address-based build), before it takes CommandsKeepingCopyBacks
+    //   (VulkanDevice recordDispatch);
+    // - those over a range a staging build copies in from its import (all claims made first; a
+    //   region's own claimed copies stay: it copies from that shadow), before its copy pass takes
+    //   CommandsKeepingCopyBacks (GuestBufferMemory::recordGpuCopies);
+    // - with aware commands (AwareCommands), those over what a caller that knows its ranges reads
+    //   or writes through the imports, and every claimed one, before it takes the command buffer
+    //   (CommandsTouching).
+    // The CPU reads a copied range only after its batch completed: the use's pending-write notes
+    // make a CPU access sync the batch (Submit records the copies first), and the title's pollers
+    // see a label only after the copies recorded ahead of its store.
+    bool CoalescesCopyBacks() const { return coalesceCopyBacks; }
+    bool DefersCopyBacks() const { return coalesceCopyBacks || DeferCopyBacks(); }
+    // Narrow copy-backs (on by default; APS5_NO_NARROW_COPY_BACKS=1 or APS5_NARROW_COPY_BACKS=0 turns
+    // them off, read when the recorder is made; off with the old
+    // deferral alone, APS5_DEFER_COPY_BACK without coalescing, whose queued copies may overlap, and
+    // on a device without buffer device addresses). A staged region's copy-back copies the whole
+    // written element range (a V# the shader may write: ~285-360 KiB per use of the hot append
+    // kernels, ~680 MiB per present before coalescing, 5.1-5.7 GB per 10 s after it), whatever
+    // part of it the shader stored. With the switch a staging shadow keeps a baseline (what the
+    // import holds of its range) behind its bytes, and its copy-back is a small compute pass that
+    // compares the two on the device and stores over PCIe only the dwords that differ (updating the
+    // baseline), so only the bytes the shader changed cross the bus (under profiling the
+    // [barriers] digest's "narrow copy-backs ... MiB stored"). Unaligned edges, copies without a
+    // usable baseline and a device without the pass copy whole as before (keeping the baseline).
+    // The shadows' side is GuestBufferMemory's (allocation, baseline refresh at copy-in, trust).
+    bool NarrowsCopyBacks() const { return narrowCopyBacks && !narrowFailed.load(std::memory_order_relaxed); }
+    // Bumped whenever queued copies some build claimed are recorded or released before that build
+    // took them over (TakeClaimedCopies): a shadow whose baseline was copied from a claimed
+    // shadow no longer knows what the import holds then (GuestBufferMemory checks it).
+    std::uint64_t ClaimBreaks() const { return claimBreaks; }
+    // Records `copies` now as one pass (lead barrier, plain and narrow copies, trail barrier), as a
+    // flush of deferred copies would: the immediate copy-back of a use whose regions copy narrow.
+    void RecordCopyBacksNow(std::vector<DeferredCopy> copies);
+    // The narrow copies of a pass as compare spans: copies back to back in their shadow and import
+    // with the same baseline join (one compare dispatch instead of one per written range); the
+    // rest stay as they are. Sorted by shadow, import and offset.
+    static std::vector<DeferredCopy> NarrowSpans(std::vector<DeferredCopy> copies);
+    // Resident buffers (APS5_RESIDENT_BUFFERS=1, which turns coalescing on; docs/design/
+    // resident-memory.md S3): at Submit or a label, the whole host pages of a queued unclaimed
+    // copy stay queued past the batch (its partial pages at either end are recorded as before):
+    // they are made inaccessible (GuestPageGuard*) and wait for the next point that records them
+    // (a command, a dispatch or copy-in over them, a label store over them, a changed mapping,
+    // APS5_RESIDENT_BUFFER_BATCHES or the APS5_RESIDENT_BUFFER_MIB cap) or for the build that takes
+    // their shadow over. A CPU access to such a page (the title's plain reads too) faults, and
+    // ResolveResidentFault lands the bytes from the shadow with a submission of its own; a copy so
+    // landed is not recorded again (the CPU may write the bytes after it). A guard stays until the
+    // batch recording its copy completed.
+    bool KeepsResidentBuffers() const { return residentBuffers; }
+    // Resident read-only copies (APS5_RESIDENT_READS=1, read when the recorder is made; docs/design/
+    // resident-memory.md S3, GuestBufferMemory.cpp "Resident reads"): a dispatch build binds an
+    // element range it only reads, inside a host import, from a device-local copy instead of the
+    // import over PCIe; the copy is refreshed from the import (recorded into the open batch) only
+    // when guest memory changed under it. The settings: APS5_RESIDENT_READS_MIB (cap of the cached
+    // copies, default 1024), APS5_RESIDENT_READS_MIN_KIB / APS5_RESIDENT_READS_MAX_KIB (the region
+    // sizes taken, default 4 / 16384) and APS5_RESIDENT_READS_VERIFY=N (every Nth use served
+    // without a refresh, 1: each one, also copies the import and the copy to the host; they are
+    // compared when the batch completed).
+    struct ResidentReadSettings {
+        bool enabled = false;
+        std::uint32_t verifyEvery = 0;
+        std::uint64_t limitBytes = 0;
+        std::uint64_t minBytes = 0;
+        std::uint64_t maxBytes = 0;
+    };
+    bool KeepsResidentReads() const { return residentReads.enabled; }
+    const ResidentReadSettings& ResidentReads() const { return residentReads; }
+    // Whether any recorder was made with APS5_RESIDENT_READS (one relaxed load): what only the
+    // resident reads use (an address space's writable ranges, a program's BDA store scan) is
+    // prepared only then.
+    static bool ResidentReadsConfigured();
+    // Resident written ranges (on by default: APS5_NO_RESIDENT_WRITES=1 or APS5_RESIDENT_WRITES=0
+    // turns them off, S11 with them; read when the recorder is made, with coalescing on and
+    // resident buffers off; narrow copy-backs needed; docs/design/
+    // resident-memory-2.md S7a, GuestBufferMemory.cpp "Resident written ranges"): a written element
+    // too large to stage, which dispatch builds bind in place, binds a device-local copy once its
+    // range had APS5_RESIDENT_WRITES_USES (8) uses within 10 s, and a use writing it queues one
+    // narrow land into the import (DeferredCopy::land) instead of storing over PCIe.
+    // APS5_RESIDENT_WRITES_MIB (512) caps the copies; APS5_RESIDENT_WRITES_VERIFY=N compares a
+    // window of every Nth clean, unchanged copy with its import once the batch completed (1: every
+    // 16th).
+    struct ResidentWriteSettings {
+        bool enabled = false;
+        std::uint32_t uses = 0;
+        std::uint32_t verifyEvery = 0;
+        std::uint64_t limitBytes = 0;
+        // APS5_RESIDENT_WRITES_ROUND (default 1): a promoted range rounded out to 64 KiB.
+        bool roundOut = true;
+        // S11 (on by default: APS5_NO_RESIDENT_WRITES_DEMOTE=1 or APS5_RESIDENT_WRITES_DEMOTE=0
+        // turns it off): ranges that stopped paying are demoted
+        // (cold, refreshed for changes of the import at most uses, both sides written, a retired
+        // import) and the "resident-writes" VRAM reclaimer demotes the coldest under pressure;
+        // APS5_RESIDENT_WRITES_RETRY_S (30): the cool-down before a demoted range is promoted again.
+        bool demote = false;
+        std::uint32_t retrySeconds = 30;
+    };
+    bool KeepsResidentWrites() const { return residentWrites.enabled && NarrowsCopyBacks(); }
+    const ResidentWriteSettings& ResidentWrites() const { return residentWrites; }
+    static bool ResidentWritesConfigured();
+    // Whether a land of the range `key` is queued; records it now (`demote`: counted as a
+    // demotion's land, else as a copy-in's).
+    bool ResidentLandQueued(const void* key) const;
+    void FlushResidentLand(const void* key, bool demote);
+    // Lands recorded since start by reason (FlushReason, then a CPU reader's sync and a demotion)
+    // and, last, the bytes they compared (relaxed).
+    static std::array<std::uint64_t, 9> ResidentLandCounts();
+    // This recorder's identity (never reused, unlike its address).
+    std::uint64_t Id() const { return id; }
+    std::uint64_t ResidentCopyBytes() const;
+    static bool ResolveResidentFault(std::uintptr_t address);
+    // ResolveResidentFault's work on the calling thread, under the GPU mutex it takes. The fault
+    // handler's call runs it on the resolver thread unless the faulting thread holds the mutex
+    // (the faulting stack may be a title's 16 KiB job fiber, too small for a submission).
+    static bool ResolveResidentFaultHere(std::uintptr_t address);
+    // Totals since start (relaxed): copies made resident, those recorded later and those dropped
+    // after a fault, guards refused and flushes at a changed mapping; faults resolved (those under
+    // the GPU lock, those that found every copy landed already) and given up.
+    struct ResidentStatistics {
+        std::uint64_t made, madeBytes, recorded, skipped, refused, remapFlushes, faults, underLock, resolved, landed, forced;
+        // Faults on a guard whose copy a submitted batch still running records: waited for, not
+        // copied again (a copy from the guard's shadow after that batch could undo the newer copy
+        // the build that took the shadow over recorded there).
+        std::uint64_t waitedLanding = 0;
+        // Copies recorded at a decision because a forced release took their guard; nanoseconds
+        // faulting threads spent resolving, and the part spent landing.
+        std::uint64_t unguarded = 0, faultNanos = 0, landNanos = 0;
+    };
+    static ResidentStatistics ResidentCounts();
+    // Commands() that leaves the queued copy-backs alone under coalescing (the caller recorded
+    // those its command touches); Commands() otherwise.
+    VkCommandBuffer CommandsKeepingCopyBacks(VkAccessFlags* coveredAccess = nullptr);
+    bool HasDeferredCopies() const { return !deferredCopies.empty() || !claimedCopies.empty(); }
+    // Why queued copy-backs were recorded (the [barriers] digest under deferral).
+    enum class FlushReason : std::uint8_t { Submit = 0, StoreRun, Command, Dispatch, DispatchLease, CopyIn, Count };
+    static const char* FlushReasonName(FlushReason reason);
+    // Records now the queued copies `selected` picks (`claimed`: from the claimed list).
+    void FlushDeferredWhere(const std::function<bool(const DeferredCopy&, bool claimed)>& selected, FlushReason reason);
+    // The queued copies over [address, address + bytes), except those claimed for `exceptSource`.
+    void FlushDeferredOverlapping(std::uint64_t address, std::size_t bytes, const void* exceptSource, FlushReason reason);
+    void FlushDeferredCopies(FlushReason reason) { flushDeferredCopies(true, reason); }
+    // Bytes the queued copies (claimed ones too) would store.
+    std::uint64_t DeferredCopyBytes() const;
+    // Totals since start (relaxed): copies deferred, copies dropped whole and bytes dropped as
+    // stored again by a later copy before any reader (coalescing only), copies recorded and the
+    // passes that recorded them (two barriers each), by reason.
+    struct CopyBackStatistics {
+        std::uint64_t deferred, deferredBytes, overwritten, overwrittenBytes, recorded, recordedBytes, passes;
+        std::array<std::uint64_t, static_cast<std::size_t>(FlushReason::Count)> flushes;
+        // Narrow copy-backs: copies recorded with a baseline, the spans they made (NarrowSpans),
+        // the bytes compared, spans copied whole (source and import off by bytes modulo 4, no
+        // pass on the device), compare dispatches, and the bytes the passes stored (counted only
+        // under APS5_PROFILE_DRAW or APS5_PROFILE_GPU; passes of batches still running count later).
+        std::uint64_t narrow = 0, narrowSpans = 0, narrowBytes = 0, narrowWhole = 0, narrowDispatches = 0, narrowStoredBytes = 0;
+        // APS5_NARROW_VERIFY: dwords whose import differed from a shadow equal to its baseline.
+        std::uint64_t narrowStale = 0;
+        // Command passes (Commands() calls that recorded queued copies) by CommandSite; aware
+        // commands (CommandsTouching) that left copies queued, the copies and bytes they left
+        // (summed per command), and the copies they recorded as over their ranges.
+        std::array<std::uint64_t, static_cast<std::size_t>(CommandSite::Count)> sites{};
+        std::uint64_t awareKeeping = 0, awareKept = 0, awareKeptBytes = 0, awareFlushed = 0;
+    };
+    static CopyBackStatistics CopyBackCounts();
     void DeferCopies(std::vector<DeferredCopy> copies);
     // A staging build that takes the shadow `sourceKey` (staging chain) claims its deferred copies:
     // Commands() leaves claimed copies alone while the build records its work (a store run, a key
@@ -138,8 +402,29 @@ public:
     // the thread's queue is full, APS5_RELEASE_QUEUE_MAX batches, or with APS5_RELEASE_ON_UNLOCK=1;
     // APS5_RELEASE_UNDER_LOCK=1 destroys it in the reap as before), so its destructor must need
     // neither the mutex nor the recorder nor a particular thread. ~Recorder joins the release
-    // thread and waits for every release in progress before the device goes.
-    void Keep(std::shared_ptr<void> object);
+    // thread and waits for every release in progress before the device goes. `bytes` is what the
+    // object holds in device buffers, counted for BoundKeptBytes (0: not counted).
+    void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
+    // The kept bytes an open batch may reach before BoundKeptBytes submits it: APS5_KEPT_BYTES_MIB
+    // (default 512; 0 turns the bound off, as APS5_NO_KEPT_BYTES_BOUND=1 does). Read once.
+    static std::size_t KeptBytesBudget();
+    // Called before each sampled or storage texture lookup, under a hold: submits the open batch
+    // once it keeps KeptBytesBudget(), and while the batches in flight (plus this thread's deferred
+    // releases) keep more than twice that, destroys the deferred ones and waits for the oldest in
+    // flight, releasing its objects at once. With no budget it does nothing, as before.
+    void BoundKeptBytes();
+    std::size_t InFlightKeptBytes() const { return inFlightKeptBytes; }
+    // What BoundKeptBytes did so far, over every recorder (kept under the GpuMutex): the open
+    // batches it submitted, its waits (an "other" sync each, for one or more of the oldest batches)
+    // with the batches and time waited, the deferred releases it destroyed early, and the peaks of
+    // kept bytes in flight and in one batch at a submit. The [recorder] kept-bytes line prints them
+    // every 10 s with APS5_PROFILE_DRAW.
+    struct KeptBoundCounts {
+        std::uint64_t submits = 0, waits = 0, waitedBatches = 0, deferredFlushes = 0;
+        double waitedMs = 0;
+        std::size_t peakInFlight = 0, peakBatch = 0;
+    };
+    static KeptBoundCounts KeptBoundTotals();
     enum class SnapshotUse : std::uint8_t { Storage, Vertex, Index16, Index32 };
     static constexpr std::size_t DrawSnapshotBudget = std::size_t{256} << 20u;
     static constexpr std::size_t DrawSnapshotEntries = 1024;
@@ -357,6 +642,12 @@ public:
     static std::optional<LabelHit> LookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal = nullptr);
     // The value alone, for callers asking whether any label is pending in a dword (afterStamp 0).
     static std::optional<std::uint64_t> LookupLabelValue(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp);
+    // Whether LookupLabelValue(dword, 4, 0) has a value for any dword of [address & ~3, address +
+    // bytes): one table lock and a range scan of the tracked dwords instead of a lookup per dword
+    // (the fast reader's known-value range, Driver::fastPendingWord). The same answer: every
+    // tracked dword in the range is looked up as LookupLabelValue looks it up, without counting a
+    // queued label's hit as a same-queue wait hit.
+    static bool LabelValueIn(std::uint64_t address, std::size_t bytes);
     // A label a queue worker decoded but has not recorded yet (Driver.cpp DeferredLabels): it
     // enters the table with no batch, and only a lookup made on the noting thread (a WAIT_REG_MEM
     // of the same queue) takes its value, since that queue's later work follows the label in queue
@@ -384,6 +675,22 @@ public:
     // page is read word by word and only a read of the label's own dwords records and waits
     // (APS5_NO_WORDWISE_QUEUED_LABELS=1: the old path). Counts the true answers.
     static bool QueuedLabelOverlapsThisThread(std::uint64_t address, std::size_t bytes);
+    // The same answer without the count: for the fast walks' direct reader (FastSrtRead), whose
+    // word reads are not the old capture's page queries.
+    static bool QueuedLabelOverlapsThisThreadUncounted(std::uint64_t address, std::size_t bytes);
+    // Pending blocks (docs/design/draw-fastpath.md section 2.3, F2): per 64 KiB block of guest
+    // memory, the serial of the newest batch of the active recorder that noted a pending write
+    // into it (every noted range: NotePendingWrite(s), labels, completion stores), set beside the
+    // snapshot publish. The block is pending while that serial is above CompletedSerial(), which
+    // advances once a batch's completions ran. Lock-free, for the fast walk's direct reader. The
+    // table is hashed: a block shares its slot with the blocks 16 GiB apart, so a collision reads
+    // pending, never clear. Kept while APS5_FAST_WALK is set (nonzero) or after
+    // TrackPendingBlocks(true); untracked, no block reads pending. The serials are offset per
+    // recorder, so a replaced device's marks read completed once its successor is activated.
+    static void TrackPendingBlocks(bool enabled);
+    static bool PendingBlocksTracked();
+    static bool BlockPending(std::uint64_t address);
+    static std::uint64_t CompletedSerial();
     // The snapshot itself (the sorted, merged union of the pending ranges; null when none), for a
     // reader that tests many ranges against one loaded snapshot: one atomic shared_ptr load per
     // validation instead of one per run, and every test sees the same snapshot (design13 R1's p0).
@@ -430,7 +737,7 @@ public:
     // worker sleeps, as for the labels above;
     static std::uint64_t PendingWriteBackCompletions();
     // dispatches and draws recorded since the last submit (the driver counts them: CountRecordedWork),
-    // so a batch is submitted after a bounded amount of work (APS5_BATCH_CAP).
+    // so a batch can be submitted after a bounded amount of work (APS5_BATCH_CAP; 0, the default: uncapped).
     static std::uint64_t RecordedWorkSinceSubmit();
     static void CountRecordedWork();
 
@@ -490,9 +797,48 @@ public:
     static constexpr std::uint32_t NoTiming = 0xffffffffu;
     static bool GpuTimingEnabled();
     static bool BatchStampsEnabled();
+    // A range starts where the caller's next command goes and records nothing but its stamp: the
+    // queued copy-backs stay queued (coalescing) and the barrier-merge state (Commands'
+    // coveredAccess) stays, so profiling leaves the recorded stream as it is without it. Every
+    // caller takes its command buffer first. Debug aid: APS5_PROFILE_GPU_FLUSHES=1 begins every
+    // range with Commands(), as before (it records every queued copy-back at every range).
     std::uint32_t BeginGpuTiming(std::uint64_t key);
+    static bool GpuTimingFlushes();
+    // Timed ranges per batch (APS5_PROFILE_GPU_RANGES, default 8192, 64..65536; read once): a
+    // batch's ranges past it are dropped and counted ([gputime] "ranges dropped").
+    static std::uint32_t GpuTimingRangeCap();
+    // Ranges a Begin*Timing refused because a render pass was open (every caller takes its
+    // command buffer first, which ends the pass; a range begun inside it would nest in the pass's
+    // draw range). Never reset; [gputime] reports the window's part.
+    static std::uint64_t GpuTimingRefusedInPass();
+    // A guest copy's transfer (VulkanDevice::CopyBuffer): keyed by its program address like a
+    // dispatch, but nested in its copy class range, so the [gputime] split rows leave it there.
+    std::uint32_t BeginTransferTiming(std::uint64_t programAddress);
     // `bytes`: what the range moved (a fill's, a copy's), summed per key on the [gputime] line.
     void EndGpuTiming(std::uint32_t index, std::uint64_t bytes = 0);
+    // What a timed program or draw binds in place in the host imports, read over PCIe when it
+    // runs: `read` the bytes of the ranges bound in place, `written` the part of them it may write,
+    // `inputs` a draw's vertex and index ranges read in place; `leased` an address-based build,
+    // whose leased heaps are not counted (its bytes are unknown). Bound bytes, not bytes fetched.
+    struct InPlaceUse {
+        std::uint64_t read = 0;
+        std::uint64_t written = 0;
+        std::uint64_t inputs = 0;
+        bool leased = false;
+    };
+    using GuestRanges = std::span<const std::pair<std::uint64_t, std::uint64_t>>;
+    // The union of `reads` (bytes), the bytes of `writes` inside it, the union of `inputs`;
+    // `leased` drops the reads and writes (an address-based build's include whole heaps).
+    static InPlaceUse InPlaceUseOf(GuestRanges reads, GuestRanges writes, GuestRanges inputs = {}, bool leased = false);
+    // Adds `use` to the open batch's range `index` (a program's: VulkanDevice recordDispatch,
+    // FastDispatch); nothing for NoTiming.
+    void NoteInPlace(std::uint32_t index, const InPlaceUse& use);
+    // A draw recorded into the pass whose draw range is `index` (the draw's own, or the open
+    // pass's when it continued it: OpenRenderPassTiming): counts the draw and its `use`, and names
+    // the pass by `target` (its first color target's guest address, else its depth target's) when
+    // the pass has no name yet. The [gputime] draw-pass line sums passes by target.
+    void NoteDrawInPass(std::uint32_t index, std::uint64_t target, const InPlaceUse& use);
+    std::uint32_t OpenRenderPassTiming() const;
     // The key of the whole-batch range (first to last command; reported as "batch" on the [gputime]
     // line, apart from the per-program totals).
     static constexpr std::uint64_t BatchTimingKey = 0x3;
@@ -502,9 +848,17 @@ public:
     // or APS5_PROFILE_GPU). A class range covers the command with its own barriers (a dispatch's
     // barriers are classes of their own, its program range stays keyed by the program), so the
     // union of every range of a batch and the batch span differ by what no class times ('untimed').
-    enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, DeferredFlat, Count };
+    // A storage image write-back is timed in three stages (Texture.cpp, ContinueGpuTiming):
+    // StorageWriteBack (its leading barrier, the seeds and the image -> linear copy), StorageRetile
+    // (the retile dispatches) and StorageStore (scratch -> unit shadow slabs / import copies and the
+    // trailing barrier); the [gputime] "retile" row sums them.
+    enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, DeferredFlat, StorageRetile, StorageStore, Count };
     static constexpr std::uint64_t ClassKey(CommandClass which) { return 0x10 + static_cast<std::uint64_t>(which); }
-    std::uint32_t BeginGpuTiming(CommandClass which) { return BeginGpuTiming(ClassKey(which)); }
+    std::uint32_t BeginGpuTiming(CommandClass which) { return startGpuTiming(ClassKey(which), TimingKind::Class); }
+    // Ends range `index` (adding `bytes`) and begins one of class `next` in the same command
+    // sequence, without a Commands() of its own (a flushing timing mode would record queued work
+    // between the caller's stages). NoTiming stays NoTiming; none begins inside a render pass.
+    std::uint32_t ContinueGpuTiming(std::uint32_t index, std::uint64_t bytes, CommandClass next);
     // Records buffer copies into the open batch outside any render pass (an open pass ends),
     // ordered behind every earlier recorded write of their sources and visible to the work after;
     // `which` names the [gputime]/[barriers] class (deferred flat slots: Draw.cpp
@@ -545,6 +899,32 @@ public:
     // A range timed outside the recorder's batches (the presenter's blit, stamped into its own
     // pool and read after its fence): enters the class totals like a recorded one.
     static void AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_t bytes);
+    // A timed range as the [gputime] digest takes it (GpuTimingDigest::AddBatch): its key and
+    // kind, the GpuMutex queue tag of the thread that began it (GuestMemory::GpuLockThreadTag),
+    // its stamps once read (ticks), what it moved (EndGpuTiming) and what it bound in place
+    // (NoteInPlace, NoteDrawInPass: `draws` and the pass `target` for a draw range).
+    enum class TimingKind : std::uint8_t { Program = 0, Transfer, Class, Batch };
+    struct TimedRange {
+        std::uint64_t key = 0;
+        TimingKind kind = TimingKind::Program;
+        std::uint32_t queue = 0xffffffffu;
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t inPlaceRead = 0;
+        std::uint64_t inPlaceWritten = 0;
+        std::uint64_t inPlaceInputs = 0;
+        std::uint32_t leased = 0;
+        std::uint32_t draws = 0;
+        std::uint64_t target = 0;
+        // The end stamp was written (EndGpuTiming, or Submit for a range left open).
+        bool ended = false;
+        // Ended by Submit, not by its End (a throw between Begin and End): it spans the rest of
+        // the batch, so the digest counts it apart and adds it to no total.
+        bool leftOpen = false;
+    };
+    // The [gputime] totals since the last report (tests; under the timing mutex).
+    static GpuTimingDigest GpuTimingTotals();
     // Presentations, so the [gputime] class totals can be given per present.
     static void CountPresent();
     // Presentations so far (never reset): a frame clock for policies that count per frame, such as
@@ -583,6 +963,7 @@ private:
         VkCommandBuffer commands = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
+        std::size_t keptBytes = 0;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
@@ -611,8 +992,8 @@ private:
         std::chrono::steady_clock::time_point submittedAt{};
         VkQueryPool queries = VK_NULL_HANDLE;
         VkQueryPool samples = VK_NULL_HANDLE;
-        std::vector<std::uint64_t> timedKeys;
-        std::vector<std::uint64_t> timedBytes;
+        // The batch's timed ranges (BeginGpuTiming), stamps filled in when read.
+        std::vector<TimedRange> timed;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
         std::uint32_t batchTiming = NoTiming;
         double gpuStartNs = 0;
@@ -683,6 +1064,13 @@ private:
         } renderPass;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
         bool hostReadOwed = false;
+        // A dispatch's trailing barrier left pending (see DeferDispatchTrail).
+        struct DispatchTrail {
+            bool pending = false;
+            bool held = false;
+            GuestOrderKey order;
+            VkAccessFlags access = 0;
+        } trail;
         // Queued DCC key stores (see QueueKeyStore).
         struct KeyStore {
             VkBuffer buffer;
@@ -713,8 +1101,10 @@ private:
     void readSamples(Batch& batch);
     bool countingSamples = false;
     // BeginGpuTiming on the open batch without Commands() (RecordStore times its own run, which
-    // Commands() would close).
-    std::uint32_t beginTiming(std::uint64_t key);
+    // Commands() would close); `kind` as the digest takes it.
+    std::uint32_t beginTiming(std::uint64_t key, TimingKind kind);
+    // The public Begin*Timing: the switch, the batch, then beginTiming.
+    std::uint32_t startGpuTiming(std::uint64_t key, TimingKind kind);
     // Vulkan entry points resolved once (constructor): the loader's vkGetDeviceProcAddr is a name
     // lookup per call, paid by every reap, store and submit otherwise. APS5_NO_PROC_TABLE=1 leaves
     // them null and resolves per call as before; vkWaitSemaphoresKHR stays a lazy lookup (timeline
@@ -743,11 +1133,76 @@ private:
     bool closeStoreRun(bool atSubmit = false);
     // Ends the render pass a draw left open (vkCmdEndRenderPass, the pass's trailing barrier).
     void endOpenRenderPass();
+    // Records the pending dispatch trail (DeferDispatchTrail), counted by what recorded it.
+    enum class TrailReason : std::uint8_t { Command, Refresh, Submit, Other };
+    void recordDispatchTrail(TrailReason reason);
     // Records the queued key stores as one run (`forWriter`: before a command writing, reading or
     // labelling over one, not at Submit).
     void recordKeyStores(bool forWriter);
     // Records the deferred copy-backs (DeferCopies) with their barrier pair; `claimed` too.
-    void flushDeferredCopies(bool claimed = false);
+    void flushDeferredCopies(bool claimed = false, FlushReason reason = FlushReason::Command);
+    // Records `copies` as one pass (lead barrier, the copies, trail barrier).
+    void recordDeferredCopies(std::vector<DeferredCopy> copies, FlushReason reason);
+    // The pass itself into `commands`: barriers, timing, covered access; returns the bytes.
+    std::uint64_t recordCopyPass(VkCommandBuffer commands, std::vector<DeferredCopy> copies);
+    // The copies of a pass between its barriers: plain ones as vkCmdCopyBuffer, narrow ones as
+    // compare dispatches (recordNarrowCopies); returns the bytes.
+    std::uint64_t recordCopyCommands(VkCommandBuffer commands, std::vector<DeferredCopy> copies);
+    std::uint64_t recordNarrowCopies(VkCommandBuffer commands, const std::vector<DeferredCopy>& copies);
+    // The compare pass's pipeline, made on first use; false (and narrow copies copy whole from then
+    // on) when the device cannot make it.
+    bool ensureNarrowPipeline();
+    // Adds the dwords the compare passes stored, and the stale dwords APS5_NARROW_VERIFY found,
+    // since the last look to the statistics; `complete` (every pass recorded so far completed)
+    // also describes the first stale dword once.
+    void noteNarrowStored(bool complete = false);
+    // Waits for the fence of the in-flight batch `serial` (left in flight).
+    void waitBatch(std::uint64_t serial);
+    bool narrowCopyBacks = false;
+    // APS5_NARROW_VERIFY=1 (with narrow copy-backs): the compare pass also reads the import where
+    // the shadow equals its baseline, counts each dword the import holds otherwise (a stale
+    // baseline: narrow would have lost that store) and stores the shadow's value there, as a whole
+    // copy would have (the [barriers] digest's "verify: N stale dwords", the first described once).
+    bool narrowVerify = false;
+    std::atomic<bool> narrowFailed{false};
+    std::uint64_t claimBreaks = 0;
+    VkPipelineLayout narrowLayout = VK_NULL_HANDLE;
+    VkPipeline narrowPipeline = VK_NULL_HANDLE;
+    // The compare passes' counters (profiling or APS5_NARROW_VERIFY): word 0 the dwords stored,
+    // word 1 the stale dwords verify found, words 2-6 the first of those (dword index in its span,
+    // the span's guest address low and high, the import's and the shadow's value). Device-local
+    // and host-visible where the device has such memory (the atomics stay off PCIe), else host
+    // memory. With the last values seen.
+    std::shared_ptr<Buffer> narrowStored;
+    std::uint32_t narrowStoredSeen = 0;
+    std::uint32_t narrowStaleSeen = 0;
+    bool narrowStaleDescribed = false;
+    // Commands() with the queued copy-backs recorded first unless `keepCopyBacks`.
+    VkCommandBuffer commandsFor(VkAccessFlags* coveredAccess, bool keepCopyBacks);
+    bool coalesceCopyBacks = false;
+    // Aware commands (AwareCommands), and the CommandSite of the Commands() call in progress (the
+    // census counts the pass it records under it).
+    bool awareCommands = false;
+    std::uint8_t commandSite = 0;
+    // CommandsTouching's body: records the claimed copies and the queued copies `touches` holds for
+    // (none when null), counts those it leaves, and hands out the command buffer without them.
+    VkCommandBuffer commandsTouching(const std::function<bool(std::uint64_t, std::uint64_t)>* touches, CommandSite site, VkAccessFlags* coveredAccess);
+    // Resident buffers (KeepsResidentBuffers): at a Submit or label (`reason`), records the queued
+    // copies but keeps the whole pages of the unclaimed ones `stored` does not overlap resident.
+    void flushKeepingResident(FlushReason reason, const std::function<bool(std::uint64_t, std::uint64_t)>& stored);
+    // A resident copy taken over by the build reusing its shadow keeps its pages guarded until the
+    // open batch completed (the build's copy-back lands its bytes by then, or holds them resident).
+    void keepGuards(std::vector<std::shared_ptr<ResidentGuard>> guards);
+    bool resolveResident(std::uintptr_t address, bool owner);
+    // Copies `copies` in order (later ones win) after everything submitted, and waits.
+    void landResident(const std::vector<DeferredCopy>& copies);
+    bool residentBuffers = false;
+    ResidentReadSettings residentReads;
+    ResidentWriteSettings residentWrites;
+    // The ResidentLandCounts slot the lands recorded now count under instead of their flush's
+    // reason (6 a CPU reader's sync, 7 a demotion; 0xff none).
+    std::uint8_t landReason = 0xff;
+    std::uint64_t residentGeneration = 0;
     std::uint64_t passSerials = 0;
     std::vector<DeferredCopy> deferredCopies;
     std::vector<DeferredCopy> claimedCopies;
@@ -757,7 +1212,7 @@ private:
     // Returns false when the locked path must run instead (no timeline, nested acquisition, off).
     bool syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int source, const void* site);
     // `source` is the CountSync source the wait is attributed to.
-    void finish(std::unique_ptr<Batch> batch, bool wait, int source);
+    void finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow = false);
     void release(Batch& batch) noexcept;
     static bool overlaps(const Batch& batch, std::uint64_t address, std::uint64_t end);
     // The first noted read of `batch` overlapping [address, end), or null.
@@ -767,6 +1222,14 @@ private:
     bool signaled(const Batch& batch) const;
     // Rebuilds the lock-free snapshot of pending writes from open, inFlight and finishing.
     void publishPendingWrites() const;
+    // Pending blocks (see BlockPending): marks the blocks of [address, end) with the batch serial
+    // (the active recorder only), and advances CompletedSerial once a batch's completions ran.
+    void markPendingBlocks(std::uint64_t address, std::uint64_t end, std::uint64_t serial) const;
+    void noteBlocksFinished(std::uint64_t serial);
+    // This recorder's offset of the pending-block serials, and the newest serial whose batch and
+    // every earlier one finished.
+    std::uint64_t blockSerialBase = 0;
+    std::uint64_t blocksFinished = 0;
     // Publishes the snapshot with [address, end) added: a copy of the current snapshot with the
     // range merged in (O(N) over the merged ranges: no gathering of every batch's writes and no
     // sort), which keeps the snapshot a superset of the pending union as the full rebuild does; a
@@ -789,8 +1252,10 @@ private:
     HostMutex writtenBackMutex;
     std::deque<std::array<std::uint64_t, 3>> writtenBack;
     std::uint64_t writtenBackSequence = 0;
-    // PendingLabel without the table mutex (the caller holds it, or the GPU mutex).
-    std::optional<LabelHit> lookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) const;
+    // PendingLabel without the table mutex (the caller holds it, or the GPU mutex). `countHits`:
+    // a hit on a queued label counts as a same-queue wait hit ([labels] line); LabelValueIn's
+    // range scan, which is no wait, passes false.
+    std::optional<LabelHit> lookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal, bool countHits = true) const;
     // Whether the in-flight batch with that serial has not signaled its fence (false when it is
     // not in flight any more): what makes a wait for it a real GPU wait (ThreadHookWaits).
     bool unsignaled(std::uint64_t serial) const;
@@ -816,6 +1281,7 @@ private:
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;
     std::uint64_t submissions = 0;
+    std::size_t inFlightKeptBytes = 0;
     std::uint64_t writeNoteCount = 0;
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per
     // frame would otherwise allocate and free their objects each time).
@@ -840,6 +1306,83 @@ private:
     std::map<DrawSnapshotKey, DrawSnapshot> drawSnapshots;
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
+};
+
+// APS5_PROFILE_GPU: the [gputime] totals of the timed ranges between two reports and the report's
+// lines. The recorder adds every finished batch's ranges (AddBatch) and the presenter's blit
+// (AddClass) under its timing mutex, and prints Report every 10 s:
+// - the program and class line (programs keyed by guest address, with the MiB they bind in place);
+// - one "row" line per bucket of GPU time per present, the guest's own work (programs, draws, the
+//   guest's copies, fills and label stores) apart from the emulator's (copy-backs, staging copies,
+//   detile uploads, retile write-backs, the dispatch barrier ranges, the rest), plus "untimed"
+//   (batch spans outside every range): the rows add up to the batch spans ("busy");
+// - the split by guest queue (the GpuMutex tag of the thread that recorded each range);
+// - the draw passes by target address, with their draws and the MiB they bind in place.
+class GpuTimingDigest {
+public:
+    using CommandClass = Recorder::CommandClass;
+    struct Totals {
+        std::uint64_t count = 0;
+        double ms = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t read = 0;
+        std::uint64_t written = 0;
+        std::uint64_t inputs = 0;
+        std::uint64_t leased = 0;
+        std::uint64_t draws = 0;
+    };
+    struct QueueTotals {
+        // The union of the queue's ranges, the program and class ranges summed, its range count;
+        // the spans of the batches its threads opened.
+        double timedMs = 0;
+        double programMs = 0;
+        double classMs = 0;
+        std::uint64_t ranges = 0;
+        double batchMs = 0;
+        std::uint64_t batches = 0;
+    };
+    static constexpr std::size_t Classes = static_cast<std::size_t>(CommandClass::Count);
+    // A finished batch's ranges, their stamps in ticks of `period` nanoseconds.
+    void AddBatch(std::span<const Recorder::TimedRange> ranges, double period);
+    // A range timed outside the batches (the presenter's blit, `queue` its thread's tag).
+    void AddClass(CommandClass which, double nanoseconds, std::uint64_t bytes, std::uint32_t queue);
+    // Programs (dispatches and the guest copies' transfers) by key, classes, draw passes by target.
+    const std::map<std::uint64_t, Totals>& Programs() const { return programs; }
+    const Totals& Class(CommandClass which) const { return classes[static_cast<std::size_t>(which)]; }
+    const std::map<std::uint64_t, Totals>& Passes() const { return passes; }
+    const std::map<std::uint32_t, QueueTotals>& Queues() const { return queues; }
+    // The dispatch program ranges alone, and the guest copies' transfers alone.
+    const Totals& Dispatches() const { return dispatches; }
+    const Totals& Transfers() const { return transfers; }
+    // Sums: program ranges (dispatches and transfers, the [gputime] line's first field), dispatches
+    // alone, classes, the union of every range, the batch spans, and the batches.
+    double ProgramMs() const { return programMs; }
+    double DispatchMs() const { return dispatchMs; }
+    double ClassMs() const { return classMs; }
+    double UnionMs() const { return unionMs; }
+    double BatchMs() const { return batchMs; }
+    std::uint64_t Batches() const { return batches; }
+    // Ranges Submit ended (TimedRange::leftOpen): counted, in no total and not in the union.
+    std::uint64_t LeftOpen() const { return leftOpen; }
+    // The report's lines (no newline), given the presents, the ranges dropped at the cap and the
+    // ranges refused inside a render pass over the window.
+    std::vector<std::string> Report(std::uint64_t presents, std::uint64_t dropped, std::uint32_t cap, std::uint64_t refusedInPass = 0) const;
+    void Clear() { *this = GpuTimingDigest{}; }
+
+private:
+    std::map<std::uint64_t, Totals> programs;
+    std::array<Totals, Classes> classes{};
+    std::map<std::uint64_t, Totals> passes;
+    std::map<std::uint32_t, QueueTotals> queues;
+    Totals dispatches;
+    Totals transfers;
+    double programMs = 0;
+    double dispatchMs = 0;
+    double classMs = 0;
+    double unionMs = 0;
+    double batchMs = 0;
+    std::uint64_t batches = 0;
+    std::uint64_t leftOpen = 0;
 };
 
 }

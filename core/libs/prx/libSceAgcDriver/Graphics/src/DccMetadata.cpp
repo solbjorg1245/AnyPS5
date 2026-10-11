@@ -76,6 +76,24 @@ ProofCounters& Proofs() {
     return counters;
 }
 
+// The key store guard's outcomes (MarkDccUncompressed with a KeyStoreGuard), counted with or
+// without profiling (the tests read them): stores that met key pages a CPU store reached since the
+// guard's generation and those pages' bytes, the bytes left to the CPU (not APS5_DCC_KEYS_STAMP_CHECK=0),
+// and stores made unchecked (no generation, or a key range the write tracking does not cover).
+struct GuardCounters {
+    std::atomic<std::uint64_t> cpuStores{0};
+    std::atomic<std::uint64_t> cpuBytes{0};
+    std::atomic<std::uint64_t> kept{0};
+    std::atomic<std::uint64_t> unchecked{0};
+};
+
+GuardCounters& Guards() {
+    static GuardCounters counters;
+    return counters;
+}
+
+std::atomic<int> stampCheckForTests{-1};
+
 bool ScanProfileEnabled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return profile;
@@ -92,7 +110,8 @@ void ReportScans(std::chrono::steady_clock::time_point now) {
     }
     if (nowMs - last < 10000 || !profile.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto& proofs = Proofs();
-    std::fprintf(stderr, "[dcc] %llu scans, %.1f MiB scanned, %llu memo hits, %llu flush syncs, %.1f ms; uncompressed keys stored: %llu on the GPU (%llu with an unaligned head or tail), %llu on the CPU; key proofs: %llu proved, %llu scanned, %llu unstable\n", static_cast<unsigned long long>(profile.scans.load()), profile.bytes.load() / 1048576.0, static_cast<unsigned long long>(profile.memoHits.load()), static_cast<unsigned long long>(profile.flushSyncs.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.gpuStores.load()), static_cast<unsigned long long>(profile.gpuSplitStores.load()), static_cast<unsigned long long>(profile.cpuStores.load()), static_cast<unsigned long long>(proofs.proved.load()), static_cast<unsigned long long>(proofs.scanned.load()), static_cast<unsigned long long>(proofs.unstable.load()));
+    const auto& guards = Guards();
+    std::fprintf(stderr, "[dcc] %llu scans, %.1f MiB scanned, %llu memo hits, %llu flush syncs, %.1f ms; uncompressed keys stored: %llu on the GPU (%llu with an unaligned head or tail), %llu on the CPU; key proofs: %llu proved, %llu scanned, %llu unstable; key stores over CPU-written pages: %llu (%llu bytes), %llu bytes kept as the CPU's, %llu unchecked\n", static_cast<unsigned long long>(profile.scans.load()), profile.bytes.load() / 1048576.0, static_cast<unsigned long long>(profile.memoHits.load()), static_cast<unsigned long long>(profile.flushSyncs.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.gpuStores.load()), static_cast<unsigned long long>(profile.gpuSplitStores.load()), static_cast<unsigned long long>(profile.cpuStores.load()), static_cast<unsigned long long>(proofs.proved.load()), static_cast<unsigned long long>(proofs.scanned.load()), static_cast<unsigned long long>(proofs.unstable.load()), static_cast<unsigned long long>(guards.cpuStores.load()), static_cast<unsigned long long>(guards.cpuBytes.load()), static_cast<unsigned long long>(guards.kept.load()), static_cast<unsigned long long>(guards.unchecked.load()));
 }
 
 void CountScan(std::size_t bytes, std::chrono::steady_clock::time_point start) {
@@ -226,7 +245,11 @@ bool StoreUncompressedOnGpu(const Context& context, Recorder& recorder, std::uin
     // a later command writing the keys; see Recorder::QueueKeyStore).
     recorder.QueueKeyStore(import->buffer, first, last, std::move(seed), begin, begin + count);
     recorder.NotePendingWrite(begin, count, Recorder::WriteKind::DccKeys);
-    GuestMemory::MarkWritten(begin, count);
+    {
+        // Named a key store by the write-back range trace (APS5_TRACE_WRITEBACK_RANGE).
+        const GuestMemory::KeyStoreScope keys(begin, begin + count);
+        GuestMemory::MarkWritten(begin, count);
+    }
     // After the note: an unlocked memo lookup drops an entry the snapshot does not cover yet. The
     // entry is kept only for the active recorder (the one the flush hook and the lookups consult).
     {
@@ -246,10 +269,93 @@ void StoreUncompressedOnCpu(std::uint64_t begin, std::size_t count) {
     // The write waits for recorded work over the range (the flush hook), so the bytes are current after.
     ForgetStores(begin, begin + count);
     const std::vector<std::byte> uncompressed(count, std::byte{0xff});
+    const GuestMemory::KeyStoreScope keys(begin, begin + count);
     GuestMemory::Write(begin, uncompressed);
     CountStore(Scans().cpuStores);
 }
 
+// Debug aid (APS5_TRACE_DCC_KEYS=1): a guarded store whose key range holds pages a CPU store
+// reached since the guard's generation, with the caller, the image and both generations.
+void TraceGuardedStore(const KeyStoreGuard& guard, std::uint64_t begin, std::size_t count, std::uint64_t cpuBytes, std::uint64_t collected, bool kept) {
+    static const bool trace = std::getenv("APS5_TRACE_DCC_KEYS") != nullptr;
+    if (!trace) return;
+    const auto packet = GuestMemory::CurrentPacket();
+    std::fprintf(stderr, "[dcc-keys] %s for image 0x%llx: keys 0x%llx+0x%zx hold 0x%llx bytes in pages a CPU store reached since generation %llu (collected at %llu); %s (packet 0x%x queue 0x%x)\n", guard.caller, static_cast<unsigned long long>(guard.image), static_cast<unsigned long long>(begin), count, static_cast<unsigned long long>(cpuBytes), static_cast<unsigned long long>(guard.generation), static_cast<unsigned long long>(collected), kept ? "left to the CPU" : "stored over", packet.opcode, packet.queue);
+}
+
+// The guard's check before "uncompressed" keys are stored over [begin, begin + count): collects the
+// range, counts the bytes of the pages a CPU store reached since the guard's generation, and returns
+// the runs to store: the range without those pages (their interior edges are page bounds, so only the
+// range's own head and tail can be unaligned, as before), or the whole range with
+// APS5_DCC_KEYS_STAMP_CHECK=0.
+std::vector<std::pair<std::uint64_t, std::uint64_t>> GuardedRuns(const KeyStoreGuard& guard, std::uint64_t begin, std::size_t count, KeyStoreOutcome& outcome) {
+    const auto end = begin + count;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> stores{{begin, end}};
+    auto& counters = Guards();
+    outcome.stored = true;
+    const auto collected = guard.generation != 0 ? GuestMemory::CollectWritesUncached(begin, count) : 0;
+    if (collected == 0) {
+        counters.unchecked.fetch_add(1, std::memory_order_relaxed);
+        return stores;
+    }
+    outcome.collected = collected;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> cpu;
+    const auto cpuBytes = GuestMemory::CpuStoredRuns(begin, count, guard.generation, cpu);
+    if (cpuBytes == 0) return stores;
+    counters.cpuStores.fetch_add(1, std::memory_order_relaxed);
+    counters.cpuBytes.fetch_add(cpuBytes, std::memory_order_relaxed);
+    const bool keep = KeysStampCheck();
+    TraceGuardedStore(guard, begin, count, cpuBytes, collected, keep);
+    if (!keep) return stores;
+    stores.clear();
+    auto at = begin;
+    for (const auto& [from, to] : cpu) {
+        if (from > at) stores.emplace_back(at, from);
+        at = to;
+    }
+    if (at < end) stores.emplace_back(at, end);
+    outcome.stored = !stores.empty();
+    outcome.kept = cpuBytes;
+    counters.kept.fetch_add(cpuBytes, std::memory_order_relaxed);
+    return stores;
+}
+
+// GuardedRuns without the key pages the game released after the guard's source was written on the
+// GPU (APS5_DROP_FREED_STORES); left out like the CPU's pages, so the image's keysSeen stays.
+std::vector<std::pair<std::uint64_t, std::uint64_t>> LiveGuardedRuns(const KeyStoreGuard& guard, std::uint64_t begin, std::size_t count, KeyStoreOutcome& outcome) {
+    auto stores = GuardedRuns(guard, begin, count, outcome);
+    const auto freed = GuestMemory::DropFreedRuns(GuestMemory::FreedStoreKind::KeyStore, guard.freeClock, stores);
+    if (freed != 0 && GuestMemory::DropFreedStores()) {
+        outcome.kept += freed;
+        outcome.stored = !stores.empty();
+    }
+    return stores;
+}
+
+}
+
+bool KeysStampCheck() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_DCC_KEYS_STAMP_CHECK");
+        return text == nullptr || std::strcmp(text, "0") != 0;
+    }();
+    const auto forced = stampCheckForTests.load(std::memory_order_relaxed);
+    return forced < 0 ? enabled : forced != 0;
+}
+
+void KeysStampCheckForTests(int check) {
+    stampCheckForTests.store(check, std::memory_order_relaxed);
+}
+
+DccKeyGuardCounts KeyGuardCounts() {
+    const auto& counters = Guards();
+    return {counters.cpuStores.load(std::memory_order_relaxed), counters.cpuBytes.load(std::memory_order_relaxed), counters.kept.load(std::memory_order_relaxed), counters.unchecked.load(std::memory_order_relaxed)};
+}
+
+std::uint64_t CollectKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes) {
+    const auto count = static_cast<std::size_t>(surfaceBytes / KeyBytes);
+    if (metaAddress == 0 || count == 0) return 0;
+    return GuestMemory::CollectWritesUncached(metaAddress, count);
 }
 
 void NoteKeysFillOnGpu(std::uint64_t begin, std::size_t count, DccKeys keys) {
@@ -458,20 +564,31 @@ bool IsDccClear(DccKeys keys) {
     return keys == DccKeys::Clear0000 || keys == DccKeys::Clear0001 || keys == DccKeys::Clear1110 || keys == DccKeys::Clear1111 || keys == DccKeys::ClearRegister;
 }
 
-void MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes) {
+KeyStoreOutcome MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes, const KeyStoreGuard& guard) {
+    KeyStoreOutcome outcome;
     const auto count = static_cast<std::size_t>(surfaceBytes / KeyBytes);
-    if (metaAddress == 0 || count == 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(metaAddress), count, true)) return;
+    if (metaAddress == 0 || count == 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(metaAddress), count, true)) return outcome;
     // The bytes are trusted only when no recorded work writes them (lock-free, with or without
     // GuestMemory::GpuMutex); otherwise the store runs and waits through the flush hook. A pending
     // GPU store of the driver's own is no reason to skip: a title kernel recorded into the same
     // batch after it may write clear keys, and the memo cannot order inside a batch.
-    if (!Recorder::SnapshotWriteOverlaps(metaAddress, count) && AlreadyUncompressed(metaAddress, count)) return;
-    StoreUncompressedOnCpu(metaAddress, count);
+    if (!Recorder::SnapshotWriteOverlaps(metaAddress, count) && AlreadyUncompressed(metaAddress, count)) return outcome;
+    for (const auto& [from, to] : LiveGuardedRuns(guard, metaAddress, count, outcome)) StoreUncompressedOnCpu(from, static_cast<std::size_t>(to - from));
+    return outcome;
+}
+
+void MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes) {
+    MarkDccUncompressed(metaAddress, surfaceBytes, KeyStoreGuard{});
 }
 
 void MarkDccUncompressed(const Context& context, std::uint64_t metaAddress, std::uint64_t surfaceBytes) {
+    MarkDccUncompressed(context, metaAddress, surfaceBytes, KeyStoreGuard{});
+}
+
+KeyStoreOutcome MarkDccUncompressed(const Context& context, std::uint64_t metaAddress, std::uint64_t surfaceBytes, const KeyStoreGuard& guard) {
+    KeyStoreOutcome outcome;
     const auto count = static_cast<std::size_t>(surfaceBytes / KeyBytes);
-    if (metaAddress == 0 || count == 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(metaAddress), count, true)) return;
+    if (metaAddress == 0 || count == 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(metaAddress), count, true)) return outcome;
     auto* recorder = CpuKeysOnly() || !GuestMemory::GpuMutex().HeldByThisThread() ? nullptr : Recorder::Active();
     // The bytes are scanned only when no recorded work writes them: a pending clear kernel's keys are
     // not in memory yet, so the bytes could read as uncompressed while the kernel will store a clear
@@ -480,9 +597,13 @@ void MarkDccUncompressed(const Context& context, std::uint64_t metaAddress, std:
     // after it may write clear keys, and nothing orders inside a batch, so a fresh fill is recorded
     // (idempotent, no wait) rather than trusting the earlier one.
     const bool pending = recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count);
-    if (!pending && AlreadyUncompressed(metaAddress, count)) return;
-    if (recorder != nullptr && StoreUncompressedOnGpu(context, *recorder, metaAddress, count)) return;
-    StoreUncompressedOnCpu(metaAddress, count);
+    if (!pending && AlreadyUncompressed(metaAddress, count)) return outcome;
+    for (const auto& [from, to] : LiveGuardedRuns(guard, metaAddress, count, outcome)) {
+        const auto bytes = static_cast<std::size_t>(to - from);
+        if (recorder != nullptr && StoreUncompressedOnGpu(context, *recorder, from, bytes)) continue;
+        StoreUncompressedOnCpu(from, bytes);
+    }
+    return outcome;
 }
 
 bool FillDccClear(VkFormat format, DccKeys keys, bool alphaOnMsb, std::span<std::byte> bytes) {

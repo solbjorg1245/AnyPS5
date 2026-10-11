@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -19,6 +20,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastLayouts.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
 #ifdef _WIN32
@@ -54,6 +58,19 @@
 
 namespace AgcDriver {
 namespace {
+
+// APS5_TEMPLATE_REFRESH_RING=1 (default off): a compute template hit whose data words differ binds
+// a copy of the template's set whose data bindings read the dispatch's words from the fast ring
+// (ShaderResources::ForkData) instead of refreshing the template's buffers with vkCmdUpdateBuffer
+// between two dispatches (RefreshData, still the fallback when the copy cannot be made). The fast
+// ring (APS5_FAST_RING_MIB) is created for it when APS5_FAST_DRAW/APS5_FAST_DISPATCH did not.
+bool TemplateRefreshRing() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_TEMPLATE_REFRESH_RING");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
 
 // The device whose loss DeviceLostHook reports (one Vulkan device at a time).
 struct DeviceFaultReport {
@@ -192,6 +209,42 @@ private:
 // The [present] line's counters (see the header); mutated under State::presentMutex.
 VulkanDevice::PresentStatistics presentCounters{};
 
+// The swapchain's present mode: FIFO unless APS5_PRESENT_MODE=mailbox|immediate asks otherwise and the
+// surface offers it. The title is paced by the VideoOut vblank either way; FIFO also holds each present
+// to the display refresh, so a 120 FPS run (APS5_VBLANK_HZ=119.88) on a 60 Hz display needs mailbox.
+VkPresentModeKHR choosePresentMode(PFN_vkGetPhysicalDeviceSurfacePresentModesKHR getModes, VkPhysicalDevice physical, VkSurfaceKHR surface) {
+    const char* value = std::getenv("APS5_PRESENT_MODE");
+    if (value == nullptr || std::strcmp(value, "fifo") == 0) return VK_PRESENT_MODE_FIFO_KHR;
+    VkPresentModeKHR wanted = VK_PRESENT_MODE_FIFO_KHR;
+    if (std::strcmp(value, "mailbox") == 0) wanted = VK_PRESENT_MODE_MAILBOX_KHR;
+    else if (std::strcmp(value, "immediate") == 0) wanted = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    else {
+        std::fprintf(stderr, "[present] APS5_PRESENT_MODE=%s refused (fifo, mailbox or immediate); using fifo\n", value);
+        return VK_PRESENT_MODE_FIFO_KHR;
+    }
+    std::uint32_t count = 0;
+    std::vector<VkPresentModeKHR> modes;
+    if (getModes(physical, surface, &count, nullptr) == VK_SUCCESS) {
+        modes.resize(count);
+        if (getModes(physical, surface, &count, modes.data()) != VK_SUCCESS) count = 0;
+        modes.resize(count);
+    }
+    if (std::find(modes.begin(), modes.end(), wanted) == modes.end()) {
+        std::fprintf(stderr, "[present] APS5_PRESENT_MODE=%s is not offered by the surface; using fifo\n", value);
+        return VK_PRESENT_MODE_FIFO_KHR;
+    }
+    std::fprintf(stderr, "[present] present mode %s (APS5_PRESENT_MODE)\n", value);
+    return wanted;
+}
+
+// Mailbox replaces the queued image rather than waiting for the refresh, which takes a third image.
+std::uint32_t swapchainImageCount(const VkSurfaceCapabilitiesKHR& surface, VkPresentModeKHR mode) {
+    std::uint32_t count = surface.minImageCount;
+    if (mode == VK_PRESENT_MODE_MAILBOX_KHR) count = std::max(count, 3u);
+    if (surface.maxImageCount != 0) count = std::min(count, surface.maxImageCount);
+    return count;
+}
+
 }
 
 // A compute dispatch's Vulkan objects, shared by every dispatch of the same compiled variant and
@@ -223,6 +276,7 @@ struct VulkanDevice::State {
     void* window = nullptr;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
     VkExtent2D extent{};
     std::vector<VkImage> images;
     VkFence acquireFence = VK_NULL_HANDLE;
@@ -260,10 +314,17 @@ struct VulkanDevice::State {
     bool textureCompressionBC = false;
     // VK_KHR_timeline_semaphore enabled: the recorder's unlocked waits are available.
     bool timelineSemaphores = false;
+    // VK_EXT_memory_budget enabled: the video-memory budget reads the heap's budget and usage.
+    bool memoryBudget = false;
     // Indirect draw features enabled (see Graphics::Context).
     bool drawIndirectFirstInstance = false;
     bool multiDrawIndirect = false;
     bool drawIndirectCount = false;
+    // VK_KHR_push_descriptor enabled and its limit (see Graphics::Context).
+    bool pushDescriptors = false;
+    std::uint32_t maxPushDescriptors = 0;
+    // vkGetPhysicalDeviceMemoryProperties2 for the video memory guard (see Graphics::Context).
+    PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
     // The device's resolved entry points (Graphics::DeviceFunctions) and the Graphics::Context
     // built once after setup (see graphicsContext); the context's pool reference is dropped before
     // the pool at teardown.
@@ -281,6 +342,15 @@ struct VulkanDevice::State {
     // references to its objects.
     HostMutex computePipelinesMutex;
     std::map<std::uint64_t, std::shared_ptr<ComputePipelineObjects>> computePipelines;
+    // The fast dispatch's pipelines (F5) by variant, under the same mutex: the push layout of the
+    // variant's bindings and the objects built on it (their layout stays null: FastLayouts owns it),
+    // or why the variant's bindings decline (remembered, so FastLayouts is asked once).
+    struct FastComputePipeline {
+        const Graphics::FastLayout* layout = nullptr;
+        std::shared_ptr<ComputePipelineObjects> objects;
+        std::optional<Graphics::FastDispatchDecline> decline;
+    };
+    std::map<std::uint64_t, FastComputePipeline> fastComputePipelines;
     std::unique_ptr<Graphics::GpuColorTransfer> colorTransfer;
     std::shared_ptr<Graphics::BufferPool> bufferPool;
     std::unique_ptr<Graphics::Buffer> emptyBuffer;
@@ -288,6 +358,10 @@ struct VulkanDevice::State {
     std::unique_ptr<Graphics::PipelineCache> pipelineCache;
     std::unique_ptr<Graphics::DescriptorCache> descriptorCache;
     std::unique_ptr<Graphics::SamplerCache> samplerCache;
+    // The fast path's push layouts and data ring (null without push descriptors; the ring also
+    // without APS5_FAST_DRAW).
+    std::unique_ptr<Graphics::FastLayouts> fastLayouts;
+    std::unique_ptr<Graphics::FastRing> fastRing;
     Graphics::ResourceCache& resourceCache = Graphics::SharedResourceCache();
     // Recorded dispatches that write a copied buffer (their results reach guest memory by a CPU
     // write-back when the batch is reaped), listed until that write-back ran. An indirect dispatch
@@ -528,6 +602,8 @@ struct VulkanDevice::State {
     ~State() {
         contextReady = false;
         if (device != VK_NULL_HANDLE) {
+            // The video-memory budget stops trimming this device's pool and querying its heap.
+            Graphics::ReleaseVram(device);
             const auto idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device);
             if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
             // Resident images kept for unfinished presentations go before the caches they came from.
@@ -561,11 +637,29 @@ struct VulkanDevice::State {
             {
                 std::lock_guard pipelines(computePipelinesMutex);
                 computePipelines.clear();
+                fastComputePipelines.clear();
             }
             // Every ShaderResources (kept by the recorder or the resource cache) is gone now, so the
             // sets and samplers they borrowed can go.
+            copiedWriters->clear();
             resourceCache.Clear();
             Graphics::ClearCachedTextures(device);
+            Graphics::ClearImageMirrors(device);
+            // Resident read-only copies (device-local buffers of this device's pool): their holders
+            // went with the recorder and the cache above, so the cache's references are the last.
+            if (Graphics::ResidentReadsLive()) {
+                if (const auto left = Graphics::ClearResidentReads(); left != 0) std::fprintf(stderr, "[resident-reads] %zu copies still held at the device teardown\n", left);
+            }
+            // Resident written ranges (APS5_RESIDENT_WRITES): their lands were recorded and waited
+            // for with the recorder above.
+            if (Graphics::ResidentWritesLive()) Graphics::ClearResidentWrites();
+            // The staging-chain registry's shadows of this device go back to its pool before the
+            // pool and the device go (the registry is process-wide; the video-memory budget's
+            // "shadows" reclaimer would otherwise free them on a destroyed device).
+            Graphics::ClearStagedShadows(device);
+            patternBuffers.clear();
+            fastRing.reset();
+            fastLayouts.reset();
             descriptorCache.reset();
             emptyBuffer.reset();
             samplerCache.reset();
@@ -804,6 +898,18 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     // without it resolves such draws on the CPU.
     state->drawIndirectCount = hasExtension(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
     if (state->drawIndirectCount) deviceExtensions.push_back(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
+    // Push descriptors: the fast draw path (docs/design/draw-fastpath.md F3) records each draw's
+    // descriptors into the command buffer instead of copying a set. Nothing uses them until a fast
+    // path is switched on. Debug aid: APS5_NO_PUSH_DESCRIPTORS=1 leaves the extension off.
+    if (hasExtension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME) && std::getenv("APS5_NO_PUSH_DESCRIPTORS") == nullptr) {
+        VkPhysicalDevicePushDescriptorPropertiesKHR pushProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &pushProperties};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &properties);
+        state->maxPushDescriptors = pushProperties.maxPushDescriptors;
+        state->pushDescriptors = state->maxPushDescriptors != 0;
+        if (state->pushDescriptors) deviceExtensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+    }
+    APS5_LOG_OUT("Vulkan push descriptors enabled=%u max=%u", static_cast<unsigned>(state->pushDescriptors), state->maxPushDescriptors);
     // Guest memory is host memory: importing it lets address-based shaders use it in place instead of
     // copying every registered allocation per draw.
     if (hasExtension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) && std::getenv("APS5_NO_HOST_IMPORT") == nullptr) {
@@ -819,6 +925,18 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         }
 #endif
         deviceExtensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    }
+    // The video-memory budget (Graphics::VramBudget) and the video memory guard and its [vram] line
+    // (Graphics::VideoMemory) read the heap's budget and this process's usage of it.
+    // APS5_NO_VRAM_BUDGET=1 leaves the extension off, as before, unless the guard wants it.
+    if (hasExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) && (std::getenv("APS5_NO_VRAM_BUDGET") == nullptr || Graphics::VideoMemory::Wanted())) {
+        auto query = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(state->instanceProc(state->instance, "vkGetPhysicalDeviceMemoryProperties2"));
+        if (query == nullptr) query = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(state->instanceProc(state->instance, "vkGetPhysicalDeviceMemoryProperties2KHR"));
+        if (query != nullptr) {
+            state->memoryBudget = true;
+            state->memoryProperties2 = query;
+            deviceExtensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+        }
     }
     VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT listRestartFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT};
     if (hasExtension(VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME)) {
@@ -1038,6 +1156,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &poolInfo, nullptr, &state->pool), "vkCreateCommandPool");
     Graphics::PrepareImportWatch(graphicsContext());
     state->bufferPool = std::make_shared<Graphics::BufferPool>(graphicsContext());
+    // The video-memory budget: the driver caches' reclaimers (once), the heap of this device's
+    // DEVICE_LOCAL memory, the driver's report on it, and this pool for the "pool" reclaimer.
+    Graphics::RegisterDriverVramReclaimers();
+    Graphics::ConfigureVram(graphicsContext(), state->memoryBudget ? state->InstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties2>("vkGetPhysicalDeviceMemoryProperties2") : nullptr, state->bufferPool, state->properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU);
     state->emptyBuffer = std::make_unique<Graphics::Buffer>(graphicsContext(), Graphics::EmptyBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     state->pipelineCache = std::make_unique<Graphics::PipelineCache>(graphicsContext(), state->properties);
     state->detiler = std::make_unique<Graphics::TextureDetiler>(graphicsContext());
@@ -1045,6 +1167,32 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     state->colorTransfer = std::make_unique<Graphics::GpuColorTransfer>(graphicsContext());
     state->descriptorCache = std::make_unique<Graphics::DescriptorCache>(graphicsContext());
     state->samplerCache = std::make_unique<Graphics::SamplerCache>();
+    // The fast path's push layouts, and its data ring only when APS5_FAST_DRAW or APS5_FAST_DISPATCH
+    // can use it, or the template refresh through the ring (APS5_TEMPLATE_REFRESH_RING, which needs
+    // no push descriptors): the ring costs APS5_FAST_RING_MIB of host memory, and the commit charge
+    // has no room to spare. For the template refresh alone (about 0.6 MiB of words per present,
+    // regions freed as their batches are released) the ring is TemplateRingMiB unless
+    // APS5_FAST_RING_MIB says otherwise.
+    bool fastWantsRing = false;
+    if (state->pushDescriptors) {
+        state->fastLayouts = std::make_unique<Graphics::FastLayouts>(graphicsContext());
+        const char* fastDraw = std::getenv("APS5_FAST_DRAW");
+        if (fastDraw == nullptr || std::strcmp(fastDraw, "0") == 0) fastDraw = std::getenv("APS5_FAST_DISPATCH");
+        fastWantsRing = fastDraw != nullptr && std::strcmp(fastDraw, "0") != 0;
+    }
+    const bool wantsRing = fastWantsRing || TemplateRefreshRing();
+    constexpr VkDeviceSize TemplateRingMiB = 8;
+    const auto ringBytes = fastWantsRing || std::getenv("APS5_FAST_RING_MIB") != nullptr ? Graphics::FastRing::ConfiguredBytes() : TemplateRingMiB << 20u;
+    // A ring the device cannot allocate (APS5_FAST_RING_MIB above a heap or allocation limit)
+    // leaves the fast path without one, which then declines every draw (and the template refresh
+    // takes RefreshData), instead of failing the device.
+    if (wantsRing && ringBytes != 0) {
+        try {
+            state->fastRing = std::make_unique<Graphics::FastRing>(graphicsContext(), ringBytes);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[fastpath] no data ring of %llu MiB: %s\n", static_cast<unsigned long long>(ringBytes >> 20u), error.what());
+        }
+    }
     state->recorder = std::make_unique<Graphics::Recorder>(graphicsContext(), state->timelineSemaphores);
     state->recorder->Activate();
     // The entry points every record site uses, resolved once (APS5_NO_PROC_TABLE=1: per call, as
@@ -1084,9 +1232,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         std::vector<VkSurfaceFormatKHR> formats(formatCount);
         check(getFormats(selected, state->surface, &formatCount, formats.data()), "vkGetPhysicalDeviceSurfaceFormatsKHR");
         require(std::any_of(formats.begin(), formats.end(), [](const auto& format) { return format.format == VK_FORMAT_B8G8R8A8_UNORM && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR; }), "BGRA8 sRGB-nonlinear surface format is unavailable");
+        state->presentMode = choosePresentMode(state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>("vkGetPhysicalDeviceSurfacePresentModesKHR"), selected, state->surface);
         VkSwapchainCreateInfoKHR swapchain{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
         swapchain.surface = state->surface;
-        swapchain.minImageCount = surface.minImageCount;
+        swapchain.minImageCount = swapchainImageCount(surface, state->presentMode);
         swapchain.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
         swapchain.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
         swapchain.imageExtent = state->extent;
@@ -1095,7 +1244,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         swapchain.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         swapchain.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
         swapchain.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-        swapchain.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        swapchain.presentMode = state->presentMode;
         swapchain.clipped = VK_FALSE;
         check(state->DeviceFunction<PFN_vkCreateSwapchainKHR>("vkCreateSwapchainKHR")(state->device, &swapchain, nullptr, &state->swapchain), "vkCreateSwapchainKHR");
         std::uint32_t imageCount = 0;
@@ -1377,9 +1526,10 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
             auto seed = std::make_shared<Graphics::Buffer>(context, 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             std::memcpy(seed->Bytes().data(), pattern.data(), 16);
             recorder.Keep(seed);
-            const auto chain = recorder.Commands();
+            const auto chain = recorder.CommandsTouchingNothing(Graphics::Recorder::CommandSite::Fill);
             const auto copyBuffer = context.Resolved(&Graphics::DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
             const VkBufferCopy first{0, 0, 16};
+            Graphics::PoisonPooled(context, chain, *patternBuffer, Graphics::PoisonSite::Pattern);
             copyBuffer(chain, seed->Handle(), patternBuffer->Handle(), 1, &first);
             for (std::size_t done = 16; done < PatternBufferBytes; done *= 2) {
                 Graphics::RecordMemoryBarrier(context, chain, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -1397,7 +1547,8 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     // A queued label store over the range lands before the fill (program order).
     recorder.FlushStoresOverlapping(address, bytes);
     VkAccessFlags covered = 0;
-    const auto commands = recorder.Commands(&covered);
+    // Aware commands (APS5_AWARE_COMMANDS): only the queued copy-backs over the range go in first.
+    const auto commands = recorder.CommandsTouching([&](std::uint64_t begin, std::uint64_t end) { return begin < address + bytes && address < end; }, Graphics::Recorder::CommandSite::Fill, &covered);
     const auto timing = recorder.BeginGpuTiming(CommandClass::Fill);
     if (Graphics::Recorder::BarrierValidate()) {
         const std::pair<std::uint64_t, std::uint64_t> range{address, address + bytes};
@@ -1473,7 +1624,7 @@ bool AliasCopy(const Graphics::Context& context, std::uint64_t destination, std:
         copyAliasNoSource.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    auto to = Graphics::StorageTexture::FindLive(destination, bytes);
+    auto to = Graphics::StorageTexture::FindLive(destination, bytes, from->Descriptor().swizzleSlice);
     if (to != nullptr && !to->SameSurfaceShape(*from)) {
         copyAliasShape.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -1652,7 +1803,8 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     recorder.FlushStoresOverlapping(source, bytes);
     recorder.FlushStoresOverlapping(destination, bytes);
     VkAccessFlags covered = 0;
-    const auto commands = recorder.Commands(&covered);
+    // Aware commands (APS5_AWARE_COMMANDS): only the queued copy-backs over either range go in first.
+    const auto commands = recorder.CommandsTouching([&](std::uint64_t begin, std::uint64_t end) { return (begin < source + bytes && source < end) || (begin < destination + bytes && destination < end); }, Graphics::Recorder::CommandSite::Copy, &covered);
     // The class range covers the barriers too; the program-keyed range inside it is the transfer.
     const auto classTiming = recorder.BeginGpuTiming(CommandClass::Copy);
     if (Graphics::Recorder::BarrierValidate()) {
@@ -1669,7 +1821,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, transferAccess);
         Graphics::Recorder::CountBarriers(CommandClass::Copy);
     }
-    const auto gpuTiming = recorder.BeginGpuTiming(programAddress);
+    const auto gpuTiming = recorder.BeginTransferTiming(programAddress);
     const VkBufferCopy region{source - sourceImport->base, destination - destinationImport->base, bytes};
     context.Resolved(&Graphics::DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, sourceImport->buffer, destinationImport->buffer, 1, &region);
     recorder.EndGpuTiming(gpuTiming, bytes);
@@ -1723,7 +1875,7 @@ void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
     require((surface.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0 && (surface.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) != 0 && (surface.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) != 0, "resized surface capabilities are unsupported");
     VkSwapchainCreateInfoKHR create{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     create.surface = state->surface;
-    create.minImageCount = surface.minImageCount;
+    create.minImageCount = swapchainImageCount(surface, state->presentMode);
     create.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
     create.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     create.imageExtent = {width, height};
@@ -1732,7 +1884,7 @@ void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
     create.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     create.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     create.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    create.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    create.presentMode = state->presentMode;
     create.oldSwapchain = state->swapchain;
     state->retiredSwapchains.reserve(state->retiredSwapchains.size() + 1);
     VkSwapchainKHR replacement = VK_NULL_HANDLE;
@@ -1905,6 +2057,14 @@ void VulkanDevice::CaptureImages(const std::string& prefix, std::span<const std:
     std::fprintf(stderr, "[capture] %s: %zu storage image files, %zu depth surface files and %zu buffers\n", prefix.c_str(), images, depths, buffers);
 }
 
+std::size_t VulkanDevice::ReadBackImage(std::uint64_t address, std::uint32_t level, std::uint32_t firstLayer, std::uint32_t layers, const std::function<void(const Graphics::ImageReadback&)>& consume) {
+    return Graphics::StorageTexture::ReadBack(graphicsContext(), address, level, firstLayer, layers, consume);
+}
+
+std::size_t VulkanDevice::ReadBackDepth(std::uint64_t address, std::uint32_t slice, const std::function<void(const Graphics::ImageReadback&)>& consume) {
+    return Graphics::ReadBackDepthSurface(graphicsContext(), address, slice, consume);
+}
+
 void VulkanDevice::CaptureTargets() {
     static const char* directory = std::getenv("APS5_CAPTURE_DIR");
     if (directory == nullptr) return;
@@ -2042,6 +2202,9 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     require(state->extent.width != 0 && state->extent.height != 0, "output window is minimized");
     require(!state->queuePending, "the previous presentation was not queued");
     require(!state->presentSlots.empty(), "device has no presentation slots");
+    // A safe point of the video-memory budget, once per frame (no cache lock is held here): the
+    // epoch ends and the reclaimers run while over.
+    Graphics::VramPresent();
     // The game path acquired the image before taking GpuMutex (Driver::Present); tests, tools and
     // APS5_SYNC_FLIP=1 acquire here.
     if (!state->imageAcquired && !AcquireImage()) return false;
@@ -2396,6 +2559,13 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.descriptorIndexing = state->descriptorIndexing;
     context.primitiveListRestart = state->primitiveListRestart;
     context.imageViewMinLod = state->imageViewMinLod;
+    context.pushDescriptors = state->pushDescriptors;
+    context.maxPushDescriptors = state->maxPushDescriptors;
+    context.fastLayouts = state->fastLayouts.get();
+    context.fastRing = state->fastRing.get();
+    context.softwareDevice = state->properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+    context.memoryBudget = state->memoryBudget;
+    context.memoryProperties2 = state->memoryProperties2;
     return context;
 }
 
@@ -2419,6 +2589,10 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     const auto context = graphicsContext();
     Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe);
     if (trace) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
+}
+
+Graphics::FastDrawOutcome VulkanDevice::FastDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders) {
+    return Graphics::DrawFast(graphicsContext(), graphics, draw, shaders);
 }
 
 namespace {
@@ -2763,6 +2937,12 @@ struct DispatchCounters {
     IndirectHold indirectHold;
     std::uint64_t cacheHits = 0, cacheMisses = 0, cacheInvalidated = 0, templateRefreshed = 0, templateSameWords = 0;
     double templateRevalidateMs = 0;
+    // APS5_TEMPLATE_REFRESH_RING: the refreshes made through the ring (ShaderResources::ForkData),
+    // the words they placed there, the hits that bound the batch's last fork again (counted as
+    // same words), the refreshes written into an idle template's buffers by the CPU (counted as
+    // refreshed) and their words, and ForkData's outcomes.
+    std::uint64_t templateForked = 0, templateForkBytes = 0, templateReused = 0, templateAdopted = 0, templateAdoptBytes = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(Graphics::ShaderResources::ForkOutcome::Count)> templateForkOutcomes{};
     std::uint64_t procLookups = 0, preBarriersRecorded = 0, preBarriersSkipped = 0;
     std::chrono::steady_clock::time_point cacheReport = std::chrono::steady_clock::now();
 };
@@ -2968,6 +3148,9 @@ struct RecordedDispatch {
     DispatchTimer* timer;
     // Whether the data refresh recorded anything.
     bool refreshed = false;
+    // Whether the dispatch bound a ForkData set (Forked or Reused) in place of the template's: the
+    // [dispatch-io] trace then lists the words it read (ShaderResources::DescribeForkedWords).
+    bool forked = false;
 };
 
 VkDevice VulkanDevice::Device() const {
@@ -2986,6 +3169,11 @@ bool VulkanDevice::VerifyRecipes() {
 
 bool VulkanDevice::TemplateDataRefresh() {
     return AgcDriver::TemplateDataRefresh();
+}
+
+VulkanDevice::TemplateRefreshCounts VulkanDevice::TemplateRefreshes() {
+    const auto& d = Dispatches();
+    return {d.templateRefreshed, d.templateForked, d.templateSameWords, d.templateReused, d.templateAdopted};
 }
 
 void VulkanDevice::NoteRecipe(RecipeEvent event, bool indirect) {
@@ -3272,6 +3460,93 @@ VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompi
     return dispatch(shader, 0, 0, 0, arguments, snapshots, programAddress, std::move(prepared), recipe);
 }
 
+std::optional<Graphics::FastDispatchDecline> VulkanDevice::PrepareFastDispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, Graphics::FastDispatchCall& call) {
+    using Decline = Graphics::FastDispatchDecline;
+    if (shader.spirv.size() < 5 || shader.spirv[0] != 0x07230203u || shader.variantId == 0) return Decline::Invalid;
+    const auto* limit = state->properties.limits.maxComputeWorkGroupCount;
+    if (arguments == 0 && (x > limit[0] || y > limit[1] || z > limit[2])) return Decline::Limits;
+    const auto context = graphicsContext();
+    if (context.fastLayouts == nullptr) return Decline::NoPush;
+    if (const auto decline = Graphics::FastDispatchPrecheck(context, shader)) return decline;
+    // The variant's pipeline on its push layout: the layout key follows from the variant's
+    // bindings, so both are made once per variant (FastLayouts::Get stays off the per-dispatch path).
+    const Graphics::FastLayout* layout = nullptr;
+    std::shared_ptr<ComputePipelineObjects> objects;
+    {
+        std::lock_guard pipelines(state->computePipelinesMutex);
+        if (const auto found = state->fastComputePipelines.find(shader.variantId); found != state->fastComputePipelines.end()) {
+            if (found->second.decline) return found->second.decline;
+            layout = found->second.layout;
+            objects = found->second.objects;
+        }
+    }
+    if (objects == nullptr) {
+        const auto remember = [&](Decline decline) {
+            std::lock_guard pipelines(state->computePipelinesMutex);
+            state->fastComputePipelines.try_emplace(shader.variantId, State::FastComputePipeline{nullptr, nullptr, decline});
+            return decline;
+        };
+        std::vector<std::uint32_t> key;
+        if (const auto decline = Graphics::FastComputeLayoutKey(shader, key)) return remember(*decline);
+        const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
+        const auto pushStages = Graphics::PushConstantStages(shaders);
+        if (pushStages != 0 && state->properties.limits.maxPushConstantsSize < Graphics::PipelinePushConstantBytes) return remember(Decline::Limits);
+        layout = context.fastLayouts->Get(key, pushStages);
+        if (layout == nullptr) return remember(Decline::PushLimit);
+        objects = std::make_shared<ComputePipelineObjects>();
+        objects->device = state->device;
+        objects->destroyModule = state->DeviceFunction<PFN_vkDestroyShaderModule>("vkDestroyShaderModule");
+        objects->destroyLayout = state->DeviceFunction<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout");
+        objects->destroyPipeline = state->DeviceFunction<PFN_vkDestroyPipeline>("vkDestroyPipeline");
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = shader.spirv.size() * sizeof(std::uint32_t);
+        moduleInfo.pCode = shader.spirv.data();
+        check(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule")(state->device, &moduleInfo, nullptr, &objects->module), "vkCreateShaderModule");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = objects->module;
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.layout = layout->pipeline;
+        check(state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(state->device, context.pipelineCache, 1, &pipelineInfo, nullptr, &objects->pipeline), "vkCreateComputePipelines");
+        std::lock_guard pipelines(state->computePipelinesMutex);
+        const auto& entry = state->fastComputePipelines.try_emplace(shader.variantId, State::FastComputePipeline{layout, objects, std::nullopt}).first->second;
+        if (entry.decline) return entry.decline;
+        layout = entry.layout;
+        objects = entry.objects;
+    }
+    call = {&shader, layout, objects->pipeline, objects, x, y, z, arguments, programAddress};
+    return std::nullopt;
+}
+
+std::optional<Graphics::FastDispatchDecline> VulkanDevice::FastDispatch(const Graphics::FastDispatchCall& call, Graphics::FastDispatchTiming& timing) {
+    using Decline = Graphics::FastDispatchDecline;
+    const auto arguments = call.arguments;
+    if (arguments != 0) {
+        // decideIndirect's CPU reasons, tested without its flush (the old path then takes the
+        // dispatch and flushes): storage results pending over the argument dwords (pending or
+        // being flushed by another thread), a label pending on them, a copied writer (its CPU
+        // write-back) over them. Also unit shadows over them: the old path's FlushPending
+        // (PublishScope::Whole) publishes those into the import before the GPU reads the
+        // arguments from it, and the fast dispatch publishes nothing.
+        auto& recorder = *state->recorder;
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> argumentRange{{{arguments, arguments + 12}}};
+        if (Graphics::StorageTexture::AnyPendingOverlaps(argumentRange) || Graphics::AnyShadowedOverlaps(arguments, 12)) return Decline::IndirectCpu;
+        for (std::uint64_t dword = arguments; dword < arguments + 12; dword += 4) {
+            if (recorder.PendingLabel(dword, 4, 0).has_value()) return Decline::IndirectCpu;
+        }
+        const auto writes = [&](const auto& writer) { return writer->WritesOverlap(arguments, 12); };
+        if (std::any_of(state->copiedWriters->begin(), state->copiedWriters->end(), writes) || std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), writes)) return Decline::IndirectCpu;
+    }
+    return Graphics::RecordFastDispatch(graphicsContext(), *state->recorder, call, timing);
+}
+
+std::optional<Graphics::FastDispatchDecline> VulkanDevice::FastDispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, Graphics::FastDispatchTiming& timing) {
+    Graphics::FastDispatchCall call;
+    if (const auto decline = PrepareFastDispatch(shader, x, y, z, arguments, programAddress, call)) return decline;
+    return FastDispatch(call, timing);
+}
+
 void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& outcome, char* groupsText) {
     auto& recorder = *state->recorder;
     auto& timer = *record.timer;
@@ -3342,6 +3617,10 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     auto& resources = *record.resources;
     const auto arguments = record.arguments;
     const auto* argumentImport = record.argumentImport;
+    // Resident read-only copies (APS5_RESIDENT_READS): checked at the build or proof; a sync since
+    // (decideIndirect's CPU path) may have reaped completions storing into a range, so they are
+    // checked again into the open batch. Nothing without resident regions or a submit since.
+    resources.RecheckResidentReads(recorder);
     // The record phase split (APS5_PROFILE_DRAW, rows "record: ..." of the [dispatch] totals):
     // opening the batch, the keeps, the data refresh, the barriers with the bind and the dispatch
     // itself, the pending-write notes and marks (MarkGpuWrites), and the completion registration.
@@ -3368,19 +3647,88 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     };
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
+    // Copy-back coalescing (APS5_COALESCE_COPY_BACKS=1, Graphics::Recorder::CoalescesCopyBacks):
+    // the queued copy-backs stay queued past this dispatch, except those over what it reads or
+    // writes through the imports (a range bound in place, its indirect arguments) and the
+    // unclaimed ones over a range it writes (a copy-back recorded after the dispatch would undo
+    // its store); an address-based build (unknown ranges) records them all. A copy claimed by
+    // this build's staging stays: the region's copy-back records it after the dispatch.
+    const bool keepCopyBacks = recorder.CoalescesCopyBacks();
+    if (keepCopyBacks && recorder.HasDeferredCopies()) {
+        using FlushReason = Graphics::Recorder::FlushReason;
+        if (resources.HoldsLease() && resources.MapsResidentLands()) {
+            // A resident written range's land (APS5_RESIDENT_WRITES) stays queued past an
+            // address-based use whose table maps the range only to its device copy (read-only, or
+            // writable: a storing use queues its own land after it, S7c) or not at all, with no
+            // descriptor or region of its own over it, unless the range holds its indirect arguments.
+            recorder.FlushDeferredWhere([&](const Graphics::Recorder::DeferredCopy& copy, bool) {
+                return !(copy.land && resources.MapsResidentLand(copy.sourceKey) && !(argumentImport != nullptr && copy.address < arguments + 12 && arguments < copy.address + copy.bytes));
+            }, FlushReason::DispatchLease);
+        } else if (resources.HoldsLease()) {
+            recorder.FlushDeferredCopies(FlushReason::DispatchLease);
+        } else {
+            const auto inPlace = resources.InPlaceReads();
+            const auto throughImport = [&](std::uint64_t begin, std::uint64_t end) {
+                return std::any_of(inPlace.begin(), inPlace.end(), [&](const auto& range) { return begin < range.second && range.first < end; }) || (argumentImport != nullptr && begin < arguments + 12 && arguments < end);
+            };
+            // A resident written range's land (APS5_RESIDENT_WRITES) stays queued past a use bound
+            // to the range's device copy: the use reads and writes no byte of the import under it.
+            recorder.FlushDeferredWhere([&](const Graphics::Recorder::DeferredCopy& copy, bool claimed) {
+                return throughImport(copy.address, copy.address + copy.bytes) || (!claimed && resources.WritesOverlap(copy.address, static_cast<std::size_t>(copy.bytes)) && !(copy.land && resources.BindsResidentLand(copy.sourceKey)));
+            }, FlushReason::Dispatch);
+        }
+    }
+    // APS5_DISPATCH_OVERLAP (Graphics::Recorder::DispatchOverlap): a direct dispatch with known
+    // ranges, recorded for a DISPATCH_DIRECT packet, defers its trailing barrier; the next one of
+    // the same guest order span (only register writes between the packets) runs alongside it.
+    const auto guestOrder = Graphics::Recorder::DispatchOverlap() && argumentImport == nullptr && !resources.HoldsLease() ? Graphics::Recorder::GuestOrder() : Graphics::Recorder::GuestOrderKey{};
+    const bool holdsTrail = recorder.HoldDispatchTrail(guestOrder);
     VkAccessFlags covered = 0;
-    const auto commands = recorder.Commands(&covered);
+    const auto commands = keepCopyBacks ? recorder.CommandsKeepingCopyBacks(&covered) : recorder.Commands(&covered, Graphics::Recorder::CommandSite::Dispatch);
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
     recorder.Keep(record.resources);
     recordStep(PhaseRecordKeeps);
+    // APS5_TEMPLATE_REFRESH_RING: the set bound in place of the template's (ForkData's copy).
+    VkDescriptorSet forkedSet = VK_NULL_HANDLE;
     if (record.dataRefresh != RecordedDispatch::DataRefresh::None) {
         // The template's data buffers take this dispatch's words: a transfer write the pre-dispatch
         // barrier makes visible (so it is recorded whatever the previous command covered), ordered
         // after an earlier dispatch's reads of the buffers by that dispatch's trailing barrier. A
         // recipe compares the two 64-bit hashes first: equal hashes mean the buffers hold the words.
         const bool differs = record.dataRefresh == RecordedDispatch::DataRefresh::Words || resources.DataWordsHash() != record.dataWordsHash;
-        if (differs && resources.RefreshData(commands, *record.shader, &recorder)) {
+        // Through the ring: no transfer is recorded, so `covered` stays and the leading barrier is
+        // elided as for a hit with the same words; any other outcome than Forked, Reused, Adopted or
+        // Same leaves the refresh to RefreshData below. Reused (the batch's last fork had these
+        // words) binds that fork's set and counts as same words, as the old path's hit after its
+        // refresh; Adopted wrote the words into the idle template's buffers on the CPU (host writes
+        // before the batch's submit) and binds its own set, a refresh with nothing recorded.
+        using ForkOutcome = Graphics::ShaderResources::ForkOutcome;
+        auto forkOutcome = ForkOutcome::Count;
+        if (differs && TemplateRefreshRing()) {
+            const auto fork = resources.ForkData(*record.shader, recorder);
+            forkOutcome = fork.outcome;
+            ++d.templateForkOutcomes[static_cast<std::size_t>(fork.outcome)];
+            if (fork.outcome == ForkOutcome::Forked || fork.outcome == ForkOutcome::Reused) forkedSet = fork.set;
+            if (fork.outcome == ForkOutcome::Forked) {
+                ++d.templateForked;
+                d.templateForkBytes += fork.bytes;
+            } else if (fork.outcome == ForkOutcome::Reused) {
+                ++d.templateReused;
+            } else if (fork.outcome == ForkOutcome::Adopted) {
+                ++d.templateAdopted;
+                d.templateAdoptBytes += fork.bytes;
+            }
+        }
+        if (forkOutcome == ForkOutcome::Forked || forkOutcome == ForkOutcome::Adopted) {
+            ++d.templateRefreshed;
+            d.templateRevalidateMs += record.revalidateMs;
+            record.refreshed = true;
+        } else if (forkOutcome == ForkOutcome::Same || forkOutcome == ForkOutcome::Reused) {
+            ++d.templateSameWords;
+        } else if (differs && (recorder.RecordDispatchTrail(), resources.RefreshData(commands, *record.shader, &recorder))) {
+            // (A held-over dispatch may still read the template's buffers: its trailing barrier goes
+            // in before the update.)
             covered = 0;
             ++d.templateRefreshed;
             d.templateRevalidateMs += record.revalidateMs;
@@ -3390,6 +3738,12 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         }
         recordStep(PhaseRecordDataRefresh);
     }
+    // ForkData adopts words into this template only once the batch recording this use finished.
+    if (TemplateRefreshRing()) resources.NoteRecorded(recorder);
+    // Nothing recorded since the held-over dispatch: this one overlaps it (its leading barrier is
+    // covered by the mask the deferral marked).
+    if (holdsTrail) recorder.ElideDispatchTrail();
+    record.forked = forkedSet != VK_NULL_HANDLE;
     using CommandClass = Graphics::Recorder::CommandClass;
     if (Graphics::Recorder::BarrierValidate()) {
         if (argumentImport != nullptr) {
@@ -3432,23 +3786,38 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recorder.EndGpuTiming(timing);
         ++d.preBarriersRecorded;
     }
+    // The program's range begins ahead of its binds: BeginGpuTiming may record queued copy-backs
+    // (Commands()), whose narrow compare pass binds a compute pipeline and push constants of its
+    // own (APS5_NARROW_COPY_BACKS), which would replace the program's between bind and dispatch.
+    const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
     context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
-    resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
+    if (forkedSet != VK_NULL_HANDLE) resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, forkedSet);
+    else resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
     if (record.pushStages != 0) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::PipelinePushConstantBytes, record.pushBytes->data());
     }
-    const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
     Graphics::RecordCheckpoint(commands, 'C', record.programAddress, record.shader != nullptr && record.shader->program != nullptr ? record.shader->program->variantId : 0, argumentImport != nullptr ? ~std::uint64_t{0} : (static_cast<std::uint64_t>(record.x) << 42u) | (static_cast<std::uint64_t>(record.y) << 21u) | record.z);
     if (argumentImport != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentImport->buffer, arguments - argumentImport->base);
     else context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, record.x, record.y, record.z);
     recorder.EndGpuTiming(gpuTiming);
-    const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
+    // APS5_PROFILE_GPU: what the program binds in place (its [gputime] MiB read/written).
+    if (gpuTiming != Graphics::Recorder::NoTiming) {
+        const auto inPlace = resources.InPlaceReads();
+        recorder.NoteInPlace(gpuTiming, Graphics::Recorder::InPlaceUseOf(inPlace, resources.GpuWrites(), {}, resources.HoldsLease()));
+    }
     // Its coverage leaves out the leading barrier of the copy-back right after it (MarkGpuWrites)
-    // and of the next dispatch or staging copy-in when nothing else is recorded first.
-    recordMemoryBarrier(Graphics::DispatchTrailingBarrier);
-    Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
-    recorder.EndGpuTiming(trailingTiming);
-    recorder.MarkCovered(Graphics::DispatchTrailingBarrier.destinationAccess);
+    // and of the next dispatch or staging copy-in when nothing else is recorded first. Deferred
+    // (APS5_DISPATCH_OVERLAP), whatever records next records it before reading the coverage
+    // (Recorder::Commands), or an overlapping dispatch of the same span leaves it out.
+    if (guestOrder.span != 0) {
+        recorder.DeferDispatchTrail(guestOrder, Graphics::DispatchTrailingBarrier.destinationAccess);
+    } else {
+        const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
+        recordMemoryBarrier(Graphics::DispatchTrailingBarrier);
+        Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
+        recorder.EndGpuTiming(trailingTiming);
+        recorder.MarkCovered(Graphics::DispatchTrailingBarrier.destinationAccess);
+    }
     recordStep(PhaseRecordBind);
     // The marks' parts (ShaderResources::MarkGpuWrites' timing) as rows splitting "record: marks".
     const auto marksBefore = timer.profile ? resources.Timing() : Graphics::ShaderResources::BuildTiming{};
@@ -3476,6 +3845,12 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         writers->push_back(kept);
     }
     recordStep(PhaseRecordCompletion);
+    // APS5_PROFILE_DRAW: the [inplace-writes] census, after the timed steps (in none of their rows).
+    // A diagnostic: nothing it throws (std::bad_alloc) may fail a dispatch already recorded.
+    try {
+        resources.NoteInPlaceWrites(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
+    } catch (...) {
+    }
 }
 
 VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut) {
@@ -3698,6 +4073,12 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     if (profile && std::chrono::steady_clock::now() - d.cacheReport > std::chrono::seconds(10)) {
         d.cacheReport = std::chrono::steady_clock::now();
         std::fprintf(stderr, "[rescache] %llu hits, %llu misses, %llu invalidated, %zu entries (dispatch + draw); template hits: %llu refreshed the data buffers (revalidate %.1f ms), %llu had the same words; Find calls %llu, Touch calls %llu\n", static_cast<unsigned long long>(d.cacheHits), static_cast<unsigned long long>(d.cacheMisses), static_cast<unsigned long long>(d.cacheInvalidated), state->resourceCache.Size(), static_cast<unsigned long long>(d.templateRefreshed), d.templateRevalidateMs, static_cast<unsigned long long>(d.templateSameWords), static_cast<unsigned long long>(ResourceCache::Finds()), static_cast<unsigned long long>(ResourceCache::Touches()));
+        if (TemplateRefreshRing()) {
+            using ForkOutcome = Graphics::ShaderResources::ForkOutcome;
+            const auto outcome = [&](ForkOutcome which) { return static_cast<unsigned long long>(d.templateForkOutcomes[static_cast<std::size_t>(which)]); };
+            const auto transient = state->descriptorCache != nullptr ? state->descriptorCache->TransientCounters() : Graphics::DescriptorCache::TransientStats{};
+            std::fprintf(stderr, "[rescache] template refresh ring: %llu of the refreshes through the ring (%.2f MiB of words), %llu adopted by an idle template (%.2f MiB); ForkData outcomes: forked %llu, reused the batch's last fork %llu, adopted %llu, same words %llu, then RefreshData: no ring %llu, ring full %llu, no set %llu, unsupported %llu; transient sets %llu from %llu pools (%llu resets, %llu destroyed), %llu refused\n", static_cast<unsigned long long>(d.templateForked), static_cast<double>(d.templateForkBytes) / 1048576.0, static_cast<unsigned long long>(d.templateAdopted), static_cast<double>(d.templateAdoptBytes) / 1048576.0, outcome(ForkOutcome::Forked), outcome(ForkOutcome::Reused), outcome(ForkOutcome::Adopted), outcome(ForkOutcome::Same), outcome(ForkOutcome::NoRing), outcome(ForkOutcome::RingFull), outcome(ForkOutcome::NoSet), outcome(ForkOutcome::Unsupported), static_cast<unsigned long long>(transient.sets), static_cast<unsigned long long>(transient.pools), static_cast<unsigned long long>(transient.resets), static_cast<unsigned long long>(transient.destroyed), static_cast<unsigned long long>(transient.refused));
+        }
         std::fprintf(stderr, "[vk] deviceProc lookups inside the device call: %llu (%.2f per dispatch); pre-dispatch barriers recorded %llu, skipped %llu\n", static_cast<unsigned long long>(d.procLookups), d.profiledDispatches != 0 ? static_cast<double>(d.procLookups) / static_cast<double>(d.profiledDispatches) : 0.0, static_cast<unsigned long long>(d.preBarriersRecorded), static_cast<unsigned long long>(d.preBarriersSkipped));
         reportRecipes();
     }
@@ -3791,7 +4172,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         // finishes the recorder up to that batch's serial. Prints the [address-sync] leases line.
         Graphics::CountLeaseOutcome(false, recorder.Submissions() + 1);
     }
-    if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, resources->Describe().c_str());
+    if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s%s\n", groupsText, resources->Describe().c_str(), record.forked ? resources->DescribeForkedWords(*record.shader).c_str() : "");
     WatchMemory(programAddress);
     // The recipe for the caller's dispatch-cache variant (design_cpu_final M4, rule R3): only an
     // object the resource cache serves under this content key (reusable: no lease, no copied
@@ -3929,7 +4310,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
         state->recorder->Sync();
         timer.phase(PhaseSync);
     }
-    if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, hit->resources->Describe().c_str());
+    if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s%s\n", groupsText, hit->resources->Describe().c_str(), record.forked ? hit->resources->DescribeForkedWords(*record.shader).c_str() : "");
     WatchMemory(programAddress);
     timer.finish(lookupsBefore, groupsText, indirect);
     if (profile) reportRecipes();

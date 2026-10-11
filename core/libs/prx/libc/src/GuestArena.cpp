@@ -1,4 +1,5 @@
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/WindowsMappings.hpp"
 #include <algorithm>
 #include <cstdint>
@@ -185,6 +186,16 @@ bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address) {
     return WindowsMappings::Get().HandleWrite(address);
 }
 
+void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes) {
+    if (!Arena::Get().Contains(pointer, bytes)) return;
+    WindowsMappings::Get().Pin(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+}
+
+void GuestArenaUnpinWritable_nid_postfix(const void* pointer, std::size_t bytes) {
+    if (!Arena::Get().Contains(pointer, bytes)) return;
+    WindowsMappings::Get().Unpin(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+}
+
 bool GuestArenaProtection_nid_postfix(std::uintptr_t address, std::uint32_t* protection) {
     return WindowsMappings::Get().Protection(address, protection);
 }
@@ -195,6 +206,18 @@ bool GuestArenaCollectWrites_nid_postfix(std::uintptr_t address, std::size_t byt
 
 void GuestArenaDescribePage_nid_postfix(std::uintptr_t address, char* text, std::size_t size) {
     WindowsMappings::Get().Describe(address, text, size);
+}
+
+bool GuestArenaTryDescribePage_nid_postfix(std::uintptr_t address, char* text, std::size_t size) {
+    return WindowsMappings::Get().TryDescribe(address, text, size);
+}
+
+std::size_t GuestArenaTrackWriteParts_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    return WindowsMappings::Get().TrackParts(address, bytes);
+}
+
+std::size_t GuestArenaTrackEdgeWriteParts_nid_postfix(std::uintptr_t begin, std::uintptr_t end) {
+    return WindowsMappings::Get().TrackEdgeParts(begin, end);
 }
 
 std::uint64_t GuestArenaMappingSerial_nid_postfix() {
@@ -238,6 +261,8 @@ bool GuestArenaWriteWatched_nid_postfix() {
 }
 
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
+    // Resident buffers' guarded pages (GuestPageGuard*) land first: the host write would fail there.
+    GuestWriteWatch::GuestPageGuardTouch_nid_postfix(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #ifdef _WIN32
     return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #else

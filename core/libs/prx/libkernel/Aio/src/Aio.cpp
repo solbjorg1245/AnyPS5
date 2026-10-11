@@ -9,13 +9,14 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/File/include/ReadTrace.hpp"
 
 #ifdef _WIN32
-#include <fcntl.h>
 #include <io.h>
 #include <limits>
+#include <windows.h>
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -50,6 +51,38 @@ void SetState(std::int32_t id, std::int32_t state) {
     g_states[id] = state;
 }
 
+#ifdef _WIN32
+std::int64_t NativePositioned(std::int32_t fd, void* buf, std::size_t nbyte, std::int64_t offset, bool write, const char* name) {
+    if (nbyte > static_cast<std::size_t>(std::numeric_limits<DWORD>::max())) {
+        throw std::runtime_error(std::string(name) + ": nbytes exceeds platform limit");
+    }
+    if (offset < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(fd));
+    if (handle == INVALID_HANDLE_VALUE) {
+        errno = EBADF;
+        return -1;
+    }
+    OVERLAPPED overlapped{};
+    overlapped.Offset = static_cast<DWORD>(offset);
+    overlapped.OffsetHigh = static_cast<DWORD>(static_cast<std::uint64_t>(offset) >> 32u);
+    DWORD done = 0;
+    const BOOL ok = write ? ::WriteFile(handle, buf, static_cast<DWORD>(nbyte), &done, &overlapped)
+                          : ::ReadFile(handle, buf, static_cast<DWORD>(nbyte), &done, &overlapped);
+    if (!ok) {
+        const DWORD error = ::GetLastError();
+        if (!write && error == ERROR_HANDLE_EOF) return 0;
+        // A transfer the descriptor's access mode does not allow (a read on a write-only fd) is
+        // EBADF, as _read/_write reported it before and as pread/pwrite report it.
+        errno = error == ERROR_ACCESS_DENIED || error == ERROR_INVALID_HANDLE ? EBADF : EIO;
+        return -1;
+    }
+    return done;
+}
+#endif
+
 std::int64_t NativePread(std::int32_t fd, void* buf, std::size_t nbyte, std::int64_t offset) {
     if (File::ReadTraceEnabled()) File::TraceReadInto("aio", File::TracedPath(fd).c_str(), offset, buf, nbyte);
     const GuestArena::HostWrite destination(buf, nbyte);
@@ -58,22 +91,7 @@ std::int64_t NativePread(std::int32_t fd, void* buf, std::size_t nbyte, std::int
         return -1;
     }
 #ifdef _WIN32
-    if (nbyte > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
-        throw std::runtime_error("sceKernelAioSubmitReadCommands: nbytes exceeds platform limit");
-    }
-    const int duped = ::_dup(fd);
-    if (duped < 0) return -1;
-    if (::_lseeki64(duped, offset, SEEK_SET) < 0) {
-        const int error = errno;
-        ::_close(duped);
-        errno = error;
-        return -1;
-    }
-    const int result = ::_read(duped, buf, static_cast<unsigned int>(nbyte));
-    const int error = errno;
-    ::_close(duped);
-    errno = error;
-    return result;
+    return NativePositioned(fd, buf, nbyte, offset, false, "sceKernelAioSubmitReadCommands");
 #else
     return static_cast<std::int64_t>(::pread(fd, buf, nbyte, static_cast<off_t>(offset)));
 #endif
@@ -81,22 +99,7 @@ std::int64_t NativePread(std::int32_t fd, void* buf, std::size_t nbyte, std::int
 
 std::int64_t NativePwrite(std::int32_t fd, const void* buf, std::size_t nbyte, std::int64_t offset) {
 #ifdef _WIN32
-    if (nbyte > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
-        throw std::runtime_error("sceKernelAioSubmitWriteCommands: nbytes exceeds platform limit");
-    }
-    const int duped = ::_dup(fd);
-    if (duped < 0) return -1;
-    if (::_lseeki64(duped, offset, SEEK_SET) < 0) {
-        const int error = errno;
-        ::_close(duped);
-        errno = error;
-        return -1;
-    }
-    const int result = ::_write(duped, buf, static_cast<unsigned int>(nbyte));
-    const int error = errno;
-    ::_close(duped);
-    errno = error;
-    return result;
+    return NativePositioned(fd, const_cast<void*>(buf), nbyte, offset, true, "sceKernelAioSubmitWriteCommands");
 #else
     return static_cast<std::int64_t>(::pwrite(fd, buf, nbyte, static_cast<off_t>(offset)));
 #endif
@@ -111,6 +114,9 @@ int SubmitCommands(KernelAioRwRequest* req, std::int32_t size, bool write, std::
     const std::int32_t queue = AllocateId();
     bool aborted = false;
     for (std::int32_t i = 0; i < size; ++i) {
+        // A guarded page (resident buffers) lands first, and none is taken until the write is
+        // done: the write would fail there, not fault.
+        const GuestWriteWatch::PageGuardHold hold(write ? req[i].buf : nullptr, req[i].nbyte);
         const std::int64_t done = write
             ? NativePwrite(req[i].fd, req[i].buf, req[i].nbyte, req[i].offset)
             : NativePread(req[i].fd, req[i].buf, req[i].nbyte, req[i].offset);

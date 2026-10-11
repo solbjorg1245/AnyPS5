@@ -1,6 +1,8 @@
 #include "Recompiler.hpp"
 #include "prx/libc/include/HostMutex.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -24,6 +26,7 @@
 #include "Optimization/include/Optimization/RequestMemoryView.hpp"
 #include "Optimization/include/Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/SrtWalker/WalkProgram.hpp"
 #include "Optimization/include/Optimization/ResourceTracker.hpp"
 #include "Optimization/include/Optimization/ShaderInfoCollector.hpp"
 #include "Optimization/include/Optimization/SrtWalker.hpp"
@@ -380,6 +383,26 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     return result;
 }
 
+// materializeResult into a caller's result (the fast paths' per-thread one, PopulateVariant): the
+// same content, but the vectors keep their storage. The variant's fields come by copy assignment
+// (a vector's existing storage is reused), its empty bindings and push constants aside; then
+// PopulateInto rewrites those in place.
+struct PopulateScratchTag {};
+
+void materializeResultInto(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, RecompileResult& result) {
+    auto bindings = std::move(result.bindings);
+    auto pushConstants = std::move(result.pushConstants);
+    result = variant.result;
+    result.bindings = std::move(bindings);
+    result.pushConstants = std::move(pushConstants);
+    auto& shaderData = HostThreadLocal<std::vector<std::uint32_t>, PopulateScratchTag>();
+    DescriptorBindingBuilder{}.PopulateInto(variant.bindings.layout, variant.info.info, variant.info.stage, variant.info.userDataBase, snapshot, partialThreads(request), result.bindings, result.pushConstants, shaderData);
+    for (auto& attribute : result.vertexAttributes) {
+        if (!request.context.vertex || attribute.location >= request.context.vertex->resourcesNum) throw std::runtime_error("Shader cache: invalid vertex attribute metadata");
+        attribute.resource = request.context.vertex->resources[attribute.location];
+    }
+}
+
 bool sameLayout(const BindingLayout& left, const BindingLayout& right) {
     return left.descriptorSet == right.descriptorSet && left.firstBinding == right.firstBinding && left.pushConstantOffsetBytes == right.pushConstantOffsetBytes && left.pushConstantSizeBytes == right.pushConstantSizeBytes;
 }
@@ -479,7 +502,10 @@ void reportResultMemo() {
     const auto misses = counters.misses.exchange(0, std::memory_order_relaxed);
     const auto evictions = counters.evictions.exchange(0, std::memory_order_relaxed);
     const auto populate = counters.populateNanoseconds.exchange(0, std::memory_order_relaxed);
-    std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions));
+    // The legacy float rules (Recompiler.hpp): instructions translated under each since start.
+    std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions; legacy float sites (totals): mad_legacy %llu%s, mullit %llu%s, clamp NaN %llu%s\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions),
+        static_cast<unsigned long long>(LegacyFloatSites(LegacyFloatSite::MadLegacy)), LegacyMadRule() ? "" : " (off: APS5_NO_LEGACY_MAD_RULE)", static_cast<unsigned long long>(LegacyFloatSites(LegacyFloatSite::Mullit)), MullitRule() ? "" : " (off: APS5_NO_MULLIT_RULE)",
+        static_cast<unsigned long long>(LegacyFloatSites(LegacyFloatSite::ClampNan)), ClampNanRule() == ClampNan::Zero ? " (APS5_CLAMP_NAN=zero)" : ClampNanRule() == ClampNan::Keep ? " (APS5_CLAMP_NAN=keep)" : " (off: FClamp alone)");
 }
 
 // Everything materializeResult reads besides the variant: the snapshot (the descriptor words, the
@@ -701,6 +727,146 @@ std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& 
     if (profile) capture->sourceNanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
     materializeCapture(*capture, runtime);
     return capture;
+}
+
+const char* WalkStatusName(WalkStatus status) {
+    switch (status) {
+        case WalkStatus::Walked: return "walked";
+        case WalkStatus::NoSource: return "no source";
+        case WalkStatus::IncompletePlan: return "incomplete plan";
+        case WalkStatus::NoProgram: return "no program";
+        case WalkStatus::Bindless: return "bindless";
+        case WalkStatus::UnsupportedRoot: return "unsupported root";
+        case WalkStatus::OpFailed: return "op failed";
+        case WalkStatus::ReadDeclined: return "read declined";
+        case WalkStatus::Failed: return "failed";
+        default: return "?";
+    }
+}
+
+WalkStatus WalkResources(const SourceHandle& handle, std::span<const std::uint32_t> userData, std::uint64_t shaderBase, const SrtRuntime& runtime, ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+    if (handle.source == nullptr || handle.source->plan == nullptr) return WalkStatus::NoSource;
+    const auto& plan = *handle.source->plan;
+    if (!plan.srtPlanComplete || !plan.resourceTrackingComplete) return WalkStatus::IncompletePlan;
+    const auto* walk = walkFor(*handle.source);
+    if (walk == nullptr) return WalkStatus::NoProgram;
+    // A bindless table's keys are enumerated by the interpreter over readMemory (resolveTableImage).
+    for (const auto& image : plan.info.images) {
+        if (image.source < plan.descriptorSources.size() && plan.descriptorSources[image.source].indirectImage.has_value()) return WalkStatus::Bindless;
+    }
+    SrtRuntime fast = runtime;
+    fast.userData = userData;
+    fast.shaderBase = shaderBase;
+    fast.walk = walk;
+    fast.readTrace = nullptr;
+    fast.deferPureLeaf = nullptr;
+    fast.deferredReads = nullptr;
+    fast.expressOnly = true;
+    // Count: the walk program was not reached (a failure before it, the uniform fill's).
+    Detail::NoteWalkOutcome(Detail::WalkOutcome::Count);
+    const auto declined = [] {
+        switch (Detail::LastWalkOutcome()) {
+            case Detail::WalkOutcome::NoProgram: return WalkStatus::NoProgram;
+            case Detail::WalkOutcome::UnsupportedRoot: return WalkStatus::UnsupportedRoot;
+            case Detail::WalkOutcome::OpFailed: return WalkStatus::OpFailed;
+            case Detail::WalkOutcome::ReadBailed: return WalkStatus::ReadDeclined;
+            default: return WalkStatus::Failed;
+        }
+    };
+    // A walk that does not complete (a declined read, above all a pending block) returns false: no
+    // exception, which cost about 1.6 ms per declined draw (s53-fastdraw-diag). Only a malformed
+    // plan or descriptor still throws.
+    try {
+        if (!ResourceMaterializer{}.TryMaterialize(plan, fast, snapshot, specialization)) return declined();
+    } catch (const std::exception&) {
+        return declined();
+    }
+    return WalkStatus::Walked;
+}
+
+namespace {
+
+// APS5_NO_VARIANT_MEMO=1: PopulateVariant scans the source's variants under its mutex on every
+// call and returns a freshly copied result, as before (the A/B for the memo and the in-place
+// populate below).
+bool variantMemo() {
+    static const bool enabled = std::getenv("APS5_NO_VARIANT_MEMO") == nullptr;
+    return enabled;
+}
+
+// PopulateVariant's per-thread memo (s53-fastdraw-diag step 2b): the variants this thread's fast
+// walks selected last, by source. A source's variant list only grows, under its mutex, and
+// findOrCompileVariant searches it before it compiles, so at most one variant matches a (layout,
+// specialization) pair and a match found once is the one the scan finds for good: a hit needs no
+// lock and no scan. The entry holds the source, so its address cannot be reused for another one
+// while the entry lives; a specialization the source does not hold is never remembered (a later
+// compile must be found).
+struct VariantMemo {
+    struct Entry {
+        std::shared_ptr<SourceEntry> source;
+        std::shared_ptr<const CompiledVariant> variant;
+    };
+    static constexpr std::size_t Entries = 8;
+    std::array<Entry, Entries> entries{};
+    std::size_t next = 0;
+    VariantMemoCounts counts;
+};
+struct VariantMemoTag {};
+
+}
+
+VariantMemoCounts ThreadVariantMemoCounts() {
+    return HostThreadLocal<VariantMemo, VariantMemoTag>().counts;
+}
+
+bool PopulateVariant(const SourceHandle& handle, const RecompileRequest& request, const ResourceSnapshot& snapshot, const ResourceSpecialization& specialization, RecompileResult& result) {
+    if (handle.source == nullptr) return false;
+    if (variantMemo()) {
+        auto& memo = HostThreadLocal<VariantMemo, VariantMemoTag>();
+        const CompiledVariant* found = nullptr;
+        for (const auto& entry : memo.entries) {
+            if (entry.source.get() == handle.source.get() && entry.variant != nullptr && sameLayout(entry.variant->layout, request.layout) && entry.variant->specialization == specialization) {
+                found = entry.variant.get();
+                break;
+            }
+        }
+        if (found != nullptr) {
+            ++memo.counts.hits;
+        } else {
+            std::shared_ptr<const CompiledVariant> variant;
+            {
+                std::lock_guard lock(handle.source->mutex);
+                for (const auto& candidate : handle.source->variants) {
+                    if (sameLayout(candidate->layout, request.layout) && candidate->specialization == specialization) {
+                        variant = candidate;
+                        break;
+                    }
+                }
+            }
+            ++memo.counts.misses;
+            if (variant == nullptr) return false;
+            found = variant.get();
+            memo.entries[memo.next] = {handle.source, std::move(variant)};
+            memo.next = (memo.next + 1) % VariantMemo::Entries;
+        }
+        // The memo entry holds the variant past this call (a later miss replaces it only after
+        // this call returned).
+        materializeResultInto(*found, request, snapshot, result);
+        return true;
+    }
+    std::shared_ptr<const CompiledVariant> variant;
+    {
+        std::lock_guard lock(handle.source->mutex);
+        for (const auto& candidate : handle.source->variants) {
+            if (sameLayout(candidate->layout, request.layout) && candidate->specialization == specialization) {
+                variant = candidate;
+                break;
+            }
+        }
+    }
+    if (variant == nullptr) return false;
+    result = materializeResult(*variant, request, snapshot);
+    return true;
 }
 
 RecompileResult Recompile(const RecompileRequest& request) {
