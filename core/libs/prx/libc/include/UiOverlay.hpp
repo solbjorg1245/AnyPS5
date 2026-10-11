@@ -36,6 +36,10 @@ namespace UiOverlay {
 inline constexpr const char* DirectoryName = "ui";
 inline constexpr const char* HideVisualModeRowSwitch = "APS5_HIDE_VISUAL_MODE_ROW";
 inline constexpr const char* ViewAsTouchPadSwitch = "APS5_VIEW_AS_TOUCHPAD";
+// Debug aid: APS5_BUTTON_ICONS_PROBE=<names> (e.g. cross,circle: a SteamDeckGlyphs name without ps4_,
+// button_ and .ctxr) writes those textures through the overlay unchanged, to tell a load-path fault from
+// a content one.
+inline constexpr const char* ButtonIconsProbeSwitch = "APS5_BUTTON_ICONS_PROBE";
 
 inline std::uint32_t ReadU32(std::string_view bytes, std::size_t offset) {
     std::uint32_t value = 0;
@@ -92,10 +96,10 @@ inline constexpr std::array<std::array<std::uint32_t, 2>, GlyphLevels - 1> Glyph
 
 inline std::uint32_t LevelSize(std::uint32_t level) { return std::max(GlyphSize >> level, 1u); }
 
-// The surface bytes of a mip chain: levels[n] holds LevelSize(n)^2 texels row by row, each R, G, B, A
-// from the low byte up.
-inline std::string GlyphSurface(const std::array<std::vector<std::uint32_t>, GlyphLevels>& levels) {
-    std::string surface(GlyphSurfaceBytes, '\0');
+// The surface bytes of a mip chain written over `surface` (the original's, so the bytes no level covers
+// stay as the title has them): levels[n] holds LevelSize(n)^2 texels row by row, each R, G, B, A from the
+// low byte up.
+inline std::string GlyphSurface(const std::array<std::vector<std::uint32_t>, GlyphLevels>& levels, std::string surface = std::string(GlyphSurfaceBytes, '\0')) {
     for (std::uint32_t level = 0; level < GlyphLevels; ++level) {
         const auto size = LevelSize(level);
         for (std::uint32_t y = 0; y < size; ++y) {
@@ -226,11 +230,12 @@ inline std::vector<std::uint32_t> RenderGlyph(Glyph glyph, std::uint32_t size) {
     return texels;
 }
 
-// The replacement file: the original's header (checked by IsGlyphTexture) and the glyph's surface.
+// The replacement file: the original's header (checked by IsGlyphTexture) and its surface with the glyph's
+// levels written in.
 inline std::string GlyphTexture(std::string_view original, Glyph glyph) {
     std::array<std::vector<std::uint32_t>, GlyphLevels> levels;
     for (std::uint32_t level = 0; level < GlyphLevels; ++level) levels[level] = RenderGlyph(glyph, LevelSize(level));
-    return std::string(original.substr(0, CtxrHeaderBytes)) + GlyphSurface(levels);
+    return std::string(original.substr(0, CtxrHeaderBytes)) + GlyphSurface(levels, std::string(original.substr(CtxrHeaderBytes)));
 }
 
 // The Steam Deck's View button (SDL Back; no PlayStation button reaches it otherwise, and a DualSense's
