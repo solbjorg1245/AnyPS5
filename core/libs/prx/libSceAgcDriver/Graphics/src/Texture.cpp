@@ -4239,6 +4239,13 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             // The kept blocks alone pass through the retiler (windows of their slices).
             shadowImport = import;
             const auto storedBytes = writeBackWindows(*import, keep, firstStored, lastStored, shadowed, imported);
+            // APS5_LATE_LAND_CHECK: the pieces stored into the import land when their batch runs (or
+            // landed, without a recorder), over any CPU store since the keep decision.
+            if (auto* recorder = Recorder::Active()) {
+                for (const auto& [from, to] : imported) recorder->NoteLateLand(GuestMemory::LateLandKind::TextureStore, from, to, decided, flushReason);
+            } else {
+                for (const auto& [from, to] : imported) GuestMemory::CheckLandedNow(GuestMemory::LateLandKind::TextureStore, from, to, decided, flushReason);
+            }
             countStorageWriteBack(storedBytes, true);
             if (profile) Profile().storageGpu += timer.lap();
             originalValid = false;
@@ -4368,10 +4375,12 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &stored, 0, nullptr, 1, &backToGeneral);
         if (batch) {
             batch->SubmitAndWait();
+            for (const auto& [from, to] : keep) GuestMemory::CheckLandedNow(GuestMemory::LateLandKind::TextureStore, from, to, decided, flushReason);
         } else {
             recorder->EndGpuTiming(timing, storedBytes);
             recorder->MarkShaderReadsCovered();
             recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored), Recorder::WriteKind::TextureStore);
+            for (const auto& [from, to] : keep) recorder->NoteLateLand(GuestMemory::LateLandKind::TextureStore, from, to, decided, flushReason);
         }
         countStorageWriteBack(storedBytes, true);
         if (profile) Profile().storageGpu += timer.lap();

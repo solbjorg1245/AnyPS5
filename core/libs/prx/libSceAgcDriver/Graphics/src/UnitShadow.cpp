@@ -241,8 +241,9 @@ struct SlabCopies {
 };
 
 // Records the copies as one command group into the active recorder's open batch (a waited batch
-// without one). `ranges` are the guest ranges copied, for the note and the hazard tracker.
-void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copies, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t bytes) {
+// without one). `ranges` are the guest ranges copied, for the note and the hazard tracker; `decided`
+// the generation the publish chose them at and `reason` its name (APS5_LATE_LAND_CHECK).
+void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copies, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t bytes, std::uint64_t decided, const char* reason) {
     const auto& context = shadow.context;
     using CommandClass = Recorder::CommandClass;
     auto* recorder = Recorder::Active();
@@ -276,6 +277,7 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     Recorder::CountBarriers(CommandClass::ShadowPublish);
     if (batch) {
         batch->SubmitAndWait();
+        for (const auto& [begin, end] : ranges) GuestMemory::CheckLandedNow(GuestMemory::LateLandKind::ShadowPublish, begin, end, decided, reason);
         return;
     }
     recorder->EndGpuTiming(timing, bytes);
@@ -283,6 +285,7 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     for (const auto& entry : copies) recorder->Keep(entry.slab);
     // CPU readers reach the import's bytes only after the hook's SyncThrough waits by this note.
     recorder->NotePendingWrites(ranges, Recorder::WriteKind::ShadowPublish);
+    for (const auto& [begin, end] : ranges) recorder->NoteLateLand(GuestMemory::LateLandKind::ShadowPublish, begin, end, decided, reason);
 }
 
 // APS5_SHADOW_VERIFY=1: the published bytes read back from the slabs equal the guest bytes.
@@ -502,7 +505,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         landOnCpu(*shadow, cpuCopies, decided);
     }
     if (ranges.empty()) return units;
-    recordCopies(*shadow, copies, ranges, bytes);
+    recordCopies(*shadow, copies, ranges, bytes, decided, ReasonNames[static_cast<std::size_t>(reason)]);
     if (!wouldLand.empty()) {
         // APS5_KEEP_CPU_STORES=0: what the CPU would have kept of the late pieces, counted ("would
         // keep") from the stamps collected by the time their copy's batch finishes (no walk here).

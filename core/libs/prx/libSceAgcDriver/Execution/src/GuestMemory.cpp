@@ -353,7 +353,7 @@ public:
         std::fprintf(stderr, " collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
         std::fprintf(stderr, " collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
         std::fprintf(stderr, " | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
-        std::fprintf(stderr, " %s | %s", FreedStoreSummary().c_str(), KeptCpuStoreSummary().c_str());
+        std::fprintf(stderr, " %s | %s | %s", FreedStoreSummary().c_str(), KeptCpuStoreSummary().c_str(), LateLandSummary().c_str());
         {
             std::lock_guard lock(state.callersMutex);
             std::fprintf(stderr, " | read callers:");
@@ -3009,6 +3009,116 @@ std::string KeptCpuStoreSummary() {
     auto used = static_cast<std::size_t>(std::snprintf(text, sizeof(text), "late stores over CPU-stored pages: %s %llu (%llu KiB) by kind", KeepCpuStores() ? "kept" : "would keep", static_cast<unsigned long long>(count), static_cast<unsigned long long>(bytes / 1024)));
     for (std::size_t k = 0; k < LateKindCount && used < sizeof(text); ++k) {
         used += static_cast<std::size_t>(std::snprintf(text + used, sizeof(text) - used, " %s %llu (%llu KiB)", LateKindNames[k], static_cast<unsigned long long>(keptStores[k].load(std::memory_order_relaxed)), static_cast<unsigned long long>(keptStoreBytes[k].load(std::memory_order_relaxed) / 1024)));
+    }
+    return text;
+}
+
+namespace {
+
+constexpr std::size_t LandKindCount = static_cast<std::size_t>(LateLandKind::Count);
+constexpr std::size_t LandPhaseCount = static_cast<std::size_t>(LateLandPhase::Count);
+constexpr const char* LandKindNames[LandKindCount] = {"shadow", "texture-store", "dcc-keys", "fill", "copy"};
+constexpr const char* LandPhaseNames[LandPhaseCount] = {"before submit", "in flight", "waited"};
+// APS5_LATE_LAND_CHECK: -1 until read from the environment (SetLateLandLevel overrides it).
+std::atomic<int> lateLandLevel{-1};
+std::atomic<std::uint64_t> landsChecked{0};
+std::atomic<std::uint64_t> landChecks{0};
+std::atomic<std::uint64_t> landCheckNs{0};
+std::array<std::array<std::atomic<std::uint64_t>, LandKindCount>, LandPhaseCount> landHits{};
+std::array<std::array<std::atomic<std::uint64_t>, LandKindCount>, LandPhaseCount> landHitBytes{};
+// The [late-land] lines: the first 24 hits, then one per kind per 10 s.
+std::atomic<int> landLinesLeft{24};
+std::array<std::atomic<std::uint64_t>, LandKindCount> landLineMs{};
+
+}
+
+int LateLandLevel() {
+    auto value = lateLandLevel.load(std::memory_order_relaxed);
+    if (value < 0) {
+        const char* text = std::getenv("APS5_LATE_LAND_CHECK");
+        value = text == nullptr ? 1 : std::clamp(std::atoi(text), 0, 2);
+        lateLandLevel.store(value, std::memory_order_relaxed);
+    }
+    return value;
+}
+
+void SetLateLandLevel(int level) {
+    lateLandLevel.store(std::clamp(level, 0, 2), std::memory_order_relaxed);
+}
+
+bool LateLandChecked(LateLandKind kind) {
+    const auto level = LateLandLevel();
+    return level >= 2 || (level == 1 && kind != LateLandKind::Fill && kind != LateLandKind::Copy);
+}
+
+LateLand MakeLateLand(LateLandKind kind, std::uint64_t begin, std::uint64_t end, std::uint64_t generation, const char* reason) {
+    LateLand land;
+    land.begin = begin;
+    land.end = end;
+    land.generation = generation;
+    land.kind = kind;
+    land.reason = reason;
+    land.packet = CurrentPacket();
+    land.notedMs = StoreClockMs();
+    return land;
+}
+
+std::uint64_t CheckLateLand(const LateLand& land, LateLandPhase phase, std::uint64_t since, std::uint64_t serial) {
+    if (land.end <= land.begin || !LateLandChecked(land.kind)) return 0;
+    const auto start = std::chrono::steady_clock::now();
+    const auto bytes = static_cast<std::size_t>(land.end - land.begin);
+    // Once the GPU may have landed, the CPU's stores since are stamped only by a walk.
+    if (phase != LateLandPhase::Submit) CollectWritesUncached(land.begin, bytes);
+    const auto from = std::max(land.generation, since);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    const auto stored = CpuStoredRuns(land.begin, bytes, from, runs);
+    if (phase != LateLandPhase::Finish) landsChecked.fetch_add(1, std::memory_order_relaxed);
+    landChecks.fetch_add(1, std::memory_order_relaxed);
+    landCheckNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    if (stored == 0) return 0;
+    const auto p = static_cast<std::size_t>(phase);
+    const auto k = static_cast<std::size_t>(land.kind);
+    landHits[p][k].fetch_add(1, std::memory_order_relaxed);
+    landHitBytes[p][k].fetch_add(stored, std::memory_order_relaxed);
+    if (!MemoryProfiled()) return stored;
+    const auto now = StoreClockMs();
+    bool print = landLinesLeft.load(std::memory_order_relaxed) > 0 && landLinesLeft.fetch_sub(1, std::memory_order_relaxed) > 0;
+    if (!print) {
+        auto last = landLineMs[k].load(std::memory_order_relaxed);
+        print = now - std::min(now, last) >= 10000 && landLineMs[k].compare_exchange_strong(last, now);
+    }
+    if (!print) return stored;
+    std::fprintf(stderr, "[late-land] %s %s 0x%llx+0x%llx (%s): %llu KiB CPU-stored since gen %llu (decided %llu, now %llu) in %zu runs, first 0x%llx+0x%llx; batch %llu, packet 0x%x queue 0x%x, noted %llu ms ago\n", LandKindNames[k], LandPhaseNames[p], static_cast<unsigned long long>(land.begin), static_cast<unsigned long long>(land.end - land.begin), land.reason != nullptr ? land.reason : "-", static_cast<unsigned long long>((stored + 1023) / 1024), static_cast<unsigned long long>(from), static_cast<unsigned long long>(land.generation), static_cast<unsigned long long>(TrackerGeneration()), runs.size(), static_cast<unsigned long long>(runs.front().first), static_cast<unsigned long long>(runs.front().second - runs.front().first), static_cast<unsigned long long>(serial), land.packet.opcode, land.packet.queue, static_cast<unsigned long long>(now - std::min(now, land.notedMs)));
+    return stored;
+}
+
+std::uint64_t CheckLandedNow(LateLandKind kind, std::uint64_t begin, std::uint64_t end, std::uint64_t generation, const char* reason) {
+    if (end <= begin || generation == 0 || !LateLandChecked(kind)) return 0;
+    return CheckLateLand(MakeLateLand(kind, begin, end, generation, reason), LateLandPhase::Waited, 0, 0);
+}
+
+std::string LateLandSummary() {
+    if (LateLandLevel() == 0) return "late lands over CPU stores: off";
+    char text[512];
+    auto used = static_cast<std::size_t>(std::snprintf(text, sizeof(text), "late lands over CPU stores: checked %llu lands (%llu checks, %.0f ms);", static_cast<unsigned long long>(landsChecked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(landChecks.load(std::memory_order_relaxed)), landCheckNs.load(std::memory_order_relaxed) / 1e6));
+    std::array<std::uint64_t, LandKindCount> kindHits{};
+    std::array<std::uint64_t, LandKindCount> kindBytes{};
+    for (std::size_t p = 0; p < LandPhaseCount && used < sizeof(text); ++p) {
+        std::uint64_t hits = 0;
+        std::uint64_t bytes = 0;
+        for (std::size_t k = 0; k < LandKindCount; ++k) {
+            const auto h = landHits[p][k].load(std::memory_order_relaxed);
+            const auto b = landHitBytes[p][k].load(std::memory_order_relaxed);
+            hits += h;
+            bytes += b;
+            kindHits[k] += h;
+            kindBytes[k] += b;
+        }
+        used += static_cast<std::size_t>(std::snprintf(text + used, sizeof(text) - used, "%s %s %llu (%llu KiB)", p == 0 ? "" : ",", LandPhaseNames[p], static_cast<unsigned long long>(hits), static_cast<unsigned long long>(bytes / 1024)));
+    }
+    if (used < sizeof(text)) used += static_cast<std::size_t>(std::snprintf(text + used, sizeof(text) - used, "; by kind"));
+    for (std::size_t k = 0; k < LandKindCount && used < sizeof(text); ++k) {
+        used += static_cast<std::size_t>(std::snprintf(text + used, sizeof(text) - used, " %s %llu (%llu KiB)", LandKindNames[k], static_cast<unsigned long long>(kindHits[k]), static_cast<unsigned long long>(kindBytes[k] / 1024)));
     }
     return text;
 }
