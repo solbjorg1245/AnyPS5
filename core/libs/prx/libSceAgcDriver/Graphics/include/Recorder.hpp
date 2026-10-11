@@ -270,6 +270,8 @@ public:
         std::uint32_t uses = 0;
         std::uint32_t verifyEvery = 0;
         std::uint64_t limitBytes = 0;
+        // APS5_RESIDENT_WRITES_ROUND (default 1): a promoted range rounded out to 64 KiB.
+        bool roundOut = true;
     };
     bool KeepsResidentWrites() const { return residentWrites.enabled && NarrowsCopyBacks(); }
     const ResidentWriteSettings& ResidentWrites() const { return residentWrites; }

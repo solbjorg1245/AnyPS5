@@ -3460,9 +3460,11 @@ bool GuestBufferMemory::noteResidentCandidates(Recorder& recorder) {
         const auto bytes = region.end - region.begin;
         if (region.direct == nullptr || region.residentWrite != nullptr || region.sparse || region.mirror != nullptr || residentWriteOver(region.begin, region.end, true) != nullptr) continue;
         if (!WritesOverlap(region.begin, static_cast<std::size_t>(bytes)) || writtenSizeReason(bytes, region.atomic) != InPlaceWriteCensus::Reason::TooLarge) continue;
-        // 64 KiB aligned where its import holds that much around it, else the region itself.
-        auto begin = region.begin & ~std::uint64_t{0xFFFF};
-        auto end = (region.end + 0xFFFF) & ~std::uint64_t{0xFFFF};
+        // 64 KiB aligned where its import holds that much around it, else the region itself
+        // (always the region itself with APS5_RESIDENT_WRITES_ROUND=0: a neighbour inside the margin
+        // straddles a rounded range and leaves the build unbindable).
+        auto begin = settings.roundOut ? region.begin & ~std::uint64_t{0xFFFF} : region.begin;
+        auto end = settings.roundOut ? (region.end + 0xFFFF) & ~std::uint64_t{0xFFFF} : region.end;
         if (!HostImportCovers(context, begin, static_cast<std::size_t>(end - begin))) {
             begin = region.begin;
             end = region.end;
@@ -3577,7 +3579,9 @@ void GuestBufferMemory::queueResidentLands(Recorder& recorder, bool defer) {
 }
 
 // After a use's marks (W4): its own notes and stamps over a range it wrote are D's writes, which
-// its queued land carries: D's sync moves past them.
+// its queued land carries: D's sync moves past them. A CPU store another thread's collect stamped
+// since the use's check (the absorb window) is not the use's own: it leaves a refresh owed (and
+// counts as both, D being dirty) before the sync moves past it.
 void GuestBufferMemory::absorbResidentWrites() const {
     const ResidentWrite* last = nullptr;
     std::uint64_t generation = 0;
@@ -3585,6 +3589,10 @@ void GuestBufferMemory::absorbResidentWrites() const {
         auto* range = region.residentWrite.get();
         if (range == nullptr || range == last || !WritesOverlap(range->begin, static_cast<std::size_t>(range->end - range->begin))) continue;
         last = range;
+        if (cpuStoredSince(*range)) {
+            ++residentWrites().counts.both;
+            if (range->refresh == RefreshNone) range->refresh = RefreshStamp;
+        }
         if (generation == 0) generation = GuestMemory::TrackerGeneration();
         range->synced = generation;
         range->notesSeen = range->notes;

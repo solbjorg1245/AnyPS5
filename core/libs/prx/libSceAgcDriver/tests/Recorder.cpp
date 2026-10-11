@@ -5632,6 +5632,23 @@ void residentWriteTests(const Device& device, Recorder& recorder) {
     auto eighth = build();
     expect(&ResidentWriteStatistics::both, 1, "both-sides changes");
     Require(boundByte(*eighth, 30000) == 0x3A && boundByte(*eighth, 24576) == 0xE5 && guest[at + 24576] == 0xE5 && guest[at + 30000] == 0x3A, "(w) a store of one side was lost");
+    // The absorb window: a CPU store another thread's collect stamps after the use's land was queued
+    // and before its marks is not the use's own write: the marks leave a refresh owed (counted
+    // `both`, D being dirty), so the next use's D holds it.
+    auto ninth = build();
+    store(*ninth, 36864, 0xF6F6F6F6u);
+    counts = ResidentWriteCounts();
+    ninth->RecordCopyBacks(writes);
+    writes.ReleaseClaims();
+    writes.NotePendingWrites(ninth->Writes(), Recorder::WriteKind::ShaderWrite);
+    guest[at + 40000] = 0x77;
+    AgcDriver::GuestMemory::CollectWritesUncached(address + at + 40000, 1);
+    ninth->MarkDirectWrites();
+    expect(&ResidentWriteStatistics::both, 1, "both-sides changes in the absorb window");
+    auto tenth = build();
+    expect(&ResidentWriteStatistics::refreshStamp, 1, "refreshes after a store in the absorb window");
+    expect(&ResidentWriteStatistics::both, 1, "both-sides changes (the next check must not count the absorbed store again)");
+    Require(boundByte(*tenth, 40000) == 0x77 && boundByte(*tenth, 36864) == 0xF6 && guest[at + 36864] == 0xF6 && guest[at + 40000] == 0x77, "(w) the device copy missed a store collected in the absorb window");
     // A changed import (the block registered again): the range is demoted, the build in place.
     second.reset();
     third.reset();
@@ -5640,6 +5657,8 @@ void residentWriteTests(const Device& device, Recorder& recorder) {
     sixth.reset();
     seventh.reset();
     eighth.reset();
+    ninth.reset();
+    tenth.reset();
     writes.Sync();
     {
         GuestAllocations::Mutation mutation;

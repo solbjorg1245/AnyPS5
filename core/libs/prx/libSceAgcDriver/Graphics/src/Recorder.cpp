@@ -1315,6 +1315,7 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
         residentWrites.limitBytes = number("APS5_RESIDENT_WRITES_MIB", 512) << 20u;
         const auto verify = number("APS5_RESIDENT_WRITES_VERIFY", 0);
         residentWrites.verifyEvery = static_cast<std::uint32_t>(verify == 1 ? 16 : verify);
+        residentWrites.roundOut = number("APS5_RESIDENT_WRITES_ROUND", 1) != 0;
     }
     // The compare pass and the shadows' baselines are addressed by buffer device address.
     if (narrowCopyBacks && ((!coalesceCopyBacks && DeferCopyBacks()) || !context.bufferDeviceAddress)) narrowCopyBacks = false;
