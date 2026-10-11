@@ -2478,7 +2478,7 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     Require(firstSlab->pins.load() == 2 && half->pin != nullptr, "destinations do not pin their slab");
     // The retile as writeBackWindows records it: the seed, then the piece's bytes over its half.
     const auto copyBuffer = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
-    const auto retile = [&](const ShadowDestination& destination, std::uint64_t begin, std::uint64_t length, std::uint8_t value, bool seed) {
+    const auto retile = [&](const ShadowDestination& destination, std::uint64_t begin, std::uint64_t length, std::uint8_t value, bool seed, bool mark = true) {
         auto pattern = std::make_shared<Buffer>(context, static_cast<std::size_t>(length), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         std::memset(pattern->Bytes().data(), value, pattern->Bytes().size());
         const auto commands = recorder.Commands();
@@ -2494,7 +2494,10 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
         copyBuffer(commands, pattern->Handle(), destination.buffer, 1, &piece);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-        const ShadowedRange range{begin & ~(unit - 1), (begin & ~(unit - 1)) + unit, destination.slab};
+        // The piece's own extent, as writeBackWindows marks it (a stale unit publishes only the
+        // retiled pages); `mark` false leaves bytes in the slab no retile marked.
+        if (!mark) return;
+        const ShadowedRange range{begin, begin + length, destination.slab};
         MarkShadowed(*import, std::span(&range, 1), TrackerGeneration());
     };
     retile(*half, unit3, unit / 2, 0x22, true);
@@ -2536,13 +2539,48 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
     Require(words[3 * unit] == 0x33 && words[4 * unit - 1] == 0x33 && words[4 * unit] == 0x11, "the partial publish's bytes are wrong");
     // A CPU write into a page of unit 4 makes it stale: the publish collects the unit itself (no
-    // walk saw the store before it), copies nothing and drops it.
+    // walk saw the store before it) and drops it. The pages the store missed still publish the
+    // retile's bytes (APS5_FIX_BOOT_STRIP; =0 or APS5_NO_EDGE_PAGE_KEEP: nothing is copied).
+    const char* bootStrip = std::getenv("APS5_FIX_BOOT_STRIP");
+    const bool pageKeep = (bootStrip == nullptr || std::string(bootStrip) != "0") && std::getenv("APS5_NO_EDGE_PAGE_KEEP") == nullptr;
     static_cast<void>(CollectWritesUncached(unit4, unit));
     *static_cast<volatile std::uint8_t*>(static_cast<void*>(static_cast<std::uint8_t*>(block) + 4 * unit + 4096)) = 0x55;
-    Require(PublishShadow(unit4, unit, PublishScope::Whole, PublishReason::Hook) == 0, "a stale unit was published");
+    Require(PublishShadow(unit4, unit, PublishScope::Whole, PublishReason::Hook) == (pageKeep ? 1u : 0u), pageKeep ? "a stale unit's unstored pages were not published" : "a stale unit was published");
     Require(!AnyShadowedOverlaps(unit4, unit), "a stale unit still counts as shadowed after its publish");
     recorder.Sync();
-    Require(words[4 * unit + 4096] == 0x55 && words[4 * unit] == 0x11, "a stale unit's publish overwrote the CPU's bytes");
+    Require(words[4 * unit + 4096] == 0x55 && words[4 * unit + 4096 + 1] == 0x11, "a stale unit's publish overwrote the CPU's page");
+    const std::uint8_t unstored = pageKeep ? 0x44 : 0x11;
+    Require(words[4 * unit] == unstored && words[4 * unit + 4095] == unstored && words[4 * unit + 2 * 4096] == unstored && words[5 * unit - 1] == unstored && words[5 * unit] == 0x11, "a stale unit's unstored pages are wrong");
+    {
+        // A half-unit retile whose seeded half holds bytes older than the import (0x99 stands in
+        // for the table a CPU store after the publish's collect rewrote): a stale publish copies
+        // the retiled pages the store missed, never the seeded ones.
+        const auto unit20 = address + 20 * unit;
+        static_cast<void>(CollectWritesUncached(unit20, 2 * unit));
+        auto lower = ShadowDestinationFor(context, *import, unit20, unit20 + unit / 2);
+        Require(lower.has_value() && lower->seedUnits.size() == 1, "unit 20's half retile does not seed");
+        retile(*lower, unit20, unit / 2, 0x77, true);
+        retile(*lower, unit20 + unit / 2, unit / 2, 0x99, false, false);
+        lower.reset();
+        *static_cast<volatile std::uint8_t*>(static_cast<void*>(static_cast<std::uint8_t*>(block) + 20 * unit + 4096 + 8)) = 0x56;
+        Require(PublishShadow(unit20, unit, PublishScope::Whole, PublishReason::Hook) == (pageKeep ? 1u : 0u), "a stale half-retiled unit's publish count is wrong");
+        recorder.Sync();
+        const std::uint8_t retiled = pageKeep ? 0x77 : 0x11;
+        Require(words[20 * unit + 4096 + 8] == 0x56 && words[20 * unit + 4096] == 0x11, "a stale half-retiled unit's publish overwrote the CPU's page");
+        Require(words[20 * unit] == retiled && words[20 * unit + 2 * 4096] == retiled && words[20 * unit + unit / 2 - 1] == retiled, "a stale half-retiled unit's retiled pages are wrong");
+        Require(words[20 * unit + unit / 2] == 0x11 && words[21 * unit - 1] == 0x11, "a stale unit published its seeded pages");
+        // A whole-block driver store into a retiled unit leaves nothing to publish.
+        const auto unit21 = unit20 + unit;
+        auto next = ShadowDestinationFor(context, *import, unit21, unit21 + unit);
+        Require(next.has_value() && next->seedUnits.empty(), "unit 21's whole retile seeds");
+        retile(*next, unit21, unit, 0x7a, false);
+        next.reset();
+        MarkWritten(unit21, unit);
+        Require(PublishShadow(unit21, unit, PublishScope::Whole, PublishReason::Hook) == 0, "a unit a whole-block driver store reached was published");
+        Require(!AnyShadowedOverlaps(unit21, unit), "a unit a driver store reached still counts as shadowed");
+        recorder.Sync();
+        Require(words[21 * unit] == 0x11 && words[22 * unit - 1] == 0x11, "a driver-stored unit's publish overwrote the import");
+    }
     // The slab boundary: a piece over units 127 and 128 is refused, each alone lands in its slab.
     const auto unit127 = address + 127 * unit;
     const auto unit128 = unit127 + unit;
@@ -4346,6 +4384,84 @@ void sharedViewGuardTests() {
 #endif
 }
 
+// Fine write tracking of shared views (APS5_FIX_BOOT_STRIP, WindowsMappings::TrackParts): a store
+// into a 16 KiB view page reports the whole page; once the page is tracked fine a store opens and
+// reports only its own 4 KiB part, the others staying armed, and a collect arms the part again; a
+// page written when made fine reports every part once; TrackEdgeParts makes fine only the view
+// pages a range covers in part.
+void sharedViewFineTrackingTests() {
+#ifdef _WIN32
+    if (!AgcDriver::GuestMemory::WriteWatched()) {
+        std::cout << "no write-watched guest arena: fine shared view tracking not tested\n";
+        return;
+    }
+    constexpr std::size_t viewPage = 16384;
+    constexpr std::size_t part = 4096;
+    constexpr std::size_t bytes = 4 * viewPage;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, static_cast<DWORD>(bytes), nullptr);
+    Require(section != nullptr, "cannot create the fine tracking test section");
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    Require(block != nullptr, "cannot reserve the fine tracking test range");
+    GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    auto* guest = static_cast<volatile unsigned char*>(block);
+    const auto base = reinterpret_cast<std::uintptr_t>(block);
+    const auto protection = [](std::uintptr_t at) {
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) == sizeof(info), "cannot query a fine tracking test page");
+        return info.Protect;
+    };
+    // The 4 KiB pages (bit i: [base + i * 4 KiB, + 4 KiB)) a collect of the range reports.
+    const auto collect = [&](bool clear) {
+        std::array<void*, 16> pages{};
+        std::size_t count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(base, bytes, pages.data(), &count, clear), "the fine tracking test range could not be collected");
+        std::uint32_t mask = 0;
+        for (std::size_t i = 0; i < count; ++i) mask |= 1u << ((reinterpret_cast<std::uintptr_t>(pages[i]) - base) / part);
+        return mask;
+    };
+    collect(true);
+    Require(collect(true) == 0, "an armed range nobody wrote reported writes");
+    guest[3 * part + 5] = 1;
+    Require(collect(true) == 0xf, "a store into a coarse view page did not report the whole page");
+    Require(GuestArena::GuestArenaTrackWriteParts_nid_postfix(base, part) == 1, "the first view page was not made fine");
+    Require(GuestArena::GuestArenaTrackWriteParts_nid_postfix(base, viewPage) == 0, "a fine view page was made fine again");
+    Require(collect(true) == 0, "making an armed, unwritten view page fine reported writes");
+    guest[3 * part + 5] = 2;
+    Require(protection(base + 3 * part) == PAGE_READWRITE && protection(base) == PAGE_READONLY && protection(base + 2 * part) == PAGE_READONLY, "a store into a fine view page opened more than its part");
+    guest[3 * part + 6] = 3;
+    Require(collect(true) == 0x8, "a store into a fine view page reported other parts");
+    Require(protection(base + 3 * part) == PAGE_READONLY, "the collect did not arm the written part again");
+    guest[5] = 4;
+    guest[part + 5] = 5;
+    Require(collect(false) == 0x3, "two parts' stores were not told apart");
+    Require(collect(true) == 0x3, "a collect without clearing forgot the stores");
+    Require(collect(true) == 0, "collected parts reported again");
+    // Every part written: the page is open as a whole, reports every part, and is armed again by part.
+    for (std::size_t at = 0; at < viewPage; at += part) guest[at + 9] = 6;
+    Require(protection(base) == PAGE_READWRITE && protection(base + 3 * part) == PAGE_READWRITE, "a view page with every part written is not open");
+    Require(collect(true) == 0xf, "a view page with every part written did not report them");
+    Require(protection(base) == PAGE_READONLY && protection(base + 3 * part) == PAGE_READONLY, "the collect did not arm a wholly written fine page again");
+    guest[2 * part + 1] = 7;
+    Require(collect(true) == 0x4, "a fine page armed again after every part was written lost its fine tracking");
+    // A page written (coarse) before it was made fine reports every part once, then by part.
+    guest[viewPage + 3 * part] = 8;
+    Require(GuestArena::GuestArenaTrackWriteParts_nid_postfix(base + viewPage, viewPage) == 1, "the second view page was not made fine");
+    Require(collect(true) == 0xf0, "a page written before it was made fine did not report every part");
+    guest[viewPage + 3 * part + 1] = 9;
+    Require(collect(true) == 0x80, "a page made fine while written did not track by part afterwards");
+    // TrackEdgeParts: a range on view page boundaries makes none fine; one starting and ending
+    // inside view pages makes those two fine, a store next to it reporting its own part alone.
+    Require(GuestArena::GuestArenaTrackEdgeWriteParts_nid_postfix(base + 2 * viewPage, base + 4 * viewPage) == 0, "a range on view page boundaries made a page fine");
+    Require(GuestArena::GuestArenaTrackEdgeWriteParts_nid_postfix(base + 2 * viewPage + part, base + 4 * viewPage - part) == 2, "the pages a range covers in part were not made fine");
+    guest[2 * viewPage + 7] = 10;
+    guest[4 * viewPage - part + 7] = 11;
+    Require(collect(true) == ((1u << 8) | (1u << 15)), "stores next to a surface's edges were reported over the surface");
+    GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+    CloseHandle(section);
+#endif
+}
+
 // The fast ring's reclaim without a GPU wait (ReclaimFastRing; the fast draw and the fast dispatch
 // share one ring): under the GPU mutex a reaped batch's kept retirement is released only at this
 // thread's unlock, so a reap alone leaves the ring full; the reclaim completes the serials of the
@@ -5844,6 +5960,7 @@ int main() {
         narrowCopyBackTests(device, recorder);
         pageGuardTests();
         sharedViewGuardTests();
+        sharedViewFineTrackingTests();
         residentBufferTests(device, recorder);
         residentSharedViewTests(device, recorder);
         residentReadTests(device, recorder);

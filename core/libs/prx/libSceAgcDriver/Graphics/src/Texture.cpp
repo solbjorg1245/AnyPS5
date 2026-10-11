@@ -89,6 +89,22 @@ std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWrit
 // writeBackLayers), and pending units a DCC clear -> uncompressed key flip kept as the texels
 // (Refresh).
 std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKept{0};
+// Write-back edge blocks (a surface sharing its 64 KiB block) StoredOver leaves to the CPU: whole,
+// by what stored the surface's pages (PageStoreCause, counted with APS5_FIX_BOOT_STRIP), or merged
+// per page (the pages no store reached since take the GPU's results: the Bink chroma tail).
+std::atomic<std::uint64_t> edgeBlocksToCpu{0}, edgeBlocksMerged{0}, edgeGpuPages{0}, edgeFinePages{0}, edgeFineAtCreation{0};
+
+// Debug aid (APS5_TRACE_EDGE_MERGE): the first 64 surfaces whose view pages were made fine (4 KiB
+// write tracking), when, and over which range: the candidates if a fine page goes wrong.
+std::size_t traceEdgeFine(const char* when, const GuestTextureResource& descriptor, std::uint64_t guestBytes, std::uint64_t address, std::uint64_t bytes, std::size_t made) {
+    static const bool trace = std::getenv("APS5_TRACE_EDGE_MERGE") != nullptr;
+    static std::atomic<int> traced{0};
+    if (trace && made != 0 && traced.fetch_add(1, std::memory_order_relaxed) < 64) {
+        std::fprintf(stderr, "[edge-fine] %s: image 0x%llx+0x%llx (format %u, tile mode %u, %ux%u) range 0x%llx+0x%llx, %zu view pages made fine\n", when, static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned>(descriptor.format), static_cast<unsigned>(descriptor.tileMode), descriptor.width, descriptor.height, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), made);
+    }
+    return made;
+}
+std::array<std::atomic<std::uint64_t>, 5> edgeCauses{};
 // Images stored by a FlushPending after a hook skip of theirs (AccessKeptByCpu), of which by the
 // hook for the read site of the last skip; images evictStale dropped (the [hooksync] and [storage] lines).
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
@@ -337,7 +353,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
-    std::fprintf(stderr, "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
+    std::fprintf(stderr, "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu, edge blocks to the CPU %llu (cpu pages %llu, driver pages %llu, driver whole %llu, unknown %llu), edge blocks merged per page %llu (GPU pages %llu, view pages made fine %llu, at creation %llu)%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), take(edgeBlocksToCpu), take(edgeCauses[1]), take(edgeCauses[2]), take(edgeCauses[3]), take(edgeCauses[4]), take(edgeBlocksMerged), take(edgeGpuPages), take(edgeFinePages), take(edgeFineAtCreation), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
@@ -1143,6 +1159,9 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         memoryType = allocation.memoryTypeIndex;
         Check(AllocateDeviceMemory(context, allocation, &memory, VramClass::Textures), "vkAllocateMemory storage texture");
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory storage");
+        // APS5_EARLY_EDGE_TRACKING=1 (opt-in, see TrackSurfaceEdgeParts): the view pages the surface
+        // shares with other data are tracked per 4 KiB before the first upload's collect arms them.
+        edgeFineAtCreation.fetch_add(traceEdgeFine("at creation", descriptor, guestBytes, descriptor.baseAddress, guestBytes, GuestMemory::TrackSurfaceEdgeParts(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))), std::memory_order_relaxed);
         uploadReason = "first";
         upload();
         defaultMip = mipLevel;
@@ -3862,10 +3881,85 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             const auto to = std::min(at + block, end);
             if (from >= to) continue;
             const bool edge = from != at || to != at + block;
-            if (changedBlocks[static_cast<std::size_t>((at - spanBegin) / block)] == GuestMemory::BlockWritten && (!edge || GuestMemory::StoredOver(from, static_cast<std::size_t>(to - from), layerGeneration[layer]))) {
+            const bool written = changedBlocks[static_cast<std::size_t>((at - spanBegin) / block)] == GuestMemory::BlockWritten;
+            if (written && (!edge || GuestMemory::StoredOver(from, static_cast<std::size_t>(to - from), layerGeneration[layer]))) {
                 skippedAny = true;
                 skippedLayer[layer] = true;
                 ++skipped;
+                if (!edge) continue;
+                // An edge block shares its 64 KiB with other data a store reached (the Bink chroma
+                // plane's tail and the table after it): with APS5_FIX_BOOT_STRIP the surface's pages
+                // no store reached since take the results, the stored ones stay the CPU's (and
+                // re-upload with the layer, which keeps its generation as for a kept block).
+                auto cause = GuestMemory::PageStoreCause::None;
+                std::uint32_t cpuPages = 0, driverPages = 0;
+                const auto gpuPages = GuestMemory::PagesUnstoredSince(from, static_cast<std::size_t>(to - from), layerGeneration[layer], &cause, &cpuPages, &driverPages);
+                std::uint32_t surfacePages = 0;
+                for (auto p = (from - at) / GuestMemory::UnstoredPageBytes; p <= (to - 1 - at) / GuestMemory::UnstoredPageBytes; ++p) surfacePages |= 1u << p;
+                // CPU-stamped surface pages may be a 16 KiB shared-view stamp over the CPU data next
+                // door: from now on such pages are tracked per 4 KiB (TrackEdgeParts).
+                if (const auto cpuSurface = cpuPages & surfacePages; cpuSurface != 0) {
+                    const auto low = static_cast<std::uint64_t>(std::countr_zero(cpuSurface));
+                    const auto high = static_cast<std::uint64_t>(31 - std::countl_zero(cpuSurface));
+                    const auto fineAt = at + low * GuestMemory::UnstoredPageBytes;
+                    const auto fineBytes = (high - low + 1) * GuestMemory::UnstoredPageBytes;
+                    edgeFinePages.fetch_add(traceEdgeFine("after a merge", descriptor, guestBytes, fineAt, fineBytes, GuestMemory::TrackEdgeParts(fineAt, static_cast<std::size_t>(fineBytes))), std::memory_order_relaxed);
+                }
+                // Debug aid: APS5_TRACE_EDGE_MERGE names the first 64 edge blocks whose surface pages
+                // a store record keeps from the results (block, surface pages, GPU pages, CPU and
+                // driver page masks, the layer's generation).
+                static const bool traceEdge = std::getenv("APS5_TRACE_EDGE_MERGE") != nullptr;
+                static std::atomic<int> edgeTraced{0};
+                if (traceEdge) {
+                    if (gpuPages != surfacePages && edgeTraced.fetch_add(1, std::memory_order_relaxed) < 64) {
+                        std::fprintf(stderr, "[edge-merge] image 0x%llx+0x%llx layer %u block 0x%llx surface %04x gpu %04x cpu %04x driver %04x cause %u generation %llu\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), layer, static_cast<unsigned long long>(at), surfacePages, gpuPages, cpuPages, driverPages, static_cast<unsigned>(cause), static_cast<unsigned long long>(layerGeneration[layer]));
+                    }
+                    // APS5_TRACE_EDGE_DUMP=<dir> also saves the whole 64 KiB block's guest bytes for the
+                    // first 32 such blocks whose surface pages the CPU stored to (what the CPU wrote).
+                    // APS5_TRACE_EDGE_WATCH arms a one-shot write trap on those pages ([edge-watch]).
+                    static const bool watchEdge = std::getenv("APS5_TRACE_EDGE_WATCH") != nullptr;
+                    static std::atomic<int> edgeArmed{0};
+                    const auto cpuSurface = cpuPages & surfacePages;
+                    if (watchEdge && cpuSurface != 0 && edgeArmed.fetch_add(1, std::memory_order_relaxed) < 48) {
+                        const auto low = static_cast<std::uint64_t>(std::countr_zero(cpuSurface));
+                        const auto high = static_cast<std::uint64_t>(31 - std::countl_zero(cpuSurface));
+                        GuestMemory::ArmEdgeWatch(at + low * GuestMemory::UnstoredPageBytes, static_cast<std::size_t>((high - low + 1) * GuestMemory::UnstoredPageBytes));
+                    }
+                    static const char* dumpDir = std::getenv("APS5_TRACE_EDGE_DUMP");
+                    static std::atomic<int> edgeDumped{0};
+                    if (dumpDir != nullptr && (cpuPages & surfacePages) != 0) {
+                        const auto n = edgeDumped.fetch_add(1, std::memory_order_relaxed);
+                        if (n < 32) {
+                            char name[512];
+                            std::snprintf(name, sizeof(name), "%s/edge_%llx_%02d_g%llu.bin", dumpDir, static_cast<unsigned long long>(at), n, static_cast<unsigned long long>(layerGeneration[layer]));
+                            if (auto* file = std::fopen(name, "wb")) {
+                                std::fwrite(reinterpret_cast<const void*>(at), 1, static_cast<std::size_t>(block), file);
+                                std::fclose(file);
+                            }
+                        }
+                    }
+                }
+                if (gpuPages == 0) {
+                    edgeBlocksToCpu.fetch_add(1, std::memory_order_relaxed);
+                    edgeCauses[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                constexpr std::uint64_t page = GuestMemory::UnstoredPageBytes;
+                for (std::uint64_t run = 0; run < block / page;) {
+                    if ((gpuPages >> run & 1u) == 0) {
+                        ++run;
+                        continue;
+                    }
+                    auto stop = run;
+                    while (stop < block / page && (gpuPages >> stop & 1u) != 0) ++stop;
+                    const auto pieceFrom = std::max(from, at + run * page);
+                    const auto pieceTo = std::min(to, at + stop * page);
+                    if (!keep.empty() && keep.back().second == pieceFrom) keep.back().second = pieceTo;
+                    else keep.emplace_back(pieceFrom, pieceTo);
+                    run = stop;
+                }
+                edgeBlocksMerged.fetch_add(1, std::memory_order_relaxed);
+                edgeGpuPages.fetch_add(static_cast<std::uint64_t>(std::popcount(gpuPages)), std::memory_order_relaxed);
                 continue;
             }
             if (!keep.empty() && keep.back().second == from) keep.back().second = to;
