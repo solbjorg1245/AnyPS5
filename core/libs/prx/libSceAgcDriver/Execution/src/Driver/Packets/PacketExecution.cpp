@@ -187,6 +187,8 @@ void Driver::execute(const Submission& submission) {
     static const bool profilePackets = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     // APS5_FAST_CENSUS (with APS5_PROFILE_DRAW): each packet's effect on a run of fast-eligible draws (F0).
     static const bool fastCensus = FastCensusActive();
+    // APS5_PROFILE_DRAW: each queue-0 packet in the recording-pipe census (parallel-recording.md stage 0).
+    static const bool pipeCensus = PipeCensusActive();
 
     thread_local PacketProfile packetProfile;
     ++packetProfile.submissions;
@@ -420,9 +422,11 @@ void Driver::execute(const Submission& submission) {
         }
         if (drawPacket) Graphics::Recorder::CountRecordedWork();
         if (fastCensus) NoteFastCensusPacket(submission.queue, header, drawPacket, header == FlipPacketHeader, header == RenderingWaitPacketHeader, wroteOnGpu);
+        if (pipeCensus && submission.queue == 0) NotePipeCensusPacket(header, drawPacket, header == FlipPacketHeader, header == RenderingWaitPacketHeader, wroteOnGpu, pendingDispatchPhases().outcome);
         cursor += count;
     }
     if (fastCensus) NoteFastCensusSubmissionEnd(submission.queue);
+    if (pipeCensus && submission.queue == 0) NotePipeCensusSubmissionEnd(workerQueued() != nullptr && workerQueued()->load(std::memory_order_relaxed) != 0);
 
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;
     if (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value() || Graphics::Recorder::RecordedWorkSinceSubmit() != 0) {

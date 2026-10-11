@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include <algorithm>
 
@@ -48,6 +49,10 @@ void Driver::noteDrawWriters(std::span<const Graphics::CompiledShader> stages, s
     for (const auto& stage : stages) {
         forEachWrittenBuffer(*stage.program, [&](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool) { noteForeignWriter(begin, end, queue); });
     }
+}
+
+void Driver::notePipeCensusWrites(const ShaderRecompiler::RecompileResult& compiled) {
+    forEachWrittenBuffer(compiled, [](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool) { NotePipeCensusWrite(begin, end, false); });
 }
 
 std::optional<WrittenBuffer> Driver::newestWriterLocked(std::uint64_t begin, std::uint64_t end) const {

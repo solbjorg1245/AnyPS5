@@ -210,6 +210,116 @@ void NoteFastCensusDropped();
 void NoteFastCensusPacket(std::uint32_t queue, std::uint32_t header, bool drawPacket, bool flip, bool renderingWait, bool wroteOnGpu);
 void NoteFastCensusSubmissionEnd(std::uint32_t queue);
 
+// The recording-pipe census (docs/design/parallel-recording.md stage 0; APS5_PROFILE_DRAW, off with
+// APS5_NO_PIPE_CENSUS=1 or APS5_FAST_DRAW): the runs of queue-0 packets a recording thread could take
+// over under two policies (0: direct and GPU-indirect draws; 1: also recorded direct dispatches), the
+// drains that end them (the queue thread waits for the recording thread), and the captures that read
+// a range the open run writes (an upper bound: the whole run counts as unrecorded).
+enum class PipeCensusDrain : std::uint8_t { LabelsPending, CpuIndirect, Dispatch, IndirectDispatch, Wait, Label, Dma, Flip, Stale, Overlap, SubmissionEnd, Other, Count };
+inline constexpr std::size_t PipeCensusDrains = static_cast<std::size_t>(PipeCensusDrain::Count);
+inline constexpr std::array<const char*, PipeCensusDrains> PipeCensusDrainNames{"labels pending", "cpu indirect", "dispatch", "indirect dispatch", "wait", "label", "dma", "flip", "stale", "overlap", "submission end", "other"};
+// How a draw packet took the GPU lock (None: it recorded nothing; Stale: a SnapshotStale retry; Other:
+// the CB metadata pass, a locked prepare) and what a DISPATCH_DIRECT did (Copy: the HLE; Other: fast).
+enum class PipeCensusLock : std::uint8_t { None, Direct, CpuIndirect, Stale, Other };
+enum class PipeCensusDispatch : std::uint8_t { None, Recorded, Copy, Other };
+enum class DispatchOutcome : std::size_t;
+
+// A queue-0 packet as the hooks saw it; labelsPending: deferred labels record inside its lock.
+struct PipeCensusPacket {
+    std::uint32_t header = 0;
+    bool drawPacket = false, flip = false, renderingWait = false, wroteOnGpu = false;
+    PipeCensusLock lock = PipeCensusLock::None;
+    PipeCensusDispatch dispatch = PipeCensusDispatch::None;
+    bool labelsPending = false;
+};
+
+// Handed over (eligible), a drain, or neither (state packets, packets that recorded nothing).
+struct PipeCensusVerdict {
+    bool eligible = false;
+    std::optional<PipeCensusDrain> drain;
+};
+
+inline PipeCensusVerdict ClassifyPipeCensus(const PipeCensusPacket& packet, bool dispatches) {
+    const auto drain = [](PipeCensusDrain why) { return PipeCensusVerdict{false, why}; };
+    const auto handed = packet.labelsPending ? drain(PipeCensusDrain::LabelsPending) : PipeCensusVerdict{true, std::nullopt};
+    const auto opcode = (packet.header >> 8u) & 0xffu;
+    if (packet.drawPacket && packet.lock == PipeCensusLock::None) return {};
+    if (packet.drawPacket && packet.lock == PipeCensusLock::Direct) return handed;
+    if (packet.drawPacket) return drain(packet.lock == PipeCensusLock::CpuIndirect ? PipeCensusDrain::CpuIndirect : packet.lock == PipeCensusLock::Stale ? PipeCensusDrain::Stale : PipeCensusDrain::Other);
+    if (opcode == 0x15 && packet.dispatch == PipeCensusDispatch::None) return {};
+    if (opcode == 0x15 && packet.dispatch == PipeCensusDispatch::Recorded) return dispatches ? handed : drain(PipeCensusDrain::Dispatch);
+    if (opcode == 0x15) return drain(packet.dispatch == PipeCensusDispatch::Copy ? PipeCensusDrain::Dma : PipeCensusDrain::Other);
+    if (opcode == 0x16) return drain(PipeCensusDrain::IndirectDispatch);
+    // The rest as they end fast-census runs (FastCensusBreak order; a declined draw never comes here).
+    constexpr std::array<PipeCensusDrain, FastCensusBreaks> drains{PipeCensusDrain::Dispatch, PipeCensusDrain::Wait, PipeCensusDrain::Label, PipeCensusDrain::Dma, PipeCensusDrain::Flip, PipeCensusDrain::Other, PipeCensusDrain::SubmissionEnd, PipeCensusDrain::Other};
+    const auto why = ClassifyFastCensusPacket(packet.header, packet.flip, packet.renderingWait, packet.wroteOnGpu);
+    return why ? drain(drains[static_cast<std::size_t>(*why)]) : PipeCensusVerdict{};
+}
+
+// One policy's runs by length (FastCensusRuns' buckets) and the drains that ended them; a drain with
+// no open run costs nothing and is not counted. Apply is true when the run drained: an eligible packet
+// whose capture read the open run's writes drains it (Overlap) and starts the next run.
+struct PipeCensusRuns {
+    std::uint64_t length = 0, count = 0, packets = 0;
+    std::array<std::uint64_t, FastCensusRuns::Buckets> runs{};
+    std::array<std::uint64_t, PipeCensusDrains> drains{};
+
+    void Close(PipeCensusDrain why) {
+        if (length == 0) return;
+        ++drains[static_cast<std::size_t>(why)];
+        ++runs[FastCensusRuns::Bucket(length)];
+        ++count;
+        packets += length;
+        length = 0;
+    }
+    bool Apply(const PipeCensusVerdict& verdict, bool overlaps) {
+        if (verdict.drain) Close(*verdict.drain);
+        const bool drained = verdict.eligible && overlaps && length != 0;
+        if (drained) Close(PipeCensusDrain::Overlap);
+        if (verdict.eligible) ++length;
+        return drained || verdict.drain.has_value();
+    }
+};
+
+// The ranges the open run writes, by kind (shader-written buffers; color and depth targets). A range
+// inside a known one of the same kind is not added again.
+struct PipeCensusOverlay {
+    static constexpr std::uint8_t Write = 1, Target = 2;
+    struct Range {
+        std::uint64_t begin, end;
+        std::uint8_t kind;
+    };
+    std::vector<Range> ranges;
+
+    void Add(const Range& range) {
+        for (const auto& known : ranges) {
+            if (known.begin <= range.begin && range.end <= known.end && (known.kind & range.kind) == range.kind) return;
+        }
+        ranges.push_back(range);
+    }
+    // The kinds of the known ranges [begin, end) overlaps; 0 for none.
+    std::uint8_t Overlaps(std::uint64_t begin, std::uint64_t end) const {
+        std::uint8_t kinds = 0;
+        for (const auto& known : ranges) {
+            if (begin < known.end && known.begin < end) kinds = static_cast<std::uint8_t>(kinds | known.kind);
+        }
+        return kinds;
+    }
+};
+
+// Hooks (FastCensus.cpp), queue 0 only: the callers check, so one thread owns the census.
+bool PipeCensusActive();
+// A draw's or dispatch's captured regions against the open runs' writes.
+void NotePipeCensusCapture(const std::vector<ShaderRecompiler::MemoryRegion>& regions);
+// The packet takes the GPU lock: how, and whether deferred labels record inside it. The writes noted
+// after it are this attempt's (targets: the color ones, depth and stencil sized from the extent).
+void NotePipeCensusLock(PipeCensusLock kind);
+void NotePipeCensusWrite(std::uint64_t begin, std::uint64_t end, bool target);
+void NotePipeCensusTargets(const Graphics::State& graphics);
+// After every queue-0 packet, and at each queue-0 submission end (the 10 s report).
+void NotePipeCensusPacket(std::uint32_t header, bool drawPacket, bool flip, bool renderingWait, bool wroteOnGpu, DispatchOutcome dispatch);
+void NotePipeCensusSubmissionEnd(bool workQueued);
+
 }
 
 #endif

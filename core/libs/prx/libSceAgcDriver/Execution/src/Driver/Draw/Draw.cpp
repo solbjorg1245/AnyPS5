@@ -375,6 +375,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (const auto& read : reads) memory.push_back({read.address, std::as_bytes(std::span(read.bytes))});
     }
 
+    // APS5_PROFILE_DRAW: the recording-pipe census (FastCensus.hpp; parallel-recording.md stage 0).
+    const bool pipeCensus = PipeCensusActive() && submission.queue == 0;
+    if (pipeCensus) NotePipeCensusCapture(memory);
     if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(queue, packet, submission, rejected);
 
     // The device's draw, true when it threw SnapshotStale and the packet is to run again
@@ -476,6 +479,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 results.push_back(hits.results[i]);
             }
         }
+        if (pipeCensus) NotePipeCensusLock(PipeCensusLock::CpuIndirect);
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
         const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
@@ -562,6 +566,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             rejected = std::move(*known);
             return DrawVerdict::Rejected;
         }
+    }
+    if (pipeCensus) {
+        NotePipeCensusLock(retry.level != 0 ? PipeCensusLock::Stale : lockedPrepare ? PipeCensusLock::Other : PipeCensusLock::Direct);
+        for (const auto& stage : stages) notePipeCensusWrites(*stage.program);
+        NotePipeCensusTargets(graphics);
     }
     lockForDraw();
     noteDrawWriters(stages, submission.queue);

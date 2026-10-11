@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -268,6 +269,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, localDevice->Serial(), request, memory, address, *keepVariant, liveWords, *compiledResult);
     if (verifyDataHits() && relocated != nullptr) verifyDataHit(snapshot, codeOffset, localDevice->Serial(), request, memory, address, *relocated, relocated->words, *compiledResult);
 
+    // APS5_PROFILE_DRAW: the recording-pipe census (FastCensus.hpp; parallel-recording.md stage 0).
+    const bool pipeCensus = PipeCensusActive() && submission.queue == 0;
+    if (pipeCensus) NotePipeCensusCapture(captured);
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
         dispatch(queue, packet, submission, indirectArguments);
         return;
@@ -316,6 +320,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
 
+    if (pipeCensus) {
+        NotePipeCensusLock(PipeCensusLock::Direct);
+        notePipeCensusWrites(compiled);
+    }
     for (;;) {
 
         std::shared_ptr<PreparedDispatch> prepared;

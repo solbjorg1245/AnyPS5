@@ -255,6 +255,8 @@ private:
     void noteWrittenBuffers(std::uint64_t program, std::uint32_t queue, const ShaderRecompiler::RecompileResult& compiled);
     void noteForeignWriter(std::uint64_t begin, std::uint64_t end, std::uint32_t queue);
     void noteDrawWriters(std::span<const Graphics::CompiledShader> stages, std::uint32_t queue);
+    // The buffers a queue-0 draw stage or dispatch writes, for the recording-pipe census (FastCensus.hpp).
+    static void notePipeCensusWrites(const ShaderRecompiler::RecompileResult& compiled);
     std::optional<WrittenBuffer> newestWriterLocked(std::uint64_t begin, std::uint64_t end) const;
     std::optional<WrittenBuffer> newestWriter(std::uint64_t begin, std::uint64_t end);
     std::optional<WrittenBuffer> newestWriterMemoized(std::uint64_t begin, std::uint64_t end, NewestWriterMemos& memos);
