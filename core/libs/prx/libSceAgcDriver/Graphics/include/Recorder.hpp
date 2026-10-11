@@ -299,6 +299,12 @@ public:
         std::uint64_t limitBytes = 0;
         // APS5_RESIDENT_WRITES_ROUND (default 1): a promoted range rounded out to 64 KiB.
         bool roundOut = true;
+        // APS5_RESIDENT_WRITES_DEMOTE=1 (S11, default off): ranges that stopped paying are demoted
+        // (cold, refreshed for changes of the import at most uses, both sides written, a retired
+        // import) and the "resident-writes" VRAM reclaimer demotes the coldest under pressure;
+        // APS5_RESIDENT_WRITES_RETRY_S (30): the cool-down before a demoted range is promoted again.
+        bool demote = false;
+        std::uint32_t retrySeconds = 30;
     };
     bool KeepsResidentWrites() const { return residentWrites.enabled && NarrowsCopyBacks(); }
     const ResidentWriteSettings& ResidentWrites() const { return residentWrites; }

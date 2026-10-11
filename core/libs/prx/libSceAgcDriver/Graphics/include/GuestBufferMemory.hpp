@@ -268,6 +268,12 @@ struct ResidentWriteStatistics {
     // Address spaces built mapping a range to its device copy, and address-based uses reading it
     // there (each checked as a use bound to D).
     std::uint64_t spacesMapped = 0, mappedUses = 0;
+    // APS5_RESIDENT_WRITES_DEMOTE (S11): ranges demoted by reason (cold: fewer uses bound to D in a
+    // whole 10 s window than promote one; cpu: refreshed for a change of the import at more than
+    // half its uses; both: both sides wrote it; vram: the "resident-writes" reclaimer; retired: its
+    // import retired or changed), each also counted in `demoted`; ranges barred from promotion for
+    // the session; promotions refused for a cool-down or a bar.
+    std::uint64_t demotedCold = 0, demotedCpu = 0, demotedBoth = 0, demotedVram = 0, demotedRetired = 0, blacklisted = 0, retryWaits = 0;
 };
 ResidentWriteStatistics ResidentWriteCounts();
 // Whether a range lives (one relaxed load).
@@ -282,6 +288,13 @@ void NoteResidentWritesAddressWriter(const std::vector<std::pair<std::uint64_t, 
 bool ResidentWritesOverlap(std::uint64_t begin, std::uint64_t end);
 // The device teardown and tests: drops every range (their lands were recorded already).
 void ClearResidentWrites();
+// Video-memory budget ("resident-writes" reclaimer, APS5_RESIDENT_WRITES_DEMOTE): under
+// GuestMemory::GpuMutex, with an active recorder that demotes, lands and drops the coldest live
+// ranges (fewest uses bound to D in this window and the last, then the largest) until about `want`
+// bytes went; their memory goes with the last build or batch holding them. 0 otherwise.
+VkDeviceSize TrimResidentWrites(VkDeviceSize want, std::uint64_t& evicted);
+// Tests: moves the clock of S11's demotion windows and cool-downs forward by `ms`.
+void ResidentWritesAdvanceClockForTests(std::int64_t ms);
 
 // The import table's identity (the fast Revalidate): serials proved under one identity stand
 // while the table still has it, i.e. the same device, the same epoch (bumped by every retire)

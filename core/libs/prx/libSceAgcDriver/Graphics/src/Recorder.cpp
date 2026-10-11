@@ -1321,6 +1321,9 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
         const auto verify = number("APS5_RESIDENT_WRITES_VERIFY", 0);
         residentWrites.verifyEvery = static_cast<std::uint32_t>(verify == 1 ? 16 : verify);
         residentWrites.roundOut = number("APS5_RESIDENT_WRITES_ROUND", 1) != 0;
+        const char* demoteSwitch = std::getenv("APS5_RESIDENT_WRITES_DEMOTE");
+        residentWrites.demote = demoteSwitch != nullptr && *demoteSwitch != '\0' && std::strcmp(demoteSwitch, "0") != 0;
+        residentWrites.retrySeconds = static_cast<std::uint32_t>(std::min<std::uint64_t>(number("APS5_RESIDENT_WRITES_RETRY_S", 30), 86400));
     }
     // Aware commands (CommandsTouching): on coalescing's disjoint queue (resident buffers' too).
     const char* awareSwitch = std::getenv("APS5_AWARE_COMMANDS");

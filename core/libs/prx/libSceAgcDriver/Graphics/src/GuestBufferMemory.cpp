@@ -3207,6 +3207,11 @@ void ClearStagedShadows(VkDevice device) {
 // changed is demoted (its land recorded, dropped); a reused build over a changed registry is
 // rebuilt. All of it runs under GuestMemory::GpuMutex; the fast dispatch's checks read the list of
 // ranges on other threads, under the registry's mutex.
+// S11 (APS5_RESIDENT_WRITES_DEMOTE=1): a range that stopped paying is demoted the same way (cold,
+// refreshed at most uses, both sides written, a retired import: demoteResidentWritesByPolicy) and
+// the "resident-writes" VRAM reclaimer demotes the coldest under pressure (TrimResidentWrites); a
+// demoted range waits a cool-down before it is promoted again, and its second demotion for CPU
+// changes or both sides bars it for the session.
 struct ResidentWrite {
     std::uint64_t begin = 0;
     std::uint64_t end = 0;
@@ -3228,6 +3233,15 @@ struct ResidentWrite {
     std::uint8_t refresh = 1;
     bool dropped = false;
     std::uint64_t checks = 0;
+    // S11: uses bound to D, refreshes for a change of the import (stamped, noted, address-based)
+    // and both-sides changes in the demotion window, the uses of the window before, when it was
+    // promoted, and whether S11 dropped it (its D then counts for the builds still holding it).
+    std::uint64_t windowUses = 0;
+    std::uint64_t windowRefreshes = 0;
+    std::uint64_t windowBoth = 0;
+    std::uint64_t lastUses = 0;
+    std::int64_t promotedMs = 0;
+    bool released = false;
 };
 
 namespace {
@@ -3248,11 +3262,30 @@ struct ResidentWriteRegistry {
     ResidentWriteStatistics reported{};
     std::array<std::uint64_t, 9> landsReported{};
     std::int64_t reportMs = 0;
+    // S11: per range begin its demotions (the end of its cool-down, those for CPU changes or both
+    // sides, whether it is barred), the demotion window's start, the import epoch the ranges'
+    // imports were checked at, and the cap (the digest).
+    struct Demotions {
+        std::int64_t untilMs = 0;
+        std::uint32_t strikes = 0;
+        bool barred = false;
+    };
+    std::map<std::uint64_t, Demotions> demotions;
+    std::int64_t policyMs = 0;
+    std::uint64_t importsEpoch = 0;
+    std::uint64_t limitBytes = 0;
 };
 
 ResidentWriteRegistry& residentWrites() {
     static auto* registry = new ResidentWriteRegistry();
     return *registry;
+}
+
+// S11's clock: steady milliseconds, moved forward by tests (ResidentWritesAdvanceClockForTests).
+std::atomic<std::int64_t> residentWriteClockOffset{0};
+
+std::int64_t residentWriteNowMs() {
+    return steadyMilliseconds() + residentWriteClockOffset.load(std::memory_order_relaxed);
 }
 
 // The live range holding [begin, end) (`whole`) or overlapping it, or null.
@@ -3283,7 +3316,9 @@ void reportResidentWrites(ResidentWriteRegistry& registry) {
     std::uint64_t landed = 0;
     for (std::size_t reason = 0; reason < 8; ++reason) landed += lands[reason] - l[reason];
     const auto refreshes = (c.refreshFirst + c.refreshStamp + c.refreshNoted + c.refreshAddress) - (r.refreshFirst + r.refreshStamp + r.refreshNoted + r.refreshAddress);
-    std::fprintf(stderr, "[resident-writes] (10 s): %zu ranges live (%.1f MiB with baselines), promoted %llu, refused: overlap %llu, vram %llu, cap %llu, span %llu; uses bound to D %llu; lands %llu (%.1f MiB compared) by reason: submit %llu store-run %llu command %llu dispatch %llu dispatch-lease %llu copy-in %llu reader %llu demote %llu; refreshes %llu (%.1f MiB): promoted %llu, stamped %llu, noted %llu, address-based %llu; address-based writers: over R %llu, elsewhere %llu; spaces mapping R to D %llu, address-based uses reading D %llu; both %llu; demoted %llu, reused builds rebuilt %llu; fast-dispatch declines %llu; collects %llu (%.0f us); verify: compared %llu, mismatched %llu\n", registry.ranges.size(), static_cast<double>(registry.bytes) / 1048576.0, d(c.promoted, r.promoted), d(c.refusedOverlap, r.refusedOverlap), d(c.refusedVram, r.refusedVram), d(c.refusedCap, r.refusedCap), d(c.refusedSpan, r.refusedSpan), d(c.uses, r.uses), static_cast<unsigned long long>(landed), static_cast<double>(lands[8] - l[8]) / 1048576.0, d(lands[0], l[0]), d(lands[1], l[1]), d(lands[2], l[2]), d(lands[3], l[3]), d(lands[4], l[4]), d(lands[5], l[5]), d(lands[6], l[6]), d(lands[7], l[7]), static_cast<unsigned long long>(refreshes), static_cast<double>(c.refreshedBytes - r.refreshedBytes) / 1048576.0, d(c.refreshFirst, r.refreshFirst), d(c.refreshStamp, r.refreshStamp), d(c.refreshNoted, r.refreshNoted), d(c.refreshAddress, r.refreshAddress), d(c.addressOver, r.addressOver), d(c.addressElsewhere, r.addressElsewhere), d(c.spacesMapped, r.spacesMapped), d(c.mappedUses, r.mappedUses), d(c.both, r.both), d(c.demoted, r.demoted), d(c.rebuilt, r.rebuilt), d(c.declines, r.declines), d(c.collects, r.collects), static_cast<double>(c.collectUs - r.collectUs), d(c.verified, r.verified), d(c.mismatched, r.mismatched));
+    // The [vram] line's resident class (resident read copies and these ranges' D+B).
+    const auto residentVram = Vram().Tracked(VramClass::Resident);
+    std::fprintf(stderr, "[resident-writes] (10 s): %zu ranges live (%.1f MiB with baselines), promoted %llu, refused: overlap %llu, vram %llu, cap %llu, span %llu; uses bound to D %llu; lands %llu (%.1f MiB compared) by reason: submit %llu store-run %llu command %llu dispatch %llu dispatch-lease %llu copy-in %llu reader %llu demote %llu; refreshes %llu (%.1f MiB): promoted %llu, stamped %llu, noted %llu, address-based %llu; address-based writers: over R %llu, elsewhere %llu; spaces mapping R to D %llu, address-based uses reading D %llu; both %llu; demoted %llu, reused builds rebuilt %llu; fast-dispatch declines %llu; collects %llu (%.0f us); verify: compared %llu, mismatched %llu; demote: cold %llu cpu %llu both %llu vram %llu retired %llu, blacklisted %llu, retry-waits %llu; VRAM resident %.1f MiB (cap %.1f MiB)\n", registry.ranges.size(), static_cast<double>(registry.bytes) / 1048576.0, d(c.promoted, r.promoted), d(c.refusedOverlap, r.refusedOverlap), d(c.refusedVram, r.refusedVram), d(c.refusedCap, r.refusedCap), d(c.refusedSpan, r.refusedSpan), d(c.uses, r.uses), static_cast<unsigned long long>(landed), static_cast<double>(lands[8] - l[8]) / 1048576.0, d(lands[0], l[0]), d(lands[1], l[1]), d(lands[2], l[2]), d(lands[3], l[3]), d(lands[4], l[4]), d(lands[5], l[5]), d(lands[6], l[6]), d(lands[7], l[7]), static_cast<unsigned long long>(refreshes), static_cast<double>(c.refreshedBytes - r.refreshedBytes) / 1048576.0, d(c.refreshFirst, r.refreshFirst), d(c.refreshStamp, r.refreshStamp), d(c.refreshNoted, r.refreshNoted), d(c.refreshAddress, r.refreshAddress), d(c.addressOver, r.addressOver), d(c.addressElsewhere, r.addressElsewhere), d(c.spacesMapped, r.spacesMapped), d(c.mappedUses, r.mappedUses), d(c.both, r.both), d(c.demoted, r.demoted), d(c.rebuilt, r.rebuilt), d(c.declines, r.declines), d(c.collects, r.collects), static_cast<double>(c.collectUs - r.collectUs), d(c.verified, r.verified), d(c.mismatched, r.mismatched), d(c.demotedCold, r.demotedCold), d(c.demotedCpu, r.demotedCpu), d(c.demotedBoth, r.demotedBoth), d(c.demotedVram, r.demotedVram), d(c.demotedRetired, r.demotedRetired), d(c.blacklisted, r.blacklisted), d(c.retryWaits, r.retryWaits), static_cast<double>(residentVram) / 1048576.0, static_cast<double>(registry.limitBytes) / 1048576.0);
     registry.reported = c;
     registry.landsReported = lands;
 }
@@ -3331,6 +3366,7 @@ bool promoteResidentWrite(const Context& context, const Recorder::ResidentWriteS
     range->importSerial = serial;
     range->baseline = baseline;
     range->charged = charged;
+    range->promotedMs = residentWriteNowMs();
     std::lock_guard lock(registry.mutex);
     registry.ranges.push_back(std::move(range));
     registry.bytes += charged;
@@ -3356,6 +3392,82 @@ void demoteResidentWrite(Recorder& recorder, ResidentWrite& range) {
     registry.live.store(!registry.ranges.empty(), std::memory_order_relaxed);
     registry.epoch.fetch_add(1, std::memory_order_relaxed);
     ++registry.counts.demoted;
+}
+
+enum class ResidentDemotion : std::uint8_t { None, Cold, Cpu, Both, Vram, Retired };
+
+// Whether the import serving R changed since its promotion (retired, remapped or imported again).
+bool residentWriteImportChanged(const Context& context, const ResidentWrite& range) {
+    const auto bytes = static_cast<std::size_t>(range.end - range.begin);
+    VkBuffer buffer = VK_NULL_HANDLE;
+    std::uint64_t base = 0;
+    return !HostImportExisting(context, range.begin, bytes, buffer, base) || buffer != range.import || base != range.importBase || HostImportSerial(context, range.begin, bytes, false) != range.importSerial;
+}
+
+// S11: demotes a live range for `reason`, its queued land recorded first (W1; into its import,
+// which the open batch keeps if it retired), and starts its cool-down; the second demotion for CPU
+// changes or both sides bars it. D and B stay held by every build and batch holding the range (W6)
+// and go with the last one (a VRAM demotion's are destroyed then, not retained by the pool).
+void demoteResidentWriteFor(Recorder& recorder, ResidentWrite& range, ResidentDemotion reason, std::int64_t nowMs) {
+    if (range.dropped) return;
+    demoteResidentWrite(recorder, range);
+    if (!range.dropped) return;
+    range.released = true;
+    if (reason == ResidentDemotion::Vram) range.buffer->DiscardOnRelease();
+    auto& registry = residentWrites();
+    auto& counts = registry.counts;
+    ++(reason == ResidentDemotion::Cold ? counts.demotedCold : reason == ResidentDemotion::Cpu ? counts.demotedCpu : reason == ResidentDemotion::Both ? counts.demotedBoth : reason == ResidentDemotion::Vram ? counts.demotedVram : counts.demotedRetired);
+    auto& demotions = registry.demotions[range.begin];
+    demotions.untilMs = nowMs + static_cast<std::int64_t>(recorder.ResidentWrites().retrySeconds) * 1000;
+    if ((reason == ResidentDemotion::Cpu || reason == ResidentDemotion::Both) && ++demotions.strikes >= 2 && !demotions.barred) {
+        demotions.barred = true;
+        ++counts.blacklisted;
+    }
+}
+
+// S11 (APS5_RESIDENT_WRITES_DEMOTE), at a dispatch build's binding or reuse, before it binds or
+// checks a range: a range whose import changed (looked at when the import epoch moved: a retired
+// import's range no longer waits for a build over it) or that both sides wrote (W3) is demoted at
+// once; at each roll of the 10 s window one is demoted that lived through the whole window with
+// fewer than APS5_RESIDENT_WRITES_USES uses bound to D (cold), or was refreshed for a change of its
+// import at more than half its uses (cpu). A build binding a range demoted here is rebuilt.
+void demoteResidentWritesByPolicy(const Context& context, Recorder& recorder) {
+    const auto& settings = recorder.ResidentWrites();
+    if (!settings.demote) return;
+    auto& registry = residentWrites();
+    const auto nowMs = residentWriteNowMs();
+    if (registry.policyMs == 0) registry.policyMs = nowMs;
+    const bool roll = nowMs - registry.policyMs >= 10000;
+    const auto importsEpoch = HostImportsEpoch();
+    const bool imports = importsEpoch != registry.importsEpoch;
+    registry.importsEpoch = importsEpoch;
+    if (!roll && !imports && std::none_of(registry.ranges.begin(), registry.ranges.end(), [](const std::shared_ptr<ResidentWrite>& range) { return range->windowBoth != 0; })) return;
+    std::vector<std::pair<std::shared_ptr<ResidentWrite>, ResidentDemotion>> demoted;
+    for (const auto& range : registry.ranges) {
+        auto reason = ResidentDemotion::None;
+        if (imports && residentWriteImportChanged(context, *range)) reason = ResidentDemotion::Retired;
+        else if (range->windowBoth != 0) reason = ResidentDemotion::Both;
+        else if (roll && range->promotedMs <= registry.policyMs && range->windowUses < settings.uses) reason = ResidentDemotion::Cold;
+        else if (roll && range->windowRefreshes * 2 > range->windowUses) reason = ResidentDemotion::Cpu;
+        if (roll) {
+            range->lastUses = range->windowUses;
+            range->windowUses = 0;
+            range->windowRefreshes = 0;
+        }
+        if (reason != ResidentDemotion::None) demoted.emplace_back(range, reason);
+    }
+    if (roll) registry.policyMs = nowMs;
+    for (const auto& [range, reason] : demoted) demoteResidentWriteFor(recorder, *range, reason, nowMs);
+}
+
+// S11: whether the range beginning at `begin` may be promoted again: not while its cool-down runs
+// nor once barred (counted as retry-waits).
+bool residentWriteMayPromote(std::uint64_t begin) {
+    auto& registry = residentWrites();
+    const auto found = registry.demotions.find(begin);
+    if (found == registry.demotions.end() || (!found->second.barred && residentWriteNowMs() >= found->second.untilMs)) return true;
+    ++registry.counts.retryWaits;
+    return false;
 }
 
 // Whether a collect stamped a block of the range since D was synced (a CPU store; the driver's own
@@ -3427,7 +3539,10 @@ void checkResidentWrite(const Context& context, Recorder& recorder, ResidentWrit
     }
     // A CPU store while the GPU's writes wait in a queued land: both sides wrote R. The land stores
     // only the dwords D changed, so the CPU's elsewhere survive into D below.
-    if (reason != RefreshFirst && recorder.ResidentLandQueued(&range) && cpuStoredSince(range)) ++counts.both;
+    if (reason != RefreshFirst && recorder.ResidentLandQueued(&range) && cpuStoredSince(range)) {
+        ++counts.both;
+        ++range.windowBoth;
+    }
     recorder.FlushKeyStoresOverlapping(range.begin, bytes);
     recorder.FlushStoresOverlapping(range.begin, bytes);
     recorder.FlushDeferredOverlapping(range.begin, bytes, nullptr, Recorder::FlushReason::CopyIn);
@@ -3451,6 +3566,7 @@ void checkResidentWrite(const Context& context, Recorder& recorder, ResidentWrit
     range.refresh = RefreshNone;
     ++(reason == RefreshFirst ? counts.refreshFirst : reason == RefreshNoted ? counts.refreshNoted : reason == RefreshAddress ? counts.refreshAddress : counts.refreshStamp);
     counts.refreshedBytes += bytes;
+    if (reason != RefreshFirst) ++range.windowRefreshes;
 }
 
 // APS5_RESIDENT_WRITES_SPACE=0: S7a's address-based writers, each owing every live range a refresh,
@@ -3558,6 +3674,35 @@ ResidentWriteStatistics ResidentWriteCounts() {
     return counts;
 }
 
+VkDeviceSize TrimResidentWrites(VkDeviceSize want, std::uint64_t& evicted) {
+    evicted = 0;
+    // Its lands are recorded by the recorder that queued them: the active one, under the GPU mutex.
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || !GuestMemory::GpuMutex().HeldByThisThread() || !recorder->KeepsResidentWrites() || !recorder->ResidentWrites().demote) return 0;
+    auto order = residentWrites().ranges;
+    std::sort(order.begin(), order.end(), [](const std::shared_ptr<ResidentWrite>& left, const std::shared_ptr<ResidentWrite>& right) {
+        const auto leftUses = left->windowUses + left->lastUses;
+        const auto rightUses = right->windowUses + right->lastUses;
+        return leftUses != rightUses ? leftUses < rightUses : left->charged > right->charged;
+    });
+    const auto nowMs = residentWriteNowMs();
+    VkDeviceSize freed = 0;
+    for (const auto& range : order) {
+        if (freed >= want) break;
+        demoteResidentWriteFor(*recorder, *range, ResidentDemotion::Vram, nowMs);
+        if (!range->released) continue;
+        // Counted as freed, as a held resident read copy is: the builds holding it are rebuilt at
+        // their next reuse (cold ones the "builds" reclaimer evicts), the batches complete.
+        freed += range->charged;
+        ++evicted;
+    }
+    return freed;
+}
+
+void ResidentWritesAdvanceClockForTests(std::int64_t ms) {
+    residentWriteClockOffset.fetch_add(ms, std::memory_order_relaxed);
+}
+
 void ClearResidentWrites() {
     auto& registry = residentWrites();
     std::vector<std::shared_ptr<ResidentWrite>> released;
@@ -3565,6 +3710,9 @@ void ClearResidentWrites() {
     for (const auto& range : registry.ranges) range->dropped = true;
     released.swap(registry.ranges);
     registry.candidates.clear();
+    registry.demotions.clear();
+    registry.policyMs = 0;
+    registry.importsEpoch = 0;
     registry.bytes = 0;
     registry.live.store(false, std::memory_order_relaxed);
     registry.epoch.fetch_add(1, std::memory_order_relaxed);
@@ -3606,6 +3754,7 @@ void GuestBufferMemory::checkMappedResidentWrites(Recorder& recorder) {
         if (range->dropped) range->refresh = RefreshStamp;
         checkResidentWrite(context, recorder, *range);
         ++residentWrites().counts.mappedUses;
+        ++range->windowUses;
     }
 }
 
@@ -3618,6 +3767,7 @@ bool GuestBufferMemory::noteResidentCandidates(Recorder& recorder) {
     auto& registry = residentWrites();
     const auto& settings = recorder.ResidentWrites();
     bool promoted = false;
+    registry.limitBytes = settings.limitBytes;
     for (const auto& region : regions) {
         // In place in a watched import (UploadFinish took its identity), written, too large to stage,
         // not inside a live range (bound to its D, or in place beside a straddler: no candidate).
@@ -3645,6 +3795,7 @@ bool GuestBufferMemory::noteResidentCandidates(Recorder& recorder) {
             ++registry.counts.refusedSpan;
             continue;
         }
+        if (settings.demote && !residentWriteMayPromote(begin)) continue;
         promoted = promoteResidentWrite(context, settings, region.copySource, region.copySourceBase, region.copySourceAddress, begin, end) || promoted;
     }
     if (registry.candidates.size() > 256) registry.candidates.clear();
@@ -3653,6 +3804,7 @@ bool GuestBufferMemory::noteResidentCandidates(Recorder& recorder) {
 
 void GuestBufferMemory::bindResidentWrites(Recorder& recorder, std::vector<Region*>& residentWanted) {
     auto& registry = residentWrites();
+    demoteResidentWritesByPolicy(context, recorder);
     noteResidentCandidates(recorder);
     std::vector<std::shared_ptr<ResidentWrite>> over;
     for (const auto& range : registry.ranges) {
@@ -3686,6 +3838,7 @@ void GuestBufferMemory::bindResidentWrites(Recorder& recorder, std::vector<Regio
 
 bool GuestBufferMemory::recordResidentWrites(Recorder& recorder) {
     auto& registry = residentWrites();
+    if (recorder.KeepsResidentWrites()) demoteResidentWritesByPolicy(context, recorder);
     const bool promoted = recorder.KeepsResidentWrites() && noteResidentCandidates(recorder);
     if (promoted || residentWriteEpoch != registry.epoch.load(std::memory_order_relaxed)) {
         // A range promoted over a region this build binds in place, or one it binds dropped since:
@@ -3725,6 +3878,7 @@ void GuestBufferMemory::queueResidentLands(Recorder& recorder, bool defer) {
         if (range == nullptr || range == last) continue;
         last = range;
         ++counts.uses;
+        ++range->windowUses;
         const auto bytes = static_cast<std::size_t>(range->end - range->begin);
         if (!WritesOverlap(range->begin, bytes)) continue;
         if (range->refresh == RefreshNone && range->notes != range->notesSeen) range->refresh = RefreshNoted;
@@ -3755,6 +3909,7 @@ void GuestBufferMemory::absorbResidentWrites() const {
         last = range;
         if (cpuStoredSince(*range)) {
             ++residentWrites().counts.both;
+            ++range->windowBoth;
             if (range->refresh == RefreshNone) range->refresh = RefreshStamp;
         }
         if (generation == 0) generation = GuestMemory::TrackerGeneration();
@@ -3772,6 +3927,18 @@ VramHeld GuestBufferMemory::DeviceBytesHeldAlone() const {
         // batch or a queued copy-back (freed when they are done), or another build (not freed).
         if (count == 1) held.alone += region.buffer->AllocationBytes();
         else if (count == 2) held.shared += region.buffer->AllocationBytes();
+    }
+    // A range S11 demoted (ResidentWrite::released) that only this build's regions still hold: its
+    // D+B go with the build (alone; shared with one batch still keeping them).
+    const ResidentWrite* last = nullptr;
+    for (const auto& region : regions) {
+        const auto& range = region.residentWrite;
+        if (range == nullptr || !range->released || range.get() == last) continue;
+        last = range.get();
+        if (range.use_count() != std::count_if(regions.begin(), regions.end(), [&](const Region& other) { return other.residentWrite == range; })) continue;
+        const auto count = range->buffer.use_count();
+        if (count == 1) held.alone += range->buffer->AllocationBytes();
+        else if (count == 2) held.shared += range->buffer->AllocationBytes();
     }
     return held;
 }
