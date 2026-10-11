@@ -1,15 +1,26 @@
-// AnyPS5 settings launcher (s61): edits anyps5-settings.ini before the game starts. libc's settings load
-// (prx/libc/src/PortSettings.cpp) runs it as a child process and waits: exit code 0 = Play (the game starts
-// and reads the file), PortSettings::LauncherExitQuit = the window was closed (the game exits), any other
-// code = it failed (the game starts with the file as it is). Dear ImGui on SDL2's renderer (Direct3D on
-// Windows, the software renderer on Linux), with mouse, keyboard and gamepad navigation; sized for a
-// Steam Deck (1280x800 fullscreen) as well as a desktop window.
-//   anyps5-launcher [--settings <file>] [--window WIDTHxHEIGHT] [--keys <k,k,...>] [--snapshot <file.bmp>]
-// --settings: the file to edit (libc passes it); without it the launcher edits anyps5-settings.ini in the
-// working directory and its button says Save. --window: the window's size instead of the automatic one.
-// --keys (tests): presses up, down, left, right, enter, space, escape, tab or start (gamepad) one after
-// another into ImGui, a key every 4 frames from frame 5. --snapshot (tests): writes the frame after the
-// keys (frame 5 without them) as a BMP and exits with code 4 without saving.
+// AnyPS5 settings launcher (s61): the player's entry point to Demon's Souls. It edits anyps5-settings.ini,
+// chooses the player's own dump (GameDir), runs the release's one-time setup when needed and starts the
+// game. Dear ImGui on SDL2's renderer (Direct3D on Windows, the software renderer on Linux), with mouse,
+// keyboard and gamepad navigation; sized for a Steam Deck (1280x800 fullscreen) as well as a desktop window.
+// Three ways it runs:
+//  - From the release folder (anyps5-launcher[.exe] next to DemonsSouls.ps1 / .sh and tools/relinker, or
+//    in its libs/): Play saves, runs the setup (DemonsSouls.ps1 -Dump <GameDir> -SetupOnly / DemonsSouls.sh
+//    --dump <GameDir> --setup-only, hidden, its output shown here) when anyps5-setup.txt says it is due,
+//    then starts the game with --launch and waits for it. --launch: straight to the game when the folder is
+//    valid and set up (no window), else the window (setting up at once when only the setup is missing).
+//    Other arguments go to the game.
+//  - From the game (libc's settings load passes --settings <file>, prx/libc/src/PortSettings.cpp): exit
+//    code 0 = Play (the game goes on and reads the file), PortSettings::LauncherExitQuit = the window was
+//    closed (the game exits), any other code = it failed (the game starts with the file as it is). The game
+//    folder is shown, not changed (the game already runs from it).
+//  - Elsewhere (a build tree): edits anyps5-settings.ini in the working directory; the button says Save.
+//   anyps5-launcher [--settings <file>] [--launch] [--window WIDTHxHEIGHT] [--deck] [--dry-run]
+//                   [--keys <k,k,...>] [--snapshot <file.bmp>] [game arguments]
+// --window: the window's size instead of the automatic one. --deck: the built-in folder browser as on a
+// Steam Deck. --dry-run (tests): runs the setup but prints the game's command instead of starting it.
+// --keys (tests): presses up, down, left, right, enter, space, escape, tab, start, a, b, y or back
+// (gamepad) one after another into ImGui, a key every 4 frames from frame 5. --snapshot (tests): writes the
+// frame after the keys (frame 5 without them) as a BMP and exits with code 4 without saving.
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
 
@@ -18,13 +29,20 @@
 #include "backends/imgui_impl_sdlrenderer2.h"
 #include "prx/libc/include/PortSettings.hpp"
 
+#include "FolderBrowser.hpp"
+#include "GameFolder.hpp"
+#include "Host.hpp"
+
 #include <algorithm>
+#include <array>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -42,20 +60,30 @@ namespace {
 
 constexpr int ExitSnapshot = 4;
 constexpr int ExitFailure = 1;
+constexpr int ExitGameStarted = 5;  // internal: the window closed, the game runs
+
+const ImVec4 Good(0.45f, 0.85f, 0.45f, 1.0f);
+const ImVec4 Warn(1.0f, 0.78f, 0.35f, 1.0f);
+const ImVec4 Bad(1.0f, 0.45f, 0.4f, 1.0f);
 
 struct Options {
     std::filesystem::path settings;
     bool fromGame = false;
+    bool launch = false;
+    bool deck = false;
+    bool dryRun = false;
     std::uint32_t windowWidth = 0;
     std::uint32_t windowHeight = 0;
     std::filesystem::path snapshot;
     std::vector<ImGuiKey> keys;
+    std::vector<std::string> gameArgs;
 };
 
 bool ParseKeys(const std::string& text, std::vector<ImGuiKey>& keys) {
     static constexpr std::pair<const char*, ImGuiKey> names[] = {{"up", ImGuiKey_UpArrow}, {"down", ImGuiKey_DownArrow}, {"left", ImGuiKey_LeftArrow},
         {"right", ImGuiKey_RightArrow}, {"enter", ImGuiKey_Enter}, {"space", ImGuiKey_Space}, {"escape", ImGuiKey_Escape}, {"tab", ImGuiKey_Tab},
-        {"start", ImGuiKey_GamepadStart}};
+        {"start", ImGuiKey_GamepadStart}, {"a", ImGuiKey_GamepadFaceDown}, {"b", ImGuiKey_GamepadFaceRight}, {"y", ImGuiKey_GamepadFaceUp},
+        {"back", ImGuiKey_GamepadBack}};
     std::size_t start = 0;
     while (start <= text.size()) {
         const auto end = std::min(text.find(',', start), text.size());
@@ -95,6 +123,12 @@ std::optional<Options> ParseOptions(int argc, char** argv) {
         if (name == "--settings" && hasValue) {
             options.settings = args[++index];
             options.fromGame = true;
+        } else if (name == PortSettings::LaunchArgument) {
+            options.launch = true;
+        } else if (name == "--deck") {
+            options.deck = true;
+        } else if (name == "--dry-run") {
+            options.dryRun = true;
         } else if (name == "--window" && hasValue) {
             if (!PortSettings::ParseResolution(PortSettings::PathText(args[++index]), options.windowWidth, options.windowHeight)) return std::nullopt;
         } else if (name == "--keys" && hasValue) {
@@ -102,10 +136,9 @@ std::optional<Options> ParseOptions(int argc, char** argv) {
         } else if (name == "--snapshot" && hasValue) {
             options.snapshot = args[++index];
         } else {
-            return std::nullopt;
+            options.gameArgs.push_back(name);  // for the game (e.g. Steam launch options)
         }
     }
-    if (options.settings.empty()) options.settings = PortSettings::FileName;
     return options;
 }
 
@@ -128,6 +161,7 @@ struct ResolutionChoice {
 // What the window edits; `settings` holds the choices as the parser's values.
 struct Model {
     Options options;
+    std::filesystem::path installDir;  // the release folder (Play sets up and starts the game); empty elsewhere
     std::string text;
     bool existed = false;
     PortSettings::Settings settings;
@@ -137,7 +171,41 @@ struct Model {
     double customFps = 45.0;
     std::string status;
     bool statusError = false;
+
+    std::array<char, 1024> gameDir{};  // the text field (UTF-8)
+    std::string checkedText;           // the text `folder` was checked for
+    Launcher::FolderCheck folder;
+    std::string setupReason;  // why Play runs the setup first; empty when it is done
+    bool python = false;
+    std::string memoryWarning;
+    std::unique_ptr<Launcher::SetupProcess> setup;
+    bool setupRunning = false;
+    bool autoPlay = false;
+    Launcher::FolderBrowser browser;
+    Launcher::NativeFolderPicker picker;
+    bool pickerBusy = false;
+    Launcher::GameProcess game;
 };
+
+bool Release(const Model& model) {
+    return !model.options.fromGame && !model.installDir.empty();
+}
+
+void SetGameDirText(Model& model, const std::string& text) {
+    const auto size = std::min(text.size(), model.gameDir.size() - 1);
+    std::memcpy(model.gameDir.data(), text.data(), size);
+    model.gameDir[size] = '\0';
+}
+
+// Checks the game folder again when its text changed (or `force`), and whether the setup is due.
+void Refresh(Model& model, bool force = false) {
+    const std::string text(model.gameDir.data());
+    if (!force && text == model.checkedText) return;
+    model.checkedText = text;
+    model.folder = Launcher::CheckGameFolder(text, model.installDir);
+    model.python = Launcher::PythonOnPath([](const char* name) { return std::getenv(name); });
+    model.setupReason = Release(model) && model.folder.state == Launcher::FolderState::Valid ? Launcher::SetupReason(model.installDir, model.folder.folder, model.python) : std::string();
+}
 
 void BuildResolutions(Model& model, int desktopWidth, int desktopHeight) {
     model.resolutions.push_back({0, 0, "Auto (a window at 60% of the screen)"});
@@ -157,6 +225,14 @@ void BuildResolutions(Model& model, int desktopWidth, int desktopHeight) {
 }
 
 void LoadModel(Model& model) {
+    model.installDir = model.options.fromGame ? std::filesystem::path() : Launcher::FindInstallDir(Launcher::ExecutablePath().parent_path());
+    if (!model.options.fromGame) {
+        // The file the game reads: APS5_SETTINGS, else next to the game in the release folder.
+        const char* configured = std::getenv("APS5_SETTINGS");
+        if (configured != nullptr && configured[0] != '\0' && PortSettings::Lower(configured) != "none") model.options.settings = Launcher::PathFromText(configured);
+        else if (!model.installDir.empty()) model.options.settings = model.installDir / PortSettings::FileName;
+        else model.options.settings = PortSettings::FileName;
+    }
     std::string error;
     model.text = ReadText(model.options.settings, model.existed, error);
     if (!error.empty()) {
@@ -172,6 +248,9 @@ void LoadModel(Model& model) {
         model.fpsChoice = 3;
         model.customFps = fps;
     }
+    SetGameDirText(model, model.settings.gameDir);
+    model.memoryWarning = Launcher::MemoryWarning();
+    Refresh(model, true);
 }
 
 // The choices as settings (the launcher's rules applied).
@@ -183,13 +262,17 @@ PortSettings::Settings Chosen(const Model& model) {
     static constexpr double fixedRates[] = {0.0, 30.0, 60.0};
     // A custom value the slider never moved keeps the file's number (it may be fractional).
     settings.fpsLimit = model.fpsChoice < 3 ? fixedRates[model.fpsChoice] : model.customFps;
+    if (!model.options.fromGame) {
+        // A valid folder as resolved (the app0 inside a picked parent); otherwise the text, kept for next time.
+        settings.gameDir = model.folder.state == Launcher::FolderState::Valid ? PortSettings::PathText(model.folder.folder) : Launcher::CleanFolderText(model.gameDir.data());
+    }
     PortSettings::ApplyLauncherRules(settings);
     return settings;
 }
 
 std::string NewText(const Model& model) {
     const std::string header = model.existed ? std::string() : std::string("# AnyPS5 settings, written by the launcher (keys: anyps5-settings.ini.example).\n");
-    return PortSettings::SetIniValues(model.existed ? model.text : header, PortSettings::LauncherValues(Chosen(model)));
+    return PortSettings::SetIniValues(model.existed ? model.text : header, PortSettings::LauncherValuesWithGameDir(Chosen(model)));
 }
 
 bool Save(Model& model) {
@@ -209,6 +292,70 @@ bool Save(Model& model) {
     model.text = text;
     model.existed = true;
     return true;
+}
+
+// Starts the game; ExitGameStarted, or -1 with the error shown.
+int StartPlaying(Model& model) {
+    std::string error;
+    if (Launcher::LaunchGame(model.installDir, model.options.gameArgs, model.options.dryRun, model.game, error)) return ExitGameStarted;
+    model.status = error;
+    model.statusError = true;
+    std::fprintf(stderr, "[launcher] %s\n", error.c_str());
+    return -1;
+}
+
+void StartSetup(Model& model) {
+    model.setup = std::make_unique<Launcher::SetupProcess>();
+    std::string error;
+    std::fprintf(stderr, "[launcher] setup: %s\n", model.setupReason.c_str());
+    if (!model.setup->Start(model.installDir, model.folder.folder, error)) {
+        model.status = "The setup did not start: " + error;
+        model.statusError = true;
+        std::fprintf(stderr, "[launcher] %s\n", model.status.c_str());
+        return;
+    }
+    model.setupRunning = true;
+    model.status.clear();
+    model.statusError = false;
+}
+
+// Play: save, then (release folder) the setup when due, then the game. The run's result, or -1 to stay.
+int Play(Model& model) {
+    if (!Save(model)) return -1;
+    if (!Release(model)) return 0;
+    Refresh(model, true);
+    if (model.folder.state != Launcher::FolderState::Valid) return -1;
+    if (!model.setupReason.empty()) {
+        StartSetup(model);
+        return -1;
+    }
+    return StartPlaying(model);
+}
+
+// A finished setup: the stamp, then the game; or its failure explained.
+int SetupFinished(Model& model) {
+    model.setupRunning = false;
+    const int code = model.setup->ExitCode();
+    std::fprintf(stderr, "[launcher] setup exited with code %d\n", code);
+    if (code == 0) {
+        std::string error;
+        const auto stamp = Launcher::SetupStamp(model.folder.folder, Launcher::ToolsFingerprint(model.installDir), model.python);
+        if (!PortSettings::WriteFileAtomic(model.installDir / Launcher::StampName, stamp, error)) std::fprintf(stderr, "[launcher] cannot write %s: %s\n", Launcher::StampName, error.c_str());
+        Refresh(model, true);
+        if (model.setupReason.empty()) return StartPlaying(model);
+        model.status = "The setup ended without errors but is not complete (" + model.setupReason + "). Its output is above.";
+        model.statusError = true;
+        return -1;
+    }
+    bool policy = false;
+    for (const auto& line : model.setup->Lines()) {
+        const auto lower = PortSettings::Lower(line);
+        if (lower.find("execution polic") != std::string::npos || lower.find("not digitally signed") != std::string::npos || lower.find("cannot be loaded") != std::string::npos) policy = true;
+    }
+    model.status = policy ? "PowerShell refused to run DemonsSouls.ps1 (an execution policy set by a group policy). Right-click DemonsSouls.ps1 > Properties > Unblock, or ask the PC's administrator to allow it."
+                          : "The setup failed (exit code " + std::to_string(code) + "). Its output is above; fix the cause and press Play to try again.";
+    model.statusError = true;
+    return -1;
 }
 
 // A readable sans-serif font of the system, else ImGui's built-in one.
@@ -248,7 +395,81 @@ void Note(const char* text) {
     ImGui::PopStyleColor();
 }
 
-enum class Action { None, Play, Quit };
+void Colored(const ImVec4& color, const std::string& text) {
+    ImGui::PushStyleColor(ImGuiCol_Text, color);
+    ImGui::TextWrapped("%s", text.c_str());
+    ImGui::PopStyleColor();
+}
+
+// The setup script's current step ("== relinking ...") in plain words.
+std::string SetupStep(const std::vector<std::string>& lines) {
+    for (auto line = lines.rbegin(); line != lines.rend(); ++line) {
+        if (line->starts_with("== relinking")) return "Step 1 of 3: relinking eboot.bin into the game executable (a minute or two)";
+        if (line->starts_with("== patching")) return "Step 2 of 3: patching the executable (ds_patch)";
+        if (line->starts_with("== linking")) return "Step 3 of 3: linking the dump's folders into app0";
+        if (line->starts_with("== setup done")) return "Setup done";
+    }
+    return "Starting the setup";
+}
+
+enum class Action { None, Play, Quit, Browse };
+
+void DrawGameFolder(Model& model, Action& action, bool focusBrowse) {
+    Label("Game folder");
+    const bool fixed = model.options.fromGame;
+    ImGui::BeginDisabled(fixed);
+    const float browseWidth = ImGui::CalcTextSize("Browse...").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+    ImGui::SetNextItemWidth(-(browseWidth + ImGui::GetStyle().ItemSpacing.x));
+#ifdef _WIN32
+    const char* hint = "D:\\Games\\PPSA01341-app0";
+#else
+    const char* hint = "/home/deck/Games/PPSA01341-app0";
+#endif
+    ImGui::InputTextWithHint("##gamedir", hint, model.gameDir.data(), model.gameDir.size());
+    ImGui::SameLine();
+    if (ImGui::Button("Browse...", ImVec2(browseWidth, 0.0f))) action = Action::Browse;
+    if (focusBrowse) {
+        ImGui::SetKeyboardFocusHere(-1);
+        ImGui::SetNavCursorVisible(true);
+    }
+    ImGui::EndDisabled();
+    if (!fixed) Refresh(model);
+
+    const auto& folder = model.folder;
+    if (folder.state == Launcher::FolderState::Empty) Note(folder.summary.c_str());
+    else if (folder.state == Launcher::FolderState::Valid) Colored(Good, folder.summary);
+    for (const auto& error : folder.errors) Colored(Bad, error);
+    for (const auto& warning : folder.warnings) Colored(Warn, warning);
+    if (fixed) Note("The game runs from the folder it was set up with. To change it, quit the game and start anyps5-launcher on its own.");
+    if (model.pickerBusy) Note("Waiting for the folder picker...");
+}
+
+void DrawSetup(Model& model) {
+    Label("Setup");
+    if (model.setupRunning) {
+        const auto lines = model.setup->Lines();
+        ImGui::ProgressBar(-1.0f * static_cast<float>(ImGui::GetTime()), ImVec2(-FLT_MIN, 0.0f), "Setting up...");
+        ImGui::TextWrapped("%s", SetupStep(lines).c_str());
+    } else if (model.folder.state != Launcher::FolderState::Valid) {
+        Note("Needs a valid game folder.");
+    } else if (model.setupReason.empty()) {
+        Colored(Good, "Done. Play starts the game.");
+    } else {
+        Note(("Play runs the one-time setup first (" + model.setupReason +
+              "): it relinks eboot.bin into the game executable, patches it and links the dump's folders into AnyPS5's app0 folder. Nothing in the dump is changed.")
+                 .c_str());
+    }
+    if (!model.python && (!model.setupReason.empty() || model.setupRunning)) {
+#ifdef _WIN32
+        Colored(Warn, "Python 3 was not found: the setup skips the speed patch (ds_patch) and the game runs much slower. Install it with: winget install Python.Python.3.12 "
+                      "(or from python.org), then start this window again.");
+#else
+        Colored(Warn, "python3 was not found: the setup skips the speed patch (ds_patch) and the game runs much slower. Install python3 with your package manager, then start "
+                      "this window again.");
+#endif
+    }
+    if (!model.memoryWarning.empty()) Colored(Warn, model.memoryWarning);
+}
 
 Action Draw(Model& model, bool firstFrame) {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -256,6 +477,9 @@ Action Draw(Model& model, bool firstFrame) {
     ImGui::SetNextWindowSize(viewport->WorkSize);
     ImGui::Begin("Settings", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
     Action action = Action::None;
+    const bool release = Release(model);
+    const bool busy = model.setupRunning || model.pickerBusy;
+    const bool canPlay = !busy && (!release || model.folder.state == Launcher::FolderState::Valid);
 
     ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 1.4f);
     ImGui::TextUnformatted("Demon's Souls");
@@ -265,9 +489,13 @@ Action Draw(Model& model, bool firstFrame) {
 
     const float footer = ImGui::GetFrameHeightWithSpacing() * 2.0f + ImGui::GetTextLineHeightWithSpacing() * 3.0f;
     ImGui::BeginChild("options", ImVec2(0.0f, -footer), ImGuiChildFlags_NavFlattened);
+    ImGui::BeginDisabled(busy);
     if (ImGui::BeginTable("settings", 2, ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch, 0.32f);
         ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch, 0.68f);
+
+        DrawGameFolder(model, action, firstFrame && !canPlay && !model.options.fromGame);
+        if (release) DrawSetup(model);
 
         Label("Resolution");
         const auto& current = model.resolutions[static_cast<std::size_t>(model.resolution)];
@@ -327,6 +555,16 @@ Action Draw(Model& model, bool firstFrame) {
         ImGui::EndDisabled();
         ImGui::EndTable();
     }
+    ImGui::EndDisabled();
+
+    // The setup's own output while it runs, and after it failed.
+    if (model.setup != nullptr && (model.setupRunning || model.setup->ExitCode() != 0)) {
+        ImGui::Spacing();
+        ImGui::BeginChild("setuplog", ImVec2(0.0f, ImGui::GetTextLineHeightWithSpacing() * 7.0f), ImGuiChildFlags_Borders);
+        for (const auto& line : model.setup->Lines()) ImGui::TextUnformatted(line.c_str());
+        if (model.setupRunning) ImGui::SetScrollHereY(1.0f);
+        ImGui::EndChild();
+    }
 
     // What the game will make of it: the parser's own summary and warnings on the text that would be saved.
     auto preview = PortSettings::Parse(NewText(model), PortSettings::PathText(model.options.settings.filename()));
@@ -344,23 +582,31 @@ Action Draw(Model& model, bool firstFrame) {
     ImGui::EndChild();
 
     ImGui::Separator();
-    if (!model.status.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, model.statusError ? ImVec4(1.0f, 0.45f, 0.4f, 1.0f) : ImGui::GetStyleColorVec4(ImGuiCol_Text));
-        ImGui::TextWrapped("%s", model.status.c_str());
-        ImGui::PopStyleColor();
-    }
-    const float buttonWidth = std::max(ImGui::CalcTextSize("Quit").x, ImGui::CalcTextSize("Play").x) + ImGui::GetStyle().FramePadding.x * 8.0f;
-    if (ImGui::Button(model.options.fromGame ? "Play" : "Save", ImVec2(buttonWidth, 0.0f))) action = Action::Play;
+    if (!model.status.empty()) Colored(model.statusError ? Bad : ImGui::GetStyleColorVec4(ImGuiCol_Text), model.status);
+    const char* playLabel = model.options.fromGame || release ? "Play" : "Save";
+    const float buttonWidth = std::max(ImGui::CalcTextSize("Quit").x, ImGui::CalcTextSize(playLabel).x) + ImGui::GetStyle().FramePadding.x * 8.0f;
+    ImGui::BeginDisabled(!canPlay);
+    if (ImGui::Button(playLabel, ImVec2(buttonWidth, 0.0f))) action = Action::Play;
     // Play starts focused with the cursor shown, so the first Enter / A plays (a hidden cursor eats it).
-    if (firstFrame) {
+    if (firstFrame && canPlay) {
         ImGui::SetKeyboardFocusHere(-1);
         ImGui::SetNavCursorVisible(true);
     }
+    ImGui::EndDisabled();
     ImGui::SameLine();
     if (ImGui::Button("Quit", ImVec2(buttonWidth, 0.0f))) action = Action::Quit;
-    if (ImGui::IsKeyPressed(ImGuiKey_GamepadStart, false)) action = Action::Play;
-    Note(("Settings file: " + PortSettings::PathText(model.options.settings) + ". Start the game with --launch to skip this window (Steam launch options: %command% --launch).").c_str());
+    if (canPlay && !model.browser.IsOpen() && ImGui::IsKeyPressed(ImGuiKey_GamepadStart, false)) action = Action::Play;
+    if (release) {
+        Note(("Settings: " + PortSettings::PathText(model.options.settings) +
+              ". Steam: add this launcher as a non-Steam game; the launch option --launch (%command% --launch) starts the game without this window once it is set up.")
+                 .c_str());
+    } else {
+        Note(("Settings file: " + PortSettings::PathText(model.options.settings) + ". Start the game with --launch to skip this window (Steam launch options: %command% --launch).").c_str());
+    }
     ImGui::End();
+
+    std::filesystem::path chosenFolder;
+    if (model.browser.Draw(chosenFolder)) SetGameDirText(model, PortSettings::PathText(chosenFolder));
     return action;
 }
 
@@ -413,8 +659,9 @@ int Run(Model& model) {
     }
     SDL_RendererInfo info{};
     SDL_GetRendererInfo(renderer, &info);
-    std::fprintf(stderr, "[launcher] window %dx%d%s, renderer %s, settings %s%s\n", width, height, (flags & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0 ? " (fullscreen)" : "",
-        info.name != nullptr ? info.name : "?", PortSettings::PathText(model.options.settings).c_str(), model.existed ? "" : " (new)");
+    std::fprintf(stderr, "[launcher] window %dx%d%s, renderer %s, settings %s%s, %s\n", width, height, (flags & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0 ? " (fullscreen)" : "",
+        info.name != nullptr ? info.name : "?", PortSettings::PathText(model.options.settings).c_str(), model.existed ? "" : " (new)",
+        model.options.fromGame ? "from the game" : model.installDir.empty() ? "no release folder (Save only)" : ("release folder " + PortSettings::PathText(model.installDir)).c_str());
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -436,6 +683,7 @@ int Run(Model& model) {
     ImGui::GetStyle().FrameRounding = 4.0f * scale;
     ImGui::GetStyle().ItemSpacing.y *= 1.6f;
     ImGui::GetStyle().CellPadding.y *= 2.0f;
+    const bool deck = model.options.deck || Launcher::IsSteamDeck();
 
     int result = -1;
     int frame = 0;
@@ -449,6 +697,16 @@ int Run(Model& model) {
             } while (SDL_PollEvent(&event));
         }
         if (result >= 0) break;
+        if (model.pickerBusy) {
+            std::filesystem::path picked;
+            const auto outcome = model.picker.Poll(picked);
+            if (outcome == Launcher::NativeFolderPicker::Outcome::Picked) SetGameDirText(model, PortSettings::PathText(picked));
+            if (outcome == Launcher::NativeFolderPicker::Outcome::Unavailable) {
+                std::fprintf(stderr, "[launcher] no system folder picker: the built-in browser\n");
+                model.browser.Open(model.folder.folder.empty() ? Launcher::PathFromText(Launcher::CleanFolderText(model.gameDir.data())) : model.folder.folder);
+            }
+            if (outcome != Launcher::NativeFolderPicker::Outcome::Busy) model.pickerBusy = false;
+        }
         SDL_GetRendererOutputSize(renderer, &outputWidth, &outputHeight);
         ImGui::GetStyle().FontScaleMain = std::clamp(static_cast<float>(outputHeight) / 720.0f, 0.75f, 4.0f);
         const auto& keys = model.options.keys;
@@ -458,7 +716,7 @@ int Run(Model& model) {
         ImGui_ImplSDLRenderer2_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
-        const auto action = Draw(model, frame == 0);
+        auto action = Draw(model, frame == 0);
         ImGui::Render();
         SDL_RenderSetScale(renderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
         SDL_SetRenderDrawColor(renderer, 15, 15, 18, 255);
@@ -471,8 +729,24 @@ int Run(Model& model) {
             result = written ? ExitSnapshot : ExitFailure;
         }
         SDL_RenderPresent(renderer);
+        if (result >= 0) break;
+        // --launch with only the setup missing: set up (and then play) at once.
+        if (model.autoPlay && frame == 2) {
+            model.autoPlay = false;
+            action = Action::Play;
+        }
         if (action == Action::Quit) result = PortSettings::LauncherExitQuit;
-        if (action == Action::Play && Save(model)) result = 0;
+        if (action == Action::Browse) {
+            const auto start = model.folder.folder.empty() ? Launcher::PathFromText(Launcher::CleanFolderText(model.gameDir.data())) : model.folder.folder;
+            if (deck) {
+                model.browser.Open(start);
+            } else {
+                model.picker.Start(window, start);
+                model.pickerBusy = true;
+            }
+        }
+        if (action == Action::Play) result = Play(model);
+        if (model.setupRunning && model.setup->Finished()) result = SetupFinished(model);
     }
 
 #ifdef _WIN32
@@ -494,14 +768,31 @@ int main(int argc, char** argv) {
     SDL_SetMainReady();
     const auto options = ParseOptions(argc, argv);
     if (!options) {
-        std::fprintf(stderr, "usage: %s [--settings <file>] [--window WIDTHxHEIGHT] [--keys <k,k,...>] [--snapshot <file.bmp>]\n", PortSettings::LauncherName);
+        std::fprintf(stderr, "usage: %s [--settings <file>] [--launch] [--window WIDTHxHEIGHT] [--deck] [--dry-run] [--keys <k,k,...>] [--snapshot <file.bmp>] [game arguments]\n",
+            PortSettings::LauncherName);
         return ExitFailure;
     }
-    Model model;
-    model.options = *options;
-    LoadModel(model);
-    const int result = Run(model);
-    std::fprintf(stderr, "[launcher] %s\n", result == 0 ? "Play" : result == PortSettings::LauncherExitQuit ? "Quit" : result == ExitSnapshot ? "snapshot taken" : "failed");
+    auto model = std::make_unique<Model>();
+    model->options = *options;
+    LoadModel(*model);
+    if (Release(*model) && model->options.launch) {
+        // --launch: straight to the game when it can; the window only to set up or to fix the folder.
+        if (model->folder.state == Launcher::FolderState::Valid && model->setupReason.empty() && model->options.snapshot.empty()) {
+            std::fprintf(stderr, "[launcher] --launch: the game folder is set up\n");
+            if (StartPlaying(*model) == ExitGameStarted) return Launcher::WaitGame(model->game);
+        } else if (model->folder.state == Launcher::FolderState::Valid) {
+            model->autoPlay = true;
+        } else {
+            model->status = "The game could not start straight away (--launch): choose a valid game folder, then press Play.";
+            model->statusError = true;
+        }
+    }
+    int result = Run(*model);
+    std::fprintf(stderr, "[launcher] %s\n", result == 0 ? (Release(*model) ? "saved" : "Play") : result == PortSettings::LauncherExitQuit ? "Quit" : result == ExitSnapshot ? "snapshot taken" : result == ExitGameStarted ? "game started" : "failed");
     std::fflush(stderr);
+    if (result == ExitGameStarted) {
+        result = Launcher::WaitGame(model->game);
+        std::fprintf(stderr, "[launcher] the game exited with code %d\n", result);
+    }
     return result;
 }

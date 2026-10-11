@@ -13,6 +13,8 @@ First start: pass your own decrypted dump with -Dump. The launcher then
   4. starts the game.
 Later starts need no arguments. Run with -Dump again after updating AnyPS5 or the dump.
 Other arguments go to DemonsSouls.exe: --launch skips the settings window (Steam: %command% --launch).
+The settings window (anyps5-launcher.exe) runs this setup itself (-Dump <its game folder> -SetupOnly) when
+the game folder is chosen there; without DemonsSouls.exe and without -Dump this script opens that window.
 
 Runtime settings (an already set environment variable always wins):
   APS5_HOST_IMPORT_MIB  guest memory the GPU may read in place; chosen from installed RAM
@@ -120,6 +122,12 @@ function Install-Game([string]$dumpPath) {
 if ($Dump) {
     Install-Game $Dump
 } elseif (-not (Test-Path -LiteralPath $exe)) {
+    $launcher = Join-Path $here "anyps5-launcher.exe"
+    if (Test-Path -LiteralPath $launcher) {
+        # A fresh install: the settings window asks for the dump, sets up and starts the game.
+        & $launcher @GameArgs
+        exit 0
+    }
     Write-Host "DemonsSouls.exe is not set up yet. Run once with your own decrypted dump:"
     Write-Host "  .\DemonsSouls.ps1 -Dump `"D:\path\to\PPSA01341-app0`""
     exit 1

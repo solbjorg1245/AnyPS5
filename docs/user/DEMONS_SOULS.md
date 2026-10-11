@@ -30,22 +30,40 @@ The port is a work in progress. Read [Known issues](#known-issues) before you st
 
 1. Unpack the archive into its own folder, for example `C:\Games\AnyPS5-DemonsSouls`. Do not
    unpack it into the dump folder. On Windows, keep the folder and the dump on local NTFS drives,
-   because the launcher links the dump with directory junctions.
-2. First start, with the path to your dump:
-   - Windows: open PowerShell in the folder and run
-     `.\DemonsSouls.ps1 -Dump "D:\Games\PPSA01341-app0"`, or run
-     `DemonsSouls.bat -Dump "D:\Games\PPSA01341-app0"` from a command prompt.
-   - Linux: `./DemonsSouls.sh --dump /path/to/PPSA01341-app0`
-   The launcher then
-   1. runs `tools/relinker` on your `eboot.bin` and writes `DemonsSouls.exe` (Windows) or
-      `DemonsSouls.elf` (Linux). The relinker also writes converted game modules into
-      `app0/sce_module`,
-   2. applies the port's executable patch with `tools/ds_patch.py` (it checks the game version and
-      writes nothing if the version does not match),
-   3. links every folder of your dump into `app0/`. Your dump is never modified,
-   4. starts the game.
-3. Later starts: `DemonsSouls.bat` / `.\DemonsSouls.ps1` on Windows, `./DemonsSouls.sh` on Linux.
-   Run with `-Dump` / `--dump` again after updating AnyPS5.
+   because the setup links the dump with directory junctions.
+2. Start **`anyps5-launcher.exe`** in that folder (Linux: `./anyps5-launcher`; on a fresh install
+   `DemonsSouls.bat` and `DemonsSouls.sh` open it too). In **Game folder**, type or paste the path of
+   your dump's `app0` folder, or press **Browse...** (the system's folder picker; on a Steam Deck the
+   window's own browser: D-pad moves, A opens a folder, B goes up, Y takes the folder shown). The
+   window checks the folder at once and says what is wrong: `eboot.bin`, `sce_sys` and `sce_module`
+   must be there, `eboot.bin` must be decrypted (an encrypted SELF does not work), the folder must be on
+   a local drive, and it names the game version (a warning for an unknown one). Choosing the folder that
+   contains `app0` works too. **Play** stays disabled until the folder is valid.
+3. Press **Play**. The first time, and after you choose another folder, update AnyPS5 or install
+   Python, the window runs the one-time setup and shows its progress (it calls `DemonsSouls.ps1 -Dump
+   <folder> -SetupOnly` / `DemonsSouls.sh --dump <folder> --setup-only`, hidden):
+   1. `tools/relinker` turns your `eboot.bin` into `DemonsSouls.exe` (Windows) or `DemonsSouls.elf`
+      (Linux) and writes converted game modules into `app0/sce_module`,
+   2. `tools/ds_patch.py` applies the port's executable patch (it checks the game version and writes
+      nothing if the version does not match; skipped with a warning when Python is missing),
+   3. every folder of your dump is linked into `app0/`. Your dump is never modified.
+
+   Then the game starts. The setup is recorded in `anyps5-setup.txt` (delete it to run the setup again).
+   Later, **Play** starts the game at once.
+
+### Steam
+
+Add `anyps5-launcher.exe` (Linux and Steam Deck: `anyps5-launcher`) as a non-Steam game. Without launch
+options the settings window opens on every start. With the launch options **`%command% --launch`** the
+game starts straight away once the game folder is set up (otherwise the window opens). On a Steam Deck,
+unpack the archive and add the launcher in Desktop Mode, then play from Game Mode.
+
+### Without the window
+
+`.\DemonsSouls.ps1 -Dump "D:\Games\PPSA01341-app0"` (PowerShell), `DemonsSouls.bat -Dump
+"D:\Games\PPSA01341-app0"` (command prompt) or `./DemonsSouls.sh --dump /path/to/PPSA01341-app0` (Linux)
+runs the same setup in a console and starts the game. Later starts: `DemonsSouls.bat` /
+`.\DemonsSouls.ps1` / `./DemonsSouls.sh`; run with `-Dump` / `--dump` again after updating AnyPS5.
 
 Options: `-SetupOnly` / `--setup-only` prepares without starting; `-NoPatch` / `--no-patch` skips the
 patch (slow; for troubleshooting only). On an Intel CPU, `-ToIntel` / `--to-intel` (together with
@@ -69,19 +87,22 @@ cache), `ANYPS5_NO_SHADER_CACHE=1` (no disk cache).
 
 ### Settings window
 
-Every start opens a settings window before the game: resolution (the presets, your desktop's size or
-auto), window mode, FPS limit, timestep and native aspect. Use the mouse, the keyboard (arrow keys,
-Enter) or a controller (D-pad, A; Start plays). **Play** saves `anyps5-settings.ini` and starts the
-game; closing the window quits without starting it. Your comments and other keys in the file are kept.
-Upscaler and frame generation are shown greyed out: they come later.
+`anyps5-launcher` is the settings window: game folder (see [Install](#install)), resolution (the
+presets, your desktop's size or auto), window mode, FPS limit, timestep and native aspect. Use the mouse,
+the keyboard (arrow keys, Enter) or a controller (D-pad, A; Start plays). **Play** saves
+`anyps5-settings.ini`, runs the setup when it is due and starts the game; **Quit** or closing the window
+exits. Your comments and other keys in the file are kept. Upscaler and frame generation are shown greyed
+out: they come later.
 
-Add `--launch` to start straight away with the saved settings:
-- Steam (a non-Steam game pointing at `DemonsSouls.exe`, `DemonsSouls.bat` or `DemonsSouls.sh`):
-  launch options `%command% --launch`
+Starting `DemonsSouls.exe` itself (or `DemonsSouls.bat` / `.sh` after the setup) opens the same window
+first; there the game folder is shown but not changed. Add `--launch` to start straight away with the
+saved settings:
+- Steam (a non-Steam game pointing at `anyps5-launcher.exe`, `DemonsSouls.exe`, `DemonsSouls.bat` or
+  `DemonsSouls.sh`): launch options `%command% --launch`
 - Windows: `DemonsSouls.bat --launch` or `.\DemonsSouls.ps1 --launch`; Linux: `./DemonsSouls.sh --launch`
 
-`APS5_NO_LAUNCHER=1` skips it too. The window is `libs/anyps5-launcher.exe` (Linux:
-`libs/anyps5-launcher`); if it is missing or cannot open, the game starts with the file as it is.
+`APS5_NO_LAUNCHER=1` skips the window when the game starts on its own. If `anyps5-launcher.exe` is
+missing (next to the game or in `libs/`) or cannot open, the game starts with the file as it is.
 
 ### Settings file
 

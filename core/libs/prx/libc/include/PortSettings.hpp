@@ -23,8 +23,8 @@
 #include <vector>
 
 // Player settings: anyps5-settings.ini next to the executable (APS5_SETTINGS=<file> names another one,
-// APS5_SETTINGS=none skips it), one "Key = Value" per line, '#' or ';' starts a comment, [sections] are
-// ignored. The APS5_* variable after each key overrides it. A key left out keeps today's behaviour: the
+// APS5_SETTINGS=none skips it), one "Key = Value" per line, '#' or ';' starts a comment (not inside a
+// "quoted" value), [sections] are ignored. The APS5_* variable after each key overrides it. A key left out keeps today's behaviour: the
 // window opens at 60% of the screen and the title's render config (its performance or cinematic mode)
 // picks the render resolution and the frame rate.
 //   Resolution = 1280x800     APS5_RESOLUTION       output size: window client area (letterboxed), render tier
@@ -43,6 +43,7 @@
 //                             APS5_NO_RESOLUTION_4K_UI=1 (environment only): Resolution or RenderResolution
 //                             up to 1080p runs its tier's own 1080p-display slot again (same HUD fault)
 //   Upscaler = off            APS5_UPSCALER         reserved: fsr, dlss (UpscalerQuality and FrameGeneration: file only, reserved)
+//   GameDir = "D:\PPSA01341-app0"                   the player's dump (app0), set by the launcher; the game ignores it
 // The title takes one fixed physics step of 1/refresh per rendered frame (59.94 Hz in its 60 FPS mode,
 // 29.97 Hz in its 30 FPS mode), so any other limit, and any frame rate below the limit, changes the game
 // speed unless Timestep = variable (libSceVideoOut TimestepPatch) feeds it the measured frame rate.
@@ -76,6 +77,7 @@ struct Settings {
     Upscaler upscaler = Upscaler::Off;
     std::string upscalerQuality;
     bool frameGeneration = false;
+    std::string gameDir;  // UTF-8, without the quotes
     std::vector<std::string> warnings;
 
     bool Any() const { return width != 0 || renderHeight != 0 || fpsLimit != 0.0 || variableTimestep || windowMode != WindowMode::Auto || nativeAspect; }
@@ -136,18 +138,40 @@ inline std::string PathText(const std::filesystem::path& path) {
 // The only game build the timestep patch's table layout is known for (gameversion.txt of the title).
 inline constexpr const char* SupportedBuildVersion = "2025-10-15.877562";
 
-// True when gameversion.txt text has a "BuildVersion=<id>" line (a leading '+' is the title's own
-// argument syntax) with exactly the supported id.
-inline bool BuildVersionSupported(std::string_view text) {
+// The id of gameversion.txt text's "BuildVersion=<id>" line (a leading '+' is the title's own argument
+// syntax), empty without one.
+inline std::string_view BuildVersionOf(std::string_view text) {
     while (!text.empty()) {
         const auto end = text.find('\n');
         auto line = Trim(text.substr(0, end));
         text = end == std::string_view::npos ? std::string_view{} : text.substr(end + 1);
         if (line.starts_with('+')) line.remove_prefix(1);
         constexpr std::string_view key = "BuildVersion=";
-        if (line.starts_with(key)) return Trim(line.substr(key.size())) == SupportedBuildVersion;
+        if (line.starts_with(key)) return Trim(line.substr(key.size()));
     }
-    return false;
+    return {};
+}
+
+// True when gameversion.txt text names exactly the supported build.
+inline bool BuildVersionSupported(std::string_view text) {
+    return BuildVersionOf(text) == SupportedBuildVersion;
+}
+
+// Where a line's comment starts ('#' or ';' outside "double quotes", so a quoted path may hold them), npos without one.
+inline std::size_t CommentStart(std::string_view line) {
+    bool quoted = false;
+    for (std::size_t index = 0; index < line.size(); ++index) {
+        if (line[index] == '"') quoted = !quoted;
+        else if (!quoted && (line[index] == '#' || line[index] == ';')) return index;
+    }
+    return std::string_view::npos;
+}
+
+// A value without its surrounding double quotes (GameDir is written quoted).
+inline std::string_view Unquote(std::string_view value) {
+    value = Trim(value);
+    if (value.size() >= 2 && value.front() == '"' && value.back() == '"') value = value.substr(1, value.size() - 2);
+    return value;
 }
 
 // Writes `content` to a temporary sibling and renames it over `target`, so a reader (or a second
@@ -282,6 +306,8 @@ inline void SetKey(Settings& settings, std::string_view key, std::string_view va
     } else if (name == "framegeneration") {
         if (text == "off" || text == "0") settings.frameGeneration = false;
         else settings.warnings.push_back(origin + ": FrameGeneration is not implemented yet; using off");
+    } else if (name == "gamedir") {
+        settings.gameDir = std::string(Unquote(value));
     } else {
         settings.warnings.push_back(origin + ": unknown key '" + std::string(Trim(key)) + "'");
     }
@@ -296,7 +322,7 @@ inline Settings Parse(std::string_view text, const std::string& origin) {
         auto line = text.substr(0, end);
         text = end == std::string_view::npos ? std::string_view{} : text.substr(end + 1);
         ++lineNumber;
-        line = Trim(line.substr(0, line.find_first_of("#;")));
+        line = Trim(line.substr(0, CommentStart(line)));
         if (line.empty() || line.front() == '[') continue;
         const auto separator = line.find('=');
         const auto where = origin + ":" + std::to_string(lineNumber);
@@ -734,6 +760,13 @@ inline std::vector<std::pair<std::string, std::string>> LauncherValues(const Set
         {"NativeAspect", settings.nativeAspect ? "on" : "off"}};
 }
 
+// LauncherValues plus the game folder, quoted (a path may hold '#' or ';'); none while it is not set.
+inline std::vector<std::pair<std::string, std::string>> LauncherValuesWithGameDir(const Settings& settings) {
+    auto values = LauncherValues(settings);
+    if (!settings.gameDir.empty()) values.emplace_back("GameDir", "\"" + settings.gameDir + "\"");
+    return values;
+}
+
 // The file's text with each key set to its value. Every active "Key = Value" line of a key (any case) gets
 // the new value and keeps its indentation, key spelling and trailing comment; a key without such a line is
 // appended. Comments (also commented-out keys), sections, other keys, a UTF-8 BOM and the line endings stay
@@ -757,7 +790,7 @@ inline std::string SetIniValues(std::string_view text, const std::vector<std::pa
             ending = end == std::string_view::npos ? "\r" : "\r\n";
         }
         start = end == std::string_view::npos ? text.size() : end + 1;
-        const auto comment = line.find_first_of("#;");
+        const auto comment = CommentStart(line);
         const auto body = line.substr(0, comment);
         const auto separator = body.find('=');
         const auto trimmed = Trim(body);

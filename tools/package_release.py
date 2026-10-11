@@ -8,7 +8,8 @@ Default mode (used by .github/workflows/release.yml, unchanged output names):
 Player archive for Demon's Souls (--game ds, in addition to the files above):
         -> AnyPS5-DemonsSouls-<tag>-<platform>-x64.zip (Windows) / .tar.gz (Linux)
     The archive holds only files built from this source (relinker, libs/*.prx, the settings launcher), the MinGW runtime
-    DLLs, launchers, the stdlib-only patch tool, docs and licenses. The player relinks their own
+    DLLs, launchers, the stdlib-only patch tool, docs and licenses. The settings launcher sits at the archive
+    root as the player's entry point (it asks for the dump and runs the setup); the player relinks their own
     dump on first start; no game code, firmware or shader cache is ever packaged.
 
 Every file comes from an explicit allowlist and is then checked against a denylist (game files,
@@ -179,7 +180,8 @@ def check_binaries(platform, libraries, runtime_names, relinker=None, launcher=N
                 problems.append(f"{library.name} imports {dll}")
         elif elf_type(library) != 3:  # ET_DYN
             problems.append(f"{library.name} is not a host ELF shared object (e_type {elf_type(library)})")
-    # tools/relinker.exe and libs/anyps5-launcher.exe do not sit next to the bundled MinGW DLLs.
+    # tools/relinker.exe and libs/anyps5-launcher.exe do not sit next to the bundled MinGW DLLs (the player
+    # archive's root copy of the launcher does, but it is linked statically like the relinker).
     for executable in (relinker, launcher):
         if platform != "windows" or executable is None:
             continue
@@ -239,7 +241,9 @@ def player_entries(platform, build, source, libraries, runtime, relinker, launch
     else:
         entries += [(f"{root}DemonsSouls.sh", player / "DemonsSouls.sh")]
     entries += [(f"{root}libs/{lib.name}", lib) for lib in libraries]
-    entries += [(f"{root}libs/{launcher.name}", launcher)]
+    # The settings launcher at the root: the player's entry point and the Steam target (the game finds it
+    # next to DemonsSouls.exe as well).
+    entries += [(f"{root}{launcher.name}", launcher)]
     entries += license_entries(build, source, root)
     return entries
 

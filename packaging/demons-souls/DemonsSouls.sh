@@ -12,6 +12,8 @@
 # Later starts: ./DemonsSouls.sh   (extra arguments after -- go to the game; ./DemonsSouls.sh --launch
 #   skips the settings window, also as Steam launch options: %command% --launch)
 # Options: --dump <dir>, --setup-only, --no-patch, --to-intel (relink for an Intel CPU; untested)
+# The settings window (anyps5-launcher) runs this setup itself (--dump <its game folder> --setup-only) when
+# the game folder is chosen there; without DemonsSouls.elf and without --dump this script opens that window.
 #
 # Runtime settings (an already exported variable always wins):
 #   APS5_HOST_IMPORT_MIB  guest memory the GPU may read in place; chosen from installed RAM
@@ -99,6 +101,8 @@ install_game() {
 if [ -n "$dump" ]; then
     install_game "$dump"
 elif [ ! -x "$exe" ]; then
+    # A fresh install: the settings window asks for the dump, sets up and starts the game.
+    [ ! -x "$here/anyps5-launcher" ] || exec "$here/anyps5-launcher" "$@"
     echo "DemonsSouls.elf is not set up yet. Run once with your own decrypted dump:"
     echo "  ./DemonsSouls.sh --dump /path/to/PPSA01341-app0"
     exit 1

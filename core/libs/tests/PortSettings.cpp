@@ -13,6 +13,8 @@
 #include <map>
 #include <string>
 
+#include "GameFolder.hpp"
+
 extern "C" {
 int APS5_VABI sceKernelOpen(const char*, int, std::uint16_t);
 int APS5_VABI sceKernelClose(int);
@@ -480,8 +482,142 @@ static void TestLauncher() {
     Require(PortSettings::FormatNumber(59.94) == "59.94" && PortSettings::FormatNumber(45.0) == "45", "numbers written short");
 }
 
+// A minimal ELF64 eboot.bin: one executable PT_LOAD at 0x83b000 holding ds_patch.py's patch site.
+static std::string FakeEboot(bool knownVersion) {
+    std::string data(0x2000, '\0');
+    const auto put = [&](std::size_t offset, std::uint64_t value, int size) {
+        for (int index = 0; index < size; ++index) data[offset + static_cast<std::size_t>(index)] = static_cast<char>((value >> (8 * index)) & 0xff);
+    };
+    data[0] = 0x7f;
+    data[1] = 'E';
+    data[2] = 'L';
+    data[3] = 'F';
+    data[4] = 2;
+    data[5] = 1;
+    put(0x20, 64, 8);
+    put(0x36, 56, 2);
+    put(0x38, 1, 2);
+    put(64 + 0x00, 1, 4);
+    put(64 + 0x04, 5, 4);
+    put(64 + 0x08, 0x1000, 8);
+    put(64 + 0x10, 0x83b000, 8);
+    put(64 + 0x20, 0x1000, 8);
+    for (std::size_t index = 0; index < Launcher::PatchSiteBytes.size(); ++index) data[0x16b3 + index] = static_cast<char>(knownVersion ? Launcher::PatchSiteBytes[index] : 0x90);
+    return data;
+}
+
+static void WriteFile(const std::filesystem::path& path, const std::string& text) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream(path, std::ios::binary) << text;
+}
+
+static void MakeDump(const std::filesystem::path& app0, const std::string& eboot) {
+    WriteFile(app0 / "eboot.bin", eboot);
+    WriteFile(app0 / "sce_sys" / "param.json", "{\n  \"contentVersion\": \"01.007.000\",\n  \"titleId\" : \"PPSA01341\"\n}\n");
+    WriteFile(app0 / "gameversion.txt", "+BuildVersion=2025-10-15.877562\r\n");
+    std::filesystem::create_directories(app0 / "sce_module");
+}
+
+static bool Mentions(const std::vector<std::string>& lines, const char* text) {
+    for (const auto& line : lines) {
+        if (line.find(text) != std::string::npos) return true;
+    }
+    return false;
+}
+
+// GameDir in the settings file and the launcher's game folder checks and setup stamp (core/launcher/GameFolder.hpp).
+static void TestGameFolder() {
+    // A quoted path keeps '#' and ';'; the comment after it stays a comment.
+    const auto parsed = FromText("GameDir = \"D:\\Games #1; old\\PPSA01341-app0\" ; my dump\n");
+    Require(parsed.gameDir == "D:\\Games #1; old\\PPSA01341-app0" && parsed.warnings.empty(), "GameDir parsed with # and ; inside quotes");
+    PortSettings::Settings chosen;
+    chosen.gameDir = "E:\\New #2\\app0";
+    const auto saved = PortSettings::SetIniValues("GameDir = \"D:\\Old;1\" ; my dump\nBogus = 1\n", PortSettings::LauncherValuesWithGameDir(chosen));
+    Require(saved.starts_with("GameDir = \"E:\\New #2\\app0\" ; my dump\nBogus = 1\n"), "GameDir replaced in place, comment kept");
+    Require(PortSettings::Parse(saved, "test.ini").gameDir == "E:\\New #2\\app0", "GameDir round trip");
+    Require(PortSettings::SetIniValues("", PortSettings::LauncherValuesWithGameDir(PortSettings::Settings{})).find("GameDir") == std::string::npos, "no GameDir key while unset");
+    Require(FromText("FpsLimit = 45 # \"quoted\" comment\nTimestep = variable\n").fpsLimit == 45.0, "comment with quotes after a plain value");
+
+    Require(Launcher::CleanFolderText("  \"C:\\Games\\dump\\\"  ") == "C:\\Games\\dump", "pasted path: quotes and trailing separator dropped");
+    Require(Launcher::CleanFolderText("C:\\") == "C:\\" && Launcher::CleanFolderText("/home/deck/app0/") == "/home/deck/app0", "roots kept, trailing slash dropped");
+
+    const auto base = std::filesystem::temp_directory_path() / "aps5-gamefolder-test";
+    std::error_code error;
+    std::filesystem::remove_all(base, error);
+    const auto install = base / "install";
+    std::filesystem::create_directories(install);
+
+    Require(Launcher::CheckGameFolder("", install).state == Launcher::FolderState::Empty, "empty folder text");
+    Require(Launcher::CheckGameFolder(PortSettings::PathText(base / "missing"), install).state == Launcher::FolderState::Invalid, "missing folder");
+
+    // The parent of app0 is taken as its app0; a supported dump has no warnings.
+    const auto good = base / "PPSA01341" / "app0";
+    MakeDump(good, FakeEboot(true));
+    const auto bytes = Launcher::ReadTextBytes(good / "eboot.bin", Launcher::PatchSiteVaddr, Launcher::PatchSiteBytes.size());
+    Require(bytes.size() == Launcher::PatchSiteBytes.size() && std::equal(bytes.begin(), bytes.end(), Launcher::PatchSiteBytes.begin()), "patch site read from the ELF");
+    auto check = Launcher::CheckGameFolder("\"" + PortSettings::PathText(base / "PPSA01341") + "/\"", install);
+    Require(check.state == Launcher::FolderState::Valid && check.errors.empty() && check.warnings.empty(), "valid dump through its parent folder");
+    Require(std::filesystem::equivalent(check.folder, good) && check.summary.find("PPSA01341") != std::string::npos && check.summary.find("(supported)") != std::string::npos, "app0 used, title and version shown");
+    Require(Launcher::CheckGameFolder(PortSettings::PathText(good / "eboot.bin"), install).state == Launcher::FolderState::Valid, "eboot.bin itself picked");
+
+    const auto unknown = base / "unknown";
+    MakeDump(unknown, FakeEboot(false));
+    check = Launcher::CheckGameFolder(PortSettings::PathText(unknown), install);
+    Require(check.state == Launcher::FolderState::Valid && Mentions(check.warnings, "Unknown game version"), "unknown version: a warning");
+
+    const auto encrypted = base / "encrypted";
+    MakeDump(encrypted, std::string("\x4f\x15\x3d\x1d", 4) + std::string(60, '\0'));
+    check = Launcher::CheckGameFolder(PortSettings::PathText(encrypted), install);
+    Require(check.state == Launcher::FolderState::Invalid && Mentions(check.errors, "encrypted"), "encrypted SELF refused");
+
+    const auto partial = base / "partial";
+    WriteFile(partial / "eboot.bin", FakeEboot(true));
+    std::filesystem::create_directories(partial / "sce_sys");
+    check = Launcher::CheckGameFolder(PortSettings::PathText(partial), install);
+    Require(check.state == Launcher::FolderState::Invalid && Mentions(check.errors, "sce_module is missing"), "missing sce_module named");
+
+    MakeDump(install / "app0", FakeEboot(true));
+    check = Launcher::CheckGameFolder(PortSettings::PathText(install / "app0"), install);
+    Require(check.state == Launcher::FolderState::Invalid && Mentions(check.errors, "AnyPS5's own folder"), "AnyPS5's own app0 refused");
+    std::filesystem::remove_all(install / "app0", error);
+
+    // The release folder, the setup stamp and why the setup is due.
+    Require(Launcher::FindInstallDir(install).empty(), "no release folder without the setup script and relinker");
+    WriteFile(install / Launcher::SetupScript, "setup");
+    WriteFile(install / "tools" / Launcher::RelinkerName, "relinker");
+    WriteFile(install / "tools" / "ds_patch.py", "patch");
+    std::filesystem::create_directories(install / "libs");
+    Require(Launcher::FindInstallDir(install) == install && Launcher::FindInstallDir(install / "libs") == install, "release folder from the root or libs/");
+    Require(Launcher::SetupReason(install, good, true).find("first start") != std::string::npos, "setup due: no executable");
+    WriteFile(install / Launcher::GameExecutable, "exe");
+    std::filesystem::create_directories(install / "app0" / "sce_sys");
+    Require(Launcher::SetupReason(install, good, true).find("no record") != std::string::npos, "setup due: no stamp");
+    WriteFile(install / Launcher::StampName, Launcher::SetupStamp(good, Launcher::ToolsFingerprint(install), false));
+    Require(Launcher::SetupReason(install, good, false).empty(), "stamp holds");
+    Require(Launcher::SetupReason(install, good, true).find("Python") != std::string::npos, "setup due: Python installed since");
+    Require(Launcher::SetupReason(install, unknown, false).find("game folder changed") != std::string::npos, "setup due: other game folder");
+    WriteFile(install / "tools" / Launcher::RelinkerName, "a newer relinker");
+    Require(Launcher::SetupReason(install, good, false).find("updated") != std::string::npos, "setup due: AnyPS5 updated");
+
+    // Python as DemonsSouls.ps1 / .sh find it, never the Store alias.
+#ifdef _WIN32
+    const char* pythonName = "python.exe";
+    const std::string pathText = PortSettings::PathText(base / "WindowsApps") + ";" + PortSettings::PathText(base / "bin");
+#else
+    const char* pythonName = "python3";
+    const std::string pathText = PortSettings::PathText(base / "WindowsApps") + ":" + PortSettings::PathText(base / "bin");
+#endif
+    const auto lookup = [&](const char* name) -> const char* { return std::string_view(name) == "PATH" ? pathText.c_str() : nullptr; };
+    WriteFile(base / "WindowsApps" / pythonName, "");
+    Require(!Launcher::PythonOnPath(lookup), "the WindowsApps alias is not Python");
+    WriteFile(base / "bin" / pythonName, "");
+    Require(Launcher::PythonOnPath(lookup), "Python on PATH");
+    std::filesystem::remove_all(base, error);
+}
+
 int main() {
     TestLauncher();
+    TestGameFolder();
     TestReviewFixes();
     TestResolution4kUi();
     TestNativeAspect();
