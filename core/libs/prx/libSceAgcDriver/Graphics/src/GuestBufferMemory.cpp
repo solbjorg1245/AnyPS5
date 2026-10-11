@@ -4721,7 +4721,12 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 narrowNow.push_back(std::move(copy));
             } else {
                 if (!recording) {
-                    commands = recorder.Commands();
+                    // Aware commands (APS5_AWARE_COMMANDS): only the queued copies over the use's
+                    // written ranges go in first (a claimed copy taken here is off the queue, which
+                    // is disjoint: no other queued copy holds its bytes).
+                    commands = recorder.CommandsTouching([&](std::uint64_t begin, std::uint64_t end) {
+                        return std::any_of(merged.begin(), merged.end(), [&](const std::pair<std::uint64_t, std::uint64_t>& range) { return begin < range.second && range.first < end; });
+                    }, Recorder::CommandSite::CopyBack);
                     timing = recorder.BeginGpuTiming(StagingCopyBackKey);
                     // The shader's stores into the buffer (whichever stage made them) precede the copy.
                     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);

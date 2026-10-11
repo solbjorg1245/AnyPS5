@@ -1251,7 +1251,7 @@ bool recordDeferredFlat(const Context& context, Recorder& recorder, const Shader
     if (copies.empty() && fallbacks.empty()) return false;
     recorder.RecordCopies(copies, Recorder::CommandClass::DeferredFlat);
     if (!fallbacks.empty()) {
-        const auto commands = recorder.Commands();
+        const auto commands = recorder.Commands(nullptr, Recorder::CommandSite::DrawOther);
         const auto update = context.Resolved(&DeviceFunctions::cmdUpdateBuffer, "vkCmdUpdateBuffer");
         for (const auto& [buffer, patch] : fallbacks) update(commands, buffer, patch.first, sizeof(std::uint32_t), &patch.second);
         recorder.MarkCovered(0);
@@ -1655,6 +1655,48 @@ void noteDrawTiming(Recorder& recorder, std::uint32_t passTiming, const State& s
     recorder.NoteDrawInPass(passTiming, target, Recorder::InPlaceUseOf(reads, writes, inputs, leased));
 }
 
+// An aware draw's import ranges (drawCommands), kept with their capacity on the calling thread.
+struct AwareRangesScratch {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    unsigned depth = 0;
+};
+
+// The command buffer of a recorded draw (recordDraw, DrawFast): its open pass continued, else
+// Commands(). Aware commands (APS5_AWARE_COMMANDS, Recorder::CommandsTouching) with copy-backs
+// queued: a draw that knows every guest range it reads or writes through the imports (`known`;
+// `list` lists them into its argument) has only the queued copies over them (and the claimed
+// ones) recorded first, and continues the open pass only when there are none (a copy cannot go
+// into a pass, and only a begun pass's opening barrier orders it before the draw); one that does
+// not know them begins its own pass behind every queued copy, as Commands() records them.
+template <typename List>
+VkCommandBuffer drawCommands(Recorder& recorder, bool& continued, bool known, const List& list) {
+    if (!recorder.AwareCommands() || !recorder.HasDeferredCopies()) return continued ? recorder.CommandsInRenderPass() : recorder.Commands(nullptr, Recorder::CommandSite::Draw);
+    if (!known) {
+        continued = false;
+        return recorder.Commands(nullptr, Recorder::CommandSite::Draw);
+    }
+    // Sorted and merged: a queued copy's test is a binary search.
+    ScratchLease<AwareRangesScratch> scratch;
+    auto& ranges = scratch->ranges;
+    ranges.clear();
+    list(ranges);
+    ranges.erase(std::remove_if(ranges.begin(), ranges.end(), [](const std::pair<std::uint64_t, std::uint64_t>& range) { return range.first >= range.second; }), ranges.end());
+    std::sort(ranges.begin(), ranges.end());
+    std::size_t last = 0;
+    for (std::size_t index = 1; index < ranges.size(); ++index) {
+        if (ranges[index].first <= ranges[last].second) ranges[last].second = std::max(ranges[last].second, ranges[index].second);
+        else ranges[++last] = ranges[index];
+    }
+    if (!ranges.empty()) ranges.resize(last + 1);
+    const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
+        const auto found = std::upper_bound(ranges.begin(), ranges.end(), begin, [](std::uint64_t at, const std::pair<std::uint64_t, std::uint64_t>& range) { return at < range.second; });
+        return found != ranges.end() && found->first < end;
+    };
+    if (continued && !recorder.WouldRecordCopies(std::cref(touches))) return recorder.CommandsInRenderPass();
+    continued = false;
+    return recorder.CommandsTouching(touches, Recorder::CommandSite::Draw);
+}
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
@@ -1708,10 +1750,22 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // A GPU-side draw whose records need no rewrite reads them in place, covered by the pass's
     // opening barrier, so it continues the pass like any other draw.
     const bool rewrites = gpuIndirect && rewritesRecords(*args);
-    const bool continued = !capture && !readsTarget && !rewrites && !deferredFlat && recorder->ContinuesRenderPass(passKey);
+    bool continued = !capture && !readsTarget && !rewrites && !deferredFlat && recorder->ContinuesRenderPass(passKey);
+    // Aware commands (drawCommands): what the draw reads or writes through the imports, as
+    // `touches` and the pending-read notes below name it; unknown for an address-based build and a
+    // captured draw.
+    const auto importRanges = [&](std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+        static_cast<void>(resources.InPlaceReads(ranges));
+        ranges.insert(ranges.end(), resources.GpuWrites().begin(), resources.GpuWrites().end());
+        ranges.insert(ranges.end(), inputs.inPlaceRanges.begin(), inputs.inPlaceRanges.end());
+        if (drawBindings != nullptr) ranges.insert(ranges.end(), drawBindings->inPlaceReads.begin(), drawBindings->inPlaceReads.end());
+        if (!gpuIndirect) return;
+        ranges.emplace_back(args->arguments, args->arguments + args->RangeBytes());
+        if (args->countIndirect) ranges.emplace_back(args->countAddress, args->countAddress + 4);
+    };
+    const auto commands = drawCommands(*recorder, continued, !resources.HoldsLease() && !capture, importRanges);
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
-    const auto commands = continued ? recorder->CommandsInRenderPass() : recorder->Commands();
     if (capture) captureInputs(context, *recorder, commands, resources, drawBindings, record.targets.empty() || record.targets.front() == nullptr ? 0 : record.targets.front()->Descriptor().baseAddress);
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
     // continued draw lies inside its pass's range).
@@ -2197,7 +2251,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     if (recorded && recorder->HasQueuedKeyStores() && (resources->HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorded && recorder->HasQueuedStores() && (resources->HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
-    const auto commands = recorded ? recorder->Commands() : batch->Handle();
+    const auto commands = recorded ? recorder->Commands(nullptr, Recorder::CommandSite::DrawOther) : batch->Handle();
     APS5_LOG_CHARS_OUT_DEBUG("CommandBatch created");
     // The draw's [gputime] class range: from its first barrier to the download barrier.
     const auto drawTiming = recorded ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
@@ -2522,7 +2576,15 @@ FastDrawOutcome DrawFast(const Context& context, const State& state, const Pm4::
     if (recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) recorder->FlushKeyStores();
     if (recorder->HasQueuedStores() && recorder->AnyQueuedStore(touches)) recorder->FlushStores();
     bool continued = recorder->ContinuesRenderPass(passKey);
-    auto commands = continued ? recorder->CommandsInRenderPass() : recorder->Commands();
+    // Aware commands (drawCommands): the elements and inputs read in place, and the records.
+    const auto importRanges = [&](std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+        ranges.assign(reads.begin(), reads.end());
+        ranges.insert(ranges.end(), inputs.inPlaceRanges.begin(), inputs.inPlaceRanges.end());
+        if (args == nullptr) return;
+        ranges.emplace_back(args->arguments, args->arguments + args->RangeBytes());
+        if (args->countIndirect) ranges.emplace_back(args->countAddress, args->countAddress + 4);
+    };
+    auto commands = drawCommands(*recorder, continued, true, importRanges);
     // The data words go into the ring for the open batch (the batch is open now, so its serial is
     // Submissions() + 1). A full ring reclaims the regions of the batches that already finished
     // and is asked once more, then declines: no GPU wait under the mutex every queue takes (the
@@ -2541,7 +2603,7 @@ FastDrawOutcome DrawFast(const Context& context, const State& state, const Pm4::
                 recorder->Sync();
                 ring.Complete(recorder->Submissions());
                 continued = false;
-                commands = recorder->Commands();
+                commands = recorder->Commands(nullptr, Recorder::CommandSite::Draw);
             } else {
                 ReclaimFastRing(ring, *recorder);
                 // The reaped batches' completions ran on this open batch: a store they queued over
@@ -2549,7 +2611,7 @@ FastDrawOutcome DrawFast(const Context& context, const State& state, const Pm4::
                 if (recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) recorder->FlushKeyStores();
                 if (recorder->HasQueuedStores() && recorder->AnyQueuedStore(touches)) recorder->FlushStores();
                 continued = continued && recorder->ContinuesRenderPass(passKey);
-                commands = continued ? recorder->CommandsInRenderPass() : recorder->Commands();
+                commands = drawCommands(*recorder, continued, true, importRanges);
             }
             region = ring.Allocate(dataBytes, recorder->Submissions() + 1);
             if (!region) return decline(FastDecline::RingFull);

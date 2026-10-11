@@ -56,7 +56,31 @@ public:
     // so a dispatch, fill or copy whose leading barrier asks for a subset of them may skip it
     // (the [barriers] line counts the merges). The call clears the mask (whatever the caller
     // records is assumed uncovered until it marks); a new batch starts uncovered.
-    VkCommandBuffer Commands(VkAccessFlags* coveredAccess = nullptr);
+    // `site`: where the call is made, for the [barriers] census of the passes that recorded queued
+    // copy-backs ("command passes by site").
+    enum class CommandSite : std::uint8_t { Other = 0, Draw, DrawOther, Fill, Copy, Dispatch, Texture, TextureWriteBack, UnitShadow, Depth, CopyBack, KeyStore, Count };
+    static const char* CommandSiteName(CommandSite site);
+    VkCommandBuffer Commands(VkAccessFlags* coveredAccess = nullptr, CommandSite site = CommandSite::Other);
+    // Aware commands (APS5_AWARE_COMMANDS=1, default off; with copy-back coalescing; read when the
+    // recorder is made): Commands() for a caller that knows every guest range it reads or writes
+    // through the host imports, `touches(begin, end)` telling whether it does so in [begin, end).
+    // Only the queued copy-backs whose bytes it touches are recorded first (resident and land
+    // copies alike), and every claimed one (the claims of a build still recording keep Commands()'
+    // rule); the others stay queued, whole and in order, for the next point that records them
+    // (nothing reads or writes their bytes before: C1). A caller whose ranges are not all known
+    // calls Commands(). Without the switch: Commands().
+    bool AwareCommands() const { return awareCommands; }
+    template <typename Touches>
+    VkCommandBuffer CommandsTouching(const Touches& touches, CommandSite site, VkAccessFlags* coveredAccess = nullptr) {
+        if (!awareCommands) return Commands(coveredAccess, site);
+        const std::function<bool(std::uint64_t, std::uint64_t)> selected = std::cref(touches);
+        return commandsTouching(&selected, site, coveredAccess);
+    }
+    // An aware caller that reads and writes no host import (images, buffers of its own).
+    VkCommandBuffer CommandsTouchingNothing(CommandSite site, VkAccessFlags* coveredAccess = nullptr) { return awareCommands ? commandsTouching(nullptr, site, coveredAccess) : Commands(coveredAccess, site); }
+    // Whether CommandsTouching(touches) would record queued copy-backs first: a claimed one, or one
+    // storing bytes `touches` holds for.
+    bool WouldRecordCopies(const std::function<bool(std::uint64_t, std::uint64_t)>& touches) const;
     // After a trailing barrier with ALL_COMMANDS as its destination stage: `access` is its
     // destination access mask.
     void MarkCovered(VkAccessFlags access);
@@ -192,7 +216,10 @@ public:
     //   (VulkanDevice recordDispatch);
     // - those over a range a staging build copies in from its import (all claims made first; a
     //   region's own claimed copies stay: it copies from that shadow), before its copy pass takes
-    //   CommandsKeepingCopyBacks (GuestBufferMemory::recordGpuCopies).
+    //   CommandsKeepingCopyBacks (GuestBufferMemory::recordGpuCopies);
+    // - with aware commands (AwareCommands), those over what a caller that knows its ranges reads
+    //   or writes through the imports, and every claimed one, before it takes the command buffer
+    //   (CommandsTouching).
     // The CPU reads a copied range only after its batch completed: the use's pending-write notes
     // make a CPU access sync the batch (Submit records the copies first), and the title's pollers
     // see a label only after the copies recorded ahead of its store.
@@ -332,6 +359,11 @@ public:
         std::uint64_t narrow = 0, narrowSpans = 0, narrowBytes = 0, narrowWhole = 0, narrowDispatches = 0, narrowStoredBytes = 0;
         // APS5_NARROW_VERIFY: dwords whose import differed from a shadow equal to its baseline.
         std::uint64_t narrowStale = 0;
+        // Command passes (Commands() calls that recorded queued copies) by CommandSite; aware
+        // commands (CommandsTouching) that left copies queued, the copies and bytes they left
+        // (summed per command), and the copies they recorded as over their ranges.
+        std::array<std::uint64_t, static_cast<std::size_t>(CommandSite::Count)> sites{};
+        std::uint64_t awareKeeping = 0, awareKept = 0, awareKeptBytes = 0, awareFlushed = 0;
     };
     static CopyBackStatistics CopyBackCounts();
     void DeferCopies(std::vector<DeferredCopy> copies);
@@ -1128,6 +1160,13 @@ private:
     // Commands() with the queued copy-backs recorded first unless `keepCopyBacks`.
     VkCommandBuffer commandsFor(VkAccessFlags* coveredAccess, bool keepCopyBacks);
     bool coalesceCopyBacks = false;
+    // Aware commands (AwareCommands), and the CommandSite of the Commands() call in progress (the
+    // census counts the pass it records under it).
+    bool awareCommands = false;
+    std::uint8_t commandSite = 0;
+    // CommandsTouching's body: records the claimed copies and the queued copies `touches` holds for
+    // (none when null), counts those it leaves, and hands out the command buffer without them.
+    VkCommandBuffer commandsTouching(const std::function<bool(std::uint64_t, std::uint64_t)>* touches, CommandSite site, VkAccessFlags* coveredAccess);
     // Resident buffers (KeepsResidentBuffers): at a Submit or label (`reason`), records the queued
     // copies but keeps the whole pages of the unclaimed ones `stored` does not overlap resident.
     void flushKeepingResident(FlushReason reason, const std::function<bool(std::uint64_t, std::uint64_t)>& stored);

@@ -575,6 +575,11 @@ std::atomic<std::uint64_t> copyBackNarrowStaleWords{0};
 // Resident written ranges' lands recorded (Recorder::ResidentLandCounts): by reason, then bytes.
 std::array<std::atomic<std::uint64_t>, 9> residentLands{};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Recorder::FlushReason::Count)> copyBackFlushes{};
+// Command passes by CommandSite, and the aware commands' counters (Recorder::CopyBackCounts): the
+// commands that left copies queued, the copies and bytes they left, the copies they recorded.
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Recorder::CommandSite::Count)> commandPasses{};
+std::atomic<std::uint64_t> awareCommandsKeeping{0}, awareCopiesKept{0}, awareBytesKept{0}, awareCopiesFlushed{0};
+std::atomic<bool> awareCommandsUsed{false};
 // Resident buffers (Recorder::KeepsResidentBuffers): counters (relaxed, on the [barriers] line),
 // the bytes kept resident at the last decision, and the live guards by sequence, which the fault
 // path searches (a guard's last holder may be a completed batch, released without the GPU mutex).
@@ -1317,6 +1322,10 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
         residentWrites.verifyEvery = static_cast<std::uint32_t>(verify == 1 ? 16 : verify);
         residentWrites.roundOut = number("APS5_RESIDENT_WRITES_ROUND", 1) != 0;
     }
+    // Aware commands (CommandsTouching): on coalescing's disjoint queue (resident buffers' too).
+    const char* awareSwitch = std::getenv("APS5_AWARE_COMMANDS");
+    awareCommands = coalesceCopyBacks && awareSwitch != nullptr && *awareSwitch != '\0' && std::strcmp(awareSwitch, "0") != 0;
+    if (awareCommands) awareCommandsUsed.store(true, std::memory_order_relaxed);
     // The compare pass and the shadows' baselines are addressed by buffer device address.
     if (narrowCopyBacks && ((!coalesceCopyBacks && DeferCopyBacks()) || !context.bufferDeviceAddress)) narrowCopyBacks = false;
     {
@@ -1672,12 +1681,39 @@ std::uint64_t Recorder::ReapsWithWork() {
     return holdCounters.reapsWithWork;
 }
 
-VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
+VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess, CommandSite site) {
+    commandSite = static_cast<std::uint8_t>(site);
     return commandsFor(coveredAccess, false);
 }
 
 VkCommandBuffer Recorder::CommandsKeepingCopyBacks(VkAccessFlags* coveredAccess) {
+    commandSite = static_cast<std::uint8_t>(CommandSite::Other);
     return commandsFor(coveredAccess, coalesceCopyBacks);
+}
+
+VkCommandBuffer Recorder::commandsTouching(const std::function<bool(std::uint64_t, std::uint64_t)>* touches, CommandSite site, VkAccessFlags* coveredAccess) {
+    commandSite = static_cast<std::uint8_t>(site);
+    ensureOpen();
+    if (HasDeferredCopies()) {
+        // The queued copies over the caller's ranges first (resident and land copies alike), and
+        // every claimed one, as Commands() records them (the claims of a build still recording
+        // keep its rule): a command pass of its site. Only those over the ranges count as flushed
+        // (the predicate runs once per copy).
+        std::uint64_t over = 0;
+        FlushDeferredWhere([&](const DeferredCopy& copy, bool claimed) {
+            const bool touched = touches != nullptr && (*touches)(copy.address, copy.address + copy.bytes);
+            if (touched) ++over;
+            return touched || claimed;
+        }, FlushReason::Command);
+        awareCopiesFlushed.fetch_add(over, std::memory_order_relaxed);
+        // The others stay queued, whole and in order (the queue stays disjoint).
+        if (HasDeferredCopies()) {
+            awareCommandsKeeping.fetch_add(1, std::memory_order_relaxed);
+            awareCopiesKept.fetch_add(deferredCopies.size() + claimedCopies.size(), std::memory_order_relaxed);
+            awareBytesKept.fetch_add(DeferredCopyBytes(), std::memory_order_relaxed);
+        }
+    }
+    return commandsFor(coveredAccess, true);
 }
 
 VkCommandBuffer Recorder::commandsFor(VkAccessFlags* coveredAccess, bool keepCopyBacks) {
@@ -1812,6 +1848,24 @@ const char* Recorder::FlushReasonName(FlushReason reason) {
     }
 }
 
+const char* Recorder::CommandSiteName(CommandSite site) {
+    switch (site) {
+    case CommandSite::Other: return "other";
+    case CommandSite::Draw: return "draw";
+    case CommandSite::DrawOther: return "draw-other";
+    case CommandSite::Fill: return "fill";
+    case CommandSite::Copy: return "copy";
+    case CommandSite::Dispatch: return "dispatch";
+    case CommandSite::Texture: return "texture";
+    case CommandSite::TextureWriteBack: return "texture-write-back";
+    case CommandSite::UnitShadow: return "unit-shadow";
+    case CommandSite::Depth: return "depth";
+    case CommandSite::CopyBack: return "copy-back";
+    case CommandSite::KeyStore: return "key-store";
+    default: return "?";
+    }
+}
+
 void Recorder::FlushDeferredWhere(const std::function<bool(const DeferredCopy&, bool claimed)>& selected, FlushReason reason) {
     // Resident copies outlive their batch: recording them opens one.
     if ((open == nullptr && !residentBuffers) || !HasDeferredCopies()) return;
@@ -1834,6 +1888,10 @@ std::uint64_t Recorder::DeferredCopyBytes() const {
     for (const auto& copy : deferredCopies) bytes += copy.bytes;
     for (const auto& copy : claimedCopies) bytes += copy.bytes;
     return bytes;
+}
+
+bool Recorder::WouldRecordCopies(const std::function<bool(std::uint64_t, std::uint64_t)>& touches) const {
+    return !claimedCopies.empty() || std::any_of(deferredCopies.begin(), deferredCopies.end(), [&](const DeferredCopy& copy) { return touches(copy.address, copy.address + copy.bytes); });
 }
 
 bool Recorder::ResidentLandQueued(const void* key) const {
@@ -1863,6 +1921,11 @@ Recorder::CopyBackStatistics Recorder::CopyBackCounts() {
     counts.narrowDispatches = copyBackNarrowDispatches.load(std::memory_order_relaxed);
     counts.narrowStoredBytes = copyBackNarrowStoredWords.load(std::memory_order_relaxed) * 4u;
     counts.narrowStale = copyBackNarrowStaleWords.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < counts.sites.size(); ++i) counts.sites[i] = commandPasses[i].load(std::memory_order_relaxed);
+    counts.awareKeeping = awareCommandsKeeping.load(std::memory_order_relaxed);
+    counts.awareKept = awareCopiesKept.load(std::memory_order_relaxed);
+    counts.awareKeptBytes = awareBytesKept.load(std::memory_order_relaxed);
+    counts.awareFlushed = awareCopiesFlushed.load(std::memory_order_relaxed);
     return counts;
 }
 
@@ -2192,6 +2255,7 @@ void Recorder::recordDeferredCopies(std::vector<DeferredCopy> copies, FlushReaso
     }
     copyBackPasses.fetch_add(1, std::memory_order_relaxed);
     copyBackFlushes[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+    if (reason == FlushReason::Command) commandPasses[commandSite].fetch_add(1, std::memory_order_relaxed);
     copyBacksRecorded.fetch_add(copies.size(), std::memory_order_relaxed);
     if (open->renderPass.open) endOpenRenderPass();
     if (open->trail.pending) recordDispatchTrail(TrailReason::Other);
@@ -2200,8 +2264,11 @@ void Recorder::recordDeferredCopies(std::vector<DeferredCopy> copies, FlushReaso
 
 void Recorder::RecordCopyBacksNow(std::vector<DeferredCopy> copies) {
     if (copies.empty()) return;
-    // Commands() records what it must first (queued copies, an open render pass's end).
-    const auto commands = Commands();
+    // Commands() records what it must first (queued copies, an open render pass's end); aware
+    // commands, only the queued copies over the bytes these store.
+    const auto commands = CommandsTouching([&](std::uint64_t begin, std::uint64_t end) {
+        return std::any_of(copies.begin(), copies.end(), [&](const DeferredCopy& copy) { return begin < copy.address + copy.bytes && copy.address < end; });
+    }, CommandSite::CopyBack);
     static_cast<void>(recordCopyPass(commands, std::move(copies)));
 }
 
@@ -2609,7 +2676,7 @@ void Recorder::recordKeyStores(bool forWriter) {
     auto stores = std::move(open->keyStores);
     open->keyStores.clear();
     if (stores.empty()) return;
-    const auto commands = Commands();
+    const auto commands = Commands(nullptr, CommandSite::KeyStore);
     const auto timing = beginTiming(ClassKey(CommandClass::DccKeyStore), TimingKind::Class);
     // Ordered behind every earlier recorded read or write of the ranges (the title's DCC clear or
     // decompress kernel storing keys through a V#), and visible to the work after and to the host.
@@ -2641,7 +2708,7 @@ void Recorder::recordKeyStores(bool forWriter) {
 void Recorder::RecordCopies(std::span<const DeferredCopy> copies, CommandClass which) {
     if (copies.empty()) return;
     // Outside any render pass, in the open batch.
-    const auto commands = Commands();
+    const auto commands = Commands(nullptr, CommandSite::DrawOther);
     const auto timing = beginTiming(ClassKey(which), TimingKind::Class);
     // Behind every earlier recorded write of the sources (a shader's stores through a V# bound in
     // place, a transfer, a label), and visible to the work after.
@@ -2980,6 +3047,17 @@ void reportBarriers() {
                 reasons += text;
             }
             std::fprintf(stderr, "; copy-back passes %llu by reason:%s, %llu copies (%.0f MiB) recorded", static_cast<unsigned long long>(counts.passes - last.passes), reasons.c_str(), static_cast<unsigned long long>(counts.recorded - last.recorded), (counts.recordedBytes - last.recordedBytes) / 1048576.0);
+            // The command passes by the caller's site (CommandSite); aware commands
+            // (APS5_AWARE_COMMANDS): those that left copies queued, the copies and MiB they left
+            // (summed per command), and the copies they recorded as over their ranges.
+            std::string sites;
+            for (std::size_t i = 0; i < counts.sites.size(); ++i) {
+                char text[48];
+                std::snprintf(text, sizeof(text), " %s %llu", Recorder::CommandSiteName(static_cast<Recorder::CommandSite>(i)), static_cast<unsigned long long>(counts.sites[i] - last.sites[i]));
+                sites += text;
+            }
+            std::fprintf(stderr, "; command passes by site:%s", sites.c_str());
+            if (awareCommandsUsed.load(std::memory_order_relaxed)) std::fprintf(stderr, "; aware: %llu commands kept %llu queued copies (%.1f MiB), %llu flushed overlapping", static_cast<unsigned long long>(counts.awareKeeping - last.awareKeeping), static_cast<unsigned long long>(counts.awareKept - last.awareKept), (counts.awareKeptBytes - last.awareKeptBytes) / 1048576.0, static_cast<unsigned long long>(counts.awareFlushed - last.awareFlushed));
         }
         if (counts.narrow != 0) std::fprintf(stderr, "; narrow copy-backs %llu in %llu spans, %.0f MiB compared in %llu dispatches, %.1f MiB stored, %llu spans copied whole", static_cast<unsigned long long>(counts.narrow - last.narrow), static_cast<unsigned long long>(counts.narrowSpans - last.narrowSpans), (counts.narrowBytes - last.narrowBytes) / 1048576.0, static_cast<unsigned long long>(counts.narrowDispatches - last.narrowDispatches), (counts.narrowStoredBytes - last.narrowStoredBytes) / 1048576.0, static_cast<unsigned long long>(counts.narrowWhole - last.narrowWhole));
         // APS5_NARROW_VERIFY: must stay 0 (a CPU store racing a running dispatch can count).

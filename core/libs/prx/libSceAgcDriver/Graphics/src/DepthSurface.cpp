@@ -201,7 +201,7 @@ private:
     struct Commands {
         explicit Commands(const Context& context) : recorder(Recorder::Active()) {
             if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
-            handle = recorder != nullptr ? recorder->Commands() : batch->Handle();
+            handle = recorder != nullptr ? recorder->CommandsTouchingNothing(Recorder::CommandSite::Depth) : batch->Handle();
         }
         void Finish(std::uint32_t barriers) {
             if (batch) batch->SubmitAndWait();

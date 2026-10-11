@@ -234,7 +234,8 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     VkAccessFlags covered = 0;
     auto timing = Recorder::NoTiming;
     if (recorder != nullptr) {
-        commands = recorder->Commands(&covered);
+        // Aware commands (APS5_AWARE_COMMANDS): only the queued copy-backs over the published ranges go in first.
+        commands = recorder->CommandsTouching([&](std::uint64_t begin, std::uint64_t end) { return std::any_of(ranges.begin(), ranges.end(), [&](const std::pair<std::uint64_t, std::uint64_t>& range) { return begin < range.second && range.first < end; }); }, Recorder::CommandSite::UnitShadow, &covered);
         timing = recorder->BeginGpuTiming(CommandClass::ShadowPublish);
         if (Recorder::BarrierValidate()) recorder->NoteAccess(CommandClass::ShadowPublish, Recorder::Access{{}, ranges, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     } else {

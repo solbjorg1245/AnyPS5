@@ -4226,6 +4226,155 @@ void narrowCopyBackTests(const Device& device, Recorder& recorder) {
     HostImportFor(context, address, bytes);
 }
 
+// Aware commands (APS5_AWARE_COMMANDS=1, with coalescing; read by a recorder made with it set): a
+// command naming the guest ranges it reads or writes through the imports (CommandsTouching)
+// records first only the queued copies over them, and every claimed one as Commands() does; the
+// others stay queued, whole, and land at Submit byte-exact. A copy over its ranges lands before its
+// own work, an unaware Commands() records every queued copy, and without the switch
+// CommandsTouching is Commands(). Command passes count by the caller's site only when they record.
+void awareCommandTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    // A recorder made with the switches given; the caller's switches come back after.
+    const auto saved = [](const char* name) {
+        const char* value = std::getenv(name);
+        return std::string(value != nullptr ? value : "");
+    };
+    const std::string awareSwitch = saved("APS5_AWARE_COMMANDS"), coalesceSwitch = saved("APS5_COALESCE_COPY_BACKS"), noCoalesceSwitch = saved("APS5_NO_COALESCE_COPY_BACKS");
+    const auto madeWith = [&](const char* aware, const char* coalesce) {
+        setSwitch("APS5_AWARE_COMMANDS", aware);
+        setSwitch("APS5_COALESCE_COPY_BACKS", coalesce);
+        setSwitch("APS5_NO_COALESCE_COPY_BACKS", "");
+        auto made = std::make_unique<Recorder>(context);
+        setSwitch("APS5_AWARE_COMMANDS", awareSwitch.c_str());
+        setSwitch("APS5_COALESCE_COPY_BACKS", coalesceSwitch.c_str());
+        setSwitch("APS5_NO_COALESCE_COPY_BACKS", noCoalesceSwitch.c_str());
+        return made;
+    };
+    Require(!madeWith("", "")->AwareCommands(), "aware commands are on by default");
+    Require(!madeWith("0", "")->AwareCommands(), "APS5_AWARE_COMMANDS=0 turned aware commands on");
+    Require(madeWith("1", "")->AwareCommands(), "APS5_AWARE_COMMANDS=1 did not turn aware commands on");
+    Require(!madeWith("1", "0")->AwareCommands(), "aware commands are on without copy-back coalescing");
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: aware commands not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the aware command test block");
+    std::memset(block, 0, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr) {
+        std::cout << "host import of the aware command test block refused: aware commands not tested\n";
+        return;
+    }
+    constexpr std::size_t sourceBytes = 8192;
+    auto first = std::make_shared<Buffer>(context, sourceBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    auto second = std::make_shared<Buffer>(context, sourceBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    const auto firstByte = [](std::size_t at) { return static_cast<unsigned char>(at * 7 + 1); };
+    const auto secondByte = [](std::size_t at) { return static_cast<unsigned char>(at * 13 + 5); };
+    for (std::size_t at = 0; at < sourceBytes; ++at) {
+        first->Bytes()[at] = std::byte{firstByte(at)};
+        second->Bytes()[at] = std::byte{secondByte(at)};
+    }
+    // The shadow's byte `at` goes to the block's byte `at`, as a staged region's copy-back.
+    const auto copyOf = [&](const std::shared_ptr<Buffer>& source, std::uint64_t at, std::uint64_t count) {
+        return std::vector<Recorder::DeferredCopy>{Recorder::DeferredCopy{source, source.get(), source->Handle(), import->buffer, at, address + at - import->base, count, address + at}};
+    };
+    // A command reading or writing the block's bytes [begin, end) through the import.
+    const auto within = [address](std::uint64_t begin, std::uint64_t end) {
+        return [=](std::uint64_t from, std::uint64_t to) { return from < address + end && address + begin < to; };
+    };
+    using Site = Recorder::CommandSite;
+    using Reason = Recorder::FlushReason;
+    const auto before = Recorder::CopyBackCounts();
+    {
+        const auto aware = madeWith("1", "1");
+        Require(aware->AwareCommands() && aware->CoalescesCopyBacks(), "APS5_AWARE_COMMANDS=1 with coalescing did not turn aware commands on");
+        aware->Activate();
+        // Nothing queued: no command pass to count.
+        static_cast<void>(aware->Commands(nullptr, Site::KeyStore));
+        aware->DeferCopies(copyOf(first, 0, 1024));
+        aware->DeferCopies(copyOf(second, 4096, 256));
+        Require(aware->WouldRecordCopies(within(1020, 1030)) && !aware->WouldRecordCopies(within(1024, 4096)), "WouldRecordCopies did not tell the copies over a range");
+        // Over neither copy, and over no import at all: both stay queued, whole.
+        static_cast<void>(aware->CommandsTouching(within(2048, 2112), Site::Fill));
+        static_cast<void>(aware->CommandsTouchingNothing(Site::Texture));
+        Require(aware->DeferredCopyBytes() == 1280, "an aware command recorded copies outside its ranges");
+        // Over the first copy: it alone lands, before the command's own work (a fill over its
+        // first half, which must win there).
+        const auto commands = aware->CommandsTouching(within(0, 512), Site::Copy);
+        Require(aware->DeferredCopyBytes() == 256, "an aware command did not record exactly the copy over its ranges");
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, import->buffer, address - import->base, 512, 0xa5a5a5a5u);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+        // The kept copy lands at Submit.
+        aware->Submit();
+        Require(!aware->HasDeferredCopies(), "Submit left queued copies");
+        aware->Sync();
+        // A claimed copy keeps Commands()' rule: an aware command over other bytes records it
+        // (breaking the claim); the unclaimed copy outside its ranges stays.
+        aware->DeferCopies(copyOf(first, 2048, 64));
+        aware->DeferCopies(copyOf(second, 3072, 64));
+        aware->ClaimDeferredCopies(second.get());
+        Require(aware->WouldRecordCopies(within(6144, 6208)), "a claimed copy did not make an aware command record copies");
+        const auto breaks = aware->ClaimBreaks();
+        static_cast<void>(aware->CommandsTouching(within(6144, 6208), Site::Fill));
+        Require(aware->DeferredCopyBytes() == 64 && aware->ClaimBreaks() == breaks + 1 && !aware->WouldRecordCopies(within(6144, 6208)), "an aware command did not record the claimed copy as Commands() does");
+        // An unaware Commands() records every queued copy.
+        aware->DeferCopies(copyOf(second, 5120, 128));
+        static_cast<void>(aware->Commands());
+        Require(!aware->HasDeferredCopies(), "an unaware Commands() left queued copies");
+        aware->Submit();
+        aware->Sync();
+    }
+    const auto awareCounts = Recorder::CopyBackCounts();
+    // Without the switch CommandsTouching is Commands(): every queued copy goes in first.
+    {
+        const auto plain = madeWith("", "1");
+        Require(!plain->AwareCommands() && plain->CoalescesCopyBacks(), "aware commands are on without APS5_AWARE_COMMANDS");
+        plain->Activate();
+        plain->DeferCopies(copyOf(first, 6144, 64));
+        static_cast<void>(plain->CommandsTouching(within(0, 64), Site::Texture));
+        Require(!plain->HasDeferredCopies(), "CommandsTouching without the switch left queued copies");
+        plain->DeferCopies(copyOf(second, 7168, 64));
+        static_cast<void>(plain->CommandsTouchingNothing(Site::Depth));
+        Require(!plain->HasDeferredCopies(), "CommandsTouchingNothing without the switch left queued copies");
+        plain->Submit();
+        plain->Sync();
+    }
+    const auto counts = Recorder::CopyBackCounts();
+    const auto site = [&](Site which) { return counts.sites[static_cast<std::size_t>(which)] - before.sites[static_cast<std::size_t>(which)]; };
+    const auto flushes = [&](Reason reason) { return counts.flushes[static_cast<std::size_t>(reason)] - before.flushes[static_cast<std::size_t>(reason)]; };
+    Require(site(Site::Copy) == 1 && site(Site::Fill) == 1 && site(Site::Other) == 1 && site(Site::Texture) == 1 && site(Site::Depth) == 1 && site(Site::KeyStore) == 0 && site(Site::Draw) == 0, "the command passes by site are off");
+    Require(counts.passes - before.passes == 6 && flushes(Reason::Command) == 5 && flushes(Reason::Submit) == 1 && counts.recorded - before.recorded == 7 && counts.recordedBytes - before.recordedBytes == 1536 + 128, "copy-back pass counters are off");
+    // Kept: both copies at the first Fill and the Texture commands, the second at the Copy one,
+    // the unclaimed one at the second Fill one; flushed as over the ranges: the first at the Copy one.
+    Require(awareCounts.awareKeeping - before.awareKeeping == 4 && awareCounts.awareKept - before.awareKept == 6 && awareCounts.awareKeptBytes - before.awareKeptBytes == 2 * 1280 + 256 + 64 && awareCounts.awareFlushed - before.awareFlushed == 1, "aware command counters are off");
+    Require(counts.awareKeeping == awareCounts.awareKeeping && counts.awareKept == awareCounts.awareKept && counts.awareFlushed == awareCounts.awareFlushed, "a recorder without the switch counted aware commands");
+    const auto* landed = static_cast<const unsigned char*>(block);
+    for (std::size_t at = 0; at < 8192; ++at) {
+        const bool fromFirst = (at >= 512 && at < 1024) || (at >= 2048 && at < 2112) || (at >= 6144 && at < 6208);
+        const bool fromSecond = (at >= 3072 && at < 3136) || (at >= 4096 && at < 4352) || (at >= 5120 && at < 5248) || (at >= 7168 && at < 7232);
+        const unsigned char want = at < 512 ? 0xa5 : fromFirst ? firstByte(at) : fromSecond ? secondByte(at) : 0;
+        if (landed[at] != want) throw std::runtime_error("an aware command test copy stored the wrong byte at offset " + std::to_string(at) + ": " + std::to_string(landed[at]) + ", expected " + std::to_string(want));
+    }
+    recorder.Activate();
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+}
+
 // The page guards resident buffers use (GuestPageGuard*): a fault runs the resolver, a guard it
 // leaves is released by force, and a page two guards hold stays guarded until both went.
 std::uint64_t guardTestIds[2]{};
@@ -6371,6 +6520,7 @@ int main() {
         pendingKeyStoreTests(device, recorder);
         coalesceCopyBackTests(device, recorder);
         narrowCopyBackTests(device, recorder);
+        awareCommandTests(device, recorder);
         pageGuardTests();
         sharedViewGuardTests();
         sharedViewFineTrackingTests();
