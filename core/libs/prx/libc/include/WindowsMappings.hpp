@@ -3,8 +3,10 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include "prx/libc/include/CrashMemory.hpp"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstddef>
 #include <cstdlib>
@@ -39,6 +41,7 @@ public:
     void Commit(void* address, std::size_t bytes, DWORD protection, std::size_t granule, bool watched) {
         std::lock_guard lock(mutex);
         const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
+        bool replaced = false;
         for (auto cursor = reinterpret_cast<std::uintptr_t>(address); cursor < end;) {
             const auto memory = query(cursor);
             const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
@@ -56,6 +59,7 @@ public:
                 if (!allocate(GetCurrentProcess(), reinterpret_cast<void*>(cursor), size, flags, protection, nullptr, 0)) fail("replace guest placeholder with private memory");
                 rememberRange(freshRanges, cursor, cursor + size);
                 mappingSerial.fetch_add(1, std::memory_order_release);
+                replaced = true;
                 cursor += size;
             } else {
                 if (memory.State != MEM_COMMIT) throw std::runtime_error("guest memory is not committed");
@@ -75,12 +79,14 @@ public:
                 cursor = stop;
             }
         }
+        if (replaced) record(CrashMemory::MapKind::Commit, address, bytes);
     }
 
     void Reset(void* address, std::size_t bytes) {
         std::lock_guard lock(mutex);
         reset(reinterpret_cast<std::uintptr_t>(address), bytes);
         mappingSerial.fetch_add(1, std::memory_order_release);
+        record(CrashMemory::MapKind::Reset, address, bytes);
     }
 
     void Map(void* address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection) {
@@ -109,6 +115,7 @@ public:
             invalidate(*shared);
         }
         mappingSerial.fetch_add(1, std::memory_order_release);
+        record(CrashMemory::MapKind::Map, address, bytes);
     }
 
     void SetProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
@@ -731,6 +738,25 @@ private:
         unmap = reinterpret_cast<UnmapFunction>(GetProcAddress(module, "UnmapViewOfFile2"));
         if (!allocate || !map || !unmap) throw std::runtime_error("Windows placeholder memory APIs are required");
         compare = reinterpret_cast<CompareFunction>(GetProcAddress(module, "CompareObjectHandles"));
+    }
+
+    // APS5_MAP_RING (on; APS5_NO_MAP_RING=1 turns it off): every change that puts bytes no write made
+    // at a guest address (the ones that bump mappingSerial) goes into a lock-free ring with its time,
+    // thread and callers, which a FATAL prints next to the zeroed object (CrashReport.cpp). These run
+    // on mmap/munmap/remap and on a guest heap cache miss or eviction, each already several system
+    // calls under the mutex (the mapping serial they bump stays put for frames: queryRegion's cache).
+    static void record(CrashMemory::MapKind kind, void* address, std::size_t bytes) {
+        static const bool enabled = [] {
+            const char* off = std::getenv("APS5_NO_MAP_RING");
+            return off == nullptr || *off == '\0' || (off[0] == '0' && off[1] == '\0');
+        }();
+        if (!enabled) return;
+        void* frames[CrashMemory::MapCallers];
+        const auto count = RtlCaptureStackBackTrace(1, static_cast<DWORD>(CrashMemory::MapCallers), frames, nullptr);
+        std::uint64_t callers[CrashMemory::MapCallers];
+        for (USHORT frame = 0; frame < count; ++frame) callers[frame] = reinterpret_cast<std::uint64_t>(frames[frame]);
+        const auto time = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        CrashMemory::MapHistory().Record(kind, reinterpret_cast<std::uint64_t>(address), bytes, static_cast<std::int64_t>(time), GetCurrentThreadId(), callers, count);
     }
 
     [[noreturn]] static void fail(const char* operation) {
