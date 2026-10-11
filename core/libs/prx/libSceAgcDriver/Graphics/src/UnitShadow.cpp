@@ -89,6 +89,9 @@ struct UnitShadow {
     std::vector<std::shared_ptr<ShadowSlab>> slabs;
     std::vector<std::uint64_t> slabFailedUntil;
     std::uint32_t liveUnits = 0;
+    // APS5_TRACE_WRITEBACK_RANGE (kept only while it is on): when units of the import were last
+    // retiled into the shadow (MarkShadowed; GuestMemory::StoreClockMs).
+    std::uint64_t markedMs = 0;
 
     std::uint64_t Units() const { return generation.size(); }
     std::uint64_t UnitBegin(std::uint64_t unit) const { return base + unit * UnitBytes; }
@@ -117,6 +120,14 @@ struct Shadows {
 Shadows& Registry() {
     static Shadows shadows;
     return shadows;
+}
+
+// APS5_TRACE_WRITEBACK_RANGE: one [wb-range] line for an event of the shadow over [begin, end) of
+// its import, when that intersects the traced range (creation, eviction, retirement and
+// destruction are never capped).
+void traceShadow(GuestMemory::RangeTraceKind kind, const UnitShadow& shadow, std::uint64_t begin, std::uint64_t end, const char* event, std::uint64_t generation) {
+    if (end <= begin || !GuestMemory::WriteBackRangeTraced(begin, end - begin)) return;
+    GuestMemory::WriteBackRangeLine(kind, kind != GuestMemory::RangeTraceKind::Shadow, "%s import 0x%llx+0x%llx: 0x%llx+0x%llx gen %llu, %u live units", event, static_cast<unsigned long long>(shadow.importBase), static_cast<unsigned long long>(shadow.importBytes), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<unsigned long long>(generation), shadow.liveUnits);
 }
 
 VkDeviceSize SlabBytes(const ShadowSlab& slab) {
@@ -153,6 +164,7 @@ std::shared_ptr<UnitShadow> findOrCreate(Shadows& registry, const Context& conte
             registry.liveBytes -= SlabBytes(*slab);
             --registry.liveSlabs;
         }
+        traceShadow(GuestMemory::RangeTraceKind::Shadow, *found->second, found->second->importBase, found->second->ImportEnd(), "drop (stale entry)", 0);
         registry.byBase.erase(found);
     }
     auto shadow = std::make_shared<UnitShadow>();
@@ -169,6 +181,7 @@ std::shared_ptr<UnitShadow> findOrCreate(Shadows& registry, const Context& conte
     shadow->slabs.assign(static_cast<std::size_t>(slabs), nullptr);
     shadow->slabFailedUntil.assign(static_cast<std::size_t>(slabs), 0);
     registry.byBase.emplace(import.base, shadow);
+    traceShadow(GuestMemory::RangeTraceKind::Shadow, *shadow, shadow->importBase, shadow->ImportEnd(), "create", 0);
     return shadow;
 }
 
@@ -300,6 +313,10 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     std::uint64_t bytes = 0;
     std::size_t units = 0;
+    // For the write-back range trace: the oldest generation among the copied units, the import's
+    // last retile.
+    std::uint64_t oldest = ~0ull;
+    std::uint64_t markedMs = 0;
     {
         // The stamps judged below see every CPU store into the live selected units up to now: a
         // store no collect walked yet would read as fresh and the copy would land over it. Every
@@ -334,6 +351,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
             }
             slab->lastUse = Recorder::Presents();
             bytes += end - begin;
+            oldest = std::min(oldest, shadow->generation[unit]);
         };
         for (auto unit = first; unit <= last; ++unit) {
             const auto k = static_cast<std::size_t>(unit - first);
@@ -382,6 +400,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
             ++units;
         }
         shadow->Recount();
+        markedMs = shadow->markedMs;
     }
     if (units == 0) return 0;
     Stats().published[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
@@ -391,9 +410,12 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         std::fprintf(stderr, "[shadow] publish %s: 0x%llx+0x%llx, %zu units, %.2f MiB, %zu slabs (packet 0x%x queue 0x%x)\n", ReasonNames[static_cast<std::size_t>(reason)], static_cast<unsigned long long>(ranges.front().first), static_cast<unsigned long long>(ranges.back().second - ranges.front().first), units, bytes / 1048576.0, copies.size(), packet.opcode, packet.queue);
     }
     recordCopies(*shadow, copies, ranges, bytes);
-    if (GuestMemory::CrashResourcesEnabled()) {
-        // The crash report's store ring: the slab copies land in the import (no MarkWritten).
-        const GuestMemory::StoreTag tag("unit shadow", ReasonNames[static_cast<std::size_t>(reason)], shadow->importBase);
+    if (GuestMemory::CrashResourcesEnabled() || GuestMemory::WriteBackRangeTraced(ranges.front().first, ranges.back().second - ranges.front().first)) {
+        // The crash report's store ring and the write-back range trace: the slab copies land in
+        // the import (no MarkWritten). The subject's age is the import's last retile (a lower
+        // bound for each unit's), its generation the oldest copied unit's.
+        const GuestMemory::StoreSubject subject{shadow->importBase, shadow->importBytes, 0, 0, 0, oldest != ~0ull ? oldest : 0, markedMs, 0};
+        const GuestMemory::StoreTag tag("unit shadow", ReasonNames[static_cast<std::size_t>(reason)], shadow->importBase, &subject);
         for (const auto& [begin, end] : ranges) GuestMemory::NoteGuestStore(begin, static_cast<std::size_t>(end - begin), "gpu (shadow publish)");
     }
     if (ShadowVerify()) verifyPublished(*shadow, copies);
@@ -470,6 +492,7 @@ bool evictOne(Shadows& registry) {
     auto& slab = victim->slabs[victimSlab];
     if (slab == nullptr) return true;
     if (TraceEnabled()) std::fprintf(stderr, "[shadow] evict slab %zu of import 0x%llx (%.1f MiB, %zu units published)\n", victimSlab, static_cast<unsigned long long>(victim->importBase), SlabBytes(*slab) / 1048576.0, published);
+    traceShadow(GuestMemory::RangeTraceKind::Shadow, *victim, std::max(victim->UnitBegin(firstUnit), victim->importBase), std::min(victim->UnitBegin(lastUnit + 1), victim->ImportEnd()), "evict slab", 0);
     // Its units read from the import from now on (the publish put their bytes there).
     for (auto unit = firstUnit; unit <= lastUnit; ++unit) {
         victim->generation[unit] = 0;
@@ -810,6 +833,17 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
             }
         }
         shadow->Recount();
+        if (GuestMemory::WriteBackRangeTraceOn()) {
+            shadow->markedMs = GuestMemory::StoreClockMs();
+            std::uint64_t markedBegin = ~0ull;
+            std::uint64_t markedEnd = 0;
+            for (const auto& [begin, end, slab] : ranges) {
+                if (end <= begin) continue;
+                markedBegin = std::min(markedBegin, begin);
+                markedEnd = std::max(markedEnd, end);
+            }
+            traceShadow(GuestMemory::RangeTraceKind::ShadowMarked, *shadow, markedBegin, markedEnd, "marked", generation);
+        }
     }
     if (lost != 0) {
         Stats().slabLost.fetch_add(lost, std::memory_order_relaxed);
@@ -870,6 +904,7 @@ void RetireShadow(const Context& context, const HostImport& import, const std::f
         --registry.liveSlabs;
     }
     ++registry.retired;
+    traceShadow(GuestMemory::RangeTraceKind::Shadow, *shadow, shadow->importBase, shadow->ImportEnd(), "retire", 0);
     if (TraceEnabled()) std::fprintf(stderr, "[shadow] retire import 0x%llx+0x%llx: %zu units published, %llu dropped (memory no longer registered)\n", static_cast<unsigned long long>(import.base), static_cast<unsigned long long>(import.bytes), published, static_cast<unsigned long long>(dropped));
     registry.byBase.erase(found);
 }
@@ -900,6 +935,7 @@ void DestroyShadows(VkDevice device) {
             registry.liveBytes -= SlabBytes(*slab);
             --registry.liveSlabs;
         }
+        traceShadow(GuestMemory::RangeTraceKind::Shadow, *it->second, it->second->importBase, it->second->ImportEnd(), "destroy", 0);
         it = registry.byBase.erase(it);
     }
 }

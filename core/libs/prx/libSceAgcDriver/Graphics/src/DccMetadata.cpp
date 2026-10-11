@@ -245,7 +245,11 @@ bool StoreUncompressedOnGpu(const Context& context, Recorder& recorder, std::uin
     // a later command writing the keys; see Recorder::QueueKeyStore).
     recorder.QueueKeyStore(import->buffer, first, last, std::move(seed), begin, begin + count);
     recorder.NotePendingWrite(begin, count, Recorder::WriteKind::DccKeys);
-    GuestMemory::MarkWritten(begin, count);
+    {
+        // Named a key store by the write-back range trace (APS5_TRACE_WRITEBACK_RANGE).
+        const GuestMemory::KeyStoreScope keys(begin, begin + count);
+        GuestMemory::MarkWritten(begin, count);
+    }
     // After the note: an unlocked memo lookup drops an entry the snapshot does not cover yet. The
     // entry is kept only for the active recorder (the one the flush hook and the lookups consult).
     {
@@ -265,6 +269,7 @@ void StoreUncompressedOnCpu(std::uint64_t begin, std::size_t count) {
     // The write waits for recorded work over the range (the flush hook), so the bytes are current after.
     ForgetStores(begin, begin + count);
     const std::vector<std::byte> uncompressed(count, std::byte{0xff});
+    const GuestMemory::KeyStoreScope keys(begin, begin + count);
     GuestMemory::Write(begin, uncompressed);
     CountStore(Scans().cpuStores);
 }

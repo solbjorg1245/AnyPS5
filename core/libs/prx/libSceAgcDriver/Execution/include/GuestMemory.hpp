@@ -329,10 +329,25 @@ struct GuestStoreRecord {
 std::size_t RecentGuestStores(std::uint64_t address, std::size_t bytes, std::span<GuestStoreRecord> out);
 // A store into guest memory the driver makes outside the paths above (a unit shadow's slab copy).
 void NoteGuestStore(std::uint64_t address, std::size_t bytes, const char* kind);
-// Names this thread's stores into guest memory for the ring until the scope ends.
+// What a store belongs to, for the write-back range trace (APS5_TRACE_WRITEBACK_RANGE): the
+// resource's guest extent and shape, the write generation its content was current at, and when it
+// was last written on the GPU and last refreshed from guest memory (StoreClockMs; 0 = not known).
+// Set with a StoreTag; the caller keeps it alive for the tag's scope.
+struct StoreSubject {
+    std::uint64_t base = 0;
+    std::uint64_t bytes = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t format = 0;
+    std::uint64_t generation = 0;
+    std::uint64_t gpuWriteMs = 0;
+    std::uint64_t refreshMs = 0;
+};
+// Names this thread's stores into guest memory for the ring until the scope ends (and, with a
+// subject, for the write-back range trace).
 class StoreTag {
 public:
-    StoreTag(const char* tag, const char* reason, std::uint64_t address);
+    StoreTag(const char* tag, const char* reason, std::uint64_t address, const StoreSubject* subject = nullptr);
     ~StoreTag();
     StoreTag(const StoreTag&) = delete;
     StoreTag& operator=(const StoreTag&) = delete;
@@ -341,12 +356,50 @@ private:
     const char* previousTag;
     const char* previousReason;
     std::uint64_t previousAddress;
+    const StoreSubject* previousSubject;
 };
 using CrashPrint = void (*)(const char* text);
 // A registry's part of the report: prints (try-locks only, at most 8 lines) what it tracks over
 // `address`. Up to 8 describers; registered at static initialization.
 using CrashDescriber = void (*)(std::uint64_t address, CrashPrint print);
 void AddCrashDescriber(CrashDescriber describer);
+
+// Write-back range trace (APS5_TRACE_WRITEBACK_RANGE=<lo>-<hi>, hex, the range [lo, hi); off by
+// default): one [wb-range] line on stderr per driver store intersecting the range (Write,
+// WriteChanged's changed span, StoreOwnBytes, MarkWritten's GPU stores, DCC key stores, unit shadow
+// publishes) with the thread's StoreTag and StoreSubject, and one per lifetime event of a storage
+// image or unit shadow over it (Texture.cpp, UnitShadow.cpp). A capped kind prints at most
+// RangeTraceCap lines; lifetime events, stores made more than 2 s after their subject's last GPU
+// write, and stores of unknown age once the trace is 60 s old are never capped. A [wb-range] totals
+// line (at the next line 10 s after the last one) counts every kind printed and dropped. Off: one
+// static test per store; on: a store outside the range pays one interval check.
+enum class RangeTraceKind : std::uint8_t { Write, WriteChanged, StoreOwnBytes, MarkWritten, KeyStore, ShadowPublish, Image, ImageRefresh, ImageDirty, Shadow, ShadowMarked, Count };
+constexpr std::uint64_t RangeTraceCap = 20000;
+// Parses "<lo>-<hi>" (hex digits, 0x optional) into [begin, end); false for anything else or an
+// empty range.
+bool ParseTraceRange(const char* text, std::uint64_t& begin, std::uint64_t& end);
+// Whether [address, address + bytes) intersects [begin, end); never for 0 bytes.
+constexpr bool TraceRangeHits(std::uint64_t begin, std::uint64_t end, std::uint64_t address, std::uint64_t bytes) {
+    return bytes != 0 && address < end && (address >= begin || begin - address < bytes);
+}
+bool WriteBackRangeTraceOn();
+bool WriteBackRangeTraced(std::uint64_t address, std::uint64_t bytes);
+// One [wb-range] line of `kind`: its name, the formatted body, then the clock, the tracker
+// generation and the thread; dropped (and counted) when `capped` and the kind's cap is spent.
+void WriteBackRangeLine(RangeTraceKind kind, bool capped, const char* format, ...);
+// The range trace names this thread's stores inside the DCC key range [begin, end) as key stores
+// until the scope ends (the store ring keeps their own kind).
+class KeyStoreScope {
+public:
+    KeyStoreScope(std::uint64_t begin, std::uint64_t end);
+    ~KeyStoreScope();
+    KeyStoreScope(const KeyStoreScope&) = delete;
+    KeyStoreScope& operator=(const KeyStoreScope&) = delete;
+
+private:
+    std::uint64_t previousBegin;
+    std::uint64_t previousEnd;
+};
 
 }
 

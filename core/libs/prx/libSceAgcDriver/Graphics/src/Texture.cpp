@@ -1162,6 +1162,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         // APS5_EARLY_EDGE_TRACKING=1 (opt-in, see TrackSurfaceEdgeParts): the view pages the surface
         // shares with other data are tracked per 4 KiB before the first upload's collect arms them.
         edgeFineAtCreation.fetch_add(traceEdgeFine("at creation", descriptor, guestBytes, descriptor.baseAddress, guestBytes, GuestMemory::TrackSurfaceEdgeParts(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))), std::memory_order_relaxed);
+        traceRange("create");
         uploadReason = "first";
         upload();
         defaultMip = mipLevel;
@@ -1787,6 +1788,10 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 
 void StorageTexture::upload(const std::vector<bool>* layers) {
     CaptureTrace::Log("upload image=%llx bytes=%llu generation=%llu reason=%s partial=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), uploadReason, layers != nullptr);
+    if (GuestMemory::WriteBackRangeTraceOn()) {
+        refreshMs = GuestMemory::StoreClockMs();
+        traceRange("refresh");
+    }
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto elementBytes = BytesPerElement(descriptor.format);
@@ -2629,6 +2634,7 @@ void StorageTexture::refreshGeneration() {
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
+    if (GuestMemory::WriteBackRangeTraceOn()) gpuWriteMs = GuestMemory::StoreClockMs();
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     for (std::uint32_t layer = first; layer < first + count; ++layer) layerPending[layer] = true;
     // Results of this image now cover the alias's results borrowed into these units: this image
@@ -2670,6 +2676,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     dirty = true;
     pending.textures.push_back(this);
     BumpPendingSerial();
+    traceRange("dirty");
 }
 
 void StorageTexture::reconcilePending() {
@@ -2683,12 +2690,24 @@ void StorageTexture::reconcilePending() {
     BumpPendingSerial();
 }
 
+void StorageTexture::traceRange(const char* event) const {
+    const bool keys = descriptor.dccAddress != 0 && GuestMemory::WriteBackRangeTraced(descriptor.dccAddress, guestBytes / 256);
+    if (!keys && !GuestMemory::WriteBackRangeTraced(descriptor.baseAddress, guestBytes)) return;
+    using Kind = GuestMemory::RangeTraceKind;
+    const auto kind = std::strcmp(event, "refresh") == 0 ? Kind::ImageRefresh : std::strcmp(event, "dirty") == 0 ? Kind::ImageDirty : Kind::Image;
+    const auto now = GuestMemory::StoreClockMs();
+    const auto ago = [now](std::uint64_t at) { return at != 0 ? static_cast<long long>(now - std::min(now, at)) : -1ll; };
+    // Creation, eviction and destruction are never capped (see GuestMemory::RangeTraceKind).
+    GuestMemory::WriteBackRangeLine(kind, kind != Kind::Image, "%s storage 0x%llx+0x%llx %ux%u fmt %u tile %u mips %u dcc 0x%llx%s gen %llu version %llu dirty %d released %d; gpu-write %lld ms ago, refresh %lld ms ago (%s); %u write-backs, last %s %lld ms ago", event, static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), descriptor.width, descriptor.height, static_cast<unsigned>(descriptor.format), static_cast<unsigned>(descriptor.tileMode), static_cast<unsigned>(descriptor.mipCount), static_cast<unsigned long long>(descriptor.dccAddress), keys ? " (keys in range)" : "", static_cast<unsigned long long>(generation), static_cast<unsigned long long>(version), dirty ? 1 : 0, released ? 1 : 0, ago(gpuWriteMs), ago(refreshMs), kind == Kind::ImageRefresh && uploadReason != nullptr ? uploadReason : "-", writeBacks, lastWriteBackReason != nullptr ? lastWriteBackReason : "-", ago(lastWriteBackMs));
+}
+
 void StorageTexture::Flush() {
     {
         auto& live = Live();
         std::lock_guard lock(live.mutex);
         released = true;
     }
+    traceRange("evict");
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
@@ -3848,8 +3867,10 @@ void StorageTexture::storeKeys(const char* caller, const std::vector<bool>& laye
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
-    // The crash report's store ring names this image for every store below (texels and keys).
-    const GuestMemory::StoreTag storeTag("storage write-back", flushReason, descriptor.baseAddress);
+    // The crash report's store ring names this image for every store below (texels and keys), the
+    // write-back range trace (APS5_TRACE_WRITEBACK_RANGE) its shape and age too.
+    const GuestMemory::StoreSubject subject{descriptor.baseAddress, guestBytes, descriptor.width, descriptor.height, static_cast<std::uint32_t>(descriptor.format), generation, gpuWriteMs, refreshMs};
+    const GuestMemory::StoreTag storeTag("storage write-back", flushReason, descriptor.baseAddress, &subject);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
     struct Account {
@@ -4316,6 +4337,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
 }
 
 StorageTexture::~StorageTexture() {
+    traceRange("destroy");
     {
         auto& live = Live();
         std::lock_guard lock(live.mutex);
