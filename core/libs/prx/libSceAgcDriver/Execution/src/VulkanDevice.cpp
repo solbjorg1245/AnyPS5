@@ -58,7 +58,7 @@
 namespace AgcDriver {
 namespace {
 
-// APS5_TEMPLATE_REFRESH_RING=1 (default off): a compute template hit whose data words differ binds
+// APS5_TEMPLATE_REFRESH_RING (default on since s61 P-LABEL step 0; =0 the old path): a compute template hit whose data words differ binds
 // a copy of the template's set whose data bindings read the dispatch's words from the fast ring
 // (ShaderResources::ForkData) instead of refreshing the template's buffers with vkCmdUpdateBuffer
 // between two dispatches (RefreshData, still the fallback when the copy cannot be made). The fast
@@ -66,7 +66,7 @@ namespace {
 bool TemplateRefreshRing() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_TEMPLATE_REFRESH_RING");
-        return value != nullptr && std::strcmp(value, "0") != 0;
+        return value == nullptr || std::strcmp(value, "0") != 0;
     }();
     return enabled;
 }
