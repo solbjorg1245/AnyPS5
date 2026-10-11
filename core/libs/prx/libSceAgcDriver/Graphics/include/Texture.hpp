@@ -292,8 +292,13 @@ public:
     // with the image), and each of `blits` then carries a region of that copy into the image with
     // its filter (linear falls back to nearest where the format cannot filter). Records into the
     // active recorder under GuestMemory::GpuMutex; the image is then dirty like a drawn target. A 2D
-    // single-layer image only; false, naming why in `refusal`, when nothing was recorded.
-    bool BlitSelf(std::span<const VkImageBlit> blits, std::span<const VkFilter> filters, const char*& refusal);
+    // single-layer image only; false, naming why in `refusal`, when nothing was recorded. With `fill`,
+    // the copy is cleared to it before blit `filledFrom`, so that blit and the ones after it carry the
+    // fill (the UI move's margins).
+    bool BlitSelf(std::span<const VkImageBlit> blits, std::span<const VkFilter> filters, const char*& refusal, const VkClearColorValue* fill = nullptr, std::size_t filledFrom = 0);
+    // The colour of the last fixed DCC clear (0000, 0001, 1110, 1111) the image was uploaded under or
+    // key-filled with; false (and `clear` untouched) when none was seen or the format is an integer one.
+    bool LastClearColor(VkClearColorValue& clear) const;
     // Debug aid (APS5_CAPTURE_DIR, see VulkanDevice::CaptureTargets): saves mip 0 of the first
     // layers of every live image (of those at `addresses`, when given) as
     // <prefix><address>_<width>x<height>_a<layers>_l<layer>.raw (u32 row pitch in texels, u32 height,
@@ -455,6 +460,8 @@ private:
     // DCC keys the image content was uploaded under: a fast-cleared surface starts as its clear value.
     DccKeys uploadedKeys = DccKeys::Uncompressed;
     DccKeys filledKeys = DccKeys::Uncompressed;
+    // LastClearColor's code (written under the live list's mutex or the GPU mutex, read at the UI move).
+    std::atomic<DccKeys> lastClearKeys{DccKeys::Uncompressed};
     mutable DccKeyProof keyProof;
     // The tracker generation after this image last took its key range into account: the upload's
     // key scan (collected just before), or a write-back's key store that left no key page to the
