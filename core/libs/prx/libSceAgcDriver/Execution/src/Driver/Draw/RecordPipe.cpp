@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -20,6 +21,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace AgcDriver::DriverDetail {
 
@@ -35,11 +45,50 @@ struct RecordPipeSlot {
     QueueStateMark mark;
     RecordPipeDispatch dispatch;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> estimate;
+    // APS5_PROFILE_DRAW: when A published the item (B's wake latency).
+    std::chrono::steady_clock::time_point published;
 };
 
 // The [pipe] line's dispatch counts (NoteRecordPipeDispatch): handed over (eligible; those writing a
 // storage image apart), then the drains in RecordPipeDispatchVerdict's order, BDA by stores.
 enum PipeDispatchCount : std::size_t { DispatchEligible, DispatchImageWrites, DispatchLocal, DispatchNoWindow, DispatchLabelsPending, DispatchBdaLoads, DispatchBdaStores, PipeDispatchCounts };
+
+// The [pipe] B line (S4.0, APS5_PROFILE_DRAW): B's time inside its holds by phase, and its counts
+// (draws by path, then dispatches, hold breaks, idle waits and wakes after one).
+enum PipeBPhase : std::size_t { BVerify, BNoteWriters, BRecipe, BRestart, BDraw, BAttach, BDispatch, BSubmitDue, BCleanup, PipeBPhases };
+enum PipeBCount : std::size_t { BItems, BRecipeItems, BRestartItems, BFullItems, BBuiltItems, BStaleItems, BDispatchItems, BHoldBreaks, BIdleWaits, BIdleSlept, BWakes, PipeBCounts };
+
+std::uint64_t pipeNs(std::chrono::steady_clock::duration duration) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count());
+}
+
+// B's phase clock (APS5_PROFILE_DRAW; idle while `on` is false): Lap adds the time since the last
+// mark to a phase.
+struct PipeLap {
+    bool on = false;
+    std::chrono::steady_clock::time_point mark;
+    void Mark() {
+        if (on) mark = std::chrono::steady_clock::now();
+    }
+    void Lap(std::array<std::atomic<std::uint64_t>, PipeBPhases>& phases, std::size_t phase) {
+        if (!on) return;
+        const auto now = std::chrono::steady_clock::now();
+        phases[phase].fetch_add(pipeNs(now - mark), std::memory_order_relaxed);
+        mark = now;
+    }
+};
+
+// The calling thread's user and kernel time (ns; 0 where unknown).
+std::uint64_t threadCpuNs() {
+#ifdef _WIN32
+    FILETIME creation, exitTime, kernel, user;
+    if (!GetThreadTimes(GetCurrentThread(), &creation, &exitTime, &kernel, &user)) return 0;
+    const auto ticks = [](const FILETIME& time) { return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32u) | time.dwLowDateTime; };
+    return (ticks(kernel) + ticks(user)) * 100;
+#else
+    return 0;
+#endif
+}
 
 // The queue-0 pipe. A (the queue-0 worker) owns the overlay, the redo queue state and the plain
 // counters; B (the recording thread) publishes through `ring.consumed`, `stale` and its atomics.
@@ -71,6 +120,14 @@ struct RecordPipeState {
     std::uint64_t dispatchItems = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
     std::atomic<std::uint64_t> holds{0}, busyNs{0}, lockWaitNs{0}, bSubmits{0};
+    // The [pipe] B line: B's phase clock, phases and counts; its hold breaks (release, yield and
+    // relock) and their relock wait, idle waits, wake latency, heap operations and CPU time; A's ring
+    // occupancy at hand-over (RecordPipeOccupancyBucket).
+    PipeLap bLap;
+    std::array<std::atomic<std::uint64_t>, PipeBPhases> bPhaseNs{};
+    std::array<std::atomic<std::uint64_t>, PipeBCounts> bCounts{};
+    std::atomic<std::uint64_t> holdBreakNs{0}, holdBreakLockNs{0}, idleNs{0}, wakeNs{0}, wakeMaxNs{0}, bAllocations{0}, bFrees{0}, bCpuNs{0};
+    std::array<std::uint64_t, RecordPipeOccupancyBuckets> occupancy{};
 };
 
 // Never destroyed: Driver::stop joins B, and a static's destructor could run before the driver's.
@@ -172,9 +229,10 @@ double sinceMs(std::chrono::steady_clock::time_point start) {
 
 // Until done(): `between` (A: the stale service and the failure checks), then a spin of
 // APS5_RECORD_PIPE_SPIN_US (50), then sleeps of a poll interval on the thread's wake event; done() is
-// checked again after `sleeping` is set, so the other side's wake (wakeSide) is never lost.
+// checked again after `sleeping` is set, so the other side's wake (wakeSide) is never lost. `slept`
+// (APS5_PROFILE_DRAW), if given, is set once the wait sleeps.
 template <typename TDone, typename TBetween>
-void pipeWait(std::atomic<bool>& sleeping, std::atomic<void*>& wake, TDone&& done, TBetween&& between) {
+void pipeWait(std::atomic<bool>& sleeping, std::atomic<void*>& wake, TDone&& done, TBetween&& between, bool* slept = nullptr) {
     static const auto spin = pipeMicros("APS5_RECORD_PIPE_SPIN_US", 50);
     const auto start = std::chrono::steady_clock::now();
     for (;;) {
@@ -188,7 +246,10 @@ void pipeWait(std::atomic<bool>& sleeping, std::atomic<void*>& wake, TDone&& don
         wake.store(event, std::memory_order_release);
         sleeping.store(true, std::memory_order_seq_cst);
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (!done() && !PollSleepOrWake(event, PollTryInterval)) PollSleep();
+        if (!done()) {
+            if (slept != nullptr) *slept = true;
+            if (!PollSleepOrWake(event, PollTryInterval)) PollSleep();
+        }
         sleeping.store(false, std::memory_order_relaxed);
     }
 }
@@ -350,7 +411,11 @@ void Driver::handOverDispatch(RecordPipeDispatch&& item) {
 void Driver::publishRecordPipeItem(std::uint64_t serial) {
     auto& pipe = recordPipe();
     if (!pipe.thread.joinable()) pipe.thread = HostThread([this] { runRecordPipe(); });
+    // APS5_PROFILE_DRAW: the publish time (B's wake latency), then the items unrecorded with this one.
+    const bool profile = recordPipeProfile();
+    if (profile) pipe.slots[RecordPipeRing::Slot(serial)].published = std::chrono::steady_clock::now();
     pipe.ring.Publish(serial);
+    if (profile) ++pipe.occupancy[RecordPipeOccupancyBucket(RecordPipeRing::Pending(serial, pipe.ring.consumed.load(std::memory_order_acquire)))];
     recordPipeHandedDraw() = true;
     ++pipe.items;
     ++pipe.run;
@@ -487,6 +552,25 @@ void Driver::recordPipeSubmissionEnd() {
     char verify[128] = "";
     if (recordPipeVerify()) std::snprintf(verify, sizeof(verify), ", verify: checks %llu, misses %llu, estimate misses %llu", static_cast<unsigned long long>(pipe.verifyChecks.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(pipe.verifyMisses.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(pipe.verifyEstimateMisses.exchange(0, std::memory_order_relaxed)));
     std::fprintf(stderr, "[pipe] queue 0 (10 s): items %llu, runs %llu (mean %.1f), holds %llu, drains:%s, A waited ms (ring full) %.1f, A drain wait ms %.1f (by reason, ms/drains that waited:%s), B busy ms %.1f, B lock wait ms %.1f, B deadline submits %llu (A left %llu to B), stale redos %llu, overlay hits %llu (draw %llu, load %llu, dispatch %llu)%s%s\n", static_cast<unsigned long long>(pipe.items), static_cast<unsigned long long>(pipe.runs), pipe.runs == 0 ? 0.0 : static_cast<double>(pipe.items) / static_cast<double>(pipe.runs), static_cast<unsigned long long>(pipe.holds.exchange(0, std::memory_order_relaxed)), drains.c_str(), pipe.ringWaitMs, pipe.drainWaitMs, waits.c_str(), busyMs, lockWaitMs, static_cast<unsigned long long>(pipe.bSubmits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(pipe.submitsLeft), static_cast<unsigned long long>(pipe.staleRedos), static_cast<unsigned long long>(pipe.overlayDraws + pipe.overlayLoads + pipe.overlayDispatches), static_cast<unsigned long long>(pipe.overlayDraws), static_cast<unsigned long long>(pipe.overlayLoads), static_cast<unsigned long long>(pipe.overlayDispatches), dispatches, verify);
+    // B's line (S4.0): us per item by phase inside its holds (other: B busy minus the rows), hold
+    // breaks, idle waits, the wake latency after one, heap operations and CPU time; A's ring at hand-over.
+    std::array<double, PipeBPhases> phaseNs{};
+    double rowsNs = 0;
+    for (std::size_t phase = 0; phase < PipeBPhases; ++phase) {
+        phaseNs[phase] = static_cast<double>(pipe.bPhaseNs[phase].exchange(0, std::memory_order_relaxed));
+        rowsNs += phaseNs[phase];
+    }
+    std::array<unsigned long long, PipeBCounts> itemCounts{};
+    for (std::size_t which = 0; which < PipeBCounts; ++which) itemCounts[which] = pipe.bCounts[which].exchange(0, std::memory_order_relaxed);
+    const auto bItems = itemCounts[BItems] == 0 ? 1.0 : static_cast<double>(itemCounts[BItems]);
+    const auto holdBreakMs = ms(pipe.holdBreakNs), holdBreakLockMs = ms(pipe.holdBreakLockNs), idleMs = ms(pipe.idleNs), wakeMs = ms(pipe.wakeNs), cpuMs = ms(pipe.bCpuNs);
+    const auto wakeMaxNs = static_cast<double>(pipe.wakeMaxNs.exchange(0, std::memory_order_relaxed));
+    const auto allocations = static_cast<double>(pipe.bAllocations.exchange(0, std::memory_order_relaxed)), frees = static_cast<double>(pipe.bFrees.exchange(0, std::memory_order_relaxed));
+    char rows[320];
+    std::snprintf(rows, sizeof(rows), "verify %.2f, note writers %.2f, recipe %.2f, restart+draw %.2f, draw %.2f, attach %.2f, dispatch %.2f, submit due %.2f, cleanup %.2f, other %.2f", phaseNs[BVerify] / 1e3 / bItems, phaseNs[BNoteWriters] / 1e3 / bItems, phaseNs[BRecipe] / 1e3 / bItems, phaseNs[BRestart] / 1e3 / bItems, phaseNs[BDraw] / 1e3 / bItems, phaseNs[BAttach] / 1e3 / bItems, phaseNs[BDispatch] / 1e3 / bItems, phaseNs[BSubmitDue] / 1e3 / bItems, phaseNs[BCleanup] / 1e3 / bItems, (busyMs * 1e6 - rowsNs) / 1e3 / bItems);
+    const auto& occupancy = pipe.occupancy;
+    std::fprintf(stderr, "[pipe] B (10 s): items %llu (draws %llu: recipe %llu, restart %llu, full %llu, built %llu, stale %llu; dispatches %llu), us per item: %s (busy minus the rows); hold breaks %llu (%.1f ms, relock wait %.1f ms); idle ms %.1f in %llu waits (%llu slept); wake latency us mean %.1f max %.1f (%llu); heap per item: %.2f allocations, %.2f frees; cpu ms %.1f (busy ms %.1f); ring at hand-over: 1 %llu, 2-4 %llu, 5-16 %llu, 17-31 %llu, full %llu\n", itemCounts[BItems], itemCounts[BItems] > itemCounts[BDispatchItems] ? itemCounts[BItems] - itemCounts[BDispatchItems] : 0ull, itemCounts[BRecipeItems], itemCounts[BRestartItems], itemCounts[BFullItems], itemCounts[BBuiltItems], itemCounts[BStaleItems], itemCounts[BDispatchItems], rows, itemCounts[BHoldBreaks], holdBreakMs, holdBreakLockMs, idleMs, itemCounts[BIdleWaits], itemCounts[BIdleSlept], itemCounts[BWakes] == 0 ? 0.0 : wakeMs * 1e3 / static_cast<double>(itemCounts[BWakes]), wakeMaxNs / 1e3, itemCounts[BWakes], allocations / bItems, frees / bItems, cpuMs, busyMs, static_cast<unsigned long long>(occupancy[0]), static_cast<unsigned long long>(occupancy[1]), static_cast<unsigned long long>(occupancy[2]), static_cast<unsigned long long>(occupancy[3]), static_cast<unsigned long long>(occupancy[4]));
+    pipe.occupancy = {};
     pipe.items = pipe.runs = pipe.staleRedos = pipe.overlayDraws = pipe.overlayLoads = pipe.overlayDispatches = pipe.submitsLeft = pipe.dispatchItems = 0;
     pipe.drains = pipe.drainsWaited = {};
     pipe.dispatches = {};
@@ -496,20 +580,43 @@ void Driver::recordPipeSubmissionEnd() {
 }
 
 bool Driver::recordPipeItem(DrawScratch& scratch, RecordPipeDraw& item) {
+    // APS5_PROFILE_DRAW: B's phases (a stale or failed call's time joins the path it took) and paths.
+    auto& pipe = recordPipe();
+    auto& lap = pipe.bLap;
+    const auto count = [&](PipeBCount which) {
+        if (lap.on) pipe.bCounts[which].fetch_add(1, std::memory_order_relaxed);
+    };
+    lap.Mark();
     noteDrawWriters(scratch.stages, 0);
+    lap.Lap(pipe.bPhaseNs, BNoteWriters);
     const auto& graphics = item.decode->state;
+    auto phase = BDraw;
     try {
         if (item.recipe != nullptr) {
-            if (item.device->DrawFromRecipe(graphics, item.parameters, scratch.stages, scratch.snapshots, item.recipe) == RecipeOutcome::Recorded) return false;
+            phase = BRecipe;
+            if (item.device->DrawFromRecipe(graphics, item.parameters, scratch.stages, scratch.snapshots, item.recipe) == RecipeOutcome::Recorded) {
+                lap.Lap(pipe.bPhaseNs, BRecipe);
+                count(BRecipeItems);
+                return false;
+            }
+            phase = BRestart;
             VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
         }
         std::shared_ptr<const DrawRecipe> built;
         item.device->Draw(graphics, item.parameters, scratch.stages, scratch.snapshots, scratch.recipeStages.empty() ? nullptr : &built);
-        if (built != nullptr) attachDrawRecipe(item.key, scratch.recipeStages, std::move(built));
+        lap.Lap(pipe.bPhaseNs, phase);
+        count(phase == BRestart ? BRestartItems : BFullItems);
+        if (built != nullptr) {
+            attachDrawRecipe(item.key, scratch.recipeStages, std::move(built));
+            lap.Lap(pipe.bPhaseNs, BAttach);
+            count(BBuiltItems);
+        }
     } catch (const Graphics::SnapshotStale& error) {
+        lap.Lap(pipe.bPhaseNs, phase);
         if (item.retryable) return true;
         reportSkip("draw", error.what());
     } catch (const std::exception& error) {
+        lap.Lap(pipe.bPhaseNs, phase);
         reportSkip("draw", error.what());
     }
     return false;
@@ -526,13 +633,33 @@ void Driver::runRecordPipe() noexcept {
     const bool profile = recordPipeProfile(), verify = recordPipeVerify(), bSubmit = recordPipeBSubmit();
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
     auto held = std::chrono::steady_clock::time_point{};
+    // APS5_PROFILE_DRAW (the [pipe] B line): the phase clock, the heap and CPU marks, the start of a
+    // hold break (the epoch: none) and whether the item ended an idle wait.
+    auto& lap = pipe.bLap;
+    lap.on = profile;
+    auto heapMark = profile ? HostHeap::ThreadCounters() : HostHeap::Counters{};
+    std::uint64_t cpuMark = profile ? threadCpuNs() : 0;
+    auto breakStart = std::chrono::steady_clock::time_point{};
+    bool afterIdle = false;
+    const auto count = [&](PipeBCount which) {
+        if (profile) pipe.bCounts[which].fetch_add(1, std::memory_order_relaxed);
+    };
     const auto release = [&] {
         if (!gpuLock.owns_lock()) return;
         gpuLock.unlock();
-        if (profile) pipe.busyNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - held).count()), std::memory_order_relaxed);
+        if (!profile) return;
+        pipe.busyNs.fetch_add(pipeNs(std::chrono::steady_clock::now() - held), std::memory_order_relaxed);
+        // B's heap operations and CPU time since the last release.
+        const auto heap = HostHeap::ThreadCounters();
+        const auto cpu = threadCpuNs();
+        pipe.bAllocations.fetch_add(heap.allocations - heapMark.allocations, std::memory_order_relaxed);
+        pipe.bFrees.fetch_add(heap.releases - heapMark.releases, std::memory_order_relaxed);
+        if (cpu >= cpuMark) pipe.bCpuNs.fetch_add(cpu - cpuMark, std::memory_order_relaxed);
+        heapMark = heap;
+        cpuMark = cpu;
     };
     // Under the mutex: the batch goes to the GPU once its oldest label is past the deadline.
-    const auto submitDue = [&] {
+    const auto submitDueNow = [&] {
         if (!bSubmit || !gpuLock.owns_lock()) return;
         const auto since = Graphics::Recorder::PendingLabelSince();
         if (!since.has_value() || std::chrono::steady_clock::now() - *since < labelFlushDeadline()) return;
@@ -541,21 +668,49 @@ void Driver::runRecordPipe() noexcept {
         localDevice->SubmitRecorded(true);
         pipe.bSubmits.fetch_add(1, std::memory_order_relaxed);
     };
+    // APS5_PROFILE_DRAW: timed while B holds the mutex (without it the check returns at once).
+    const auto submitDue = [&] {
+        if (!profile || !gpuLock.owns_lock()) return submitDueNow();
+        lap.Mark();
+        submitDueNow();
+        lap.Lap(pipe.bPhaseNs, BSubmitDue);
+    };
     try {
         for (;;) {
             const auto serial = pipe.ring.NextItem();
             if (serial == 0) {
                 submitDue();
                 release();
-                pipeWait(pipe.bSleeping, pipe.bWake, [&] { return pipe.stopping.load(std::memory_order_acquire) || pipe.ring.NextItem() != 0; }, [] {});
+                // APS5_PROFILE_DRAW: B's idle wait, whether it slept, and the next item's wake latency.
+                const auto idleStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                bool slept = false;
+                pipeWait(pipe.bSleeping, pipe.bWake, [&] { return pipe.stopping.load(std::memory_order_acquire) || pipe.ring.NextItem() != 0; }, [] {}, profile ? &slept : nullptr);
+                if (profile) {
+                    pipe.idleNs.fetch_add(pipeNs(std::chrono::steady_clock::now() - idleStart), std::memory_order_relaxed);
+                    count(BIdleWaits);
+                    if (slept) count(BIdleSlept);
+                    afterIdle = true;
+                }
                 if (pipe.stopping.load(std::memory_order_acquire)) break;
                 continue;
             }
-            if (gpuLock.owns_lock() && std::chrono::steady_clock::now() - held >= hold) {
-                release();
-                std::this_thread::yield();
+            if (gpuLock.owns_lock()) {
+                if (const auto now = std::chrono::steady_clock::now(); now - held >= hold) {
+                    breakStart = now;
+                    release();
+                    std::this_thread::yield();
+                }
             }
             auto& slot = pipe.slots[RecordPipeRing::Slot(serial)];
+            if (afterIdle) {
+                // The item that ended an idle wait: since A published it.
+                afterIdle = false;
+                const auto now = std::chrono::steady_clock::now();
+                const auto latency = now > slot.published ? pipeNs(now - slot.published) : 0;
+                pipe.wakeNs.fetch_add(latency, std::memory_order_relaxed);
+                if (latency > pipe.wakeMaxNs.load(std::memory_order_relaxed)) pipe.wakeMaxNs.store(latency, std::memory_order_relaxed);
+                count(BWakes);
+            }
             const bool dispatchItem = slot.kind == RecordPipeKind::Dispatch;
             const auto opcode = dispatchItem ? 0x15u : slot.draw.opcode;
             const auto key = dispatchItem ? slot.dispatch.key : slot.draw.key;
@@ -566,10 +721,24 @@ void Driver::runRecordPipe() noexcept {
                 gpuLock.lock();
                 held = std::chrono::steady_clock::now();
                 pipe.holds.fetch_add(1, std::memory_order_relaxed);
-                if (profile) pipe.lockWaitNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(held - start).count()), std::memory_order_relaxed);
+                if (profile) {
+                    pipe.lockWaitNs.fetch_add(pipeNs(held - start), std::memory_order_relaxed);
+                    // A hold break: its release, yield and relock, and the relock's wait (in the lock wait too).
+                    if (breakStart != std::chrono::steady_clock::time_point{}) {
+                        count(BHoldBreaks);
+                        pipe.holdBreakNs.fetch_add(pipeNs(held - breakStart), std::memory_order_relaxed);
+                        pipe.holdBreakLockNs.fetch_add(pipeNs(held - start), std::memory_order_relaxed);
+                    }
+                }
+                breakStart = {};
             }
+            count(BItems);
             GuestMemory::SetCurrentPacket(opcode, 0);
-            if (verify) verifyPipeReads(pipe, dispatchItem ? slot.dispatch.captured : slot.scratch.memory, dispatchItem ? slot.dispatch.consumed : slot.draw.consumed, serial, "item", opcode, key);
+            if (verify) {
+                lap.Mark();
+                verifyPipeReads(pipe, dispatchItem ? slot.dispatch.captured : slot.scratch.memory, dispatchItem ? slot.dispatch.consumed : slot.draw.consumed, serial, "item", opcode, key);
+                lap.Lap(pipe.bPhaseNs, BVerify);
+            }
             GuestMemory::recordedWrites = verify ? &pipe.writeLog.Begin(serial) : nullptr;
             // As lockForDraw: a device replaced since A prepared the item (never a windowed one, so rare).
             auto& itemDevice = dispatchItem ? slot.dispatch.device : slot.draw.device;
@@ -579,11 +748,18 @@ void Driver::runRecordPipe() noexcept {
                 itemDevice = std::move(current);
             }
             bool stale = false;
-            if (dispatchItem) recordPipeDispatch(slot.dispatch);
-            else stale = recordPipeItem(slot.scratch, slot.draw);
+            if (dispatchItem) {
+                lap.Mark();
+                recordPipeDispatch(slot.dispatch);
+                lap.Lap(pipe.bPhaseNs, BDispatch);
+                count(BDispatchItems);
+            } else {
+                stale = recordPipeItem(slot.scratch, slot.draw);
+            }
             GuestMemory::recordedWrites = nullptr;
             submitDue();
             if (stale) {
+                count(BStaleItems);
                 // Stale: A redoes the item at its next service point, under its own lock.
                 release();
                 pipe.stale.Raise(serial);
@@ -591,8 +767,13 @@ void Driver::runRecordPipe() noexcept {
                 pipeWait(pipe.bSleeping, pipe.bWake, [&] { return pipe.stopping.load(std::memory_order_acquire) || pipe.stale.Redone(serial); }, [] {});
                 if (!pipe.stale.Redone(serial)) break;
             }
-            if (verify) verifyPipeEstimate(pipe, serial, opcode, key, slot.estimate);
+            if (verify) {
+                lap.Mark();
+                verifyPipeEstimate(pipe, serial, opcode, key, slot.estimate);
+                lap.Lap(pipe.bPhaseNs, BVerify);
+            }
             // The device call published the item's pending writes: release what it held, then the slot.
+            lap.Mark();
             if (dispatchItem) slot.dispatch = {};
             auto& scratch = slot.scratch;
             scratch.results.clear();
@@ -612,6 +793,7 @@ void Driver::runRecordPipe() noexcept {
             Graphics::Recorder::CountRecordedWork();
             pipe.ring.Consume(serial);
             wakeSide(pipe.aSleeping, pipe.aWake);
+            lap.Lap(pipe.bPhaseNs, BCleanup);
         }
     } catch (...) {
         pipe.failure = std::current_exception();

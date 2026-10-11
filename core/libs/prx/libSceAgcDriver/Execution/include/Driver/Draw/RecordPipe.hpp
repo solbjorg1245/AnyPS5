@@ -57,6 +57,13 @@ struct RecordPipeRing {
     void Consume(std::uint64_t serial) { consumed.store(serial, std::memory_order_release); }
 };
 
+// APS5_PROFILE_DRAW, the [pipe] B line: the items unrecorded once A published one (handed minus
+// consumed), bucketed 1, 2-4, 5-16, 17-31 and a full ring (0 counts as 1).
+inline constexpr std::size_t RecordPipeOccupancyBuckets = 5;
+constexpr std::size_t RecordPipeOccupancyBucket(std::uint64_t outstanding) {
+    return outstanding <= 1 ? 0 : outstanding <= 4 ? 1 : outstanding <= 16 ? 2 : outstanding < RecordPipeRing::Depth ? 3 : 4;
+}
+
 // The writes of handed items B has not recorded (shader-written buffers; padded color, depth, HTILE
 // and DCC targets), each range tagged with its newest item's serial: A adds an item's ranges at
 // hand-over and prunes by `consumed` before a capture, validation or indirect read checks it.
