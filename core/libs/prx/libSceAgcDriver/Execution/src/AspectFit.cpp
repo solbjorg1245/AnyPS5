@@ -91,5 +91,26 @@ AspectFitRect MapRectInto_nid_postfix(AspectFitRect rect, std::uint32_t bufferWi
     return AspectFitRect{static_cast<std::int32_t>(left), static_cast<std::int32_t>(top), roundToExtent(right - left), roundToExtent(bottom - top)};
 }
 
+std::uint32_t ComputeRectMoveBlits_nid_postfix(std::uint32_t width, std::uint32_t height, AspectFitRect rect, AspectFitBlit* out) {
+    require(width != 0 && height != 0 && out != nullptr, "move blits need an image and an output");
+    if (rect.x == 0 && rect.y == 0 && rect.width == width && rect.height == height) return 0;
+    require(rect.x >= 0 && rect.y >= 0 && rect.width != 0 && rect.height != 0 && static_cast<std::uint64_t>(rect.x) + rect.width <= width && static_cast<std::uint64_t>(rect.y) + rect.height <= height, "move rect must lie inside the image");
+    require(rect.height == height || rect.width == width, "move rect must be a full-height column or a full-width band");
+    const auto left = static_cast<std::uint32_t>(rect.x);
+    const auto top = static_cast<std::uint32_t>(rect.y);
+    const auto right = width - left - rect.width;
+    const auto bottom = height - top - rect.height;
+    std::uint32_t count = 0;
+    out[count++] = AspectFitBlit{AspectFitRect{0, 0, width, height}, rect, false};
+    if (rect.height == height) {
+        if (left != 0) out[count++] = AspectFitBlit{AspectFitRect{0, 0, 1, height}, AspectFitRect{0, 0, left, height}, true};
+        if (right != 0) out[count++] = AspectFitBlit{AspectFitRect{static_cast<std::int32_t>(width - 1), 0, 1, height}, AspectFitRect{static_cast<std::int32_t>(left + rect.width), 0, right, height}, true};
+    } else {
+        if (top != 0) out[count++] = AspectFitBlit{AspectFitRect{0, 0, width, 1}, AspectFitRect{0, 0, width, top}, true};
+        if (bottom != 0) out[count++] = AspectFitBlit{AspectFitRect{0, static_cast<std::int32_t>(height - 1), width, 1}, AspectFitRect{0, static_cast<std::int32_t>(top + rect.height), width, bottom}, true};
+    }
+    return count;
+}
+
 }
 }

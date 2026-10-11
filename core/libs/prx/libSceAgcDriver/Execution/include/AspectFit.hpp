@@ -17,6 +17,14 @@ struct AspectFitSize {
     std::uint32_t height;
 };
 
+// One blit of an image into itself (through a copy): `source` stretched over `destination`, with
+// nearest filtering (one edge texel line spread over a margin) or linear.
+struct AspectFitBlit {
+    AspectFitRect source;
+    AspectFitRect destination;
+    bool nearest;
+};
+
 extern "C" {
 
 double ComputeContainScale_nid_postfix(std::uint32_t sourceWidth, std::uint32_t sourceHeight, std::uint32_t boundsWidth, std::uint32_t boundsHeight, bool allowUpscale);
@@ -39,6 +47,12 @@ AspectFitRect ComputeUndistortedRect_nid_postfix(std::uint32_t bufferWidth, std:
 // `rect` (pixels of a bufferWidth x bufferHeight buffer) carried into `into` as the whole buffer maps
 // onto it, rounded outwards to whole pixels.
 AspectFitRect MapRectInto_nid_postfix(AspectFitRect rect, std::uint32_t bufferWidth, std::uint32_t bufferHeight, AspectFitRect into);
+// Native aspect's UI move (APS5_NATIVE_ASPECT_UI_BLIT): the blits that carry a whole width x height
+// image into `rect` (a centred column or band, as ComputeUndistortedRect gives: full height or full
+// width), linear, then stretch the image's outermost column (row) over each margin the rect leaves,
+// nearest, so what the edges hold (nothing, or a full-screen dim) still reaches the window's edges.
+// Writes up to three entries of `out`; returns how many (0 when `rect` is the whole image).
+std::uint32_t ComputeRectMoveBlits_nid_postfix(std::uint32_t width, std::uint32_t height, AspectFitRect rect, AspectFitBlit* out);
 
 }
 }
