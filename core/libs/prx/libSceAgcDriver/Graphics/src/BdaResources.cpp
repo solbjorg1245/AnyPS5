@@ -216,6 +216,8 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     if (!cached.has_value()) built = memory.AddressRanges();
     const auto& ranges = cached.has_value() ? *cached->ranges : built;
     const auto serial = cached.has_value() ? cached->serial : 0;
+    // Fixed with the table: a demotion before the completion leaves the pages D's until it landed.
+    residentMapped = memory.ResidentWritesMappedWritable();
     // APS5_CHECK_STALE_IMPORTS: every mapped device range must be a live buffer's.
     if (checkTables()) {
         static std::atomic<int> reports{0};
@@ -375,13 +377,28 @@ void BdaResources::markWrittenPages() const {
     auto* words = reinterpret_cast<std::uint32_t*>(fault->Bytes().data());
     Require(words[Abi::WrittenOverflowWord] == 0, "more than " + std::to_string(Abi::WrittenPageSlots) + " pages stored to through GPU-selected buffer descriptors in one use are not implemented");
     bool any = false;
+    // A table mapping resident written ranges to D writable (S7c): the pages are stamped there, and
+    // those inside a range taken as D's own.
+    std::vector<std::uint64_t> pages;
     for (std::uint32_t slot = 0; slot < Abi::WrittenPageSlots; ++slot) {
         const auto page = words[Abi::WrittenSlotsWord + slot];
         if (page == 0) continue;
-        GuestMemory::MarkWritten(static_cast<std::uint64_t>(page - 1u) << Abi::WrittenPageShift, std::size_t{1} << Abi::WrittenPageShift);
+        if (!residentMapped.empty()) pages.push_back(static_cast<std::uint64_t>(page - 1u) << Abi::WrittenPageShift);
+        else GuestMemory::MarkWritten(static_cast<std::uint64_t>(page - 1u) << Abi::WrittenPageShift, std::size_t{1} << Abi::WrittenPageShift);
         any = true;
     }
+    if (!pages.empty()) MarkResidentMappedPages(residentMapped, pages);
     if (any) std::memset(words + Abi::WrittenSlotsWord, 0, Abi::WrittenPageSlots * sizeof(std::uint32_t));
+}
+
+void BdaResources::NoteWrittenPageForTests(std::uint64_t address) const {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    auto* words = reinterpret_cast<std::uint32_t*>(fault->Bytes().data());
+    for (std::uint32_t slot = 0; slot < Abi::WrittenPageSlots; ++slot) {
+        if (words[Abi::WrittenSlotsWord + slot] != 0) continue;
+        words[Abi::WrittenSlotsWord + slot] = static_cast<std::uint32_t>(address >> Abi::WrittenPageShift) + 1u;
+        return;
+    }
 }
 
 }

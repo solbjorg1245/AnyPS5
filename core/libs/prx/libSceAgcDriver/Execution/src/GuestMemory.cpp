@@ -353,6 +353,7 @@ public:
         std::fprintf(stderr, " collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
         std::fprintf(stderr, " collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
         std::fprintf(stderr, " | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
+        std::fprintf(stderr, " %s | %s", FreedStoreSummary().c_str(), KeptCpuStoreSummary().c_str());
         {
             std::lock_guard lock(state.callersMutex);
             std::fprintf(stderr, " | read callers:");
@@ -502,10 +503,13 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
     forgetSerial.fetch_add(1, std::memory_order_release);
     Pages().forget(address, bytes);
     forgetSerial.fetch_add(1, std::memory_order_release);
+    if (WriteBackRangeTraced(address, bytes)) WriteBackRangeLine(RangeTraceKind::Forget, false, "0x%llx-0x%llx", static_cast<unsigned long long>(address), static_cast<unsigned long long>(address + bytes));
 }
 
 void PageStates::initializeSlow() {
     std::call_once(once, [&] {
+        // The free log registers its release listener when made.
+        static_cast<void>(FreeClock());
         GuestArena::GuestArenaRange_nid_postfix(&arena.base, &arena.size);
         const bool arenaCached = arena.allocate();
         bool imageCached = false;
@@ -1528,7 +1532,7 @@ std::atomic<CrashDescriber> crashDescribers[8] = {};
 std::atomic<std::size_t> crashDescriberCount{0};
 
 // The write-back range trace (APS5_TRACE_WRITEBACK_RANGE, see RangeTraceKind).
-constexpr const char* RangeTraceNames[] = {"Write", "WriteChanged-span", "StoreOwnBytes", "MarkWritten", "DCC-key-store", "shadow-publish", "image", "image-refresh", "image-dirty", "shadow", "shadow-marked"};
+constexpr const char* RangeTraceNames[] = {"Write", "WriteChanged-span", "StoreOwnBytes", "MarkWritten", "DCC-key-store", "shadow-publish", "image", "image-refresh", "image-dirty", "shadow", "shadow-marked", "forget", "release", "freed-store"};
 static_assert(std::size(RangeTraceNames) == static_cast<std::size_t>(RangeTraceKind::Count));
 // A store this long after its subject's last GPU write is late (never capped); a store of unknown
 // age is not capped once the trace is this old.
@@ -2769,6 +2773,231 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
         std::memcpy(destination, source.data(), source.size());
         return std::pair<std::uint64_t, std::uint64_t>{address, address + source.size()};
     });
+}
+
+namespace {
+
+// The free log (FreeClock): per 4 KiB page of the guest arena, the clock of the last release over
+// it. The table is reserved whole and committed by chunk at the first release inside it; a chunk no
+// release reached reads as 0 (`present`).
+constexpr std::size_t FreeChunkPages = 16384;
+constexpr std::size_t FreedKindCount = static_cast<std::size_t>(FreedStoreKind::Count);
+constexpr const char* FreedKindNames[FreedKindCount] = {"write-back", "keys", "shadow", "copy-back"};
+// APS5_DROP_FREED_STORES: -1 until read from the environment (SetDropFreedStores overrides it).
+std::atomic<int> dropFreedStores{-1};
+
+struct FreeLog {
+    std::uintptr_t base = 0;
+    std::size_t pages = 0;
+    std::uint32_t* stamps = nullptr;
+    std::unique_ptr<std::atomic<std::uint8_t>[]> present;
+    std::atomic<std::uint32_t> clock{0};
+    std::atomic<std::uint64_t> releases{0};
+    std::atomic<std::uint64_t> releasedBytes{0};
+    std::array<std::atomic<std::uint64_t>, FreedKindCount> stores{};
+    std::array<std::atomic<std::uint64_t>, FreedKindCount> storeBytes{};
+
+    FreeLog() {
+        std::size_t size = 0;
+        GuestArena::GuestArenaRange_nid_postfix(&base, &size);
+        const auto chunks = (size / PageBytes + FreeChunkPages - 1) / FreeChunkPages;
+        if (chunks == 0) return;
+#ifdef _WIN32
+        stamps = static_cast<std::uint32_t*>(VirtualAlloc(nullptr, chunks * FreeChunkPages * sizeof(std::uint32_t), MEM_RESERVE, PAGE_READWRITE));
+#else
+        stamps = static_cast<std::uint32_t*>(std::calloc(chunks * FreeChunkPages, sizeof(std::uint32_t)));
+#endif
+        if (stamps == nullptr) return;
+        present = std::make_unique<std::atomic<std::uint8_t>[]>(chunks);
+        pages = size / PageBytes;
+        GuestAllocations::GuestAllocationsSetReleaseListener_nid_postfix(&NoteReleased);
+    }
+
+    bool chunkPresent(std::size_t page) const {
+        return present[page / FreeChunkPages].load(std::memory_order_acquire) != 0;
+    }
+
+    std::uint32_t load(std::size_t page) const {
+        return chunkPresent(page) ? std::atomic_ref<std::uint32_t>(stamps[page]).load(std::memory_order_relaxed) : 0u;
+    }
+
+    void stamp(std::size_t page, std::uint32_t value) {
+        if (!chunkPresent(page)) {
+#ifdef _WIN32
+            // Committing a committed chunk again changes nothing, so racing releases need no lock.
+            if (VirtualAlloc(stamps + page / FreeChunkPages * FreeChunkPages, FreeChunkPages * sizeof(std::uint32_t), MEM_COMMIT, PAGE_READWRITE) == nullptr) return;
+#endif
+            present[page / FreeChunkPages].store(1, std::memory_order_release);
+        }
+        std::atomic_ref<std::uint32_t> slot(stamps[page]);
+        auto old = slot.load(std::memory_order_relaxed);
+        while (old < value && !slot.compare_exchange_weak(old, value, std::memory_order_relaxed)) {
+        }
+    }
+};
+
+FreeLog& Frees() {
+    static FreeLog log;
+    return log;
+}
+
+}
+
+std::uint32_t FreeClock() {
+    return Frees().clock.load(std::memory_order_acquire);
+}
+
+void NoteReleased(std::uintptr_t address, std::size_t bytes) {
+    auto& log = Frees();
+    const auto limit = log.base + log.pages * PageBytes;
+    if (bytes == 0 || address >= limit || address + bytes <= log.base) return;
+    const auto value = log.clock.fetch_add(1, std::memory_order_acq_rel) + 1;
+    log.releases.fetch_add(1, std::memory_order_relaxed);
+    log.releasedBytes.fetch_add(bytes, std::memory_order_relaxed);
+    const auto first = (std::max(address, log.base) - log.base) / PageBytes;
+    const auto last = (std::min<std::uintptr_t>(address + bytes, limit) - 1 - log.base) / PageBytes;
+    for (auto page = first; page <= last; ++page) log.stamp(page, value);
+    if (WriteBackRangeTraced(address, bytes)) WriteBackRangeLine(RangeTraceKind::Release, false, "0x%llx-0x%llx clock %u", static_cast<unsigned long long>(address), static_cast<unsigned long long>(address + bytes), value);
+}
+
+bool DropFreedStores() {
+    auto value = dropFreedStores.load(std::memory_order_relaxed);
+    if (value < 0) {
+        const char* text = std::getenv("APS5_DROP_FREED_STORES");
+        value = text == nullptr || std::strcmp(text, "0") != 0 ? 1 : 0;
+        dropFreedStores.store(value, std::memory_order_relaxed);
+    }
+    return value != 0;
+}
+
+void SetDropFreedStores(bool drop) {
+    dropFreedStores.store(drop ? 1 : 0, std::memory_order_relaxed);
+}
+
+std::uint64_t DropFreedRun(FreedStoreKind kind, std::uint32_t clock, std::uint64_t begin, std::uint64_t end, std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) {
+    if (end <= begin) return 0;
+    auto& log = Frees();
+    const auto limit = static_cast<std::uint64_t>(log.base + log.pages * PageBytes);
+    if (clock >= log.clock.load(std::memory_order_acquire) || end <= log.base || begin >= limit) {
+        out.emplace_back(begin, end);
+        return 0;
+    }
+    const bool drop = DropFreedStores();
+    const auto from = std::max<std::uint64_t>(begin, log.base);
+    const auto to = std::min(end, limit);
+    std::uint64_t freed = 0;
+    // The start of the piece not stored yet (moves past a released page only when dropping).
+    auto at = begin;
+    for (auto page = static_cast<std::size_t>((from - log.base) / PageBytes); log.base + page * PageBytes < to; ++page) {
+        if (!log.chunkPresent(page)) {
+            page = (page / FreeChunkPages + 1) * FreeChunkPages - 1;
+            continue;
+        }
+        if (log.load(page) <= clock) continue;
+        const auto pageBegin = std::max<std::uint64_t>(from, log.base + page * PageBytes);
+        const auto pageEnd = std::min<std::uint64_t>(to, log.base + (page + 1) * PageBytes);
+        freed += pageEnd - pageBegin;
+        if (!drop) continue;
+        if (pageBegin > at) out.emplace_back(at, pageBegin);
+        at = pageEnd;
+    }
+    if (at < end) out.emplace_back(at, end);
+    if (freed != 0) {
+        const auto index = static_cast<std::size_t>(kind);
+        log.stores[index].fetch_add(1, std::memory_order_relaxed);
+        log.storeBytes[index].fetch_add(freed, std::memory_order_relaxed);
+        if (WriteBackRangeTraced(begin, end - begin)) WriteBackRangeLine(RangeTraceKind::FreedStore, false, "%s 0x%llx+0x%llx: 0x%llx bytes in pages released after source clock %u (now %u), %s", FreedKindNames[index], static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<unsigned long long>(freed), clock, log.clock.load(std::memory_order_relaxed), drop ? "dropped" : "would drop");
+    }
+    return freed;
+}
+
+std::uint64_t DropFreedRuns(FreedStoreKind kind, std::uint32_t clock, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs) {
+    if (runs.empty() || clock >= FreeClock()) return 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> kept;
+    kept.reserve(runs.size());
+    std::uint64_t freed = 0;
+    for (const auto& [begin, end] : runs) freed += DropFreedRun(kind, clock, begin, end, kept);
+    runs.swap(kept);
+    return freed;
+}
+
+std::string FreedStoreSummary() {
+    auto& log = Frees();
+    std::uint64_t count = 0;
+    std::uint64_t bytes = 0;
+    for (std::size_t k = 0; k < FreedKindCount; ++k) {
+        count += log.stores[k].load(std::memory_order_relaxed);
+        bytes += log.storeBytes[k].load(std::memory_order_relaxed);
+    }
+    char text[512];
+    auto used = static_cast<std::size_t>(std::snprintf(text, sizeof(text), "releases %llu (%.0f MiB, clock %u) | stores into freed pages: %s %llu (%llu KiB) by kind", static_cast<unsigned long long>(log.releases.load(std::memory_order_relaxed)), log.releasedBytes.load(std::memory_order_relaxed) / 1048576.0, log.clock.load(std::memory_order_relaxed), DropFreedStores() ? "dropped" : "would drop", static_cast<unsigned long long>(count), static_cast<unsigned long long>(bytes / 1024)));
+    for (std::size_t k = 0; k < FreedKindCount && used < sizeof(text); ++k) {
+        used += static_cast<std::size_t>(std::snprintf(text + used, sizeof(text) - used, " %s %llu (%llu KiB)", FreedKindNames[k], static_cast<unsigned long long>(log.stores[k].load(std::memory_order_relaxed)), static_cast<unsigned long long>(log.storeBytes[k].load(std::memory_order_relaxed) / 1024)));
+    }
+    return text;
+}
+
+namespace {
+
+constexpr std::size_t LateKindCount = static_cast<std::size_t>(LateStoreKind::Count);
+constexpr const char* LateKindNames[LateKindCount] = {"write-back", "shadow"};
+// APS5_KEEP_CPU_STORES: -1 until read from the environment (SetKeepCpuStores overrides it).
+std::atomic<int> keepCpuStores{-1};
+std::array<std::atomic<std::uint64_t>, LateKindCount> keptStores{};
+std::array<std::atomic<std::uint64_t>, LateKindCount> keptStoreBytes{};
+
+}
+
+bool KeepCpuStores() {
+    auto value = keepCpuStores.load(std::memory_order_relaxed);
+    if (value < 0) {
+        const char* text = std::getenv("APS5_KEEP_CPU_STORES");
+        value = text == nullptr || std::strcmp(text, "0") != 0 ? 1 : 0;
+        keepCpuStores.store(value, std::memory_order_relaxed);
+    }
+    return value != 0;
+}
+
+void SetKeepCpuStores(bool keep) {
+    keepCpuStores.store(keep ? 1 : 0, std::memory_order_relaxed);
+}
+
+std::uint64_t KeepCpuStoredRun(LateStoreKind kind, std::uint64_t generation, std::uint64_t begin, std::uint64_t end, std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) {
+    if (end <= begin) return 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> stored;
+    const auto kept = CpuStoredRuns(begin, static_cast<std::size_t>(end - begin), generation, stored);
+    if (kept == 0 || !KeepCpuStores()) {
+        out.emplace_back(begin, end);
+    } else {
+        // The runs are clipped to the range, merged and in address order: the gaps are stored.
+        auto at = begin;
+        for (const auto& [from, to] : stored) {
+            if (from > at) out.emplace_back(at, from);
+            at = to;
+        }
+        if (at < end) out.emplace_back(at, end);
+    }
+    if (kept != 0) {
+        const auto index = static_cast<std::size_t>(kind);
+        keptStores[index].fetch_add(1, std::memory_order_relaxed);
+        keptStoreBytes[index].fetch_add(kept, std::memory_order_relaxed);
+    }
+    return kept;
+}
+
+std::string KeptCpuStoreSummary() {
+    std::uint64_t count = 0;
+    std::uint64_t bytes = 0;
+    for (std::size_t k = 0; k < LateKindCount; ++k) {
+        count += keptStores[k].load(std::memory_order_relaxed);
+        bytes += keptStoreBytes[k].load(std::memory_order_relaxed);
+    }
+    char text[256];
+    auto used = static_cast<std::size_t>(std::snprintf(text, sizeof(text), "late stores over CPU-stored pages: %s %llu (%llu KiB) by kind", KeepCpuStores() ? "kept" : "would keep", static_cast<unsigned long long>(count), static_cast<unsigned long long>(bytes / 1024)));
+    for (std::size_t k = 0; k < LateKindCount && used < sizeof(text); ++k) {
+        used += static_cast<std::size_t>(std::snprintf(text + used, sizeof(text) - used, " %s %llu (%llu KiB)", LateKindNames[k], static_cast<unsigned long long>(keptStores[k].load(std::memory_order_relaxed)), static_cast<unsigned long long>(keptStoreBytes[k].load(std::memory_order_relaxed) / 1024)));
+    }
+    return text;
 }
 
 }

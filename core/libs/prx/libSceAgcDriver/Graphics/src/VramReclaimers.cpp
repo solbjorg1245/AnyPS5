@@ -4,6 +4,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 
 namespace AgcDriver::Graphics {
@@ -37,6 +39,19 @@ std::string census() {
         line += text;
     }
     return line;
+}
+
+// Resident written ranges with S11's demotion, as the recorders read them (both on by default:
+// APS5_<name>=0 or APS5_NO_<name>=1 turns one off, APS5_<name>=1 forces it on): the
+// "resident-writes" reclaimer is registered (without them the [vram] line stays as it was).
+bool residentWritesDemoteSwitched() {
+    const auto defaultOn = [](const char* name, const char* optOut) {
+        const char* value = std::getenv(name);
+        if (value != nullptr && *value != '\0') return std::strcmp(value, "0") != 0;
+        const char* off = std::getenv(optOut);
+        return off == nullptr || *off == '\0' || std::strcmp(off, "0") == 0;
+    };
+    return defaultOn("APS5_RESIDENT_WRITES", "APS5_NO_RESIDENT_WRITES") && defaultOn("APS5_RESIDENT_WRITES_DEMOTE", "APS5_NO_RESIDENT_WRITES_DEMOTE");
 }
 
 }
@@ -73,6 +88,10 @@ void RegisterDriverVramReclaimers() {
             return held.Total();
         });
         budget.AddReclaimer("resident", VramReclaimLevel::SafePoint, 40, [](VkDeviceSize want, std::uint64_t& evicted) { return TrimResidentReads(want, evicted); });
+        // Last: a demoted range costs a land now and, until it is promoted again, its uses in place
+        // over PCIe (~112 MiB per use of the hot range), more than anything above costs to make
+        // again. Under the GPU mutex with the active recorder only (TrimResidentWrites).
+        if (residentWritesDemoteSwitched()) budget.AddReclaimer("resident-writes", VramReclaimLevel::SafePoint, 50, [](VkDeviceSize want, std::uint64_t& evicted) { return TrimResidentWrites(want, evicted); });
         SetVramCensus(&census);
     });
 }

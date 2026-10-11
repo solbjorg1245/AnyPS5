@@ -320,6 +320,18 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuardedRuns(const KeyStoreG
     return stores;
 }
 
+// GuardedRuns without the key pages the game released after the guard's source was written on the
+// GPU (APS5_DROP_FREED_STORES); left out like the CPU's pages, so the image's keysSeen stays.
+std::vector<std::pair<std::uint64_t, std::uint64_t>> LiveGuardedRuns(const KeyStoreGuard& guard, std::uint64_t begin, std::size_t count, KeyStoreOutcome& outcome) {
+    auto stores = GuardedRuns(guard, begin, count, outcome);
+    const auto freed = GuestMemory::DropFreedRuns(GuestMemory::FreedStoreKind::KeyStore, guard.freeClock, stores);
+    if (freed != 0 && GuestMemory::DropFreedStores()) {
+        outcome.kept += freed;
+        outcome.stored = !stores.empty();
+    }
+    return stores;
+}
+
 }
 
 bool KeysStampCheck() {
@@ -561,7 +573,7 @@ KeyStoreOutcome MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t sur
     // GPU store of the driver's own is no reason to skip: a title kernel recorded into the same
     // batch after it may write clear keys, and the memo cannot order inside a batch.
     if (!Recorder::SnapshotWriteOverlaps(metaAddress, count) && AlreadyUncompressed(metaAddress, count)) return outcome;
-    for (const auto& [from, to] : GuardedRuns(guard, metaAddress, count, outcome)) StoreUncompressedOnCpu(from, static_cast<std::size_t>(to - from));
+    for (const auto& [from, to] : LiveGuardedRuns(guard, metaAddress, count, outcome)) StoreUncompressedOnCpu(from, static_cast<std::size_t>(to - from));
     return outcome;
 }
 
@@ -586,7 +598,7 @@ KeyStoreOutcome MarkDccUncompressed(const Context& context, std::uint64_t metaAd
     // (idempotent, no wait) rather than trusting the earlier one.
     const bool pending = recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count);
     if (!pending && AlreadyUncompressed(metaAddress, count)) return outcome;
-    for (const auto& [from, to] : GuardedRuns(guard, metaAddress, count, outcome)) {
+    for (const auto& [from, to] : LiveGuardedRuns(guard, metaAddress, count, outcome)) {
         const auto bytes = static_cast<std::size_t>(to - from);
         if (recorder != nullptr && StoreUncompressedOnGpu(context, *recorder, from, bytes)) continue;
         StoreUncompressedOnCpu(from, bytes);

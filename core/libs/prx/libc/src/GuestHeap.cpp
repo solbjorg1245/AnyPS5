@@ -169,6 +169,7 @@ private:
 #ifdef _WIN32
             GuestArena::GuestArenaReset_nid_postfix(raw, bytes);
             GuestAllocations::GuestAllocationsInvalidate_nid_postfix(reinterpret_cast<std::uintptr_t>(raw), bytes);
+            GuestAllocations::GuestAllocationsReleased_nid_postfix(reinterpret_cast<std::uintptr_t>(raw), bytes);
 #endif
             GuestArena::GuestArenaRelease_nid_postfix(raw, bytes);
         }

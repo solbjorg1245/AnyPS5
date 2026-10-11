@@ -20,6 +20,8 @@ public:
     VkDescriptorBufferInfo Table() const;
     VkDescriptorBufferInfo Fault() const;
     void CheckFault() const;
+    // Tests: a page the shader recorded as stored to through the table, as the next CheckFault reads it.
+    void NoteWrittenPageForTests(std::uint64_t address) const;
     // APS5_PROFILE_DRAW: page tables served from the per-device cache and built anew (cumulative),
     // and how many recent tables the cache holds right now.
     struct TableCacheStats {
@@ -50,6 +52,9 @@ private:
     std::shared_ptr<Buffer> table;
     std::unique_ptr<Buffer> fault;
     std::size_t tableBytes = 0;
+    // The resident written ranges the table maps to their device copy with the Write permission
+    // (S7c, taken with the table): the pages stored to go to MarkResidentMappedPages.
+    std::vector<std::shared_ptr<ResidentWrite>> residentMapped;
 };
 
 }

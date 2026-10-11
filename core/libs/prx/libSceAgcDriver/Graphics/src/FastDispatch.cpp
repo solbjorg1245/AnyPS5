@@ -463,7 +463,7 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
     const auto guestOrder = Recorder::DispatchOverlap() && !indirect ? Recorder::GuestOrder() : Recorder::GuestOrderKey{};
     const bool holdsTrail = recorder.HoldDispatchTrail(guestOrder);
     VkAccessFlags covered = 0;
-    const auto commands = keepCopyBacks ? recorder.CommandsKeepingCopyBacks(&covered) : recorder.Commands(&covered);
+    const auto commands = keepCopyBacks ? recorder.CommandsKeepingCopyBacks(&covered) : recorder.Commands(&covered, Recorder::CommandSite::Dispatch);
     // The ring regions belong to the open batch (nothing above submits).
     if (!scratch.data.empty() && recorder.Submissions() + 1 != serial) return Decline::Ring;
     timing.recorded = true;

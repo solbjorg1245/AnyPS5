@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BarrierMerge.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
@@ -1096,6 +1097,13 @@ void storeRunTests(const Device& device, Recorder& recorder) {
     Require(covered == (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT), "the covered mask is not reported");
     recorder.Commands(&covered);
     Require(covered == 0, "the covered mask survived a Commands() call");
+    // A caller that records nothing after opening the batch gives the mask back (the batch opening
+    // before a copied region, Recorder::MergeDispatchBarriers): the next caller is told it again.
+    recorder.MarkCovered(StagingCopyAccess);
+    recorder.Commands(&covered);
+    recorder.MarkCovered(covered);
+    recorder.Commands(&covered);
+    Require(covered == StagingCopyAccess, "a covered mask given back was lost");
     recorder.Sync();
     // The hazard tracker (counting mode only): accesses are noted without effect on the batch.
     const std::pair<std::uint64_t, std::uint64_t> range{address, address + 64};
@@ -3408,6 +3416,29 @@ void metadataPassTests(const Device& device, Recorder& recorder) {
     Require(keysUncompressed() && memoryHolds({0xff, 0xff, 0xff, 0xff}), "a pass over a remade resident image did not store the 1111 value");
 }
 
+// The dispatch path's barrier merges (BarrierMerge.hpp, Recorder::MergeDispatchBarriers): a
+// dispatch's trailing barrier covers the leading barrier of a staging copy pass and of the next
+// dispatch; a copy-in pass's coverage (shader accesses) leaves the next pass its barrier; nothing
+// covered, or part of it, records every barrier; the argument barrier merged into the leading one
+// contains both and widens neither's source stages.
+void barrierMergeTests() {
+    Require(DispatchTrailingBarrier.destinationStages == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, "the dispatch's trailing barrier must reach every later stage to cover");
+    Require(LeadingBarrierCovered(DispatchTrailingBarrier.destinationAccess, StagingCopyAccess), "a copy-back after a dispatch keeps its leading barrier");
+    Require(LeadingBarrierCovered(DispatchTrailingBarrier.destinationAccess, DispatchLeadingBarrier.destinationAccess), "a dispatch after a dispatch keeps its leading barrier");
+    constexpr VkAccessFlags copyInCoverage = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    Require(!LeadingBarrierCovered(copyInCoverage, StagingCopyAccess), "a copy-in pass's coverage left out a transfer's barrier");
+    Require(LeadingBarrierCovered(copyInCoverage, DispatchLeadingBarrier.destinationAccess), "a dispatch after a copy-in pass keeps its leading barrier");
+    Require(!LeadingBarrierCovered(0, StagingCopyAccess) && !LeadingBarrierCovered(0, 0), "nothing covered left a barrier out");
+    Require(!LeadingBarrierCovered(VK_ACCESS_TRANSFER_READ_BIT, StagingCopyAccess), "a partly covered pass left its barrier out");
+    constexpr auto merged = MergeAdjacentBarriers(IndirectArgumentsBarrier, DispatchLeadingBarrier);
+    Require(BarrierContains(merged, IndirectArgumentsBarrier) && BarrierContains(merged, DispatchLeadingBarrier), "the merged barrier lost part of one of its two");
+    Require(IndirectArgumentsBarrier.sourceStages == DispatchLeadingBarrier.sourceStages && merged.sourceStages == DispatchLeadingBarrier.sourceStages, "the merge widened a source scope");
+    Require(merged.destinationStages == (VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT), "the merged barrier's destination stages are wrong");
+    Require(merged.destinationAccess == (VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT), "the merged barrier's destination accesses are wrong");
+    Require(!BarrierContains(merged, DispatchTrailingBarrier) && !BarrierContains(DispatchLeadingBarrier, merged), "containment is not strict");
+    Require(BarrierContains(merged, merged), "a barrier does not contain itself");
+}
+
 // The data word positions of a dispatch-cache variant (Driver.cpp's data-only hits): leaves
 // located among the runs' words, aliased, unaligned, out-of-run and mismatched ones skipped.
 void dataWordPositionsTests() {
@@ -4330,6 +4361,233 @@ void narrowCopyBackTests(const Device& device, Recorder& recorder) {
             if (std::to_integer<unsigned char>(shadow->Bytes()[span + at]) != shadowByte(at)) throw std::runtime_error("APS5_NARROW_VERIFY left a wrong baseline byte at offset " + std::to_string(at));
         }
         Require(after.narrowStale - before.narrowStale == staleWords, "APS5_NARROW_VERIFY counted " + std::to_string(after.narrowStale - before.narrowStale) + " stale dwords, expected " + std::to_string(staleWords));
+    }
+    recorder.Activate();
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+}
+
+// Aware commands (on by default with coalescing: APS5_NO_AWARE_COMMANDS=1 or APS5_AWARE_COMMANDS=0
+// turns them off, APS5_AWARE_COMMANDS=1 forces them on; read when a recorder is made): a
+// command naming the guest ranges it reads or writes through the imports (CommandsTouching)
+// records first only the queued copies over them, and every claimed one as Commands() does; the
+// others stay queued, whole, and land at Submit byte-exact. A copy over its ranges lands before its
+// own work, an unaware Commands() records every queued copy, and with APS5_NO_AWARE_COMMANDS=1
+// CommandsTouching is Commands(). Command passes count by the caller's site only when they record.
+void awareCommandTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    // A recorder made with the switches given; the caller's switches come back after.
+    const auto saved = [](const char* name) {
+        const char* value = std::getenv(name);
+        return std::string(value != nullptr ? value : "");
+    };
+    const std::string awareSwitch = saved("APS5_AWARE_COMMANDS"), coalesceSwitch = saved("APS5_COALESCE_COPY_BACKS"), noCoalesceSwitch = saved("APS5_NO_COALESCE_COPY_BACKS");
+    const std::string noAwareSwitch = saved("APS5_NO_AWARE_COMMANDS");
+    const auto madeWith = [&](const char* aware, const char* coalesce, const char* noAware = "") {
+        setSwitch("APS5_AWARE_COMMANDS", aware);
+        setSwitch("APS5_NO_AWARE_COMMANDS", noAware);
+        setSwitch("APS5_COALESCE_COPY_BACKS", coalesce);
+        setSwitch("APS5_NO_COALESCE_COPY_BACKS", "");
+        auto made = std::make_unique<Recorder>(context);
+        setSwitch("APS5_AWARE_COMMANDS", awareSwitch.c_str());
+        setSwitch("APS5_NO_AWARE_COMMANDS", noAwareSwitch.c_str());
+        setSwitch("APS5_COALESCE_COPY_BACKS", coalesceSwitch.c_str());
+        setSwitch("APS5_NO_COALESCE_COPY_BACKS", noCoalesceSwitch.c_str());
+        return made;
+    };
+    Require(madeWith("", "")->AwareCommands(), "aware commands are not on by default");
+    Require(!madeWith("", "", "1")->AwareCommands(), "APS5_NO_AWARE_COMMANDS=1 did not turn aware commands off");
+    Require(madeWith("", "", "0")->AwareCommands(), "APS5_NO_AWARE_COMMANDS=0 turned aware commands off");
+    Require(!madeWith("0", "")->AwareCommands(), "APS5_AWARE_COMMANDS=0 turned aware commands on");
+    Require(madeWith("1", "")->AwareCommands(), "APS5_AWARE_COMMANDS=1 did not turn aware commands on");
+    Require(madeWith("1", "", "1")->AwareCommands(), "APS5_AWARE_COMMANDS=1 did not force aware commands on over the opt-out");
+    Require(!madeWith("1", "0")->AwareCommands(), "aware commands are on without copy-back coalescing");
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: aware commands not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the aware command test block");
+    std::memset(block, 0, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr) {
+        std::cout << "host import of the aware command test block refused: aware commands not tested\n";
+        return;
+    }
+    constexpr std::size_t sourceBytes = 8192;
+    auto first = std::make_shared<Buffer>(context, sourceBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    auto second = std::make_shared<Buffer>(context, sourceBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    const auto firstByte = [](std::size_t at) { return static_cast<unsigned char>(at * 7 + 1); };
+    const auto secondByte = [](std::size_t at) { return static_cast<unsigned char>(at * 13 + 5); };
+    for (std::size_t at = 0; at < sourceBytes; ++at) {
+        first->Bytes()[at] = std::byte{firstByte(at)};
+        second->Bytes()[at] = std::byte{secondByte(at)};
+    }
+    // The shadow's byte `at` goes to the block's byte `at`, as a staged region's copy-back.
+    const auto copyOf = [&](const std::shared_ptr<Buffer>& source, std::uint64_t at, std::uint64_t count) {
+        return std::vector<Recorder::DeferredCopy>{Recorder::DeferredCopy{source, source.get(), source->Handle(), import->buffer, at, address + at - import->base, count, address + at}};
+    };
+    // A command reading or writing the block's bytes [begin, end) through the import.
+    const auto within = [address](std::uint64_t begin, std::uint64_t end) {
+        return [=](std::uint64_t from, std::uint64_t to) { return from < address + end && address + begin < to; };
+    };
+    using Site = Recorder::CommandSite;
+    using Reason = Recorder::FlushReason;
+    const auto before = Recorder::CopyBackCounts();
+    {
+        const auto aware = madeWith("1", "1");
+        Require(aware->AwareCommands() && aware->CoalescesCopyBacks(), "APS5_AWARE_COMMANDS=1 with coalescing did not turn aware commands on");
+        aware->Activate();
+        // Nothing queued: no command pass to count.
+        static_cast<void>(aware->Commands(nullptr, Site::KeyStore));
+        aware->DeferCopies(copyOf(first, 0, 1024));
+        aware->DeferCopies(copyOf(second, 4096, 256));
+        Require(aware->WouldRecordCopies(within(1020, 1030)) && !aware->WouldRecordCopies(within(1024, 4096)), "WouldRecordCopies did not tell the copies over a range");
+        // Over neither copy, and over no import at all: both stay queued, whole.
+        static_cast<void>(aware->CommandsTouching(within(2048, 2112), Site::Fill));
+        static_cast<void>(aware->CommandsTouchingNothing(Site::Texture));
+        Require(aware->DeferredCopyBytes() == 1280, "an aware command recorded copies outside its ranges");
+        // Over the first copy: it alone lands, before the command's own work (a fill over its
+        // first half, which must win there).
+        const auto commands = aware->CommandsTouching(within(0, 512), Site::Copy);
+        Require(aware->DeferredCopyBytes() == 256, "an aware command did not record exactly the copy over its ranges");
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, import->buffer, address - import->base, 512, 0xa5a5a5a5u);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+        // The kept copy lands at Submit.
+        aware->Submit();
+        Require(!aware->HasDeferredCopies(), "Submit left queued copies");
+        aware->Sync();
+        // A claimed copy keeps Commands()' rule: an aware command over other bytes records it
+        // (breaking the claim); the unclaimed copy outside its ranges stays.
+        aware->DeferCopies(copyOf(first, 2048, 64));
+        aware->DeferCopies(copyOf(second, 3072, 64));
+        aware->ClaimDeferredCopies(second.get());
+        Require(aware->WouldRecordCopies(within(6144, 6208)), "a claimed copy did not make an aware command record copies");
+        const auto breaks = aware->ClaimBreaks();
+        static_cast<void>(aware->CommandsTouching(within(6144, 6208), Site::Fill));
+        Require(aware->DeferredCopyBytes() == 64 && aware->ClaimBreaks() == breaks + 1 && !aware->WouldRecordCopies(within(6144, 6208)), "an aware command did not record the claimed copy as Commands() does");
+        // An unaware Commands() records every queued copy.
+        aware->DeferCopies(copyOf(second, 5120, 128));
+        static_cast<void>(aware->Commands());
+        Require(!aware->HasDeferredCopies(), "an unaware Commands() left queued copies");
+        aware->Submit();
+        aware->Sync();
+    }
+    const auto awareCounts = Recorder::CopyBackCounts();
+    // The old path (APS5_NO_AWARE_COMMANDS=1): CommandsTouching is Commands(), every queued copy
+    // goes in first.
+    {
+        const auto plain = madeWith("", "1", "1");
+        Require(!plain->AwareCommands() && plain->CoalescesCopyBacks(), "aware commands are on with APS5_NO_AWARE_COMMANDS=1");
+        plain->Activate();
+        plain->DeferCopies(copyOf(first, 6144, 64));
+        static_cast<void>(plain->CommandsTouching(within(0, 64), Site::Texture));
+        Require(!plain->HasDeferredCopies(), "CommandsTouching without the switch left queued copies");
+        plain->DeferCopies(copyOf(second, 7168, 64));
+        static_cast<void>(plain->CommandsTouchingNothing(Site::Depth));
+        Require(!plain->HasDeferredCopies(), "CommandsTouchingNothing without the switch left queued copies");
+        plain->Submit();
+        plain->Sync();
+    }
+    const auto counts = Recorder::CopyBackCounts();
+    const auto site = [&](Site which) { return counts.sites[static_cast<std::size_t>(which)] - before.sites[static_cast<std::size_t>(which)]; };
+    const auto flushes = [&](Reason reason) { return counts.flushes[static_cast<std::size_t>(reason)] - before.flushes[static_cast<std::size_t>(reason)]; };
+    Require(site(Site::Copy) == 1 && site(Site::Fill) == 1 && site(Site::Other) == 1 && site(Site::Texture) == 1 && site(Site::Depth) == 1 && site(Site::KeyStore) == 0 && site(Site::Draw) == 0, "the command passes by site are off");
+    Require(counts.passes - before.passes == 6 && flushes(Reason::Command) == 5 && flushes(Reason::Submit) == 1 && counts.recorded - before.recorded == 7 && counts.recordedBytes - before.recordedBytes == 1536 + 128, "copy-back pass counters are off");
+    // Kept: both copies at the first Fill and the Texture commands, the second at the Copy one,
+    // the unclaimed one at the second Fill one; flushed as over the ranges: the first at the Copy one.
+    Require(awareCounts.awareKeeping - before.awareKeeping == 4 && awareCounts.awareKept - before.awareKept == 6 && awareCounts.awareKeptBytes - before.awareKeptBytes == 2 * 1280 + 256 + 64 && awareCounts.awareFlushed - before.awareFlushed == 1, "aware command counters are off");
+    Require(counts.awareKeeping == awareCounts.awareKeeping && counts.awareKept == awareCounts.awareKept && counts.awareFlushed == awareCounts.awareFlushed, "a recorder without the switch counted aware commands");
+    const auto* landed = static_cast<const unsigned char*>(block);
+    for (std::size_t at = 0; at < 8192; ++at) {
+        const bool fromFirst = (at >= 512 && at < 1024) || (at >= 2048 && at < 2112) || (at >= 6144 && at < 6208);
+        const bool fromSecond = (at >= 3072 && at < 3136) || (at >= 4096 && at < 4352) || (at >= 5120 && at < 5248) || (at >= 7168 && at < 7232);
+        const unsigned char want = at < 512 ? 0xa5 : fromFirst ? firstByte(at) : fromSecond ? secondByte(at) : 0;
+        if (landed[at] != want) throw std::runtime_error("an aware command test copy stored the wrong byte at offset " + std::to_string(at) + ": " + std::to_string(landed[at]) + ", expected " + std::to_string(want));
+    }
+    // The dispatch path's barrier merges (Recorder::MergeDispatchBarriers) read the coverage when a
+    // command takes the command buffer. What an aware command records between two dispatches (a
+    // kept copy-back over its ranges, a resident land, recorded at once or by the S11 demotion) ends
+    // with its own trailing barrier and leaves that barrier's coverage, never the earlier
+    // dispatch's; a copy it keeps records nothing, so the dispatch's coverage stays (and the batch
+    // opening's hand-back keeps it); a dispatch's deferred trailing barrier is recorded before the
+    // coverage is read, kept copies or not. The copies land byte-exact at Submit.
+    {
+        const auto merging = madeWith("1", "1");
+        merging->Activate();
+        const auto copyTo = [&](const std::shared_ptr<Buffer>& source, std::uint64_t from, std::uint64_t at, std::uint64_t count) {
+            return std::vector<Recorder::DeferredCopy>{Recorder::DeferredCopy{source, source.get(), source->Handle(), import->buffer, from, address + at - import->base, count, address + at}};
+        };
+        // A copy pass's coverage: what a dispatch's trailing barrier covers, and the indirect
+        // argument reads (which a dispatch's does not).
+        const auto copyPassCoverage = [](VkAccessFlags covered) { return (covered & VK_ACCESS_INDIRECT_COMMAND_READ_BIT) != 0 && LeadingBarrierCovered(covered, StagingCopyAccess) && LeadingBarrierCovered(covered, DispatchLeadingBarrier.destinationAccess); };
+        const auto dispatchTrail = [&](VkCommandBuffer commands) {
+            RecordMemoryBarrier(context, commands, DispatchTrailingBarrier.sourceStages, DispatchTrailingBarrier.destinationStages, DispatchTrailingBarrier.sourceAccess, DispatchTrailingBarrier.destinationAccess);
+            merging->MarkCovered(DispatchTrailingBarrier.destinationAccess);
+        };
+        VkAccessFlags covered = 0;
+        // Dispatch 1 queues its copy-back; dispatch 2 touches other bytes: the copy stays queued,
+        // nothing is recorded between, and dispatch 1's trailing barrier covers dispatch 2's lead.
+        dispatchTrail(merging->Commands(nullptr, Site::Dispatch));
+        merging->DeferCopies(copyTo(first, 0, 16384, 1024));
+        auto commands = merging->CommandsTouching(within(20480, 20544), Site::Dispatch, &covered);
+        Require(merging->DeferredCopyBytes() == 1024 && covered == DispatchTrailingBarrier.destinationAccess, "an aware command that kept a copy-back lost the dispatch's coverage");
+        Require(LeadingBarrierCovered(covered, DispatchLeadingBarrier.destinationAccess), "a dispatch after a kept copy-back kept its leading barrier");
+        dispatchTrail(commands);
+        // A batch opening that records nothing gives the coverage back with the copy still queued.
+        static_cast<void>(merging->CommandsKeepingCopyBacks(&covered));
+        merging->MarkCovered(covered);
+        Require(merging->DeferredCopyBytes() == 1024 && covered == DispatchTrailingBarrier.destinationAccess, "the batch opening did not keep the coverage over a kept copy-back");
+        // Dispatch 2's copy-back pass over the kept copy's bytes: the kept copy lands first with its
+        // own barrier pair, whose trailing barrier is then the coverage.
+        static_cast<void>(merging->CommandsTouching(within(16384, 16896), Site::CopyBack, &covered));
+        Require(!merging->HasDeferredCopies() && copyPassCoverage(covered), "a kept copy-back recorded between two dispatches left the dispatch's coverage");
+        // A resident land recorded at once (queueResidentLands outside deferral) between two dispatches.
+        dispatchTrail(merging->Commands(nullptr, Site::Dispatch));
+        auto land = copyTo(second, 0, 24576, 512);
+        land[0].land = true;
+        merging->RecordCopyBacksNow(std::move(land));
+        static_cast<void>(merging->Commands(&covered, Site::Dispatch));
+        Require(copyPassCoverage(covered), "a land recorded between two dispatches left the earlier dispatch's coverage");
+        // A queued land the S11 demotion records (FlushResidentLand) between two dispatches.
+        dispatchTrail(merging->Commands(nullptr, Site::Dispatch));
+        land = copyTo(second, 1024, 25600, 256);
+        land[0].land = true;
+        merging->DeferCopies(std::move(land));
+        Require(merging->ResidentLandQueued(second.get()), "the land was not queued");
+        merging->FlushResidentLand(second.get(), true);
+        static_cast<void>(merging->CommandsTouchingNothing(Site::Dispatch, &covered));
+        Require(!merging->HasDeferredCopies() && copyPassCoverage(covered), "a land the demotion recorded between two dispatches left the earlier dispatch's coverage");
+        // A deferred dispatch trail (APS5_DISPATCH_OVERLAP) with a copy-back queued after it: an aware
+        // command that keeps the copy records the trail before it reads the coverage.
+        const auto trailsBefore = Recorder::DispatchTrailCounts();
+        static_cast<void>(merging->Commands(nullptr, Site::Dispatch));
+        merging->DeferDispatchTrail(Recorder::GuestOrderKey{1, 1}, DispatchTrailingBarrier.destinationAccess);
+        merging->DeferCopies(copyTo(first, 2048, 28672, 256));
+        static_cast<void>(merging->CommandsTouching(within(32768, 32832), Site::Dispatch, &covered));
+        const auto trails = Recorder::DispatchTrailCounts();
+        Require(trails.command == trailsBefore.command + 1 && merging->DeferredCopyBytes() == 256 && covered == DispatchTrailingBarrier.destinationAccess, "an aware command that kept a copy-back did not record the deferred dispatch trail first");
+        merging->Submit();
+        Require(!merging->HasDeferredCopies(), "Submit left the queued copy-back");
+        merging->Sync();
+        for (std::size_t at = 16384; at < 32768; ++at) {
+            const unsigned char want = at < 17408 ? firstByte(at - 16384) : at >= 24576 && at < 25088 ? secondByte(at - 24576) : at >= 25600 && at < 25856 ? secondByte(at - 24576) : at >= 28672 && at < 28928 ? firstByte(at - 26624) : 0;
+            if (landed[at] != want) throw std::runtime_error("a copy recorded between two dispatches stored the wrong byte at offset " + std::to_string(at) + ": " + std::to_string(landed[at]) + ", expected " + std::to_string(want));
+        }
     }
     recorder.Activate();
     {
@@ -5577,9 +5835,34 @@ void residentReadTests(const Device& device, Recorder& recorder) {
 // later use bound to D leaves queued (the dispatch rule) and replaces, and which Commands(), Submit
 // and a CPU reader's sync record; a CPU store into the range reaches D before the next use, also
 // while a land is queued (counted `both`: the GPU's dwords land first, the CPU's byte stays); a
-// changed import demotes the range and the next build binds in place.
+// changed import demotes the range and the next build binds in place. On by default (S12) with
+// S11's demotion; APS5_NO_RESIDENT_WRITES=1 (or APS5_RESIDENT_WRITES=0) is the old path, where
+// the uses that promote a range leave it in place. The stage's own recorder pins S11 off.
 void residentWriteTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
+    // The defaults: resident written ranges and their demotion on; APS5_NO_RESIDENT_WRITES=1 or
+    // APS5_RESIDENT_WRITES=0 turns the ranges off and the demotion with them,
+    // APS5_RESIDENT_WRITES=1 forces them on over the opt-out. The caller's switches are restored.
+    {
+        const auto saved = [](const char* name) {
+            const char* value = std::getenv(name);
+            return std::string(value != nullptr ? value : "");
+        };
+        const std::string writesSwitch = saved("APS5_RESIDENT_WRITES"), noWritesSwitch = saved("APS5_NO_RESIDENT_WRITES");
+        const auto made = [&](const char* on, const char* off) {
+            setSwitch("APS5_RESIDENT_WRITES", on);
+            setSwitch("APS5_NO_RESIDENT_WRITES", off);
+            Recorder made(context);
+            return std::pair{made.ResidentWrites().enabled, made.ResidentWrites().demote};
+        };
+        Require(made("", "") == std::pair{true, true}, "(w) resident written ranges and their demotion are not on by default");
+        Require(made("", "1") == std::pair{false, false}, "(w) APS5_NO_RESIDENT_WRITES=1 did not turn resident written ranges off");
+        Require(made("0", "") == std::pair{false, false}, "(w) APS5_RESIDENT_WRITES=0 did not turn resident written ranges off");
+        Require(made("1", "1") == std::pair{true, true}, "(w) APS5_RESIDENT_WRITES=1 did not force resident written ranges on");
+        Require(made("", "0") == std::pair{true, true}, "(w) APS5_NO_RESIDENT_WRITES=0 turned resident written ranges off");
+        setSwitch("APS5_RESIDENT_WRITES", writesSwitch.c_str());
+        setSwitch("APS5_NO_RESIDENT_WRITES", noWritesSwitch.c_str());
+    }
     constexpr std::size_t unit = 65536;
     // Over the written-shadow window (16 MiB by default): in place for being too large.
     constexpr std::size_t span = (std::size_t{16} << 20u) + unit;
@@ -5626,16 +5909,22 @@ void residentWriteTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the resident write block refused or unwatched: resident written ranges not tested\n";
         return;
     }
-    setSwitch("APS5_RESIDENT_WRITES", "1");
+    // `plain`: the old path; `writes`: S7 alone (S11 pinned off: its policy would demote here).
     setSwitch("APS5_RESIDENT_WRITES_USES", "2");
+    setSwitch("APS5_NO_RESIDENT_WRITES", "1");
+    Recorder plain(context);
+    setSwitch("APS5_NO_RESIDENT_WRITES", "");
+    setSwitch("APS5_RESIDENT_WRITES", "1");
+    setSwitch("APS5_NO_RESIDENT_WRITES_DEMOTE", "1");
     Recorder writes(context);
     setSwitch("APS5_RESIDENT_WRITES", "");
     setSwitch("APS5_RESIDENT_WRITES_USES", "");
+    setSwitch("APS5_NO_RESIDENT_WRITES_DEMOTE", "");
     if (!writes.KeepsResidentWrites()) {
         std::cout << "no narrow copy-backs: resident written ranges not tested\n";
         return;
     }
-    Require(!recorder.KeepsResidentWrites() && writes.ResidentWrites().uses == 2, "(w) APS5_RESIDENT_WRITES did not set up the recorder");
+    Require(!plain.KeepsResidentWrites() && plain.NarrowsCopyBacks() && writes.ResidentWrites().uses == 2 && !writes.ResidentWrites().demote, "(w) APS5_RESIDENT_WRITES did not set up the recorders");
     writes.Activate();
     const auto build = [&]() {
         auto memory = std::make_unique<GuestBufferMemory>(context);
@@ -5675,6 +5964,24 @@ void residentWriteTests(const Device& device, Recorder& recorder) {
         writes.Sync();
         return std::to_integer<unsigned char>(readback->Bytes()[0]);
     };
+    // The old path (APS5_NO_RESIDENT_WRITES=1): the uses that would promote the range leave it in
+    // place.
+    {
+        plain.Activate();
+        const auto promoted = ResidentWriteCounts().promoted;
+        for (int use = 0; use < 2; ++use) {
+            auto memory = build();
+            Require(memory->ServedInPlace(address + at), "(w) a use with APS5_NO_RESIDENT_WRITES=1 did not bind in place");
+            memory->RecordCopyBacks(plain);
+            plain.ReleaseClaims();
+            plain.NotePendingWrites(memory->Writes(), Recorder::WriteKind::ShaderWrite);
+            memory->MarkDirectWrites();
+            plain.Submit();
+            plain.Sync();
+        }
+        Require(ResidentWriteCounts().promoted == promoted, "(w) APS5_NO_RESIDENT_WRITES=1 promoted a range");
+        writes.Activate();
+    }
     auto counts = ResidentWriteCounts();
     const auto expect = [&](std::uint64_t ResidentWriteStatistics::*field, std::uint64_t delta, const char* what) {
         const auto now = ResidentWriteCounts();
@@ -5883,11 +6190,14 @@ void residentWriteSpaceTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the resident write space block refused or unwatched: resident written spaces not tested\n";
         return;
     }
+    // S7 alone: S11 pinned off (its policy would demote here).
     setSwitch("APS5_RESIDENT_WRITES", "1");
     setSwitch("APS5_RESIDENT_WRITES_USES", "2");
+    setSwitch("APS5_NO_RESIDENT_WRITES_DEMOTE", "1");
     Recorder writes(context);
     setSwitch("APS5_RESIDENT_WRITES", "");
     setSwitch("APS5_RESIDENT_WRITES_USES", "");
+    setSwitch("APS5_NO_RESIDENT_WRITES_DEMOTE", "");
     if (!writes.KeepsResidentWrites()) {
         std::cout << "no narrow copy-backs: resident written spaces not tested\n";
         return;
@@ -5981,6 +6291,437 @@ void residentWriteSpaceTests(const Device& device, Recorder& recorder) {
     writes.Sync();
     second.reset();
     writes.Sync();
+}
+
+// S7c (APS5_RESIDENT_WRITES_WRITABLE, default on under APS5_RESIDENT_WRITES): a space built while
+// R is promoted splits a WRITABLE direct base entry too, R mapped to D with Read|Write; the lease
+// rule keeps R's land queued past such a build; a program that may store through BDA queues R's
+// land after its use (replacing the queued one), one that stores nowhere does not; its writer list
+// owes R no refresh; at its completion a page it stored to inside R is stamped and taken as D's (no
+// refresh owed), one outside R stamped as before; APS5_RESIDENT_WRITES_WRITABLE=0 keeps the
+// writable entry whole (S7b).
+void residentWriteWritableTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t span = (std::size_t{16} << 20u) + unit;
+    constexpr std::size_t bytes = span + 2 * unit;
+    constexpr std::size_t at = unit;
+    if (context.hostImportAlignment == 0 || !context.bufferDeviceAddress || DeviceStagingWanted(span, false)) {
+        std::cout << "host imports, device addresses or an element too large to stage unavailable: resident written writable spaces not tested\n";
+        return;
+    }
+    void* block = AllocateWatched(bytes, unit);
+    if (block == nullptr) {
+        std::cout << "no write watching: resident written writable spaces not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* guest = static_cast<volatile unsigned char*>(block);
+    for (std::size_t offset = 0; offset + at < bytes; ++offset) guest[at + offset] = static_cast<unsigned char>((at + offset) * 5 + 1);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        // Writable for the GPU: the space's base region over the block is writable and direct.
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            ResidentWritesWritableForTests(-1);
+            ClearResidentWrites();
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+            recorder.Activate();
+        }
+    } unregister{context, recorder, block, address};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || import->unwatched || !AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "host import of the resident write writable block refused or unwatched: resident written writable spaces not tested\n";
+        return;
+    }
+    // S7 alone: S11 pinned off (its policy would demote here).
+    setSwitch("APS5_RESIDENT_WRITES", "1");
+    setSwitch("APS5_RESIDENT_WRITES_USES", "2");
+    setSwitch("APS5_NO_RESIDENT_WRITES_DEMOTE", "1");
+    Recorder writes(context);
+    setSwitch("APS5_RESIDENT_WRITES", "");
+    setSwitch("APS5_RESIDENT_WRITES_USES", "");
+    setSwitch("APS5_NO_RESIDENT_WRITES_DEMOTE", "");
+    if (!writes.KeepsResidentWrites()) {
+        std::cout << "no narrow copy-backs: resident written writable spaces not tested\n";
+        return;
+    }
+    writes.Activate();
+    ResidentWritesWritableForTests(1);
+    const auto build = [&]() {
+        auto memory = std::make_unique<GuestBufferMemory>(context);
+        memory->AllowDeviceStaging();
+        memory->AddWritable(address + at, span);
+        memory->UploadPrepare(false);
+        memory->UploadFinish(false);
+        return memory;
+    };
+    const auto marks = [&](GuestBufferMemory& memory) {
+        memory.RecordCopyBacks(writes);
+        writes.ReleaseClaims();
+        writes.NotePendingWrites(memory.Writes(), Recorder::WriteKind::ShaderWrite);
+        memory.MarkDirectWrites();
+    };
+    const auto leasedBuild = [&]() {
+        auto memory = std::make_unique<GuestBufferMemory>(context);
+        memory->AllowDeviceStaging();
+        memory->AcquireRegistered();
+        memory->Upload(true);
+        return memory;
+    };
+    // Two uses of the writable descriptor promote R = the element rounded out to 64 KiB.
+    {
+        auto first = build();
+        marks(*first);
+        writes.Submit();
+        writes.Sync();
+    }
+    auto second = build();
+    Require(ResidentWriteCounts().live == 1 && !second->ServedInPlace(address + at), "(ww) the range was not promoted for the writable space tests");
+    const std::uint64_t rBegin = address + at;
+    const std::uint64_t rEnd = address + at + span;
+    // A use bound to D queues R's land; its key and the queued lands of it are read without flushing.
+    marks(*second);
+    const void* key = nullptr;
+    writes.FlushDeferredWhere([&](const Recorder::DeferredCopy& copy, bool) {
+        if (copy.land) key = copy.sourceKey;
+        return false;
+    }, Recorder::FlushReason::Dispatch);
+    Require(key != nullptr, "(ww) the use did not queue a land of the range");
+    const auto landsQueued = [&]() {
+        std::size_t count = 0;
+        writes.FlushDeferredWhere([&](const Recorder::DeferredCopy& copy, bool) {
+            if (copy.land && copy.sourceKey == key) ++count;
+            return false;
+        }, Recorder::FlushReason::Dispatch);
+        return count;
+    };
+    constexpr auto readWrite = ShaderRecompiler::BdaAbi::Read | ShaderRecompiler::BdaAbi::Write;
+    auto counts = ResidentWriteCounts();
+    // (a) The space splits the writable base entry: R maps to D with Read|Write.
+    auto leased = leasedBuild();
+    std::vector<ShaderRecompiler::BdaAbi::Range> inBlock;
+    for (const auto& range : leased->AddressRanges()) {
+        if (range.begin < address + bytes && address < range.end) inBlock.push_back(range);
+    }
+    Require(inBlock.size() == 3, "(ww) the leased space did not split the writable base entry into three: " + std::to_string(inBlock.size()) + " entries");
+    const auto before = inBlock[0];
+    const auto mapped = inBlock[1];
+    const auto after = inBlock[2];
+    Require(before.end == rBegin && mapped.begin == rBegin && mapped.end == rEnd && after.begin == rEnd, "(ww) the writable split has the wrong bounds");
+    Require(mapped.permissions == readWrite && before.permissions == readWrite && after.permissions == readWrite, "(ww) the writable split entries are not Read|Write");
+    const auto importAt = before.deviceAddress + (rBegin - before.begin);
+    Require(mapped.deviceAddress != importAt, "(ww) the writable range still maps to its import");
+    Require(ResidentWriteCounts().spacesWritable >= counts.spacesWritable + 1, "(ww) the space was not counted as mapping a range writable");
+    Require(leased->ResidentWritesMappedWritable().size() == 1, "(ww) the build does not list the range mapped writable");
+    // (b) The lease rule keeps the land queued past the use.
+    Require(leased->MapsResidentLands() && leased->MapsResidentLand(key), "(ww) a writable split lease build does not map the range's land");
+    writes.FlushDeferredWhere([&](const Recorder::DeferredCopy& copy, bool) { return !(copy.land && leased->MapsResidentLand(copy.sourceKey)); }, Recorder::FlushReason::DispatchLease);
+    Require(landsQueued() == 1, "(ww) the lease flush recorded the mapped range's land");
+    // (c) A program that stores nowhere through BDA reads D only: no land of its own.
+    counts = ResidentWriteCounts();
+    marks(*leased);
+    Require(ResidentWriteCounts().mappedWriters == counts.mappedWriters && landsQueued() == 1, "(ww) a use that stores nowhere queued a land");
+    // (d) A storing program's use queues R's land after it, replacing the queued one, and owes R
+    // no refresh for its writer list (R is in the space's writable ranges, but it stores into D).
+    leased->NoteAddressStores();
+    leased->NoteResidentWritesWriter();
+    Require(ResidentWriteCounts().addressElsewhere == counts.addressElsewhere + 1 && ResidentWriteCounts().addressOver == counts.addressOver, "(ww) the storing use's writer list owed the mapped range a refresh");
+    marks(*leased);
+    Require(ResidentWriteCounts().mappedWriters == counts.mappedWriters + 1, "(ww) the storing use was not counted as writing D");
+    Require(landsQueued() == 1, "(ww) the storing use did not replace the range's land with its own");
+    // (e) Its completion: a page inside R is stamped (other watchers) and taken as D's, one outside
+    // R is stamped; the next check of R owes no refresh.
+    if (((address + bytes) >> ShaderRecompiler::BdaAbi::WrittenPageShift) + 1u < std::uint64_t{0xFFFFFFFFu}) {
+        BdaResources bda(context, *leased);
+        const auto insidePage = rBegin + 2 * unit;
+        const auto outsidePage = address;
+        bda.NoteWrittenPageForTests(insidePage);
+        bda.NoteWrittenPageForTests(outsidePage);
+        counts = ResidentWriteCounts();
+        const auto generation = AgcDriver::GuestMemory::TrackerGeneration();
+        bda.CheckFault();
+        Require(!AgcDriver::GuestMemory::UnchangedSince(outsidePage, 4096, generation) && !AgcDriver::GuestMemory::UnchangedSince(insidePage, 4096, generation), "(ww) the stored pages were not stamped at the completion");
+        Require(ResidentWriteCounts().mappedPages == counts.mappedPages + 1, "(ww) the page inside the range was not taken as D's");
+        leased->RecheckResidentReads(writes);
+        const auto now = ResidentWriteCounts();
+        Require(now.refreshStamp == counts.refreshStamp && now.refreshAddress == counts.refreshAddress && now.both == counts.both, "(ww) the range owed a refresh for the storing use's own pages");
+        Require(now.mappedUses == counts.mappedUses + 1, "(ww) the recheck did not check the mapped range");
+    } else {
+        std::cout << "the test block lies past the written-page records' reach: S7c completion not tested\n";
+    }
+    leased.reset();
+    // (f) APS5_RESIDENT_WRITES_WRITABLE=0: the writable entry stays whole, mapped to the import.
+    ResidentWritesWritableForTests(0);
+    {
+        auto whole = leasedBuild();
+        const auto ranges = whole->AddressRanges();
+        const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin <= rBegin && rBegin < range.end; });
+        Require(found != ranges.end() && found->end >= rEnd && found->permissions == readWrite, "(ww) with the knob off the writable entry over the range is not whole");
+        Require(found->deviceAddress + (rBegin - found->begin) == importAt, "(ww) with the knob off the range does not map to its import");
+        Require(!whole->MapsResidentLand(key) && whole->ResidentWritesMappedWritable().empty(), "(ww) with the knob off the build maps the range's land");
+        counts = ResidentWriteCounts();
+        whole->NoteAddressStores();
+        marks(*whole);
+        Require(ResidentWriteCounts().mappedWriters == counts.mappedWriters, "(ww) with the knob off a storing use queued a land");
+    }
+    writes.Submit();
+    writes.Sync();
+    second.reset();
+    writes.Sync();
+}
+
+// S11 (APS5_RESIDENT_WRITES_DEMOTE, GuestBufferMemory.cpp demoteResidentWritesByPolicy and
+// TrimResidentWrites): on by default with the ranges (S12; APS5_NO_RESIDENT_WRITES_DEMOTE=1 or
+// APS5_RESIDENT_WRITES_DEMOTE=0 turns it alone off); a range with fewer than APS5_RESIDENT_WRITES_USES uses
+// bound to its device copy in a whole 10 s window is demoted at the window's roll, its queued land
+// recorded first; a demoted range waits its cool-down before it is promoted again; the
+// "resident-writes" reclaimer demotes the colder of two ranges and reports its bytes; a range
+// demoted twice for CPU changes (refreshed at most uses) is barred.
+void residentWriteDemoteTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t unit = 65536;
+    // Over the written-shadow window (16 MiB by default): in place for being too large.
+    constexpr std::size_t span = (std::size_t{16} << 20u) + unit;
+    // Range A, a 64 KiB gap, range B, a gap, and a page a read-only build reads (a policy point).
+    constexpr std::size_t at = unit;
+    constexpr std::size_t second = at + span + unit;
+    constexpr std::size_t poll = second + span + unit;
+    constexpr std::size_t bytes = poll + unit;
+    // The defaults: demotion on with the ranges; APS5_NO_RESIDENT_WRITES_DEMOTE=1 or
+    // APS5_RESIDENT_WRITES_DEMOTE=0 turns it alone off, APS5_RESIDENT_WRITES_DEMOTE=1 forces it on
+    // over the opt-out. The caller's switches are restored.
+    {
+        const auto saved = [](const char* name) {
+            const char* value = std::getenv(name);
+            return std::string(value != nullptr ? value : "");
+        };
+        const std::string demoteSwitch = saved("APS5_RESIDENT_WRITES_DEMOTE"), noDemoteSwitch = saved("APS5_NO_RESIDENT_WRITES_DEMOTE");
+        const auto made = [&](const char* on, const char* off) {
+            setSwitch("APS5_RESIDENT_WRITES_DEMOTE", on);
+            setSwitch("APS5_NO_RESIDENT_WRITES_DEMOTE", off);
+            Recorder made(context);
+            return std::pair{made.ResidentWrites().enabled, made.ResidentWrites().demote};
+        };
+        Require(made("", "") == std::pair{true, true}, "(d) APS5_RESIDENT_WRITES_DEMOTE is not on by default");
+        Require(made("", "1") == std::pair{true, false}, "(d) APS5_NO_RESIDENT_WRITES_DEMOTE=1 did not turn demotion alone off");
+        Require(made("0", "") == std::pair{true, false}, "(d) APS5_RESIDENT_WRITES_DEMOTE=0 did not turn demotion alone off");
+        Require(made("1", "1") == std::pair{true, true}, "(d) APS5_RESIDENT_WRITES_DEMOTE=1 did not force demotion on");
+        Require(made("", "0") == std::pair{true, true}, "(d) APS5_NO_RESIDENT_WRITES_DEMOTE=0 turned demotion off");
+        setSwitch("APS5_RESIDENT_WRITES_DEMOTE", demoteSwitch.c_str());
+        setSwitch("APS5_NO_RESIDENT_WRITES_DEMOTE", noDemoteSwitch.c_str());
+    }
+    if (context.hostImportAlignment == 0 || !context.bufferDeviceAddress || DeviceStagingWanted(span, false)) {
+        std::cout << "host imports, device addresses or an element too large to stage unavailable: resident write demotion not tested\n";
+        return;
+    }
+    void* block = AllocateWatched(bytes, unit);
+    if (block == nullptr) {
+        std::cout << "no write watching: resident write demotion not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* guest = static_cast<volatile unsigned char*>(block);
+    const auto pattern = [](std::size_t offset) { return static_cast<unsigned char>(offset * 13 + 5); };
+    for (std::size_t offset = 0; offset < bytes; ++offset) guest[offset] = pattern(offset);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            ClearResidentWrites();
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+            recorder.Activate();
+        }
+    } unregister{context, recorder, block, address};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || import->unwatched || !AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "host import of the resident write block refused or unwatched: resident write demotion not tested\n";
+        return;
+    }
+    setSwitch("APS5_RESIDENT_WRITES", "1");
+    setSwitch("APS5_RESIDENT_WRITES_USES", "2");
+    setSwitch("APS5_RESIDENT_WRITES_DEMOTE", "1");
+    Recorder writes(context);
+    setSwitch("APS5_RESIDENT_WRITES", "");
+    setSwitch("APS5_RESIDENT_WRITES_USES", "");
+    setSwitch("APS5_RESIDENT_WRITES_DEMOTE", "");
+    if (!writes.KeepsResidentWrites()) {
+        std::cout << "no narrow copy-backs: resident write demotion not tested\n";
+        return;
+    }
+    Require(writes.ResidentWrites().demote && writes.ResidentWrites().retrySeconds == 30, "(d) APS5_RESIDENT_WRITES_DEMOTE=1 did not turn demotion on");
+    writes.Activate();
+    // A dispatch build writing the range at `offset`.
+    const auto build = [&](std::size_t offset) {
+        auto memory = std::make_unique<GuestBufferMemory>(context);
+        memory->AllowDeviceStaging();
+        memory->AddWritable(address + offset, span);
+        memory->UploadPrepare(false);
+        memory->UploadFinish(false);
+        return memory;
+    };
+    // A dispatch build reading one page past both ranges: a policy point, and nothing else.
+    const auto pollPolicy = [&]() {
+        auto memory = std::make_unique<GuestBufferMemory>(context);
+        memory->AllowDeviceStaging();
+        memory->AddReadable(address + poll, 4096);
+        memory->UploadPrepare(false);
+        memory->UploadFinish(false);
+    };
+    // After a recorded use: ShaderResources::MarkGpuWrites' copy-backs, notes and marks.
+    const auto marks = [&](GuestBufferMemory& memory) {
+        memory.RecordCopyBacks(writes);
+        writes.ReleaseClaims();
+        writes.NotePendingWrites(memory.Writes(), Recorder::WriteKind::ShaderWrite);
+        memory.MarkDirectWrites();
+    };
+    std::vector<std::unique_ptr<GuestBufferMemory>> held;
+    const auto settle = [&]() {
+        writes.Submit();
+        writes.Sync();
+        held.clear();
+    };
+    // A use of the range at `offset`: a shader's store of 16 bytes of `value` at `into`, its land
+    // queued; the build is held until settled.
+    const auto use = [&](std::size_t offset, std::size_t into, std::uint32_t value) {
+        auto memory = build(offset);
+        std::uint32_t adjustment = 0;
+        const auto info = memory->Descriptor(address + offset, span, adjustment);
+        const auto commands = writes.CommandsKeepingCopyBacks();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, info.buffer, info.offset + adjustment + into, 16, value);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        marks(*memory);
+        held.push_back(std::move(memory));
+    };
+    // Two uses writing nothing: the first in place, the second promotes (unless refused) and binds D.
+    const auto promote = [&](std::size_t offset) {
+        for (int round = 0; round < 2; ++round) {
+            auto memory = build(offset);
+            marks(*memory);
+            held.push_back(std::move(memory));
+            settle();
+        }
+    };
+    auto counts = ResidentWriteCounts();
+    const auto expect = [&](std::uint64_t ResidentWriteStatistics::*field, std::uint64_t delta, const char* what) {
+        const auto now = ResidentWriteCounts();
+        if (now.*field - counts.*field != delta) throw std::runtime_error(std::string("(d) ") + what + ": counted " + std::to_string(now.*field - counts.*field) + ", expected " + std::to_string(delta));
+    };
+    const auto demoteLands = [] { return Recorder::ResidentLandCounts()[7]; };
+    // Cold: a use queues A's land; the window rolls once with A promoted inside it (not cold), then
+    // again with no use bound to D: A is demoted at that roll, its land recorded first, and the
+    // import holds exactly the bytes D changed.
+    promote(at);
+    expect(&ResidentWriteStatistics::promoted, 1, "ranges promoted");
+    use(at, 0, 0x5A5A5A5Au);
+    Require(writes.DeferredCopyBytes() == span && guest[at] == pattern(at), "(d) the use did not queue the range's land");
+    ResidentWritesAdvanceClockForTests(10001);
+    pollPolicy();
+    expect(&ResidentWriteStatistics::demoted, 0, "ranges demoted in the window that promoted them");
+    Require(writes.DeferredCopyBytes() == span, "(d) the policy point recorded the land of a live range");
+    auto landed = demoteLands();
+    ResidentWritesAdvanceClockForTests(10001);
+    pollPolicy();
+    expect(&ResidentWriteStatistics::demotedCold, 1, "cold demotions");
+    expect(&ResidentWriteStatistics::demoted, 1, "ranges demoted");
+    Require(demoteLands() - landed == 1 && !writes.HasDeferredCopies() && ResidentWriteCounts().live == 0, "(d) the cold range was not landed before it was dropped");
+    settle();
+    Require(guest[at] == 0x5A && guest[at + 15] == 0x5A && guest[at - 1] == pattern(at - 1) && guest[at + 16] == pattern(at + 16) && guest[at + span - 1] == pattern(at + span - 1), "(d) the demotion's land did not store the device copy's changed bytes alone");
+    // The cool-down (APS5_RESIDENT_WRITES_RETRY_S, 30 s): A's next promotion is refused (a retry
+    // wait), and allowed once the cool-down ran out.
+    counts = ResidentWriteCounts();
+    promote(at);
+    expect(&ResidentWriteStatistics::promoted, 0, "ranges promoted during their cool-down");
+    expect(&ResidentWriteStatistics::retryWaits, 1, "promotions refused for the cool-down");
+    Require(ResidentWriteCounts().live == 0, "(d) a range lives during its cool-down");
+    ResidentWritesAdvanceClockForTests(30001);
+    promote(at);
+    expect(&ResidentWriteStatistics::promoted, 1, "ranges promoted after their cool-down");
+    // The "resident-writes" reclaimer: of A (three uses bound to D) and B (two) it demotes B, the
+    // colder, lands it first and reports its bytes; A stays bound to its device copy.
+    promote(second);
+    expect(&ResidentWriteStatistics::promoted, 2, "ranges promoted (A and B)");
+    use(at, 32, 0x6B6B6B6Bu);
+    settle();
+    use(at, 48, 0x6C6C6C6Cu);
+    settle();
+    use(second, 64, 0x7C7C7C7Cu);
+    counts = ResidentWriteCounts();
+    landed = demoteLands();
+    std::uint64_t evicted = 0;
+    const auto freed = TrimResidentWrites(1, evicted);
+    const auto after = ResidentWriteCounts();
+    expect(&ResidentWriteStatistics::demotedVram, 1, "VRAM demotions");
+    Require(evicted == 1 && freed != 0 && freed == counts.liveBytes - after.liveBytes && after.live == 1, "(d) the reclaimer did not demote one range and report its bytes");
+    Require(demoteLands() - landed == 1, "(d) the reclaimer did not land the range it demoted");
+    settle();
+    Require(guest[second + 64] == 0x7C && guest[second + 80] == pattern(second + 80) && guest[at + 32] == 0x6B, "(d) the reclaimer's land lost bytes");
+    {
+        auto bound = build(at);
+        Require(!bound->ServedInPlace(address + at), "(d) the reclaimer demoted the range with more uses");
+    }
+    // CPU changes: a CPU store before each use refreshes D at most uses; at the roll A is demoted
+    // (cpu), and after its second such demotion it is barred: never promoted again.
+    ResidentWritesAdvanceClockForTests(10001);
+    pollPolicy();
+    Require(ResidentWriteCounts().live == 1, "(d) a range used and unchanged was demoted at the roll");
+    const auto cpuUses = [&](std::size_t into) {
+        for (std::size_t round = 0; round < 2; ++round) {
+            guest[at + into + round * 256] = 0x11;
+            use(at, into + round * 256 + 64, 0x22222222u);
+            settle();
+        }
+    };
+    counts = ResidentWriteCounts();
+    cpuUses(65536);
+    expect(&ResidentWriteStatistics::refreshStamp, 2, "refreshes after CPU stores");
+    ResidentWritesAdvanceClockForTests(10001);
+    pollPolicy();
+    expect(&ResidentWriteStatistics::demotedCpu, 1, "cpu demotions");
+    expect(&ResidentWriteStatistics::blacklisted, 0, "ranges barred after one cpu demotion");
+    ResidentWritesAdvanceClockForTests(30001);
+    promote(at);
+    expect(&ResidentWriteStatistics::promoted, 1, "ranges promoted after a cpu demotion's cool-down");
+    cpuUses(131072);
+    ResidentWritesAdvanceClockForTests(10001);
+    pollPolicy();
+    expect(&ResidentWriteStatistics::demotedCpu, 2, "cpu demotions");
+    expect(&ResidentWriteStatistics::blacklisted, 1, "ranges barred after two cpu demotions");
+    ResidentWritesAdvanceClockForTests(30001);
+    counts = ResidentWriteCounts();
+    promote(at);
+    expect(&ResidentWriteStatistics::promoted, 0, "barred ranges promoted");
+    expect(&ResidentWriteStatistics::retryWaits, 1, "promotions refused for a bar");
+    settle();
 }
 
 // SpirvMayStoreThroughBda: a store or atomic through a physical storage buffer pointer counts,
@@ -6477,6 +7218,7 @@ int main() {
         ignoredWordBitsTests();
         deferredRunsTests();
         bufferBaseWordsTests();
+        barrierMergeTests();
         resultCopyCostTests();
         dataRefreshTests(device, recorder);
         minLodTests(device, recorder);
@@ -6486,6 +7228,7 @@ int main() {
         keyGuardTests(device, recorder);
         coalesceCopyBackTests(device, recorder);
         narrowCopyBackTests(device, recorder);
+        awareCommandTests(device, recorder);
         pageGuardTests();
         sharedViewGuardTests();
         sharedViewFineTrackingTests();
@@ -6494,6 +7237,8 @@ int main() {
         residentReadTests(device, recorder);
         residentWriteTests(device, recorder);
         residentWriteSpaceTests(device, recorder);
+        residentWriteWritableTests(device, recorder);
+        residentWriteDemoteTests(device, recorder);
         bdaStoreScanTests();
         fastRingReclaimTests(device, recorder);
         templateRefreshRingTests(device, recorder);

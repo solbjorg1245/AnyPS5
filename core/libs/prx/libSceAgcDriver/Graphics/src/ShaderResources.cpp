@@ -1397,6 +1397,9 @@ void ShaderResources::buildComplete() {
         timing.bindingsMs += phase(BuildPhase::Images);
         guestMemory.UploadFinish(usesBda);
         timing.uploadMs += phase(BuildPhase::Upload);
+        // Resident written ranges its table maps to their device copy writable (S7c): a storing
+        // program's uses write them there and queue their lands.
+        if (usesBda && bdaStores) guestMemory.NoteAddressStores();
         if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
         phase(BuildPhase::Bda);

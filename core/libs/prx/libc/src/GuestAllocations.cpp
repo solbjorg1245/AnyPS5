@@ -43,6 +43,7 @@ Registry& registry() {
 
 std::atomic<std::uint64_t> generation{1};
 std::atomic<void (*)(std::uintptr_t, std::size_t)> invalidator{nullptr};
+std::atomic<void (*)(std::uintptr_t, std::size_t)> releaseListener{nullptr};
 std::atomic<bool (*)()> pinWaiter{nullptr};
 
 std::chrono::milliseconds pinWait() {
@@ -63,10 +64,19 @@ void require(bool condition, const char* reason) {
 struct MutationState {
     std::unique_lock<std::mutex> lock;
     std::vector<std::pair<std::uintptr_t, std::size_t>> changed;
+    // For the release listener: the unmapped ranges, and the removed allocations less what the same
+    // mutation registers again (a shrinking re-registration keeps its bytes). A protection change
+    // or a new registration releases nothing (what the range held before was released then).
+    std::vector<std::pair<std::uintptr_t, std::size_t>> released;
+    std::vector<std::pair<std::uintptr_t, std::size_t>> removed;
+    std::vector<std::pair<std::uintptr_t, std::size_t>> added;
 };
 
-void recordChange(void* mutation, const void* pointer, std::size_t bytes) {
-    if (mutation != nullptr && bytes != 0) static_cast<MutationState*>(mutation)->changed.emplace_back(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+void recordChange(void* mutation, const void* pointer, std::size_t bytes, std::vector<std::pair<std::uintptr_t, std::size_t>> MutationState::*list = nullptr) {
+    if (mutation == nullptr || bytes == 0) return;
+    auto* state = static_cast<MutationState*>(mutation);
+    state->changed.emplace_back(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+    if (list != nullptr) (state->*list).emplace_back(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
 #ifndef _WIN32
@@ -113,6 +123,26 @@ void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     if (const auto callback = invalidator.load(std::memory_order_acquire)) {
         for (const auto& [address, bytes] : state->changed) callback(address, bytes);
     }
+    if (const auto listener = releaseListener.load(std::memory_order_acquire)) {
+        for (const auto& [address, bytes] : state->released) listener(address, bytes);
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> pieces, next;
+        for (const auto& [address, bytes] : state->removed) {
+            pieces.assign(1, {address, address + bytes});
+            for (const auto& [from, size] : state->added) {
+                next.clear();
+                for (const auto& [low, high] : pieces) {
+                    if (from + size <= low || from >= high) {
+                        next.emplace_back(low, high);
+                        continue;
+                    }
+                    if (low < from) next.emplace_back(low, from);
+                    if (from + size < high) next.emplace_back(from + size, high);
+                }
+                pieces.swap(next);
+            }
+            for (const auto& [low, high] : pieces) listener(low, static_cast<std::size_t>(high - low));
+        }
+    }
     delete state;
 }
 
@@ -127,6 +157,14 @@ void GuestAllocationsSetInvalidator_nid_postfix(void (*callback)(std::uintptr_t,
 void GuestAllocationsInvalidate_nid_postfix(std::uintptr_t address, std::size_t bytes) {
     generation.fetch_add(1, std::memory_order_release);
     if (const auto callback = invalidator.load(std::memory_order_acquire)) callback(address, bytes);
+}
+
+void GuestAllocationsSetReleaseListener_nid_postfix(void (*callback)(std::uintptr_t, std::size_t)) {
+    releaseListener.store(callback, std::memory_order_release);
+}
+
+void GuestAllocationsReleased_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    if (const auto listener = releaseListener.load(std::memory_order_acquire)) listener(address, bytes);
 }
 
 void GuestAllocationsSetPinWaiter_nid_postfix(bool (*callback)()) {
@@ -217,7 +255,7 @@ void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
 #endif
 
 void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t bytes, bool readable, bool writable) {
-    recordChange(mutation, pointer, bytes);
+    recordChange(mutation, pointer, bytes, &MutationState::added);
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     require(address != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address, "invalid guest allocation range");
     require(!writable || readable, "writable guest allocation must be readable");
@@ -332,7 +370,7 @@ Range GuestAllocationsFind_nid_postfix(void*, const void* pointer) {
 void GuestAllocationsRemove_nid_postfix(void* mutation, const void* pointer) {
     const auto range = GuestAllocationsFind_nid_postfix(mutation, pointer);
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, range.bytes);
-    recordChange(mutation, pointer, range.bytes);
+    recordChange(mutation, pointer, range.bytes, &MutationState::removed);
     auto& ranges = registry().ranges;
     const auto exact = ranges.find(range.address);
     if (exact != ranges.end() && exact->second->allocationBytes == exact->second->bytes) {
@@ -382,7 +420,7 @@ void GuestAllocationsProtect_nid_postfix(void* mutation, const void* pointer, st
 
 void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, const std::function<void(const void*, std::size_t, const void*, bool)>& apply) {
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, bytes);
-    recordChange(mutation, pointer, bytes);
+    recordChange(mutation, pointer, bytes, &MutationState::released);
     const auto end = reinterpret_cast<std::uintptr_t>(pointer) + bytes;
     auto cursor = reinterpret_cast<std::uintptr_t>(pointer);
     bool any = false;
