@@ -10,6 +10,7 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/WideConversion.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Multibyte.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/StringExtensions.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/UiOverlay.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Math.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Time.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/FileAndHeap.cpp
@@ -250,6 +251,20 @@ if(BUILD_TESTING)
     add_test(NAME port_settings COMMAND port_settings_tests)
     if(WIN32)
         set_tests_properties(port_settings PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(ui_overlay_tests EXCLUDE_FROM_ALL ${LIBS_INCLUDE_DIR}/tests/UiOverlay.cpp)
+target_include_directories(ui_overlay_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(ui_overlay_tests PRIVATE libc libkernel)
+set_target_properties(ui_overlay_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(ui_overlay_tests)
+if(BUILD_TESTING)
+    set_target_properties(ui_overlay_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME ui_overlay COMMAND ui_overlay_tests)
+    if(WIN32)
+        set_tests_properties(ui_overlay PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

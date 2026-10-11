@@ -140,6 +140,10 @@ extern "C" const PortSettings::Settings& GetPortSettings_nid_no_patch() {
     return settings;
 }
 
+std::vector<std::filesystem::path> PortOverrideDirectories() {
+    return PortSettings::OverrideDirectories(ExecutableDirectory(), UserSettingsDirectory());
+}
+
 void InstallPortSettingsOverlay(const std::function<std::filesystem::path(const char*)>& resolve) {
     const auto args = PortSettings::GameArgs(GetPortSettings_nid_no_patch());
     if (args.empty()) return;
