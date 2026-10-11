@@ -80,6 +80,12 @@ and edit it. The game's own performance and cinematic modes are replaced by thes
 
 The log shows the result in its `[settings]` lines.
 
+A `Resolution` up to 1080p (or `RenderResolution` 900 or 1080) renders its tier's size (1600x900 at
+1280x720 or 1280x800, 1920x1080 at 1920x1080) inside the game's WantsHigh tier, so the HUD and menus are
+laid out on its 2160p display buffer and scaled down to the window: the game's 1080p tiers draw the HUD's
+item diamonds and the equipment menu's slot frames too large. `APS5_NO_RESOLUTION_4K_UI=1` brings back
+the 1080p tier.
+
 `NativeAspect = on` widens the camera and presents the 16:9 render targets at the window's shape.
 The HUD, menus and movies stay 16:9 in a centred region; beside them the 3D shows (black bars beside
 a movie). `APS5_NO_NATIVE_ASPECT_UI_RECT=1` stretches the UI across the window with the 3D instead,

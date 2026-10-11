@@ -277,7 +277,7 @@ NativeAspectPatch& NativeAspectPatch::Get() {
 }
 
 NativeAspectPatch::NativeAspectPatch() {
-    plan = PortSettings::PlanNativeAspect(GetPortSettings_nid_no_patch());
+    plan = PortSettings::PlanTierRewrite(GetPortSettings_nid_no_patch());
     if (plan.Active()) wideBits = PortSettings::AspectBits(plan.Aspect());
 }
 
@@ -332,9 +332,9 @@ void NativeAspectPatch::locate() {
     }
     table = entries;
     singleton = reinterpret_cast<unsigned char*>(slot);
-    std::fprintf(stderr, "[aspect] render %ux%u in the %s slot (tier table at %p, display half %s), aspect %.4f (%ux%u), display pointer slot %p\n",
+    std::fprintf(stderr, "[aspect] render %ux%u in the %s slot (tier table at %p, display half %s), aspect %.4f (%ux%u), display pointer slot %p%s\n",
         plan.renderWidth, plan.renderHeight, plan.slot->convar, static_cast<void*>(table), displayHalf ? "as expected" : "differs (not written)", plan.Aspect(),
-        plan.aspectWidth, plan.aspectHeight, static_cast<void*>(singleton));
+        plan.aspectWidth, plan.aspectHeight, static_cast<void*>(singleton), plan.uiOnly ? " (Resolution's 4K UI: aspect field and presentation left alone)" : "");
     std::fflush(stderr);
 }
 
@@ -394,7 +394,7 @@ void NativeAspectPatch::patchTargets(std::intptr_t delta, bool& display) {
 }
 
 void NativeAspectPatch::follow() {
-    if (singleton == nullptr || fieldRefused) return;
+    if (plan.uiOnly || singleton == nullptr || fieldRefused) return;
     const auto object = static_cast<std::uintptr_t>(std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(singleton)).load(std::memory_order_acquire));
     if (object == 0 || !objectWritable(object)) return;
     auto& aspectField = *reinterpret_cast<std::uint32_t*>(object + PortSettings::DisplayAspectOffset);
@@ -429,7 +429,9 @@ std::string NativeAspectPatch::Digest() {
     std::lock_guard lock(mutex);
     char text[256];
     if (table == nullptr) {
-        std::snprintf(text, sizeof(text), ", native aspect not applied (%s)", searched ? "see the [aspect] line" : "video out not opened");
+        std::snprintf(text, sizeof(text), ", %s not applied (%s)", plan.uiOnly ? "4K UI" : "native aspect", searched ? "see the [aspect] line" : "video out not opened");
+    } else if (plan.uiOnly) {
+        std::snprintf(text, sizeof(text), ", 4K UI: %ux%u in %s, display buffer %ux%u", plan.renderWidth, plan.renderHeight, plan.slot->convar, plan.slot->displayWidth, plan.slot->displayHeight);
     } else {
         std::snprintf(text, sizeof(text), ", native aspect %.4f (%ux%u in %s): display mode %d, %llu/%llu flips native, %llu field writes%s; shared targets %s, display buffer %s", plan.Aspect(),
             plan.renderWidth, plan.renderHeight, plan.slot->convar, mode, static_cast<unsigned long long>(windowWideFlips), static_cast<unsigned long long>(windowFlips),

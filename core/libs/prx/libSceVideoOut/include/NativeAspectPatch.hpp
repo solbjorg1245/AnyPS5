@@ -24,6 +24,9 @@
 // modes, so its two loads are pointed at a pair of sizes in a page allocated within reach; Init's
 // display buffer sizes and the display-size getters are immediates rewritten in place. Every byte is
 // checked against the build first; a half whose bytes differ writes nothing and stays 16:9 (part 1).
+// Plain Resolution up to 1080p (PortSettings::PlanResolution4kUi, r6) uses the same table rewrite to run
+// its tier's render size in the WantsHigh slot (3840x2160 display buffer); the aspect field and the
+// presentation are left alone there.
 // APS5_PROFILE_DRAW=1 appends the state to the 10 s [timestep] line.
 class NativeAspectPatch {
 public:
