@@ -49,16 +49,17 @@ inline std::filesystem::path::string_type Key(const std::filesystem::path& path)
 
 }
 
+// Exported from libc with C linkage (other modules import only unmangled _nid_no_patch names).
 // Registers `bytes` to replace the bytes at `offset` of hostPath in every later read of it.
-void AddReadPatch_nid_no_patch(const std::filesystem::path& hostPath, std::uint64_t offset, std::string bytes);
+extern "C" void AddReadPatch_nid_no_patch(const std::filesystem::path& hostPath, std::uint64_t offset, std::string bytes);
 // The ranges registered for hostPath, or null; readers keep the pointer per open file.
-std::shared_ptr<const ReadPatch::Ranges> ReadPatchesFor_nid_no_patch(const std::filesystem::path& hostPath);
+extern "C" std::shared_ptr<const ReadPatch::Ranges> ReadPatchesFor_nid_no_patch(const std::filesystem::path& hostPath);
 // Descriptors: sceKernelOpen records every file it opens (a reused number starts clean), close forgets it,
 // and the descriptor readers ask for the file's ranges.
-void TrackReadPatchDescriptor_nid_no_patch(int fd, const std::filesystem::path& hostPath);
-void ForgetReadPatchDescriptor_nid_no_patch(int fd);
-std::shared_ptr<const ReadPatch::Ranges> ReadPatchesForDescriptor_nid_no_patch(int fd);
+extern "C" void TrackReadPatchDescriptor_nid_no_patch(int fd, const std::filesystem::path& hostPath);
+extern "C" void ForgetReadPatchDescriptor_nid_no_patch(int fd);
+extern "C" std::shared_ptr<const ReadPatch::Ranges> ReadPatchesForDescriptor_nid_no_patch(int fd);
 // ReadPatch::Apply on a finished read; the first read it changes is named on stderr.
-void ApplyReadPatches_nid_no_patch(const ReadPatch::Ranges& ranges, const char* api, std::uint64_t offset, void* destination, std::uint64_t size);
+extern "C" void ApplyReadPatches_nid_no_patch(const ReadPatch::Ranges& ranges, const char* api, std::uint64_t offset, void* destination, std::uint64_t size);
 
 #endif
