@@ -268,6 +268,11 @@ struct ResidentWriteStatistics {
     // Address spaces built mapping a range to its device copy, and address-based uses reading it
     // there (each checked as a use bound to D).
     std::uint64_t spacesMapped = 0, mappedUses = 0;
+    // S7c (APS5_RESIDENT_WRITES_WRITABLE, default on): spaces mapping a range to its device copy
+    // with the Write permission, address-based uses that may store through BDA and so queue its
+    // land (they write D), and the pages such uses stored to inside it, stamped at their
+    // completion and taken as D's own (not a change of the import D lacks).
+    std::uint64_t spacesWritable = 0, mappedWriters = 0, mappedPages = 0;
     // APS5_RESIDENT_WRITES_DEMOTE (S11): ranges demoted by reason (cold: fewer uses bound to D in a
     // whole 10 s window than promote one; cpu: refreshed for a change of the import at more than
     // half its uses; both: both sides wrote it; vram: the "resident-writes" reclaimer; retired: its
@@ -281,9 +286,10 @@ bool ResidentWritesLive();
 // Under GuestMemory::GpuMutex: a GPU write the recorder noted over [begin, end) (Recorder::
 // noteWrite: the ranges over it refresh D before their next use, unless the note is that use's
 // own), and an address-based use that may store through its BDA table to `ranges` (sorted and
-// merged; the ranges overlapping them refresh; null: every range).
+// merged; the ranges overlapping them refresh; null: every range), except the ranges `inDevice`
+// its table maps to their device copy (it stores those into D, which its land carries).
 void NoteResidentWritesWrite(std::uint64_t begin, std::uint64_t end);
-void NoteResidentWritesAddressWriter(const std::vector<std::pair<std::uint64_t, std::uint64_t>>* ranges);
+void NoteResidentWritesAddressWriter(const std::vector<std::pair<std::uint64_t, std::uint64_t>>* ranges, const std::vector<std::shared_ptr<ResidentWrite>>* inDevice = nullptr);
 // Any thread: whether a live range overlaps [begin, end) (the fast dispatch declines the element).
 bool ResidentWritesOverlap(std::uint64_t begin, std::uint64_t end);
 // The device teardown and tests: drops every range (their lands were recorded already).
@@ -295,6 +301,15 @@ void ClearResidentWrites();
 VkDeviceSize TrimResidentWrites(VkDeviceSize want, std::uint64_t& evicted);
 // Tests: moves the clock of S11's demotion windows and cool-downs forward by `ms`.
 void ResidentWritesAdvanceClockForTests(std::int64_t ms);
+// Tests: APS5_RESIDENT_WRITES_WRITABLE as if set to `writable` (-1: the environment's); the
+// registry epoch moves, so the cached address space is built again.
+void ResidentWritesWritableForTests(int writable);
+// Under GuestMemory::GpuMutex, at the completion of an address-based use whose table maps `mapped`
+// to their device copy with the Write permission (BdaResources::CheckFault): stamps the 4 KiB pages
+// it stored to (their guest addresses) and takes those inside a range as D's own (W4): the use
+// queued the range's land, which its batch recorded, so the import holds them by now. The range's
+// sync moves past them unless it changed since (a CPU store meanwhile owes a refresh, as both).
+void MarkResidentMappedPages(const std::vector<std::shared_ptr<ResidentWrite>>& mapped, std::span<const std::uint64_t> pages);
 
 // The import table's identity (the fast Revalidate): serials proved under one identity stand
 // while the table still has it, i.e. the same device, the same epoch (bumped by every retire)
@@ -443,6 +458,13 @@ public:
     // The same use for the resident written ranges (APS5_RESIDENT_WRITES): the live ranges that
     // list overlaps refresh D before their next use (NoteResidentWritesAddressWriter).
     void NoteResidentWritesWriter() const;
+    // The program may store through its BDA table (ShaderResources, after UploadFinish): each use
+    // writes the ranges the table maps to their device copy with the Write permission and queues
+    // their lands (RecordCopyBacks).
+    void NoteAddressStores();
+    // Those ranges, for the build's BdaResources (MarkResidentMappedPages at its completion): none
+    // when the table maps none (unsplit, no space, APS5_RESIDENT_WRITES_WRITABLE=0).
+    std::vector<std::shared_ptr<ResidentWrite>> ResidentWritesMappedWritable() const;
     // Whether the region owning `address` is bound from a resident read-only copy.
     bool ServedResident(std::uint64_t address) const;
     // Whether a region binds the device copy of the resident written range `key` (VulkanDevice::
@@ -740,6 +762,9 @@ private:
     // through the import (a draw build, a descriptor inside or a span over one): it binds the
     // space's import table (AddressSpace::importRanges) and notes those ranges as read in place.
     bool residentUnsplit = false;
+    // NoteAddressStores: the table maps resident written ranges writable and the program may store
+    // through it (each use queues their lands).
+    bool residentMappedStores = false;
     // The resident write registry's epoch at AcquireRegistered (0: none configured, or APS5_RESIDENT_
     // WRITES_SPACE=0): its descriptors were checked against the ranges live then.
     std::uint64_t residentSpaceEpochAt = 0;

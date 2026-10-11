@@ -3657,9 +3657,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         using FlushReason = Graphics::Recorder::FlushReason;
         if (resources.HoldsLease() && resources.MapsResidentLands()) {
             // A resident written range's land (APS5_RESIDENT_WRITES) stays queued past an
-            // address-based use whose table maps the range only to its device copy (read-only) or
-            // not at all, with no descriptor or region of its own over it, unless the range holds
-            // its indirect arguments.
+            // address-based use whose table maps the range only to its device copy (read-only, or
+            // writable: a storing use queues its own land after it, S7c) or not at all, with no
+            // descriptor or region of its own over it, unless the range holds its indirect arguments.
             recorder.FlushDeferredWhere([&](const Graphics::Recorder::DeferredCopy& copy, bool) {
                 return !(copy.land && resources.MapsResidentLand(copy.sourceKey) && !(argumentImport != nullptr && copy.address < arguments + 12 && arguments < copy.address + copy.bytes));
             }, FlushReason::DispatchLease);
