@@ -110,7 +110,7 @@ void storeClearTexels(const Context& context, const ColorTarget& color, const st
     if (!IsDccClear(keys)) return;
     // The key store below replaces the clear code just read: a CPU store into the keys after this
     // collect is the title's (the guard's generation; KeyStoreGuard).
-    const auto keysSeen = CollectKeys(color.dccAddress, color.bytes);
+    const auto keysSeen = CollectKeys(color.dccAddress, color.bytes, KeyCollectSite::FastClear);
     const auto current = keys == DccKeys::ClearRegister ? texel : clearTexel(color, keys);
     const auto elementBytes = static_cast<std::size_t>(color.elementBytes);
     std::vector<std::byte> texels(color.bytes);
@@ -122,7 +122,7 @@ void storeClearTexels(const Context& context, const ColorTarget& color, const st
 void materializeRegisterClear(const Context& context, const ColorTarget& color, StorageTexture& resident) {
     if (color.dccAddress == 0 || resident.Descriptor().dccAddress != color.dccAddress) return;
     if (CurrentDccKeys(color.dccAddress, color.bytes) != DccKeys::ClearRegister) return;
-    const auto keysSeen = CollectKeys(color.dccAddress, color.bytes);
+    const auto keysSeen = CollectKeys(color.dccAddress, color.bytes, KeyCollectSite::RegisterClear);
     const auto texel = clearTexel(color, DccKeys::ClearRegister);
     const char* refusal = nullptr;
     if (clearToTexel(resident, texel, color.elementBytes, refusal)) {
@@ -1989,7 +1989,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         }
         // A fast-cleared DCC target holds its clear value wherever the draw does not write.
         if (color.dccAddress != 0) {
-            binding.keysSeen = CollectKeys(color.dccAddress, ColorTargetLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes).Bytes());
+            binding.keysSeen = CollectKeys(color.dccAddress, ColorTargetLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes).Bytes(), KeyCollectSite::SyncDraw);
             const auto keys = CurrentDccKeys(color.dccAddress, colorLayout.Bytes());
             if (IsDccClear(keys)) {
                 const auto pixels = binding.gpuTiling ? binding.tiled->Bytes() : binding.transfer->Bytes();
@@ -2743,7 +2743,7 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
         auto keys = CurrentDccKeys(color.dccAddress, color.bytes);
         if (keys == DccKeys::Uncompressed) continue;
         Require(IsDccClear(keys), std::string("CB metadata pass over DCC keys that are ") + DccKeysName(keys) + " (per-block metadata is not modeled)");
-        const auto keysSeen = CollectKeys(color.dccAddress, color.bytes);
+        const auto keysSeen = CollectKeys(color.dccAddress, color.bytes, KeyCollectSite::MetadataPass);
         const auto texel = clearTexel(color, keys);
         std::shared_ptr<StorageTexture> resident;
         if (color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr) {

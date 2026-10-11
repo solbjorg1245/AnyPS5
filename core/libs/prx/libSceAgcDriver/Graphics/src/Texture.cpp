@@ -1810,7 +1810,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     };
     uploadedKeys = ProvedClearKeys(descriptor, guestBytes, keyProof);
     // The scan's collect stamped the CPU's key stores up to here: the keys the image starts from.
-    if (descriptor.dccAddress != 0) keysSeen = GuestMemory::TrackerGeneration();
+    if (descriptor.dccAddress != 0) keysSeen = KeysSeenGeneration();
     filledKeys = DccKeys::Uncompressed;
     VkClearColorValue clearValue{};
     if (IsDccClear(uploadedKeys) && ClearColorFor(storageFormat, uploadedKeys, clearValue)) {
@@ -3874,7 +3874,7 @@ KeyStoreGuard StorageTexture::keyStoreGuard(const char* caller, const std::vecto
 void StorageTexture::storeKeys(const char* caller, const std::vector<bool>& layers) {
     if (IsDccClear(filledKeys)) return;
     const auto outcome = MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, keyStoreGuard(caller, layers));
-    if (outcome.stored && outcome.kept == 0) keysSeen = outcome.collected != 0 ? outcome.collected : GuestMemory::TrackerGeneration();
+    if (outcome.stored && outcome.kept == 0) keysSeen = outcome.collected != 0 ? outcome.collected : KeysSeenGeneration();
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {

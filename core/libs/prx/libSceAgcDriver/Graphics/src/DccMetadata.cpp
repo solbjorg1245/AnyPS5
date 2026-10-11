@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -16,6 +17,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -94,9 +96,58 @@ GuardCounters& Guards() {
 
 std::atomic<int> stampCheckForTests{-1};
 
+// APS5_PROFILE_DRAW: the guard's walks (and generation reads) by KeyCollectSite, cumulative, on the
+// [dcc] line: how often each runs and what it costs (a tracker hold, and for a walk the arena's
+// write watch over the key pages).
+struct GuardWalks {
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(KeyCollectSite::Count)> calls{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(KeyCollectSite::Count)> nanoseconds{};
+};
+
+GuardWalks& Walks() {
+    static GuardWalks walks;
+    return walks;
+}
+
 bool ScanProfileEnabled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return profile;
+}
+
+// Times one guard walk of `site` while profiling (no clock read otherwise).
+class TimedWalk {
+public:
+    explicit TimedWalk(KeyCollectSite site) : site(site), profile(ScanProfileEnabled()) {
+        if (profile) start = std::chrono::steady_clock::now();
+    }
+    ~TimedWalk() {
+        if (!profile) return;
+        auto& walks = Walks();
+        const auto index = static_cast<std::size_t>(site);
+        walks.calls[index].fetch_add(1, std::memory_order_relaxed);
+        walks.nanoseconds[index].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    }
+    TimedWalk(const TimedWalk&) = delete;
+    TimedWalk& operator=(const TimedWalk&) = delete;
+
+private:
+    KeyCollectSite site;
+    bool profile;
+    std::chrono::steady_clock::time_point start{};
+};
+
+// The [dcc] line's guard walks: calls/us per site, cumulative.
+std::string GuardWalkSummary() {
+    static constexpr const char* names[] = {"fast-clear", "register clear", "sync draw", "metadata pass", "store", "keys seen"};
+    static_assert(std::size(names) == static_cast<std::size_t>(KeyCollectSite::Count));
+    auto& walks = Walks();
+    std::string text;
+    char part[96];
+    for (std::size_t site = 0; site < std::size(names); ++site) {
+        std::snprintf(part, sizeof(part), "%s%s %llu/%.0f", site == 0 ? "" : ", ", names[site], static_cast<unsigned long long>(walks.calls[site].load(std::memory_order_relaxed)), walks.nanoseconds[site].load(std::memory_order_relaxed) / 1e3);
+        text += part;
+    }
+    return text;
 }
 
 void ReportScans(std::chrono::steady_clock::time_point now) {
@@ -111,7 +162,7 @@ void ReportScans(std::chrono::steady_clock::time_point now) {
     if (nowMs - last < 10000 || !profile.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto& proofs = Proofs();
     const auto& guards = Guards();
-    std::fprintf(stderr, "[dcc] %llu scans, %.1f MiB scanned, %llu memo hits, %llu flush syncs, %.1f ms; uncompressed keys stored: %llu on the GPU (%llu with an unaligned head or tail), %llu on the CPU; key proofs: %llu proved, %llu scanned, %llu unstable; key stores over CPU-written pages: %llu (%llu bytes), %llu bytes kept as the CPU's, %llu unchecked\n", static_cast<unsigned long long>(profile.scans.load()), profile.bytes.load() / 1048576.0, static_cast<unsigned long long>(profile.memoHits.load()), static_cast<unsigned long long>(profile.flushSyncs.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.gpuStores.load()), static_cast<unsigned long long>(profile.gpuSplitStores.load()), static_cast<unsigned long long>(profile.cpuStores.load()), static_cast<unsigned long long>(proofs.proved.load()), static_cast<unsigned long long>(proofs.scanned.load()), static_cast<unsigned long long>(proofs.unstable.load()), static_cast<unsigned long long>(guards.cpuStores.load()), static_cast<unsigned long long>(guards.cpuBytes.load()), static_cast<unsigned long long>(guards.kept.load()), static_cast<unsigned long long>(guards.unchecked.load()));
+    std::fprintf(stderr, "[dcc] %llu scans, %.1f MiB scanned, %llu memo hits, %llu flush syncs, %.1f ms; uncompressed keys stored: %llu on the GPU (%llu with an unaligned head or tail), %llu on the CPU; key proofs: %llu proved, %llu scanned, %llu unstable; key stores over CPU-written pages: %llu (%llu bytes), %llu bytes kept as the CPU's, %llu unchecked; guard walks (calls/us): %s\n", static_cast<unsigned long long>(profile.scans.load()), profile.bytes.load() / 1048576.0, static_cast<unsigned long long>(profile.memoHits.load()), static_cast<unsigned long long>(profile.flushSyncs.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.gpuStores.load()), static_cast<unsigned long long>(profile.gpuSplitStores.load()), static_cast<unsigned long long>(profile.cpuStores.load()), static_cast<unsigned long long>(proofs.proved.load()), static_cast<unsigned long long>(proofs.scanned.load()), static_cast<unsigned long long>(proofs.unstable.load()), static_cast<unsigned long long>(guards.cpuStores.load()), static_cast<unsigned long long>(guards.cpuBytes.load()), static_cast<unsigned long long>(guards.kept.load()), static_cast<unsigned long long>(guards.unchecked.load()), GuardWalkSummary().c_str());
 }
 
 void CountScan(std::size_t bytes, std::chrono::steady_clock::time_point start) {
@@ -293,14 +344,19 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuardedRuns(const KeyStoreG
     std::vector<std::pair<std::uint64_t, std::uint64_t>> stores{{begin, end}};
     auto& counters = Guards();
     outcome.stored = true;
-    const auto collected = guard.generation != 0 ? GuestMemory::CollectWritesUncached(begin, count) : 0;
+    std::uint64_t collected = 0;
+    std::uint64_t cpuBytes = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> cpu;
+    if (guard.generation != 0) {
+        const TimedWalk timed(KeyCollectSite::Store);
+        collected = GuestMemory::CollectWritesUncached(begin, count);
+        if (collected != 0) cpuBytes = GuestMemory::CpuStoredRuns(begin, count, guard.generation, cpu);
+    }
     if (collected == 0) {
         counters.unchecked.fetch_add(1, std::memory_order_relaxed);
         return stores;
     }
     outcome.collected = collected;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> cpu;
-    const auto cpuBytes = GuestMemory::CpuStoredRuns(begin, count, guard.generation, cpu);
     if (cpuBytes == 0) return stores;
     counters.cpuStores.fetch_add(1, std::memory_order_relaxed);
     counters.cpuBytes.fetch_add(cpuBytes, std::memory_order_relaxed);
@@ -352,10 +408,16 @@ DccKeyGuardCounts KeyGuardCounts() {
     return {counters.cpuStores.load(std::memory_order_relaxed), counters.cpuBytes.load(std::memory_order_relaxed), counters.kept.load(std::memory_order_relaxed), counters.unchecked.load(std::memory_order_relaxed)};
 }
 
-std::uint64_t CollectKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes) {
+std::uint64_t CollectKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes, KeyCollectSite site) {
     const auto count = static_cast<std::size_t>(surfaceBytes / KeyBytes);
     if (metaAddress == 0 || count == 0) return 0;
+    const TimedWalk timed(site);
     return GuestMemory::CollectWritesUncached(metaAddress, count);
+}
+
+std::uint64_t KeysSeenGeneration() {
+    const TimedWalk timed(KeyCollectSite::KeysSeen);
+    return GuestMemory::TrackerGeneration();
 }
 
 void NoteKeysFillOnGpu(std::uint64_t begin, std::size_t count, DccKeys keys) {

@@ -71,10 +71,18 @@ struct KeyStoreOutcome {
 };
 KeyStoreOutcome MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes, const KeyStoreGuard& guard);
 KeyStoreOutcome MarkDccUncompressed(const Context& context, std::uint64_t metaAddress, std::uint64_t surfaceBytes, const KeyStoreGuard& guard);
+// Where the guard walks the key range or reads the tracker generation (the [dcc] line's "guard
+// walks" under APS5_PROFILE_DRAW: calls and time per site): the key reads of a fast-clear
+// materialization, a register clear, a synchronous draw and a CB metadata pass (CollectKeys), the
+// store's own check (the collect and CpuStoredRuns, see KeyStoreGuard), and a storage image's keysSeen
+// (KeysSeenGeneration).
+enum class KeyCollectSite : std::uint8_t { FastClear, RegisterClear, SyncDraw, MetadataPass, Store, KeysSeen, Count };
 // The key range's CPU stores collected now (an uncached walk), for the guard of a store decided on
 // keys read next to this call (just before it where the read runs on every draw, so the walk is
 // made only for a store); 0 when the range is not tracked (the store is then unchecked).
-std::uint64_t CollectKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes);
+std::uint64_t CollectKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes, KeyCollectSite site);
+// GuestMemory::TrackerGeneration for a storage image's keysSeen (counted as KeyCollectSite::KeysSeen).
+std::uint64_t KeysSeenGeneration();
 // On unless APS5_DCC_KEYS_STAMP_CHECK=0; the tests set it with KeysStampCheckForTests (1 on, 0 off,
 // -1 back to the environment).
 bool KeysStampCheck();
