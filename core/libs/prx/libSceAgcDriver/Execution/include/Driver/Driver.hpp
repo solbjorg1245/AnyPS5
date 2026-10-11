@@ -280,6 +280,10 @@ private:
     static void fastPendingWord(std::uint64_t address, const PendingView& view, FastPendingAnswer& answer);
     template<typename TVisit>
     static void forEachWrittenBuffer(const ShaderRecompiler::RecompileResult& compiled, TVisit&& visit);
+    template<typename TVisit>
+    static void forEachWrittenImage(const ShaderRecompiler::RecompileResult& compiled, TVisit&& visit);
+    // Whether a program writes a storage image (the recording pipe's dispatch counts, RecordPipe.hpp).
+    static bool writesStorageImages(const ShaderRecompiler::RecompileResult& compiled);
     void noteWrittenBuffers(std::uint64_t program, std::uint32_t queue, const ShaderRecompiler::RecompileResult& compiled);
     void noteForeignWriter(std::uint64_t begin, std::uint64_t end, std::uint32_t queue);
     void noteDrawWriters(std::span<const Graphics::CompiledShader> stages, std::uint32_t queue);

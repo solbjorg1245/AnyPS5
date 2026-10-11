@@ -84,6 +84,9 @@ bool PendingStorageOverlaps(std::uint64_t address, std::size_t bytes, const Stor
 // OpStore, OpCopyMemory or atomic whose pointer is typed PhysicalStorageBuffer, or comes from an
 // instruction the scan does not type. Independent of debug names (an inlined lookup keeps it).
 bool SpirvMayStoreThroughBda(std::span<const std::uint32_t> words);
+// Whether a compiled program may store through its BDA table: its debug names, then the scan above
+// (ShaderAddressResources.cpp, memoized by variant); also the recording pipe's dispatch counts.
+bool ProgramStoresThroughBda(const ShaderRecompiler::RecompileResult& program);
 
 // Per-device descriptor objects shared by ShaderResources builds: set layouts by their binding list
 // (immutable; kept until the device is torn down, which Vulkan allows even for pipeline layouts made

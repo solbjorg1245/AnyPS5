@@ -30,6 +30,10 @@ struct RecordPipeSlot {
     QueueStateMark mark;
 };
 
+// The [pipe] line's dispatch counts (NoteRecordPipeDispatch): handed over (eligible; those writing a
+// storage image apart), then the drains in RecordPipeDispatchVerdict's order, BDA by stores.
+enum PipeDispatchCount : std::size_t { DispatchEligible, DispatchImageWrites, DispatchLocal, DispatchNoWindow, DispatchLabelsPending, DispatchBdaLoads, DispatchBdaStores, PipeDispatchCounts };
+
 // The queue-0 pipe. A (the queue-0 worker) owns the overlay, the redo queue state and the plain
 // counters; B (the recording thread) publishes through `ring.consumed`, `stale` and its atomics.
 struct RecordPipeState {
@@ -54,6 +58,8 @@ struct RecordPipeState {
     std::array<double, PipeCensusDrains> drainWaitByReason{};
     // Due batch submits A left to B, and B's.
     std::uint64_t submitsLeft = 0;
+    // S3.0 (APS5_PROFILE_DRAW): queue-0 dispatches at the would-be hand-over, by verdict.
+    std::array<std::uint64_t, PipeDispatchCounts> dispatches{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
     std::atomic<std::uint64_t> holds{0}, busyNs{0}, lockWaitNs{0}, bSubmits{0};
 };
@@ -185,6 +191,16 @@ bool RecordPipeActive() {
         return !declined;
     }();
     return active;
+}
+
+void NoteRecordPipeDispatch(const RecordPipeDispatchFacts& facts) {
+    auto& counts = recordPipe().dispatches;
+    if (RecordPipeDispatchVerdict(facts).eligible) {
+        ++counts[DispatchEligible];
+        if (facts.imageWrites) ++counts[DispatchImageWrites];
+    } else if (!facts.replaying) {
+        ++counts[facts.local ? DispatchLocal : !facts.window ? DispatchNoWindow : facts.labelsPending ? DispatchLabelsPending : facts.bdaStores ? DispatchBdaStores : DispatchBdaLoads];
+    }
 }
 
 bool Driver::recordPipeDrawing(std::uint32_t queue) {
@@ -353,11 +369,15 @@ void Driver::recordPipeSubmissionEnd() {
     if (waits.empty()) waits = " none";
     const auto ms = [](std::atomic<std::uint64_t>& ns) { return static_cast<double>(ns.exchange(0, std::memory_order_relaxed)) / 1e6; };
     const auto busyMs = ms(pipe.busyNs), lockWaitMs = ms(pipe.lockWaitNs);
+    const auto& counts = pipe.dispatches;
+    char dispatches[256];
+    std::snprintf(dispatches, sizeof(dispatches), ", dispatches: eligible %llu (image writes %llu), bda loads %llu, bda stores %llu, labels pending %llu, local packet %llu, no window %llu", static_cast<unsigned long long>(counts[DispatchEligible]), static_cast<unsigned long long>(counts[DispatchImageWrites]), static_cast<unsigned long long>(counts[DispatchBdaLoads]), static_cast<unsigned long long>(counts[DispatchBdaStores]), static_cast<unsigned long long>(counts[DispatchLabelsPending]), static_cast<unsigned long long>(counts[DispatchLocal]), static_cast<unsigned long long>(counts[DispatchNoWindow]));
     char verify[80] = "";
     if (recordPipeVerify()) std::snprintf(verify, sizeof(verify), ", verify: checks %llu, misses %llu", static_cast<unsigned long long>(pipe.verifyChecks.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(pipe.verifyMisses.exchange(0, std::memory_order_relaxed)));
-    std::fprintf(stderr, "[pipe] queue 0 (10 s): items %llu, runs %llu (mean %.1f), holds %llu, drains:%s, A waited ms (ring full) %.1f, A drain wait ms %.1f (by reason, ms/drains that waited:%s), B busy ms %.1f, B lock wait ms %.1f, B deadline submits %llu (A left %llu to B), stale redos %llu, overlay hits %llu (draw %llu, load %llu)%s\n", static_cast<unsigned long long>(pipe.items), static_cast<unsigned long long>(pipe.runs), pipe.runs == 0 ? 0.0 : static_cast<double>(pipe.items) / static_cast<double>(pipe.runs), static_cast<unsigned long long>(pipe.holds.exchange(0, std::memory_order_relaxed)), drains.c_str(), pipe.ringWaitMs, pipe.drainWaitMs, waits.c_str(), busyMs, lockWaitMs, static_cast<unsigned long long>(pipe.bSubmits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(pipe.submitsLeft), static_cast<unsigned long long>(pipe.staleRedos), static_cast<unsigned long long>(pipe.overlayDraws + pipe.overlayLoads), static_cast<unsigned long long>(pipe.overlayDraws), static_cast<unsigned long long>(pipe.overlayLoads), verify);
+    std::fprintf(stderr, "[pipe] queue 0 (10 s): items %llu, runs %llu (mean %.1f), holds %llu, drains:%s, A waited ms (ring full) %.1f, A drain wait ms %.1f (by reason, ms/drains that waited:%s), B busy ms %.1f, B lock wait ms %.1f, B deadline submits %llu (A left %llu to B), stale redos %llu, overlay hits %llu (draw %llu, load %llu)%s%s\n", static_cast<unsigned long long>(pipe.items), static_cast<unsigned long long>(pipe.runs), pipe.runs == 0 ? 0.0 : static_cast<double>(pipe.items) / static_cast<double>(pipe.runs), static_cast<unsigned long long>(pipe.holds.exchange(0, std::memory_order_relaxed)), drains.c_str(), pipe.ringWaitMs, pipe.drainWaitMs, waits.c_str(), busyMs, lockWaitMs, static_cast<unsigned long long>(pipe.bSubmits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(pipe.submitsLeft), static_cast<unsigned long long>(pipe.staleRedos), static_cast<unsigned long long>(pipe.overlayDraws + pipe.overlayLoads), static_cast<unsigned long long>(pipe.overlayDraws), static_cast<unsigned long long>(pipe.overlayLoads), dispatches, verify);
     pipe.items = pipe.runs = pipe.staleRedos = pipe.overlayDraws = pipe.overlayLoads = pipe.submitsLeft = 0;
     pipe.drains = pipe.drainsWaited = {};
+    pipe.dispatches = {};
     pipe.drainWaitByReason = {};
     pipe.ringWaitMs = pipe.drainWaitMs = 0;
     pipe.lastReport = std::chrono::steady_clock::now();

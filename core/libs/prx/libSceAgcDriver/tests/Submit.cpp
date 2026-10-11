@@ -596,6 +596,11 @@ void testRecordPipe() {
 
     const auto handed = RecordPipeDrawVerdict(PipeCensusLock::Direct, false);
     check(handed.eligible && !handed.drain && RecordPipeDrawVerdict(PipeCensusLock::Direct, true).drain == PipeCensusDrain::LabelsPending && RecordPipeDrawVerdict(PipeCensusLock::CpuIndirect, false).drain == PipeCensusDrain::CpuIndirect && RecordPipeDrawVerdict(PipeCensusLock::Stale, false).drain == PipeCensusDrain::Stale && RecordPipeDrawVerdict(PipeCensusLock::Other, false).drain == PipeCensusDrain::Other, "record pipe: direct draws are handed over, labels pending, cpu-indirect, stale and other draws drain");
+    // Stage 3's dispatch verdict: a top-level dispatch is handed over, storage image writes or not;
+    // local packets, a device without a window, labels pending and BDA programs drain, in that order.
+    const auto plain = RecordPipeDispatchVerdict({}), images = RecordPipeDispatchVerdict({.imageWrites = true}), replay = RecordPipeDispatchVerdict({.replaying = true, .local = true});
+    check(plain.eligible && !plain.drain && images.eligible && !images.drain && !replay.eligible && !replay.drain, "record pipe: a top-level dispatch is handed over, A's stale redo neither hands over nor drains");
+    check(RecordPipeDispatchVerdict({.local = true, .window = false, .labelsPending = true}).drain == PipeCensusDrain::IndirectDispatch && RecordPipeDispatchVerdict({.window = false, .labelsPending = true}).drain == PipeCensusDrain::Other && RecordPipeDispatchVerdict({.labelsPending = true, .bda = true}).drain == PipeCensusDrain::LabelsPending && RecordPipeDispatchVerdict({.bda = true}).drain == PipeCensusDrain::Dispatch && RecordPipeDispatchVerdict({.bda = true, .bdaStores = true, .imageWrites = true}).drain == PipeCensusDrain::Dispatch, "record pipe: local packets, no window, labels pending and BDA dispatches drain");
     const auto header = [](std::uint32_t opcode) { return 0xc0000000u | (opcode << 8u); };
     overlay.Add({0x5010, 0x5018, write, 7});
     const auto top = [&](std::vector<std::uint32_t> words, bool draw = false, bool flip = false) { return RecordPipeTopDrain(words, draw, flip, false, overlay); };

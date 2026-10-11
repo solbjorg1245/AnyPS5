@@ -1,11 +1,14 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -311,6 +314,18 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         throw std::runtime_error(where + std::string(error.what()));
     };
     phaseTiming.Phase(PhaseSnapshots);
+
+    // APS5_RECORD_PIPE with APS5_PROFILE_DRAW: what stage 3 would do with the dispatch here, before
+    // anything records (the [pipe] line's dispatch counts; parallel-recording-s3-plan.md S3.0).
+    if (profile && submission.queue == 0 && RecordPipeActive()) {
+        const auto* const commands = submission.commands.data();
+        const bool local = indirectArguments != 0 || packet.data() < commands || packet.data() >= commands + submission.commands.size();
+        RecordPipeDispatchFacts facts{!recordPipeDrawing(submission.queue), local, localDevice->Window() != nullptr, !deferredLabels().labels.empty()};
+        facts.bda = std::any_of(compiled.bindings.begin(), compiled.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; });
+        facts.bdaStores = facts.bda && Graphics::ProgramStoresThroughBda(compiled);
+        facts.imageWrites = writesStorageImages(compiled);
+        NoteRecordPipeDispatch(facts);
+    }
 
     std::shared_ptr<RecipeHit> recipeHit;
     if (cached && keepVariant != nullptr && !stampValidate()) {

@@ -92,6 +92,29 @@ inline PipeCensusVerdict RecordPipeDrawVerdict(PipeCensusLock lock, bool labelsP
     return ClassifyPipeCensus({0, true, false, false, false, lock, PipeCensusDispatch::None, labelsPending}, false);
 }
 
+// Stage 3's hand-over (parallel-recording-s3-plan.md section 2): a queue-0 dispatch as A knows it
+// before PrepareRecipe (Dispatch.cpp). local: its packet is not in the submission's commands (the
+// arrays 0x16 passes, CPU-read, GPU-indirect or fill-kernel; 0x16 drains at the top); window: the
+// device has a window (as draws); bda: a BdaPagetable binding (S3.2 takes the load-only ones,
+// bdaStores false, which can turn stale on B); imageWrites: it writes a storage image (its ranges
+// join the overlay). Handed over, a drain with the census's reason, or neither (A's stale redo).
+struct RecordPipeDispatchFacts {
+    bool replaying = false, local = false, window = true, labelsPending = false, bda = false, bdaStores = false, imageWrites = false;
+};
+
+inline PipeCensusVerdict RecordPipeDispatchVerdict(const RecordPipeDispatchFacts& facts) {
+    const auto drain = [](PipeCensusDrain why) { return PipeCensusVerdict{false, why}; };
+    if (facts.replaying) return {};
+    if (facts.local) return drain(PipeCensusDrain::IndirectDispatch);
+    if (!facts.window) return drain(PipeCensusDrain::Other);
+    if (facts.labelsPending) return drain(PipeCensusDrain::LabelsPending);
+    if (facts.bda) return drain(PipeCensusDrain::Dispatch);
+    return {true, std::nullopt};
+}
+
+// APS5_PROFILE_DRAW (A, with the pipe on): the verdict joins the [pipe] line's dispatch counts (S3.0).
+void NoteRecordPipeDispatch(const RecordPipeDispatchFacts& facts);
+
 // Whether A drains before a packet runs (PacketExecution.cpp, before flushBetweenPackets): draws
 // decide in the packet; both dispatches drain (the game always puts a label or wait between draws
 // and compute, so it costs nothing, and the fill/copy HLE is covered); a sample dump (0x46 event
