@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
 #include <cstring>
@@ -127,6 +128,8 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         countCopy(CopyShape, 0, started, started);
         return false;
     }
+    // The recording pipe's items record before the copy (stage 3: a 0x15 no longer drains at the top).
+    if (recordPipeDispatching(queueId)) drainRecordPipe(PipeCensusDrain::Dma);
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     const auto locked = std::chrono::steady_clock::now();

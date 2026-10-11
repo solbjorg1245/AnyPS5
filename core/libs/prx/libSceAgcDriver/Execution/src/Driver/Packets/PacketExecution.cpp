@@ -311,7 +311,8 @@ void Driver::execute(const Submission& submission) {
             if (PassDump::FrameActive()) PassDump::BeforeWork(device.Load().get(), submission.queue);
             timed(&WorkerProfile::dispatchMs, [&] { tolerate("dispatch", [&] { dispatch(queue, packet, submission); }); });
             traceDispatch(queue, packet, submission.queue);
-            Graphics::Recorder::CountRecordedWork();
+            // A dispatch handed to the recording pipe is counted by B once it records it (as a draw, below).
+            if (!(recordPipe && submission.queue == 0 && recordPipeTookDraw())) Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(false);
         } else if (opcode == 0x16) {
             const PassDump::Serial passSerial;

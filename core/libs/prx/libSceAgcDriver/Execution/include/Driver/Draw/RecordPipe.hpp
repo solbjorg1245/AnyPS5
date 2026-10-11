@@ -21,8 +21,14 @@ namespace AgcDriver::DriverDetail {
 // below are header-only for tests/Submit.cpp; the threads, drains and stale redo are in RecordPipe.cpp.
 
 // APS5_RECORD_PIPE (read once; on by default since s60, "0" = off), declined under the switches that
-// need A-side state (plan 7), APS5_CAPTURE_DIR among them. The stage-0 census is off while it is on.
+// need A-side state (plan 7); APS5_CAPTURE_DIR no longer does (S3.1b: A records on its own while a
+// frame trace runs). The stage-0 census is off while it is on.
 bool RecordPipeActive();
+
+// APS5_RECORD_PIPE_DISPATCH=1 (read once, only with the pipe on; default off): queue-0 direct
+// dispatches ride it too (parallel-recording-s3-plan.md S3.1), declined under APS5_PROBE_DISPATCH
+// and APS5_ASPECT_PROBE (their state is A's).
+bool RecordPipeDispatchActive();
 
 // Item serials count from 1 (0: none). `handed` is the last serial A published, `consumed` the last
 // B recorded; 64-bit, so they never wrap. Serial s lives in slot s % Depth: A may fill the next slot
@@ -51,10 +57,20 @@ struct RecordPipeRing {
     void Consume(std::uint64_t serial) { consumed.store(serial, std::memory_order_release); }
 };
 
+// APS5_PROFILE_DRAW, the [pipe] B line: the items unrecorded once A published one (handed minus
+// consumed), bucketed 1, 2-4, 5-16, 17-31 and a full ring (0 counts as 1).
+inline constexpr std::size_t RecordPipeOccupancyBuckets = 5;
+constexpr std::size_t RecordPipeOccupancyBucket(std::uint64_t outstanding) {
+    return outstanding <= 1 ? 0 : outstanding <= 4 ? 1 : outstanding <= 16 ? 2 : outstanding < RecordPipeRing::Depth ? 3 : 4;
+}
+
 // The writes of handed items B has not recorded (shader-written buffers; padded color, depth, HTILE
 // and DCC targets), each range tagged with its newest item's serial: A adds an item's ranges at
 // hand-over and prunes by `consumed` before a capture, validation or indirect read checks it.
 using RecordPipeOverlay = PipeCensusOverlay;
+
+// What a slot holds: a draw (its DrawScratch and RecordPipeDraw) or a dispatch (RecordPipeDispatch).
+enum class RecordPipeKind : std::uint8_t { Draw, Dispatch };
 
 // An item's queue state at hand-over, for A's redo of a stale item: QueueState without constantRam
 // (draws never read it; DUMP_CONST_RAM, its only reader, drains) and without the fastState memo
@@ -92,16 +108,46 @@ inline PipeCensusVerdict RecordPipeDrawVerdict(PipeCensusLock lock, bool labelsP
     return ClassifyPipeCensus({0, true, false, false, false, lock, PipeCensusDispatch::None, labelsPending}, false);
 }
 
+// Stage 3's hand-over (parallel-recording-s3-plan.md section 2): a queue-0 dispatch as A knows it
+// before PrepareRecipe (Dispatch.cpp). local: its packet is not in the submission's commands (the
+// arrays 0x16 passes, CPU-read, GPU-indirect or fill-kernel; 0x16 drains at the top); window: the
+// device has a window (as draws); bda: a BdaPagetable binding (S3.2 takes the load-only ones,
+// bdaStores false, which can turn stale on B); imageWrites: it writes a storage image (its ranges
+// join the overlay). Handed over, a drain with the census's reason, or neither (A's stale redo).
+struct RecordPipeDispatchFacts {
+    bool replaying = false, local = false, window = true, labelsPending = false, bda = false, bdaStores = false, imageWrites = false;
+};
+
+inline PipeCensusVerdict RecordPipeDispatchVerdict(const RecordPipeDispatchFacts& facts) {
+    const auto drain = [](PipeCensusDrain why) { return PipeCensusVerdict{false, why}; };
+    if (facts.replaying) return {};
+    if (facts.local) return drain(PipeCensusDrain::IndirectDispatch);
+    if (!facts.window) return drain(PipeCensusDrain::Other);
+    if (facts.labelsPending) return drain(PipeCensusDrain::LabelsPending);
+    if (facts.bda) return drain(PipeCensusDrain::Dispatch);
+    return {true, std::nullopt};
+}
+
+// APS5_PROFILE_DRAW (A, with the pipe on): the verdict joins the [pipe] line's dispatch counts (S3.0).
+void NoteRecordPipeDispatch(const RecordPipeDispatchFacts& facts);
+
+// The overlay ranges of a storage image a handed item writes, from its T# (8 dwords): the surface's
+// guest bytes + 64 KiB from its base and its DCC (a byte per 256 + 4 KiB); a null T# has none; no
+// words or a T# the decoder rejects, everything (each capture drains until the item is recorded).
+void RecordPipeImageRanges(std::span<const std::uint32_t> words, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
+
 // Whether A drains before a packet runs (PacketExecution.cpp, before flushBetweenPackets): draws
 // decide in the packet; both dispatches drain (the game always puts a label or wait between draws
-// and compute, so it costs nothing, and the fill/copy HLE is covered); a sample dump (0x46 event
-// 0x39) and an indirect register load (0x63/0x64/0x9f) whose pairs lie in the pruned overlay drain;
-// the rest as the census. wroteOnGpu is not known yet and needs no test: it is set only for labels
-// and copies (0x37/0x49/0x40/0x50/0x83, PacketMemory.cpp), which drain by opcode.
-inline std::optional<PipeCensusDrain> RecordPipeTopDrain(std::span<const std::uint32_t> packet, bool drawPacket, bool flip, bool renderingWait, const RecordPipeOverlay& overlay) {
+// and compute, so it costs nothing, and the fill/copy HLE is covered), except a direct one with
+// `dispatches` (APS5_RECORD_PIPE_DISPATCH), which decides in the packet like a draw (Dispatch.cpp;
+// the fill/copy HLE drains itself); a sample dump (0x46 event 0x39) and an indirect register load
+// (0x63/0x64/0x9f) whose pairs lie in the pruned overlay drain; the rest as the census. wroteOnGpu
+// is not known yet and needs no test: it is set only for labels and copies (0x37/0x49/0x40/0x50/0x83,
+// PacketMemory.cpp), which drain by opcode.
+inline std::optional<PipeCensusDrain> RecordPipeTopDrain(std::span<const std::uint32_t> packet, bool drawPacket, bool flip, bool renderingWait, const RecordPipeOverlay& overlay, bool dispatches = false) {
     const auto opcode = (packet[0] >> 8u) & 0xffu;
     if (drawPacket) return std::nullopt;
-    if (opcode == 0x15 && !flip && !renderingWait) return PipeCensusDrain::Dispatch;
+    if (opcode == 0x15 && !flip && !renderingWait) return dispatches ? std::optional<PipeCensusDrain>{} : PipeCensusDrain::Dispatch;
     if (opcode == 0x46 && packet.size() > 1 && (packet[1] & 0x3fu) == 0x39u) return PipeCensusDrain::Other;
     if ((opcode == 0x63 || opcode == 0x64 || opcode == 0x9f) && packet.size() > 4) {
         const auto begin = packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u);
@@ -161,6 +207,25 @@ struct RecordPipeWriteLog {
         return 0;
     }
 };
+
+// APS5_RECORD_PIPE_VERIFY, B after recording an item: the first write its device calls logged
+// (RecordPipeWriteLog) that its own overlay estimate, the ranges its hand-over left under its serial
+// joined end to end, does not cover; none when the estimate covers every write.
+inline std::optional<std::pair<std::uint64_t, std::uint64_t>> RecordPipeEstimateMiss(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::span<const std::pair<std::uint64_t, std::uint64_t>> estimate) {
+    for (const auto& write : writes) {
+        auto covered = write.first;
+        for (bool advanced = true; advanced && covered < write.second;) {
+            advanced = false;
+            for (const auto& [begin, end] : estimate) {
+                if (begin > covered || covered >= end) continue;
+                covered = end;
+                advanced = true;
+            }
+        }
+        if (covered < write.second) return write;
+    }
+    return std::nullopt;
+}
 
 }
 

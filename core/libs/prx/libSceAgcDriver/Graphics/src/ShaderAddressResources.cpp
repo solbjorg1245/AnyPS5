@@ -79,8 +79,6 @@ bool SpirvMayStoreThroughBda(std::span<const std::uint32_t> words) {
     return false;
 }
 
-namespace {
-
 // Whether a compiled program may store through its BDA table (resident read-only copies, see
 // GuestBufferMemory.cpp "Resident reads"): the recompiler defines its write lookup, named
 // "get_bda_write_pointer", only for a program with BDA stores, and every BDA store calls it
@@ -90,7 +88,7 @@ namespace {
 // say it only reads is scanned as well (SpirvMayStoreThroughBda): a store through a physical
 // pointer counts whatever the names (an optimizer that inlined only the write lookup). Memoized
 // by variant.
-bool programStoresThroughBda(const ShaderRecompiler::RecompileResult& program) {
+bool ProgramStoresThroughBda(const ShaderRecompiler::RecompileResult& program) {
     static const bool all = std::getenv("APS5_RESIDENT_READS_ALL_WRITERS") != nullptr;
     if (all) return true;
     static HostMutex memoMutex;
@@ -124,8 +122,6 @@ bool programStoresThroughBda(const ShaderRecompiler::RecompileResult& program) {
     return stores;
 }
 
-}
-
 void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots) {
     for (const auto& shader : shaders) {
         Require(shader.program != nullptr, "missing compiled shader");
@@ -144,7 +140,7 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
         usesBda = usesBda || tables != 0;
         // The scan only when resident reads or written ranges may use it; otherwise every BDA
         // program counts as storing (nothing reads the flag without them).
-        bdaStores = bdaStores || (tables != 0 && (!(Recorder::ResidentReadsConfigured() || Recorder::ResidentWritesConfigured()) || programStoresThroughBda(*shader.program)));
+        bdaStores = bdaStores || (tables != 0 && (!(Recorder::ResidentReadsConfigured() || Recorder::ResidentWritesConfigured()) || ProgramStoresThroughBda(*shader.program)));
         usesFaultBuffer = usesFaultBuffer || faults != 0;
     }
     if (usesBda) {

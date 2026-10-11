@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include <algorithm>
 
@@ -20,6 +21,31 @@ void Driver::forEachWrittenBuffer(const ShaderRecompiler::RecompileResult& compi
             visit(element, base, base + size, element < binding.bufferAtomic.size() && binding.bufferAtomic[element]);
         }
     }
+}
+
+// The T#s (8 dwords) of the storage image elements a program writes (an element beyond imageWritten
+// counts as written, as ShaderResources.cpp decides); null T#s bind driver memory and are left out
+// (NullTextureWords), an element its binding has no words for is visited with none.
+template<typename TVisit>
+void Driver::forEachWrittenImage(const ShaderRecompiler::RecompileResult& compiled, TVisit&& visit) {
+    for (const auto& binding : compiled.bindings) {
+        if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::StorageImage) continue;
+        for (std::uint32_t element = 0; element < binding.count; ++element) {
+            if (element < binding.imageWritten.size() && !binding.imageWritten[element]) continue;
+            if (binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 8) {
+                visit(std::span<const std::uint32_t>{});
+                continue;
+            }
+            const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8, 8);
+            if (words[0] != 0 || (words[1] & 0xffu) != 0) visit(words);
+        }
+    }
+}
+
+bool Driver::writesStorageImages(const ShaderRecompiler::RecompileResult& compiled) {
+    bool writes = false;
+    forEachWrittenImage(compiled, [&](std::span<const std::uint32_t>) { writes = true; });
+    return writes;
 }
 
 std::atomic<std::uint64_t>& WrittenBufferPushes() {
@@ -57,6 +83,12 @@ void Driver::notePipeCensusWrites(const ShaderRecompiler::RecompileResult& compi
 
 void Driver::notePipeItemWrites(const ShaderRecompiler::RecompileResult& compiled, std::uint64_t serial, PipeCensusOverlay& overlay) {
     forEachWrittenBuffer(compiled, [&](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool) { overlay.Add({begin, end, PipeCensusOverlay::Write, serial}); });
+}
+
+void Driver::notePipeItemImages(const ShaderRecompiler::RecompileResult& compiled, std::uint64_t serial, PipeCensusOverlay& overlay) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    forEachWrittenImage(compiled, [&](std::span<const std::uint32_t> words) { RecordPipeImageRanges(words, ranges); });
+    for (const auto& [begin, end] : ranges) overlay.Add({begin, end, PipeCensusOverlay::Target, serial});
 }
 
 std::optional<WrittenBuffer> Driver::newestWriterLocked(std::uint64_t begin, std::uint64_t end) const {
