@@ -15,6 +15,7 @@ static void Require(bool value, const char* what) {
 // A button icon file as the dump has it: the header fields IsGlyphTexture reads, a zero surface.
 static std::string GlyphFile() {
     std::string file(UiOverlay::CtxrHeaderBytes + UiOverlay::GlyphSurfaceBytes, '\0');
+    file += std::string("RTXT\x6e\0\0\0\x41\0\x02\0", UiOverlay::CtxrFooterBytes);
     UiOverlay::WriteU32(file, UiOverlay::CtxrSizeOffset, static_cast<std::uint32_t>(UiOverlay::GlyphSurfaceBytes));
     const std::uint32_t words[] = {0x00000000u, 0xc8200000u, 0x801fc01fu, 0x90970facu, 0u, 0u, 0u, 0u};
     for (std::size_t i = 0; i < 8; ++i) UiOverlay::WriteU32(file, UiOverlay::CtxrDescriptorOffset + 4 * i, words[i]);
@@ -54,6 +55,9 @@ static void TestGlyphTexture() {
     UiOverlay::WriteU32(other, UiOverlay::CtxrDescriptorOffset + 4, 0xc8f00000u);
     Require(!UiOverlay::IsGlyphTexture(other), "another format must be refused");
     Require(!UiOverlay::IsGlyphTexture(std::string_view(original).substr(1)), "another size must be refused");
+    auto unsigned_ = original;
+    unsigned_[unsigned_.size() - UiOverlay::CtxrFooterBytes] = 'X';
+    Require(!UiOverlay::IsGlyphTexture(unsigned_), "a file without the RTXT footer must be refused");
 
     auto marked = original;
     // A byte no level covers (the gap after level 1's 64x64 texels in the tail block) keeps its value.
@@ -85,6 +89,9 @@ static void TestGlyphTexture() {
     }
     Require(replaced.compare(0, UiOverlay::CtxrHeaderBytes, std::string(original.substr(0, UiOverlay::CtxrHeaderBytes))) == 0 &&
             UiOverlay::ReadU32(replaced, UiOverlay::CtxrSizeOffset) == UiOverlay::GlyphSurfaceBytes, "the header round-trips");
+    // The footer is what t665 lost (the surface was written 12 bytes late, over it): white squares in game.
+    Require(replaced.compare(replaced.size() - UiOverlay::CtxrFooterBytes, UiOverlay::CtxrFooterBytes, original, original.size() - UiOverlay::CtxrFooterBytes, UiOverlay::CtxrFooterBytes) == 0,
+            "the RTXT footer round-trips");
     for (const auto glyph : {UiOverlay::Glyph::A, UiOverlay::Glyph::B, UiOverlay::Glyph::X, UiOverlay::Glyph::Y, UiOverlay::Glyph::Menu, UiOverlay::Glyph::View}) {
         for (std::uint32_t level = 0; level < UiOverlay::GlyphLevels; ++level) {
             const auto texels = UiOverlay::RenderGlyph(glyph, UiOverlay::LevelSize(level));

@@ -53,11 +53,14 @@ inline void WriteU32(std::string& bytes, std::size_t offset, std::uint32_t value
 
 // ---- Button icon textures -------------------------------------------------------------------------------
 
-// A ctxr texture: a 77-byte header (the surface size at +0x18, the 8-dword T# at +0x21 with a zero base
-// address), then the surface as the GPU reads it. Each button icon is 128x128 R8G8B8A8_SRGB (format 130),
+// A ctxr texture: a 65-byte header (the surface size at +0x18, the 8-dword T# at +0x21 with a zero base
+// address), the surface as the GPU reads it, and a 12-byte footer ("RTXT", version 110, the surface's offset
+// 0x41 in a u16, its size in 64 KiB pages in a u16). The footer must stay: a file without it loads as a
+// plain white texture (s61 t665). Each button icon is 128x128 R8G8B8A8_SRGB (format 130),
 // 8 levels, SW_64KB_S (tile mode 9): the tail block (levels 1-7) first, then level 0, 64 KiB each.
 // Texels are premultiplied by alpha.
-inline constexpr std::size_t CtxrHeaderBytes = 77;
+inline constexpr std::size_t CtxrHeaderBytes = 0x41;
+inline constexpr std::size_t CtxrFooterBytes = 12;
 inline constexpr std::size_t CtxrSizeOffset = 0x18;
 inline constexpr std::size_t CtxrDescriptorOffset = 0x21;
 inline constexpr std::uint32_t GlyphSize = 128;
@@ -67,7 +70,9 @@ inline constexpr std::size_t GlyphSurfaceBytes = 2 * GlyphBlockBytes;
 
 // True when `file` is a button icon texture in the layout GlyphSurface writes.
 inline bool IsGlyphTexture(std::string_view file) {
-    if (file.size() != CtxrHeaderBytes + GlyphSurfaceBytes || ReadU32(file, CtxrSizeOffset) != GlyphSurfaceBytes) return false;
+    if (file.size() != CtxrHeaderBytes + GlyphSurfaceBytes + CtxrFooterBytes || ReadU32(file, CtxrSizeOffset) != GlyphSurfaceBytes) return false;
+    const auto footer = file.substr(CtxrHeaderBytes + GlyphSurfaceBytes);
+    if (footer.substr(0, 4) != "RTXT" || ReadU32(footer, 8) != (CtxrHeaderBytes | ((GlyphSurfaceBytes >> 16u) << 16u))) return false;
     std::array<std::uint32_t, 8> words{};
     for (std::size_t i = 0; i < words.size(); ++i) words[i] = ReadU32(file, CtxrDescriptorOffset + 4 * i);
     const auto format = (words[1] >> 20u) & 0x1ffu;
@@ -230,12 +235,13 @@ inline std::vector<std::uint32_t> RenderGlyph(Glyph glyph, std::uint32_t size) {
     return texels;
 }
 
-// The replacement file: the original's header (checked by IsGlyphTexture) and its surface with the glyph's
-// levels written in.
+// The replacement file: the original's header and footer (checked by IsGlyphTexture) around its surface with
+// the glyph's levels written in.
 inline std::string GlyphTexture(std::string_view original, Glyph glyph) {
     std::array<std::vector<std::uint32_t>, GlyphLevels> levels;
     for (std::uint32_t level = 0; level < GlyphLevels; ++level) levels[level] = RenderGlyph(glyph, LevelSize(level));
-    return std::string(original.substr(0, CtxrHeaderBytes)) + GlyphSurface(levels, std::string(original.substr(CtxrHeaderBytes)));
+    return std::string(original.substr(0, CtxrHeaderBytes)) + GlyphSurface(levels, std::string(original.substr(CtxrHeaderBytes, GlyphSurfaceBytes))) +
+        std::string(original.substr(CtxrHeaderBytes + GlyphSurfaceBytes));
 }
 
 // The Steam Deck's View button (SDL Back; no PlayStation button reaches it otherwise, and a DualSense's
