@@ -1,5 +1,6 @@
 #include "prx/libc/include/UiOverlay.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/ReadPatch.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -34,6 +35,55 @@ std::filesystem::path WriteOverlay(const char* folder, const char* name, const s
     return PortSettings::WriteOverrideFile(directories, name, content, error);
 }
 
+// The circled Square and Triangle of the UI atlas (UiOverlay.hpp): the blocks under them, redrawn, replace
+// the atlas file's bytes in every read of it. Returns the text for the log line.
+std::string InstallAtlasIcons(const std::function<std::filesystem::path(const char*)>& resolve) {
+    const auto ctal = ReadWhole(resolve(UiOverlay::AtlasGuest));
+    if (!ctal) return "atlas kept: global.ctal missing";
+    const auto pages = resolve(UiOverlay::AtlasPagesGuest);
+    std::error_code sizeError;
+    const auto bytes = std::filesystem::file_size(pages, sizeError);
+    std::ifstream file(pages, std::ios::binary);
+    const auto readAt = [&file](std::uint64_t offset, std::string& into) {
+        file.seekg(static_cast<std::streamoff>(offset));
+        file.read(into.data(), static_cast<std::streamsize>(into.size()));
+        return static_cast<bool>(file);
+    };
+    std::string header(UiOverlay::CtxrHeaderBytes, '\0');
+    std::string footer(UiOverlay::CtxrFooterBytes, '\0');
+    if (sizeError || !file || bytes < footer.size() || !readAt(0, header) || !readAt(bytes - footer.size(), footer) ||
+        !UiOverlay::IsAtlasPages(header, footer, bytes)) {
+        return "atlas kept: global_pages.ctxr not as expected";
+    }
+    UiOverlay::AtlasBlocks blocks;
+    std::string redrawn;
+    std::string kept;
+    for (const auto& entry : UiOverlay::SteamDeckAtlasGlyphs) {
+        const auto sprite = UiOverlay::FindAtlasSprite(*ctal, entry.name);
+        if (!sprite) {
+            kept += std::string(kept.empty() ? "" : ", ") + entry.label + " (no atlas entry)";
+            continue;
+        }
+        for (const auto offset : UiOverlay::SpriteBlocks(*sprite)) {
+            auto& block = blocks[offset];
+            if (!block.empty()) continue;
+            block.assign(UiOverlay::GlyphBlockBytes, '\0');
+            if (!readAt(offset, block)) throw std::runtime_error("cannot read " + PortSettings::PathText(pages));
+        }
+        const auto texels = UiOverlay::ReadSprite(blocks, *sprite);
+        if (UiOverlay::SpriteHash(texels) != entry.original) {
+            kept += std::string(kept.empty() ? "" : ", ") + entry.label + " (other art)";
+            continue;
+        }
+        UiOverlay::WriteSprite(blocks, *sprite, UiOverlay::RedrawCircledSprite(texels, sprite->size, entry.glyph));
+        redrawn += std::string(redrawn.empty() ? "" : ", ") + entry.label;
+    }
+    if (redrawn.empty()) return "atlas kept: " + kept;
+    for (auto& [offset, block] : blocks) AddReadPatch_nid_no_patch(pages, offset, std::move(block));
+    return "atlas circled " + redrawn + " redrawn (" + std::to_string(blocks.size() * UiOverlay::GlyphBlockBytes / 1024) +
+        " KiB patched into reads of global_pages.ctxr)" + (kept.empty() ? "" : "; kept " + kept);
+}
+
 void InstallButtonIcons(const std::function<std::filesystem::path(const char*)>& resolve) {
     if (GetPortSettings_nid_no_patch().buttonIcons != PortSettings::ButtonIcons::SteamDeck) return;
     std::size_t replaced = 0;
@@ -61,9 +111,15 @@ void InstallButtonIcons(const std::function<std::filesystem::path(const char*)>&
         AddPathAliasHost_nid_no_patch(guest.c_str(), written);
         ++replaced;
     }
-    std::fprintf(stderr, "[settings] button icons: Steam Deck, %zu of %zu textures replaced (%s)%s%s%s%s\n", replaced, UiOverlay::SteamDeckGlyphs.size(),
+    std::string atlas;
+    try {
+        atlas = InstallAtlasIcons(resolve);
+    } catch (const std::exception& error) {
+        atlas = std::string("atlas kept (") + error.what() + ")";
+    }
+    std::fprintf(stderr, "[settings] button icons: Steam Deck, %zu of %zu textures replaced (%s)%s%s%s%s; %s\n", replaced, UiOverlay::SteamDeckGlyphs.size(),
         PortSettings::PathText(written.parent_path()).c_str(), skipped.empty() ? "" : "; kept the title's ", skipped.c_str(),
-        probed.empty() ? "" : "; probe, written unchanged: ", probed.c_str());
+        probed.empty() ? "" : "; probe, written unchanged: ", probed.c_str(), atlas.c_str());
 }
 
 void InstallVisualModeRowRemoval(const std::function<std::filesystem::path(const char*)>& resolve) {

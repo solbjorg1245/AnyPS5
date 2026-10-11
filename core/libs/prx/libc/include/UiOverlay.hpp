@@ -6,8 +6,10 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -25,7 +27,8 @@
 //    Create/touchpad are redrawn here in a Steam Deck style (our own shapes: a dark disc with a light rim and
 //    a letter, three bars or two squares) in the original's format; L1/R1/L2/R2/L3/R3, the sticks, the d-pad
 //    and the touchpad swipes keep the title's art (the Deck uses the same names). A texture whose header is
-//    not the expected 128x128 RGBA8 sRGB 8-level SW_64KB_S surface keeps the original.
+//    not the expected 128x128 RGBA8 sRGB 8-level SW_64KB_S surface keeps the original. The circled Square
+//    and Triangle on the panel borders are UI atlas sprites: they get X and Y in reads of the atlas.
 // 2. The Visual Mode row (APS5_HIDE_VISUAL_MODE_ROW=1, experimental). Options > Display is the entity
 //    tree of ui/scripts/_cmn/uistartmenu.cgpr (SettingsPages/SettingsPageBG/MenuContents: DisplayAdjust,
 //    StatSpacer, VisualMode, MotionBlur, FilmGrain, Filters_List, FilterIntensity); the copy drops the
@@ -164,6 +167,21 @@ inline std::vector<GlyphSegment> GlyphStrokes(Glyph glyph) {
 
 inline constexpr float StrokeWidth = 10.5f;
 
+// True when (x, y) lies on one of the strokes (128-unit space).
+inline bool OnStroke(const std::vector<GlyphSegment>& strokes, float x, float y) {
+    constexpr float half2 = StrokeWidth * StrokeWidth / 4.0f;
+    for (const auto& stroke : strokes) {
+        const float sx = stroke.bx - stroke.ax;
+        const float sy = stroke.by - stroke.ay;
+        const float length2 = sx * sx + sy * sy;
+        const float along = length2 == 0.0f ? 0.0f : std::clamp(((x - stroke.ax) * sx + (y - stroke.ay) * sy) / length2, 0.0f, 1.0f);
+        const float qx = stroke.ax + along * sx - x;
+        const float qy = stroke.ay + along * sy - y;
+        if (qx * qx + qy * qy <= half2) return true;
+    }
+    return false;
+}
+
 struct GlyphColor {
     float r, g, b, a;
 };
@@ -195,17 +213,7 @@ inline GlyphColor GlyphSample(Glyph glyph, const std::vector<GlyphSegment>& stro
             return body;
         default: break;
     }
-    constexpr float half2 = StrokeWidth * StrokeWidth / 4.0f;
-    for (const auto& stroke : strokes) {
-        const float sx = stroke.bx - stroke.ax;
-        const float sy = stroke.by - stroke.ay;
-        const float length2 = sx * sx + sy * sy;
-        const float along = length2 == 0.0f ? 0.0f : std::clamp(((x - stroke.ax) * sx + (y - stroke.ay) * sy) / length2, 0.0f, 1.0f);
-        const float qx = stroke.ax + along * sx - x;
-        const float qy = stroke.ay + along * sy - y;
-        if (qx * qx + qy * qy <= half2) return ink;
-    }
-    return body;
+    return OnStroke(strokes, x, y) ? ink : body;
 }
 
 // One level of a glyph, `size` texels square, 4x4 samples per texel, premultiplied by alpha.
@@ -242,6 +250,164 @@ inline std::string GlyphTexture(std::string_view original, Glyph glyph) {
     for (std::uint32_t level = 0; level < GlyphLevels; ++level) levels[level] = RenderGlyph(glyph, LevelSize(level));
     return std::string(original.substr(0, CtxrHeaderBytes)) + GlyphSurface(levels, std::string(original.substr(CtxrHeaderBytes, GlyphSurfaceBytes))) +
         std::string(original.substr(CtxrHeaderBytes + GlyphSurfaceBytes));
+}
+
+// ---- Circled buttons in the UI atlas ----------------------------------------------------------------------
+
+// The circled Square and Triangle on the panel borders are not button icon files but sprites of the UI
+// atlas: ui/textures/_ps5/global.ctal (u8 path length, the path, u32 count, 40-byte entries: u32 name hash,
+// a UV quad of 4 float pairs, u32 page) over ui/textures/_ps5/_ps5/global_pages.ctxr, 5 pages of 4096x4096
+// R8G8B8A8_SRGB SW_64KB_S in the ctxr layout above (+0x18 holds one page's size; no mips). A copy of the
+// 335 MB file for two 70x70 sprites is not worth it: the 64 KiB blocks under them are redrawn once and
+// replace the file's bytes as the title reads them (ReadPatch.hpp). The title's rings stay; the white face
+// inside AtlasFaceRadius gets the Deck letter in black instead of the PlayStation symbol.
+inline constexpr const char* AtlasGuest = "/app0/ui/textures/_ps5/global.ctal";
+inline constexpr const char* AtlasPagesGuest = "/app0/ui/textures/_ps5/_ps5/global_pages.ctxr";
+inline constexpr std::uint32_t AtlasPageSize = 4096;
+inline constexpr std::uint32_t AtlasPages = 5;
+inline constexpr std::uint64_t AtlasPageBytes = std::uint64_t{AtlasPageSize} * AtlasPageSize * 4;
+inline constexpr std::uint64_t AtlasFileBytes = CtxrHeaderBytes + AtlasPages * AtlasPageBytes + CtxrFooterBytes;
+inline constexpr std::size_t AtlasEntryBytes = 40;
+
+struct AtlasGlyph {
+    std::uint32_t name;
+    std::uint64_t original;
+    Glyph glyph;
+    const char* label;
+};
+
+// Circled Square -> X, circled Triangle -> Y (70x70 on page 0). `original` is SpriteHash of the dump's
+// sprite: another dump revision keeps its art.
+inline constexpr std::array<AtlasGlyph, 2> SteamDeckAtlasGlyphs{{{0x3616049fu, 0xeb31759cb3394edcull, Glyph::X, "square"},
+    {0x46961d48u, 0x3b90d5317f87e0e7ull, Glyph::Y, "triangle"}}};
+
+// True when `header` and `footer` (the first 65 and last 12 bytes of a `fileBytes` file) are the dump's atlas
+// pages.
+inline bool IsAtlasPages(std::string_view header, std::string_view footer, std::uint64_t fileBytes) {
+    if (fileBytes != AtlasFileBytes || header.size() != CtxrHeaderBytes || footer.size() != CtxrFooterBytes) return false;
+    if (ReadU32(header, CtxrSizeOffset) != AtlasPageBytes) return false;
+    if (footer.substr(0, 4) != "RTXT" || ReadU32(footer, 8) != (CtxrHeaderBytes | (((AtlasPages * AtlasPageBytes) >> 16u) << 16u))) return false;
+    // T# words 1-4: format 130 4096x4096, SW_64KB_S 2D array, last slice 4.
+    constexpr std::array<std::uint32_t, 4> words{0xc8200000u, 0x83ffc3ffu, 0xd0900facu, 4u};
+    for (std::size_t i = 0; i < words.size(); ++i) {
+        if (ReadU32(header, CtxrDescriptorOffset + 4 * (i + 1)) != words[i]) return false;
+    }
+    return true;
+}
+
+struct AtlasSprite {
+    std::uint32_t page, x, y, size;
+};
+
+// The square sprite `name` names in a ctal file, in texels; nothing for a missing, non-square or off-page
+// entry.
+inline std::optional<AtlasSprite> FindAtlasSprite(std::string_view ctal, std::uint32_t name) {
+    if (ctal.empty()) return std::nullopt;
+    std::size_t cursor = 1 + static_cast<std::uint8_t>(ctal[0]);
+    if (cursor + 4 > ctal.size()) return std::nullopt;
+    const auto count = ReadU32(ctal, cursor);
+    cursor += 4;
+    if (count > (ctal.size() - cursor) / AtlasEntryBytes) return std::nullopt;
+    for (std::uint32_t index = 0; index < count; ++index, cursor += AtlasEntryBytes) {
+        if (ReadU32(ctal, cursor) != name) continue;
+        std::array<float, 8> uv{};
+        for (std::size_t i = 0; i < uv.size(); ++i) {
+            const auto bits = ReadU32(ctal, cursor + 4 + 4 * i);
+            std::memcpy(&uv[i], &bits, sizeof(bits));
+        }
+        const auto texel = [](float a, float b, float c, float d, bool high) {
+            const float value = high ? std::max({a, b, c, d}) : std::min({a, b, c, d});
+            return static_cast<std::int64_t>(std::lround(value * AtlasPageSize));
+        };
+        const auto x0 = texel(uv[0], uv[2], uv[4], uv[6], false), x1 = texel(uv[0], uv[2], uv[4], uv[6], true);
+        const auto y0 = texel(uv[1], uv[3], uv[5], uv[7], false), y1 = texel(uv[1], uv[3], uv[5], uv[7], true);
+        const auto page = ReadU32(ctal, cursor + 36);
+        if (page >= AtlasPages || x0 < 0 || y0 < 0 || x1 > AtlasPageSize || y1 > AtlasPageSize || x1 <= x0 || x1 - x0 != y1 - y0) return std::nullopt;
+        return AtlasSprite{page, static_cast<std::uint32_t>(x0), static_cast<std::uint32_t>(y0), static_cast<std::uint32_t>(x1 - x0)};
+    }
+    return std::nullopt;
+}
+
+// File offset of texel (x, y) of atlas page `page`: 64 KiB blocks of 128x128 texels, 32 to a row.
+constexpr std::uint64_t AtlasTexelOffset(std::uint32_t page, std::uint32_t x, std::uint32_t y) {
+    return CtxrHeaderBytes + page * AtlasPageBytes + (std::uint64_t{y >> 7u} * (AtlasPageSize >> 7u) + (x >> 7u)) * GlyphBlockBytes +
+        Standard64KbOffset(x & 127u, y & 127u);
+}
+
+// Atlas blocks by file offset, GlyphBlockBytes each.
+using AtlasBlocks = std::map<std::uint64_t, std::string>;
+
+// The file offsets of the blocks a sprite touches.
+inline std::vector<std::uint64_t> SpriteBlocks(const AtlasSprite& sprite) {
+    std::vector<std::uint64_t> offsets;
+    for (std::uint32_t y = sprite.y & ~127u; y < sprite.y + sprite.size; y += 128) {
+        for (std::uint32_t x = sprite.x & ~127u; x < sprite.x + sprite.size; x += 128) offsets.push_back(AtlasTexelOffset(sprite.page, x, y));
+    }
+    return offsets;
+}
+
+// The sprite's texels row by row (R, G, B, A from the low byte); `blocks` holds every SpriteBlocks block.
+inline std::vector<std::uint32_t> ReadSprite(const AtlasBlocks& blocks, const AtlasSprite& sprite) {
+    std::vector<std::uint32_t> texels;
+    texels.reserve(static_cast<std::size_t>(sprite.size) * sprite.size);
+    for (std::uint32_t y = sprite.y; y < sprite.y + sprite.size; ++y) {
+        for (std::uint32_t x = sprite.x; x < sprite.x + sprite.size; ++x) {
+            texels.push_back(ReadU32(blocks.at(AtlasTexelOffset(sprite.page, x & ~127u, y & ~127u)), Standard64KbOffset(x & 127u, y & 127u)));
+        }
+    }
+    return texels;
+}
+
+inline void WriteSprite(AtlasBlocks& blocks, const AtlasSprite& sprite, const std::vector<std::uint32_t>& texels) {
+    std::size_t index = 0;
+    for (std::uint32_t y = sprite.y; y < sprite.y + sprite.size; ++y) {
+        for (std::uint32_t x = sprite.x; x < sprite.x + sprite.size; ++x) {
+            WriteU32(blocks.at(AtlasTexelOffset(sprite.page, x & ~127u, y & ~127u)), Standard64KbOffset(x & 127u, y & 127u), texels.at(index++));
+        }
+    }
+}
+
+// FNV-1a over the texels' bytes in file order.
+inline std::uint64_t SpriteHash(const std::vector<std::uint32_t>& texels) {
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (const auto texel : texels) {
+        for (std::uint32_t shift = 0; shift < 32; shift += 8) hash = (hash ^ ((texel >> shift) & 0xffu)) * 0x100000001b3ull;
+    }
+    return hash;
+}
+
+// In a 70-texel sprite the white face ends at radius 19.5 (the symbol reaches 18, the rings start at 20);
+// the letter is drawn at 0.45 texels per glyph unit (28 texels tall).
+inline constexpr float AtlasFaceRadius = 19.5f;
+inline constexpr float AtlasGlyphScale = 0.45f;
+
+// The sprite (`size` texels square) with its symbol redrawn: texels whose centre lies inside the face
+// become white with `glyph`'s strokes in black (4x4 samples, opaque); the rings and corners stay.
+inline std::vector<std::uint32_t> RedrawCircledSprite(std::vector<std::uint32_t> texels, std::uint32_t size, Glyph glyph) {
+    constexpr int samples = 4;
+    const auto strokes = GlyphStrokes(glyph);
+    const float scale = static_cast<float>(size) / 70.0f;
+    const float centre = static_cast<float>(size) / 2.0f;
+    const float face = AtlasFaceRadius * scale;
+    const float units = 1.0f / (AtlasGlyphScale * scale);
+    for (std::uint32_t py = 0; py < size; ++py) {
+        for (std::uint32_t px = 0; px < size; ++px) {
+            const float dx = static_cast<float>(px) + 0.5f - centre;
+            const float dy = static_cast<float>(py) + 0.5f - centre;
+            if (dx * dx + dy * dy >= face * face) continue;
+            int covered = 0;
+            for (int sy = 0; sy < samples; ++sy) {
+                for (int sx = 0; sx < samples; ++sx) {
+                    const float gx = 64.0f + (static_cast<float>(px) + (static_cast<float>(sx) + 0.5f) / samples - centre) * units;
+                    const float gy = 64.0f + (static_cast<float>(py) + (static_cast<float>(sy) + 0.5f) / samples - centre) * units;
+                    if (OnStroke(strokes, gx, gy)) ++covered;
+                }
+            }
+            const auto value = static_cast<std::uint32_t>(std::lround(255.0f * (1.0f - static_cast<float>(covered) / (samples * samples))));
+            texels[static_cast<std::size_t>(py) * size + px] = value | (value << 8u) | (value << 16u) | 0xff000000u;
+        }
+    }
+    return texels;
 }
 
 // The Steam Deck's View button (SDL Back; no PlayStation button reaches it otherwise, and a DualSense's

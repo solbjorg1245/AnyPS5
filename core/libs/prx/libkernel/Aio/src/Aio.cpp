@@ -8,6 +8,7 @@
 #include <thread>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/ReadPatch.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
@@ -91,10 +92,14 @@ std::int64_t NativePread(std::int32_t fd, void* buf, std::size_t nbyte, std::int
         return -1;
     }
 #ifdef _WIN32
-    return NativePositioned(fd, buf, nbyte, offset, false, "sceKernelAioSubmitReadCommands");
+    const auto read = NativePositioned(fd, buf, nbyte, offset, false, "sceKernelAioSubmitReadCommands");
 #else
-    return static_cast<std::int64_t>(::pread(fd, buf, nbyte, static_cast<off_t>(offset)));
+    const auto read = static_cast<std::int64_t>(::pread(fd, buf, nbyte, static_cast<off_t>(offset)));
 #endif
+    if (read > 0) {
+        if (const auto patches = ReadPatchesForDescriptor_nid_no_patch(fd)) ApplyReadPatches_nid_no_patch(*patches, "aio", static_cast<std::uint64_t>(offset), buf, static_cast<std::uint64_t>(read));
+    }
+    return read;
 }
 
 std::int64_t NativePwrite(std::int32_t fd, const void* buf, std::size_t nbyte, std::int64_t offset) {

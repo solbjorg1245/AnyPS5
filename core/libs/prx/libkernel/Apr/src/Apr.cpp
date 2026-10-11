@@ -2,6 +2,7 @@
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/ReadPatch.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/Apr/include/AprCommandBuffer.hpp"
 #include "prx/libkernel/File/include/ReadTrace.hpp"
@@ -35,6 +36,7 @@ constexpr int GUEST_EINVAL = 22;
 struct AprFile {
     std::filesystem::path path;
     std::uint64_t size;
+    std::shared_ptr<const ReadPatch::Ranges> patches;  // ReadPatch.hpp; null for nearly every file
 };
 
 std::mutex g_filesLock;
@@ -110,7 +112,8 @@ bool _resolve(const char* guestPath, std::uint32_t* id, std::uint64_t* size) {
     auto found = g_idsByPath.find(key);
     if (found == g_idsByPath.end()) {
         found = g_idsByPath.emplace(key, static_cast<std::uint32_t>(g_files.size())).first;
-        g_files.push_back({std::move(hostPath), bytes});
+        auto patches = ReadPatchesFor_nid_no_patch(hostPath);
+        g_files.push_back({std::move(hostPath), bytes, std::move(patches)});
     }
     if (id) *id = found->second;
     if (size) *size = bytes;
@@ -154,6 +157,7 @@ void _readFile(const Apr::ReadFileCommand& command) {
     if (stream.bad()) throw std::runtime_error("APR: read failed for " + file.path.string());
     const auto read = static_cast<std::uint64_t>(stream.gcount());
     if (read != command.size) throw std::runtime_error("APR: read of " + file.path.string() + " at offset " + std::to_string(command.offset) + " returned " + std::to_string(read) + " of " + std::to_string(command.size) + " bytes");
+    if (file.patches) ApplyReadPatches_nid_no_patch(*file.patches, "apr", command.offset, reinterpret_cast<void*>(command.destination), read);
 }
 
 void _writeAddress(const Apr::WriteAddressCommand& command) {
