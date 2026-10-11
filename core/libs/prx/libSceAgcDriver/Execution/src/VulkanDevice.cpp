@@ -15,7 +15,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/BarrierMerge.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -3754,34 +3753,23 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         const auto images = resources.StorageImages();
         recorder.NoteAccess(CommandClass::DispatchLeading, Graphics::Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, resources.HoldsLease()});
     }
-    // Results of earlier recorded work are visible to this dispatch, its own to everything after
-    // (Graphics::DispatchLeadingBarrier, DispatchTrailingBarrier).
-    const auto recordMemoryBarrier = [&](const Graphics::MemoryBarrierMasks& masks) { Graphics::RecordMemoryBarrier(context, commands, masks.sourceStages, masks.destinationStages, masks.sourceAccess, masks.destinationAccess); };
-    const bool leading = !(Graphics::LeadingBarrierCovered(covered, Graphics::DispatchLeadingBarrier.destinationAccess) && barrierElision);
-    // An indirect dispatch whose leading barrier is recorded takes the argument barrier into it:
-    // nothing is recorded between the two and both have ALL_COMMANDS as their source stage, so one
-    // barrier with both destinations does what the two did (Graphics::MergeAdjacentBarriers;
-    // APS5_NO_DISPATCH_BARRIER_ELIDE=1 records them apart, Recorder::MergeDispatchBarriers).
-    const bool argumentsMerged = argumentImport != nullptr && leading && Graphics::Recorder::MergeDispatchBarriers();
     if (argumentImport != nullptr) {
         // The group counts were stored by earlier recorded work (a dispatch in place, a fill) or the
         // host; the indirect read follows all of it.
-        if (argumentsMerged) {
-            Graphics::Recorder::CountMerged(CommandClass::IndirectArguments);
-        } else {
-            const auto timing = recorder.BeginGpuTiming(CommandClass::IndirectArguments);
-            recordMemoryBarrier(Graphics::IndirectArgumentsBarrier);
-            Graphics::Recorder::CountBarriers(CommandClass::IndirectArguments);
-            recorder.EndGpuTiming(timing, 12);
-        }
+        const auto timing = recorder.BeginGpuTiming(CommandClass::IndirectArguments);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+        Graphics::Recorder::CountBarriers(CommandClass::IndirectArguments);
+        recorder.EndGpuTiming(timing, 12);
         recorder.NotePendingRead(arguments, 12, Graphics::Recorder::ReadKind::Indirect);
     }
-    if (!leading) {
+    // Results of earlier recorded work are visible to this dispatch, its own to everything after.
+    constexpr VkAccessFlags shaderAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    if ((covered & shaderAccess) == shaderAccess && barrierElision) {
         ++d.preBarriersSkipped;
         Graphics::Recorder::CountMerged(CommandClass::DispatchLeading);
     } else {
         const auto timing = recorder.BeginGpuTiming(CommandClass::DispatchLeading);
-        recordMemoryBarrier(argumentsMerged ? Graphics::MergeAdjacentBarriers(Graphics::IndirectArgumentsBarrier, Graphics::DispatchLeadingBarrier) : Graphics::DispatchLeadingBarrier);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         Graphics::Recorder::CountBarriers(CommandClass::DispatchLeading);
         recorder.EndGpuTiming(timing);
         ++d.preBarriersRecorded;
@@ -3805,18 +3793,15 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         const auto inPlace = resources.InPlaceReads();
         recorder.NoteInPlace(gpuTiming, Graphics::Recorder::InPlaceUseOf(inPlace, resources.GpuWrites(), {}, resources.HoldsLease()));
     }
-    // Its coverage leaves out the leading barrier of the copy-back right after it (MarkGpuWrites)
-    // and of the next dispatch or staging copy-in when nothing else is recorded first. Deferred
-    // (APS5_DISPATCH_OVERLAP), whatever records next records it before reading the coverage
-    // (Recorder::Commands), or an overlapping dispatch of the same span leaves it out.
+    constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
     if (guestOrder.span != 0) {
-        recorder.DeferDispatchTrail(guestOrder, Graphics::DispatchTrailingBarrier.destinationAccess);
+        recorder.DeferDispatchTrail(guestOrder, dispatchedAccess);
     } else {
         const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
-        recordMemoryBarrier(Graphics::DispatchTrailingBarrier);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
         Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
         recorder.EndGpuTiming(trailingTiming);
-        recorder.MarkCovered(Graphics::DispatchTrailingBarrier.destinationAccess);
+        recorder.MarkCovered(dispatchedAccess);
     }
     recordStep(PhaseRecordBind);
     // The marks' parts (ShaderResources::MarkGpuWrites' timing) as rows splitting "record: marks".
