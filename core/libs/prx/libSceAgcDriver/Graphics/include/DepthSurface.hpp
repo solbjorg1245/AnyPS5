@@ -65,9 +65,18 @@ std::string DepthViewportDigest();
 // dispatches). NoteDisplayBufferDraw runs for every draw (prepareDrawInputs), AspectProbeDispatch
 // around every dispatch (Driver::dispatch), NoteDisplayBufferStorageWrite where a storage image is
 // marked written (StorageTexture::MarkDirty), NoteDisplayBufferPresent at every present.
+// The display buffer's composite also names the UI target (the one texture it samples at the
+// display buffer's size, or APS5_NATIVE_ASPECT_UI_TARGET); the digest lists the composite's samples
+// and the UI target's draws ('UI draw', grouped by state) and dispatches, and how many were remapped.
 void NoteDisplayBufferPresent(std::uint64_t address);
 void NoteDisplayBufferDraw(const State& state, std::span<const CompiledShader> shaders);
 void NoteDisplayBufferStorageWrite(std::uint64_t address, std::uint32_t width, std::uint32_t height);
+// APS5_NATIVE_ASPECT_UI_RECT=1 (experimental, native aspect only): the viewport and scissor a draw
+// records. A blended draw into the UI target is mapped into the part of the target the presenter
+// shows undistorted (ComputeUndistortedRect at the presentation aspect), so the 16:9 UI keeps its
+// proportions in a centred region; every other draw keeps state.viewport and state.scissor.
+VkViewport UiRectViewport(const State& state);
+VkRect2D UiRectScissor(const State& state);
 struct AspectProbeDispatch {
     explicit AspectProbeDispatch(std::uint64_t program);
     ~AspectProbeDispatch();
