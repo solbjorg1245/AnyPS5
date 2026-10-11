@@ -2654,7 +2654,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                     const auto& own = moved->first->Descriptor();
                     std::snprintf(movedText, sizeof(movedText), "image 0x%llx %ux%u format %u re-uploaded (version %llu -> %llu)", static_cast<unsigned long long>(own.baseAddress), own.width, own.height, static_cast<unsigned>(own.format), static_cast<unsigned long long>(moved->second), static_cast<unsigned long long>(moved->first->Version()));
                 }
-                std::fprintf(stderr, "[rescache] fast proof wrong (%s path, stage %u variant 0x%llx, %zu textures %zu storage images): %s%s | %s\n", ownRefreshed ? "T1" : accepted ? "accepted-overlap" : "fast", static_cast<unsigned>(shaders.front().stage), static_cast<unsigned long long>(shaders.front().program != nullptr ? shaders.front().program->variantId : 0), textures.size(), storageTextures.size(), same ? "" : walkMismatch, movedText, Describe().c_str());
+                // APS5_TRACE_WALKS adds the object the walk's lookup returned (walkReplacement).
+                std::fprintf(stderr, "[rescache] fast proof wrong (%s path, stage %u variant 0x%llx, %zu textures %zu storage images): %s%s%s | %s\n", ownRefreshed ? "T1" : accepted ? "accepted-overlap" : "fast", static_cast<unsigned>(shaders.front().stage), static_cast<unsigned long long>(shaders.front().program != nullptr ? shaders.front().program->variantId : 0), textures.size(), storageTextures.size(), same ? "" : walkMismatch, same ? "" : walkReplacement, movedText, Describe().c_str());
             }
         }
         const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
