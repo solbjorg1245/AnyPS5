@@ -18,6 +18,7 @@
 #include "prx/libkernel/Time/include/Time.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
 #include "prx/libSceVideoOut/include/TimestepPatch.hpp"
+#include "prx/libSceVideoOut/include/NativeAspectPatch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -142,6 +143,7 @@ public:
         if (info.index >= 0) ++cfg->bufferPending[info.index];
         request->reserved = true;
         TimestepPatch::Get().Flip(vblankRate());
+        NativeAspectPatch::Get().Flip();
         return request;
     }
 

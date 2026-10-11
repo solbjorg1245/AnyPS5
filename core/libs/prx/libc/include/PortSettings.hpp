@@ -4,15 +4,18 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -30,6 +33,7 @@
 //   Timestep = fixed          APS5_TIMESTEP         variable (1): the frame step follows the frame time
 //   TimestepMinHz = 19.98     APS5_TIMESTEP_MIN_HZ  slowest step rate; slower frames slow the game down
 //   WindowMode = windowed     APS5_WINDOW_MODE      or fullscreen (desktop size, the frame scaled into it)
+//   NativeAspect = off        APS5_NATIVE_ASPECT    on (1): render at Resolution's aspect, wider view (Hor+)
 //   Upscaler = off            APS5_UPSCALER         reserved: fsr, dlss (UpscalerQuality and FrameGeneration: file only, reserved)
 // The title takes one fixed physics step of 1/refresh per rendered frame (59.94 Hz in its 60 FPS mode,
 // 29.97 Hz in its 30 FPS mode), so any other limit, and any frame rate below the limit, changes the game
@@ -54,12 +58,13 @@ struct Settings {
     bool variableTimestep = false;
     double timestepMinHz = DefaultTimestepMinHz;
     WindowMode windowMode = WindowMode::Auto;
+    bool nativeAspect = false;
     Upscaler upscaler = Upscaler::Off;
     std::string upscalerQuality;
     bool frameGeneration = false;
     std::vector<std::string> warnings;
 
-    bool Any() const { return width != 0 || renderHeight != 0 || fpsLimit != 0.0 || variableTimestep || windowMode != WindowMode::Auto; }
+    bool Any() const { return width != 0 || renderHeight != 0 || fpsLimit != 0.0 || variableTimestep || windowMode != WindowMode::Auto || nativeAspect; }
 };
 
 // The title's render tiers (r_Wants4K): internal resolution; the title upscales to its 1080p or 2160p
@@ -250,6 +255,10 @@ inline void SetKey(Settings& settings, std::string_view key, std::string_view va
         else if (text == "windowed") settings.windowMode = WindowMode::Windowed;
         else if (text == "fullscreen") settings.windowMode = WindowMode::Fullscreen;
         else refuse("auto, windowed or fullscreen");
+    } else if (name == "nativeaspect") {
+        if (text == "off" || text == "0" || text == "false") settings.nativeAspect = false;
+        else if (text == "on" || text == "1" || text == "true") settings.nativeAspect = true;
+        else refuse("on or off");
     } else if (name == "upscaler") {
         if (text == "off") settings.upscaler = Upscaler::Off;
         else if (text == "fsr" || text == "dlss") settings.warnings.push_back(origin + ": Upscaler = " + text + " is not implemented yet; using off");
@@ -287,10 +296,10 @@ inline Settings Parse(std::string_view text, const std::string& origin) {
 }
 
 inline void ApplyEnvironment(Settings& settings, const std::function<const char*(const char*)>& lookup) {
-    static constexpr std::array<std::pair<const char*, const char*>, 7> variables{{
+    static constexpr std::array<std::pair<const char*, const char*>, 8> variables{{
         {"APS5_RESOLUTION", "Resolution"}, {"APS5_RENDER_RESOLUTION", "RenderResolution"}, {"APS5_FPS_LIMIT", "FpsLimit"},
         {"APS5_TIMESTEP", "Timestep"}, {"APS5_TIMESTEP_MIN_HZ", "TimestepMinHz"}, {"APS5_WINDOW_MODE", "WindowMode"},
-        {"APS5_UPSCALER", "Upscaler"}}};
+        {"APS5_NATIVE_ASPECT", "NativeAspect"}, {"APS5_UPSCALER", "Upscaler"}}};
     for (const auto& [variable, key] : variables) {
         const char* value = lookup(variable);
         if (value != nullptr && value[0] != '\0') SetKey(settings, key, value, variable);
@@ -306,6 +315,10 @@ inline void Normalize(Settings& settings) {
             settings.fpsLimit, settings.fpsLimit / GameRefresh60);
         settings.warnings.push_back(text);
         settings.fpsLimit = 60.0;
+    }
+    if (settings.nativeAspect && settings.width == 0) {
+        settings.warnings.push_back("NativeAspect = on needs Resolution = WIDTHxHEIGHT (the aspect to render at); using off");
+        settings.nativeAspect = false;
     }
 }
 
@@ -333,6 +346,111 @@ inline const RenderTier* SelectRenderTier(const Settings& settings) {
         if (RenderTiers[index].height >= imageHeight) return &RenderTiers[index];
     }
     return &RenderTiers[RenderTiers.size() - 2];
+}
+
+// Native aspect (NativeAspect = on): the title renders at Resolution's aspect instead of a 16:9 tier.
+// Its r_Wants4K tiers come from a table (render and display width/height per mode, read for every view's
+// render targets); libSceVideoOut NativeAspectPatch rewrites one slot's render size there and sets the
+// display's aspect, which the camera's projection reads (its FOV is vertical: a wider aspect widens the
+// view, Hor+). The slot's display buffer keeps its 16:9 size and holds the wider image squeezed; the
+// presenter shows it at Resolution's aspect. The slot is the first whose own render size holds the
+// planned one (the title also sizes shared targets from the slot's 16:9 render size) and whose display
+// buffer is at least the output in both directions (else the first that holds the render size).
+struct NativeAspectSlot {
+    std::uint32_t renderWidth;
+    std::uint32_t renderHeight;
+    std::uint32_t displayWidth;
+    std::uint32_t displayHeight;
+    std::uint32_t mode;
+    const char* convar;
+};
+inline constexpr std::array<NativeAspectSlot, 4> NativeAspectSlots{{
+    {1600, 900, 1920, 1080, 1, "WantsPerf"}, {1920, 1080, 1920, 1080, 2, "WantsBase"}, {2560, 1440, 3840, 2160, 3, "WantsHigh"},
+    {3840, 2160, 3840, 2160, 4, "WantsSuperHigh"}}};
+
+struct NativeAspectPlan {
+    std::uint32_t renderWidth = 0;
+    std::uint32_t renderHeight = 0;
+    std::uint32_t aspectWidth = 0;
+    std::uint32_t aspectHeight = 0;
+    const NativeAspectSlot* slot = nullptr;
+
+    bool Active() const { return slot != nullptr; }
+    float Aspect() const { return aspectHeight == 0 ? 0.0f : static_cast<float>(static_cast<double>(aspectWidth) / aspectHeight); }
+};
+
+// The render size for Resolution WxH: RenderResolution's height, else the output height up to 1440 (as
+// the tiers: a 2160p output renders 1440p), the width from the aspect; at most 3840x2160 (the title's
+// shared render-target memory is sized for that), width a multiple of 8, height of 4.
+inline NativeAspectPlan PlanNativeAspect(const Settings& settings) {
+    NativeAspectPlan plan;
+    if (!settings.nativeAspect || settings.width == 0 || settings.height == 0) return plan;
+    const double aspect = static_cast<double>(settings.width) / settings.height;
+    double height = settings.renderHeight != 0 ? settings.renderHeight : std::min<std::uint32_t>(settings.height, 1440);
+    double width = height * aspect;
+    if (width > 3840.0) {
+        width = 3840.0;
+        height = width / aspect;
+    }
+    if (height > 2160.0) {
+        height = 2160.0;
+        width = height * aspect;
+    }
+    plan.renderWidth = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::lround(width / 8.0)) * 8, 320, 3840);
+    plan.renderHeight = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::lround(height / 4.0)) * 4, 180, 2160);
+    plan.aspectWidth = settings.width;
+    plan.aspectHeight = settings.height;
+    const auto holds = [&](const NativeAspectSlot& slot) { return plan.renderWidth <= slot.renderWidth && plan.renderHeight <= slot.renderHeight; };
+    for (const auto& slot : NativeAspectSlots) {
+        if (holds(slot) && settings.width <= slot.displayWidth && settings.height <= slot.displayHeight) {
+            plan.slot = &slot;
+            return plan;
+        }
+    }
+    for (const auto& slot : NativeAspectSlots) {
+        if (holds(slot)) {
+            plan.slot = &slot;
+            return plan;
+        }
+    }
+    return plan;
+}
+
+// The title's tier table in the supported build (PE VA 0x14251eb48, read by FUN_14091ab90): render width,
+// render height, display width, display height, five entries each, indexed by EWantsDisplayMode - 1
+// (WantsPerf 1 .. WantsTrinity 5). The render half is the signature that must occur once; the display
+// half is only checked for the log (it is never written).
+inline constexpr std::array<std::uint32_t, 20> TierTable{{1600, 1920, 2560, 3840, 2688, 900, 1080, 1440, 2160, 1512,
+    1920, 1920, 3840, 3840, 3840, 1080, 1080, 2160, 2160, 2160}};
+inline constexpr std::size_t TierTableSignatureEntries = 10;
+// The CRenderDisplay singleton pointer (DAT_142f1a988) relative to the table, and the object's fields:
+// +4 the aspect every camera projection divides by (16:9 from its Init), +0x3c the EWantsDisplayMode.
+inline constexpr std::ptrdiff_t DisplaySingletonFromTierTable = 0x142f1a988 - 0x14251eb48;
+inline constexpr std::size_t DisplayAspectOffset = 0x4;
+inline constexpr std::size_t DisplayModeOffset = 0x3c;
+inline constexpr std::uint32_t Aspect16x9Bits = 0x3fe38e39;
+
+struct TableWrite {
+    std::size_t entry;
+    std::uint32_t value;
+};
+
+// The two entries the plan rewrites: the slot's render width and render height.
+inline std::array<TableWrite, 2> TierTableWrites(const NativeAspectPlan& plan) {
+    const std::size_t index = plan.slot->mode - 1;
+    return {{{index, plan.renderWidth}, {5 + index, plan.renderHeight}}};
+}
+
+inline std::uint32_t AspectBits(float aspect) { return std::bit_cast<std::uint32_t>(aspect); }
+
+// The value the display's aspect field should hold: the plan's aspect while the display runs the slot's
+// mode (its views then render the rewritten size), 16:9 in any other mode; nothing when the field holds
+// neither value (another layout: leave it alone).
+inline std::optional<std::uint32_t> DisplayAspectBits(std::uint32_t current, std::int32_t mode, const NativeAspectPlan& plan) {
+    const auto wide = AspectBits(plan.Aspect());
+    if (current != wide && current != Aspect16x9Bits) return std::nullopt;
+    if (mode < 0 || mode > 5) return std::nullopt;
+    return static_cast<std::uint32_t>(mode) == plan.slot->mode ? wide : Aspect16x9Bits;
 }
 
 struct ClientSize {
@@ -363,7 +481,8 @@ inline bool DpiAwareWindow(const Settings& settings, const char* switchValue) {
 // The title's arguments the settings imply; empty when they imply none.
 inline std::vector<std::string> GameArgs(const Settings& settings) {
     std::vector<std::string> args;
-    if (const auto* tier = SelectRenderTier(settings)) args.push_back(std::string("+r_Wants4K=") + tier->convar);
+    if (const auto plan = PlanNativeAspect(settings); plan.Active()) args.push_back(std::string("+r_Wants4K=") + plan.slot->convar);
+    else if (const auto* tier = SelectRenderTier(settings)) args.push_back(std::string("+r_Wants4K=") + tier->convar);
     if (const auto fps = GameFramesPerSecond(settings)) args.push_back("+TargetFramesPerSecond=" + std::to_string(fps));
     return args;
 }
@@ -389,7 +508,11 @@ inline std::string Describe(const Settings& settings) {
         std::snprintf(text, sizeof(text), "Resolution %ux%u, ", settings.width, settings.height);
         result += text;
     }
-    if (const auto* tier = SelectRenderTier(settings)) {
+    if (const auto plan = PlanNativeAspect(settings); plan.Active()) {
+        std::snprintf(text, sizeof(text), "native aspect %.4f: render %ux%u in the r_Wants4K=%s slot (display buffer %ux%u), ", plan.Aspect(),
+            plan.renderWidth, plan.renderHeight, plan.slot->convar, plan.slot->displayWidth, plan.slot->displayHeight);
+        result += text;
+    } else if (const auto* tier = SelectRenderTier(settings)) {
         std::snprintf(text, sizeof(text), "render r_Wants4K=%s (%ux%u), ", tier->convar, tier->width, tier->height);
         result += text;
     }

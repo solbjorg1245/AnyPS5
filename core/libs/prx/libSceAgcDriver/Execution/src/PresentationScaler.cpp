@@ -125,7 +125,7 @@ void PresentationScaler::RecordBlit(VkCommandBuffer commands, VkImage destinatio
 
 void PresentationScaler::RecordBlitFrom(const Graphics::Context& context, VkCommandBuffer commands, VkImage image, VkImageLayout layout, std::uint32_t width, std::uint32_t height, VkFilter filter, VkImage destinationImage, std::uint32_t destinationWidth, std::uint32_t destinationHeight) {
     Graphics::Require(image != VK_NULL_HANDLE && width != 0 && height != 0, "presentation blit source is unavailable");
-    const auto rect = ComputeContainRect_nid_postfix(width, height, destinationWidth, destinationHeight);
+    const auto rect = ComputePresentationRect_nid_postfix(width, height, destinationWidth, destinationHeight);
     VkImageBlit blit{};
     blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.srcOffsets[0] = {0, 0, 0};
