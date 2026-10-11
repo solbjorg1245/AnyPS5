@@ -70,6 +70,12 @@ bool& recordPipeReplaying() {
     return replaying;
 }
 
+// A: set by the hand-over, read and cleared at the packet's end (recordPipeTookDraw).
+bool& recordPipeHandedDraw() {
+    static thread_local bool handed = false;
+    return handed;
+}
+
 bool recordPipeProfile() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return profile;
@@ -226,9 +232,16 @@ void Driver::handOverDraw(DrawScratch& scratch, RecordPipeDraw&& draw, const Que
     notePipeTargets(slot.draw.decode->state, serial, pipe.overlay);
     if (!pipe.thread.joinable()) pipe.thread = HostThread([this] { runRecordPipe(); });
     pipe.ring.Publish(serial);
+    recordPipeHandedDraw() = true;
     ++pipe.items;
     ++pipe.run;
     wakeSide(pipe.bSleeping, pipe.bWake);
+}
+
+bool Driver::recordPipeTookDraw() {
+    const bool handed = recordPipeHandedDraw();
+    recordPipeHandedDraw() = false;
+    return handed;
 }
 
 bool Driver::recordPipeTakesSubmit() {
@@ -452,6 +465,10 @@ void Driver::runRecordPipe() noexcept {
             slot.draw.entry.reset();
             slot.draw.device.reset();
             slot.draw.recipe.reset();
+            // B counts the item once it is in the open batch (A skips handed draws at the packet's
+            // end): a submit between A's count and B's recording cleared it, and the EOP's and the
+            // submission end's submit-if-open then left the recorded draw in an unsubmitted batch.
+            Graphics::Recorder::CountRecordedWork();
             pipe.ring.Consume(serial);
             wakeSide(pipe.aSleeping, pipe.aWake);
         }

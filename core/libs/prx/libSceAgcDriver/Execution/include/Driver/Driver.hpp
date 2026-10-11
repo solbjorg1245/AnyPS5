@@ -210,6 +210,8 @@ private:
     void recordPipeSubmissionEnd();
     // A's deadline submit on queue 0 goes to B while B has items (S2.1, APS5_RECORD_PIPE_NO_B_SUBMIT=1: off).
     static bool recordPipeTakesSubmit();
+    // Whether the packet's draw was handed over (cleared by the call): B counts it as recorded work.
+    static bool recordPipeTookDraw();
     bool recordPipeItem(DrawScratch& scratch, RecordPipeDraw& item);
     void runRecordPipe() noexcept;
     void stopRecordPipe();

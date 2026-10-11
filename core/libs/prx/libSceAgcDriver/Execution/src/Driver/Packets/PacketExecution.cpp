@@ -425,7 +425,7 @@ void Driver::execute(const Submission& submission) {
             }
             if (endOfPipeInterrupt && !interruptDeferred) AgcDriverDeliverEopInterrupt(submission.queue);
         }
-        if (drawPacket) Graphics::Recorder::CountRecordedWork();
+        if (drawPacket && !(recordPipe && submission.queue == 0 && recordPipeTookDraw())) Graphics::Recorder::CountRecordedWork();
         if (fastCensus) NoteFastCensusPacket(submission.queue, header, drawPacket, header == FlipPacketHeader, header == RenderingWaitPacketHeader, wroteOnGpu);
         if (pipeCensus && submission.queue == 0) NotePipeCensusPacket(header, drawPacket, header == FlipPacketHeader, header == RenderingWaitPacketHeader, wroteOnGpu, pendingDispatchPhases().outcome);
         cursor += count;
