@@ -86,7 +86,8 @@ the shared render targets at `Resolution` itself (the post effects break: bloom 
 and `APS5_NATIVE_ASPECT_UI=1` gives the display buffer the window's shape (the bottom HUD is cut off
 when the window is wider than 16:9). `APS5_NATIVE_ASPECT_UI_RECT=1` (experimental, without
 `APS5_NATIVE_ASPECT_UI`) draws the HUD into a centred 16:9 region instead of stretching it across the
-window.
+window. Known issue: at 2560x1080 the item icons in the HUD and in the equipment menu are missing with
+`APS5_NATIVE_ASPECT_UI_RECT=1` (at 1280x800 they show).
 
 Troubleshooting: GPU-to-guest copy-backs are coalesced and narrowed (only changed dwords are written
 back) by default. `APS5_NO_COALESCE_COPY_BACKS=1` and `APS5_NO_NARROW_COPY_BACKS=1` turn these off
