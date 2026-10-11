@@ -44,6 +44,9 @@
 //                             up to 1080p runs its tier's own 1080p-display slot again (same HUD fault)
 //   Upscaler = off            APS5_UPSCALER         reserved: fsr, dlss (UpscalerQuality and FrameGeneration: file only, reserved)
 //   GameDir = "D:\PPSA01341-app0"                   the player's dump (app0), set by the launcher; the game ignores it
+//   DeluxeEdition = auto      APS5_DELUXE_EDITION   the Deluxe Edition add-on, owned when the dump holds it
+//                                                   (AddonContent.hpp); off answers 'not owned' even then
+//   AddonDir = "D:\PPSA01341-ac"                    a folder holding the dumped add-ons, when not next to app0
 // The title takes one fixed physics step of 1/refresh per rendered frame (59.94 Hz in its 60 FPS mode,
 // 29.97 Hz in its 30 FPS mode), so any other limit, and any frame rate below the limit, changes the game
 // speed unless Timestep = variable (libSceVideoOut TimestepPatch) feeds it the measured frame rate.
@@ -57,6 +60,7 @@ inline constexpr double DefaultTimestepMinHz = 20000.0 / 1001.0;
 
 enum class WindowMode { Auto, Windowed, Fullscreen };
 enum class Upscaler { Off, Fsr, Dlss };
+enum class DeluxeEdition { Auto, Off };
 
 struct Settings {
     std::string source;
@@ -78,6 +82,8 @@ struct Settings {
     std::string upscalerQuality;
     bool frameGeneration = false;
     std::string gameDir;  // UTF-8, without the quotes
+    DeluxeEdition deluxeEdition = DeluxeEdition::Auto;
+    std::string addonDir;  // UTF-8, without the quotes
     std::vector<std::string> warnings;
 
     bool Any() const { return width != 0 || renderHeight != 0 || fpsLimit != 0.0 || variableTimestep || windowMode != WindowMode::Auto || nativeAspect; }
@@ -308,6 +314,12 @@ inline void SetKey(Settings& settings, std::string_view key, std::string_view va
         else settings.warnings.push_back(origin + ": FrameGeneration is not implemented yet; using off");
     } else if (name == "gamedir") {
         settings.gameDir = std::string(Unquote(value));
+    } else if (name == "deluxeedition") {
+        if (text == "auto" || text == "on" || text == "1" || text == "true") settings.deluxeEdition = DeluxeEdition::Auto;
+        else if (text == "off" || text == "0" || text == "false") settings.deluxeEdition = DeluxeEdition::Off;
+        else refuse("auto or off");
+    } else if (name == "addondir") {
+        settings.addonDir = std::string(Unquote(value));
     } else {
         settings.warnings.push_back(origin + ": unknown key '" + std::string(Trim(key)) + "'");
     }
@@ -336,10 +348,10 @@ inline Settings Parse(std::string_view text, const std::string& origin) {
 }
 
 // The variable that overrides each key (the launcher names the ones set, which win over its choices).
-inline constexpr std::array<std::pair<const char*, const char*>, 8> EnvironmentKeys{{
+inline constexpr std::array<std::pair<const char*, const char*>, 9> EnvironmentKeys{{
     {"APS5_RESOLUTION", "Resolution"}, {"APS5_RENDER_RESOLUTION", "RenderResolution"}, {"APS5_FPS_LIMIT", "FpsLimit"},
     {"APS5_TIMESTEP", "Timestep"}, {"APS5_TIMESTEP_MIN_HZ", "TimestepMinHz"}, {"APS5_WINDOW_MODE", "WindowMode"},
-    {"APS5_NATIVE_ASPECT", "NativeAspect"}, {"APS5_UPSCALER", "Upscaler"}}};
+    {"APS5_NATIVE_ASPECT", "NativeAspect"}, {"APS5_UPSCALER", "Upscaler"}, {"APS5_DELUXE_EDITION", "DeluxeEdition"}}};
 
 inline void ApplyEnvironment(Settings& settings, const std::function<const char*(const char*)>& lookup) {
     for (const auto& [variable, key] : EnvironmentKeys) {
@@ -712,6 +724,7 @@ inline std::string Describe(const Settings& settings) {
     }
     result += settings.windowMode == WindowMode::Fullscreen ? ", WindowMode fullscreen" : settings.windowMode == WindowMode::Windowed ? ", WindowMode windowed" : "";
     result += ", Upscaler off";
+    if (settings.deluxeEdition == DeluxeEdition::Off) result += ", Deluxe Edition content off";
     result += settings.source.empty() ? " (no settings file)" : " (" + settings.source + ")";
     return result;
 }
@@ -757,7 +770,8 @@ inline std::vector<std::pair<std::string, std::string>> LauncherValues(const Set
         {"WindowMode", settings.windowMode == WindowMode::Fullscreen ? "fullscreen" : "windowed"}, // auto is windowed (DisplayWindow)
         {"FpsLimit", settings.fpsLimit == 0.0 ? std::string("auto") : FormatNumber(settings.fpsLimit)},
         {"Timestep", settings.variableTimestep ? "variable" : "fixed"},
-        {"NativeAspect", settings.nativeAspect ? "on" : "off"}};
+        {"NativeAspect", settings.nativeAspect ? "on" : "off"},
+        {"DeluxeEdition", settings.deluxeEdition == DeluxeEdition::Off ? "off" : "auto"}};
 }
 
 // LauncherValues plus the game folder, quoted (a path may hold '#' or ';'). An empty folder is written as

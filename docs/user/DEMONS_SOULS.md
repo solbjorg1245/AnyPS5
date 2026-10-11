@@ -95,7 +95,8 @@ cache), `ANYPS5_NO_SHADER_CACHE=1` (no disk cache).
 ### Settings window
 
 `anyps5-launcher` is the settings window: game folder (see [Install](#install)), resolution (the
-presets, your desktop's size or auto), window mode, FPS limit, timestep and native aspect. Use the mouse,
+presets, your desktop's size or auto), window mode, FPS limit, timestep, native aspect and the Deluxe
+Edition content (see [Deluxe Edition content](#deluxe-edition-content)). Use the mouse,
 the keyboard (arrow keys, Enter) or a controller (D-pad, A; Start plays). **Play** saves
 `anyps5-settings.ini`, runs the setup when it is due and starts the game; **Quit** or closing the window
 exits. Your comments and other keys in the file are kept. Upscaler and frame generation are shown greyed
@@ -124,6 +125,8 @@ by these keys:
 | `Timestep` | `APS5_TIMESTEP` | `fixed` (the game's own: slow motion below the limit) or `variable` (experimental: the game keeps its speed at any frame rate) |
 | `WindowMode` | `APS5_WINDOW_MODE` | `windowed` or `fullscreen` |
 | `NativeAspect` | `APS5_NATIVE_ASPECT` | `off` or `on` (experimental: renders at `Resolution`'s own aspect, e.g. 21:9, instead of letterboxed 16:9) |
+| `DeluxeEdition` | `APS5_DELUXE_EDITION` | `auto` (the Deluxe Edition add-on is owned when your dump holds it) or `off` (not owned, even then); see [Deluxe Edition content](#deluxe-edition-content) |
+| `AddonDir` | | a folder holding your dumped add-ons, when they are not next to the game folder |
 
 The log shows the result in its `[settings]` lines.
 
@@ -146,6 +149,27 @@ Two environment-only switches go further and are experimental: `APS5_NATIVE_ASPE
 the shared render targets at `Resolution` itself (the post effects break: bloom blobs and ghosting),
 and `APS5_NATIVE_ASPECT_UI=1` gives the display buffer the window's shape (the bottom HUD is cut off
 when the window is wider than 16:9).
+
+### Deluxe Edition content
+
+The Digital Deluxe Edition's in-game items (the Fluted armour set) come with an add-on the game asks the
+system for (entitlement `DEMONSSOULSGIFT2`; the pre-order gift is `DEMONSSOULSGIFT1`). AnyPS5 answers
+from what your dump holds: the add-on counts as owned only when your dump contains it, and nothing is
+ever written into your dump. When it is owned, the game offers the Deluxe items when you create a
+character and puts them into that character's inventory.
+
+What counts as the add-on in your dump: a non-empty folder whose name holds the entitlement label or its
+content id (for example `EP9000-PPSA01341_00-DEMONSSOULSGIFT2`), or whose `sce_sys/param.json` or
+`param.sfo` names that content id. It is looked for next to the game folder (the dump's `app0`), up to
+two levels into a folder named with the title id or `addcont` / `dlc` there (`PPSA01341-ac\...`,
+`addcont\PPSA01341\...`), and in `AddonDir` when you set one. Other game dumps (folders with an
+`eboot.bin`) are not looked into.
+
+The settings window shows the row **Deluxe Edition content**: "Found in your dump" with a checkbox to
+turn the owned add-on off (and on again), or "Not found in your dump", greyed out. Turning it off makes
+the game take the Deluxe items away from a character that has them (as on a console without the
+add-on); turning it on again gives them back. The log line `[settings] deluxe edition: ...` says what was
+found and whether it is enabled. An `anyps5-entitlements.ini` entry for `DEMONSSOULSGIFT2` is ignored.
 
 Troubleshooting: GPU-to-guest copy-backs are coalesced and narrowed (only changed dwords are written
 back) by default. `APS5_NO_COALESCE_COPY_BACKS=1` and `APS5_NO_NARROW_COPY_BACKS=1` turn these off

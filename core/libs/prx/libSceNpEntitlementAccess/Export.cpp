@@ -2,7 +2,11 @@
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/AddonContent.hpp"
+#include "prx/libc/include/PortSettings.hpp"
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -33,31 +37,73 @@ std::filesystem::path EntitlementsPath() {
 #endif
 }
 
+std::vector<std::string> FileLabels() {
+    std::vector<std::string> labels;
+    const auto path = EntitlementsPath();
+    std::ifstream file(path);
+    if (!file) {
+        if (std::getenv("ANYPS5_ENTITLEMENTS") != nullptr || std::filesystem::exists(path)) throw std::runtime_error("NpEntitlementAccess: cannot read " + path.string());
+        return labels;
+    }
+    std::string line;
+    while (std::getline(file, line)) {
+        line.erase(std::min(line.find_first_of("#;"), line.size()));
+        const auto first = line.find_first_not_of(" \t\r");
+        if (first == std::string::npos) continue;
+        const auto label = line.substr(first, line.find_last_not_of(" \t\r") + 1 - first);
+        if (label.size() >= sizeof(NpUnifiedEntitlementLabel::data)) throw std::runtime_error("NpEntitlementAccess: entitlement label '" + label + "' in " + path.string() + " is longer than 16 characters");
+        labels.push_back(label);
+    }
+    return labels;
+}
+
+// The game's dump folders: GameDir from the settings (the launcher's), and /app0 with the dump its folders
+// link to (the release's setup links the dump's folders into app0).
+std::vector<std::filesystem::path> GameFolders(const PortSettings::Settings& settings) {
+    std::vector<std::filesystem::path> folders;
+    if (!settings.gameDir.empty()) folders.push_back(AddonContent::PathFromText(settings.gameDir));
+    for (const auto& folder : AddonContent::DumpFolders(ResolvePath_nid_no_patch("/app0"))) folders.push_back(folder);
+    return folders;
+}
+
+// The add-ons the player owns: the entitlements file's labels and the title's add-ons found in the dump
+// (s61 T-deluxe: the Deluxe Edition only from the dump, and not with DeluxeEdition = off). Logged once,
+// with the '[settings] deluxe edition' line.
 const std::vector<NpEntitlementAccessAddcontEntitlementInfo>& OwnedAddons() {
     static const auto owned = [] {
+        const auto& settings = GetPortSettings_nid_no_patch();
+        const bool deluxe = settings.deluxeEdition != PortSettings::DeluxeEdition::Off;
+        const auto found = AddonContent::Find(GameFolders(settings), AddonContent::PathFromText(settings.addonDir));
+        std::vector<std::string> notes;
+        const auto labels = AddonContent::AnsweredLabels(FileLabels(), found, deluxe, notes);
         std::vector<NpEntitlementAccessAddcontEntitlementInfo> addons;
-        const auto path = EntitlementsPath();
-        std::ifstream file(path);
-        if (!file) {
-            if (std::getenv("ANYPS5_ENTITLEMENTS") != nullptr || std::filesystem::exists(path)) throw std::runtime_error("NpEntitlementAccess: cannot read " + path.string());
-            return addons;
-        }
-        std::string line;
-        while (std::getline(file, line)) {
-            line.erase(std::min(line.find_first_of("#;"), line.size()));
-            const auto first = line.find_first_not_of(" \t\r");
-            if (first == std::string::npos) continue;
-            const auto label = line.substr(first, line.find_last_not_of(" \t\r") + 1 - first);
+        for (const auto& label : labels) {
             NpEntitlementAccessAddcontEntitlementInfo info{};
-            if (label.size() >= sizeof(info.entitlement_label.data)) throw std::runtime_error("NpEntitlementAccess: entitlement label '" + label + "' in " + path.string() + " is longer than 16 characters");
             std::memcpy(info.entitlement_label.data, label.data(), label.size());
             info.package_type = 3;
             info.download_status = 4;
             addons.push_back(info);
         }
+        const auto* entry = AddonContent::FindLabel(found, AddonContent::DeluxeEditionLabel);
+        if (entry != nullptr) std::fprintf(stderr, "[settings] deluxe edition: found in the dump (%s: %s), %s\n", PortSettings::PathText(entry->folder).c_str(), entry->reason.c_str(), deluxe ? "enabled" : "turned off (DeluxeEdition = off)");
+        else std::fprintf(stderr, "[settings] deluxe edition: not found in the dump, not owned%s\n", deluxe ? "" : " (DeluxeEdition = off)");
+        for (const auto& note : notes) std::fprintf(stderr, "[entitlement] %s\n", note.c_str());
+        std::string answered;
+        for (const auto& label : labels) answered += (answered.empty() ? "" : ", ") + label;
+        std::fprintf(stderr, "[entitlement] owned add-ons: %s\n", answered.empty() ? "none" : answered.c_str());
+        std::fflush(stderr);
         return addons;
     }();
     return owned;
+}
+
+// The game's queries, the first few of each kind (the answer is fixed for the process).
+void LogQuery(const char* what, const char* label, int result, std::uint32_t hits) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) >= 8) return;
+    if (label != nullptr) std::fprintf(stderr, "[entitlement] %s %.16s: %s\n", what, label, result == 0 ? "owned" : "not owned");
+    else std::fprintf(stderr, "[entitlement] %s: %u owned\n", what, hits);
+    std::fflush(stderr);
 }
 
 }
@@ -70,9 +116,11 @@ int APS5_VABI sceNpEntitlementAccessGetAddcontEntitlementInfo(uint32_t service_l
     for (const auto& addon : OwnedAddons()) {
         if (std::strncmp(addon.entitlement_label.data, entitlement_label->data, sizeof(entitlement_label->data)) == 0) {
             *info = addon;
+            LogQuery("GetAddcontEntitlementInfo", entitlement_label->data, 0, 1);
             return 0;
         }
     }
+    LogQuery("GetAddcontEntitlementInfo", entitlement_label->data, SCE_NP_ENTITLEMENT_ACCESS_ERROR_NOT_FOUND, 0);
     return SCE_NP_ENTITLEMENT_ACCESS_ERROR_NOT_FOUND;
 }
 
@@ -82,6 +130,7 @@ int APS5_VABI sceNpEntitlementAccessGetAddcontEntitlementInfoList(uint32_t servi
     const auto& owned = OwnedAddons();
     *hit_num = static_cast<uint32_t>(owned.size());
     std::copy_n(owned.begin(), std::min<std::size_t>(list_num, owned.size()), list);
+    LogQuery("GetAddcontEntitlementInfoList", nullptr, 0, *hit_num);
     return 0;
 }
 
@@ -94,6 +143,7 @@ int APS5_VABI sceNpEntitlementAccessGetSkuFlag(uint32_t* sku_flag) {
 int APS5_VABI sceNpEntitlementAccessInitialize(const NpEntitlementAccessInitParam* init_param, NpEntitlementAccessBootParam* boot_param) {
     (void)init_param;
     (void)boot_param;
+    OwnedAddons();  // the dump is looked at (and the '[settings] deluxe edition' line printed) at boot
     return 0;
 }
 
