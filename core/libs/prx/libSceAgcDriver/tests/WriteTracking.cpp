@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #ifdef _WIN32
@@ -330,6 +331,66 @@ void CheckStoreRing() {
     Require(found[2].begin == base + 512, "the stores are not listed newest first");
     Require(RecentGuestStores(base + 768, 4096 - 768, found) == 0, "a store is listed outside its range");
 }
+
+// The free log (APS5_DROP_FREED_STORES): a store whose source clock predates a release of its pages
+// leaves those pages out, one whose source followed the release keeps them, and with the switch off
+// every store is kept whole (and counted). A registry Remove releases, less what the same mutation
+// registers again; a new registration or a protection change does not.
+void CheckFreedStores() {
+    using Runs = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    constexpr std::uint64_t page = 4096;
+    void* memory = AllocateWatched(Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    SetDropFreedStores(true);
+    const auto before = FreeClock();
+    Runs runs{{base, base + 4 * page}};
+    Require(DropFreedRuns(FreedStoreKind::WriteBack, before, runs) == 0 && runs == Runs{{base, base + 4 * page}}, "a store with no release since its source lost bytes");
+    NoteReleased(base + page + 100, 50);
+    const auto released = FreeClock();
+    if (released == before) {
+        std::cout << "free log: the test block is outside the guest arena, skipped\n";
+        return;
+    }
+    Require(DropFreedRuns(FreedStoreKind::WriteBack, before, runs) == page && runs == Runs{{base, base + page}, {base + 2 * page, base + 4 * page}}, "the page released after the store's source was stored");
+    runs = {{base + page - 96, base + page + 32}};
+    Require(DropFreedRuns(FreedStoreKind::ShadowPublish, before, runs) == 32 && runs == Runs{{base + page - 96, base + page}}, "a run is not cut at the released page's bound");
+    runs = {{base, base + 4 * page}};
+    Require(DropFreedRuns(FreedStoreKind::WriteBack, released, runs) == 0 && runs == Runs{{base, base + 4 * page}}, "a store whose source followed the release lost bytes");
+    Require(DropFreedRuns(FreedStoreKind::WriteBack, NoFreeClock, runs) == 0 && runs.size() == 1, "a store of unknown age lost bytes");
+    SetDropFreedStores(false);
+    Require(DropFreedRuns(FreedStoreKind::KeyStore, before, runs) == page && runs == Runs{{base, base + 4 * page}}, "APS5_DROP_FREED_STORES=0 did not store the run whole, or did not count it");
+    Require(FreedStoreSummary().find("would drop") != std::string::npos, "the digest does not say 'would drop' with the switch off");
+    SetDropFreedStores(true);
+    Require(FreedStoreSummary().find("stores into freed pages: dropped") != std::string::npos, "the digest does not count dropped stores");
+    void* piece = reinterpret_cast<void*>(base + 8 * page);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(piece, 4 * page, true, true);
+    }
+    const auto added = FreeClock();
+    Require(added == released, "a new registration moved the free clock");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Protect(piece, page, true, false, [] {});
+    }
+    Require(FreeClock() == added, "a protection change moved the free clock");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(piece);
+        mutation.Add(piece, 2 * page, true, true);
+    }
+    const auto shrunk = FreeClock();
+    Require(shrunk > added, "a shrinking re-registration did not move the free clock");
+    runs = {{base + 8 * page, base + 12 * page}};
+    Require(DropFreedRuns(FreedStoreKind::CopyBack, added, runs) == 2 * page && runs == Runs{{base + 8 * page, base + 10 * page}}, "a re-registration released the pages it kept, or kept those it gave back");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(piece);
+    }
+    Require(FreeClock() > shrunk, "a registry Remove did not move the free clock");
+    runs = {{base + 8 * page, base + 12 * page}};
+    Require(DropFreedRuns(FreedStoreKind::CopyBack, shrunk, runs) == 2 * page && runs == Runs{{base + 10 * page, base + 12 * page}}, "the removed allocation's pages were stored");
+}
 }
 
 int main() {
@@ -346,6 +407,7 @@ int main() {
         }
         CheckRangeTraceFilter();
         CheckStoreRing();
+        CheckFreedStores();
         CheckSharedBlock();
         CheckUnstoredPages();
         CheckMixedEdge();

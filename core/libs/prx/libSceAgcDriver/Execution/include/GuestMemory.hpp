@@ -244,6 +244,26 @@ void FlushGpuWrites(std::uint64_t address, std::size_t bytes);
 // value before consulting the page states and reading directly, and the same value after, knows
 // the states it consulted were current and no page it read changed its mapping meanwhile.
 std::uint64_t ForgetSerial();
+// Free log (APS5_DROP_FREED_STORES; on by default, =0 stores as before): each 4 KiB page of the guest
+// arena keeps the free clock of the last release over it, a release being a range libc reports as
+// unmapped, freed or mapped anew (GuestAllocationsSetReleaseListener), never a protection change.
+// A store of GPU-produced bytes into guest memory (a storage write-back, a unit shadow publish, DCC
+// key stores of a write-back, a queued copy-back) carries the clock read when its source was written
+// on the GPU: the pages released since hold another owner's bytes, and DropFreedRun leaves them out.
+// Off, the pages are only counted ("would drop" on the [guestmem] line). NoFreeClock: a source of
+// unknown age, never dropped. NoteReleased is the listener (the libc mutation's thread: atomics only).
+constexpr std::uint32_t NoFreeClock = 0xffffffffu;
+std::uint32_t FreeClock();
+void NoteReleased(std::uintptr_t address, std::size_t bytes);
+bool DropFreedStores();
+void SetDropFreedStores(bool drop);
+enum class FreedStoreKind : std::uint8_t { WriteBack, KeyStore, ShadowPublish, CopyBack, Count };
+// Appends to `out` the parts of [begin, end) to store: with the switch on, without the 4 KiB pages
+// released after `clock`, else the whole run. Returns the bytes of those pages (counted per kind).
+std::uint64_t DropFreedRun(FreedStoreKind kind, std::uint32_t clock, std::uint64_t begin, std::uint64_t end, std::vector<std::pair<std::uint64_t, std::uint64_t>>& out);
+std::uint64_t DropFreedRuns(FreedStoreKind kind, std::uint32_t clock, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs);
+// The [guestmem] line's part: releases, and the stores into freed pages dropped (or would drop) by kind.
+std::string FreedStoreSummary();
 // Page queries (Accessible, DescribeCommitted, CheckRange, ...) that found pages a resident buffer's
 // page guard holds and answered them as the guest maps them (APS5_RESIDENT_BUFFERS; total since start).
 std::uint64_t GuardedPageQueries();
@@ -372,8 +392,11 @@ void AddCrashDescriber(CrashDescriber describer);
 // RangeTraceCap lines; lifetime events, stores made more than 2 s after their subject's last GPU
 // write, and stores of unknown age once the trace is 60 s old are never capped. A [wb-range] totals
 // line (at the next line 10 s after the last one) counts every kind printed and dropped. Off: one
-// static test per store; on: a store outside the range pays one interval check.
-enum class RangeTraceKind : std::uint8_t { Write, WriteChanged, StoreOwnBytes, MarkWritten, KeyStore, ShadowPublish, Image, ImageRefresh, ImageDirty, Shadow, ShadowMarked, Count };
+// static test per store; on: a store outside the range pays one interval check. Never capped either:
+// "forget" (every libc mapping or protection change over the range: ForgetPages), "release" (the
+// free log's releases, with the clock) and "freed-store" (a store's pages released after its source
+// clock, dropped or not; see DropFreedRun).
+enum class RangeTraceKind : std::uint8_t { Write, WriteChanged, StoreOwnBytes, MarkWritten, KeyStore, ShadowPublish, Image, ImageRefresh, ImageDirty, Shadow, ShadowMarked, Forget, Release, FreedStore, Count };
 constexpr std::uint64_t RangeTraceCap = 20000;
 // Parses "<lo>-<hi>" (hex digits, 0x optional) into [begin, end); false for anything else or an
 // empty range.

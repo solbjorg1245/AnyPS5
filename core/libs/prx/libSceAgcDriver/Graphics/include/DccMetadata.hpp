@@ -57,6 +57,10 @@ struct KeyStoreGuard {
     // The surface the keys belong to (the trace names it).
     std::uint64_t image = 0;
     std::uint64_t generation = 0;
+    // The free clock of the keys' source (GuestMemory::FreeClock at the image's last GPU write):
+    // key pages released since are left out (APS5_DROP_FREED_STORES); GuestMemory::NoFreeClock
+    // (unknown, the draw-time stores) never drops.
+    std::uint32_t freeClock = 0xffffffffu;
 };
 // What a guarded store did: whether keys were stored, the key bytes left to the CPU, and the
 // generation of the guard's collect of the key range (0 when unchecked or nothing was stored).

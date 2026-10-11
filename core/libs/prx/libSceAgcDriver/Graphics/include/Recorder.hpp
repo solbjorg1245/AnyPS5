@@ -176,6 +176,9 @@ public:
         VkDeviceSize baselineOffset = 0;
         // A resident written range's land (KeepsResidentWrites): `sourceKey` is the range.
         bool land = false;
+        // GuestMemory::FreeClock when the copy was first queued (DeferCopies; a claimed copy keeps
+        // its own): the pages released since are not copied back (APS5_DROP_FREED_STORES).
+        std::uint32_t freeClock = 0xffffffffu;
     };
     static bool DeferCopyBacks();
     // Copy-back coalescing (on by default; APS5_NO_COALESCE_COPY_BACKS=1 or APS5_COALESCE_COPY_BACKS=0

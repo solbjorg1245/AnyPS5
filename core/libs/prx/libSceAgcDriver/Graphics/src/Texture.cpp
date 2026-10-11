@@ -1128,6 +1128,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         trackedLayerBytes = blockUnits ? 65536 : guestBytes / trackedLayers;
         layerGeneration.assign(trackedLayers, 0);
         layerPending.assign(trackedLayers, false);
+        layerFreeClock.assign(trackedLayers, GuestMemory::NoFreeClock);
         sliceLinearBytes = geometry.sliceLinearBytes;
         const auto linearBytes = sliceLinearBytes * arrayLayers;
 
@@ -2636,7 +2637,11 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     if (GuestMemory::WriteBackRangeTraceOn()) gpuWriteMs = GuestMemory::StoreClockMs();
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
-    for (std::uint32_t layer = first; layer < first + count; ++layer) layerPending[layer] = true;
+    const auto freeClock = GuestMemory::FreeClock();
+    for (std::uint32_t layer = first; layer < first + count; ++layer) {
+        layerPending[layer] = true;
+        layerFreeClock[layer] = freeClock;
+    }
     // Results of this image now cover the alias's results borrowed into these units: this image
     // stores them, the alias no longer has to (its results, unchanged since the borrow, are in
     // this image's content). An alias written since keeps its own newer results pending.
@@ -3848,12 +3853,19 @@ void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes) {
 // stored unit is untracked, as its texels then are.
 KeyStoreGuard StorageTexture::keyStoreGuard(const char* caller, const std::vector<bool>& layers) const {
     std::uint64_t oldest = 0;
+    // The keys' pages released after the stored units' newest GPU write are left out
+    // (APS5_DROP_FREED_STORES; a unit never written on the GPU keeps them all).
+    std::uint32_t freeClock = 0;
+    for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+        if (layers[layer]) freeClock = std::max(freeClock, layerFreeClock[layer]);
+    }
+    if (freeClock == 0) freeClock = GuestMemory::NoFreeClock;
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (!layers[layer]) continue;
-        if (layerGeneration[layer] == 0) return {caller, descriptor.baseAddress, 0};
+        if (layerGeneration[layer] == 0) return {caller, descriptor.baseAddress, 0, freeClock};
         oldest = oldest == 0 ? layerGeneration[layer] : std::min(oldest, layerGeneration[layer]);
     }
-    return {caller, descriptor.baseAddress, oldest == 0 ? 0 : std::max(oldest, keysSeen)};
+    return {caller, descriptor.baseAddress, oldest == 0 ? 0 : std::max(oldest, keysSeen), freeClock};
 }
 
 // The "uncompressed" keys after a write-back of `layers` (not over the clear keys of a keys fill),
@@ -4019,6 +4031,19 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     if (traceKept && skippedAny) {
         const auto first = keep.empty() ? descriptor.baseAddress + guestBytes : keep.front().first;
         std::fprintf(stderr, "[flush] image 0x%llx+0x%llx keeps %zu CPU-written 64 KiB blocks (first stored byte at +0x%llx, %zu ranges stored, generation %llu)\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), skipped, static_cast<unsigned long long>(first - descriptor.baseAddress), keep.size(), static_cast<unsigned long long>(generation));
+    }
+    // APS5_DROP_FREED_STORES: the pages the game released (unmapped, freed, mapped anew) after the
+    // layer's last GPU write belong to another allocation now and are left out, whichever path stores
+    // below (block windows, whole-layer copies, the CPU write-back); the layer keeps its generation,
+    // as for a kept block.
+    if (!keep.empty()) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> live;
+        live.reserve(keep.size());
+        for (const auto& [from, to] : keep) {
+            const auto layer = std::min<std::uint32_t>(trackedLayers - 1, static_cast<std::uint32_t>((from - descriptor.baseAddress) / std::max<std::uint64_t>(trackedLayerBytes, 1)));
+            if (GuestMemory::DropFreedRun(GuestMemory::FreedStoreKind::WriteBack, layerFreeClock[layer], from, to, live) != 0 && GuestMemory::DropFreedStores()) skippedLayer[layer] = true;
+        }
+        keep.swap(live);
     }
     // Taken before this write-back stamps anything (see advanceAdjacent), with the 64 KiB block span
     // its stamps cover.

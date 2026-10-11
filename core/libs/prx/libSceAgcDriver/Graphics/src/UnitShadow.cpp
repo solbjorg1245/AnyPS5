@@ -84,6 +84,9 @@ struct UnitShadow {
     // for the unit's bytes [p * 4096, (p + 1) * 4096)); the rest of a partly covered unit is a seed
     // of the import, never published by a stale unit (APS5_FIX_BOOT_STRIP).
     std::vector<std::uint32_t> retiledPages;
+    // Per unit: the free clock (GuestMemory::FreeClock) when it last went live, the age of the oldest
+    // bytes its slab holds; a publish leaves out the pages released since (APS5_DROP_FREED_STORES).
+    std::vector<std::uint32_t> freeClock;
     // Slab k covers units [k * SlabUnits(), (k + 1) * SlabUnits()), made on demand; a failed
     // allocation is not retried before the noted present.
     std::vector<std::shared_ptr<ShadowSlab>> slabs;
@@ -177,6 +180,7 @@ std::shared_ptr<UnitShadow> findOrCreate(Shadows& registry, const Context& conte
     shadow->generation.assign(static_cast<std::size_t>(units), 0);
     shadow->published.assign(static_cast<std::size_t>(units), 0);
     shadow->retiledPages.assign(static_cast<std::size_t>(units), 0);
+    shadow->freeClock.assign(static_cast<std::size_t>(units), GuestMemory::NoFreeClock);
     const auto slabs = (units + SlabUnits() - 1) / SlabUnits();
     shadow->slabs.assign(static_cast<std::size_t>(slabs), nullptr);
     shadow->slabFailedUntil.assign(static_cast<std::size_t>(slabs), 0);
@@ -339,7 +343,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         std::lock_guard lock(registry.mutex);
         std::vector<std::uint8_t> changed, cpu;
         changedUnits(*shadow, first, last, changed, cpu);
-        const auto addCopy = [&](const std::shared_ptr<ShadowSlab>& slab, std::uint64_t unit, std::uint64_t begin, std::uint64_t end) {
+        const auto addPiece = [&](const std::shared_ptr<ShadowSlab>& slab, std::uint64_t unit, std::uint64_t begin, std::uint64_t end) {
             const VkBufferCopy region{(unit - slab->firstUnit) * UnitBytes + (begin - shadow->UnitBegin(unit)), begin - shadow->importBase, end - begin};
             if (!copies.empty() && copies.back().slab == slab && copies.back().regions.back().dstOffset + copies.back().regions.back().size == region.dstOffset) {
                 copies.back().regions.back().size += region.size;
@@ -352,6 +356,14 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
             slab->lastUse = Recorder::Presents();
             bytes += end - begin;
             oldest = std::min(oldest, shadow->generation[unit]);
+        };
+        // APS5_DROP_FREED_STORES: the unit's pages the game released since it went live hold another
+        // allocation's bytes; the copy leaves them out (the unit is done with either way).
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> pieces;
+        const auto addCopy = [&](const std::shared_ptr<ShadowSlab>& slab, std::uint64_t unit, std::uint64_t begin, std::uint64_t end) {
+            pieces.clear();
+            GuestMemory::DropFreedRun(GuestMemory::FreedStoreKind::ShadowPublish, shadow->freeClock[unit], begin, end, pieces);
+            for (const auto& [from, to] : pieces) addPiece(slab, unit, from, to);
         };
         for (auto unit = first; unit <= last; ++unit) {
             const auto k = static_cast<std::size_t>(unit - first);
@@ -402,7 +414,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         shadow->Recount();
         markedMs = shadow->markedMs;
     }
-    if (units == 0) return 0;
+    if (units == 0 || ranges.empty()) return 0;
     Stats().published[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     Stats().publishedBytes[static_cast<std::size_t>(reason)].fetch_add(bytes, std::memory_order_relaxed);
     if (tracePublishesLeft.load(std::memory_order_relaxed) > 0 && tracePublishesLeft.fetch_sub(1, std::memory_order_relaxed) > 0) {
@@ -803,11 +815,14 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
         if (shadow == nullptr) return;
         const auto present = Recorder::Presents();
         // A unit not live any more starts its retiled pages afresh; a live one adds to them (its
-        // slab still holds the earlier retile's unpublished results).
+        // slab still holds the earlier retile's unpublished results) and keeps its free clock.
+        const auto freeClock = GuestMemory::FreeClock();
         for (const auto& [begin, end, slab] : ranges) {
             if (end <= begin) continue;
             for (auto unit = shadow->UnitOf(begin); unit <= shadow->UnitOf(end - 1); ++unit) {
-                if (!shadow->Live(unit)) shadow->retiledPages[unit] = 0;
+                if (shadow->Live(unit)) continue;
+                shadow->retiledPages[unit] = 0;
+                shadow->freeClock[unit] = freeClock;
             }
         }
         for (const auto& [begin, end, slab] : ranges) {

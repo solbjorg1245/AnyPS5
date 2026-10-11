@@ -469,6 +469,9 @@ private:
     std::uint64_t trackedLayerBytes = 0;
     std::vector<std::uint64_t> layerGeneration;
     std::vector<bool> layerPending;
+    // Per tracked layer: the free clock (GuestMemory::FreeClock) at its last GPU write
+    // (markLayersPending); a write-back leaves out the pages released since (APS5_DROP_FREED_STORES).
+    std::vector<std::uint32_t> layerFreeClock;
     bool blockUnits = false;
     // Write-back hysteresis (block units, see writeBack): partial stores in the current window of
     // presents, its first present, and the present until which every pending unit is stored.

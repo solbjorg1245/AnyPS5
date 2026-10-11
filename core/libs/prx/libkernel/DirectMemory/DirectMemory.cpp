@@ -485,6 +485,18 @@ void AddMapping(std::uintptr_t address, std::size_t len, std::uint64_t phys, int
 #endif
 }
 
+// Whether [address, address + len) maps exactly the physical range at `phys` already (g_directLock).
+bool MapsPhysical(std::uintptr_t address, std::size_t len, std::uint64_t phys) {
+    auto it = g_directMappings.upper_bound(address);
+    if (it == g_directMappings.begin()) return false;
+    auto cursor = address;
+    for (--it; it != g_directMappings.end() && cursor < address + len; ++it) {
+        if (it->first > cursor || it->second.end <= cursor || it->second.phys + (cursor - it->first) != phys + (cursor - address)) return false;
+        cursor = it->second.end;
+    }
+    return cursor >= address + len;
+}
+
 bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, size_t len, int prot, int flags, int64_t physStart = -1) {
     constexpr int GuestMapFixed = 0x10;
     constexpr int GuestMapNoOverwrite = 0x80;
@@ -492,10 +504,12 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
     ValidateRange(addr, len, PS5_PAGE_SIZE);
     Trace("remap fixed %p+0x%zx prot=0x%x phys=0x%llx", addr, len, prot, static_cast<long long>(physStart));
     const auto nativeProtection = LinuxProtFromSce(prot);
+    bool released = physStart < 0;
     mutation.Protect(addr, len, (prot & 3) != 0, (prot & 2) != 0, [&] {
         const auto address = reinterpret_cast<std::uintptr_t>(addr);
         std::lock_guard lock(g_directLock);
         if (physStart >= 0) {
+            released = !MapsPhysical(address, len, static_cast<std::uint64_t>(physStart));
             AddMapping(address, len, static_cast<std::uint64_t>(physStart), nativeProtection);
         } else {
             EraseMappings(address, address + len);
@@ -508,6 +522,9 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
 #endif
         }
     });
+    // The range holds other bytes now (fresh anonymous memory, other physical pages): GPU results
+    // bound for what it held are not stored into it (the driver's free log, APS5_DROP_FREED_STORES).
+    if (released) GuestAllocations::GuestAllocationsReleased_nid_postfix(reinterpret_cast<std::uintptr_t>(addr), len);
     return true;
 }
 

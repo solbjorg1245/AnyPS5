@@ -1776,9 +1776,11 @@ void dropOverwritten(std::vector<Recorder::DeferredCopy>& copies, std::uint64_t 
 void Recorder::DeferCopies(std::vector<DeferredCopy> copies) {
     if (copies.empty()) return;
     ensureOpen();
-    for (const auto& copy : copies) {
+    const auto freeClock = GuestMemory::FreeClock();
+    for (auto& copy : copies) {
         copyBacksDeferred.fetch_add(1, std::memory_order_relaxed);
         copyBackBytesDeferred.fetch_add(copy.bytes, std::memory_order_relaxed);
+        copy.freeClock = std::min(copy.freeClock, freeClock);
     }
     if (coalesceCopyBacks) {
         // The bytes a copy stores again lose their earlier queued copy (in program order: within
@@ -2179,6 +2181,29 @@ void Recorder::recordDeferredCopies(std::vector<DeferredCopy> copies, FlushReaso
             copy.guard->landingSerial = submissions + 1;
             open->kept.push_back(copy.guard);
         }
+    }
+    // APS5_DROP_FREED_STORES: the bytes of a queued copy the game released since it was queued are
+    // left out (offsets move as in dropOverwritten, the order stays: queued copies may overlap
+    // without coalescing); resident copies and lands are guarded whole.
+    if (!copies.empty() && std::any_of(copies.begin(), copies.end(), [now = GuestMemory::FreeClock()](const DeferredCopy& copy) { return copy.freeClock < now; })) {
+        std::vector<DeferredCopy> live;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> pieces;
+        for (auto& copy : copies) {
+            pieces.clear();
+            if (copy.guard != nullptr || copy.land || GuestMemory::DropFreedRun(GuestMemory::FreedStoreKind::CopyBack, copy.freeClock, copy.address, copy.address + copy.bytes, pieces) == 0) {
+                live.push_back(std::move(copy));
+                continue;
+            }
+            for (const auto& [from, to] : pieces) {
+                auto piece = copy;
+                piece.address = from;
+                piece.sourceOffset += from - copy.address;
+                piece.destinationOffset += from - copy.address;
+                piece.bytes = to - from;
+                live.push_back(std::move(piece));
+            }
+        }
+        copies.swap(live);
     }
     if (copies.empty()) return;
     if (residentWrites.enabled) {
