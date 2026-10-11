@@ -1161,6 +1161,25 @@ void testUndistortedRect() {
     check(same(MapRectInto_nid_postfix({0, 1080, 1920, 1080}, 3840, 2160, column), 480, 1080, 1440, 1080), "map rect: the bottom-left quarter");
     check(same(MapRectInto_nid_postfix({1, 1, 1, 1}, 3840, 2160, column), 480, 1, 2, 1), "map rect: rounds outwards");
     check(same(MapRectInto_nid_postfix({0, 0, 3840, 2160}, 3840, 2160, {0, 108, 3840, 1944}), 0, 108, 3840, 1944), "map rect: a band");
+    // The UI move (APS5_NATIVE_ASPECT_UI_BLIT): the whole image into the rect, then each margin from
+    // the image's outermost texel line.
+    std::array<AspectFitBlit, 3> blits{};
+    check(ComputeRectMoveBlits_nid_postfix(3840, 2160, column, blits.data()) == 3, "move blits: a column has two margins");
+    check(same(blits[0].source, 0, 0, 3840, 2160) && same(blits[0].destination, 480, 0, 2880, 2160) && !blits[0].nearest, "move blits: the whole image into the column, linear");
+    check(same(blits[1].source, 0, 0, 1, 2160) && same(blits[1].destination, 0, 0, 480, 2160) && blits[1].nearest, "move blits: the left margin from column 0");
+    check(same(blits[2].source, 3839, 0, 1, 2160) && same(blits[2].destination, 3360, 0, 480, 2160) && blits[2].nearest, "move blits: the right margin from the last column");
+    check(ComputeRectMoveBlits_nid_postfix(3840, 2160, ComputeUndistortedRect_nid_postfix(3840, 2160, 3440, 1440), blits.data()) == 3 && same(blits[2].destination, 3349, 0, 491, 2160), "move blits: an odd margin keeps its width");
+    check(ComputeRectMoveBlits_nid_postfix(1920, 1080, {0, 54, 1920, 972}, blits.data()) == 3, "move blits: a band has two margins");
+    check(same(blits[1].source, 0, 0, 1920, 1) && same(blits[1].destination, 0, 0, 1920, 54), "move blits: the top margin from row 0");
+    check(same(blits[2].source, 0, 1079, 1920, 1) && same(blits[2].destination, 0, 1026, 1920, 54), "move blits: the bottom margin from the last row");
+    check(ComputeRectMoveBlits_nid_postfix(3840, 2160, {0, 0, 3840, 2160}, blits.data()) == 0, "move blits: nothing for the whole image");
+    bool refused = false;
+    try {
+        static_cast<void>(ComputeRectMoveBlits_nid_postfix(3840, 2160, {10, 10, 100, 100}, blits.data()));
+    } catch (const std::exception&) {
+        refused = true;
+    }
+    check(refused, "move blits: a rect with margins on both axes is refused");
 }
 
 }
