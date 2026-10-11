@@ -38,6 +38,8 @@ void InstallButtonIcons(const std::function<std::filesystem::path(const char*)>&
     if (GetPortSettings_nid_no_patch().buttonIcons != PortSettings::ButtonIcons::SteamDeck) return;
     std::size_t replaced = 0;
     std::string skipped;
+    std::string probed;
+    const char* probe = std::getenv(UiOverlay::ButtonIconsProbeSwitch);
     std::filesystem::path written;
     for (const auto& entry : UiOverlay::SteamDeckGlyphs) {
         const std::string guest = std::string(UiOverlay::GlyphGuestDirectory) + entry.name;
@@ -47,13 +49,21 @@ void InstallButtonIcons(const std::function<std::filesystem::path(const char*)>&
             continue;
         }
         std::string error;
-        written = WriteOverlay("buttonicons-steamdeck", entry.name, UiOverlay::GlyphTexture(*original, entry.glyph), error);
+        std::string stem(entry.name);
+        stem = stem.substr(0, stem.find('.'));
+        for (const char* prefix : {"ps4_", "button_"}) {
+            if (stem.rfind(prefix, 0) == 0) stem.erase(0, std::string_view(prefix).size());
+        }
+        const bool unchanged = probe != nullptr && ("," + std::string(probe) + ",").find("," + stem + ",") != std::string::npos;
+        if (unchanged) probed += std::string(probed.empty() ? "" : ", ") + stem;
+        written = WriteOverlay("buttonicons-steamdeck", entry.name, unchanged ? *original : UiOverlay::GlyphTexture(*original, entry.glyph), error);
         if (written.empty()) throw std::runtime_error(error.empty() ? "no folder to write the icons to" : error);
         AddPathAliasHost_nid_no_patch(guest.c_str(), written);
         ++replaced;
     }
-    std::fprintf(stderr, "[settings] button icons: Steam Deck, %zu of %zu textures replaced (%s)%s%s\n", replaced, UiOverlay::SteamDeckGlyphs.size(),
-        PortSettings::PathText(written.parent_path()).c_str(), skipped.empty() ? "" : "; kept the title's ", skipped.c_str());
+    std::fprintf(stderr, "[settings] button icons: Steam Deck, %zu of %zu textures replaced (%s)%s%s%s%s\n", replaced, UiOverlay::SteamDeckGlyphs.size(),
+        PortSettings::PathText(written.parent_path()).c_str(), skipped.empty() ? "" : "; kept the title's ", skipped.c_str(),
+        probed.empty() ? "" : "; probe, written unchanged: ", probed.c_str());
 }
 
 void InstallVisualModeRowRemoval(const std::function<std::filesystem::path(const char*)>& resolve) {
