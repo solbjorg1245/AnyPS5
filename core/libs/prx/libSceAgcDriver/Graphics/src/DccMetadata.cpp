@@ -78,7 +78,7 @@ ProofCounters& Proofs() {
 
 // The key store guard's outcomes (MarkDccUncompressed with a KeyStoreGuard), counted with or
 // without profiling (the tests read them): stores that met key pages a CPU store reached since the
-// guard's generation and those pages' bytes, the bytes left to the CPU (APS5_DCC_KEYS_STAMP_CHECK=1),
+// guard's generation and those pages' bytes, the bytes left to the CPU (not APS5_DCC_KEYS_STAMP_CHECK=0),
 // and stores made unchecked (no generation, or a key range the write tracking does not cover).
 struct GuardCounters {
     std::atomic<std::uint64_t> cpuStores{0};
@@ -245,7 +245,11 @@ bool StoreUncompressedOnGpu(const Context& context, Recorder& recorder, std::uin
     // a later command writing the keys; see Recorder::QueueKeyStore).
     recorder.QueueKeyStore(import->buffer, first, last, std::move(seed), begin, begin + count);
     recorder.NotePendingWrite(begin, count, Recorder::WriteKind::DccKeys);
-    GuestMemory::MarkWritten(begin, count);
+    {
+        // Named a key store by the write-back range trace (APS5_TRACE_WRITEBACK_RANGE).
+        const GuestMemory::KeyStoreScope keys(begin, begin + count);
+        GuestMemory::MarkWritten(begin, count);
+    }
     // After the note: an unlocked memo lookup drops an entry the snapshot does not cover yet. The
     // entry is kept only for the active recorder (the one the flush hook and the lookups consult).
     {
@@ -265,6 +269,7 @@ void StoreUncompressedOnCpu(std::uint64_t begin, std::size_t count) {
     // The write waits for recorded work over the range (the flush hook), so the bytes are current after.
     ForgetStores(begin, begin + count);
     const std::vector<std::byte> uncompressed(count, std::byte{0xff});
+    const GuestMemory::KeyStoreScope keys(begin, begin + count);
     GuestMemory::Write(begin, uncompressed);
     CountStore(Scans().cpuStores);
 }
@@ -280,9 +285,9 @@ void TraceGuardedStore(const KeyStoreGuard& guard, std::uint64_t begin, std::siz
 
 // The guard's check before "uncompressed" keys are stored over [begin, begin + count): collects the
 // range, counts the bytes of the pages a CPU store reached since the guard's generation, and returns
-// the runs to store: the whole range, or with APS5_DCC_KEYS_STAMP_CHECK=1 the range without those
-// pages (their interior edges are page bounds, so only the range's own head and tail can be
-// unaligned, as before).
+// the runs to store: the range without those pages (their interior edges are page bounds, so only the
+// range's own head and tail can be unaligned, as before), or the whole range with
+// APS5_DCC_KEYS_STAMP_CHECK=0.
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuardedRuns(const KeyStoreGuard& guard, std::uint64_t begin, std::size_t count, KeyStoreOutcome& outcome) {
     const auto end = begin + count;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> stores{{begin, end}};
@@ -320,7 +325,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuardedRuns(const KeyStoreG
 bool KeysStampCheck() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_DCC_KEYS_STAMP_CHECK");
-        return text != nullptr && std::strcmp(text, "1") == 0;
+        return text == nullptr || std::strcmp(text, "0") != 0;
     }();
     const auto forced = stampCheckForTests.load(std::memory_order_relaxed);
     return forced < 0 ? enabled : forced != 0;

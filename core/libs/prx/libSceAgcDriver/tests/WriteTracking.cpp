@@ -276,6 +276,27 @@ void CheckCpuStoredRuns() {
     Require(CpuStoredRuns(base, 2 * Block, 0, runs) == 0 && runs.empty(), "a generation of 0 lists stores");
 }
 
+// The write-back range trace's switch (APS5_TRACE_WRITEBACK_RANGE=<lo>-<hi>, hex): the range is
+// [lo, hi), and a store is traced only when one of its bytes lies inside it.
+void CheckRangeTraceFilter() {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    Require(ParseTraceRange("0x3c0000000-0x3e0000000", begin, end) && begin == 0x3c0000000ull && end == 0x3e0000000ull, "the range switch is not parsed");
+    Require(ParseTraceRange("1000-2000", begin, end) && begin == 0x1000 && end == 0x2000, "a range without 0x is not parsed as hex");
+    for (const char* bad : {"", "0x1000", "0x1000-", "-0x1000", "0x2000-0x1000", "0x1000-0x1000", "0x1000--0x2000", "0x1000-0x2000x", " 0x1000-0x2000", "0x1000-0x2000 ", "0x-0x10"}) {
+        Require(!ParseTraceRange(bad, begin, end), std::string("the range switch '") + bad + "' is accepted");
+    }
+    Require(!ParseTraceRange(nullptr, begin, end), "an unset range switch is accepted");
+    constexpr std::uint64_t low = 0x1000;
+    constexpr std::uint64_t high = 0x2000;
+    Require(TraceRangeHits(low, high, low, 1) && TraceRangeHits(low, high, high - 1, 1), "the range's first or last byte is not traced");
+    Require(!TraceRangeHits(low, high, high, 16), "a store at the range's end is traced (exclusive)");
+    Require(!TraceRangeHits(low, high, low - 16, 16), "a store ending at the range's begin is traced");
+    Require(TraceRangeHits(low, high, low - 16, 17) && TraceRangeHits(low, high, 0, ~0ull), "a store over the range's begin is not traced");
+    Require(!TraceRangeHits(low, high, low, 0), "an empty store is traced");
+    Require(!TraceRangeHits(low, high, ~0ull - 4, 4), "a store at the top of the address space is traced");
+}
+
 // The crash report's store ring (APS5_CRASH_RESOURCES=1, set by main): the driver's stores of 16
 // bytes or more over an address, newest first, with the thread's StoreTag and the stored span.
 void CheckStoreRing() {
@@ -323,6 +344,7 @@ int main() {
             std::cout << "no write watching: skipped\n";
             return 77;
         }
+        CheckRangeTraceFilter();
         CheckStoreRing();
         CheckSharedBlock();
         CheckUnstoredPages();

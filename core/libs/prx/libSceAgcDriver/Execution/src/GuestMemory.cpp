@@ -4,6 +4,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/CrashResources.hpp"
+#include <cctype>
 #include <cstdarg>
 #include <mutex>
 #include <array>
@@ -1522,8 +1523,115 @@ std::atomic<std::uint64_t> storeRingNext{0};
 thread_local const char* storeTag = nullptr;
 thread_local const char* storeReason = nullptr;
 thread_local std::uint64_t storeTagAddress = 0;
+thread_local const StoreSubject* storeSubject = nullptr;
 std::atomic<CrashDescriber> crashDescribers[8] = {};
 std::atomic<std::size_t> crashDescriberCount{0};
+
+// The write-back range trace (APS5_TRACE_WRITEBACK_RANGE, see RangeTraceKind).
+constexpr const char* RangeTraceNames[] = {"Write", "WriteChanged-span", "StoreOwnBytes", "MarkWritten", "DCC-key-store", "shadow-publish", "image", "image-refresh", "image-dirty", "shadow", "shadow-marked"};
+static_assert(std::size(RangeTraceNames) == static_cast<std::size_t>(RangeTraceKind::Count));
+// A store this long after its subject's last GPU write is late (never capped); a store of unknown
+// age is not capped once the trace is this old.
+constexpr std::uint64_t LateStoreMs = 2000;
+constexpr std::uint64_t UncappedAfterMs = 60000;
+constexpr std::uint64_t RangeTotalsMs = 10000;
+
+struct RangeTrace {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    // When the switch was first read (at the run's first store).
+    std::uint64_t startMs = 0;
+};
+
+const RangeTrace& Traced() {
+    static const RangeTrace trace = [] {
+        RangeTrace parsed;
+        const char* text = std::getenv("APS5_TRACE_WRITEBACK_RANGE");
+        if (text == nullptr) return parsed;
+        if (!ParseTraceRange(text, parsed.begin, parsed.end)) {
+            std::fprintf(stderr, "[wb-range] APS5_TRACE_WRITEBACK_RANGE='%s' is not <lo>-<hi> (hex): off\n", text);
+            return RangeTrace{};
+        }
+        parsed.startMs = StoreClockMs();
+        std::fprintf(stderr, "[wb-range] tracing driver stores and storage images over 0x%llx-0x%llx (cap %llu lines per kind)\n", static_cast<unsigned long long>(parsed.begin), static_cast<unsigned long long>(parsed.end), static_cast<unsigned long long>(RangeTraceCap));
+        return parsed;
+    }();
+    return trace;
+}
+
+std::atomic<std::uint64_t> rangePrinted[static_cast<std::size_t>(RangeTraceKind::Count)] = {};
+std::atomic<std::uint64_t> rangeDropped[static_cast<std::size_t>(RangeTraceKind::Count)] = {};
+std::atomic<std::uint64_t> rangeTotalsAt{0};
+// The DCC key range a KeyStoreScope names on this thread.
+thread_local std::uint64_t keyStoreBegin = 0;
+thread_local std::uint64_t keyStoreEnd = 0;
+
+// The thread's description (SetThreadDescription), read at its first traced line.
+const char* traceThreadName() {
+    thread_local char name[64] = "";
+#ifdef _WIN32
+    thread_local bool named = false;
+    if (!named) {
+        named = true;
+        PWSTR description = nullptr;
+        if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &description)) && description != nullptr) {
+            WideCharToMultiByte(CP_UTF8, 0, description, -1, name, sizeof(name), nullptr, nullptr);
+            LocalFree(description);
+        }
+    }
+#endif
+    return name;
+}
+
+// "<n> ms" since `at`, or "-" when not known.
+void formatAge(char* text, std::size_t size, std::uint64_t now, std::uint64_t at) {
+    if (at == 0) std::snprintf(text, size, "-");
+    else std::snprintf(text, size, "%llu ms", static_cast<unsigned long long>(now - std::min(now, at)));
+}
+
+// A store the range trace prints once the store path's locks are released (declared before them):
+// the stored span and its stamp (0: not stamped), set when the span intersects the range.
+struct TracedStore {
+    RangeTraceKind kind;
+    bool gpu;
+    std::uint64_t callBegin;
+    std::uint64_t callEnd;
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::uint64_t generation = 0;
+
+    void arm(std::uint64_t storedBegin, std::uint64_t storedEnd) {
+        if (storedEnd <= storedBegin || !WriteBackRangeTraced(storedBegin, storedEnd - storedBegin)) return;
+        begin = storedBegin;
+        end = storedEnd;
+    }
+    ~TracedStore() {
+        if (end > begin) print();
+    }
+    void print() const {
+        const auto& trace = Traced();
+        const auto now = StoreClockMs();
+        const auto* subject = storeSubject;
+        const auto named = keyStoreEnd > keyStoreBegin && callBegin >= keyStoreBegin && callEnd <= keyStoreEnd && kind != RangeTraceKind::ShadowPublish ? RangeTraceKind::KeyStore : kind;
+        // Late: more than 2 s after the subject's last GPU write; unknown age: capped for the first 60 s.
+        const bool aged = subject != nullptr && subject->gpuWriteMs != 0;
+        const bool late = aged && now - std::min(now, subject->gpuWriteMs) > LateStoreMs;
+        const bool capped = aged ? !late : now - std::min(now, trace.startMs) < UncappedAfterMs;
+        char call[64] = "";
+        if (callBegin != begin || callEnd != end) std::snprintf(call, sizeof(call), " call 0x%llx+0x%llx", static_cast<unsigned long long>(callBegin), static_cast<unsigned long long>(callEnd - callBegin));
+        char image[256] = " image -";
+        if (subject != nullptr) {
+            char written[32];
+            char refreshed[32];
+            formatAge(written, sizeof(written), now, subject->gpuWriteMs);
+            formatAge(refreshed, sizeof(refreshed), now, subject->refreshMs);
+            std::snprintf(image, sizeof(image), " image 0x%llx+0x%llx %ux%u fmt %u gen %llu; age gpu-write %s refresh %s", static_cast<unsigned long long>(subject->base), static_cast<unsigned long long>(subject->bytes), subject->width, subject->height, subject->format, static_cast<unsigned long long>(subject->generation), written, refreshed);
+        }
+        const auto inBegin = std::max(begin, trace.begin);
+        const auto inEnd = std::min(end, trace.end);
+        WriteBackRangeLine(named, capped, "gpu %d 0x%llx+0x%llx (in range 0x%llx+0x%llx)%s gen %llu by %s/%s 0x%llx%s late %d", gpu ? 1 : 0, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<unsigned long long>(inBegin), static_cast<unsigned long long>(inEnd - inBegin), call, static_cast<unsigned long long>(generation), storeTag != nullptr ? storeTag : "-", storeReason != nullptr ? storeReason : "-", static_cast<unsigned long long>(storeTagAddress), image, late ? 1 : 0);
+    }
+};
 
 void recordStore(std::uint64_t begin, std::uint64_t end, std::uint32_t generation, const char* kind) {
     auto* slots = StoreSlots();
@@ -1669,20 +1777,89 @@ std::size_t RecentGuestStores(std::uint64_t address, std::size_t bytes, std::spa
 }
 
 void NoteGuestStore(std::uint64_t address, std::size_t bytes, const char* kind) {
+    TracedStore rangeStore{RangeTraceKind::ShadowPublish, true, address, address + bytes};
+    rangeStore.arm(address, address + bytes);
     if (StoreSlots() == nullptr) return;
     recordStore(address, address + bytes, Tracker().generation.load(std::memory_order_relaxed) + 1, kind);
 }
 
-StoreTag::StoreTag(const char* tag, const char* reason, std::uint64_t address) : previousTag(storeTag), previousReason(storeReason), previousAddress(storeTagAddress) {
+StoreTag::StoreTag(const char* tag, const char* reason, std::uint64_t address, const StoreSubject* subject) : previousTag(storeTag), previousReason(storeReason), previousAddress(storeTagAddress), previousSubject(storeSubject) {
     storeTag = tag;
     storeReason = reason;
     storeTagAddress = address;
+    storeSubject = subject;
 }
 
 StoreTag::~StoreTag() {
     storeTag = previousTag;
     storeReason = previousReason;
     storeTagAddress = previousAddress;
+    storeSubject = previousSubject;
+}
+
+bool ParseTraceRange(const char* text, std::uint64_t& begin, std::uint64_t& end) {
+    if (text == nullptr || !std::isxdigit(static_cast<unsigned char>(*text))) return false;
+    char* stop = nullptr;
+    const auto low = std::strtoull(text, &stop, 16);
+    if (stop == text || *stop != '-' || !std::isxdigit(static_cast<unsigned char>(stop[1]))) return false;
+    const char* second = stop + 1;
+    const auto high = std::strtoull(second, &stop, 16);
+    if (stop == second || *stop != '\0' || high <= low) return false;
+    begin = low;
+    end = high;
+    return true;
+}
+
+bool WriteBackRangeTraceOn() {
+    const auto& trace = Traced();
+    return trace.end > trace.begin;
+}
+
+bool WriteBackRangeTraced(std::uint64_t address, std::uint64_t bytes) {
+    const auto& trace = Traced();
+    return trace.end > trace.begin && TraceRangeHits(trace.begin, trace.end, address, bytes);
+}
+
+void WriteBackRangeLine(RangeTraceKind kind, bool capped, const char* format, ...) {
+    const auto index = static_cast<std::size_t>(kind);
+    const auto now = StoreClockMs();
+    if (capped && rangePrinted[index].load(std::memory_order_relaxed) >= RangeTraceCap) {
+        rangeDropped[index].fetch_add(1, std::memory_order_relaxed);
+    } else {
+        rangePrinted[index].fetch_add(1, std::memory_order_relaxed);
+        char body[768];
+        va_list args;
+        va_start(args, format);
+        std::vsnprintf(body, sizeof(body), format, args);
+        va_end(args);
+        unsigned thread = 0;
+#ifdef _WIN32
+        thread = static_cast<unsigned>(GetCurrentThreadId());
+#endif
+        std::fprintf(stderr, "[wb-range] %s %s at %llu ms tracker %u thread %u '%s'\n", RangeTraceNames[index], body, static_cast<unsigned long long>(now), static_cast<unsigned>(Tracker().generation.load(std::memory_order_relaxed)), thread, traceThreadName());
+    }
+    auto last = rangeTotalsAt.load(std::memory_order_relaxed);
+    if (last == 0) {
+        rangeTotalsAt.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now - std::min(now, last) < RangeTotalsMs || !rangeTotalsAt.compare_exchange_strong(last, now)) return;
+    char totals[1024];
+    std::size_t used = static_cast<std::size_t>(std::snprintf(totals, sizeof(totals), "[wb-range] totals at %llu ms (printed/dropped):", static_cast<unsigned long long>(now)));
+    for (std::size_t i = 0; i < std::size(RangeTraceNames) && used < sizeof(totals); ++i) {
+        used += static_cast<std::size_t>(std::snprintf(totals + used, sizeof(totals) - used, " %s %llu/%llu", RangeTraceNames[i], static_cast<unsigned long long>(rangePrinted[i].load(std::memory_order_relaxed)), static_cast<unsigned long long>(rangeDropped[i].load(std::memory_order_relaxed))));
+    }
+    std::fprintf(stderr, "%s\n", totals);
+}
+
+KeyStoreScope::KeyStoreScope(std::uint64_t begin, std::uint64_t end) : previousBegin(keyStoreBegin), previousEnd(keyStoreEnd) {
+    keyStoreBegin = begin;
+    keyStoreEnd = end;
+}
+
+KeyStoreScope::~KeyStoreScope() {
+    keyStoreBegin = previousBegin;
+    keyStoreEnd = previousEnd;
 }
 
 void AddCrashDescriber(CrashDescriber describer) {
@@ -1690,16 +1867,20 @@ void AddCrashDescriber(CrashDescriber describer) {
     if (index < std::size(crashDescribers)) crashDescribers[index].store(describer, std::memory_order_release);
 }
 
-std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
+std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, RangeTraceKind kind, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
     if (bytes == 0) return 0;
-    const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
+    // The range trace's line, printed after the tracker lock below is released.
+    TracedStore rangeStore{kind, false, address, address + bytes};
+    const auto stampStored = [&rangeStore](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         recordStore(stored.first, stored.second, tracker.generation.load(std::memory_order_relaxed) + 1, "driver memcpy");
+        rangeStore.arm(stored.first, stored.second);
         if (stored.second <= stored.first || !tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) return 0;
         ++tracker.generation;
         for (auto block = tracker.blockOf(stored.first); block <= tracker.blockOf(stored.second - 1); ++block) {
             tracker.stamp(block, tracker.generation, StampKind::Driver);
             tracker.noteDriverStore(block, stored.first, stored.second, tracker.generation);
         }
+        rangeStore.generation = tracker.generation;
         return tracker.generation;
     };
     // Resident buffers (APS5_RESIDENT_BUFFERS): a store into a page a guard holds faults into the
@@ -1732,7 +1913,7 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
 }
 
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std::function<void()>& store) {
-    return storeOwn(address, bytes, [&] {
+    return storeOwn(address, bytes, RangeTraceKind::StoreOwnBytes, [&] {
         store();
         return std::pair<std::uint64_t, std::uint64_t>{address, address + bytes};
     });
@@ -1753,6 +1934,9 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
         std::fprintf(stderr, "[gpu-writes] 0x%llx+0x%zx reported from +0x%llx\n", static_cast<unsigned long long>(address), bytes, ModuleOffset(__builtin_return_address(0)));
     }
     if (StoreSlots() != nullptr) recordStore(address, address + bytes, Tracker().generation.load(std::memory_order_relaxed) + 1, "gpu (MarkWritten)");
+    // The range trace's line, printed after the tracker lock below is released.
+    TracedStore rangeStore{RangeTraceKind::MarkWritten, true, address, address + bytes};
+    rangeStore.arm(address, address + bytes);
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -1764,6 +1948,7 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
         tracker.stamp(block, tracker.generation, StampKind::Driver);
         tracker.noteDriverStore(block, address, address + bytes, tracker.generation);
     }
+    rangeStore.generation = tracker.generation;
     return tracker.generation;
 }
 
@@ -2550,7 +2735,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
         return std::memcmp(current.data() + at, original.data() + at, length) != 0;
     };
     // Stamped like a GPU write: a collect memoized for this packet would not see the page fault.
-    storeOwn(address, size, [&] {
+    storeOwn(address, size, RangeTraceKind::WriteChanged, [&] {
         std::size_t firstChanged = size;
         std::size_t lastChanged = 0;
         for (std::size_t at = 0; at < size; at += block) {
@@ -2580,7 +2765,10 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
     auto* destination = reinterpret_cast<void*>(address);
     CheckRange(destination, source.size(), alignment, true);
     // Stamped like a GPU write: a collect memoized for this packet would not see the page fault.
-    StoreOwnBytes(address, source.size(), [&] { std::memcpy(destination, source.data(), source.size()); });
+    storeOwn(address, source.size(), RangeTraceKind::Write, [&] {
+        std::memcpy(destination, source.data(), source.size());
+        return std::pair<std::uint64_t, std::uint64_t>{address, address + source.size()};
+    });
 }
 
 }

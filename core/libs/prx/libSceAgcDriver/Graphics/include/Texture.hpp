@@ -383,6 +383,9 @@ private:
     void markLayersPending(std::uint32_t first, std::uint32_t count);
     // Registers or unregisters the image as its pending layers say (after a write-back).
     void reconcilePending();
+    // APS5_TRACE_WRITEBACK_RANGE: one [wb-range] line for a lifetime event of the image ("create",
+    // "refresh", "dirty", "evict", "destroy") when its surface or its DCC keys intersect the range.
+    void traceRange(const char* event) const;
     // Pending images whose surface shares one of the 64 KiB write-stamp blocks firstBlock..lastBlock
     // (the span a write-back stamps) without overlapping this one: the tracked layer of theirs
     // holding the shared block, when its memory is unchanged since its generation (see writeBack),
@@ -507,6 +510,10 @@ private:
     std::uint64_t lastStoredEnd = 0;
     bool lastKeysStored = false;
     std::uint32_t writeBacks = 0;
+    // APS5_TRACE_WRITEBACK_RANGE (kept only while it is on): when the image was last written on the
+    // GPU (markLayersPending) and last uploaded from guest memory (GuestMemory::StoreClockMs).
+    std::uint64_t gpuWriteMs = 0;
+    std::uint64_t refreshMs = 0;
     std::atomic<bool> cached{false};
     // The present a consumer last proved the image current at (NoteProved).
     mutable std::atomic<std::uint64_t> provedPresent{0};
