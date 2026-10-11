@@ -176,8 +176,10 @@ void notePipeTargets(const Graphics::State& graphics, std::uint64_t serial, Reco
 
 bool RecordPipeActive() {
     static const bool active = [] {
+        // On by default since s60 (t572/t573 and t580/t581 same-binary A/Bs, t575 verify 0 misses);
+        // APS5_RECORD_PIPE=0 is the old path (A records every draw itself).
         const char* value = std::getenv("APS5_RECORD_PIPE");
-        if (value == nullptr || std::strcmp(value, "1") != 0) return false;
+        if (value != nullptr && std::strcmp(value, "0") == 0) return false;
         const auto set = [](const char* name) { return std::getenv(name) != nullptr; };
         const char* fastDispatch = std::getenv("APS5_FAST_DISPATCH");
         const bool declined = FastDrawEnabled() || FastDrawVerifyEvery() != 0 || set("APS5_LOCKED_DRAW_PREPARE") || Graphics::Recorder::DispatchOverlap() || FastCensusActive() || (fastDispatch != nullptr && std::strcmp(fastDispatch, "0") != 0) || PassDump::Enabled() || set("APS5_CAPTURE_DIR") || Graphics::CheckpointsRequested() || set("APS5_DUMP_DRAW_SHADERS") || set("APS5_DUMP_DRAW_SLOT1") || ShaderRecompiler::DebugProbeActive() || !LabelBatchSubmit() || set("APS5_DRAIN_ALL") || set("APS5_DRAW_DRAIN");

@@ -20,8 +20,8 @@ namespace AgcDriver::DriverDetail {
 // recording thread (B) through a ring of slots that each own a whole DrawScratch. The pure parts
 // below are header-only for tests/Submit.cpp; the threads, drains and stale redo are in RecordPipe.cpp.
 
-// APS5_RECORD_PIPE=1 (read once; default off), declined under the switches that need A-side state
-// (plan 7). The stage-0 census is off while it is on.
+// APS5_RECORD_PIPE (read once; on by default since s60, "0" = off), declined under the switches that
+// need A-side state (plan 7), APS5_CAPTURE_DIR among them. The stage-0 census is off while it is on.
 bool RecordPipeActive();
 
 // Item serials count from 1 (0: none). `handed` is the last serial A published, `consumed` the last
