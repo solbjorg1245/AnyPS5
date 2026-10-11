@@ -1543,6 +1543,16 @@ const HostImport* HostImportMemoized(const Context& context, std::uint64_t addre
     return import;
 }
 
+bool DrawMemos() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_DRAW_MEMOS");
+        if (value == nullptr || std::strcmp(value, "1") != 0) return false;
+        std::fprintf(stderr, "[draws] Draw memos on (APS5_DRAW_MEMOS=1): imports through the thread memo, pipelines through CachedPipelineMemoized\n");
+        return true;
+    }();
+    return enabled;
+}
+
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();

@@ -452,6 +452,10 @@ struct PipelineStore {
     std::atomic<std::uint64_t> removals{0};
     // CachedFastPipeline lookups its memo answered (the [pipecache] line).
     std::atomic<std::uint64_t> memoHits{0};
+    // CachedPipelineMemoized (APS5_DRAW_MEMOS=1) lookups its memo answered and missed (the
+    // [pipecache] line; a miss asks the store and is counted there too).
+    std::atomic<std::uint64_t> drawMemoHits{0};
+    std::atomic<std::uint64_t> drawMemoMisses{0};
     // Ticks once per lookup that answers a stored pipeline (store hit, insert, memo hit): the
     // pipelines' storeUse stamps, by which the eviction picks the least recently used entry.
     std::atomic<std::uint64_t> useClock{0};
@@ -495,7 +499,9 @@ void reportPipelines(PipelineStore& store) {
     if (now - store.lastReport < std::chrono::seconds(10)) return;
     store.lastReport = now;
     const auto lookups = store.hits + store.misses + store.uncached;
-    std::fprintf(stderr, "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached; %llu framebuffers made; %llu fast lookups answered by the thread memo (not counted above)\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size(), static_cast<unsigned long long>(framebuffersMade.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(store.memoHits.exchange(0, std::memory_order_relaxed)));
+    char drawMemo[160] = "";
+    if (DrawMemos()) std::snprintf(drawMemo, sizeof(drawMemo), "; Draw (APS5_DRAW_MEMOS): %llu lookups answered by the thread memo (not counted above), %llu missed it", static_cast<unsigned long long>(store.drawMemoHits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(store.drawMemoMisses.exchange(0, std::memory_order_relaxed)));
+    std::fprintf(stderr, "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached; %llu framebuffers made; %llu fast lookups answered by the thread memo (not counted above)%s\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size(), static_cast<unsigned long long>(framebuffersMade.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(store.memoHits.exchange(0, std::memory_order_relaxed)), drawMemo);
     store.hits = store.misses = store.uncached = store.evicted = 0;
 }
 
@@ -630,6 +636,45 @@ std::shared_ptr<Pipeline> CachedFastPipeline(const Context& context, const State
         return pipeline;
     }
     ++scratch.memo.misses;
+    bool stored = false;
+    auto pipeline = cachedPipeline(context, scratch.key, make, &stored);
+    if (stored) scratch.memo.Note(scratch.key, hash, removals, owner, std::weak_ptr<const void>(context.bufferPool), pipeline);
+    return pipeline;
+}
+
+namespace {
+
+// CachedPipelineMemoized's key buffer and memo (Draw's pipelines; the fast draw's memo is its own).
+struct DrawPipelineScratch {
+    std::vector<std::byte> key;
+    KeyedMemo<Pipeline, 8> memo;
+};
+struct DrawPipelineScratchTag {};
+
+}
+
+std::shared_ptr<Pipeline> CachedPipelineMemoized(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    if (pipelineCacheDisabled() || !pipelineMemoEnabled()) return CachedPipeline(context, state, vertexInput, resources, shaders, attachmentLayout);
+    const auto make = [&] { return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout); };
+    auto& scratch = HostThreadLocal<DrawPipelineScratch, DrawPipelineScratchTag>();
+    // CachedPipeline's key: the set layout key, push layout 0.
+    pipelineKeyInto(context, state, vertexInput, resources.LayoutKey(), 0, shaders, attachmentLayout, scratch.key);
+    // No variant id: a private pipeline, as the store makes it.
+    if (scratch.key.empty()) return cachedPipeline(context, scratch.key, make);
+    auto& store = Pipelines();
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto hash = KeyHash(scratch.key);
+    // As CachedFastPipeline: the device instance (alive), and the removals read before the store answers.
+    const void* owner = context.bufferPool.get();
+    const auto removals = store.removals.load(std::memory_order_acquire);
+    if (auto pipeline = scratch.memo.Find(scratch.key, hash, removals, owner)) {
+        ++scratch.memo.hits;
+        touch(store, *pipeline);
+        if (profile) store.drawMemoHits.fetch_add(1, std::memory_order_relaxed);
+        return pipeline;
+    }
+    ++scratch.memo.misses;
+    if (profile) store.drawMemoMisses.fetch_add(1, std::memory_order_relaxed);
     bool stored = false;
     auto pipeline = cachedPipeline(context, scratch.key, make, &stored);
     if (stored) scratch.memo.Note(scratch.key, hash, removals, owner, std::weak_ptr<const void>(context.bufferPool), pipeline);

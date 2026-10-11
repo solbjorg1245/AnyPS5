@@ -59,7 +59,7 @@ enum PipeDispatchCount : std::size_t { DispatchEligible, DispatchImageWrites, Di
 // (draws by path, then dispatches, hold breaks, idle waits and wakes after one, and B's collect epoch
 // bumps under APS5_RECORD_PIPE_EPOCH).
 enum PipeBPhase : std::size_t { BVerify, BNoteWriters, BRecipe, BRestart, BDraw, BAttach, BDispatch, BSubmitDue, BCleanup, PipeBPhases };
-enum PipeBCount : std::size_t { BItems, BRecipeItems, BRestartItems, BFullItems, BBuiltItems, BStaleItems, BDispatchItems, BHoldBreaks, BIdleWaits, BIdleSlept, BWakes, BEpochs, PipeBCounts };
+enum PipeBCount : std::size_t { BItems, BRecipeItems, BRestartItems, BFullItems, BBuiltItems, BStaleItems, BDispatchItems, BHoldBreaks, BIdleWaits, BIdleSlept, BWakes, BEpochs, BImportMemoHits, BImportMemoMisses, PipeBCounts };
 
 std::uint64_t pipeNs(std::chrono::steady_clock::duration duration) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count());
@@ -584,7 +584,9 @@ void Driver::recordPipeSubmissionEnd() {
     char rows[320];
     std::snprintf(rows, sizeof(rows), "verify %.2f, note writers %.2f, recipe %.2f, restart+draw %.2f, draw %.2f, attach %.2f, dispatch %.2f, submit due %.2f, cleanup %.2f, other %.2f", phaseNs[BVerify] / 1e3 / bItems, phaseNs[BNoteWriters] / 1e3 / bItems, phaseNs[BRecipe] / 1e3 / bItems, phaseNs[BRestart] / 1e3 / bItems, phaseNs[BDraw] / 1e3 / bItems, phaseNs[BAttach] / 1e3 / bItems, phaseNs[BDispatch] / 1e3 / bItems, phaseNs[BSubmitDue] / 1e3 / bItems, phaseNs[BCleanup] / 1e3 / bItems, (busyMs * 1e6 - rowsNs) / 1e3 / bItems);
     const auto& occupancy = pipe.occupancy;
-    std::fprintf(stderr, "[pipe] B (10 s): items %llu (draws %llu: recipe %llu, restart %llu, full %llu, built %llu, stale %llu; dispatches %llu), us per item: %s (busy minus the rows); hold breaks %llu (%.1f ms, relock wait %.1f ms); idle ms %.1f in %llu waits (%llu slept); wake latency us mean %.1f max %.1f (%llu); heap per item: %.2f allocations, %.2f frees; cpu ms %.1f (busy ms %.1f); ring at hand-over: 1 %llu, 2-4 %llu, 5-16 %llu, 17-31 %llu, full %llu; collect epochs %llu\n", itemCounts[BItems], itemCounts[BItems] > itemCounts[BDispatchItems] ? itemCounts[BItems] - itemCounts[BDispatchItems] : 0ull, itemCounts[BRecipeItems], itemCounts[BRestartItems], itemCounts[BFullItems], itemCounts[BBuiltItems], itemCounts[BStaleItems], itemCounts[BDispatchItems], rows, itemCounts[BHoldBreaks], holdBreakMs, holdBreakLockMs, idleMs, itemCounts[BIdleWaits], itemCounts[BIdleSlept], itemCounts[BWakes] == 0 ? 0.0 : wakeMs * 1e3 / static_cast<double>(itemCounts[BWakes]), wakeMaxNs / 1e3, itemCounts[BWakes], allocations / bItems, frees / bItems, cpuMs, busyMs, static_cast<unsigned long long>(occupancy[0]), static_cast<unsigned long long>(occupancy[1]), static_cast<unsigned long long>(occupancy[2]), static_cast<unsigned long long>(occupancy[3]), static_cast<unsigned long long>(occupancy[4]), itemCounts[BEpochs]);
+    char importMemo[96] = "";
+    if (Graphics::DrawMemos()) std::snprintf(importMemo, sizeof(importMemo), "; import memo (APS5_DRAW_MEMOS): hits %llu, misses %llu", itemCounts[BImportMemoHits], itemCounts[BImportMemoMisses]);
+    std::fprintf(stderr, "[pipe] B (10 s): items %llu (draws %llu: recipe %llu, restart %llu, full %llu, built %llu, stale %llu; dispatches %llu), us per item: %s (busy minus the rows); hold breaks %llu (%.1f ms, relock wait %.1f ms); idle ms %.1f in %llu waits (%llu slept); wake latency us mean %.1f max %.1f (%llu); heap per item: %.2f allocations, %.2f frees; cpu ms %.1f (busy ms %.1f); ring at hand-over: 1 %llu, 2-4 %llu, 5-16 %llu, 17-31 %llu, full %llu; collect epochs %llu%s\n", itemCounts[BItems], itemCounts[BItems] > itemCounts[BDispatchItems] ? itemCounts[BItems] - itemCounts[BDispatchItems] : 0ull, itemCounts[BRecipeItems], itemCounts[BRestartItems], itemCounts[BFullItems], itemCounts[BBuiltItems], itemCounts[BStaleItems], itemCounts[BDispatchItems], rows, itemCounts[BHoldBreaks], holdBreakMs, holdBreakLockMs, idleMs, itemCounts[BIdleWaits], itemCounts[BIdleSlept], itemCounts[BWakes] == 0 ? 0.0 : wakeMs * 1e3 / static_cast<double>(itemCounts[BWakes]), wakeMaxNs / 1e3, itemCounts[BWakes], allocations / bItems, frees / bItems, cpuMs, busyMs, static_cast<unsigned long long>(occupancy[0]), static_cast<unsigned long long>(occupancy[1]), static_cast<unsigned long long>(occupancy[2]), static_cast<unsigned long long>(occupancy[3]), static_cast<unsigned long long>(occupancy[4]), itemCounts[BEpochs], importMemo);
     pipe.occupancy = {};
     pipe.items = pipe.runs = pipe.staleRedos = pipe.overlayDraws = pipe.overlayLoads = pipe.overlayDispatches = pipe.submitsLeft = pipe.dispatchItems = 0;
     pipe.drains = pipe.drainsWaited = {};
@@ -656,6 +658,9 @@ void Driver::runRecordPipe() noexcept {
     lap.on = profile;
     auto heapMark = profile ? HostHeap::ThreadCounters() : HostHeap::Counters{};
     std::uint64_t cpuMark = profile ? threadCpuNs() : 0;
+    // APS5_DRAW_MEMOS=1 with APS5_PROFILE_DRAW: B's import memo answers so far (its memo starts empty).
+    const bool drawMemos = profile && Graphics::DrawMemos();
+    std::uint64_t memoHitsMark = 0, memoMissesMark = 0;
     auto breakStart = std::chrono::steady_clock::time_point{};
     bool afterIdle = false;
     const auto count = [&](PipeBCount which) {
@@ -674,6 +679,12 @@ void Driver::runRecordPipe() noexcept {
         if (cpu >= cpuMark) pipe.bCpuNs.fetch_add(cpu - cpuMark, std::memory_order_relaxed);
         heapMark = heap;
         cpuMark = cpu;
+        if (!drawMemos) return;
+        const auto& memo = Graphics::ThreadHostImportMemo();
+        pipe.bCounts[BImportMemoHits].fetch_add(memo.hits - memoHitsMark, std::memory_order_relaxed);
+        pipe.bCounts[BImportMemoMisses].fetch_add(memo.misses - memoMissesMark, std::memory_order_relaxed);
+        memoHitsMark = memo.hits;
+        memoMissesMark = memo.misses;
     };
     // Under the mutex: the batch goes to the GPU once its oldest label is past the deadline.
     const auto submitDueNow = [&] {

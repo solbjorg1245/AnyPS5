@@ -896,8 +896,9 @@ struct DrawInputs {
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
 // instead of computed. `scratch` is the draw's (DrawInputScratch): the inputs point into it.
-// `memoizedImports` (DrawFast only): the in-place inputs find their imports through the thread's
-// memo (HostImportMemoized); Draw and DrawWithRecipe call HostImportFor as before.
+// `memoizedImports` (DrawFast; Draw with APS5_DRAW_MEMOS=1): the in-place inputs find their imports
+// through the thread's memo (HostImportMemoized); Draw without it and DrawWithRecipe call
+// HostImportFor as before.
 DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, DrawInputScratch& scratch, bool memoizedImports = false) {
     DrawInputs inputs;
     scratch.inPlaceRanges.clear();
@@ -1880,8 +1881,8 @@ bool RecordDraws() {
 }
 
 // The memory-state decision of an indirect draw's records (Draw, DrawFast): GPU-side from the host
-// import, or why the CPU reads them (see Draw). `memoized` (DrawFast only): the import through the
-// thread's memo (HostImportMemoized) instead of HostImportFor.
+// import, or why the CPU reads them (see Draw). `memoized` (DrawFast; Draw with APS5_DRAW_MEMOS=1):
+// the import through the thread's memo (HostImportMemoized) instead of HostImportFor.
 IndirectDrawPath indirectPathFor(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, const HostImport*& import, bool memoized = false) {
     if (StorageTexture::FlushPending(address, bytes, nullptr, "indirect draw arguments")) {
         if (recorder != nullptr) {
@@ -1966,7 +1967,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     double ownWaitedMs = 0;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
     ScratchLease<DrawInputScratch> inputScratch;
-    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, *inputScratch);
+    // APS5_DRAW_MEMOS=1 (DrawMemos, s4-plan S4.2): the in-place inputs through the thread's import
+    // memo, as DrawFast's (this thread holds GuestMemory::GpuMutex for the whole draw).
+    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, *inputScratch, DrawMemos());
     if (inputs.nothing) return;
     const auto* args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
@@ -2092,7 +2095,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     std::vector<Pm4::DrawArguments> records;
     if (args != nullptr) {
         static const bool gpuIndirectDraws = std::getenv("APS5_NO_GPU_INDIRECT_DRAW") == nullptr;
-        const auto decide = [&](std::uint64_t address, std::size_t bytes, const HostImport*& import) { return indirectPathFor(context, recorder, address, bytes, import); };
+        // APS5_DRAW_MEMOS=1: the imports through the thread's memo, as DrawFast decides.
+        const bool memoized = DrawMemos();
+        const auto decide = [&](std::uint64_t address, std::size_t bytes, const HostImport*& import) { return indirectPathFor(context, recorder, address, bytes, import, memoized); };
         const auto rangeBytes = args->RangeBytes();
         if (rangeBytes == 0) {
             report(" indirect draw without records");
@@ -2184,7 +2189,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // The state is copied only when a mask must change.
     auto masked = maskedState(state, inputs.fragmentOutputs);
     const State& pipelineState = masked.has_value() ? *masked : state;
-    auto pipeline = CachedPipeline(context, pipelineState, *inputs.vertexInput, *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    // APS5_DRAW_MEMOS=1: the same store key through the thread's key buffer and pipeline memo.
+    const auto attachmentLayout = lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    auto pipeline = DrawMemos() ? CachedPipelineMemoized(context, pipelineState, *inputs.vertexInput, *resources, shaders, attachmentLayout) : CachedPipeline(context, pipelineState, *inputs.vertexInput, *resources, shaders, attachmentLayout);
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     std::vector<std::shared_ptr<StorageTexture>> owners;
