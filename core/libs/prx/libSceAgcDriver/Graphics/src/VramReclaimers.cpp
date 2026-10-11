@@ -41,14 +41,17 @@ std::string census() {
     return line;
 }
 
-// APS5_RESIDENT_WRITES=1 with APS5_RESIDENT_WRITES_DEMOTE=1 (as the recorders read them): the
+// Resident written ranges with S11's demotion, as the recorders read them (both on by default:
+// APS5_<name>=0 or APS5_NO_<name>=1 turns one off, APS5_<name>=1 forces it on): the
 // "resident-writes" reclaimer is registered (without them the [vram] line stays as it was).
 bool residentWritesDemoteSwitched() {
-    const auto on = [](const char* name) {
+    const auto defaultOn = [](const char* name, const char* optOut) {
         const char* value = std::getenv(name);
-        return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+        if (value != nullptr && *value != '\0') return std::strcmp(value, "0") != 0;
+        const char* off = std::getenv(optOut);
+        return off == nullptr || *off == '\0' || std::strcmp(off, "0") == 0;
     };
-    return on("APS5_RESIDENT_WRITES") && on("APS5_RESIDENT_WRITES_DEMOTE");
+    return defaultOn("APS5_RESIDENT_WRITES", "APS5_NO_RESIDENT_WRITES") && defaultOn("APS5_RESIDENT_WRITES_DEMOTE", "APS5_NO_RESIDENT_WRITES_DEMOTE");
 }
 
 }

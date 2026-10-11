@@ -47,7 +47,8 @@ std::atomic<std::atomic<std::uint64_t>*> pendingBlockTable{nullptr};
 std::atomic<std::uint64_t> completedBlockSerial{0};
 // Some recorder was made with APS5_RESIDENT_READS (Recorder::ResidentReadsConfigured).
 std::atomic<bool> residentReadsConfigured{false};
-// Some recorder was made with APS5_RESIDENT_WRITES (Recorder::ResidentWritesConfigured).
+// Some recorder was made with resident written ranges on (APS5_RESIDENT_WRITES, on by default;
+// Recorder::ResidentWritesConfigured).
 std::atomic<bool> residentWritesConfigured{false};
 
 void trackPendingBlocksFromEnvironment() {
@@ -1308,8 +1309,10 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
     }
     // Resident written ranges (KeepsResidentWrites): their lands are queued narrow copy-backs
     // (coalescing; narrow copy-backs are checked when asked), never kept resident past a batch.
-    const char* residentWritesSwitch = std::getenv("APS5_RESIDENT_WRITES");
-    residentWrites.enabled = coalesceCopyBacks && !residentBuffers && residentWritesSwitch != nullptr && *residentWritesSwitch != '\0' && std::strcmp(residentWritesSwitch, "0") != 0;
+    // On by default (S12), as are S11's demotion and the aware commands below: APS5_<name>=0 or
+    // APS5_NO_<name>=1 turns one off (APS5_NO_RESIDENT_WRITES=1 takes the demotion with it),
+    // APS5_<name>=1 forces it on (over the opt-out); unset or empty leaves the default.
+    residentWrites.enabled = coalesceCopyBacks && !residentBuffers && defaultOn("APS5_RESIDENT_WRITES", "APS5_NO_RESIDENT_WRITES");
     if (residentWrites.enabled) {
         residentWritesConfigured.store(true, std::memory_order_relaxed);
         const auto number = [](const char* name, std::uint64_t fallback) {
@@ -1321,13 +1324,11 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
         const auto verify = number("APS5_RESIDENT_WRITES_VERIFY", 0);
         residentWrites.verifyEvery = static_cast<std::uint32_t>(verify == 1 ? 16 : verify);
         residentWrites.roundOut = number("APS5_RESIDENT_WRITES_ROUND", 1) != 0;
-        const char* demoteSwitch = std::getenv("APS5_RESIDENT_WRITES_DEMOTE");
-        residentWrites.demote = demoteSwitch != nullptr && *demoteSwitch != '\0' && std::strcmp(demoteSwitch, "0") != 0;
+        residentWrites.demote = defaultOn("APS5_RESIDENT_WRITES_DEMOTE", "APS5_NO_RESIDENT_WRITES_DEMOTE");
         residentWrites.retrySeconds = static_cast<std::uint32_t>(std::min<std::uint64_t>(number("APS5_RESIDENT_WRITES_RETRY_S", 30), 86400));
     }
     // Aware commands (CommandsTouching): on coalescing's disjoint queue (resident buffers' too).
-    const char* awareSwitch = std::getenv("APS5_AWARE_COMMANDS");
-    awareCommands = coalesceCopyBacks && awareSwitch != nullptr && *awareSwitch != '\0' && std::strcmp(awareSwitch, "0") != 0;
+    awareCommands = coalesceCopyBacks && defaultOn("APS5_AWARE_COMMANDS", "APS5_NO_AWARE_COMMANDS");
     if (awareCommands) awareCommandsUsed.store(true, std::memory_order_relaxed);
     // The compare pass and the shadows' baselines are addressed by buffer device address.
     if (narrowCopyBacks && ((!coalesceCopyBacks && DeferCopyBacks()) || !context.bufferDeviceAddress)) narrowCopyBacks = false;

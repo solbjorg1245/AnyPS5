@@ -61,14 +61,15 @@ public:
     enum class CommandSite : std::uint8_t { Other = 0, Draw, DrawOther, Fill, Copy, Dispatch, Texture, TextureWriteBack, UnitShadow, Depth, CopyBack, KeyStore, Count };
     static const char* CommandSiteName(CommandSite site);
     VkCommandBuffer Commands(VkAccessFlags* coveredAccess = nullptr, CommandSite site = CommandSite::Other);
-    // Aware commands (APS5_AWARE_COMMANDS=1, default off; with copy-back coalescing; read when the
-    // recorder is made): Commands() for a caller that knows every guest range it reads or writes
-    // through the host imports, `touches(begin, end)` telling whether it does so in [begin, end).
+    // Aware commands (on by default: APS5_NO_AWARE_COMMANDS=1 or APS5_AWARE_COMMANDS=0 turns them
+    // off; with copy-back coalescing; read when the recorder is made): Commands() for a caller that
+    // knows every guest range it reads or writes through the host imports, `touches(begin, end)`
+    // telling whether it does so in [begin, end).
     // Only the queued copy-backs whose bytes it touches are recorded first (resident and land
     // copies alike), and every claimed one (the claims of a build still recording keep Commands()'
     // rule); the others stay queued, whole and in order, for the next point that records them
     // (nothing reads or writes their bytes before: C1). A caller whose ranges are not all known
-    // calls Commands(). Without the switch: Commands().
+    // calls Commands(). Turned off: Commands().
     bool AwareCommands() const { return awareCommands; }
     template <typename Touches>
     VkCommandBuffer CommandsTouching(const Touches& touches, CommandSite site, VkAccessFlags* coveredAccess = nullptr) {
@@ -286,8 +287,9 @@ public:
     // resident reads use (an address space's writable ranges, a program's BDA store scan) is
     // prepared only then.
     static bool ResidentReadsConfigured();
-    // Resident written ranges (APS5_RESIDENT_WRITES=1, read when the recorder is made, with
-    // coalescing on and resident buffers off; narrow copy-backs needed; docs/design/
+    // Resident written ranges (on by default: APS5_NO_RESIDENT_WRITES=1 or APS5_RESIDENT_WRITES=0
+    // turns them off, S11 with them; read when the recorder is made, with coalescing on and
+    // resident buffers off; narrow copy-backs needed; docs/design/
     // resident-memory-2.md S7a, GuestBufferMemory.cpp "Resident written ranges"): a written element
     // too large to stage, which dispatch builds bind in place, binds a device-local copy once its
     // range had APS5_RESIDENT_WRITES_USES (8) uses within 10 s, and a use writing it queues one
@@ -302,7 +304,8 @@ public:
         std::uint64_t limitBytes = 0;
         // APS5_RESIDENT_WRITES_ROUND (default 1): a promoted range rounded out to 64 KiB.
         bool roundOut = true;
-        // APS5_RESIDENT_WRITES_DEMOTE=1 (S11, default off): ranges that stopped paying are demoted
+        // S11 (on by default: APS5_NO_RESIDENT_WRITES_DEMOTE=1 or APS5_RESIDENT_WRITES_DEMOTE=0
+        // turns it off): ranges that stopped paying are demoted
         // (cold, refreshed for changes of the import at most uses, both sides written, a retired
         // import) and the "resident-writes" VRAM reclaimer demotes the coldest under pressure;
         // APS5_RESIDENT_WRITES_RETRY_S (30): the cool-down before a demoted range is promoted again.

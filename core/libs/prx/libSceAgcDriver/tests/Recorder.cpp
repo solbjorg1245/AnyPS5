@@ -4339,11 +4339,12 @@ void narrowCopyBackTests(const Device& device, Recorder& recorder) {
     HostImportFor(context, address, bytes);
 }
 
-// Aware commands (APS5_AWARE_COMMANDS=1, with coalescing; read by a recorder made with it set): a
+// Aware commands (on by default with coalescing: APS5_NO_AWARE_COMMANDS=1 or APS5_AWARE_COMMANDS=0
+// turns them off, APS5_AWARE_COMMANDS=1 forces them on; read when a recorder is made): a
 // command naming the guest ranges it reads or writes through the imports (CommandsTouching)
 // records first only the queued copies over them, and every claimed one as Commands() does; the
 // others stay queued, whole, and land at Submit byte-exact. A copy over its ranges lands before its
-// own work, an unaware Commands() records every queued copy, and without the switch
+// own work, an unaware Commands() records every queued copy, and with APS5_NO_AWARE_COMMANDS=1
 // CommandsTouching is Commands(). Command passes count by the caller's site only when they record.
 void awareCommandTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
@@ -4353,19 +4354,25 @@ void awareCommandTests(const Device& device, Recorder& recorder) {
         return std::string(value != nullptr ? value : "");
     };
     const std::string awareSwitch = saved("APS5_AWARE_COMMANDS"), coalesceSwitch = saved("APS5_COALESCE_COPY_BACKS"), noCoalesceSwitch = saved("APS5_NO_COALESCE_COPY_BACKS");
-    const auto madeWith = [&](const char* aware, const char* coalesce) {
+    const std::string noAwareSwitch = saved("APS5_NO_AWARE_COMMANDS");
+    const auto madeWith = [&](const char* aware, const char* coalesce, const char* noAware = "") {
         setSwitch("APS5_AWARE_COMMANDS", aware);
+        setSwitch("APS5_NO_AWARE_COMMANDS", noAware);
         setSwitch("APS5_COALESCE_COPY_BACKS", coalesce);
         setSwitch("APS5_NO_COALESCE_COPY_BACKS", "");
         auto made = std::make_unique<Recorder>(context);
         setSwitch("APS5_AWARE_COMMANDS", awareSwitch.c_str());
+        setSwitch("APS5_NO_AWARE_COMMANDS", noAwareSwitch.c_str());
         setSwitch("APS5_COALESCE_COPY_BACKS", coalesceSwitch.c_str());
         setSwitch("APS5_NO_COALESCE_COPY_BACKS", noCoalesceSwitch.c_str());
         return made;
     };
-    Require(!madeWith("", "")->AwareCommands(), "aware commands are on by default");
+    Require(madeWith("", "")->AwareCommands(), "aware commands are not on by default");
+    Require(!madeWith("", "", "1")->AwareCommands(), "APS5_NO_AWARE_COMMANDS=1 did not turn aware commands off");
+    Require(madeWith("", "", "0")->AwareCommands(), "APS5_NO_AWARE_COMMANDS=0 turned aware commands off");
     Require(!madeWith("0", "")->AwareCommands(), "APS5_AWARE_COMMANDS=0 turned aware commands on");
     Require(madeWith("1", "")->AwareCommands(), "APS5_AWARE_COMMANDS=1 did not turn aware commands on");
+    Require(madeWith("1", "", "1")->AwareCommands(), "APS5_AWARE_COMMANDS=1 did not force aware commands on over the opt-out");
     Require(!madeWith("1", "0")->AwareCommands(), "aware commands are on without copy-back coalescing");
     if (context.hostImportAlignment == 0) {
         std::cout << "host imports unavailable: aware commands not tested\n";
@@ -4450,10 +4457,11 @@ void awareCommandTests(const Device& device, Recorder& recorder) {
         aware->Sync();
     }
     const auto awareCounts = Recorder::CopyBackCounts();
-    // Without the switch CommandsTouching is Commands(): every queued copy goes in first.
+    // The old path (APS5_NO_AWARE_COMMANDS=1): CommandsTouching is Commands(), every queued copy
+    // goes in first.
     {
-        const auto plain = madeWith("", "1");
-        Require(!plain->AwareCommands() && plain->CoalescesCopyBacks(), "aware commands are on without APS5_AWARE_COMMANDS");
+        const auto plain = madeWith("", "1", "1");
+        Require(!plain->AwareCommands() && plain->CoalescesCopyBacks(), "aware commands are on with APS5_NO_AWARE_COMMANDS=1");
         plain->Activate();
         plain->DeferCopies(copyOf(first, 6144, 64));
         static_cast<void>(plain->CommandsTouching(within(0, 64), Site::Texture));
@@ -5726,9 +5734,34 @@ void residentReadTests(const Device& device, Recorder& recorder) {
 // later use bound to D leaves queued (the dispatch rule) and replaces, and which Commands(), Submit
 // and a CPU reader's sync record; a CPU store into the range reaches D before the next use, also
 // while a land is queued (counted `both`: the GPU's dwords land first, the CPU's byte stays); a
-// changed import demotes the range and the next build binds in place.
+// changed import demotes the range and the next build binds in place. On by default (S12) with
+// S11's demotion; APS5_NO_RESIDENT_WRITES=1 (or APS5_RESIDENT_WRITES=0) is the old path, where
+// the uses that promote a range leave it in place. The stage's own recorder pins S11 off.
 void residentWriteTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
+    // The defaults: resident written ranges and their demotion on; APS5_NO_RESIDENT_WRITES=1 or
+    // APS5_RESIDENT_WRITES=0 turns the ranges off and the demotion with them,
+    // APS5_RESIDENT_WRITES=1 forces them on over the opt-out. The caller's switches are restored.
+    {
+        const auto saved = [](const char* name) {
+            const char* value = std::getenv(name);
+            return std::string(value != nullptr ? value : "");
+        };
+        const std::string writesSwitch = saved("APS5_RESIDENT_WRITES"), noWritesSwitch = saved("APS5_NO_RESIDENT_WRITES");
+        const auto made = [&](const char* on, const char* off) {
+            setSwitch("APS5_RESIDENT_WRITES", on);
+            setSwitch("APS5_NO_RESIDENT_WRITES", off);
+            Recorder made(context);
+            return std::pair{made.ResidentWrites().enabled, made.ResidentWrites().demote};
+        };
+        Require(made("", "") == std::pair{true, true}, "(w) resident written ranges and their demotion are not on by default");
+        Require(made("", "1") == std::pair{false, false}, "(w) APS5_NO_RESIDENT_WRITES=1 did not turn resident written ranges off");
+        Require(made("0", "") == std::pair{false, false}, "(w) APS5_RESIDENT_WRITES=0 did not turn resident written ranges off");
+        Require(made("1", "1") == std::pair{true, true}, "(w) APS5_RESIDENT_WRITES=1 did not force resident written ranges on");
+        Require(made("", "0") == std::pair{true, true}, "(w) APS5_NO_RESIDENT_WRITES=0 turned resident written ranges off");
+        setSwitch("APS5_RESIDENT_WRITES", writesSwitch.c_str());
+        setSwitch("APS5_NO_RESIDENT_WRITES", noWritesSwitch.c_str());
+    }
     constexpr std::size_t unit = 65536;
     // Over the written-shadow window (16 MiB by default): in place for being too large.
     constexpr std::size_t span = (std::size_t{16} << 20u) + unit;
@@ -5775,16 +5808,22 @@ void residentWriteTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the resident write block refused or unwatched: resident written ranges not tested\n";
         return;
     }
-    setSwitch("APS5_RESIDENT_WRITES", "1");
+    // `plain`: the old path; `writes`: S7 alone (S11 pinned off: its policy would demote here).
     setSwitch("APS5_RESIDENT_WRITES_USES", "2");
+    setSwitch("APS5_NO_RESIDENT_WRITES", "1");
+    Recorder plain(context);
+    setSwitch("APS5_NO_RESIDENT_WRITES", "");
+    setSwitch("APS5_RESIDENT_WRITES", "1");
+    setSwitch("APS5_NO_RESIDENT_WRITES_DEMOTE", "1");
     Recorder writes(context);
     setSwitch("APS5_RESIDENT_WRITES", "");
     setSwitch("APS5_RESIDENT_WRITES_USES", "");
+    setSwitch("APS5_NO_RESIDENT_WRITES_DEMOTE", "");
     if (!writes.KeepsResidentWrites()) {
         std::cout << "no narrow copy-backs: resident written ranges not tested\n";
         return;
     }
-    Require(!recorder.KeepsResidentWrites() && writes.ResidentWrites().uses == 2, "(w) APS5_RESIDENT_WRITES did not set up the recorder");
+    Require(!plain.KeepsResidentWrites() && plain.NarrowsCopyBacks() && writes.ResidentWrites().uses == 2 && !writes.ResidentWrites().demote, "(w) APS5_RESIDENT_WRITES did not set up the recorders");
     writes.Activate();
     const auto build = [&]() {
         auto memory = std::make_unique<GuestBufferMemory>(context);
@@ -5824,6 +5863,24 @@ void residentWriteTests(const Device& device, Recorder& recorder) {
         writes.Sync();
         return std::to_integer<unsigned char>(readback->Bytes()[0]);
     };
+    // The old path (APS5_NO_RESIDENT_WRITES=1): the uses that would promote the range leave it in
+    // place.
+    {
+        plain.Activate();
+        const auto promoted = ResidentWriteCounts().promoted;
+        for (int use = 0; use < 2; ++use) {
+            auto memory = build();
+            Require(memory->ServedInPlace(address + at), "(w) a use with APS5_NO_RESIDENT_WRITES=1 did not bind in place");
+            memory->RecordCopyBacks(plain);
+            plain.ReleaseClaims();
+            plain.NotePendingWrites(memory->Writes(), Recorder::WriteKind::ShaderWrite);
+            memory->MarkDirectWrites();
+            plain.Submit();
+            plain.Sync();
+        }
+        Require(ResidentWriteCounts().promoted == promoted, "(w) APS5_NO_RESIDENT_WRITES=1 promoted a range");
+        writes.Activate();
+    }
     auto counts = ResidentWriteCounts();
     const auto expect = [&](std::uint64_t ResidentWriteStatistics::*field, std::uint64_t delta, const char* what) {
         const auto now = ResidentWriteCounts();
@@ -6032,11 +6089,14 @@ void residentWriteSpaceTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the resident write space block refused or unwatched: resident written spaces not tested\n";
         return;
     }
+    // S7 alone: S11 pinned off (its policy would demote here).
     setSwitch("APS5_RESIDENT_WRITES", "1");
     setSwitch("APS5_RESIDENT_WRITES_USES", "2");
+    setSwitch("APS5_NO_RESIDENT_WRITES_DEMOTE", "1");
     Recorder writes(context);
     setSwitch("APS5_RESIDENT_WRITES", "");
     setSwitch("APS5_RESIDENT_WRITES_USES", "");
+    setSwitch("APS5_NO_RESIDENT_WRITES_DEMOTE", "");
     if (!writes.KeepsResidentWrites()) {
         std::cout << "no narrow copy-backs: resident written spaces not tested\n";
         return;
@@ -6187,11 +6247,14 @@ void residentWriteWritableTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the resident write writable block refused or unwatched: resident written writable spaces not tested\n";
         return;
     }
+    // S7 alone: S11 pinned off (its policy would demote here).
     setSwitch("APS5_RESIDENT_WRITES", "1");
     setSwitch("APS5_RESIDENT_WRITES_USES", "2");
+    setSwitch("APS5_NO_RESIDENT_WRITES_DEMOTE", "1");
     Recorder writes(context);
     setSwitch("APS5_RESIDENT_WRITES", "");
     setSwitch("APS5_RESIDENT_WRITES_USES", "");
+    setSwitch("APS5_NO_RESIDENT_WRITES_DEMOTE", "");
     if (!writes.KeepsResidentWrites()) {
         std::cout << "no narrow copy-backs: resident written writable spaces not tested\n";
         return;
@@ -6322,7 +6385,8 @@ void residentWriteWritableTests(const Device& device, Recorder& recorder) {
 }
 
 // S11 (APS5_RESIDENT_WRITES_DEMOTE, GuestBufferMemory.cpp demoteResidentWritesByPolicy and
-// TrimResidentWrites): off by default; a range with fewer than APS5_RESIDENT_WRITES_USES uses
+// TrimResidentWrites): on by default with the ranges (S12; APS5_NO_RESIDENT_WRITES_DEMOTE=1 or
+// APS5_RESIDENT_WRITES_DEMOTE=0 turns it alone off); a range with fewer than APS5_RESIDENT_WRITES_USES uses
 // bound to its device copy in a whole 10 s window is demoted at the window's roll, its queued land
 // recorded first; a demoted range waits its cool-down before it is promoted again; the
 // "resident-writes" reclaimer demotes the colder of two ranges and reports its bytes; a range
@@ -6337,11 +6401,28 @@ void residentWriteDemoteTests(const Device& device, Recorder& recorder) {
     constexpr std::size_t second = at + span + unit;
     constexpr std::size_t poll = second + span + unit;
     constexpr std::size_t bytes = poll + unit;
+    // The defaults: demotion on with the ranges; APS5_NO_RESIDENT_WRITES_DEMOTE=1 or
+    // APS5_RESIDENT_WRITES_DEMOTE=0 turns it alone off, APS5_RESIDENT_WRITES_DEMOTE=1 forces it on
+    // over the opt-out. The caller's switches are restored.
     {
-        setSwitch("APS5_RESIDENT_WRITES", "1");
-        Recorder plain(context);
-        setSwitch("APS5_RESIDENT_WRITES", "");
-        Require(!plain.ResidentWrites().demote && !recorder.ResidentWrites().demote, "(d) APS5_RESIDENT_WRITES_DEMOTE is on by default");
+        const auto saved = [](const char* name) {
+            const char* value = std::getenv(name);
+            return std::string(value != nullptr ? value : "");
+        };
+        const std::string demoteSwitch = saved("APS5_RESIDENT_WRITES_DEMOTE"), noDemoteSwitch = saved("APS5_NO_RESIDENT_WRITES_DEMOTE");
+        const auto made = [&](const char* on, const char* off) {
+            setSwitch("APS5_RESIDENT_WRITES_DEMOTE", on);
+            setSwitch("APS5_NO_RESIDENT_WRITES_DEMOTE", off);
+            Recorder made(context);
+            return std::pair{made.ResidentWrites().enabled, made.ResidentWrites().demote};
+        };
+        Require(made("", "") == std::pair{true, true}, "(d) APS5_RESIDENT_WRITES_DEMOTE is not on by default");
+        Require(made("", "1") == std::pair{true, false}, "(d) APS5_NO_RESIDENT_WRITES_DEMOTE=1 did not turn demotion alone off");
+        Require(made("0", "") == std::pair{true, false}, "(d) APS5_RESIDENT_WRITES_DEMOTE=0 did not turn demotion alone off");
+        Require(made("1", "1") == std::pair{true, true}, "(d) APS5_RESIDENT_WRITES_DEMOTE=1 did not force demotion on");
+        Require(made("", "0") == std::pair{true, true}, "(d) APS5_NO_RESIDENT_WRITES_DEMOTE=0 turned demotion off");
+        setSwitch("APS5_RESIDENT_WRITES_DEMOTE", demoteSwitch.c_str());
+        setSwitch("APS5_NO_RESIDENT_WRITES_DEMOTE", noDemoteSwitch.c_str());
     }
     if (context.hostImportAlignment == 0 || !context.bufferDeviceAddress || DeviceStagingWanted(span, false)) {
         std::cout << "host imports, device addresses or an element too large to stage unavailable: resident write demotion not tested\n";

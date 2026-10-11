@@ -360,7 +360,8 @@ void SetVramCensus(std::function<std::string()> census);
 //     become the other reclaimers' for the next pass.
 //  40 resident: resident read copies nothing else holds (APS5_RESIDENT_READS).
 //  50 resident-writes: the coldest resident written ranges, landed and dropped (with
-//     APS5_RESIDENT_WRITES_DEMOTE=1 only; GuestBufferMemory.cpp TrimResidentWrites).
+//     S11's demotion, on by default: not with APS5_NO_RESIDENT_WRITES=1 or
+//     APS5_NO_RESIDENT_WRITES_DEMOTE=1; GuestBufferMemory.cpp TrimResidentWrites).
 // The device registers the pool's (order 0, Inline) in ConfigureVram.
 void RegisterDriverVramReclaimers();
 // Hands evicted objects to the open batch (destroyed once it completed, off the GPU mutex) when

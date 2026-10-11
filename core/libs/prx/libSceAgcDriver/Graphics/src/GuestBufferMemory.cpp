@@ -3194,7 +3194,8 @@ void ClearStagedShadows(VkDevice device) {
     // Released here, after the lock: back to the device's pool while it still lives.
 }
 
-// Resident written ranges (Recorder::KeepsResidentWrites, APS5_RESIDENT_WRITES=1; docs/design/
+// Resident written ranges (Recorder::KeepsResidentWrites, on by default, APS5_NO_RESIDENT_WRITES=1
+// turns them off; docs/design/
 // resident-memory-2.md S7a). A written element over the written-shadow window is bound in place:
 // the hot kernels (t439: 0x248994d00, 0x248997600) read and write ~112 MiB of host memory over PCIe
 // at every use. The range R of such an element (rounded out to 64 KiB inside its import), bound in
@@ -3217,7 +3218,8 @@ void ClearStagedShadows(VkDevice device) {
 // changed is demoted (its land recorded, dropped); a reused build over a changed registry is
 // rebuilt. All of it runs under GuestMemory::GpuMutex; the fast dispatch's checks read the list of
 // ranges on other threads, under the registry's mutex.
-// S11 (APS5_RESIDENT_WRITES_DEMOTE=1): a range that stopped paying is demoted the same way (cold,
+// S11 (on by default, APS5_NO_RESIDENT_WRITES_DEMOTE=1 turns it off): a range that stopped paying
+// is demoted the same way (cold,
 // refreshed at most uses, both sides written, a retired import: demoteResidentWritesByPolicy) and
 // the "resident-writes" VRAM reclaimer demotes the coldest under pressure (TrimResidentWrites); a
 // demoted range waits a cool-down before it is promoted again, and its second demotion for CPU

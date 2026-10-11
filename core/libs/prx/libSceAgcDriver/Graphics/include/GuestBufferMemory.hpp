@@ -246,7 +246,8 @@ void ResidentReadsFailCollectForTests(bool fail);
 // holding it is rebuilt (RecordResidentReads) and its memory goes with the last holder.
 VideoMemory::ResidentTrim TrimResidentReads(std::uint64_t bytes);
 
-// Resident written ranges (Recorder::KeepsResidentWrites, APS5_RESIDENT_WRITES=1; see
+// Resident written ranges (Recorder::KeepsResidentWrites, on by default, APS5_NO_RESIDENT_WRITES=1
+// turns them off; see
 // GuestBufferMemory.cpp "Resident written ranges"): the range of a written element too large to
 // stage binds a device copy D in its dispatch builds, and its writes reach the import by a land.
 struct ResidentWrite;
