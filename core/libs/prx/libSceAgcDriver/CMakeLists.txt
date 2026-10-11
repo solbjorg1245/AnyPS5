@@ -68,6 +68,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Diagnostics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/FrameTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/PassDump.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/ExposureWatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DataHitVerification.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/Dispatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/FastDispatch.cpp
@@ -344,6 +345,13 @@ target_include_directories(agc_inplace_write_census_tests PRIVATE ${LIBS_INCLUDE
 target_link_libraries(agc_inplace_write_census_tests PRIVATE libc)
 set_target_properties(agc_inplace_write_census_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_inplace_write_census_tests)
+
+# The [exposure] watch's decode and list statistics (Execution/include/Driver/ExposureWatch.hpp): header only, no device.
+add_test_executable(agc_exposure_watch_tests EXCLUDE_FROM_ALL tests/ExposureWatch.cpp)
+target_include_directories(agc_exposure_watch_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_exposure_watch_tests PRIVATE libc)
+set_target_properties(agc_exposure_watch_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_exposure_watch_tests)
 
 add_test_executable(agc_shader_disk_cache_tests EXCLUDE_FROM_ALL tests/ShaderDiskCache.cpp)
 target_include_directories(agc_shader_disk_cache_tests PRIVATE ${LIBS_INCLUDE_DIR})

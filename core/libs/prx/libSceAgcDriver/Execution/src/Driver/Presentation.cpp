@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/ExposureWatch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/PassDump.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -126,6 +127,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         gpuReady(context);
         timing.Mark("release_and_callback");
         if (profile) reportPresents(waitedMs, inFlight);
+        if (ExposureWatch::Enabled() && buffer != nullptr) ExposureWatch::AtPresent();
         CheckFailure();
     } catch (const ProcessShutdown&) {
         throw;
