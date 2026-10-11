@@ -99,6 +99,16 @@ struct GuestBufferMemory::AddressSpace {
     std::vector<CopiedRange> copied;
     // The BDA table entries of `base`, in its order.
     std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
+    // Resident written ranges (APS5_RESIDENT_WRITES; not with APS5_RESIDENT_WRITES_SPACE=0): the
+    // registry epoch the space was built under (0: none), the live ranges `ranges` maps to their
+    // device copy D (each inside a read-only base range served in place by its import; Read only),
+    // their bytes (sorted; out of directRanges), and the table mapping them to the import instead
+    // (with its own serial) for a build that reads them through the import (residentUnsplit).
+    std::uint64_t residentEpoch = 0;
+    std::vector<std::shared_ptr<ResidentWrite>> residentMapped;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> residentHoles;
+    std::vector<ShaderRecompiler::BdaAbi::Range> importRanges;
+    std::uint64_t importSerial = 0;
 };
 
 namespace {
@@ -135,6 +145,14 @@ AddressSpaceCache& Spaces() {
     static AddressSpaceCache cache;
     return cache;
 }
+
+// Resident written ranges in the address space (defined with their registry, "Resident written
+// ranges"): the registry epoch a space maps them under (0: none), the live ranges with it, and the
+// split of one read-only in-place table entry around those inside it.
+std::uint64_t residentSpaceEpoch();
+std::vector<std::shared_ptr<ResidentWrite>> residentSpaceRanges(std::uint64_t& epoch);
+bool residentWritesOverAny(std::uint64_t begin, std::uint64_t end);
+void splitResidentEntry(VkBuffer import, std::uint64_t importBase, const std::vector<std::shared_ptr<ResidentWrite>>& live, std::vector<ShaderRecompiler::BdaAbi::Range>& ranges, std::vector<std::shared_ptr<ResidentWrite>>& mapped, std::vector<std::pair<std::uint64_t, std::uint64_t>>& holes);
 
 bool addressSpaceCacheEnabled() {
     static const bool disabled = std::getenv("APS5_NO_ADDRESS_SPACE_CACHE") != nullptr;
@@ -1615,6 +1633,8 @@ void GuestBufferMemory::AcquireRegistered() {
     // Read before the lease below is acquired: a mutation ending in between leaves the space
     // stale by its generation, never newer than it (see AddressSpace).
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    // Resident written ranges: the registry this build's descriptors are checked against.
+    residentSpaceEpochAt = residentSpaceEpoch();
     if (addressSpaceCacheEnabled()) {
         auto current = spaces.current.load();
         bool hit = false;
@@ -1625,6 +1645,7 @@ void GuestBufferMemory::AcquireRegistered() {
             else if (current->device != context.device) spaces.rebuiltDevice.fetch_add(1, std::memory_order_relaxed);
             else if (current->generation != generation) spaces.rebuiltGeneration.fetch_add(1, std::memory_order_relaxed);
             else if (current->importsEpoch != state.epoch) spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed);
+            else if (current->residentEpoch != residentSpaceEpoch()) spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed);
             else hit = true;
         }
         if (hit) {
@@ -1723,6 +1744,13 @@ void GuestBufferMemory::AcquireRegistered() {
             // re-resolves every pointer as before.
             std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
             bool publish = true;
+            // Resident written ranges: taken before the import lock (the registry's lock is never
+            // held around it); a promotion or drop after this moves the epoch: the space is stale.
+            std::uint64_t residentEpoch = 0;
+            const auto residentLive = residentSpaceRanges(residentEpoch);
+            std::vector<std::shared_ptr<ResidentWrite>> residentMapped;
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> residentHoles;
+            std::vector<ShaderRecompiler::BdaAbi::Range> importRanges;
             {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
@@ -1731,7 +1759,11 @@ void GuestBufferMemory::AcquireRegistered() {
                     spaces.unpublished.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     for (const auto& region : regions) {
-                        if (region.direct != nullptr || region.mirror != nullptr) ranges.push_back(addressRange(region));
+                        if (region.direct == nullptr && region.mirror == nullptr) continue;
+                        ranges.push_back(addressRange(region));
+                        if (residentLive.empty()) continue;
+                        importRanges.push_back(ranges.back());
+                        if (region.direct != nullptr && !region.writable && !region.span) splitResidentEntry(region.direct->buffer, region.direct->base, residentLive, ranges, residentMapped, residentHoles);
                     }
                 }
             }
@@ -1743,6 +1775,14 @@ void GuestBufferMemory::AcquireRegistered() {
                 built->serial = spaces.serials.fetch_add(1, std::memory_order_relaxed) + 1;
                 built->lease = std::move(lease);
                 built->ranges = std::move(ranges);
+                built->residentEpoch = residentEpoch;
+                if (!residentMapped.empty()) {
+                    std::sort(residentHoles.begin(), residentHoles.end());
+                    built->residentMapped = std::move(residentMapped);
+                    built->residentHoles = std::move(residentHoles);
+                    built->importRanges = std::move(importRanges);
+                    built->importSerial = spaces.serials.fetch_add(1, std::memory_order_relaxed) + 1;
+                }
                 std::vector<Region> extras;
                 for (auto& region : regions) {
                     if (region.direct != nullptr || region.mirror != nullptr) {
@@ -1764,10 +1804,24 @@ void GuestBufferMemory::AcquireRegistered() {
                         else (*direct)[out++] = range;
                     }
                     direct->resize(out);
+                    if (!built->residentHoles.empty()) {
+                        // A range mapped to its device copy is not read through the import.
+                        std::vector<std::pair<std::uint64_t, std::uint64_t>> kept;
+                        for (const auto& range : *direct) {
+                            auto cursor = range.first;
+                            for (const auto& [holeBegin, holeEnd] : built->residentHoles) {
+                                if (holeEnd <= cursor || range.second <= holeBegin) continue;
+                                if (cursor < holeBegin) kept.emplace_back(cursor, holeBegin);
+                                cursor = holeEnd;
+                            }
+                            if (cursor < range.second) kept.emplace_back(cursor, range.second);
+                        }
+                        *direct = std::move(kept);
+                    }
                     built->directRanges = std::move(direct);
-                    // Only when a recorder keeps resident reads (else nothing reads it); a space
-                    // built without it counts as storing anywhere (NoteAddressWriter).
-                    if (Recorder::ResidentReadsConfigured()) {
+                    // Only when a recorder keeps resident reads or writes (else nothing reads it);
+                    // a space built without it counts as storing anywhere (NoteAddressWriter).
+                    if (Recorder::ResidentReadsConfigured() || Recorder::ResidentWritesConfigured()) {
                         auto writable = std::make_shared<std::vector<std::pair<std::uint64_t, std::uint64_t>>>();
                         for (const auto& region : built->base) {
                             if (region.direct != nullptr && region.writable && !region.span) writable->emplace_back(region.begin, region.end);
@@ -1938,12 +1992,16 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
     bool span = false;
     switch (baseOverlap(address, address + bytes, nullptr)) {
         case BaseOverlap::Inside:
+            // Bound to the import: over a resident written range (one the space maps to its device
+            // copy: the build binds the space's import table, one copy of the range per use).
+            if (residentImportOver(address, address + bytes)) residentUnsplit = true;
             return;
         case BaseOverlap::Partial:
             // Served by one import over the crossed ranges (UploadFinish makes it), the space kept.
             if (spannable(address, address + bytes)) {
                 Spaces().spanned.fetch_add(1, std::memory_order_relaxed);
                 span = true;
+                if (residentImportOver(address, address + bytes)) residentUnsplit = true;
                 break;
             }
             Spaces().dissolvedOverlap.fetch_add(1, std::memory_order_relaxed);
@@ -3126,6 +3184,585 @@ void ClearStagedShadows(VkDevice device) {
     // Released here, after the lock: back to the device's pool while it still lives.
 }
 
+// Resident written ranges (Recorder::KeepsResidentWrites, APS5_RESIDENT_WRITES=1; docs/design/
+// resident-memory-2.md S7a). A written element over the written-shadow window is bound in place:
+// the hot kernels (t439: 0x248994d00, 0x248997600) read and write ~112 MiB of host memory over PCIe
+// at every use. The range R of such an element (rounded out to 64 KiB inside its import), bound in
+// place by dispatch builds APS5_RESIDENT_WRITES_USES times within 10 s, is promoted when its import
+// is watched and no span, no other range overlaps it and APS5_RESIDENT_WRITES_MIB and the video-
+// memory budget admit it: one device-local buffer holds D, the GPU's copy of R, and behind it B,
+// what the import held when both last agreed. A dispatch build binds D for every region over R
+// (written or read) when each lies in R, in place in R's import; otherwise it binds R in place.
+// W1: a use writing R queues R's land, a narrow copy-back from D (baseline B) into the import
+// (Recorder::DeferredCopy::land), which whatever records queued copy-backs records first (Submit,
+// labels, any Commands(), a dispatch reading the import in place, an address-based dispatch, a
+// copy-in over R, a CPU reader's sync); a later use bound to D leaves it queued (VulkanDevice::
+// recordDispatch) and queues its own, which replaces it. A use notes and stamps its writes as an
+// in-place use does (other readers learn of them) and D's synced generation moves past them (W4).
+// W2: before every use bound to D, a change of the import since D was synced (a collected CPU store
+// or a driver store, a GPU write noted that is not a use's own, an address-based use whose BDA
+// table lets it store over R) refreshes D and B from the import after R's queued land: the land stores
+// only the dwords the GPU changed, so a CPU store elsewhere in R survives into D (one made while a
+// land waited is counted `both`; a dword both sides changed keeps the GPU's). A range whose import
+// changed is demoted (its land recorded, dropped); a reused build over a changed registry is
+// rebuilt. All of it runs under GuestMemory::GpuMutex; the fast dispatch's checks read the list of
+// ranges on other threads, under the registry's mutex.
+struct ResidentWrite {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    // The import it lands into: its buffer, base, device address (of the base) and serial.
+    VkBuffer import = VK_NULL_HANDLE;
+    std::uint64_t importBase = 0;
+    VkDeviceAddress importAddress = 0;
+    std::uint64_t importSerial = 0;
+    // D at offset 0, B at `baseline`, and the bytes charged for both.
+    std::shared_ptr<Buffer> buffer;
+    VkDeviceSize baseline = 0;
+    std::uint64_t charged = 0;
+    // The tracker generation D stands for, the GPU writes noted over R and those seen by then, and
+    // a refresh owed before the next use (ResidentRefresh: promoted, a change seen during a use, an
+    // address-based use).
+    std::uint64_t synced = 0;
+    std::uint64_t notes = 0;
+    std::uint64_t notesSeen = 0;
+    std::uint8_t refresh = 1;
+    bool dropped = false;
+    std::uint64_t checks = 0;
+};
+
+namespace {
+
+enum ResidentRefresh : std::uint8_t { RefreshNone = 0, RefreshFirst, RefreshStamp, RefreshNoted, RefreshAddress };
+
+struct ResidentWriteRegistry {
+    HostMutex mutex;
+    std::vector<std::shared_ptr<ResidentWrite>> ranges;
+    std::atomic<bool> live{false};
+    // Bumped by every promotion and drop: a reused build made under another epoch is checked.
+    std::atomic<std::uint64_t> epoch{1};
+    std::atomic<std::uint64_t> declines{0}, verified{0}, mismatched{0}, spacesMapped{0};
+    std::uint64_t bytes = 0;
+    // Promotion candidates: their uses within the 10 s window that began at the second member.
+    std::map<std::pair<std::uint64_t, std::uint64_t>, std::pair<std::uint32_t, std::int64_t>> candidates;
+    ResidentWriteStatistics counts{};
+    ResidentWriteStatistics reported{};
+    std::array<std::uint64_t, 9> landsReported{};
+    std::int64_t reportMs = 0;
+};
+
+ResidentWriteRegistry& residentWrites() {
+    static auto* registry = new ResidentWriteRegistry();
+    return *registry;
+}
+
+// The live range holding [begin, end) (`whole`) or overlapping it, or null.
+ResidentWrite* residentWriteOver(std::uint64_t begin, std::uint64_t end, bool whole) {
+    for (const auto& range : residentWrites().ranges) {
+        if (whole ? range->begin <= begin && end <= range->end : range->begin < end && begin < range->end) return range.get();
+    }
+    return nullptr;
+}
+
+// The [resident-writes] line every 10 s (APS5_PROFILE_DRAW): the counts since the last one.
+void reportResidentWrites(ResidentWriteRegistry& registry) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    const auto nowMs = steadyMilliseconds();
+    if (registry.reportMs == 0) registry.reportMs = nowMs;
+    if (nowMs - registry.reportMs < 10000) return;
+    registry.reportMs = nowMs;
+    auto c = registry.counts;
+    c.declines = registry.declines.load(std::memory_order_relaxed);
+    c.verified = registry.verified.load(std::memory_order_relaxed);
+    c.mismatched = registry.mismatched.load(std::memory_order_relaxed);
+    c.spacesMapped = registry.spacesMapped.load(std::memory_order_relaxed);
+    const auto& r = registry.reported;
+    const auto lands = Recorder::ResidentLandCounts();
+    const auto& l = registry.landsReported;
+    const auto d = [](std::uint64_t now, std::uint64_t before) { return static_cast<unsigned long long>(now - before); };
+    std::uint64_t landed = 0;
+    for (std::size_t reason = 0; reason < 8; ++reason) landed += lands[reason] - l[reason];
+    const auto refreshes = (c.refreshFirst + c.refreshStamp + c.refreshNoted + c.refreshAddress) - (r.refreshFirst + r.refreshStamp + r.refreshNoted + r.refreshAddress);
+    std::fprintf(stderr, "[resident-writes] (10 s): %zu ranges live (%.1f MiB with baselines), promoted %llu, refused: overlap %llu, vram %llu, cap %llu, span %llu; uses bound to D %llu; lands %llu (%.1f MiB compared) by reason: submit %llu store-run %llu command %llu dispatch %llu dispatch-lease %llu copy-in %llu reader %llu demote %llu; refreshes %llu (%.1f MiB): promoted %llu, stamped %llu, noted %llu, address-based %llu; address-based writers: over R %llu, elsewhere %llu; spaces mapping R to D %llu, address-based uses reading D %llu; both %llu; demoted %llu, reused builds rebuilt %llu; fast-dispatch declines %llu; collects %llu (%.0f us); verify: compared %llu, mismatched %llu\n", registry.ranges.size(), static_cast<double>(registry.bytes) / 1048576.0, d(c.promoted, r.promoted), d(c.refusedOverlap, r.refusedOverlap), d(c.refusedVram, r.refusedVram), d(c.refusedCap, r.refusedCap), d(c.refusedSpan, r.refusedSpan), d(c.uses, r.uses), static_cast<unsigned long long>(landed), static_cast<double>(lands[8] - l[8]) / 1048576.0, d(lands[0], l[0]), d(lands[1], l[1]), d(lands[2], l[2]), d(lands[3], l[3]), d(lands[4], l[4]), d(lands[5], l[5]), d(lands[6], l[6]), d(lands[7], l[7]), static_cast<unsigned long long>(refreshes), static_cast<double>(c.refreshedBytes - r.refreshedBytes) / 1048576.0, d(c.refreshFirst, r.refreshFirst), d(c.refreshStamp, r.refreshStamp), d(c.refreshNoted, r.refreshNoted), d(c.refreshAddress, r.refreshAddress), d(c.addressOver, r.addressOver), d(c.addressElsewhere, r.addressElsewhere), d(c.spacesMapped, r.spacesMapped), d(c.mappedUses, r.mappedUses), d(c.both, r.both), d(c.demoted, r.demoted), d(c.rebuilt, r.rebuilt), d(c.declines, r.declines), d(c.collects, r.collects), static_cast<double>(c.collectUs - r.collectUs), d(c.verified, r.verified), d(c.mismatched, r.mismatched));
+    registry.reported = c;
+    registry.landsReported = lands;
+}
+
+// Promotes [begin, end) of the import (`import` based at `importBase`, device address
+// `importAddress`): not when another range overlaps it, past the cap, refused by the video-memory
+// budget or the device, or when that import no longer serves the range.
+bool promoteResidentWrite(const Context& context, const Recorder::ResidentWriteSettings& settings, VkBuffer import, std::uint64_t importBase, VkDeviceAddress importAddress, std::uint64_t begin, std::uint64_t end) {
+    auto& registry = residentWrites();
+    auto& counts = registry.counts;
+    if (residentWriteOver(begin, end, false) != nullptr) {
+        ++counts.refusedOverlap;
+        return false;
+    }
+    const auto bytes = static_cast<std::size_t>(end - begin);
+    const VkDeviceSize baseline = (bytes + 255) & ~VkDeviceSize{255};
+    const std::uint64_t charged = BufferPool::Capacity(static_cast<std::size_t>(baseline + bytes));
+    if (registry.bytes + charged > settings.limitBytes) {
+        ++counts.refusedCap;
+        return false;
+    }
+    VkBuffer buffer = VK_NULL_HANDLE;
+    std::uint64_t base = 0;
+    const auto serial = HostImportSerial(context, begin, bytes, false);
+    if (serial == 0 || !HostImportExisting(context, begin, bytes, buffer, base) || buffer != import || base != importBase) return false;
+    if (!VideoMemory::Admits(charged) || !AdmitVram(VramClass::Resident, charged)) {
+        ++counts.refusedVram;
+        return false;
+    }
+    auto range = std::make_shared<ResidentWrite>();
+    try {
+        const VramClassScope resident(VramClass::Resident);
+        range->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(baseline + bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    } catch (const std::exception& error) {
+        static std::atomic<int> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 4) std::fprintf(stderr, "[resident-writes] a range of %zu bytes refused: %s\n", bytes, error.what());
+        ++counts.refusedVram;
+        return false;
+    }
+    range->begin = begin;
+    range->end = end;
+    range->import = import;
+    range->importBase = importBase;
+    range->importAddress = importAddress;
+    range->importSerial = serial;
+    range->baseline = baseline;
+    range->charged = charged;
+    std::lock_guard lock(registry.mutex);
+    registry.ranges.push_back(std::move(range));
+    registry.bytes += charged;
+    registry.live.store(true, std::memory_order_relaxed);
+    registry.epoch.fetch_add(1, std::memory_order_relaxed);
+    ++counts.promoted;
+    return true;
+}
+
+// Drops a range: its queued land recorded first (into its import, which the open batch keeps if
+// it retired), then out of the registry; reused builds binding it are rebuilt.
+void demoteResidentWrite(Recorder& recorder, ResidentWrite& range) {
+    recorder.FlushResidentLand(&range, true);
+    auto& registry = residentWrites();
+    std::shared_ptr<ResidentWrite> released;
+    std::lock_guard lock(registry.mutex);
+    const auto found = std::find_if(registry.ranges.begin(), registry.ranges.end(), [&](const std::shared_ptr<ResidentWrite>& live) { return live.get() == &range; });
+    if (found == registry.ranges.end()) return;
+    range.dropped = true;
+    released = std::move(*found);
+    registry.ranges.erase(found);
+    registry.bytes -= range.charged;
+    registry.live.store(!registry.ranges.empty(), std::memory_order_relaxed);
+    registry.epoch.fetch_add(1, std::memory_order_relaxed);
+    ++registry.counts.demoted;
+}
+
+// Whether a collect stamped a block of the range since D was synced (a CPU store; the driver's own
+// stamps do not count). The caller collected the range.
+bool cpuStoredSince(const ResidentWrite& range) {
+    const auto blocks = static_cast<std::size_t>(((range.end - 1) >> 16u) - (range.begin >> 16u) + 1);
+    std::vector<std::uint64_t> generations(blocks, range.synced);
+    std::vector<std::uint8_t> changed(blocks, 0);
+    std::vector<std::uint8_t> cpu(blocks, 0);
+    GuestMemory::ChangedBlocks(range.begin, static_cast<std::size_t>(range.end - range.begin), generations, changed, cpu);
+    return std::any_of(cpu.begin(), cpu.end(), [](std::uint8_t block) { return block != 0; });
+}
+
+// APS5_RESIDENT_WRITES_VERIFY: a 1 MiB window (moving along R) of a clean, unchanged D and of the
+// import, copied to the host at this point of the batch, where they must agree; compared when the
+// batch completed.
+void verifyResidentWrite(const Context& context, Recorder& recorder, const ResidentWrite& range) {
+    const auto bytes = range.end - range.begin;
+    const auto window = std::min<std::uint64_t>(bytes, std::uint64_t{1} << 20u);
+    const auto offset = ((range.checks * window) % (bytes - window + 1)) & ~std::uint64_t{3};
+    auto fromImport = std::make_shared<Buffer>(context, static_cast<std::size_t>(window), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    auto fromCopy = std::make_shared<Buffer>(context, static_cast<std::size_t>(window), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto commands = recorder.CommandsKeepingCopyBacks();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    CopyBuffer(context, commands, range.import, range.begin - range.importBase + offset, fromImport->Handle(), 0, window);
+    CopyBuffer(context, commands, range.buffer->Handle(), offset, fromCopy->Handle(), 0, window);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    recorder.NotePendingRead(range.begin + offset, static_cast<std::size_t>(window), Recorder::ReadKind::GpuCopy);
+    recorder.Keep(range.buffer);
+    const auto address = range.begin + offset;
+    recorder.OnComplete([fromImport, fromCopy, address] {
+        const auto expected = fromImport->Bytes();
+        const auto actual = fromCopy->Bytes();
+        auto& registry = residentWrites();
+        registry.verified.fetch_add(1, std::memory_order_relaxed);
+        if (std::memcmp(expected.data(), actual.data(), expected.size()) == 0) return;
+        registry.mismatched.fetch_add(1, std::memory_order_relaxed);
+        std::size_t at = 0;
+        while (at < expected.size() && expected[at] == actual[at]) ++at;
+        static std::atomic<int> described{0};
+        if (described.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[resident-writes] verify: the device copy of 0x%llx+0x%zx differs from its import at +0x%zx (import %02x, copy %02x)\n", static_cast<unsigned long long>(address), expected.size(), at, std::to_integer<unsigned>(expected[at]), std::to_integer<unsigned>(actual[at]));
+    });
+}
+
+// W2, before a use bound to D: a change of the import since D was synced refreshes D and B from
+// it, ahead of the work and after the queued land of R (and the queued label and key stores over
+// R), as a resident read-only copy is refreshed; every APS5_RESIDENT_WRITES_VERIFY-th check of a
+// clean, unchanged D compares a window of it with the import.
+void checkResidentWrite(const Context& context, Recorder& recorder, ResidentWrite& range) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto& counts = residentWrites().counts;
+    const auto bytes = static_cast<std::size_t>(range.end - range.begin);
+    // The collect walks R's pages (~28k per 112 MiB) once per collect epoch; later ones hit the memo.
+    // A failed walk (0: an uncommitted or no-access page) may have reset dirty pages without
+    // stamping them: D is not trusted then (counted as stamped), as a resident read-only copy is not.
+    const auto collectStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool collected = GuestMemory::CollectWrites(range.begin, bytes) != 0;
+    if (profile) {
+        ++counts.collects;
+        counts.collectUs += microsecondsSince(collectStart);
+    }
+    auto reason = range.refresh;
+    if (reason == RefreshNone && range.notes != range.notesSeen) reason = RefreshNoted;
+    if (reason == RefreshNone && (!collected || !GuestMemory::UnchangedSince(range.begin, bytes, range.synced))) reason = RefreshStamp;
+    if (reason == RefreshNone) {
+        const auto every = recorder.ResidentWrites().verifyEvery;
+        if (every != 0 && ++range.checks % every == 0 && !recorder.ResidentLandQueued(&range)) verifyResidentWrite(context, recorder, range);
+        return;
+    }
+    // A CPU store while the GPU's writes wait in a queued land: both sides wrote R. The land stores
+    // only the dwords D changed, so the CPU's elsewhere survive into D below.
+    if (reason != RefreshFirst && recorder.ResidentLandQueued(&range) && cpuStoredSince(range)) ++counts.both;
+    recorder.FlushKeyStoresOverlapping(range.begin, bytes);
+    recorder.FlushStoresOverlapping(range.begin, bytes);
+    recorder.FlushDeferredOverlapping(range.begin, bytes, nullptr, Recorder::FlushReason::CopyIn);
+    const auto commands = recorder.CommandsKeepingCopyBacks();
+    // Every store collected or stamped up to here is in the import when the copy runs.
+    const auto generation = GuestMemory::TrackerGeneration();
+    const auto timing = recorder.BeginGpuTiming(StagingCopyInKey);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    CopyBuffer(context, commands, range.import, range.begin - range.importBase, range.buffer->Handle(), 0, bytes);
+    // B takes D's bytes on the device (no second read over PCIe).
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    CopyBuffer(context, commands, range.buffer->Handle(), 0, range.buffer->Handle(), range.baseline, bytes);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    for (int barrier = 0; barrier < 3; ++barrier) Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+    recorder.MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    recorder.EndGpuTiming(timing, 2 * bytes);
+    recorder.NotePendingRead(range.begin, bytes, Recorder::ReadKind::GpuCopy);
+    recorder.Keep(range.buffer);
+    range.synced = generation;
+    range.notesSeen = range.notes;
+    range.refresh = RefreshNone;
+    ++(reason == RefreshFirst ? counts.refreshFirst : reason == RefreshNoted ? counts.refreshNoted : reason == RefreshAddress ? counts.refreshAddress : counts.refreshStamp);
+    counts.refreshedBytes += bytes;
+}
+
+// APS5_RESIDENT_WRITES_SPACE=0: S7a's address-based writers, each owing every live range a refresh,
+// and address spaces mapping every range to its import.
+bool residentWritesSpace() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_RESIDENT_WRITES_SPACE");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+std::uint64_t residentSpaceEpoch() {
+    if (!Recorder::ResidentWritesConfigured() || !residentWritesSpace()) return 0;
+    return residentWrites().epoch.load(std::memory_order_relaxed);
+}
+
+std::vector<std::shared_ptr<ResidentWrite>> residentSpaceRanges(std::uint64_t& epoch) {
+    epoch = 0;
+    if (!Recorder::ResidentWritesConfigured() || !residentWritesSpace()) return {};
+    auto& registry = residentWrites();
+    std::lock_guard lock(registry.mutex);
+    epoch = registry.epoch.load(std::memory_order_relaxed);
+    return registry.ranges;
+}
+
+bool residentWritesOverAny(std::uint64_t begin, std::uint64_t end) {
+    auto& registry = residentWrites();
+    if (!registry.live.load(std::memory_order_relaxed)) return false;
+    std::lock_guard lock(registry.mutex);
+    return residentWriteOver(begin, end, false) != nullptr;
+}
+
+// The last entry of `ranges` (a read-only base range served in place by `import` at `importBase`)
+// is split around the live ranges of that import inside it: each maps to its device copy D (the
+// entry's permissions), the rest to the import as before.
+void splitResidentEntry(VkBuffer import, std::uint64_t importBase, const std::vector<std::shared_ptr<ResidentWrite>>& live, std::vector<ShaderRecompiler::BdaAbi::Range>& ranges, std::vector<std::shared_ptr<ResidentWrite>>& mapped, std::vector<std::pair<std::uint64_t, std::uint64_t>>& holes) {
+    const auto whole = ranges.back();
+    std::vector<std::shared_ptr<ResidentWrite>> inside;
+    for (const auto& range : live) {
+        if (range->import == import && range->importBase == importBase && whole.begin <= range->begin && range->end <= whole.end) inside.push_back(range);
+    }
+    if (inside.empty()) return;
+    std::sort(inside.begin(), inside.end(), [](const std::shared_ptr<ResidentWrite>& left, const std::shared_ptr<ResidentWrite>& right) { return left->begin < right->begin; });
+    // One count per space that maps a range (its first split).
+    if (mapped.empty()) residentWrites().spacesMapped.fetch_add(1, std::memory_order_relaxed);
+    ranges.pop_back();
+    auto cursor = whole.begin;
+    for (auto& range : inside) {
+        if (cursor < range->begin) ranges.push_back({cursor, range->begin, whole.deviceAddress + (cursor - whole.begin), whole.permissions, 0});
+        ranges.push_back({range->begin, range->end, range->buffer->DeviceAddress(), whole.permissions, 0});
+        holes.emplace_back(range->begin, range->end);
+        cursor = range->end;
+        mapped.push_back(std::move(range));
+    }
+    if (cursor < whole.end) ranges.push_back({cursor, whole.end, whole.deviceAddress + (cursor - whole.begin), whole.permissions, 0});
+}
+
+}
+
+bool ResidentWritesLive() {
+    return residentWrites().live.load(std::memory_order_relaxed);
+}
+
+void NoteResidentWritesWrite(std::uint64_t begin, std::uint64_t end) {
+    for (const auto& range : residentWrites().ranges) {
+        if (range->begin < end && begin < range->end) ++range->notes;
+    }
+}
+
+void NoteResidentWritesAddressWriter(const std::vector<std::pair<std::uint64_t, std::uint64_t>>* ranges) {
+    auto& registry = residentWrites();
+    bool over = false;
+    for (const auto& range : registry.ranges) {
+        if (ranges != nullptr) {
+            // Sorted and merged: the first entry ending past R's begin overlaps R if it starts before its end.
+            const auto found = std::upper_bound(ranges->begin(), ranges->end(), range->begin, [](std::uint64_t value, const std::pair<std::uint64_t, std::uint64_t>& entry) { return value < entry.second; });
+            if (found == ranges->end() || found->first >= range->end) continue;
+        }
+        over = true;
+        if (range->refresh == RefreshNone) range->refresh = RefreshAddress;
+    }
+    ++(over ? registry.counts.addressOver : registry.counts.addressElsewhere);
+}
+
+bool ResidentWritesOverlap(std::uint64_t begin, std::uint64_t end) {
+    auto& registry = residentWrites();
+    if (!registry.live.load(std::memory_order_relaxed)) return false;
+    std::lock_guard lock(registry.mutex);
+    if (std::none_of(registry.ranges.begin(), registry.ranges.end(), [&](const std::shared_ptr<ResidentWrite>& range) { return range->begin < end && begin < range->end; })) return false;
+    registry.declines.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+ResidentWriteStatistics ResidentWriteCounts() {
+    auto& registry = residentWrites();
+    std::lock_guard lock(registry.mutex);
+    auto counts = registry.counts;
+    counts.declines = registry.declines.load(std::memory_order_relaxed);
+    counts.verified = registry.verified.load(std::memory_order_relaxed);
+    counts.mismatched = registry.mismatched.load(std::memory_order_relaxed);
+    counts.spacesMapped = registry.spacesMapped.load(std::memory_order_relaxed);
+    counts.live = registry.ranges.size();
+    counts.liveBytes = registry.bytes;
+    return counts;
+}
+
+void ClearResidentWrites() {
+    auto& registry = residentWrites();
+    std::vector<std::shared_ptr<ResidentWrite>> released;
+    std::lock_guard lock(registry.mutex);
+    for (const auto& range : registry.ranges) range->dropped = true;
+    released.swap(registry.ranges);
+    registry.candidates.clear();
+    registry.bytes = 0;
+    registry.live.store(false, std::memory_order_relaxed);
+    registry.epoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool GuestBufferMemory::residentHoleOver(std::uint64_t begin, std::uint64_t end) const {
+    if (space == nullptr || space->residentHoles.empty()) return false;
+    return std::any_of(space->residentHoles.begin(), space->residentHoles.end(), [&](const std::pair<std::uint64_t, std::uint64_t>& hole) { return hole.first < end && begin < hole.second; });
+}
+
+bool GuestBufferMemory::residentImportOver(std::uint64_t begin, std::uint64_t end) const {
+    return residentHoleOver(begin, end) || (residentSpaceEpochAt != 0 && residentWritesOverAny(begin, end));
+}
+
+bool GuestBufferMemory::MapsResidentLands() const {
+    return space != nullptr && !residentUnsplit && residentSpaceEpochAt != 0 && uploaded && !committed;
+}
+
+bool GuestBufferMemory::MapsResidentLand(const void* key) const {
+    // Under the registry the build's descriptors were checked against, a live range none of them
+    // binds, no region of its own overlaps, and its table maps only to the range's device copy (or
+    // not at all): the use reads and writes no byte of the range's import.
+    if (!MapsResidentLands() || residentWrites().epoch.load(std::memory_order_relaxed) != residentSpaceEpochAt) return false;
+    const auto& range = *static_cast<const ResidentWrite*>(key);
+    if (range.dropped || std::any_of(regions.begin(), regions.end(), [&](const Region& region) { return region.begin < range.end && range.begin < region.end; })) return false;
+    const auto& table = space->ranges;
+    auto entry = std::upper_bound(table.begin(), table.end(), range.begin, [](std::uint64_t value, const ShaderRecompiler::BdaAbi::Range& item) { return value < item.end; });
+    for (; entry != table.end() && entry->begin < range.end; ++entry) {
+        if (entry->begin != range.begin || entry->end != range.end || entry->deviceAddress != range.buffer->DeviceAddress()) return false;
+    }
+    return true;
+}
+
+// W2 for an address-based use whose table maps ranges to their device copy, before every recorded
+// use: as a use bound to D (it reads D, never stores to it: the entries are read-only). A range
+// dropped since the space was built is no longer kept current: D takes the import first.
+void GuestBufferMemory::checkMappedResidentWrites(Recorder& recorder) {
+    for (const auto& range : space->residentMapped) {
+        if (range->dropped) range->refresh = RefreshStamp;
+        checkResidentWrite(context, recorder, *range);
+        ++residentWrites().counts.mappedUses;
+    }
+}
+
+bool GuestBufferMemory::BindsResidentLand(const void* key) const {
+    if (!residentWriteRegions || !uploaded || committed) return false;
+    return std::any_of(regions.begin(), regions.end(), [key](const Region& region) { return region.residentWrite.get() == key; });
+}
+
+bool GuestBufferMemory::noteResidentCandidates(Recorder& recorder) {
+    auto& registry = residentWrites();
+    const auto& settings = recorder.ResidentWrites();
+    bool promoted = false;
+    for (const auto& region : regions) {
+        // In place in a watched import (UploadFinish took its identity), written, too large to stage,
+        // not inside a live range (bound to its D, or in place beside a straddler: no candidate).
+        const auto bytes = region.end - region.begin;
+        if (region.direct == nullptr || region.residentWrite != nullptr || region.sparse || region.mirror != nullptr || residentWriteOver(region.begin, region.end, true) != nullptr) continue;
+        if (!WritesOverlap(region.begin, static_cast<std::size_t>(bytes)) || writtenSizeReason(bytes, region.atomic) != InPlaceWriteCensus::Reason::TooLarge) continue;
+        // 64 KiB aligned where its import holds that much around it, else the region itself
+        // (always the region itself with APS5_RESIDENT_WRITES_ROUND=0: a neighbour inside the margin
+        // straddles a rounded range and leaves the build unbindable).
+        auto begin = settings.roundOut ? region.begin & ~std::uint64_t{0xFFFF} : region.begin;
+        auto end = settings.roundOut ? (region.end + 0xFFFF) & ~std::uint64_t{0xFFFF} : region.end;
+        if (!HostImportCovers(context, begin, static_cast<std::size_t>(end - begin))) {
+            begin = region.begin;
+            end = region.end;
+        }
+        const auto nowMs = steadyMilliseconds();
+        auto& [uses, windowMs] = registry.candidates[{begin, end}];
+        if (uses == 0 || nowMs - windowMs > 10000) {
+            uses = 0;
+            windowMs = nowMs;
+        }
+        if (++uses < settings.uses) continue;
+        registry.candidates.erase(std::pair<std::uint64_t, std::uint64_t>{begin, end});
+        if (region.span || region.copySourceAddress == 0) {
+            ++registry.counts.refusedSpan;
+            continue;
+        }
+        promoted = promoteResidentWrite(context, settings, region.copySource, region.copySourceBase, region.copySourceAddress, begin, end) || promoted;
+    }
+    if (registry.candidates.size() > 256) registry.candidates.clear();
+    return promoted;
+}
+
+void GuestBufferMemory::bindResidentWrites(Recorder& recorder, std::vector<Region*>& residentWanted) {
+    auto& registry = residentWrites();
+    noteResidentCandidates(recorder);
+    std::vector<std::shared_ptr<ResidentWrite>> over;
+    for (const auto& range : registry.ranges) {
+        if (std::any_of(regions.begin(), regions.end(), [&](const Region& region) { return region.begin < range->end && range->begin < region.end; })) over.push_back(range);
+    }
+    for (const auto& range : over) {
+        const auto bytes = static_cast<std::size_t>(range->end - range->begin);
+        VkBuffer buffer = VK_NULL_HANDLE;
+        std::uint64_t base = 0;
+        if (!HostImportExisting(context, range->begin, bytes, buffer, base) || buffer != range->import || base != range->importBase || HostImportSerial(context, range->begin, bytes, false) != range->importSerial) {
+            // Its import changed (a remap): demoted, and this build binds the range in place.
+            demoteResidentWrite(recorder, *range);
+            continue;
+        }
+        // Every region over the range binds D, or none does: each lies in it, in place in its import.
+        const bool bindable = std::all_of(regions.begin(), regions.end(), [&](const Region& region) {
+            return region.end <= range->begin || range->end <= region.begin || (region.direct != nullptr && region.copySource == range->import && region.copySourceBase == range->importBase && range->begin <= region.begin && region.end <= range->end && !region.span && !region.sparse && region.mirror == nullptr);
+        });
+        if (!bindable) continue;
+        for (auto& region : regions) {
+            if (region.begin < range->end && range->begin < region.end) region.residentWrite = range;
+        }
+        residentWriteRegions = true;
+        checkResidentWrite(context, recorder, *range);
+    }
+    residentWritesCheckedAt = recorder.Submissions();
+    residentWriteEpoch = registry.epoch.load(std::memory_order_relaxed);
+    std::erase_if(residentWanted, [](const Region* region) { return region->residentWrite != nullptr; });
+    reportResidentWrites(registry);
+}
+
+bool GuestBufferMemory::recordResidentWrites(Recorder& recorder) {
+    auto& registry = residentWrites();
+    const bool promoted = recorder.KeepsResidentWrites() && noteResidentCandidates(recorder);
+    if (promoted || residentWriteEpoch != registry.epoch.load(std::memory_order_relaxed)) {
+        // A range promoted over a region this build binds in place, or one it binds dropped since:
+        // rebuilt, so the new build binds as the registry says.
+        const bool stale = promoted || std::any_of(regions.begin(), regions.end(), [](const Region& region) { return region.residentWrite != nullptr ? region.residentWrite->dropped : region.direct != nullptr && residentWriteOver(region.begin, region.end, true) != nullptr; });
+        if (stale) {
+            ++registry.counts.rebuilt;
+            reportResidentWrites(registry);
+            return false;
+        }
+        residentWriteEpoch = registry.epoch.load(std::memory_order_relaxed);
+    }
+    checkResidentWrites(recorder);
+    reportResidentWrites(registry);
+    return true;
+}
+
+void GuestBufferMemory::checkResidentWrites(Recorder& recorder) {
+    residentWritesCheckedAt = recorder.Submissions();
+    const ResidentWrite* last = nullptr;
+    for (const auto& region : regions) {
+        if (region.residentWrite == nullptr || region.residentWrite.get() == last) continue;
+        last = region.residentWrite.get();
+        checkResidentWrite(context, recorder, *region.residentWrite);
+    }
+}
+
+// After a use, before its notes and marks: each range it wrote queues its land (replacing the one
+// queued); a change of the import since the check, which cannot be the use's own yet, leaves a
+// refresh owed before the next use.
+void GuestBufferMemory::queueResidentLands(Recorder& recorder, bool defer) {
+    auto& counts = residentWrites().counts;
+    std::vector<Recorder::DeferredCopy> lands;
+    const ResidentWrite* last = nullptr;
+    for (const auto& region : regions) {
+        auto* range = region.residentWrite.get();
+        if (range == nullptr || range == last) continue;
+        last = range;
+        ++counts.uses;
+        const auto bytes = static_cast<std::size_t>(range->end - range->begin);
+        if (!WritesOverlap(range->begin, bytes)) continue;
+        if (range->refresh == RefreshNone && range->notes != range->notesSeen) range->refresh = RefreshNoted;
+        if (range->refresh == RefreshNone && !GuestMemory::UnchangedSince(range->begin, bytes, range->synced)) range->refresh = RefreshStamp;
+        Recorder::DeferredCopy land{region.residentWrite, range, range->buffer->Handle(), range->import, 0, range->begin - range->importBase, bytes, range->begin};
+        land.sourceAddress = range->buffer->DeviceAddress();
+        land.destinationAddress = range->importAddress;
+        land.baselineOffset = range->baseline;
+        land.land = true;
+        lands.push_back(std::move(land));
+        recorder.Keep(range->buffer);
+    }
+    if (lands.empty()) return;
+    if (defer) recorder.DeferCopies(std::move(lands));
+    else recorder.RecordCopyBacksNow(std::move(lands));
+}
+
+// After a use's marks (W4): its own notes and stamps over a range it wrote are D's writes, which
+// its queued land carries: D's sync moves past them. A CPU store another thread's collect stamped
+// since the use's check (the absorb window) is not the use's own: it leaves a refresh owed (and
+// counts as both, D being dirty) before the sync moves past it.
+void GuestBufferMemory::absorbResidentWrites() const {
+    const ResidentWrite* last = nullptr;
+    std::uint64_t generation = 0;
+    for (const auto& region : regions) {
+        auto* range = region.residentWrite.get();
+        if (range == nullptr || range == last || !WritesOverlap(range->begin, static_cast<std::size_t>(range->end - range->begin))) continue;
+        last = range;
+        if (cpuStoredSince(*range)) {
+            ++residentWrites().counts.both;
+            if (range->refresh == RefreshNone) range->refresh = RefreshStamp;
+        }
+        if (generation == 0) generation = GuestMemory::TrackerGeneration();
+        range->synced = generation;
+        range->notesSeen = range->notes;
+    }
+}
+
 VramHeld GuestBufferMemory::DeviceBytesHeldAlone() const {
     VramHeld held;
     for (const auto& region : regions) {
@@ -3437,6 +4074,11 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     // the write watch (taken before the import lock), which tells a copy current.
     std::vector<Region*> residentWanted;
     const bool residentReads = recorder != nullptr && recorder->KeepsResidentReads() && stagingAllowed && !addressable && GuestMemory::WriteWatched();
+    // Resident written ranges (Recorder::KeepsResidentWrites): likewise; a region inside a live
+    // range is not staged (it binds the range's device copy), unless atomic or misaligned in its
+    // import (staged as before: it cannot bind the copy, and a GPU copy keeping UploadPrepare's
+    // shadow as a plain buffer would copy back whole and leave the build unreusable).
+    const bool residentWritesOn = recorder != nullptr && recorder->KeepsResidentWrites() && stagingAllowed && !addressable && GuestMemory::WriteWatched();
     // One clock pair around the loop (an address-based build has ~1200 regions): the [buffers]
     // 'import lookup' is the loop less the mirror refreshes and the CPU copies, timed apart.
     const auto loopStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -3477,9 +4119,17 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             }
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
-            const bool staged = recorder != nullptr && stagingEligible(region, addressable);
+            const bool staged = recorder != nullptr && stagingEligible(region, addressable) && !(residentWritesOn && !region.atomic && entry != nullptr && (region.begin - entry->base) % context.limits.minStorageBufferOffsetAlignment == 0 && residentWriteOver(region.begin, region.end, true) != nullptr);
             if (entry != nullptr && !staged && (region.begin - entry->base) % context.limits.minStorageBufferOffsetAlignment == 0) {
                 region.direct = entry;
+                // Resident written ranges: the import's identity, taken now under its lock (none for
+                // a span or unwatched import, or one without a device address).
+                if (residentWritesOn) {
+                    const bool usable = !entry->span && !entry->unwatched && entry->address != 0;
+                    region.copySource = usable ? entry->buffer : VK_NULL_HANDLE;
+                    region.copySourceBase = entry->base;
+                    region.copySourceAddress = usable ? entry->address : 0;
+                }
                 // Resident reads: the import (taken now, under its lock) is the copy's source.
                 if (residentReads && residentEligible(region, *entry, addressable, recorder)) {
                     region.copySource = entry->buffer;
@@ -3540,6 +4190,12 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     const auto loopUs = profile ? microsecondsSince(loopStart) : 0;
     const auto tailStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (!gpuCopies.empty()) recordGpuCopies(gpuCopies, addressable);
+    // Resident written ranges: promotion, then the regions over a live range bind its device copy
+    // (not a resident read-only copy), the range checked against its import and refreshed first.
+    if (residentWritesOn) bindResidentWrites(*recorder, residentWanted);
+    // A space mapping resident written ranges to their device copy: a draw build (no per-use check,
+    // VulkanDevice::recordDispatch's RecheckResidentReads) binds the space's import table.
+    if (space != nullptr && !space->residentMapped.empty() && !stagingAllowed) residentUnsplit = true;
     if (!residentWanted.empty()) {
         // Resident reads: a region takes the cached copy of its range while the import it was
         // bound to is still the one serving the range (the flushes and copies above may have
@@ -3979,6 +4635,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     // Deferred (Recorder::DeferCopies) unless a draw's render pass is open: a copy cannot go into
     // it, and the next draw may continue the pass without Commands().
     const bool defer = recorder.DefersCopyBacks() && !recorder.RenderPassOpen();
+    if (residentWriteRegions) queueResidentLands(recorder, defer);
     // The written ranges, merged: a V# bound twice would otherwise copy the same bytes twice.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
     if (!writes.empty()) {
@@ -4122,6 +4779,14 @@ VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std:
     Require(found != nullptr, "guest buffer has no GPU owner");
     const auto& region = *found;
     Require(address >= region.begin && address + bytes <= region.end && (region.buffer != nullptr || region.direct != nullptr || region.mirror != nullptr), "guest buffer view exceeds its GPU owner");
+    if (region.residentWrite != nullptr) {
+        // A resident written range's device copy holds the range from its first byte, aligned in
+        // the import as the region's in-place binding is: the same adjustment as there.
+        const auto offset = address - region.residentWrite->begin;
+        adjustment = static_cast<std::uint32_t>(offset % context.limits.minStorageBufferOffsetAlignment);
+        Require(adjustment % 4 == 0 && bytes + adjustment <= context.limits.maxStorageBufferRange, "resident written range view off its alignment or over the descriptor range limit");
+        return {region.residentWrite->buffer->Handle(), offset - adjustment, bytes + adjustment};
+    }
     if (region.resident != nullptr) {
         // A resident read-only copy holds the range from its first byte, which is aligned in the
         // import as an in-place binding is: the same adjustment as there.
@@ -4142,7 +4807,7 @@ VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std:
 
 bool GuestBufferMemory::ServedInPlace(std::uint64_t address) const {
     const auto* found = owner(address);
-    return found != nullptr && address < found->end && found->direct != nullptr && found->resident == nullptr;
+    return found != nullptr && address < found->end && found->direct != nullptr && found->resident == nullptr && found->residentWrite == nullptr;
 }
 
 bool GuestBufferMemory::ServedResident(std::uint64_t address) const {
@@ -4180,15 +4845,18 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
     if (space == nullptr) return result;
     // The table is searched by address (the recompiler's lookup bisects it): both lists are sorted
     // and disjoint, so a merge keeps it so.
+    // A build reading a mapped range through the import binds the import table.
+    const auto& spaceRanges = residentUnsplit && !space->residentMapped.empty() ? space->importRanges : space->ranges;
     std::vector<ShaderRecompiler::BdaAbi::Range> merged;
-    merged.reserve(result.size() + space->ranges.size());
-    std::merge(space->ranges.begin(), space->ranges.end(), result.begin(), result.end(), std::back_inserter(merged), [](const auto& left, const auto& right) { return left.begin < right.begin; });
+    merged.reserve(result.size() + spaceRanges.size());
+    std::merge(spaceRanges.begin(), spaceRanges.end(), result.begin(), result.end(), std::back_inserter(merged), [](const auto& left, const auto& right) { return left.begin < right.begin; });
     return merged;
 }
 
 std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {
     if (space == nullptr || !regions.empty()) return std::nullopt;
     Require(uploaded && !committed, "guest GPU address ranges are not available");
+    if (residentUnsplit && !space->residentMapped.empty()) return CachedTable{space->importSerial, &space->importRanges};
     return CachedTable{space->serial, &space->ranges};
 }
 
@@ -4230,6 +4898,7 @@ void GuestBufferMemory::MarkDirectWrites() const {
         const auto& region = *found;
         if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
     }
+    if (residentWriteRegions) absorbResidentWrites();
     // Staging chain: each staged region whose copy-back was recorded now holds its range as the
     // import will (after the marks above, so only later writers stamp past the generation).
     if (chainable.empty()) return;
@@ -4279,7 +4948,7 @@ void GuestBufferMemory::NoteInPlaceWrites(std::uint64_t program) const {
     }
     for (const auto& region : regions) {
         // In place: the import itself or an image mirror (a host-cached buffer), not a copy or a shadow.
-        if ((region.direct == nullptr && region.mirror == nullptr) || !WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) continue;
+        if ((region.direct == nullptr && region.mirror == nullptr) || region.residentWrite != nullptr || !WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) continue;
         noteInPlaceWrite(state, region.begin, region.end, reasonOf(region), program);
     }
 }
@@ -4346,8 +5015,9 @@ void GuestBufferMemory::WriteBack() {
         // Every branch below but the direct, copied-back and staged ones stores from the CPU.
         if (region.direct == nullptr && !(region.gpuCopy && (region.copiedBack || region.deviceLocal)) && !(region.mirror != nullptr && !region.mirror->writable)) Recorder::NoteWrittenBack(begin, static_cast<std::size_t>(end - begin));
         if (region.direct != nullptr) {
-            // The GPU wrote imported guest memory directly; page write watching did not see it.
-            GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+            // The GPU wrote imported guest memory directly; page write watching did not see it. A
+            // resident written range's land was stamped at the use (MarkDirectWrites).
+            if (region.residentWrite == nullptr) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
             continue;
         }
         if (region.mirror != nullptr) {
@@ -4490,6 +5160,7 @@ bool GuestBufferMemory::RebasedDescriptor(std::uint64_t address, std::size_t byt
     // address: the range must end inside it, as a build's Inside descriptor does.
     const Region* found = nullptr;
     if (baseOverlap(address, address + bytes, &found) != BaseOverlap::Inside || found == nullptr) return false;
+    if (!residentUnsplit && residentImportOver(address, address + bytes)) return false;
     const auto& region = *found;
     if (region.direct == nullptr && (region.mirror == nullptr || region.mirror->writable || region.mirror->heap)) return false;
     const auto alignment = context.limits.minStorageBufferOffsetAlignment;
@@ -4537,8 +5208,8 @@ std::span<const std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPl
         }
     }
     for (const auto& region : regions) {
-        // A resident read-only copy is not read through the import (its refresh notes its own read).
-        if (region.direct != nullptr && region.resident == nullptr) out.emplace_back(region.begin, region.end);
+        // A resident copy is not read through the import (its refresh notes its own read).
+        if (region.direct != nullptr && region.resident == nullptr && region.residentWrite == nullptr) out.emplace_back(region.begin, region.end);
     }
     return out;
 }
@@ -4559,8 +5230,10 @@ std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> Gues
         }
     }
     for (const auto& region : regions) {
-        if (region.direct != nullptr && region.resident == nullptr) out.emplace_back(region.begin, region.end);
+        if (region.direct != nullptr && region.resident == nullptr && region.residentWrite == nullptr) out.emplace_back(region.begin, region.end);
     }
+    // The ranges the space maps to their device copy, read through the import by this build.
+    if (space != nullptr && residentUnsplit) out.insert(out.end(), space->residentHoles.begin(), space->residentHoles.end());
     return space != nullptr ? space->directRanges : nullptr;
 }
 
@@ -4598,6 +5271,14 @@ bool GuestBufferMemory::residentEligible(const Region& region, const HostImport&
 
 bool GuestBufferMemory::RecordResidentReads(Recorder& recorder) {
     if (!uploaded || committed) return true;
+    // Resident written ranges: a build made under another registry may be rebuilt; the ranges it
+    // binds are checked and refreshed.
+    if (residentWriteEpoch != 0 && !recordResidentWrites(recorder)) return false;
+    // A range its table maps to a device copy was dropped: rebuilt (the new space maps the import).
+    if (space != nullptr && !residentUnsplit && std::any_of(space->residentMapped.begin(), space->residentMapped.end(), [](const std::shared_ptr<ResidentWrite>& range) { return range->dropped; })) {
+        ++residentWrites().counts.rebuilt;
+        return false;
+    }
     // Refused a copy for the video memory budget, and a pressure episode ended since: rebuilt, so
     // its ranges take copies again (no rebuild while one is open; never with the guard off).
     if (residentBudgetRound != 0 && residentBudgetRound <= VideoMemory::Rounds() && !VideoMemory::UnderPressure()) {
@@ -4638,6 +5319,9 @@ bool GuestBufferMemory::RecordResidentReads(Recorder& recorder) {
 }
 
 void GuestBufferMemory::RecheckResidentReads(Recorder& recorder) {
+    if (residentWriteRegions && uploaded && !committed && residentWritesCheckedAt != recorder.Submissions()) checkResidentWrites(recorder);
+    // Resident written ranges its table maps to their device copy: checked at every recorded use.
+    if (space != nullptr && !residentUnsplit && !space->residentMapped.empty() && uploaded && !committed) checkMappedResidentWrites(recorder);
     if (!residentRegions || !uploaded || committed) return;
     if (residentCheckedBy == &recorder && residentCheckedAt == recorder.Submissions()) return;
     // A batch was submitted since the check (a sync between it and the record): its completions
@@ -4824,13 +5508,12 @@ void GuestBufferMemory::recordResidentReads(Recorder& recorder, std::span<Region
     reportResidentReads(cache);
 }
 
-void GuestBufferMemory::NoteAddressWriter(const Recorder* recorder) const {
-    if (!ResidentReadsLive() || !uploaded || committed) return;
+const std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>>& GuestBufferMemory::addressWriterList() const {
     if (!addressWriterKnown || addressWriterSpace != space.get()) {
         // Once per build (and space it holds): the ranges its BDA table lets a shader store to,
         // the space's writable base ranges and this build's own regions with the Write
-        // permission (addressRange). A space built before any recorder kept resident reads has
-        // no list: anywhere (null).
+        // permission (addressRange). A space built before any recorder kept resident reads or
+        // writes has no list: anywhere (null).
         addressWriterKnown = true;
         addressWriterSpace = space.get();
         std::vector<std::pair<std::uint64_t, std::uint64_t>> own;
@@ -4862,8 +5545,20 @@ void GuestBufferMemory::NoteAddressWriter(const Recorder* recorder) const {
             addressWriterRanges = std::make_shared<const std::vector<std::pair<std::uint64_t, std::uint64_t>>>(std::move(own));
         }
     }
+    return addressWriterRanges;
+}
+
+void GuestBufferMemory::NoteAddressWriter(const Recorder* recorder) const {
+    if (!ResidentReadsLive() || !uploaded || committed) return;
     // An empty list (nothing writable) notes nothing.
-    NoteResidentReadsAddressWriter(addressWriterRanges, recorder);
+    NoteResidentReadsAddressWriter(addressWriterList(), recorder);
+}
+
+void GuestBufferMemory::NoteResidentWritesWriter() const {
+    // The live ranges its list overlaps owe a refresh (an empty list: none); no list (a space built
+    // before resident writes were configured, no upload, APS5_RESIDENT_WRITES_SPACE=0): every one.
+    const bool listed = residentWritesSpace() && uploaded && !committed;
+    NoteResidentWritesAddressWriter(listed ? addressWriterList().get() : nullptr);
 }
 
 std::uint64_t ImageMirrorSerial(const Context& context, std::uint64_t address, std::size_t bytes) {

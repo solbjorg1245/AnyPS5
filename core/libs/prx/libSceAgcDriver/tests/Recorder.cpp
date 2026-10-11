@@ -5457,6 +5457,419 @@ void residentReadTests(const Device& device, Recorder& recorder) {
     recorder.Activate();
 }
 
+// Resident written ranges (APS5_RESIDENT_WRITES=1, GuestBufferMemory.cpp "Resident written
+// ranges"): a written element too large to stage, which dispatch builds bind in place, is promoted
+// after APS5_RESIDENT_WRITES_USES uses and its builds bind the device copy D (not the import,
+// nothing read in place); a use's stores into D reach the import by one queued narrow land, which a
+// later use bound to D leaves queued (the dispatch rule) and replaces, and which Commands(), Submit
+// and a CPU reader's sync record; a CPU store into the range reaches D before the next use, also
+// while a land is queued (counted `both`: the GPU's dwords land first, the CPU's byte stays); a
+// changed import demotes the range and the next build binds in place.
+void residentWriteTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t unit = 65536;
+    // Over the written-shadow window (16 MiB by default): in place for being too large.
+    constexpr std::size_t span = (std::size_t{16} << 20u) + unit;
+    constexpr std::size_t bytes = span + 2 * unit;
+    constexpr std::size_t at = unit;
+    if (context.hostImportAlignment == 0 || !context.bufferDeviceAddress || DeviceStagingWanted(span, false)) {
+        std::cout << "host imports, device addresses or an element too large to stage unavailable: resident written ranges not tested\n";
+        return;
+    }
+    void* block = AllocateWatched(bytes, unit);
+    if (block == nullptr) {
+        std::cout << "no write watching: resident written ranges not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* guest = static_cast<volatile unsigned char*>(block);
+    const auto pattern = [](std::size_t offset) { return static_cast<unsigned char>((at + offset) * 13 + 5); };
+    for (std::size_t offset = 0; offset + at < bytes; ++offset) guest[at + offset] = pattern(offset);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            ClearResidentWrites();
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+            recorder.Activate();
+        }
+    } unregister{context, recorder, block, address};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || import->unwatched || !AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "host import of the resident write block refused or unwatched: resident written ranges not tested\n";
+        return;
+    }
+    setSwitch("APS5_RESIDENT_WRITES", "1");
+    setSwitch("APS5_RESIDENT_WRITES_USES", "2");
+    Recorder writes(context);
+    setSwitch("APS5_RESIDENT_WRITES", "");
+    setSwitch("APS5_RESIDENT_WRITES_USES", "");
+    if (!writes.KeepsResidentWrites()) {
+        std::cout << "no narrow copy-backs: resident written ranges not tested\n";
+        return;
+    }
+    Require(!recorder.KeepsResidentWrites() && writes.ResidentWrites().uses == 2, "(w) APS5_RESIDENT_WRITES did not set up the recorder");
+    writes.Activate();
+    const auto build = [&]() {
+        auto memory = std::make_unique<GuestBufferMemory>(context);
+        memory->AllowDeviceStaging();
+        memory->AddWritable(address + at, span);
+        memory->UploadPrepare(false);
+        memory->UploadFinish(false);
+        return memory;
+    };
+    // After a recorded use: ShaderResources::MarkGpuWrites' copy-backs, notes and marks.
+    const auto marks = [&](GuestBufferMemory& memory) {
+        memory.RecordCopyBacks(writes);
+        writes.ReleaseClaims();
+        writes.NotePendingWrites(memory.Writes(), Recorder::WriteKind::ShaderWrite);
+        memory.MarkDirectWrites();
+    };
+    // A shader's store: 16 bytes of `value` at `offset` into what the build binds.
+    const auto store = [&](const GuestBufferMemory& memory, std::size_t offset, std::uint32_t value) {
+        std::uint32_t adjustment = 0;
+        const auto info = memory.Descriptor(address + at, span, adjustment);
+        const auto commands = writes.CommandsKeepingCopyBacks();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, info.buffer, info.offset + adjustment + offset, 16, value);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    };
+    // The byte the build binds at `offset`, read back after everything recorded (Submit lands).
+    const auto boundByte = [&](const GuestBufferMemory& memory, std::size_t offset) {
+        std::uint32_t adjustment = 0;
+        const auto info = memory.Descriptor(address + at, span, adjustment);
+        auto readback = std::make_shared<Buffer>(context, 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = writes.CommandsKeepingCopyBacks();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, commands, info.buffer, info.offset + adjustment + offset, readback->Handle(), 0, 4);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        writes.Keep(readback);
+        writes.Submit();
+        writes.Sync();
+        return std::to_integer<unsigned char>(readback->Bytes()[0]);
+    };
+    auto counts = ResidentWriteCounts();
+    const auto expect = [&](std::uint64_t ResidentWriteStatistics::*field, std::uint64_t delta, const char* what) {
+        const auto now = ResidentWriteCounts();
+        if (now.*field - counts.*field != delta) throw std::runtime_error(std::string("(w) ") + what + ": counted " + std::to_string(now.*field - counts.*field) + ", expected " + std::to_string(delta));
+    };
+    const auto lands = [](std::size_t reason) { return Recorder::ResidentLandCounts()[reason]; };
+    // The first use binds in place; the second promotes the range and binds its device copy.
+    {
+        auto first = build();
+        Require(first->ServedInPlace(address + at), "(w) a range was promoted before its uses");
+        marks(*first);
+        writes.Submit();
+        writes.Sync();
+    }
+    auto second = build();
+    expect(&ResidentWriteStatistics::promoted, 1, "ranges promoted");
+    expect(&ResidentWriteStatistics::refreshFirst, 1, "promotion fills");
+    std::uint32_t adjustment = 0;
+    Require(second->Descriptor(address + at, span, adjustment).buffer != import->buffer && !second->ServedInPlace(address + at) && second->InPlaceReads().empty(), "(w) the promoted range is not bound from its device copy");
+    store(*second, 0, 0xA1A1A1A1u);
+    marks(*second);
+    Require(writes.DeferredCopyBytes() == span && guest[at] == pattern(0), "(w) the use did not queue one land of the range");
+    // A later use bound to D: the dispatch rule (VulkanDevice::recordDispatch) leaves the land
+    // queued, and the use's own land replaces it.
+    auto third = build();
+    const auto before = Recorder::ResidentLandCounts();
+    writes.FlushDeferredWhere([&](const Recorder::DeferredCopy& copy, bool claimed) {
+        return !claimed && third->WritesOverlap(copy.address, static_cast<std::size_t>(copy.bytes)) && !(copy.land && third->BindsResidentLand(copy.sourceKey));
+    }, Recorder::FlushReason::Dispatch);
+    Require(Recorder::ResidentLandCounts() == before && writes.DeferredCopyBytes() == span, "(w) a use bound to the device copy recorded the land");
+    store(*third, 4096, 0xB2B2B2B2u);
+    marks(*third);
+    Require(writes.DeferredCopyBytes() == span, "(w) a newer land did not replace the queued one");
+    // Commands() records it: the import holds both stores, the bytes around them as they were.
+    static_cast<void>(writes.Commands());
+    Require(!writes.HasDeferredCopies() && lands(2) - before[2] == 1, "(w) Commands() did not record the land");
+    writes.Submit();
+    writes.Sync();
+    Require(guest[at] == 0xA1 && guest[at + 15] == 0xA1 && guest[at + 4096] == 0xB2 && guest[at + 16] == pattern(16) && guest[at + 8192] == pattern(8192), "(w) the land did not store the device copy's changed bytes alone");
+    // Submit records it, and so does a CPU reader's sync.
+    auto fourth = build();
+    store(*fourth, 8192, 0xC3C3C3C3u);
+    marks(*fourth);
+    const auto submits = lands(0);
+    writes.Submit();
+    writes.Sync();
+    Require(lands(0) - submits == 1 && guest[at + 8192] == 0xC3, "(w) Submit did not land the range");
+    auto fifth = build();
+    store(*fifth, 12288, 0xD4D4D4D4u);
+    marks(*fifth);
+    const auto readers = lands(6);
+    writes.SyncThrough(address + at + 12288, 16);
+    Require(lands(6) - readers == 1 && guest[at + 12288] == 0xD4, "(w) a reader's sync did not land the range");
+    // A CPU store into the landed range reaches D before the next use; the GPU's bytes stay.
+    counts = ResidentWriteCounts();
+    guest[at + 20000] = 0x5C;
+    auto sixth = build();
+    expect(&ResidentWriteStatistics::refreshStamp, 1, "refreshes after a CPU store");
+    expect(&ResidentWriteStatistics::both, 0, "both-sides changes of a landed range");
+    Require(boundByte(*sixth, 20000) == 0x5C && boundByte(*sixth, 0) == 0xA1, "(w) the device copy missed the CPU store or lost the GPU's");
+    // Both sides: a land queued, then a CPU store elsewhere in the range: the next use lands the
+    // GPU's dwords first, then D takes the import, so both stores survive.
+    auto seventh = build();
+    store(*seventh, 24576, 0xE5E5E5E5u);
+    marks(*seventh);
+    guest[at + 30000] = 0x3A;
+    counts = ResidentWriteCounts();
+    auto eighth = build();
+    expect(&ResidentWriteStatistics::both, 1, "both-sides changes");
+    Require(boundByte(*eighth, 30000) == 0x3A && boundByte(*eighth, 24576) == 0xE5 && guest[at + 24576] == 0xE5 && guest[at + 30000] == 0x3A, "(w) a store of one side was lost");
+    // The absorb window: a CPU store another thread's collect stamps after the use's land was queued
+    // and before its marks is not the use's own write: the marks leave a refresh owed (counted
+    // `both`, D being dirty), so the next use's D holds it.
+    auto ninth = build();
+    store(*ninth, 36864, 0xF6F6F6F6u);
+    counts = ResidentWriteCounts();
+    ninth->RecordCopyBacks(writes);
+    writes.ReleaseClaims();
+    writes.NotePendingWrites(ninth->Writes(), Recorder::WriteKind::ShaderWrite);
+    guest[at + 40000] = 0x77;
+    AgcDriver::GuestMemory::CollectWritesUncached(address + at + 40000, 1);
+    ninth->MarkDirectWrites();
+    expect(&ResidentWriteStatistics::both, 1, "both-sides changes in the absorb window");
+    auto tenth = build();
+    expect(&ResidentWriteStatistics::refreshStamp, 1, "refreshes after a store in the absorb window");
+    expect(&ResidentWriteStatistics::both, 1, "both-sides changes (the next check must not count the absorbed store again)");
+    Require(boundByte(*tenth, 40000) == 0x77 && boundByte(*tenth, 36864) == 0xF6 && guest[at + 36864] == 0xF6 && guest[at + 40000] == 0x77, "(w) the device copy missed a store collected in the absorb window");
+    // Address-based writers (ShaderResources::Bind of a program that may store through its BDA
+    // table): only a writer whose writable ranges overlap the range owes it a refresh.
+    auto eleventh = build();
+    store(*eleventh, 45056, 0x1B1B1B1Bu);
+    marks(*eleventh);
+    counts = ResidentWriteCounts();
+    {
+        // A build writing only past the range, in the same import: its list misses it.
+        auto elsewhere = std::make_unique<GuestBufferMemory>(context);
+        elsewhere->AddWritable(address + at + span, unit);
+        elsewhere->UploadPrepare(false);
+        elsewhere->UploadFinish(false);
+        elsewhere->NoteResidentWritesWriter();
+    }
+    // Ranges ending at its begin or starting at its end miss it too (half-open).
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> below{{address, address + at}}, above{{address + at + span, address + bytes}}, inside{{address, address + at}, {address + at + 4096, address + at + 8192}};
+    NoteResidentWritesAddressWriter(&below);
+    NoteResidentWritesAddressWriter(&above);
+    expect(&ResidentWriteStatistics::addressElsewhere, 3, "address-based writers elsewhere");
+    expect(&ResidentWriteStatistics::addressOver, 0, "address-based writers over the range");
+    auto twelfth = build();
+    expect(&ResidentWriteStatistics::refreshAddress, 0, "refreshes for writers whose ranges miss the range");
+    Require(twelfth->Descriptor(address + at, span, adjustment).buffer != import->buffer && boundByte(*twelfth, 45056) == 0x1B, "(w) a writer elsewhere unbound the device copy or lost the GPU's bytes");
+    counts = ResidentWriteCounts();
+    NoteResidentWritesAddressWriter(&inside);
+    expect(&ResidentWriteStatistics::addressOver, 1, "address-based writers over the range");
+    auto thirteenth = build();
+    expect(&ResidentWriteStatistics::refreshAddress, 1, "refreshes for a writer over the range");
+    Require(boundByte(*thirteenth, 45056) == 0x1B && guest[at + 45056] == 0x1B, "(w) the refresh for a writer lost the GPU's bytes");
+    // No list (a space built before resident writes were configured): every range.
+    counts = ResidentWriteCounts();
+    NoteResidentWritesAddressWriter(nullptr);
+    auto fourteenth = build();
+    expect(&ResidentWriteStatistics::addressOver, 1, "address-based writers without a list");
+    expect(&ResidentWriteStatistics::refreshAddress, 1, "refreshes for a writer without a list");
+    // A changed import (the block registered again): the range is demoted, the build in place.
+    second.reset();
+    third.reset();
+    fourth.reset();
+    fifth.reset();
+    sixth.reset();
+    seventh.reset();
+    eighth.reset();
+    ninth.reset();
+    tenth.reset();
+    eleventh.reset();
+    twelfth.reset();
+    thirteenth.reset();
+    fourteenth.reset();
+    writes.Sync();
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    Require(HostImportFor(context, address, bytes) != nullptr, "(w) the block was not imported again");
+    counts = ResidentWriteCounts();
+    {
+        auto remapped = build();
+        expect(&ResidentWriteStatistics::demoted, 1, "ranges demoted over a changed import");
+        Require(remapped->ServedInPlace(address + at) && ResidentWriteCounts().live == 0, "(w) a range over a changed import stayed bound");
+    }
+    writes.Sync();
+}
+
+// Resident written ranges in a leased address space (APS5_RESIDENT_WRITES, GuestBufferMemory.cpp
+// splitResidentEntry): a cached space built while a range R is promoted splits the read-only direct
+// base entry around R and maps R to its device copy D (Read only); a lease build that maps R (no
+// descriptor, no region of its own over it) leaves R's queued land queued (MapsResidentLand); a
+// build with a descriptor inside R binds the unsplit import table instead.
+void residentWriteSpaceTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t span = (std::size_t{16} << 20u) + unit;
+    constexpr std::size_t bytes = span + 2 * unit;
+    constexpr std::size_t at = unit;
+    if (context.hostImportAlignment == 0 || !context.bufferDeviceAddress || DeviceStagingWanted(span, false)) {
+        std::cout << "host imports, device addresses or an element too large to stage unavailable: resident written spaces not tested\n";
+        return;
+    }
+    void* block = AllocateWatched(bytes, unit);
+    if (block == nullptr) {
+        std::cout << "no write watching: resident written spaces not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* guest = static_cast<volatile unsigned char*>(block);
+    for (std::size_t offset = 0; offset + at < bytes; ++offset) guest[at + offset] = static_cast<unsigned char>((at + offset) * 7 + 3);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        // Read-only for the GPU: the space's base region over the block is read-only and direct.
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, false);
+    }
+    struct Unregister {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            ClearResidentWrites();
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+            recorder.Activate();
+        }
+    } unregister{context, recorder, block, address};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || import->unwatched || !AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "host import of the resident write space block refused or unwatched: resident written spaces not tested\n";
+        return;
+    }
+    setSwitch("APS5_RESIDENT_WRITES", "1");
+    setSwitch("APS5_RESIDENT_WRITES_USES", "2");
+    Recorder writes(context);
+    setSwitch("APS5_RESIDENT_WRITES", "");
+    setSwitch("APS5_RESIDENT_WRITES_USES", "");
+    if (!writes.KeepsResidentWrites()) {
+        std::cout << "no narrow copy-backs: resident written spaces not tested\n";
+        return;
+    }
+    writes.Activate();
+    const auto build = [&]() {
+        auto memory = std::make_unique<GuestBufferMemory>(context);
+        memory->AllowDeviceStaging();
+        memory->AddWritable(address + at, span);
+        memory->UploadPrepare(false);
+        memory->UploadFinish(false);
+        return memory;
+    };
+    const auto marks = [&](GuestBufferMemory& memory) {
+        memory.RecordCopyBacks(writes);
+        writes.ReleaseClaims();
+        writes.NotePendingWrites(memory.Writes(), Recorder::WriteKind::ShaderWrite);
+        memory.MarkDirectWrites();
+    };
+    const auto store = [&](const GuestBufferMemory& memory, std::size_t offset, std::uint32_t value) {
+        std::uint32_t adjustment = 0;
+        const auto info = memory.Descriptor(address + at, span, adjustment);
+        const auto commands = writes.CommandsKeepingCopyBacks();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, info.buffer, info.offset + adjustment + offset, 16, value);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    };
+    // Two uses of the writable descriptor promote R = the element rounded out to 64 KiB.
+    {
+        auto first = build();
+        marks(*first);
+        writes.Submit();
+        writes.Sync();
+    }
+    auto second = build();
+    std::uint32_t adjustment = 0;
+    Require(ResidentWriteCounts().live == 1 && second->Descriptor(address + at, span, adjustment).buffer != import->buffer && !second->ServedInPlace(address + at), "(ws) the range was not promoted for the space tests");
+    const std::uint64_t rBegin = address + at;
+    const std::uint64_t rEnd = address + at + span;
+    // A use bound to D queues R's land; its key is read without flushing anything.
+    store(*second, 0, 0xA1A1A1A1u);
+    marks(*second);
+    const void* key = nullptr;
+    writes.FlushDeferredWhere([&](const Recorder::DeferredCopy& copy, bool) {
+        if (copy.land) key = copy.sourceKey;
+        return false;
+    }, Recorder::FlushReason::Dispatch);
+    Require(key != nullptr && writes.HasDeferredCopies(), "(ws) the use did not queue a land of the range");
+    // (a) A leased build made after the promotion: its space splits the read-only base entry around R.
+    const auto spaces = ResidentWriteCounts().spacesMapped;
+    ShaderRecompiler::BdaAbi::Range before{}, mapped{}, after{};
+    {
+        GuestBufferMemory leased(context);
+        leased.AllowDeviceStaging();
+        leased.AcquireRegistered();
+        leased.Upload(true);
+        std::vector<ShaderRecompiler::BdaAbi::Range> inBlock;
+        for (const auto& range : leased.AddressRanges()) {
+            if (range.begin < address + bytes && address < range.end) inBlock.push_back(range);
+        }
+        Require(inBlock.size() == 3, "(ws) the leased space did not split the base entry into three: " + std::to_string(inBlock.size()) + " entries");
+        before = inBlock[0];
+        mapped = inBlock[1];
+        after = inBlock[2];
+        Require(before.begin == address && before.end == rBegin && after.begin == rEnd && after.end == address + bytes, "(ws) the pieces outside the range have the wrong bounds");
+        Require(mapped.begin == rBegin && mapped.end == rEnd && mapped.permissions == ShaderRecompiler::BdaAbi::Read, "(ws) the range is not one Read entry");
+        Require(before.permissions == ShaderRecompiler::BdaAbi::Read && after.permissions == ShaderRecompiler::BdaAbi::Read, "(ws) the pieces outside the range are not Read entries");
+        Require(after.deviceAddress - before.deviceAddress == after.begin - before.begin, "(ws) the pieces outside the range are not contiguous in the import");
+        Require(mapped.deviceAddress != before.deviceAddress + (rBegin - before.begin), "(ws) the range still maps to its import, not its device copy");
+        Require(ResidentWriteCounts().spacesMapped >= spaces + 1, "(ws) the space was not counted as mapping a range");
+        // (b) The lease rule: the build maps every land and this one, which stays queued.
+        Require(leased.MapsResidentLands() && leased.MapsResidentLand(key), "(ws) a split lease build does not map the range's land");
+        Require(writes.HasDeferredCopies(), "(ws) mapping the land flushed it");
+    }
+    // (c) A descriptor inside R binds the import: the table is unsplit and the land is not mapped.
+    {
+        GuestBufferMemory leased(context);
+        leased.AllowDeviceStaging();
+        leased.AcquireRegistered();
+        leased.AddReadable(rBegin + 4096, 4096);
+        leased.Upload(true);
+        const auto importAt = before.deviceAddress + (rBegin - before.begin);
+        const auto ranges = leased.AddressRanges();
+        const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin <= rBegin && rBegin < range.end; });
+        Require(found != ranges.end() && found->end >= rEnd, "(ws) the unsplit table has no entry over the range");
+        Require(found->deviceAddress + (rBegin - found->begin) == importAt && found->deviceAddress != mapped.deviceAddress, "(ws) a build with a descriptor in the range does not map it to the import");
+        Require(!leased.MapsResidentLand(key), "(ws) a build with a descriptor in the range maps its land");
+        Require(writes.HasDeferredCopies(), "(ws) building the unsplit lease flushed the land");
+    }
+    writes.Submit();
+    writes.Sync();
+    second.reset();
+    writes.Sync();
+}
+
 // SpirvMayStoreThroughBda: a store or atomic through a physical storage buffer pointer counts,
 // whatever the names; loads through one and stores to other storage classes do not; a store
 // through a pointer the scan cannot type counts.
@@ -5964,6 +6377,8 @@ int main() {
         residentBufferTests(device, recorder);
         residentSharedViewTests(device, recorder);
         residentReadTests(device, recorder);
+        residentWriteTests(device, recorder);
+        residentWriteSpaceTests(device, recorder);
         bdaStoreScanTests();
         fastRingReclaimTests(device, recorder);
         templateRefreshRingTests(device, recorder);
