@@ -6,9 +6,11 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
@@ -41,21 +43,44 @@ struct DrawScratch {
     std::vector<Pm4::DrawArguments> records;
     // The draw relocation's candidate list and state (DrawRelocation.cpp), reset per draw.
     DrawRelocation relocation;
+    // A recording-pipe slot's capture memory (the snapshots point into its pages), so it outlives
+    // the draw that handed the slot over; other leases keep it on draw()'s stack.
+    std::optional<ShaderMemory> shaderMemory;
     unsigned depth = 0;
 };
 
-// Lends the calling thread its DrawScratch while no other lease on this thread holds it.
+struct Submission;
+
+// A draw handed to the recording pipe (RecordPipe.cpp): what its locked half reads besides the
+// slot's DrawScratch (graphics is decode->state), and what A needs to redo it if it turns stale.
+struct RecordPipeDraw {
+    std::shared_ptr<const DrawDecode> decode;
+    std::shared_ptr<DrawEntry> entry;
+    std::shared_ptr<VulkanDevice> device;
+    std::shared_ptr<const DrawRecipe> recipe;
+    Pm4::DrawParameters parameters{};
+    std::uint64_t key = 0;
+    std::uint32_t opcode = 0;
+    bool retryable = false, hit = false;
+    std::span<const std::uint32_t> packet;
+    const Submission* submission = nullptr;
+};
+
+// Lends the calling thread its DrawScratch while no other lease on this thread holds it; `slot`, the
+// recording pipe's next free slot (RecordPipe.cpp), is taken first when no lease holds it.
 class DrawScratchLease {
 public:
-    DrawScratchLease();
+    explicit DrawScratchLease(DrawScratch* slot = nullptr);
     ~DrawScratchLease();
     DrawScratchLease(const DrawScratchLease&) = delete;
     DrawScratchLease& operator=(const DrawScratchLease&) = delete;
     DrawScratch& operator*() const { return *scratch; }
     DrawScratch* operator->() const { return scratch; }
+    bool Slot() const { return slot; }
 
 private:
     DrawScratch* scratch = nullptr;
+    bool slot = false;
     std::unique_ptr<DrawScratch> owned;
 };
 

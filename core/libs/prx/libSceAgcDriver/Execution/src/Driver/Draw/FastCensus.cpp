@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastDraw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -432,7 +433,7 @@ void reportPipeCensus(PipeCensusState& census) {
 }
 
 bool PipeCensusActive() {
-    static const bool active = std::getenv("APS5_PROFILE_DRAW") != nullptr && std::getenv("APS5_NO_PIPE_CENSUS") == nullptr && !FastDrawEnabled();
+    static const bool active = std::getenv("APS5_PROFILE_DRAW") != nullptr && std::getenv("APS5_NO_PIPE_CENSUS") == nullptr && !FastDrawEnabled() && !RecordPipeActive();
     return active;
 }
 

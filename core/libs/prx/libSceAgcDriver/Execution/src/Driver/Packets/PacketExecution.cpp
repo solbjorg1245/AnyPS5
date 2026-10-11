@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/FrameTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/PassDump.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -189,6 +190,9 @@ void Driver::execute(const Submission& submission) {
     static const bool fastCensus = FastCensusActive();
     // APS5_PROFILE_DRAW: each queue-0 packet in the recording-pipe census (parallel-recording.md stage 0).
     static const bool pipeCensus = PipeCensusActive();
+    // APS5_RECORD_PIPE: queue-0 draws recorded on the recording thread; the packets that need its
+    // items recorded first drain at their boundary, and the submission's end drains.
+    static const bool recordPipe = RecordPipeActive();
 
     thread_local PacketProfile packetProfile;
     ++packetProfile.submissions;
@@ -212,6 +216,7 @@ void Driver::execute(const Submission& submission) {
         if (guestOrder) Graphics::Recorder::NoteGuestPacket(opcode, header == FlipPacketHeader || header == RenderingWaitPacketHeader);
         CaptureTrace::Log("packet submission=%llu queue=%x offset=%zu header=%08x words=%zu", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, header, packet.size());
 
+        if (recordPipe && submission.queue == 0) recordPipeBoundary(packet, header);
         const auto flushStart = profilePackets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         flushBetweenPackets(submission.queue, header, opcode == 0x49 || opcode == 0x37);
         PacketTimer packetTimer{profilePackets, header == FlipPacketHeader ? 0xffffu : opcode, submission.queue, packetProfile, std::chrono::steady_clock::now()};
@@ -425,6 +430,7 @@ void Driver::execute(const Submission& submission) {
         if (pipeCensus && submission.queue == 0) NotePipeCensusPacket(header, drawPacket, header == FlipPacketHeader, header == RenderingWaitPacketHeader, wroteOnGpu, pendingDispatchPhases().outcome);
         cursor += count;
     }
+    if (recordPipe && submission.queue == 0) recordPipeSubmissionEnd();
     if (fastCensus) NoteFastCensusSubmissionEnd(submission.queue);
     if (pipeCensus && submission.queue == 0) NotePipeCensusSubmissionEnd(workerQueued() != nullptr && workerQueued()->load(std::memory_order_relaxed) != 0);
 

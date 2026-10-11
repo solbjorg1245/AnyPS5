@@ -55,6 +55,10 @@ void Driver::notePipeCensusWrites(const ShaderRecompiler::RecompileResult& compi
     forEachWrittenBuffer(compiled, [](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool) { NotePipeCensusWrite(begin, end, false); });
 }
 
+void Driver::notePipeItemWrites(const ShaderRecompiler::RecompileResult& compiled, std::uint64_t serial, PipeCensusOverlay& overlay) {
+    forEachWrittenBuffer(compiled, [&](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool) { overlay.Add({begin, end, PipeCensusOverlay::Write, serial}); });
+}
+
 std::optional<WrittenBuffer> Driver::newestWriterLocked(std::uint64_t begin, std::uint64_t end) const {
     for (auto it = writtenBuffers.rbegin(); it != writtenBuffers.rend(); ++it) {
         if (begin < it->end && it->begin < end) return *it;

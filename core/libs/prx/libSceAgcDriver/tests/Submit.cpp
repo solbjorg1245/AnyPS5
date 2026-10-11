@@ -583,8 +583,21 @@ void testRecordPipe() {
     const auto header = [](std::uint32_t opcode) { return 0xc0000000u | (opcode << 8u); };
     overlay.Add({0x5010, 0x5018, write, 7});
     const auto top = [&](std::vector<std::uint32_t> words, bool draw = false, bool flip = false) { return RecordPipeTopDrain(words, draw, flip, false, overlay); };
-    check(!top({header(0x2d)}, true) && !top({header(0x15)}) && !top({header(0x76)}) && !top({header(0x46), 0x04}) && !top({header(0x63), 0x5018, 0, 0, 4}) && !top({header(0x63), 0x5000, 0, 0, 0}), "record pipe: draws, direct dispatches, state packets and loads beside the overlay do not drain at the boundary");
-    check(top({header(0x16)}) == PipeCensusDrain::IndirectDispatch && top({header(0x49)}) == PipeCensusDrain::Label && top({header(0x50)}) == PipeCensusDrain::Dma && top({header(0x10) | (0x17u << 2u)}, false, true) == PipeCensusDrain::Flip && top({header(0x46), 0x39}) == PipeCensusDrain::Other && top({header(0x9f), 0x5000, 0, 0, 3}) == PipeCensusDrain::Overlap, "record pipe: indirect dispatches, labels, copies, flips, sample dumps and loads over the overlay drain");
+    check(!top({header(0x2d)}, true) && !top({header(0x76)}) && !top({header(0x46), 0x04}) && !top({header(0x63), 0x5018, 0, 0, 4}) && !top({header(0x63), 0x5000, 0, 0, 0}), "record pipe: draws, state packets and loads beside the overlay do not drain at the boundary");
+    check(top({header(0x15), 1, 1, 1}) == PipeCensusDrain::Dispatch && top({header(0x16)}) == PipeCensusDrain::IndirectDispatch && top({header(0x49)}) == PipeCensusDrain::Label && top({header(0x50)}) == PipeCensusDrain::Dma && top({header(0x10) | (0x17u << 2u)}, false, true) == PipeCensusDrain::Flip && top({header(0x46), 0x39}) == PipeCensusDrain::Other && top({header(0x9f), 0x5000, 0, 0, 3}) == PipeCensusDrain::Overlap, "record pipe: direct and indirect dispatches, labels, copies, flips, sample dumps and loads over the overlay drain");
+
+    // The stale handshake: B raises k and waits, A redoes k and finishes it, B consumes k; a later
+    // raise of another item is a new handshake.
+    RecordPipeStale stale;
+    bool handshake = stale.Pending() == 0 && !stale.Redone(7);
+    stale.Raise(7);
+    handshake = handshake && stale.Pending() == 7 && !stale.Redone(7);
+    stale.Finish(7);
+    handshake = handshake && stale.Pending() == 0 && stale.Redone(7);
+    stale.Raise(9);
+    handshake = handshake && stale.Pending() == 9 && !stale.Redone(9);
+    stale.Finish(9);
+    check(handshake && stale.Redone(9) && !stale.Redone(7) && stale.Pending() == 0, "record pipe: a stale item is raised by B, redone and finished by A, then released to B");
 }
 
 // The fast dispatch (F5): the compare its verify mode makes between the old path's capture and the

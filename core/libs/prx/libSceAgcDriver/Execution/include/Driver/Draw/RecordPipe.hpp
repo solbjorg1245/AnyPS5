@@ -16,7 +16,11 @@ namespace AgcDriver::DriverDetail {
 // The queue-0 recording pipe (APS5_RECORD_PIPE=1; docs/design/parallel-recording.md stage 1 and
 // parallel-recording-s1-plan.md): the queue thread (A) hands direct and GPU-indirect draws to one
 // recording thread (B) through a ring of slots that each own a whole DrawScratch. The pure parts
-// below are header-only for tests/Submit.cpp; the threads, drains and rewind are in RecordPipe.cpp.
+// below are header-only for tests/Submit.cpp; the threads, drains and stale redo are in RecordPipe.cpp.
+
+// APS5_RECORD_PIPE=1 (read once; default off), declined under the switches that need A-side state
+// (plan 7). The stage-0 census is off while it is on.
+bool RecordPipeActive();
 
 // Item serials count from 1 (0: none). `handed` is the last serial A published, `consumed` the last
 // B recorded; 64-bit, so they never wrap. Serial s lives in slot s % Depth: A may fill the next slot
@@ -50,10 +54,10 @@ struct RecordPipeRing {
 // hand-over and prunes by `consumed` before a capture, validation or indirect read checks it.
 using RecordPipeOverlay = PipeCensusOverlay;
 
-// A run's rewind point (plan 5): QueueState without constantRam (draws never read it, 0x81 replays
-// idempotently, 0x83 drains) and without the fastState memo (Restore resets it). Replaying the run's
-// state packets brings stateSerial back to A's value, which the rewind verifies. ~9 KB with the
-// register files instead of 57; saving into a long-lived mark keeps the vectors' capacity.
+// An item's queue state at hand-over, for A's redo of a stale item: QueueState without constantRam
+// (draws never read it; DUMP_CONST_RAM, its only reader, drains) and without the fastState memo
+// (Restore resets it). ~9 KB with the register files instead of 57; saving into the slot's
+// long-lived mark keeps the vectors' capacity.
 struct QueueStateMark {
     Registers shader, context, userConfig;
     std::optional<Registers> savedContext;
@@ -87,13 +91,15 @@ inline PipeCensusVerdict RecordPipeDrawVerdict(PipeCensusLock lock, bool labelsP
 }
 
 // Whether A drains before a packet runs (PacketExecution.cpp, before flushBetweenPackets): draws
-// decide in the packet and DISPATCH_DIRECT before its unlocked prepare; a sample dump (0x46 event
+// decide in the packet; both dispatches drain (the game always puts a label or wait between draws
+// and compute, so it costs nothing, and the fill/copy HLE is covered); a sample dump (0x46 event
 // 0x39) and an indirect register load (0x63/0x64/0x9f) whose pairs lie in the pruned overlay drain;
 // the rest as the census. wroteOnGpu is not known yet and needs no test: it is set only for labels
 // and copies (0x37/0x49/0x40/0x50/0x83, PacketMemory.cpp), which drain by opcode.
 inline std::optional<PipeCensusDrain> RecordPipeTopDrain(std::span<const std::uint32_t> packet, bool drawPacket, bool flip, bool renderingWait, const RecordPipeOverlay& overlay) {
     const auto opcode = (packet[0] >> 8u) & 0xffu;
     if (drawPacket) return std::nullopt;
+    if (opcode == 0x15 && !flip && !renderingWait) return PipeCensusDrain::Dispatch;
     if (opcode == 0x46 && packet.size() > 1 && (packet[1] & 0x3fu) == 0x39u) return PipeCensusDrain::Other;
     if ((opcode == 0x63 || opcode == 0x64 || opcode == 0x9f) && packet.size() > 4) {
         const auto begin = packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u);
@@ -103,6 +109,23 @@ inline std::optional<PipeCensusDrain> RecordPipeTopDrain(std::span<const std::ui
     }
     return ClassifyPipeCensus({packet[0], false, flip, renderingWait}, false).drain;
 }
+
+// The stale handshake: B, whose device call threw SnapshotStale for item k, records nothing for it,
+// releases the GPU mutex, raises k and waits; A, at its next service point (a packet boundary or any
+// of its pipe waits), redoes k through the retry ladder and finishes it; B then consumes k and goes on
+// with k + 1, which was prepared while k was unconsumed (its writes in the overlay).
+struct RecordPipeStale {
+    std::atomic<std::uint64_t> raised{0}, redone{0};
+    // B.
+    void Raise(std::uint64_t serial) { raised.store(serial, std::memory_order_release); }
+    bool Redone(std::uint64_t serial) const { return redone.load(std::memory_order_acquire) == serial; }
+    // A: the item to redo, or 0; Finish publishes the redo (the release pairs with Redone).
+    std::uint64_t Pending() const { return raised.load(std::memory_order_acquire); }
+    void Finish(std::uint64_t serial) {
+        raised.store(0, std::memory_order_relaxed);
+        redone.store(serial, std::memory_order_release);
+    }
+};
 
 }
 
