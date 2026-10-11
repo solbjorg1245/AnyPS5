@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -58,6 +59,8 @@ struct Statistics {
     std::atomic<std::uint64_t> detiledShadow{0}, detiledShadowBytes{0}, detiledImport{0}, detiledImportBytes{0}, tailPublishes{0};
     std::array<std::atomic<std::uint64_t>, ReasonCount> published{}, publishedBytes{};
     std::atomic<std::uint64_t> staleDroppedCpu{0}, staleDroppedDriver{0}, skippedInCompletion{0}, evictions{0}, lostOnRetire{0}, droppedOnRetire{0}, slabLost{0}, verified{0}, mismatches{0};
+    // Stale-dropped units whose unstored pages were published anyway (APS5_FIX_BOOT_STRIP).
+    std::atomic<std::uint64_t> pageKeptUnits{0}, pageKeptPages{0};
 };
 
 Statistics& Stats() {
@@ -77,6 +80,10 @@ struct UnitShadow {
     // whether a slab -> import copy was recorded at that generation.
     std::vector<std::uint64_t> generation;
     std::vector<std::uint8_t> published;
+    // Per unit: the 4 KiB pages the retiles since the unit was last live wrote into the slab (bit p
+    // for the unit's bytes [p * 4096, (p + 1) * 4096)); the rest of a partly covered unit is a seed
+    // of the import, never published by a stale unit (APS5_FIX_BOOT_STRIP).
+    std::vector<std::uint32_t> retiledPages;
     // Slab k covers units [k * SlabUnits(), (k + 1) * SlabUnits()), made on demand; a failed
     // allocation is not retried before the noted present.
     std::vector<std::shared_ptr<ShadowSlab>> slabs;
@@ -157,6 +164,7 @@ std::shared_ptr<UnitShadow> findOrCreate(Shadows& registry, const Context& conte
     const auto units = (import.base + import.bytes - shadow->base + UnitBytes - 1) / UnitBytes;
     shadow->generation.assign(static_cast<std::size_t>(units), 0);
     shadow->published.assign(static_cast<std::size_t>(units), 0);
+    shadow->retiledPages.assign(static_cast<std::size_t>(units), 0);
     const auto slabs = (units + SlabUnits() - 1) / SlabUnits();
     shadow->slabs.assign(static_cast<std::size_t>(slabs), nullptr);
     shadow->slabFailedUntil.assign(static_cast<std::size_t>(slabs), 0);
@@ -314,11 +322,49 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         std::lock_guard lock(registry.mutex);
         std::vector<std::uint8_t> changed, cpu;
         changedUnits(*shadow, first, last, changed, cpu);
+        const auto addCopy = [&](const std::shared_ptr<ShadowSlab>& slab, std::uint64_t unit, std::uint64_t begin, std::uint64_t end) {
+            const VkBufferCopy region{(unit - slab->firstUnit) * UnitBytes + (begin - shadow->UnitBegin(unit)), begin - shadow->importBase, end - begin};
+            if (!copies.empty() && copies.back().slab == slab && copies.back().regions.back().dstOffset + copies.back().regions.back().size == region.dstOffset) {
+                copies.back().regions.back().size += region.size;
+                ranges.back().second = end;
+            } else {
+                if (copies.empty() || copies.back().slab != slab) copies.push_back({slab, {}});
+                copies.back().regions.push_back(region);
+                ranges.emplace_back(begin, end);
+            }
+            slab->lastUse = Recorder::Presents();
+            bytes += end - begin;
+        };
         for (auto unit = first; unit <= last; ++unit) {
             const auto k = static_cast<std::size_t>(unit - first);
             if (!selected[k] || !shadow->Live(unit)) continue;
             if (changed[k] == GuestMemory::BlockWritten) {
-                // Newer bytes reached the import since the retile: the slab's are dead.
+                // Newer bytes reached the import since the retile: the slab's are dead over the
+                // pages those stores reached. The retiled pages they missed still hold the GPU's
+                // results and are published (APS5_FIX_BOOT_STRIP; PagesUnstoredSince answers 0
+                // when off or unsure). Seeded pages are not: a CPU store after the collect above
+                // would be reverted to the seed's older bytes by the copy.
+                const auto [unitBegin, unitEnd] = shadow->UnitRange(unit);
+                const auto& keptSlab = shadow->slabs[static_cast<std::size_t>(unit / SlabUnits())];
+                const auto retiled = shadow->retiledPages[unit];
+                const auto kept = keptSlab != nullptr && retiled != 0 && unitEnd > unitBegin ? GuestMemory::PagesUnstoredSince(unitBegin, static_cast<std::size_t>(unitEnd - unitBegin), shadow->generation[unit]) & retiled : 0u;
+                if (kept != 0) {
+                    constexpr std::uint64_t page = GuestMemory::UnstoredPageBytes;
+                    const auto blockBegin = shadow->UnitBegin(unit);
+                    for (std::uint64_t run = 0; run < UnitBytes / page;) {
+                        if ((kept >> run & 1u) == 0) {
+                            ++run;
+                            continue;
+                        }
+                        auto stop = run;
+                        while (stop < UnitBytes / page && (kept >> stop & 1u) != 0) ++stop;
+                        addCopy(keptSlab, unit, std::max(unitBegin, blockBegin + run * page), std::min(unitEnd, blockBegin + stop * page));
+                        run = stop;
+                    }
+                    ++units;
+                    Stats().pageKeptUnits.fetch_add(1, std::memory_order_relaxed);
+                    Stats().pageKeptPages.fetch_add(static_cast<std::uint64_t>(std::popcount(kept)), std::memory_order_relaxed);
+                }
                 shadow->generation[unit] = 0;
                 (cpu[k] != 0 ? Stats().staleDroppedCpu : Stats().staleDroppedDriver).fetch_add(1, std::memory_order_relaxed);
                 continue;
@@ -331,18 +377,8 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
             }
             const auto [begin, end] = shadow->UnitRange(unit);
             if (end <= begin) continue;
-            const VkBufferCopy region{(unit - slab->firstUnit) * UnitBytes + (begin - shadow->UnitBegin(unit)), begin - shadow->importBase, end - begin};
-            if (!copies.empty() && copies.back().slab == slab && copies.back().regions.back().dstOffset + copies.back().regions.back().size == region.dstOffset) {
-                copies.back().regions.back().size += region.size;
-                ranges.back().second = end;
-            } else {
-                if (copies.empty() || copies.back().slab != slab) copies.push_back({slab, {}});
-                copies.back().regions.push_back(region);
-                ranges.emplace_back(begin, end);
-            }
+            addCopy(slab, unit, begin, end);
             shadow->published[unit] = 1;
-            slab->lastUse = Recorder::Presents();
-            bytes += end - begin;
             ++units;
         }
         shadow->Recount();
@@ -714,6 +750,14 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
         const auto shadow = find(registry, import);
         if (shadow == nullptr) return;
         const auto present = Recorder::Presents();
+        // A unit not live any more starts its retiled pages afresh; a live one adds to them (its
+        // slab still holds the earlier retile's unpublished results).
+        for (const auto& [begin, end, slab] : ranges) {
+            if (end <= begin) continue;
+            for (auto unit = shadow->UnitOf(begin); unit <= shadow->UnitOf(end - 1); ++unit) {
+                if (!shadow->Live(unit)) shadow->retiledPages[unit] = 0;
+            }
+        }
         for (const auto& [begin, end, slab] : ranges) {
             if (end <= begin) continue;
             bytes += end - begin;
@@ -725,6 +769,12 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
                     ++lost;
                     continue;
                 }
+                constexpr std::uint64_t page = GuestMemory::UnstoredPageBytes;
+                static_assert(UnitBytes / page <= 32);
+                const auto unitBegin = shadow->UnitBegin(unit);
+                const auto from = (std::max(begin, unitBegin) - unitBegin) / page;
+                const auto to = (std::min(end, unitBegin + UnitBytes) - unitBegin + page - 1) / page;
+                for (auto bit = from; bit < to; ++bit) shadow->retiledPages[unit] |= 1u << bit;
                 shadow->generation[unit] = generation;
                 shadow->published[unit] = 0;
                 current->lastUse = present;
@@ -856,6 +906,8 @@ std::string ShadowReport() {
         retired = registry.retired;
     }
     std::snprintf(text, sizeof(text), " %llu/%.1f by reason {%s }, stale-dropped %llu (cpu %llu, driver %llu), skipped-in-completion %llu, slabs %llu live %.1f MiB / peak %.1f MiB, evictions %llu, slab lost %llu, retired %llu, dropped on retire %llu, lost on retire %llu", publishedTotal, mib(publishedBytesTotal), reasons.c_str(), cpuDropped + driverDropped, cpuDropped, driverDropped, take(statistics.skippedInCompletion), liveSlabs, mib(liveBytes), mib(peakBytes), take(statistics.evictions), take(statistics.slabLost), retired, take(statistics.droppedOnRetire), take(statistics.lostOnRetire));
+    line += text;
+    std::snprintf(text, sizeof(text), ", stale page-kept %llu units/%llu pages", take(statistics.pageKeptUnits), take(statistics.pageKeptPages));
     line += text;
     if (ShadowVerify()) {
         std::snprintf(text, sizeof(text), ", verified %llu, mismatches %llu", take(statistics.verified), take(statistics.mismatches));
