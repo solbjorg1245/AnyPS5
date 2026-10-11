@@ -1809,6 +1809,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         refreshGeneration();
     };
     uploadedKeys = ProvedClearKeys(descriptor, guestBytes, keyProof);
+    if (IsDccClear(uploadedKeys) && uploadedKeys != DccKeys::ClearRegister) lastClearKeys.store(uploadedKeys, std::memory_order_relaxed);
     // The scan's collect stamped the CPU's key stores up to here: the keys the image starts from.
     if (descriptor.dccAddress != 0) keysSeen = GuestMemory::TrackerGeneration();
     filledKeys = DccKeys::Uncompressed;
@@ -3275,6 +3276,7 @@ std::size_t StorageTexture::NoteKeysFill(std::uint64_t address, std::size_t byte
     for (auto* texture : live.textures) {
         if (texture->released || texture->descriptor.dccAddress != address || texture->guestBytes / keyBytes == 0 || bytes < texture->guestBytes / keyBytes) continue;
         texture->filledKeys = keys;
+        if (IsDccClear(keys) && keys != DccKeys::ClearRegister) texture->lastClearKeys.store(keys, std::memory_order_relaxed);
         ++covered;
         if (traceKeys && IsDccClear(keys)) std::fprintf(stderr, "[dcc-keys] %s key fill over 0x%llx+0x%llx (uploaded %s, dirty %d)\n", DccKeysName(keys), static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), DccKeysName(texture->uploadedKeys), texture->dirty ? 1 : 0);
         if (refillDisabled || !IsDccClear(keys) || texture->uploadedKeys != keys) continue;
@@ -3643,7 +3645,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
     return true;
 }
 
-bool StorageTexture::BlitSelf(std::span<const VkImageBlit> blits, std::span<const VkFilter> filters, const char*& refusal) {
+bool StorageTexture::BlitSelf(std::span<const VkImageBlit> blits, std::span<const VkFilter> filters, const char*& refusal, const VkClearColorValue* fill, std::size_t filledFrom) {
     if (blits.empty() || blits.size() != filters.size()) {
         refusal = "no blits";
         return false;
@@ -3705,7 +3707,8 @@ bool StorageTexture::BlitSelf(std::span<const VkImageBlit> blits, std::span<cons
     const auto scratch = blitScratch->image;
     const auto commands = recorder->CommandsTouchingNothing(Recorder::CommandSite::Texture);
     const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::Copy);
-    Recorder::CountBarriers(Recorder::CommandClass::Copy, 5);
+    const bool clearing = fill != nullptr && filledFrom < blits.size();
+    Recorder::CountBarriers(Recorder::CommandClass::Copy, clearing ? 7 : 5);
     if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
     if (Recorder::BarrierValidate()) {
         const std::array<std::pair<VkImage, bool>, 1> images{{{image, true}}};
@@ -3747,6 +3750,17 @@ bool StorageTexture::BlitSelf(std::span<const VkImageBlit> blits, std::span<cons
     barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
     const auto blit = context.Function<PFN_vkCmdBlitImage>("vkCmdBlitImage");
     for (std::size_t index = 0; index < blits.size(); ++index) {
+        if (clearing && index == filledFrom) {
+            // The blits so far have read the copy; it now holds the fill for the rest.
+            VkImageMemoryBarrier toClear = barriers[1];
+            toClear.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            toClear.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            toClear.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            toClear.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toClear);
+            context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, scratch, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, fill, 1, &toClear.subresourceRange);
+            barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barriers[1]);
+        }
         const auto filter = filters[index] == VK_FILTER_LINEAR && !linear ? VK_FILTER_NEAREST : filters[index];
         blit(commands, scratch, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image, VK_IMAGE_LAYOUT_GENERAL, 1, &blits[index], filter);
     }
@@ -3759,6 +3773,10 @@ bool StorageTexture::BlitSelf(std::span<const VkImageBlit> blits, std::span<cons
     // deferred write-back.
     MarkDirty();
     return true;
+}
+
+bool StorageTexture::LastClearColor(VkClearColorValue& clear) const {
+    return ClearColorFor(storageFormat, lastClearKeys.load(std::memory_order_relaxed), clear);
 }
 
 // See AdjacentGenerationEnabled above.

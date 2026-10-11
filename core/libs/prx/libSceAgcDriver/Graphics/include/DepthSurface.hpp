@@ -76,14 +76,16 @@ std::string DepthViewportDigest();
 void NoteDisplayBufferPresent(std::uint64_t address);
 void NoteDisplayBufferDraw(const State& state, std::span<const CompiledShader> shaders);
 void NoteDisplayBufferStorageWrite(std::uint64_t address, std::uint32_t width, std::uint32_t height);
-// APS5_NATIVE_ASPECT_UI_RECT=1 (experimental, native aspect only): the viewport and scissor a draw
+// APS5_NATIVE_ASPECT_UI_RECT (on inside NativeAspect = on; APS5_NO_NATIVE_ASPECT_UI_RECT=1 = off;
+// native aspect only): the viewport and scissor a draw
 // records. A blended draw into the UI target is mapped into the part of the target the presenter
 // shows undistorted (ComputeUndistortedRect at the presentation aspect), so the 16:9 UI keeps its
 // proportions in a centred region; every other draw keeps state.viewport and state.scissor.
 // Inside UI_RECT, APS5_NATIVE_ASPECT_UI_BLIT (default on; APS5_NO_NATIVE_ASPECT_UI_BLIT=1 goes back
 // to the per-draw remap) leaves the UI draws whole and instead moves the UI target's content into
 // that region at the display buffer's composite (NoteDisplayBufferDraw records the blits): draws
-// whose fragment programs clip by fragment position keep drawing where they clip.
+// whose fragment programs clip by fragment position keep drawing where they clip. The margins take
+// the UI target's clear colour (APS5_NATIVE_ASPECT_UI_EDGE_STRETCH=1: its edge columns stretched).
 VkViewport UiRectViewport(const State& state);
 VkRect2D UiRectScissor(const State& state);
 struct AspectProbeDispatch {
