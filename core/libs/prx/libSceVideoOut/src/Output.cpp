@@ -10,6 +10,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
+#include "prx/libSceVideoOut/include/NativeAspectPatch.hpp"
 
 static int validateOutputConfig(int handle, uint64_t mode, const VideoOutOutputOptions* options, void* reservedPtr, uint64_t reserved) {
     if (!VideoOutDriver::Get().IsOpen(handle)) {
@@ -69,6 +70,7 @@ int APS5_VABI sceVideoOutOpen(int userId, int busType, int index, const void* pa
     if (handle < 0) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_RESOURCE_BUSY");
     }
+    NativeAspectPatch::Get().Open();
     return handle;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();

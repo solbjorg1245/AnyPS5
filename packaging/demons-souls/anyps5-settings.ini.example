@@ -12,6 +12,10 @@
 # Render resolution by hand: auto, 900, 1080, 1440 or 2160 (2160 is the game's cinematic setting).
 # RenderResolution = auto
 
+# Native aspect: on renders at Resolution's own aspect (21:9, 32:9, 16:10, ...) with a wider or taller
+# view instead of a letterboxed 16:9 image. Needs Resolution = WIDTHxHEIGHT. Experimental.
+# NativeAspect = off
+
 # Frame rate limit: auto, 30, 60, or any value from 20 to 240 with Timestep = variable.
 # FpsLimit = 60
 

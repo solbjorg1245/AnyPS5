@@ -76,6 +76,7 @@ and edit it. The game's own performance and cinematic modes are replaced by thes
 | `FpsLimit` | `APS5_FPS_LIMIT` | `auto`, `30`, `60`; other values (20 to 240) need `Timestep = variable` |
 | `Timestep` | `APS5_TIMESTEP` | `fixed` (the game's own: slow motion below the limit) or `variable` (experimental: the game keeps its speed at any frame rate) |
 | `WindowMode` | `APS5_WINDOW_MODE` | `windowed` or `fullscreen` |
+| `NativeAspect` | `APS5_NATIVE_ASPECT` | `off` or `on` (experimental: renders at `Resolution`'s own aspect, e.g. 21:9, instead of letterboxed 16:9) |
 
 The log shows the result in its `[settings]` lines.
 

@@ -13,6 +13,7 @@
 #include <sstream>
 
 #include "prx/libc/include/General.hpp"
+#include "prx/libSceVideoOut/include/NativeAspectPatch.hpp"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -234,13 +235,13 @@ bool TimestepPatch::store(float rate60, float rate30) {
 void TimestepPatch::report(std::uint64_t now) {
     const double seconds = static_cast<double>(now - windowStart) / 1e9;
     if (table != nullptr) {
-        std::fprintf(stderr, "[timestep] 10 s: %llu flips (%.2f FPS), game speed %.3fx, variable step %.2f-%.2f Hz (%d FPS mode entry), %llu flips slower than the %.2f Hz floor\n",
+        std::fprintf(stderr, "[timestep] 10 s: %llu flips (%.2f FPS), game speed %.3fx, variable step %.2f-%.2f Hz (%d FPS mode entry), %llu flips slower than the %.2f Hz floor%s\n",
             static_cast<unsigned long long>(windowFlips), windowFlips / seconds, windowGameSeconds / seconds, windowMinHz, windowMaxHz, mode30 ? 30 : 60,
-            static_cast<unsigned long long>(windowFloored), floorHz);
+            static_cast<unsigned long long>(windowFloored), floorHz, NativeAspectPatch::Get().Digest().c_str());
     } else {
-        std::fprintf(stderr, "[timestep] 10 s: %llu flips (%.2f FPS), game speed %.3fx, fixed step (%d FPS mode)%s\n",
+        std::fprintf(stderr, "[timestep] 10 s: %llu flips (%.2f FPS), game speed %.3fx, fixed step (%d FPS mode)%s%s\n",
             static_cast<unsigned long long>(windowFlips), windowFlips / seconds, windowGameSeconds / seconds, mode30 ? 30 : 60,
-            enabled ? ", refresh table not found" : "");
+            enabled ? ", refresh table not found" : "", NativeAspectPatch::Get().Digest().c_str());
     }
     std::fflush(stderr);
     windowStart = now;
