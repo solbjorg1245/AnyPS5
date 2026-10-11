@@ -14,6 +14,8 @@
 
 # Native aspect: on renders at Resolution's own aspect (21:9, 32:9, 16:10, ...) with a wider or taller
 # view instead of a letterboxed 16:9 image. Needs Resolution = WIDTHxHEIGHT. Experimental.
+# The environment switches APS5_NATIVE_ASPECT_RENDER=1 (post effects break) and APS5_NATIVE_ASPECT_UI=1
+# (bottom HUD cut off wider than 16:9) are more experimental still.
 # NativeAspect = off
 
 # Frame rate limit: auto, 30, 60, or any value from 20 to 240 with Timestep = variable.

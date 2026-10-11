@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DEPTHSURFACE_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TexelStats.hpp"
 #include <cstddef>
@@ -49,6 +50,39 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
 // effect: the surface's pending metadata clears are recorded. The fast proof's check of an element
 // a depth surface served (ShaderResources::fastRevalidate).
 bool DepthSurfaceServes(const Context& context, const GuestTextureResource& resource, const Texture* texture);
+// Debug aid (APS5_ASPECT_PROBE=1 with APS5_PROFILE_DRAW=1; Demon's Souls native aspect): notes the
+// viewport and scissor of a draw into a depth surface. DepthViewportDigest returns, for the largest depth
+// extent drawn into since its last call, the draws and their first four distinct viewport/scissor pairs
+// ("; depth viewports ..."), then the display buffer writes below ("; display buffer writes ..."),
+// for the 10 s [draw] line; empty when off.
+void NoteDepthViewport(const State& state);
+std::string DepthViewportDigest();
+// The same probe's display buffer writes, to tell the UI draws from the 3D composite and upscale:
+// a presented buffer's address is registered (the last four), and every draw whose colour target is
+// one of them and every dispatch whose storage image is one of them is listed by program (fragment
+// variant id, compute program address), viewport, scissor, blend, extent, count and order within the
+// frame (its rank among the frame's display buffer writes and its index among the frame's draws and
+// dispatches). NoteDisplayBufferDraw runs for every draw (prepareDrawInputs), AspectProbeDispatch
+// around every dispatch (Driver::dispatch), NoteDisplayBufferStorageWrite where a storage image is
+// marked written (StorageTexture::MarkDirty), NoteDisplayBufferPresent at every present.
+// The display buffer's composite also names the UI target (the one texture it samples at the
+// display buffer's size, or APS5_NATIVE_ASPECT_UI_TARGET); the digest lists the composite's samples
+// and the UI target's draws ('UI draw', grouped by state) and dispatches, and how many were remapped.
+void NoteDisplayBufferPresent(std::uint64_t address);
+void NoteDisplayBufferDraw(const State& state, std::span<const CompiledShader> shaders);
+void NoteDisplayBufferStorageWrite(std::uint64_t address, std::uint32_t width, std::uint32_t height);
+// APS5_NATIVE_ASPECT_UI_RECT=1 (experimental, native aspect only): the viewport and scissor a draw
+// records. A blended draw into the UI target is mapped into the part of the target the presenter
+// shows undistorted (ComputeUndistortedRect at the presentation aspect), so the 16:9 UI keeps its
+// proportions in a centred region; every other draw keeps state.viewport and state.scissor.
+VkViewport UiRectViewport(const State& state);
+VkRect2D UiRectScissor(const State& state);
+struct AspectProbeDispatch {
+    explicit AspectProbeDispatch(std::uint64_t program);
+    ~AspectProbeDispatch();
+    AspectProbeDispatch(const AspectProbeDispatch&) = delete;
+    AspectProbeDispatch& operator=(const AspectProbeDispatch&) = delete;
+};
 
 }
 

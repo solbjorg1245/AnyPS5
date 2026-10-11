@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -9,11 +10,14 @@
 #include <atomic>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -513,6 +517,395 @@ std::uint64_t DepthSurfaceSerial() {
 bool DepthSurfaceAt(std::uint64_t address, std::uint32_t width, std::uint32_t height) {
     std::lock_guard lock(surfacesMutex());
     return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->Covers(address, width, height) && !surface->overwritten; });
+}
+
+namespace {
+
+bool depthProbeOn() {
+    static const bool on = std::getenv("APS5_ASPECT_PROBE") != nullptr && std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return on;
+}
+
+struct ProbedViewport {
+    VkViewport viewport;
+    VkRect2D scissor;
+    std::uint64_t draws;
+};
+
+struct DepthViewportWindow {
+    VkExtent2D extent{};
+    std::uint64_t draws = 0;
+    std::vector<ProbedViewport> viewports;
+};
+
+HostMutex& probeMutex() {
+    static HostMutex mutex;
+    return mutex;
+}
+
+DepthViewportWindow& probeWindow() {
+    static auto* window = new DepthViewportWindow();
+    return *window;
+}
+
+// A distinct write of a watched target: a draw ('D') or a dispatch ('C') into a display buffer, a
+// draw ('U') or a dispatch ('V') into the UI target, of one program (0 for 'U': UI draws are grouped
+// by state only), viewport, scissor, blend and extent, with its count and the span of its order
+// within the frames.
+struct DisplayWrite {
+    char kind;
+    std::uint64_t program;
+    VkViewport viewport;
+    VkRect2D scissor;
+    bool blend;
+    VkExtent2D extent;
+    std::uint64_t count = 1;
+    std::uint32_t firstRank = 0;
+    std::uint32_t lastRank = 0;
+    std::uint64_t firstWork = 0;
+    std::uint64_t lastWork = 0;
+};
+
+// A texture the display buffer's composite samples (its fragment program's sampled images).
+struct CompositeSample {
+    std::uint64_t address;
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t format;
+};
+
+struct DisplayWriteWindow {
+    // Kept across windows: the registered buffers, the current frame's counters and the last
+    // composite's samples.
+    std::array<std::uint64_t, 4> buffers{};
+    std::size_t nextBuffer = 0;
+    std::uint64_t work = 0;
+    std::uint32_t rank = 0;
+    std::array<CompositeSample, 4> samples{};
+    std::size_t sampleCount = 0;
+    std::size_t displaySized = 0;
+    // Since the last digest.
+    std::uint64_t presents = 0;
+    std::uint64_t frameWork = 0;
+    std::uint64_t draws = 0;
+    std::uint64_t dispatches = 0;
+    std::uint64_t uiDraws = 0;
+    std::uint64_t uiDispatches = 0;
+    std::uint64_t remapped = 0;
+    std::uint64_t unlisted = 0;
+    std::vector<DisplayWrite> writes;
+};
+
+DisplayWriteWindow& displayWindow() {
+    static auto* window = new DisplayWriteWindow();
+    return *window;
+}
+
+// APS5_NATIVE_ASPECT_UI_RECT=1 (experimental, native aspect only: nothing happens without a
+// presentation aspect): the blended draws into the UI target are drawn into the part of it that the
+// presenter shows undistorted (ComputeUndistortedRect), so the 16:9 UI keeps its proportions in a
+// centred 16:9 region of a wider (or taller) window. The UI target is the one texture at the display
+// buffer's size that the display buffer's composite samples (learned from the first composite; until
+// then, or when that is not one texture, nothing is remapped), or APS5_NATIVE_ASPECT_UI_TARGET=<hex
+// address>. The composite and every other write of the display buffer keep their state.
+bool uiRectOn() {
+    static const bool on = [] {
+        const char* value = std::getenv("APS5_NATIVE_ASPECT_UI_RECT");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    return on;
+}
+
+std::atomic<std::uint64_t>& uiTarget() {
+    static std::atomic<std::uint64_t> target{[] {
+        const char* value = std::getenv("APS5_NATIVE_ASPECT_UI_TARGET");
+        return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+    }()};
+    return target;
+}
+
+bool watchOn() {
+    return depthProbeOn() || uiRectOn();
+}
+
+// The dispatch running on this thread (AspectProbeDispatch) and the storage images it has noted.
+struct ProbeDispatchSubject {
+    bool active = false;
+    std::uint64_t program = 0;
+    std::array<std::uint64_t, 4> noted{};
+    std::size_t notedCount = 0;
+};
+
+ProbeDispatchSubject& probeDispatchSubject() {
+    static thread_local ProbeDispatchSubject subject;
+    return subject;
+}
+
+bool isDisplayBuffer(const DisplayWriteWindow& window, std::uint64_t address) {
+    return address != 0 && std::find(window.buffers.begin(), window.buffers.end(), address) != window.buffers.end();
+}
+
+void noteDisplayWrite(DisplayWriteWindow& window, const DisplayWrite& write) {
+    const auto rank = window.rank++;
+    ++(write.kind == 'D' ? window.draws : write.kind == 'C' ? window.dispatches : write.kind == 'U' ? window.uiDraws : window.uiDispatches);
+    if (!depthProbeOn()) return;
+    for (auto& entry : window.writes) {
+        if (entry.kind == write.kind && entry.program == write.program && entry.blend == write.blend && entry.extent.width == write.extent.width && entry.extent.height == write.extent.height
+            && std::memcmp(&entry.viewport, &write.viewport, sizeof(VkViewport)) == 0 && std::memcmp(&entry.scissor, &write.scissor, sizeof(VkRect2D)) == 0) {
+            ++entry.count;
+            entry.firstRank = std::min(entry.firstRank, rank);
+            entry.lastRank = std::max(entry.lastRank, rank);
+            entry.firstWork = std::min(entry.firstWork, window.work);
+            entry.lastWork = std::max(entry.lastWork, window.work);
+            return;
+        }
+    }
+    if (window.writes.size() >= 16) {
+        ++window.unlisted;
+        return;
+    }
+    auto entry = write;
+    entry.firstRank = entry.lastRank = rank;
+    entry.firstWork = entry.lastWork = window.work;
+    window.writes.push_back(entry);
+}
+
+// The composite's sampled textures (from its fragment program's descriptor words); the UI target is
+// learned when exactly one of them, other than a display buffer, has the display buffer's extent.
+void learnComposite(DisplayWriteWindow& window, std::span<const CompiledShader> shaders, VkExtent2D extent) {
+    window.sampleCount = 0;
+    window.displaySized = 0;
+    std::uint64_t candidate = 0;
+    for (const auto& shader : shaders) {
+        if (shader.stage != ShaderRecompiler::ShaderStage::Fragment || shader.program == nullptr) continue;
+        for (const auto& binding : shader.program->bindings) {
+            if (binding.kind != ShaderRecompiler::DescriptorKind::SampledImage || binding.guestDescriptor.size() < static_cast<std::size_t>(binding.count) * 8u) continue;
+            for (std::uint32_t element = 0; element < binding.count; ++element) {
+                GuestTextureResource resource{};
+                try {
+                    resource = DecodeTextureResource(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u));
+                } catch (const std::exception&) {
+                    continue;
+                }
+                if (resource.baseAddress == 0) continue;
+                if (window.sampleCount < window.samples.size()) window.samples[window.sampleCount++] = {resource.baseAddress, resource.width, resource.height, resource.format};
+                if (resource.width == extent.width && resource.height == extent.height && !isDisplayBuffer(window, resource.baseAddress) && resource.baseAddress != candidate) {
+                    ++window.displaySized;
+                    candidate = resource.baseAddress;
+                }
+            }
+        }
+    }
+    if (!uiRectOn()) return;
+    static const bool named = uiTarget().load(std::memory_order_relaxed) != 0;
+    static bool reported = false;
+    if (named) {
+        if (!reported) std::fprintf(stderr, "[aspect] UI rect (APS5_NATIVE_ASPECT_UI_RECT, experimental): UI target 0x%llx from APS5_NATIVE_ASPECT_UI_TARGET\n", static_cast<unsigned long long>(uiTarget().load(std::memory_order_relaxed)));
+    } else if (window.displaySized == 1) {
+        // Followed from composite to composite: a change (a menu or movie composite) is printed.
+        if (uiTarget().exchange(candidate, std::memory_order_relaxed) == candidate) return;
+        std::fprintf(stderr, "[aspect] UI rect (APS5_NATIVE_ASPECT_UI_RECT, experimental): UI target 0x%llx %ux%u learned from the display buffer's composite\n", static_cast<unsigned long long>(candidate), extent.width, extent.height);
+    } else if (!reported) {
+        std::fprintf(stderr, "[aspect] UI rect (APS5_NATIVE_ASPECT_UI_RECT, experimental): a composite samples %zu textures at the display buffer's %ux%u: no UI target from it (APS5_NATIVE_ASPECT_UI_TARGET=<hex> names one)\n", window.displaySized, extent.width, extent.height);
+    } else {
+        return;
+    }
+    reported = true;
+    std::fflush(stderr);
+}
+
+// The undistorted rect a draw into the UI target is mapped into, or false: not the UI target, not
+// blended (a clear or a copy keeps the whole target, so the columns outside the rect are cleared
+// too), no presentation aspect, or a rect that is the whole target.
+bool uiRect(const State& state, AspectFitRect& rect, VkExtent2D& extent) {
+    if (!uiRectOn() || !state.hasColorTarget) return false;
+    const auto target = uiTarget().load(std::memory_order_relaxed);
+    const auto& color = state.colors.empty() ? state.color : state.colors[0];
+    if (target == 0 || color.address != target || color.extent.width == 0 || color.extent.height == 0) return false;
+    const auto& blend = state.blends.empty() ? state.blend : state.blends[0];
+    if (blend.blendEnable != VK_TRUE) return false;
+    const auto aspect = PresentationAspect_nid_postfix();
+    if (aspect.width == 0 || aspect.height == 0) return false;
+    rect = ComputeUndistortedRect_nid_postfix(color.extent.width, color.extent.height, aspect.width, aspect.height);
+    extent = color.extent;
+    return rect.width != extent.width || rect.height != extent.height;
+}
+
+std::string displayWriteDigest() {
+    DisplayWriteWindow window;
+    {
+        std::lock_guard lock(probeMutex());
+        auto& live = displayWindow();
+        window = live;
+        live.presents = live.frameWork = live.draws = live.dispatches = live.uiDraws = live.uiDispatches = live.remapped = live.unlisted = 0;
+        live.writes.clear();
+    }
+    std::sort(window.writes.begin(), window.writes.end(), [](const auto& left, const auto& right) { return left.firstRank < right.firstRank; });
+    char text[320];
+    std::snprintf(text, sizeof(text), "; display buffer writes (APS5_ASPECT_PROBE): %llu presents, %.0f draws+dispatches per frame, %llu draws, %llu dispatches, %llu unlisted; buffers",
+        static_cast<unsigned long long>(window.presents), window.presents != 0 ? static_cast<double>(window.frameWork) / static_cast<double>(window.presents) : 0.0,
+        static_cast<unsigned long long>(window.draws), static_cast<unsigned long long>(window.dispatches), static_cast<unsigned long long>(window.unlisted));
+    std::string result = text;
+    for (const auto buffer : window.buffers) {
+        if (buffer == 0) continue;
+        std::snprintf(text, sizeof(text), " 0x%llx", static_cast<unsigned long long>(buffer));
+        result += text;
+    }
+    result += "; composite samples";
+    for (std::size_t index = 0; index < window.sampleCount; ++index) {
+        const auto& sample = window.samples[index];
+        std::snprintf(text, sizeof(text), " 0x%llx %ux%u f%u", static_cast<unsigned long long>(sample.address), sample.width, sample.height, sample.format);
+        result += text;
+    }
+    std::snprintf(text, sizeof(text), " (%zu at display size); UI target 0x%llx: %llu draws, %llu dispatches, %llu remapped (APS5_NATIVE_ASPECT_UI_RECT %s)", window.displaySized,
+        static_cast<unsigned long long>(uiTarget().load(std::memory_order_relaxed)), static_cast<unsigned long long>(window.uiDraws), static_cast<unsigned long long>(window.uiDispatches),
+        static_cast<unsigned long long>(window.remapped), uiRectOn() ? "on" : "off");
+    result += text;
+    for (const auto& entry : window.writes) {
+        if (entry.kind == 'D' || entry.kind == 'U') {
+            std::snprintf(text, sizeof(text), "; #%u-%u @%llu-%llu %s fs %016llx %ux%u viewport %.0f,%.0f %.0fx%.0f scissor %d,%d %ux%u blend %s (%llu)", entry.firstRank, entry.lastRank,
+                static_cast<unsigned long long>(entry.firstWork), static_cast<unsigned long long>(entry.lastWork), entry.kind == 'D' ? "draw" : "UI draw", static_cast<unsigned long long>(entry.program),
+                entry.extent.width, entry.extent.height, entry.viewport.x, entry.viewport.y, entry.viewport.width, entry.viewport.height, entry.scissor.offset.x, entry.scissor.offset.y,
+                entry.scissor.extent.width, entry.scissor.extent.height, entry.blend ? "on" : "off", static_cast<unsigned long long>(entry.count));
+        } else {
+            std::snprintf(text, sizeof(text), "; #%u-%u @%llu-%llu %s cs 0x%llx storage %ux%u (%llu)", entry.firstRank, entry.lastRank, static_cast<unsigned long long>(entry.firstWork),
+                static_cast<unsigned long long>(entry.lastWork), entry.kind == 'C' ? "dispatch" : "UI dispatch", static_cast<unsigned long long>(entry.program), entry.extent.width, entry.extent.height,
+                static_cast<unsigned long long>(entry.count));
+        }
+        result += text;
+    }
+    return result;
+}
+
+}
+
+void NoteDepthViewport(const State& state) {
+    if (!depthProbeOn() || !state.depth) return;
+    const auto extent = state.depth->extent;
+    const auto area = static_cast<std::uint64_t>(extent.width) * extent.height;
+    std::lock_guard lock(probeMutex());
+    auto& window = probeWindow();
+    const auto largest = static_cast<std::uint64_t>(window.extent.width) * window.extent.height;
+    if (area < largest || (area == largest && extent.width != window.extent.width)) return;
+    if (area > largest) {
+        window = {};
+        window.extent = extent;
+    }
+    ++window.draws;
+    for (auto& entry : window.viewports) {
+        if (std::memcmp(&entry.viewport, &state.viewport, sizeof(VkViewport)) == 0 && std::memcmp(&entry.scissor, &state.scissor, sizeof(VkRect2D)) == 0) {
+            ++entry.draws;
+            return;
+        }
+    }
+    if (window.viewports.size() < 4) window.viewports.push_back({state.viewport, state.scissor, 1});
+}
+
+std::string DepthViewportDigest() {
+    if (!depthProbeOn()) return {};
+    DepthViewportWindow window;
+    {
+        std::lock_guard lock(probeMutex());
+        window = probeWindow();
+        probeWindow() = {};
+    }
+    char text[192];
+    std::snprintf(text, sizeof(text), "; depth viewports (APS5_ASPECT_PROBE): largest surface %ux%u, %llu draws", window.extent.width, window.extent.height, static_cast<unsigned long long>(window.draws));
+    std::string result = text;
+    for (const auto& entry : window.viewports) {
+        std::snprintf(text, sizeof(text), "; viewport %.0f,%.0f %.0fx%.0f scissor %d,%d %ux%u (%llu draws)", entry.viewport.x, entry.viewport.y, entry.viewport.width, entry.viewport.height,
+            entry.scissor.offset.x, entry.scissor.offset.y, entry.scissor.extent.width, entry.scissor.extent.height, static_cast<unsigned long long>(entry.draws));
+        result += text;
+    }
+    return result + displayWriteDigest();
+}
+
+void NoteDisplayBufferPresent(std::uint64_t address) {
+    if (!watchOn() || address == 0) return;
+    std::lock_guard lock(probeMutex());
+    auto& window = displayWindow();
+    if (!isDisplayBuffer(window, address)) window.buffers[window.nextBuffer++ % window.buffers.size()] = address;
+    ++window.presents;
+    window.frameWork += window.work;
+    window.work = 0;
+    window.rank = 0;
+}
+
+void NoteDisplayBufferDraw(const State& state, std::span<const CompiledShader> shaders) {
+    if (!watchOn()) return;
+    std::uint64_t program = 0;
+    for (const auto& shader : shaders) {
+        if (shader.stage == ShaderRecompiler::ShaderStage::Fragment && shader.program != nullptr) program = shader.program->variantId;
+    }
+    AspectFitRect rect{};
+    VkExtent2D extent{};
+    const bool remapped = uiRect(state, rect, extent);
+    std::lock_guard lock(probeMutex());
+    auto& window = displayWindow();
+    ++window.work;
+    if (remapped) ++window.remapped;
+    const auto ui = uiTarget().load(std::memory_order_relaxed);
+    const auto targets = state.colors.empty() ? (state.hasColorTarget ? 1u : 0u) : state.colors.size();
+    for (std::size_t slot = 0; slot < targets; ++slot) {
+        const auto& color = state.colors.empty() ? state.color : state.colors[slot];
+        const auto& blend = slot < state.blends.size() ? state.blends[slot] : state.blend;
+        if (isDisplayBuffer(window, color.address) || isDisplayBuffer(window, color.surfaceAddress)) {
+            learnComposite(window, shaders, color.extent);
+            noteDisplayWrite(window, {'D', program, state.viewport, state.scissor, blend.blendEnable == VK_TRUE, color.extent});
+            return;
+        }
+        if (ui != 0 && color.address == ui) {
+            noteDisplayWrite(window, {'U', 0, state.viewport, state.scissor, blend.blendEnable == VK_TRUE, color.extent});
+            return;
+        }
+    }
+}
+
+void NoteDisplayBufferStorageWrite(std::uint64_t address, std::uint32_t width, std::uint32_t height) {
+    if (!depthProbeOn()) return;
+    auto& subject = probeDispatchSubject();
+    if (!subject.active) return;
+    std::lock_guard lock(probeMutex());
+    auto& window = displayWindow();
+    const bool ui = address == uiTarget().load(std::memory_order_relaxed);
+    if (!ui && !isDisplayBuffer(window, address)) return;
+    const auto noted = subject.noted.begin() + static_cast<std::ptrdiff_t>(subject.notedCount);
+    if (std::find(subject.noted.begin(), noted, address) != noted) return;
+    if (subject.notedCount < subject.noted.size()) subject.noted[subject.notedCount++] = address;
+    noteDisplayWrite(window, {ui ? 'V' : 'C', subject.program, VkViewport{}, VkRect2D{}, false, VkExtent2D{width, height}});
+}
+
+VkViewport UiRectViewport(const State& state) {
+    AspectFitRect rect{};
+    VkExtent2D extent{};
+    if (!uiRect(state, rect, extent)) return state.viewport;
+    const auto scaleX = static_cast<float>(rect.width) / static_cast<float>(extent.width);
+    const auto scaleY = static_cast<float>(rect.height) / static_cast<float>(extent.height);
+    auto viewport = state.viewport;
+    viewport.x = static_cast<float>(rect.x) + viewport.x * scaleX;
+    viewport.y = static_cast<float>(rect.y) + viewport.y * scaleY;
+    viewport.width *= scaleX;
+    viewport.height *= scaleY;
+    return viewport;
+}
+
+VkRect2D UiRectScissor(const State& state) {
+    AspectFitRect rect{};
+    VkExtent2D extent{};
+    if (!uiRect(state, rect, extent)) return state.scissor;
+    const auto mapped = MapRectInto_nid_postfix({state.scissor.offset.x, state.scissor.offset.y, state.scissor.extent.width, state.scissor.extent.height}, extent.width, extent.height, rect);
+    return VkRect2D{{mapped.x, mapped.y}, {mapped.width, mapped.height}};
+}
+
+AspectProbeDispatch::AspectProbeDispatch(std::uint64_t program) {
+    if (!depthProbeOn()) return;
+    probeDispatchSubject() = {true, program, {}, 0};
+    std::lock_guard lock(probeMutex());
+    ++displayWindow().work;
+}
+
+AspectProbeDispatch::~AspectProbeDispatch() {
+    probeDispatchSubject().active = false;
 }
 
 }

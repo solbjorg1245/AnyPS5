@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 
 namespace AgcDriver {
 
@@ -37,6 +38,7 @@ void PresentClear(const PresentationWindow& window, bool opaque, void (*gpuReady
 }
 
 void PresentBuffer(const PresentationWindow& window, const DisplayBuffer& buffer, void (*gpuReady)(void*), void* context) {
+    Graphics::NoteDisplayBufferPresent(buffer.address);
     DriverDetail::Driver::Get().Present(window, &buffer, true, gpuReady, context);
 }
 
