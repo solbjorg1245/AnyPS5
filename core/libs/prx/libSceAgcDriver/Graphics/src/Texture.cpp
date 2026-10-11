@@ -1803,6 +1803,8 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         refreshGeneration();
     };
     uploadedKeys = ProvedClearKeys(descriptor, guestBytes, keyProof);
+    // The scan's collect stamped the CPU's key stores up to here: the keys the image starts from.
+    if (descriptor.dccAddress != 0) keysSeen = GuestMemory::TrackerGeneration();
     filledKeys = DccKeys::Uncompressed;
     VkClearColorValue clearValue{};
     if (IsDccClear(uploadedKeys) && ClearColorFor(storageFormat, uploadedKeys, clearValue)) {
@@ -3821,6 +3823,29 @@ void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes) {
     writeBackLayers(layers);
 }
 
+// The key store guard of a write-back of `layers`: the oldest generation of the stored units (the
+// one their texels keep the CPU's 64 KiB blocks and edge pages by), raised to keysSeen (CPU key
+// stores the image's upload already took in); 0, unchecked and stored whole as before, when a
+// stored unit is untracked, as its texels then are.
+KeyStoreGuard StorageTexture::keyStoreGuard(const char* caller, const std::vector<bool>& layers) const {
+    std::uint64_t oldest = 0;
+    for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+        if (!layers[layer]) continue;
+        if (layerGeneration[layer] == 0) return {caller, descriptor.baseAddress, 0};
+        oldest = oldest == 0 ? layerGeneration[layer] : std::min(oldest, layerGeneration[layer]);
+    }
+    return {caller, descriptor.baseAddress, oldest == 0 ? 0 : std::max(oldest, keysSeen)};
+}
+
+// The "uncompressed" keys after a write-back of `layers` (not over the clear keys of a keys fill),
+// guarded; keysSeen follows a store that left no key page to the CPU (a page left to it is counted
+// again at the next store, as a kept texel block keeps its unit's old generation).
+void StorageTexture::storeKeys(const char* caller, const std::vector<bool>& layers) {
+    if (IsDccClear(filledKeys)) return;
+    const auto outcome = MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, keyStoreGuard(caller, layers));
+    if (outcome.stored && outcome.kept == 0) keysSeen = outcome.collected != 0 ? outcome.collected : GuestMemory::TrackerGeneration();
+}
+
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     // The crash report's store ring names this image for every store below (texels and keys).
@@ -4029,7 +4054,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             if (profile) Profile().storageGpu += timer.lap();
             originalValid = false;
             traceKeyStore("block write-back", descriptor, guestBytes);
-            if (!IsDccClear(filledKeys)) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes);
+            storeKeys("block write-back", layers);
             uploadedKeys = DccKeys::Uncompressed;
             for (const auto& [from, to] : keep) GuestMemory::MarkWritten(from, static_cast<std::size_t>(to - from));
             settle(true);
@@ -4167,7 +4192,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         // metadata is host-imported (no CPU wait for the title's key-writing kernels), else a CPU
         // store (APS5_CPU_DCC_KEYS=1 keeps the CPU store; see DccMetadata.hpp).
         traceKeyStore("layer write-back", descriptor, guestBytes);
-        if (!IsDccClear(filledKeys)) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes);
+        storeKeys("layer write-back", layers);
         uploadedKeys = DccKeys::Uncompressed;
         for (const auto& [from, to] : keep) GuestMemory::MarkWritten(from, static_cast<std::size_t>(to - from));
         // The walk covers this surface's pages only: an adjacent image's later CPU write is stamped
@@ -4277,7 +4302,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // The texels now hold the whole image, so later reads must see them rather than a fast clear
     // (the keys may be host-imported although the texels were not: then a recorded fill, else a CPU store).
     traceKeyStore("cpu write-back", descriptor, guestBytes);
-    if (!IsDccClear(filledKeys)) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes);
+    storeKeys("cpu write-back", layers);
     uploadedKeys = DccKeys::Uncompressed;
     // The store above is the only write to these pages, so `original` is current at a fresh
     // generation, unless blocks were kept for the CPU: then the image is stale there.

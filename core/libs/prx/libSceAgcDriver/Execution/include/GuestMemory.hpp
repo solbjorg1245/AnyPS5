@@ -101,6 +101,13 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
 constexpr std::size_t UnstoredPageBytes = 4096;
 enum class PageStoreCause : std::uint8_t { None, CpuPages, DriverPages, DriverWhole, Unknown };
 std::uint32_t PagesUnstoredSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, PageStoreCause* cause = nullptr, std::uint32_t* cpuPages = nullptr, std::uint32_t* driverPages = nullptr);
+// The parts of [address, address + bytes) whose 4 KiB pages a CPU store (a collect's dirty page,
+// never the driver's own Write or MarkWritten) reached since `generation`, as [begin, end) runs
+// clipped to the range and merged, in address order, into `runs`; returns their bytes. The range
+// may span blocks. A block with a newer CPU stamp and no page record (APS5_NO_EDGE_PAGE_KEEP=1)
+// counts whole. Nothing for a generation of 0 or outside the watched arena. Walks nothing: the
+// caller collects the range first (the DCC key store guard, DccMetadata.cpp).
+std::uint64_t CpuStoredRuns(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs);
 // Debug aid (APS5_TRACE_EDGE_WATCH): makes [address, address + bytes) read-only until the next CPU
 // write into it, which is reported once on stderr ([edge-watch]: the writer's code address, module
 // offsets of a few unwound frames, the old bytes); a range is armed only while none is. Windows only.

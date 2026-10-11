@@ -3207,6 +3207,92 @@ void pendingKeyStoreTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 }
 
+// The key store guard (KeyStoreGuard): a guarded "uncompressed" store counts the key pages a CPU
+// store reached since the guard's generation, and with APS5_DCC_KEYS_STAMP_CHECK those pages keep
+// the CPU's bytes while the rest of the keys become 0xff: on the CPU, then as a recorded fill split
+// around the kept page (the keys' unaligned head and tail included). Bytes outside the keys stay.
+void keyGuardTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t bytes = 65536;
+    void* block = AllocateWatched(bytes, 65536);
+    if (block == nullptr) {
+        std::cout << "write watching unavailable: key store guard not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* memory = static_cast<volatile std::uint8_t*>(block);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    // Keys over parts of pages 0 and 3 and all of pages 1 and 2: [0x802, 0x3806).
+    constexpr std::uint64_t first = 0x802;
+    constexpr std::size_t keyCount = 0x3004;
+    constexpr std::uint64_t surfaceBytes = keyCount * 256;
+    const auto keys = address + first;
+    // One guarded store: page `page` (or none, ~0u) takes a CPU store after the guard's generation
+    // (0: an unchecked store), on the GPU or the CPU, with the switch on or off.
+    const auto store = [&](const char* name, bool gpu, bool check, std::uint32_t page, bool unchecked) {
+        recorder.Sync();
+        std::memset(block, 0x11, bytes);
+        std::memset(static_cast<std::uint8_t*>(block) + first, 0x00, keyCount);
+        const auto synced = AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
+        Require(synced != 0, std::string(name) + ": the key guard block is not collected");
+        // Inside the keys and inside the page.
+        const auto poked = page != ~0u ? std::max<std::uint64_t>(page * 4096 + 0x40, first + 0x40) : 0;
+        if (page != ~0u) memory[poked] = 0x5a;
+        const auto keptFrom = page != ~0u ? std::max<std::uint64_t>(page * 4096, first) : 0;
+        const auto keptTo = page != ~0u ? std::min<std::uint64_t>((page + 1) * 4096, first + keyCount) : 0;
+        KeysStampCheckForTests(check ? 1 : 0);
+        const auto before = KeyGuardCounts();
+        const KeyStoreGuard guard{name, address, unchecked ? 0 : synced};
+        const auto outcome = gpu ? MarkDccUncompressed(context, keys, surfaceBytes, guard) : MarkDccUncompressed(keys, surfaceBytes, guard);
+        recorder.Sync();
+        KeysStampCheckForTests(-1);
+        const auto after = KeyGuardCounts();
+        const bool met = page != ~0u && !unchecked;
+        Require(outcome.stored && (outcome.collected != 0) == !unchecked && after.unchecked == before.unchecked + (unchecked ? 1 : 0), std::string(name) + ": the store's outcome or unchecked count is wrong");
+        Require(after.cpuStores == before.cpuStores + (met ? 1 : 0) && after.cpuBytes == before.cpuBytes + (met ? keptTo - keptFrom : 0), std::string(name) + ": the CPU-written key page is not counted (" + std::to_string(after.cpuBytes - before.cpuBytes) + " bytes)");
+        const bool keep = met && check;
+        Require(outcome.kept == (keep ? keptTo - keptFrom : 0) && after.kept == before.kept + outcome.kept, std::string(name) + ": the kept key bytes are not counted (" + std::to_string(outcome.kept) + ")");
+        for (std::uint64_t at = 0; at < bytes; ++at) {
+            const bool key = at >= first && at < first + keyCount;
+            const bool kept = keep && at >= keptFrom && at < keptTo;
+            const std::uint8_t expected = !key ? 0x11 : !kept ? 0xff : at == poked ? 0x5a : 0x00;
+            Require(memory[at] == expected, std::string(name) + ": byte " + std::to_string(at) + " is " + std::to_string(memory[at]) + ", not " + std::to_string(expected));
+        }
+    };
+    store("cpu, switch off", false, false, 1, false);
+    store("cpu, switch on", false, true, 1, false);
+    store("cpu, switch on, head page", false, true, 0, false);
+    store("cpu, switch on, no CPU store", false, true, ~0u, false);
+    store("cpu, unchecked", false, true, 2, true);
+    if (context.hostImportAlignment == 0 || HostImportFor(context, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "host imports unavailable or unwatched: the guarded GPU key store not tested\n";
+        return;
+    }
+    store("gpu, switch off", true, false, 2, false);
+    store("gpu, switch on", true, true, 2, false);
+    store("gpu, switch on, head page", true, true, 0, false);
+    store("gpu, switch on, tail page", true, true, 3, false);
+    store("gpu, unchecked", true, true, 1, true);
+}
+
 void metadataPassTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -6397,6 +6483,7 @@ int main() {
         firstLayerViewTests(device, recorder);
         metadataPassTests(device, recorder);
         pendingKeyStoreTests(device, recorder);
+        keyGuardTests(device, recorder);
         coalesceCopyBackTests(device, recorder);
         narrowCopyBackTests(device, recorder);
         pageGuardTests();

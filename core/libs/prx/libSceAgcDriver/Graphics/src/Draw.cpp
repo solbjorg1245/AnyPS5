@@ -108,21 +108,25 @@ void storeClearTexels(const Context& context, const ColorTarget& color, const st
     StorageTexture::FlushPending(color.address, color.bytes, nullptr, "fast-clear materialization");
     const auto keys = ReadDccKeys(color.dccAddress, color.bytes);
     if (!IsDccClear(keys)) return;
+    // The key store below replaces the clear code just read: a CPU store into the keys after this
+    // collect is the title's (the guard's generation; KeyStoreGuard).
+    const auto keysSeen = CollectKeys(color.dccAddress, color.bytes);
     const auto current = keys == DccKeys::ClearRegister ? texel : clearTexel(color, keys);
     const auto elementBytes = static_cast<std::size_t>(color.elementBytes);
     std::vector<std::byte> texels(color.bytes);
     for (std::size_t offset = 0; offset + elementBytes <= texels.size(); offset += elementBytes) std::memcpy(texels.data() + offset, current.data(), elementBytes);
     GuestMemory::Write(color.address, texels);
-    MarkDccUncompressed(context, color.dccAddress, color.bytes);
+    MarkDccUncompressed(context, color.dccAddress, color.bytes, KeyStoreGuard{"fast-clear materialization", color.address, keysSeen});
 }
 
 void materializeRegisterClear(const Context& context, const ColorTarget& color, StorageTexture& resident) {
     if (color.dccAddress == 0 || resident.Descriptor().dccAddress != color.dccAddress) return;
     if (CurrentDccKeys(color.dccAddress, color.bytes) != DccKeys::ClearRegister) return;
+    const auto keysSeen = CollectKeys(color.dccAddress, color.bytes);
     const auto texel = clearTexel(color, DccKeys::ClearRegister);
     const char* refusal = nullptr;
     if (clearToTexel(resident, texel, color.elementBytes, refusal)) {
-        MarkDccUncompressed(context, color.dccAddress, color.bytes);
+        MarkDccUncompressed(context, color.dccAddress, color.bytes, KeyStoreGuard{"register clear", color.address, keysSeen});
         return;
     }
     storeClearTexels(context, color, texel);
@@ -1927,6 +1931,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         std::unique_ptr<DeviceBuffer> tiledDevice;
         std::unique_ptr<DeviceBuffer> linearDevice;
         std::vector<std::byte> original;
+        // The key range collected before its keys were read (the guard of the key store after the
+        // draw; KeyStoreGuard).
+        std::uint64_t keysSeen = 0;
         TileMipLayout mip{};
         std::unique_ptr<RenderTarget> target;
         // APS5_DUMP_TARGETS: the rendered linear pixels, read back for target_<address>_<n>.raw.
@@ -1982,6 +1989,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         }
         // A fast-cleared DCC target holds its clear value wherever the draw does not write.
         if (color.dccAddress != 0) {
+            binding.keysSeen = CollectKeys(color.dccAddress, ColorTargetLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes).Bytes());
             const auto keys = CurrentDccKeys(color.dccAddress, colorLayout.Bytes());
             if (IsDccClear(keys)) {
                 const auto pixels = binding.gpuTiling ? binding.tiled->Bytes() : binding.transfer->Bytes();
@@ -2361,7 +2369,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         if (binding.gpuTiling) GuestMemory::WriteChanged(binding.color.address, binding.tiled->Bytes(), binding.original);
         else WriteColorTarget(binding.color, binding.transfer->Bytes());
         // The stored texels are the whole target now, so later reads must see them rather than a fast clear.
-        MarkDccUncompressed(binding.color.dccAddress, ColorTargetLayout(binding.color.extent.width, binding.color.extent.height, binding.color.tileMode, binding.color.elementBytes).Bytes());
+        MarkDccUncompressed(binding.color.dccAddress, ColorTargetLayout(binding.color.extent.width, binding.color.extent.height, binding.color.tileMode, binding.color.elementBytes).Bytes(), KeyStoreGuard{"synchronous draw", binding.color.address, binding.keysSeen});
     }
     timer.phase(PhaseWriteBack);
     if (profile && traceDraws) {
@@ -2735,6 +2743,7 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
         auto keys = CurrentDccKeys(color.dccAddress, color.bytes);
         if (keys == DccKeys::Uncompressed) continue;
         Require(IsDccClear(keys), std::string("CB metadata pass over DCC keys that are ") + DccKeysName(keys) + " (per-block metadata is not modeled)");
+        const auto keysSeen = CollectKeys(color.dccAddress, color.bytes);
         const auto texel = clearTexel(color, keys);
         std::shared_ptr<StorageTexture> resident;
         if (color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr) {
@@ -2750,7 +2759,7 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
             const bool current = keys == DccKeys::ClearRegister ? clearToTexel(*resident, texel, color.elementBytes, refusal) : StorageTexture::FindPending(color.address, color.bytes, FixR0bEnabled() ? color.slice : 0u) == resident || resident->UploadedKeys() == keys;
             if (current) {
                 resident->MarkDirty();
-                MarkDccUncompressed(context, color.dccAddress, color.bytes);
+                MarkDccUncompressed(context, color.dccAddress, color.bytes, KeyStoreGuard{"metadata pass", color.address, keysSeen});
                 continue;
             }
         }

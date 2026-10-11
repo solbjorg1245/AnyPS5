@@ -1851,6 +1851,40 @@ std::uint32_t PagesUnstoredSince(std::uint64_t address, std::size_t bytes, std::
     return range & ~(cpuStored | driverStored);
 }
 
+std::uint64_t CpuStoredRuns(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs) {
+    runs.clear();
+    if (generation == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched || !tracker.covers(address, bytes)) return 0;
+    const auto end = address + bytes;
+    std::uint64_t stored = 0;
+    const auto add = [&](std::uint64_t from, std::uint64_t to) {
+        if (!runs.empty() && runs.back().second == from) runs.back().second = to;
+        else runs.emplace_back(from, to);
+        stored += to - from;
+    };
+    for (auto block = tracker.blockOf(address), last = tracker.blockOf(end - 1); block <= last; ++block) {
+        if (tracker.cpuStampOf(block) <= generation) continue;
+        const auto begin = tracker.blockBegin(block);
+        const auto from = std::max(address, begin);
+        const auto to = std::min<std::uint64_t>(end, begin + WriteBlockBytes);
+        const auto found = tracker.cpuPages.find(block);
+        if (found == tracker.cpuPages.end()) {
+            add(from, to);
+            continue;
+        }
+        for (auto at = from; at < to;) {
+            const auto page = static_cast<std::size_t>((at - begin) / WritePageBytes);
+            const auto pageEnd = std::min<std::uint64_t>(to, begin + (page + 1) * WritePageBytes);
+            if (found->second.pages[page] > generation) add(at, pageEnd);
+            at = pageEnd;
+        }
+    }
+    return stored;
+}
+
 std::size_t TrackEdgeParts(std::uint64_t address, std::size_t bytes) {
     static const bool enabled = std::getenv("APS5_NO_FINE_EDGE_TRACKING") == nullptr;
     if (!enabled || !pageKeepUnits() || bytes == 0) return 0;

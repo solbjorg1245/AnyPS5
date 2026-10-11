@@ -426,6 +426,8 @@ private:
     std::uint64_t borrowUnits(StorageTexture& source, const std::vector<bool>& units);
     void forgetBorrowed(std::uint32_t first, std::uint32_t count);
     bool clearByKeysFill(DccKeys keys, std::uint8_t key);
+    KeyStoreGuard keyStoreGuard(const char* caller, const std::vector<bool>& layers) const;
+    void storeKeys(const char* caller, const std::vector<bool>& layers);
     bool overlaps(std::uint64_t address, std::size_t bytes) const;
     bool pendingUnitInside(std::uint64_t address, std::size_t bytes) const;
     VkImageView createView(std::uint32_t mip, bool firstLayer = false) const;
@@ -444,6 +446,11 @@ private:
     DccKeys uploadedKeys = DccKeys::Uncompressed;
     DccKeys filledKeys = DccKeys::Uncompressed;
     mutable DccKeyProof keyProof;
+    // The tracker generation after this image last took its key range into account: the upload's
+    // key scan (collected just before), or a write-back's key store that left no key page to the
+    // CPU. The key store guard counts only CPU stores newer than it (and than the stored units'
+    // generations): earlier ones are the keys the image was uploaded under. 0 before either.
+    std::uint64_t keysSeen = 0;
     struct ForeignKeyProof {
         std::uint64_t dccAddress = 0;
         DccKeyProof proof;

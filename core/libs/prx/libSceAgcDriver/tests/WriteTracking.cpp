@@ -243,6 +243,39 @@ void CheckEqualsSince() {
     Require(!EqualsCommittedSince(base, snapshot, synced), "a driver store into a stamped block is not seen");
 }
 
+// The DCC key store guard's question (DccMetadata.cpp): the CPU's stores into a range since a
+// generation by 4 KiB page, without the driver's own stores, merged across a block boundary and
+// clipped to the range.
+void CheckCpuStoredRuns() {
+    void* memory = AllocateWatched(2 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, 2 * Block);
+    const auto synced = CollectWrites(base, 2 * Block);
+    Require(synced != 0, "the CPU-stored runs block is not collected");
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    Require(CpuStoredRuns(base, 2 * Block, synced, runs) == 0 && runs.empty(), "CPU stores older than the generation are listed");
+    bytes[Block - 4096 + 8] = 0x22;
+    bytes[Block + 8] = 0x22;
+    bytes[Block + 3 * 4096 + 8] = 0x22;
+    MarkWritten(base + 4096, 64);
+    Write(base + 2 * 4096, std::array<std::byte, 16>{});
+    CollectWritesUncached(base, 2 * Block);
+    const auto stored = CpuStoredRuns(base + 100, 2 * Block - 200, synced, runs);
+    // APS5_NO_EDGE_PAGE_KEEP=1 keeps no page records: a CPU-stamped block counts whole.
+    if (std::getenv("APS5_NO_EDGE_PAGE_KEEP") != nullptr) {
+        Require(stored == 2 * Block - 200 && runs.size() == 1, "CPU-stamped blocks do not count whole with APS5_NO_EDGE_PAGE_KEEP");
+        return;
+    }
+    Require(stored == 3 * 4096 && runs.size() == 2, "the CPU's pages are not listed alone (" + std::to_string(stored) + " bytes in " + std::to_string(runs.size()) + " runs)");
+    Require(runs[0].first == base + Block - 4096 && runs[0].second == base + Block + 4096, "CPU pages on both sides of a block boundary are not one run");
+    Require(runs[1].first == base + Block + 3 * 4096 && runs[1].second == base + Block + 4 * 4096, "a lone CPU page is not listed");
+    Require(CpuStoredRuns(base + Block - 100, 50, synced, runs) == 50 && runs.size() == 1 && runs[0].first == base + Block - 100 && runs[0].second == base + Block - 50, "a run is not clipped to the range");
+    Require(CpuStoredRuns(base, 3 * 4096, synced, runs) == 0 && runs.empty(), "the driver's own stores are listed as the CPU's");
+    Require(CpuStoredRuns(base, 2 * Block, TrackerGeneration(), runs) == 0 && runs.empty(), "CPU stores older than a later generation are listed");
+    Require(CpuStoredRuns(base, 2 * Block, 0, runs) == 0 && runs.empty(), "a generation of 0 lists stores");
+}
+
 // The crash report's store ring (APS5_CRASH_RESOURCES=1, set by main): the driver's stores of 16
 // bytes or more over an address, newest first, with the thread's StoreTag and the stored span.
 void CheckStoreRing() {
@@ -296,6 +329,7 @@ int main() {
         CheckMixedEdge();
         CheckOwnStore();
         CheckEqualsSince();
+        CheckCpuStoredRuns();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;

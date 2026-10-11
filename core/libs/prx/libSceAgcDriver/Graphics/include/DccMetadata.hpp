@@ -42,6 +42,47 @@ void MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes);
 // reads as uncompressed from ReadDccKeys while that batch is pending; otherwise the CPU store above.
 // APS5_CPU_DCC_KEYS=1 always stores on the CPU.
 void MarkDccUncompressed(const Context& context, std::uint64_t metaAddress, std::uint64_t surfaceBytes);
+// Who stores the keys, and since which write generation a CPU store into the key range is the
+// game's rather than a key the driver may replace: a storage image's write-back passes the
+// generation its texels keep the CPU's blocks by (StorageTexture::keyStoreGuard), a render target
+// pass a CollectKeys taken where it read the keys it replaces. Before a store the key range is
+// collected, and the bytes of the 4 KiB pages a CPU store reached since `generation` are counted
+// ([dcc] "key stores over CPU-written pages"; APS5_TRACE_DCC_KEYS=1 names each store). With
+// APS5_DCC_KEYS_STAMP_CHECK=1 (off by default) those pages keep the CPU's bytes and only the rest is
+// stored, as the texel write-back keeps the CPU's blocks (a key range the title freed and reused
+// for its own objects is not filled with 0xff then). A generation of 0 stores unchecked (counted).
+struct KeyStoreGuard {
+    const char* caller = "unguarded";
+    // The surface the keys belong to (the trace names it).
+    std::uint64_t image = 0;
+    std::uint64_t generation = 0;
+};
+// What a guarded store did: whether keys were stored, the key bytes left to the CPU, and the
+// generation of the guard's collect of the key range (0 when unchecked or nothing was stored).
+struct KeyStoreOutcome {
+    bool stored = false;
+    std::uint64_t kept = 0;
+    std::uint64_t collected = 0;
+};
+KeyStoreOutcome MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes, const KeyStoreGuard& guard);
+KeyStoreOutcome MarkDccUncompressed(const Context& context, std::uint64_t metaAddress, std::uint64_t surfaceBytes, const KeyStoreGuard& guard);
+// The key range's CPU stores collected now (an uncached walk), for the guard of a store decided on
+// keys read next to this call (just before it where the read runs on every draw, so the walk is
+// made only for a store); 0 when the range is not tracked (the store is then unchecked).
+std::uint64_t CollectKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes);
+// APS5_DCC_KEYS_STAMP_CHECK=1; the tests set it with KeysStampCheckForTests (1 on, 0 off, -1 back to
+// the environment).
+bool KeysStampCheck();
+void KeysStampCheckForTests(int check);
+// Cumulative guard outcomes (counted with or without profiling): stores that met CPU-written key
+// pages and those pages' bytes, the bytes left to the CPU, and unchecked stores.
+struct DccKeyGuardCounts {
+    std::uint64_t cpuStores;
+    std::uint64_t cpuBytes;
+    std::uint64_t kept;
+    std::uint64_t unchecked;
+};
+DccKeyGuardCounts KeyGuardCounts();
 // Fills `bytes` with the texel a 0000/0001/1110/1111 clear code stands for ("1" is 1.0 or the integer
 // maximum; the alpha channel is the last one in memory when alphaOnMsb, else the first, and 3-channel
 // formats have none). False when the format has no encoding here.
