@@ -287,6 +287,13 @@ public:
     // may carry DCC metadata, and this surface must be host-imported (the write-back is GPU-direct).
     // False, naming why, when the copy must be a transfer.
     bool CopyFrom(StorageTexture& source, const char*& refusal);
+    // Native aspect's UI move (APS5_NATIVE_ASPECT_UI_BLIT, see DepthSurface.cpp): mip 0 of the
+    // image is copied on the device into a scratch image of its own (made at the first call, kept
+    // with the image), and each of `blits` then carries a region of that copy into the image with
+    // its filter (linear falls back to nearest where the format cannot filter). Records into the
+    // active recorder under GuestMemory::GpuMutex; the image is then dirty like a drawn target. A 2D
+    // single-layer image only; false, naming why in `refusal`, when nothing was recorded.
+    bool BlitSelf(std::span<const VkImageBlit> blits, std::span<const VkFilter> filters, const char*& refusal);
     // Debug aid (APS5_CAPTURE_DIR, see VulkanDevice::CaptureTargets): saves mip 0 of the first
     // layers of every live image (of those at `addresses`, when given) as
     // <prefix><address>_<width>x<height>_a<layers>_l<layer>.raw (u32 row pitch in texels, u32 height,
@@ -534,6 +541,8 @@ private:
     // The generation at which a one-layer FillClear was refused as 'surface changed': the check
     // fails again until `generation` moves, so ClassifyFill skips the layer match meanwhile.
     std::uint64_t layerRefusedGeneration = ~0ull;
+    // BlitSelf's copy of mip 0 (made at its first call).
+    std::unique_ptr<OwnedImage> blitScratch;
 };
 
 // APS5_PROFILE_DRAW: what the image lookups on this thread did since the last reset, by outcome

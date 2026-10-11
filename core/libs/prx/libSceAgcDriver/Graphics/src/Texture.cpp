@@ -3643,6 +3643,124 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
     return true;
 }
 
+bool StorageTexture::BlitSelf(std::span<const VkImageBlit> blits, std::span<const VkFilter> filters, const char*& refusal) {
+    if (blits.empty() || blits.size() != filters.size()) {
+        refusal = "no blits";
+        return false;
+    }
+    if (released) {
+        refusal = "released";
+        return false;
+    }
+    if (descriptor.dimension != TextureDimension::k2D || geometry.imageLayers != 1 || geometry.imageDepth != 1 || geometry.thick) {
+        refusal = "not a 2D image";
+        return false;
+    }
+    VkFormatProperties properties{};
+    context.formatProperties(context.physical, storageFormat, &properties);
+    constexpr VkFormatFeatureFlags blitFeatures = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    if ((properties.optimalTilingFeatures & blitFeatures) != blitFeatures) {
+        refusal = "format cannot blit";
+        return false;
+    }
+    const bool linear = (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr) {
+        refusal = "no recorder";
+        return false;
+    }
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) {
+        refusal = "no GPU lock";
+        return false;
+    }
+    if (blitScratch == nullptr) {
+        try {
+            VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            imageInfo.imageType = VK_IMAGE_TYPE_2D;
+            imageInfo.format = storageFormat;
+            imageInfo.extent = {descriptor.width, descriptor.height, 1};
+            imageInfo.mipLevels = 1;
+            imageInfo.arrayLayers = 1;
+            imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+            imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+            imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            VkImage created = VK_NULL_HANDLE;
+            Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &imageInfo, nullptr, &created), "vkCreateImage blit scratch");
+            auto scratch = std::make_unique<OwnedImage>(context, created, VK_NULL_HANDLE);
+            VkMemoryRequirements requirements{};
+            context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, created, &requirements);
+            VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            allocation.allocationSize = requirements.size;
+            allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            Check(AllocateDeviceMemory(context, allocation, &scratch->memory, VramClass::Textures), "vkAllocateMemory blit scratch");
+            Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, created, scratch->memory, 0), "vkBindImageMemory blit scratch");
+            blitScratch = std::move(scratch);
+        } catch (const std::exception&) {
+            refusal = "no scratch image";
+            return false;
+        }
+    }
+    const auto scratch = blitScratch->image;
+    const auto commands = recorder->CommandsTouchingNothing(Recorder::CommandSite::Texture);
+    const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::Copy);
+    Recorder::CountBarriers(Recorder::CommandClass::Copy, 5);
+    if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
+    if (Recorder::BarrierValidate()) {
+        const std::array<std::pair<VkImage, bool>, 1> images{{{image, true}}};
+        recorder->NoteAccess(Recorder::CommandClass::Copy, Recorder::Access{{}, {}, images, VK_PIPELINE_STAGE_TRANSFER_BIT});
+    }
+    const auto barrier = context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+    VkImageMemoryBarrier barriers[2]{};
+    for (auto& entry : barriers) {
+        entry.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        entry.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        entry.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    }
+    // The image's writes so far reach the copy; the scratch's earlier content (the last move's) is
+    // discarded once its reads are done.
+    barriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barriers[0].image = image;
+    barriers[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+    barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barriers[1].srcAccessMask = 0;
+    barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barriers[1].image = scratch;
+    barriers[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
+    VkImageCopy region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstSubresource = region.srcSubresource;
+    region.extent = {descriptor.width, descriptor.height, 1};
+    context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, scratch, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
+    const auto blit = context.Function<PFN_vkCmdBlitImage>("vkCmdBlitImage");
+    for (std::size_t index = 0; index < blits.size(); ++index) {
+        const auto filter = filters[index] == VK_FILTER_LINEAR && !linear ? VK_FILTER_NEAREST : filters[index];
+        blit(commands, scratch, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image, VK_IMAGE_LAYOUT_GENERAL, 1, &blits[index], filter);
+    }
+    VkImageMemoryBarrier moved = barriers[0];
+    moved.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    moved.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &moved);
+    recorder->EndGpuTiming(timing, guestBytes);
+    // As after a draw into the image: the results are the image's, guest memory follows at the
+    // deferred write-back.
+    MarkDirty();
+    return true;
+}
+
 // See AdjacentGenerationEnabled above.
 std::vector<StorageTexture::Adjacent> StorageTexture::adjacentPendingUnchanged(std::uint64_t firstBlock, std::uint64_t lastBlock) const {
     std::vector<Adjacent> adjacent;

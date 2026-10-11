@@ -67,7 +67,12 @@ std::string DepthViewportDigest();
 // marked written (StorageTexture::MarkDirty), NoteDisplayBufferPresent at every present.
 // The display buffer's composite also names the UI target (the one texture it samples at the
 // display buffer's size, or APS5_NATIVE_ASPECT_UI_TARGET); the digest lists the composite's samples
-// and the UI target's draws ('UI draw', grouped by state) and dispatches, and how many were remapped.
+// and the UI target's draws ('UI draw', grouped by state, with whether the fragment program reads
+// FragCoord and why the draw was or was not remapped) and dispatches, and how many were remapped.
+// The UI phase (from the UI target's first draw to the composite) is listed too: every colour target
+// written with its draws, blended draws and remap reasons, the textures the UI draws sample (flagged
+// when of the UI target's extent or written in the phase), dispatches and copies or clears writing
+// other images of the UI target's extent, and the moves APS5_NATIVE_ASPECT_UI_BLIT made or refused.
 void NoteDisplayBufferPresent(std::uint64_t address);
 void NoteDisplayBufferDraw(const State& state, std::span<const CompiledShader> shaders);
 void NoteDisplayBufferStorageWrite(std::uint64_t address, std::uint32_t width, std::uint32_t height);
@@ -75,6 +80,10 @@ void NoteDisplayBufferStorageWrite(std::uint64_t address, std::uint32_t width, s
 // records. A blended draw into the UI target is mapped into the part of the target the presenter
 // shows undistorted (ComputeUndistortedRect at the presentation aspect), so the 16:9 UI keeps its
 // proportions in a centred region; every other draw keeps state.viewport and state.scissor.
+// Inside UI_RECT, APS5_NATIVE_ASPECT_UI_BLIT (default on; APS5_NO_NATIVE_ASPECT_UI_BLIT=1 goes back
+// to the per-draw remap) leaves the UI draws whole and instead moves the UI target's content into
+// that region at the display buffer's composite (NoteDisplayBufferDraw records the blits): draws
+// whose fragment programs clip by fragment position keep drawing where they clip.
 VkViewport UiRectViewport(const State& state);
 VkRect2D UiRectScissor(const State& state);
 struct AspectProbeDispatch {
