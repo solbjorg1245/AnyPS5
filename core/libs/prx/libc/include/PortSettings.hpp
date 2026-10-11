@@ -40,6 +40,8 @@
 //                             with the 3D instead of kept in a centred 16:9 region
 //                             APS5_NO_NATIVE_ASPECT_4K_UI=1 (environment only): the smallest slot again,
 //                             a 1080p UI below 1440p (its HUD item cluster and menu slots drawn too large)
+//                             APS5_NO_RESOLUTION_4K_UI=1 (environment only): Resolution or RenderResolution
+//                             up to 1080p runs its tier's own 1080p-display slot again (same HUD fault)
 //   Upscaler = off            APS5_UPSCALER         reserved: fsr, dlss (UpscalerQuality and FrameGeneration: file only, reserved)
 // The title takes one fixed physics step of 1/refresh per rendered frame (59.94 Hz in its 60 FPS mode,
 // 29.97 Hz in its 30 FPS mode), so any other limit, and any frame rate below the limit, changes the game
@@ -69,6 +71,8 @@ struct Settings {
     bool nativeAspectUi = false;
     // Native aspect keeps the UI on a 3840x2160 display buffer (PlanNativeAspect); APS5_NO_NATIVE_ASPECT_4K_UI.
     bool nativeAspect4kUi = true;
+    // A tier up to 1080p keeps the UI on a 3840x2160 display buffer (PlanResolution4kUi); APS5_NO_RESOLUTION_4K_UI.
+    bool resolution4kUi = true;
     Upscaler upscaler = Upscaler::Off;
     std::string upscalerQuality;
     bool frameGeneration = false;
@@ -324,6 +328,10 @@ inline void ApplyEnvironment(Settings& settings, const std::function<const char*
     // but 0) brings back the smallest slot that holds the render size (WantsPerf at 1280x800).
     if (const char* value = lookup("APS5_NATIVE_ASPECT_4K_UI"); value != nullptr && value[0] != '\0') settings.nativeAspect4kUi = std::string_view(value) != "0";
     if (const char* value = lookup("APS5_NO_NATIVE_ASPECT_4K_UI"); value != nullptr && value[0] != '\0' && std::string_view(value) != "0") settings.nativeAspect4kUi = false;
+    // The plain path's 4K UI (r6): APS5_RESOLUTION_4K_UI=0 or APS5_NO_RESOLUTION_4K_UI=1 (any value but 0)
+    // brings back the tier's own slot (WantsPerf at 1280x720, WantsBase at 1920x1080).
+    if (const char* value = lookup("APS5_RESOLUTION_4K_UI"); value != nullptr && value[0] != '\0') settings.resolution4kUi = std::string_view(value) != "0";
+    if (const char* value = lookup("APS5_NO_RESOLUTION_4K_UI"); value != nullptr && value[0] != '\0' && std::string_view(value) != "0") settings.resolution4kUi = false;
 }
 
 // A limit other than the title's 30 or 60 without the variable timestep would change the game speed
@@ -407,6 +415,9 @@ struct NativeAspectPlan {
     std::uint32_t sharedHeight = 0;
     std::uint32_t displayWidth = 0;
     std::uint32_t displayHeight = 0;
+    // Plain Resolution's 4K UI (PlanResolution4kUi): only the table rewrite; the aspect field and the
+    // presentation are left alone (the image stays 16:9).
+    bool uiOnly = false;
 
     bool Active() const { return slot != nullptr; }
     bool SharedNative() const { return sharedWidth != 0; }
@@ -496,6 +507,44 @@ inline NativeAspectPlan PlanNativeAspect(const Settings& settings) {
     return plan;
 }
 
+// Plain Resolution's 4K UI (r6, Settings::resolution4kUi, on by default): a tier with a 1080p display
+// buffer (WantsPerf, WantsBase: Resolution or RenderResolution up to 1080p, NativeAspect off) lays the
+// HUD item cluster and the menu slots out wrong (NativeAspectUiDisplayHeight: t475 t550 t565 t588), so
+// the title runs the first 3840x2160-display slot that holds the tier's render size (WantsHigh) with that
+// slot's render entries rewritten to the tier's size: the 3D renders as in the tier's own slot (1600x900
+// at 1280x720, 1920x1080 at 1920x1080), the UI is laid out on the 2160p display buffer and the presenter
+// scales it down to the window. The table rewrite is native aspect part 5's (NativeAspectPatch, t592);
+// the aspect field is not written. Inactive under NativeAspect (PlanNativeAspect plans the slot), above
+// 1080p, and with APS5_RESOLUTION_4K_UI=0 / APS5_NO_RESOLUTION_4K_UI=1 (the tier's own slot, as s58-s61).
+inline NativeAspectPlan PlanResolution4kUi(const Settings& settings) {
+    NativeAspectPlan plan;
+    if (!settings.resolution4kUi || settings.nativeAspect) return plan;
+    const auto* tier = SelectRenderTier(settings);
+    if (tier == nullptr) return plan;
+    const auto own = std::find_if(NativeAspectSlots.begin(), NativeAspectSlots.end(), [&](const NativeAspectSlot& slot) { return std::string_view(slot.convar) == tier->convar; });
+    if (own == NativeAspectSlots.end() || own->displayHeight >= NativeAspectUiDisplayHeight) return plan;
+    for (const auto& slot : NativeAspectSlots) {
+        if (slot.displayHeight >= NativeAspectUiDisplayHeight && tier->width <= slot.renderWidth && tier->height <= slot.renderHeight) {
+            plan.slot = &slot;
+            break;
+        }
+    }
+    if (!plan.Active()) return plan;
+    plan.renderWidth = tier->width;
+    plan.renderHeight = tier->height;
+    plan.aspectWidth = 16;
+    plan.aspectHeight = 9;
+    plan.uiOnly = true;
+    return plan;
+}
+
+// The slot whose render entries NativeAspectPatch rewrites and the overlay forces: native aspect's plan,
+// else plain Resolution's 4K UI; inactive when the title keeps its tier's own slot.
+inline NativeAspectPlan PlanTierRewrite(const Settings& settings) {
+    if (const auto plan = PlanNativeAspect(settings); plan.Active()) return plan;
+    return PlanResolution4kUi(settings);
+}
+
 // Native aspect's UI rect (libSceAgcDriver DepthSurface.cpp, s59-s61): the 16:9 UI is moved into a
 // centred 16:9 region of the display buffer at its composite, so the HUD, menus and movies keep their
 // proportions while the 3D fills the window. On wherever native aspect is planned and the display
@@ -581,7 +630,7 @@ inline bool DpiAwareWindow(const Settings& settings, const char* switchValue) {
 // The title's arguments the settings imply; empty when they imply none.
 inline std::vector<std::string> GameArgs(const Settings& settings) {
     std::vector<std::string> args;
-    if (const auto plan = PlanNativeAspect(settings); plan.Active()) args.push_back(std::string("+r_Wants4K=") + plan.slot->convar);
+    if (const auto plan = PlanTierRewrite(settings); plan.Active()) args.push_back(std::string("+r_Wants4K=") + plan.slot->convar);
     else if (const auto* tier = SelectRenderTier(settings)) args.push_back(std::string("+r_Wants4K=") + tier->convar);
     if (const auto fps = GameFramesPerSecond(settings)) args.push_back("+TargetFramesPerSecond=" + std::to_string(fps));
     return args;
@@ -613,6 +662,10 @@ inline std::string Describe(const Settings& settings) {
             plan.renderWidth, plan.renderHeight, plan.slot->convar, plan.SharedNative() ? plan.sharedWidth : plan.slot->renderWidth,
             plan.SharedNative() ? plan.sharedHeight : plan.slot->renderHeight, plan.DisplayNative() ? plan.displayWidth : plan.slot->displayWidth,
             plan.DisplayNative() ? plan.displayHeight : plan.slot->displayHeight);
+        result += text;
+    } else if (const auto ui = PlanResolution4kUi(settings); ui.Active()) {
+        std::snprintf(text, sizeof(text), "render %ux%u (the %s tier) in the r_Wants4K=%s slot (display buffer %ux%u: 4K UI, APS5_NO_RESOLUTION_4K_UI=1 for the tier's own), ",
+            ui.renderWidth, ui.renderHeight, SelectRenderTier(settings)->convar, ui.slot->convar, ui.slot->displayWidth, ui.slot->displayHeight);
         result += text;
     } else if (const auto* tier = SelectRenderTier(settings)) {
         std::snprintf(text, sizeof(text), "render r_Wants4K=%s (%ux%u), ", tier->convar, tier->width, tier->height);

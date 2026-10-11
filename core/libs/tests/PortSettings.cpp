@@ -96,9 +96,9 @@ static void TestFrameRate() {
     Require(PortSettings::GameFramesPerSecond(FromText("FpsLimit = auto\n")) == 0, "auto");
 
     const auto args = PortSettings::GameArgs(FromText("Resolution = 1280x800\nFpsLimit = 30\n"));
-    Require(args.size() == 2 && args[0] == "+r_Wants4K=WantsPerf" && args[1] == "+TargetFramesPerSecond=30", "game args");
-    Require(PortSettings::AppendLines("+a = 1\r\n+b = 2", args) == "+a = 1\r\n+b = 2\r\n+r_Wants4K=WantsPerf\r\n+TargetFramesPerSecond=30\r\n", "render config append");
-    Require(PortSettings::AppendWords("+x=false", args) == "+x=false +r_Wants4K=WantsPerf +TargetFramesPerSecond=30", "command line append");
+    Require(args.size() == 2 && args[0] == "+r_Wants4K=WantsHigh" && args[1] == "+TargetFramesPerSecond=30", "game args (4K UI slot, r6)");
+    Require(PortSettings::AppendLines("+a = 1\r\n+b = 2", args) == "+a = 1\r\n+b = 2\r\n+r_Wants4K=WantsHigh\r\n+TargetFramesPerSecond=30\r\n", "render config append");
+    Require(PortSettings::AppendWords("+x=false", args) == "+x=false +r_Wants4K=WantsHigh +TargetFramesPerSecond=30", "command line append");
 }
 
 static void TestWindowSize() {
@@ -183,8 +183,8 @@ static void TestOverlay() {
     { std::ofstream file(root / "app0" / "misc" / "gamecommandlineargs.txt", std::ios::binary); file << "+untouched"; }
     SetVariable("APS5_SETTINGS", settingsPath.string().c_str());
 
-    Require(ReadGuest("/app0/misc/RenderConfig_PS5_Perf.txt") == "+r_Wants4K = WantsHigh\r\n+TargetFramesPerSecond = 60\r\n+r_Wants4K=WantsPerf\r\n+TargetFramesPerSecond=30\r\n", "render config overlay");
-    Require(ReadGuest("/app0/packagecmdlineargs.txt") == "+cp11_callHomeLockDownEnabled=false +r_Wants4K=WantsPerf +TargetFramesPerSecond=30", "command line overlay");
+    Require(ReadGuest("/app0/misc/RenderConfig_PS5_Perf.txt") == "+r_Wants4K = WantsHigh\r\n+TargetFramesPerSecond = 60\r\n+r_Wants4K=WantsHigh\r\n+TargetFramesPerSecond=30\r\n", "render config overlay");
+    Require(ReadGuest("/app0/packagecmdlineargs.txt") == "+cp11_callHomeLockDownEnabled=false +r_Wants4K=WantsHigh +TargetFramesPerSecond=30", "command line overlay");
     Require(ReadGuest("/app0/misc/gamecommandlineargs.txt") == "+untouched", "other files untouched");
     Require(GetPortSettings_nid_no_patch().width == 1280, "process settings");
 
@@ -238,7 +238,7 @@ static void TestNativeAspect() {
         return plan.Active() && plan.renderWidth == width && plan.renderHeight == height && std::string(plan.slot->convar) == convar;
     };
     Require(!planFor("Resolution = 2560x1080").Active(), "off by default");
-    Require(PortSettings::GameArgs(FromText("Resolution = 2560x1080"))[0] == "+r_Wants4K=WantsBase", "off: stage 1 tier");
+    Require(PortSettings::GameArgs(FromText("Resolution = 2560x1080"))[0] == "+r_Wants4K=WantsHigh", "off: the WantsBase tier in the 4K UI slot (r6)");
     Require(is(native("2560x1080"), 2560, 1080, "WantsHigh"), "21:9 1080p renders 2560x1080 in the 4K-display slot");
     Require(is(native("1280x800"), 1280, 800, "WantsHigh"), "Steam Deck renders 1280x800 in the 4K-display slot (4K UI)");
     Require(is(native("1920x1080"), 1920, 1080, "WantsHigh"), "16:9 1080p renders 1080p in the 4K-display slot (4K UI)");
@@ -369,8 +369,53 @@ static void TestNativeAspect() {
     Require(!PortSettings::NativeAspectUiRect(uiHalf, nullptr, nullptr), "the display half leaves nothing to move");
 }
 
+// Plain Resolution's 4K UI (r6): a tier up to 1080p runs in the WantsHigh slot at the tier's render size.
+static void TestResolution4kUi() {
+    const auto withEnvironment = [](const std::string& text, const char* variable, const char* value) {
+        auto settings = PortSettings::Parse(text, "test.ini");
+        PortSettings::ApplyEnvironment(settings, [&](const char* name) -> const char* { return std::string(name) == variable ? value : nullptr; });
+        PortSettings::Normalize(settings);
+        return settings;
+    };
+    const auto is = [](const PortSettings::NativeAspectPlan& plan, std::uint32_t width, std::uint32_t height, const char* convar) {
+        return plan.Active() && plan.uiOnly && plan.renderWidth == width && plan.renderHeight == height && std::string(plan.slot->convar) == convar
+            && plan.slot->displayHeight == 2160 && plan.Aspect() == 16.0f / 9.0f && !plan.SharedNative() && !plan.DisplayNative();
+    };
+    const auto ui = [](const char* text) { return PortSettings::PlanResolution4kUi(FromText(text)); };
+    Require(is(ui("Resolution = 1920x1080"), 1920, 1080, "WantsHigh"), "1080p: WantsBase's size in the 4K-display slot");
+    Require(is(ui("Resolution = 1280x720"), 1600, 900, "WantsHigh"), "720p: WantsPerf's size in the 4K-display slot");
+    Require(is(ui("Resolution = 1280x800"), 1600, 900, "WantsHigh"), "Steam Deck: WantsPerf's size");
+    Require(is(ui("Resolution = 2560x1080"), 1920, 1080, "WantsHigh"), "ultrawide 1080p: WantsBase's size");
+    Require(is(ui("RenderResolution = 900"), 1600, 900, "WantsHigh"), "RenderResolution = 900 alone");
+    Require(is(ui("Resolution = 3840x2160\nRenderResolution = 1080"), 1920, 1080, "WantsHigh"), "RenderResolution = 1080 at 4K");
+    Require(!ui("Resolution = 2560x1440").Active() && !ui("Resolution = 3840x2160").Active(), "1440p and up keep their own slot");
+    Require(!ui("Resolution = 1280x720\nRenderResolution = 2160").Active(), "RenderResolution = 2160 keeps WantsSuperHigh");
+    Require(!ui("").Active() && PortSettings::GameArgs(FromText("")).empty(), "no Resolution: nothing");
+    Require(!ui("NativeAspect = on\nResolution = 1920x1080").Active(), "NativeAspect plans its own slot");
+    Require(!PortSettings::PlanTierRewrite(FromText("NativeAspect = on\nResolution = 1280x800")).uiOnly, "native aspect's plan wins");
+    Require(PortSettings::PlanTierRewrite(FromText("Resolution = 1920x1080")).uiOnly, "plain: the 4K UI plan");
+    Require(PortSettings::GameArgs(FromText("Resolution = 1920x1080"))[0] == "+r_Wants4K=WantsHigh", "1080p forces WantsHigh");
+    Require(PortSettings::GameArgs(FromText("Resolution = 2560x1440"))[0] == "+r_Wants4K=WantsHigh", "1440p unchanged");
+    Require(PortSettings::Describe(FromText("Resolution = 1280x720")).find("render 1600x900 (the WantsPerf tier) in the r_Wants4K=WantsHigh slot (display buffer 3840x2160: 4K UI") != std::string::npos, "describe");
+    Require(!PortSettings::NativeAspectUiRect(FromText("Resolution = 1280x720"), nullptr, nullptr), "no UI rect: the image stays 16:9");
+    const auto writes = PortSettings::TierTableWrites(ui("Resolution = 1280x720"));
+    Require(writes.size() == 2 && writes[0].entry == 2 && writes[0].value == 1600 && writes[1].entry == 7 && writes[1].value == 900, "WantsHigh render entries take the tier's size");
+
+    // APS5_RESOLUTION_4K_UI=0 / APS5_NO_RESOLUTION_4K_UI=1: the tier's own slot (s58-s61).
+    const auto off = withEnvironment("Resolution = 1280x720\n", "APS5_NO_RESOLUTION_4K_UI", "1");
+    Require(!off.resolution4kUi && !PortSettings::PlanResolution4kUi(off).Active() && PortSettings::GameArgs(off)[0] == "+r_Wants4K=WantsPerf", "APS5_NO_RESOLUTION_4K_UI=1: WantsPerf");
+    const auto offBase = withEnvironment("Resolution = 1920x1080\n", "APS5_RESOLUTION_4K_UI", "0");
+    Require(PortSettings::GameArgs(offBase)[0] == "+r_Wants4K=WantsBase", "APS5_RESOLUTION_4K_UI=0: WantsBase");
+    Require(PortSettings::Describe(offBase).find("render r_Wants4K=WantsBase (1920x1080)") != std::string::npos, "describe: the old line");
+    Require(withEnvironment("Resolution = 1920x1080\n", "APS5_NO_RESOLUTION_4K_UI", "0").resolution4kUi, "APS5_NO_RESOLUTION_4K_UI=0 keeps it");
+    Require(withEnvironment("Resolution = 1920x1080\n", "APS5_RESOLUTION_4K_UI", "1").resolution4kUi, "APS5_RESOLUTION_4K_UI=1");
+    const auto nativeOff = withEnvironment("NativeAspect = on\nResolution = 1280x800\n", "APS5_NO_RESOLUTION_4K_UI", "1");
+    Require(std::string(PortSettings::PlanTierRewrite(nativeOff).slot->convar) == "WantsHigh", "native aspect's 4K UI is its own switch");
+}
+
 int main() {
     TestReviewFixes();
+    TestResolution4kUi();
     TestNativeAspect();
     TestParse();
     TestEnvironment();
