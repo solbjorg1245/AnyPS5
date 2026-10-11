@@ -545,6 +545,7 @@ void testRecordPipe() {
     using Ring = RecordPipeRing;
     check(Ring::Slot(1) == 1 && Ring::Slot(32) == 0 && Ring::Slot(33) == 1 && Ring::Empty(5, 5) && !Ring::Full(36, 5) && Ring::Full(37, 5) && Ring::Pending(37, 5) == 32, "record pipe: slots, empty and full");
     check(RecordPipeOccupancyBuckets == 5 && RecordPipeOccupancyBucket(0) == 0 && RecordPipeOccupancyBucket(1) == 0 && RecordPipeOccupancyBucket(2) == 1 && RecordPipeOccupancyBucket(4) == 1 && RecordPipeOccupancyBucket(5) == 2 && RecordPipeOccupancyBucket(16) == 2 && RecordPipeOccupancyBucket(17) == 3 && RecordPipeOccupancyBucket(31) == 3 && RecordPipeOccupancyBucket(Ring::Pending(37, 5)) == 4 && RecordPipeOccupancyBucket(Ring::Depth + 1) == 4, "record pipe: ring occupancy buckets at hand-over");
+    check(RecordPipeEpochFor(0, 0) == RecordPipeEpochStep::Unordered && RecordPipeEpochFor(0, 7) == RecordPipeEpochStep::Unordered && RecordPipeEpochFor(7, 0) == RecordPipeEpochStep::Bump && RecordPipeEpochFor(7, 7) == RecordPipeEpochStep::Keep && RecordPipeEpochFor(9, 7) == RecordPipeEpochStep::Bump, "record pipe: B's collect epoch follows the items' hand-over epochs");
     Ring ring;
     const std::uint64_t start = 0x100000000ull - 24;
     ring.handed = start;
