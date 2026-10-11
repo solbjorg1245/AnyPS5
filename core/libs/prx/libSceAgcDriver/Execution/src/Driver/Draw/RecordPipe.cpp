@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/FrameTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/PassDump.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
@@ -88,6 +89,13 @@ bool& recordPipeReplaying() {
 bool& recordPipeHandedDraw() {
     static thread_local bool handed = false;
     return handed;
+}
+
+// A: set while a frame trace runs (APS5_CAPTURE_DIR, FrameTrace.hpp), taken at a packet boundary
+// after a drain (recordPipeBoundary): the traced packets record on A as without the pipe.
+bool& recordPipeTracing() {
+    static thread_local bool tracing = false;
+    return tracing;
 }
 
 bool recordPipeProfile() {
@@ -216,7 +224,7 @@ bool RecordPipeActive() {
         if (value == nullptr || std::strcmp(value, "1") != 0) return false;
         const auto set = [](const char* name) { return std::getenv(name) != nullptr; };
         const char* fastDispatch = std::getenv("APS5_FAST_DISPATCH");
-        const bool declined = FastDrawEnabled() || FastDrawVerifyEvery() != 0 || set("APS5_LOCKED_DRAW_PREPARE") || Graphics::Recorder::DispatchOverlap() || FastCensusActive() || (fastDispatch != nullptr && std::strcmp(fastDispatch, "0") != 0) || PassDump::Enabled() || set("APS5_CAPTURE_DIR") || Graphics::CheckpointsRequested() || set("APS5_DUMP_DRAW_SHADERS") || set("APS5_DUMP_DRAW_SLOT1") || ShaderRecompiler::DebugProbeActive() || !LabelBatchSubmit() || set("APS5_DRAIN_ALL") || set("APS5_DRAW_DRAIN");
+        const bool declined = FastDrawEnabled() || FastDrawVerifyEvery() != 0 || set("APS5_LOCKED_DRAW_PREPARE") || Graphics::Recorder::DispatchOverlap() || FastCensusActive() || (fastDispatch != nullptr && std::strcmp(fastDispatch, "0") != 0) || PassDump::Enabled() || Graphics::CheckpointsRequested() || set("APS5_DUMP_DRAW_SHADERS") || set("APS5_DUMP_DRAW_SLOT1") || ShaderRecompiler::DebugProbeActive() || !LabelBatchSubmit() || set("APS5_DRAIN_ALL") || set("APS5_DRAW_DRAIN");
         std::fprintf(stderr, "[pipe] queue 0 recording pipe %s\n", declined ? "declined: a fast-path, verify, dump or drain switch is set" : "on");
         return !declined;
     }();
@@ -266,11 +274,11 @@ void NoteRecordPipeDispatch(const RecordPipeDispatchFacts& facts) {
 }
 
 bool Driver::recordPipeDrawing(std::uint32_t queue) {
-    return queue == 0 && RecordPipeActive() && !recordPipeReplaying();
+    return queue == 0 && RecordPipeActive() && !recordPipeReplaying() && !recordPipeTracing();
 }
 
 bool Driver::recordPipeDispatching(std::uint32_t queue) {
-    return queue == 0 && RecordPipeDispatchActive() && !recordPipeReplaying();
+    return queue == 0 && RecordPipeDispatchActive() && !recordPipeReplaying() && !recordPipeTracing();
 }
 
 DrawScratch* Driver::recordPipeScratch() {
@@ -427,6 +435,13 @@ void Driver::drainRecordPipe(PipeCensusDrain why) {
 void Driver::recordPipeBoundary(std::span<const std::uint32_t> packet, std::uint32_t header) {
     auto& pipe = recordPipe();
     serviceRecordPipe();
+    // APS5_CAPTURE_DIR: a frame trace starts and ends at a present (the presenting thread); A follows
+    // it here, before the packet and after a drain, so a traced command's line, write notes and
+    // dumps see it recorded. The directory alone no longer declines the pipe.
+    if (const bool tracing = FrameTrace::Noting(); tracing != recordPipeTracing()) {
+        drainRecordPipe(PipeCensusDrain::Other);
+        recordPipeTracing() = tracing;
+    }
     const bool special = header == FlipPacketHeader || header == RenderingWaitPacketHeader;
     const bool dispatches = RecordPipeDispatchActive();
     const auto opcode = (header >> 8u) & 0xffu;
