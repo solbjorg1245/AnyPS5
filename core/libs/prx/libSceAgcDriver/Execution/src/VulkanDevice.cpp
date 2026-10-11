@@ -1525,7 +1525,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
             auto seed = std::make_shared<Graphics::Buffer>(context, 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             std::memcpy(seed->Bytes().data(), pattern.data(), 16);
             recorder.Keep(seed);
-            const auto chain = recorder.Commands();
+            const auto chain = recorder.CommandsTouchingNothing(Graphics::Recorder::CommandSite::Fill);
             const auto copyBuffer = context.Resolved(&Graphics::DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
             const VkBufferCopy first{0, 0, 16};
             Graphics::PoisonPooled(context, chain, *patternBuffer, Graphics::PoisonSite::Pattern);
@@ -1546,7 +1546,8 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     // A queued label store over the range lands before the fill (program order).
     recorder.FlushStoresOverlapping(address, bytes);
     VkAccessFlags covered = 0;
-    const auto commands = recorder.Commands(&covered);
+    // Aware commands (APS5_AWARE_COMMANDS): only the queued copy-backs over the range go in first.
+    const auto commands = recorder.CommandsTouching([&](std::uint64_t begin, std::uint64_t end) { return begin < address + bytes && address < end; }, Graphics::Recorder::CommandSite::Fill, &covered);
     const auto timing = recorder.BeginGpuTiming(CommandClass::Fill);
     if (Graphics::Recorder::BarrierValidate()) {
         const std::pair<std::uint64_t, std::uint64_t> range{address, address + bytes};
@@ -1801,7 +1802,8 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     recorder.FlushStoresOverlapping(source, bytes);
     recorder.FlushStoresOverlapping(destination, bytes);
     VkAccessFlags covered = 0;
-    const auto commands = recorder.Commands(&covered);
+    // Aware commands (APS5_AWARE_COMMANDS): only the queued copy-backs over either range go in first.
+    const auto commands = recorder.CommandsTouching([&](std::uint64_t begin, std::uint64_t end) { return (begin < source + bytes && source < end) || (begin < destination + bytes && destination < end); }, Graphics::Recorder::CommandSite::Copy, &covered);
     // The class range covers the barriers too; the program-keyed range inside it is the transfer.
     const auto classTiming = recorder.BeginGpuTiming(CommandClass::Copy);
     if (Graphics::Recorder::BarrierValidate()) {
@@ -3655,9 +3657,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         using FlushReason = Graphics::Recorder::FlushReason;
         if (resources.HoldsLease() && resources.MapsResidentLands()) {
             // A resident written range's land (APS5_RESIDENT_WRITES) stays queued past an
-            // address-based use whose table maps the range only to its device copy (read-only) or
-            // not at all, with no descriptor or region of its own over it, unless the range holds
-            // its indirect arguments.
+            // address-based use whose table maps the range only to its device copy (read-only, or
+            // writable: a storing use queues its own land after it, S7c) or not at all, with no
+            // descriptor or region of its own over it, unless the range holds its indirect arguments.
             recorder.FlushDeferredWhere([&](const Graphics::Recorder::DeferredCopy& copy, bool) {
                 return !(copy.land && resources.MapsResidentLand(copy.sourceKey) && !(argumentImport != nullptr && copy.address < arguments + 12 && arguments < copy.address + copy.bytes));
             }, FlushReason::DispatchLease);
@@ -3681,7 +3683,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     const auto guestOrder = Graphics::Recorder::DispatchOverlap() && argumentImport == nullptr && !resources.HoldsLease() ? Graphics::Recorder::GuestOrder() : Graphics::Recorder::GuestOrderKey{};
     const bool holdsTrail = recorder.HoldDispatchTrail(guestOrder);
     VkAccessFlags covered = 0;
-    const auto commands = keepCopyBacks ? recorder.CommandsKeepingCopyBacks(&covered) : recorder.Commands(&covered);
+    const auto commands = keepCopyBacks ? recorder.CommandsKeepingCopyBacks(&covered) : recorder.Commands(&covered, Graphics::Recorder::CommandSite::Dispatch);
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
     recorder.Keep(record.resources);

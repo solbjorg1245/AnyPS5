@@ -685,7 +685,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             std::unique_ptr<CommandBatch> batch;
             VkCommandBuffer commands = VK_NULL_HANDLE;
             if (recorder != nullptr) {
-                commands = recorder->Commands();
+                commands = recorder->CommandsTouchingNothing(Recorder::CommandSite::Texture);
                 recorder->Keep(staging, static_cast<std::size_t>(guestBytes));
                 recorder->Keep(tiled, static_cast<std::size_t>(guestBytes));
                 recorder->Keep(linear, static_cast<std::size_t>(linearBytes));
@@ -1827,7 +1827,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         VkCommandBuffer commands = VK_NULL_HANDLE;
         auto timing = Recorder::NoTiming;
         if (recorder != nullptr) {
-            commands = recorder->Commands();
+            commands = recorder->CommandsTouchingNothing(Recorder::CommandSite::Texture);
             timing = recorder->BeginGpuTiming(Recorder::CommandClass::DccClear);
             if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
             ++Profile().storageRecordedClears;
@@ -1913,7 +1913,8 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         if (recorder != nullptr) {
             // A queued label store in the surface lands before the detile reads it.
             recorder->FlushStoresOverlapping(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
-            commands = recorder->Commands();
+            // Aware commands (APS5_AWARE_COMMANDS): only the queued copy-backs over the surface go in first.
+            commands = recorder->CommandsTouching([&](std::uint64_t begin, std::uint64_t end) { return begin < descriptor.baseAddress + guestBytes && descriptor.baseAddress < end; }, Recorder::CommandSite::Texture);
             timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
             recorder->Keep(linear, linear->Size());
             // The image itself must outlive the recorded copy: the cache may evict it right after.
@@ -2162,7 +2163,8 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
         }
         // A queued label store in a run lands before the detile reads it.
         for (const auto& [begin, end] : reads) recorder->FlushStoresOverlapping(begin, static_cast<std::size_t>(end - begin));
-        commands = recorder->Commands();
+        // Aware commands (APS5_AWARE_COMMANDS): only the queued copy-backs over the import pieces go in first.
+        commands = recorder->CommandsTouching([&](std::uint64_t begin, std::uint64_t end) { return std::any_of(reads.begin(), reads.end(), [&](const std::pair<std::uint64_t, std::uint64_t>& range) { return begin < range.second && range.first < end; }); }, Recorder::CommandSite::Texture);
         timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
         recorder->Keep(linear, linear->Size());
         for (const auto& source : sources) {
@@ -2318,7 +2320,7 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
     if (recorder != nullptr) {
         recorder->FlushKeyStoresOverlapping(flushBegin, static_cast<std::size_t>(flushEnd - flushBegin));
         recorder->FlushStoresOverlapping(flushBegin, static_cast<std::size_t>(flushEnd - flushBegin));
-        commands = recorder->Commands(&covered);
+        commands = recorder->Commands(&covered, Recorder::CommandSite::TextureWriteBack);
         timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageWriteBack);
         recorder->Keep(linear, linear->Size());
         recorder->Keep(tiledScratch, tiledScratch->Size());
@@ -3331,7 +3333,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
             BumpPendingSerial();
         }
     }
-    const auto commands = recorder->Commands();
+    const auto commands = recorder->CommandsTouchingNothing(Recorder::CommandSite::Texture);
     const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::DccClear);
     if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
     Recorder::CountBarriers(Recorder::CommandClass::DccClear, 2);
@@ -3467,7 +3469,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
     // below makes those units stale (nothing for a 64 KiB-multiple surface).
     PublishShadow(begin, bytes, PublishScope::PartialUnits, PublishReason::FillClear);
     GuestMemory::MarkWritten(begin, bytes);
-    const auto commands = recorder->Commands();
+    const auto commands = recorder->CommandsTouchingNothing(Recorder::CommandSite::Texture);
     const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::FillClear);
     Recorder::CountBarriers(Recorder::CommandClass::FillClear, 2);
     if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
@@ -3584,7 +3586,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
         }
     }
     GuestMemory::MarkWritten(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
-    const auto commands = recorder->Commands();
+    const auto commands = recorder->CommandsTouchingNothing(Recorder::CommandSite::Texture);
     const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::Copy);
     Recorder::CountBarriers(Recorder::CommandClass::Copy, 2);
     if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
@@ -3755,7 +3757,7 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
     VkCommandBuffer commands = VK_NULL_HANDLE;
     auto timing = Recorder::NoTiming;
     if (recorder != nullptr) {
-        commands = recorder->Commands();
+        commands = recorder->CommandsTouchingNothing(Recorder::CommandSite::Texture);
         timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
         if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
         if (auto other = source.weak_from_this().lock()) recorder->Keep(std::move(other));
@@ -4129,7 +4131,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         if (recorder != nullptr) {
             recorder->FlushKeyStoresOverlapping(firstStored, static_cast<std::size_t>(lastStored - firstStored));
             recorder->FlushStoresOverlapping(firstStored, static_cast<std::size_t>(lastStored - firstStored));
-            commands = recorder->Commands();
+            commands = recorder->Commands(nullptr, Recorder::CommandSite::TextureWriteBack);
             timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageWriteBack);
             recorder->Keep(linear, linear->Size());
             recorder->Keep(tiledScratch, tiledScratch->Size());
