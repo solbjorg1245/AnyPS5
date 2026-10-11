@@ -49,8 +49,13 @@ struct RecordPipeState {
     std::uint64_t run = 0, items = 0, runs = 0, staleRedos = 0, overlayDraws = 0, overlayLoads = 0;
     std::array<std::uint64_t, PipeCensusDrains> drains{};
     double ringWaitMs = 0, drainWaitMs = 0;
+    // The drains that found unrecorded items, and A's wait in them, by reason.
+    std::array<std::uint64_t, PipeCensusDrains> drainsWaited{};
+    std::array<double, PipeCensusDrains> drainWaitByReason{};
+    // Due batch submits A left to B, and B's.
+    std::uint64_t submitsLeft = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
-    std::atomic<std::uint64_t> holds{0}, busyNs{0}, lockWaitNs{0};
+    std::atomic<std::uint64_t> holds{0}, busyNs{0}, lockWaitNs{0}, bSubmits{0};
 };
 
 // Never destroyed: Driver::stop joins B, and a static's destructor could run before the driver's.
@@ -95,6 +100,15 @@ void verifyPipeReads(RecordPipeState& pipe, std::span<const ShaderRecompiler::Me
         if (total <= 20 || total % 1000 == 0) std::fprintf(stderr, "[pipe] verify miss: %s %llu (opcode 0x%x, key 0x%llx) read [0x%llx,0x%llx) written by item %llu (unrecorded at its capture); overlay estimate had it: no\n", who, static_cast<unsigned long long>(serial), opcode, static_cast<unsigned long long>(key), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), static_cast<unsigned long long>(writer));
         return;
     }
+}
+
+// B submits a batch whose oldest recorded label is past the deadline (APS5_LABEL_FLUSH_US, 1 ms) after
+// each item it records and before it sleeps; A leaves the deadline submit to B while B has items
+// (its try fails under B's holds, PacketFlush.cpp, so the label waited for A's outright lock at 4x the
+// deadline). APS5_RECORD_PIPE_NO_B_SUBMIT=1: A submits as before.
+bool recordPipeBSubmit() {
+    static const bool enabled = std::getenv("APS5_RECORD_PIPE_NO_B_SUBMIT") == nullptr;
+    return enabled;
 }
 
 std::chrono::microseconds pipeMicros(const char* name, std::uint64_t fallback) {
@@ -217,6 +231,15 @@ void Driver::handOverDraw(DrawScratch& scratch, RecordPipeDraw&& draw, const Que
     wakeSide(pipe.bSleeping, pipe.bWake);
 }
 
+bool Driver::recordPipeTakesSubmit() {
+    if (!RecordPipeActive() || !recordPipeBSubmit()) return false;
+    auto& pipe = recordPipe();
+    // B checks the deadline after its next item, unless it has none or waits for a stale redo.
+    if (RecordPipeRing::Empty(pipe.ring.handed.load(std::memory_order_relaxed), pipe.ring.consumed.load(std::memory_order_acquire)) || pipe.stale.Pending() != 0) return false;
+    ++pipe.submitsLeft;
+    return true;
+}
+
 void Driver::serviceRecordPipe() {
     auto& pipe = recordPipe();
     const auto serial = pipe.stale.Pending();
@@ -265,9 +288,17 @@ void Driver::drainRecordPipe(PipeCensusDrain why) {
         ++pipe.drains[static_cast<std::size_t>(why)];
         pipe.run = 0;
     }
-    const auto start = recordPipeProfile() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    pipeWait(pipe.aSleeping, pipe.aWake, [&] { return RecordPipeRing::Empty(pipe.ring.handed.load(std::memory_order_relaxed), pipe.ring.consumed.load(std::memory_order_acquire)); }, [&] { recordPipeWaitRound(); });
-    if (recordPipeProfile()) pipe.drainWaitMs += sinceMs(start);
+    const auto empty = [&] { return RecordPipeRing::Empty(pipe.ring.handed.load(std::memory_order_relaxed), pipe.ring.consumed.load(std::memory_order_acquire)); };
+    // Only a drain that finds unrecorded items waits; it is timed by reason.
+    const bool timed = recordPipeProfile() && !empty();
+    const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    pipeWait(pipe.aSleeping, pipe.aWake, empty, [&] { recordPipeWaitRound(); });
+    if (timed) {
+        const auto ms = sinceMs(start);
+        pipe.drainWaitMs += ms;
+        pipe.drainWaitByReason[static_cast<std::size_t>(why)] += ms;
+        ++pipe.drainsWaited[static_cast<std::size_t>(why)];
+    }
     pipe.overlay.ranges.clear();
 }
 
@@ -297,19 +328,24 @@ void Driver::recordPipeSubmissionEnd() {
     drainRecordPipe(PipeCensusDrain::SubmissionEnd);
     auto& pipe = recordPipe();
     if (!recordPipeProfile() || std::chrono::steady_clock::now() - pipe.lastReport < std::chrono::seconds(10)) return;
-    std::string drains;
+    std::string drains, waits;
     char item[64];
     for (std::size_t why = 0; why < PipeCensusDrains; ++why) {
         std::snprintf(item, sizeof(item), " %s %llu", PipeCensusDrainNames[why], static_cast<unsigned long long>(pipe.drains[why]));
         drains += item;
+        if (pipe.drainsWaited[why] == 0) continue;
+        std::snprintf(item, sizeof(item), " %s %.1f/%llu", PipeCensusDrainNames[why], pipe.drainWaitByReason[why], static_cast<unsigned long long>(pipe.drainsWaited[why]));
+        waits += item;
     }
+    if (waits.empty()) waits = " none";
     const auto ms = [](std::atomic<std::uint64_t>& ns) { return static_cast<double>(ns.exchange(0, std::memory_order_relaxed)) / 1e6; };
     const auto busyMs = ms(pipe.busyNs), lockWaitMs = ms(pipe.lockWaitNs);
     char verify[80] = "";
     if (recordPipeVerify()) std::snprintf(verify, sizeof(verify), ", verify: checks %llu, misses %llu", static_cast<unsigned long long>(pipe.verifyChecks.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(pipe.verifyMisses.exchange(0, std::memory_order_relaxed)));
-    std::fprintf(stderr, "[pipe] queue 0 (10 s): items %llu, runs %llu (mean %.1f), holds %llu, drains:%s, A waited ms (ring full) %.1f, A drain wait ms %.1f, B busy ms %.1f, B lock wait ms %.1f, stale redos %llu, overlay hits %llu (draw %llu, load %llu)%s\n", static_cast<unsigned long long>(pipe.items), static_cast<unsigned long long>(pipe.runs), pipe.runs == 0 ? 0.0 : static_cast<double>(pipe.items) / static_cast<double>(pipe.runs), static_cast<unsigned long long>(pipe.holds.exchange(0, std::memory_order_relaxed)), drains.c_str(), pipe.ringWaitMs, pipe.drainWaitMs, busyMs, lockWaitMs, static_cast<unsigned long long>(pipe.staleRedos), static_cast<unsigned long long>(pipe.overlayDraws + pipe.overlayLoads), static_cast<unsigned long long>(pipe.overlayDraws), static_cast<unsigned long long>(pipe.overlayLoads), verify);
-    pipe.items = pipe.runs = pipe.staleRedos = pipe.overlayDraws = pipe.overlayLoads = 0;
-    pipe.drains = {};
+    std::fprintf(stderr, "[pipe] queue 0 (10 s): items %llu, runs %llu (mean %.1f), holds %llu, drains:%s, A waited ms (ring full) %.1f, A drain wait ms %.1f (by reason, ms/drains that waited:%s), B busy ms %.1f, B lock wait ms %.1f, B deadline submits %llu (A left %llu to B), stale redos %llu, overlay hits %llu (draw %llu, load %llu)%s\n", static_cast<unsigned long long>(pipe.items), static_cast<unsigned long long>(pipe.runs), pipe.runs == 0 ? 0.0 : static_cast<double>(pipe.items) / static_cast<double>(pipe.runs), static_cast<unsigned long long>(pipe.holds.exchange(0, std::memory_order_relaxed)), drains.c_str(), pipe.ringWaitMs, pipe.drainWaitMs, waits.c_str(), busyMs, lockWaitMs, static_cast<unsigned long long>(pipe.bSubmits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(pipe.submitsLeft), static_cast<unsigned long long>(pipe.staleRedos), static_cast<unsigned long long>(pipe.overlayDraws + pipe.overlayLoads), static_cast<unsigned long long>(pipe.overlayDraws), static_cast<unsigned long long>(pipe.overlayLoads), verify);
+    pipe.items = pipe.runs = pipe.staleRedos = pipe.overlayDraws = pipe.overlayLoads = pipe.submitsLeft = 0;
+    pipe.drains = pipe.drainsWaited = {};
+    pipe.drainWaitByReason = {};
     pipe.ringWaitMs = pipe.drainWaitMs = 0;
     pipe.lastReport = std::chrono::steady_clock::now();
 }
@@ -348,7 +384,7 @@ void Driver::runRecordPipe() noexcept {
     GuestMemory::MarkRecordPipeThread();
     auto& pipe = recordPipe();
     static const auto hold = pipeMicros("APS5_RECORD_PIPE_HOLD_US", 200);
-    const bool profile = recordPipeProfile(), verify = recordPipeVerify();
+    const bool profile = recordPipeProfile(), verify = recordPipeVerify(), bSubmit = recordPipeBSubmit();
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
     auto held = std::chrono::steady_clock::time_point{};
     const auto release = [&] {
@@ -356,10 +392,21 @@ void Driver::runRecordPipe() noexcept {
         gpuLock.unlock();
         if (profile) pipe.busyNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - held).count()), std::memory_order_relaxed);
     };
+    // Under the mutex: the batch goes to the GPU once its oldest label is past the deadline.
+    const auto submitDue = [&] {
+        if (!bSubmit || !gpuLock.owns_lock()) return;
+        const auto since = Graphics::Recorder::PendingLabelSince();
+        if (!since.has_value() || std::chrono::steady_clock::now() - *since < labelFlushDeadline()) return;
+        const auto localDevice = device.Load();
+        if (localDevice == nullptr) return;
+        localDevice->SubmitRecorded(true);
+        pipe.bSubmits.fetch_add(1, std::memory_order_relaxed);
+    };
     try {
         for (;;) {
             const auto serial = pipe.ring.NextItem();
             if (serial == 0) {
+                submitDue();
                 release();
                 pipeWait(pipe.bSleeping, pipe.bWake, [&] { return pipe.stopping.load(std::memory_order_acquire) || pipe.ring.NextItem() != 0; }, [] {});
                 if (pipe.stopping.load(std::memory_order_acquire)) break;
@@ -383,6 +430,7 @@ void Driver::runRecordPipe() noexcept {
             GuestMemory::recordedWrites = verify ? &pipe.writeLog.Begin(serial) : nullptr;
             const bool stale = recordPipeItem(slot.scratch, slot.draw);
             GuestMemory::recordedWrites = nullptr;
+            submitDue();
             if (stale) {
                 // Stale: A redoes the item at its next service point, under its own lock.
                 release();

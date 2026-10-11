@@ -208,6 +208,8 @@ private:
     void drainRecordPipe(PipeCensusDrain why);
     void recordPipeBoundary(std::span<const std::uint32_t> packet, std::uint32_t header);
     void recordPipeSubmissionEnd();
+    // A's deadline submit on queue 0 goes to B while B has items (S2.1, APS5_RECORD_PIPE_NO_B_SUBMIT=1: off).
+    static bool recordPipeTakesSubmit();
     bool recordPipeItem(DrawScratch& scratch, RecordPipeDraw& item);
     void runRecordPipe() noexcept;
     void stopRecordPipe();

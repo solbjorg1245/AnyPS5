@@ -384,10 +384,13 @@ namespace {
 
 // The queue-0 thread's pipe census, the report included (no other thread touches it: no lock): the
 // running packet's notes, each policy's runs and overlay, and the window's counts.
-constexpr std::size_t PipeCensusPolicies = 2;
+// Bit 0: also recorded direct dispatches; bit 1: also the labels and stores stage 2 hands over.
+constexpr std::size_t PipeCensusPolicies = 4;
+constexpr std::array<const char*, PipeCensusPolicies> PipeCensusPolicyNames{"draws only", "draws and dispatches", "draws and labels", "draws, labels and dispatches"};
 struct PipeCensusState {
     PipeCensusLock lock = PipeCensusLock::None;
     bool labelsPending = false;
+    PipeCensusLabel label = PipeCensusLabel::None;
     std::array<std::uint8_t, PipeCensusPolicies> overlaps{};
     std::vector<PipeCensusOverlay::Range> writes;
     std::array<PipeCensusRuns, PipeCensusPolicies> runs{};
@@ -411,7 +414,7 @@ void reportPipeCensus(PipeCensusState& census) {
     for (std::size_t policy = 0; policy < PipeCensusPolicies; ++policy) {
         const auto& runs = census.runs[policy];
         const auto& overlaps = census.overlapCounts[policy];
-        std::snprintf(item, sizeof(item), "%llu runs of %llu (mean %.1f), by length:", static_cast<unsigned long long>(runs.count), static_cast<unsigned long long>(runs.packets), runs.count == 0 ? 0.0 : static_cast<double>(runs.packets) / static_cast<double>(runs.count));
+        std::snprintf(item, sizeof(item), "; %s: %llu runs of %llu (mean %.1f), by length:", PipeCensusPolicyNames[policy], static_cast<unsigned long long>(runs.count), static_cast<unsigned long long>(runs.packets), runs.count == 0 ? 0.0 : static_cast<double>(runs.packets) / static_cast<double>(runs.count));
         policies[policy] = item;
         for (std::size_t bucket = 0; bucket < FastCensusRuns::Buckets; ++bucket) {
             std::snprintf(item, sizeof(item), " %s %llu", FastCensusRuns::BucketNames[bucket], static_cast<unsigned long long>(runs.runs[bucket]));
@@ -425,7 +428,9 @@ void reportPipeCensus(PipeCensusState& census) {
         std::snprintf(item, sizeof(item), "; captures over unrecorded writes: draws %llu (targets %llu), dispatches %llu (targets %llu)", static_cast<unsigned long long>(overlaps[0]), static_cast<unsigned long long>(overlaps[1]), static_cast<unsigned long long>(overlaps[2]), static_cast<unsigned long long>(overlaps[3]));
         policies[policy] += item;
     }
-    std::fprintf(stderr, "[pipe] census queue 0 (10 s): draws %llu (labels pending %llu), dispatches %llu (labels pending %llu), submission ends %llu (%llu with work queued); draws only: %s; draws and dispatches: %s\n", static_cast<unsigned long long>(census.draws), static_cast<unsigned long long>(census.drawLabels), static_cast<unsigned long long>(census.dispatches), static_cast<unsigned long long>(census.dispatchLabels), static_cast<unsigned long long>(census.ends), static_cast<unsigned long long>(census.endsQueued), policies[0].c_str(), policies[1].c_str());
+    std::string all;
+    for (const auto& policy : policies) all += policy;
+    std::fprintf(stderr, "[pipe] census queue 0 (10 s): draws %llu (labels pending %llu), dispatches %llu (labels pending %llu), submission ends %llu (%llu with work queued)%s\n", static_cast<unsigned long long>(census.draws), static_cast<unsigned long long>(census.drawLabels), static_cast<unsigned long long>(census.dispatches), static_cast<unsigned long long>(census.dispatchLabels), static_cast<unsigned long long>(census.ends), static_cast<unsigned long long>(census.endsQueued), all.c_str());
     // A new window from now; the runs and overlays are empty at a submission end.
     census = {};
 }
@@ -464,16 +469,21 @@ void NotePipeCensusTargets(const Graphics::State& graphics) {
     if (graphics.stencilTest && graphics.depth->stencilAddress != 0) NotePipeCensusWrite(graphics.depth->stencilAddress, graphics.depth->stencilAddress + texels, true);
 }
 
+void NotePipeCensusLabel(PipeCensusLabel kind, std::uint64_t begin, std::uint64_t end) {
+    pipeCensus().label = kind;
+    if (kind == PipeCensusLabel::Hand) NotePipeCensusWrite(begin, end, false);
+}
+
 void NotePipeCensusPacket(std::uint32_t header, bool drawPacket, bool flip, bool renderingWait, bool wroteOnGpu, DispatchOutcome dispatch) {
     auto& census = pipeCensus();
-    PipeCensusPacket packet{header, drawPacket, flip, renderingWait, wroteOnGpu, drawPacket ? census.lock : PipeCensusLock::None, PipeCensusDispatch::None, census.labelsPending};
+    PipeCensusPacket packet{header, drawPacket, flip, renderingWait, wroteOnGpu, drawPacket ? census.lock : PipeCensusLock::None, PipeCensusDispatch::None, census.labelsPending, census.label};
     if (((header >> 8u) & 0xffu) == 0x15) packet.dispatch = dispatch == DispatchOutcome::Real ? PipeCensusDispatch::Recorded : dispatch == DispatchOutcome::CopyHle || dispatch == DispatchOutcome::FillHle ? PipeCensusDispatch::Copy : dispatch == DispatchOutcome::Fast ? PipeCensusDispatch::Other : PipeCensusDispatch::None;
     // Only a packet that recorded handed its capture to the device.
     const bool recorded = drawPacket ? packet.lock != PipeCensusLock::None : packet.dispatch == PipeCensusDispatch::Recorded;
     if (recorded) ++(drawPacket ? census.draws : census.dispatches);
     if (recorded && packet.labelsPending) ++(drawPacket ? census.drawLabels : census.dispatchLabels);
     for (std::size_t policy = 0; policy < PipeCensusPolicies; ++policy) {
-        const auto verdict = ClassifyPipeCensus(packet, policy == 1);
+        const auto verdict = ClassifyPipeCensus(packet, (policy & 1u) != 0, (policy & 2u) != 0);
         const auto overlap = recorded ? census.overlaps[policy] : std::uint8_t{0};
         if (overlap != 0) ++census.overlapCounts[policy][drawPacket ? 0 : 2];
         if ((overlap & PipeCensusOverlay::Target) != 0) ++census.overlapCounts[policy][drawPacket ? 1 : 3];
@@ -484,6 +494,7 @@ void NotePipeCensusPacket(std::uint32_t header, bool drawPacket, bool flip, bool
     }
     census.lock = PipeCensusLock::None;
     census.labelsPending = false;
+    census.label = PipeCensusLabel::None;
     census.overlaps = {};
     census.writes.clear();
 }

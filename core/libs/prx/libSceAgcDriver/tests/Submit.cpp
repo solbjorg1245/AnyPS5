@@ -497,6 +497,21 @@ void testPipeCensus() {
     check(both({header(0x16)}, false, PipeCensusDrain::IndirectDispatch) && both({header(0x3c)}, false, PipeCensusDrain::Wait) && both({header(0x49)}, false, PipeCensusDrain::Label) && both({header(0x50)}, false, PipeCensusDrain::Dma) && both({header(0x10) | (0x17u << 2u), false, true}, false, PipeCensusDrain::Flip), "pipe census: indirect dispatches, waits, labels, copies and flips drain");
     check(both({header(0x76)}, false, std::nullopt) && both({header(0x76), false, false, false, true}, false, PipeCensusDrain::Label) && both({header(0x22)}, false, PipeCensusDrain::Other), "pipe census: state packets are neutral, GPU stores and unknown packets drain");
 
+    // The label policies (stage 2): handed labels and stores ride, no-op ones are neutral, the rest drain.
+    const auto with = [](const PipeCensusPacket& packet, bool dispatches, bool labels, bool eligible, std::optional<PipeCensusDrain> drain) {
+        const auto verdict = ClassifyPipeCensus(packet, dispatches, labels);
+        return verdict.eligible == eligible && verdict.drain == drain;
+    };
+    const auto stored = [&](std::uint32_t opcode, PipeCensusLabel kind) {
+        PipeCensusPacket packet{header(opcode), false, false, false, true};
+        packet.label = kind;
+        return packet;
+    };
+    check(with(stored(0x49, PipeCensusLabel::Hand), false, true, true, std::nullopt) && with(stored(0x49, PipeCensusLabel::Hand), true, true, true, std::nullopt) && with(stored(0x49, PipeCensusLabel::Hand), false, false, false, PipeCensusDrain::Label) && with(stored(0x40, PipeCensusLabel::Hand), false, true, true, std::nullopt) && with(stored(0x40, PipeCensusLabel::Hand), true, false, false, PipeCensusDrain::Dma), "pipe census: handed labels and stores ride with labels, drain without");
+    check(with(stored(0x37, PipeCensusLabel::Neutral), false, true, false, std::nullopt) && with(stored(0x37, PipeCensusLabel::None), false, true, false, PipeCensusDrain::Label) && with(stored(0x50, PipeCensusLabel::None), true, true, false, PipeCensusDrain::Dma) && with(draw(PipeCensusLock::Direct, true), false, true, true, std::nullopt) && with(dispatch(PipeCensusDispatch::Recorded, true), true, true, true, std::nullopt) && with(dispatch(PipeCensusDispatch::Recorded, false), false, true, false, PipeCensusDrain::Dispatch), "pipe census: with labels, no-op labels are neutral, other labels and memory stores drain, and nothing records labels inside a lock");
+    const auto fromPacket = [](std::vector<std::uint32_t> words) { return PipeCensusStoreFromPacket(words); };
+    check(fromPacket({header(0x83), 0, 4, 0x1000, 0}) && fromPacket({header(0x40), 5, 7, 0, 0x1000, 0}) && !fromPacket({header(0x40), 1, 0x2000, 0, 0x1000, 0}) && fromPacket({header(0x50), 2u << 29u, 7, 0, 0x1000, 0, 64}) && fromPacket({header(0x50), 1u << 29u, 0, 0, 0x1000, 0, 64}) && !fromPacket({header(0x50), 0, 0x2000, 0, 0x1000, 0, 64}) && !fromPacket({header(0x50), 2u << 29u}) && !fromPacket({header(0x37), 0}), "pipe census: stores from the packet, the GDS or constant RAM can ride, memory-sourced ones drain");
+
     PipeCensusRuns runs;
     const PipeCensusVerdict handed{true, std::nullopt};
     const bool drainedEmpty = runs.Apply({false, PipeCensusDrain::Wait}, false);
