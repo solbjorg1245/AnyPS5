@@ -1374,6 +1374,14 @@ std::uint64_t CollectEpochBumps() {
     return collectEpochBumps.load(std::memory_order_relaxed);
 }
 
+std::uint64_t ThreadCollectEpoch() {
+    return threadCollectEpoch;
+}
+
+void ResetCollectEpoch() {
+    threadCollectEpoch = 0;
+}
+
 namespace {
 
 void unwatchLocked(const WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {

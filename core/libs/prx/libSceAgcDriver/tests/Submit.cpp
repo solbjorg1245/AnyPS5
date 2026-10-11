@@ -545,6 +545,7 @@ void testRecordPipe() {
     using Ring = RecordPipeRing;
     check(Ring::Slot(1) == 1 && Ring::Slot(32) == 0 && Ring::Slot(33) == 1 && Ring::Empty(5, 5) && !Ring::Full(36, 5) && Ring::Full(37, 5) && Ring::Pending(37, 5) == 32, "record pipe: slots, empty and full");
     check(RecordPipeOccupancyBuckets == 5 && RecordPipeOccupancyBucket(0) == 0 && RecordPipeOccupancyBucket(1) == 0 && RecordPipeOccupancyBucket(2) == 1 && RecordPipeOccupancyBucket(4) == 1 && RecordPipeOccupancyBucket(5) == 2 && RecordPipeOccupancyBucket(16) == 2 && RecordPipeOccupancyBucket(17) == 3 && RecordPipeOccupancyBucket(31) == 3 && RecordPipeOccupancyBucket(Ring::Pending(37, 5)) == 4 && RecordPipeOccupancyBucket(Ring::Depth + 1) == 4, "record pipe: ring occupancy buckets at hand-over");
+    check(RecordPipeEpochFor(0, 0) == RecordPipeEpochStep::Unordered && RecordPipeEpochFor(0, 7) == RecordPipeEpochStep::Unordered && RecordPipeEpochFor(7, 0) == RecordPipeEpochStep::Bump && RecordPipeEpochFor(7, 7) == RecordPipeEpochStep::Keep && RecordPipeEpochFor(9, 7) == RecordPipeEpochStep::Bump, "record pipe: B's collect epoch follows the items' hand-over epochs");
     Ring ring;
     const std::uint64_t start = 0x100000000ull - 24;
     ring.handed = start;
@@ -1143,6 +1144,49 @@ void testFastPipelineMemo() {
     for (int i = 1; i < 9; ++i) check(ring.Find(keys[i], KeyHash(keys[i]), 0, nullptr) == values[i], "fast pipeline memo: a recent key was lost");
 }
 
+// Draw's pipeline lookup with APS5_DRAW_MEMOS=1 (CachedPipelineMemoized, s4-plan S4.2): its key is
+// CachedPipeline's (pipelineKeyInto with the set layout key and push layout 0, which FastPipelineKey
+// builds for push layout 0), so one built into the thread's used buffer equals a fresh one; the
+// attachment layout (Draw's lean GENERAL) is part of it; it differs from a fast draw's key of the
+// same configuration (push layout 3), so a memo noted under one never answers the other, nor after
+// the store removed an entry.
+void testDrawPipelineKey() {
+    using namespace AgcDriver::Graphics;
+    Context context{};
+    context.device = reinterpret_cast<VkDevice>(std::uintptr_t{0x1000});
+    State state{};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.cullMode = VK_CULL_MODE_NONE;
+    state.blends.resize(1);
+    VertexInputLayout input;
+    input.bindings.push_back({0, 16, VK_VERTEX_INPUT_RATE_VERTEX});
+    input.attributes.push_back({0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0});
+    ShaderRecompiler::RecompileResult vertex;
+    ShaderRecompiler::RecompileResult fragment;
+    vertex.variantId = 5;
+    fragment.variantId = 6;
+    const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    const std::array<std::uint32_t, 4> layoutKey{0, 7, 1, 1};
+    std::vector<std::byte> fresh;
+    FastPipelineKey(context, state, input, 0, layoutKey, shaders, VK_IMAGE_LAYOUT_GENERAL, fresh);
+    check(!fresh.empty(), "draw pipeline key: the key is empty");
+    std::vector<std::byte> reused(700, std::byte{0x5a});
+    FastPipelineKey(context, state, input, 0, layoutKey, shaders, VK_IMAGE_LAYOUT_GENERAL, reused);
+    check(reused == fresh, "draw pipeline key: a key built into a used buffer differs from a fresh one");
+    FastPipelineKey(context, state, input, 0, layoutKey, shaders, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, reused);
+    check(reused != fresh, "draw pipeline key: the attachment layout is not in the key");
+    std::vector<std::byte> fast;
+    FastPipelineKey(context, state, input, 3, layoutKey, shaders, VK_IMAGE_LAYOUT_GENERAL, fast);
+    check(fast != fresh, "draw pipeline key: equal to the fast draw's key of the same configuration");
+    auto pool = std::make_shared<int>(1);
+    auto pipeline = std::make_shared<int>(7);
+    KeyedMemo<int, 8> memo;
+    memo.Note(fresh, KeyHash(fresh), 2, pool.get(), pool, pipeline);
+    check(memo.Find(fresh, KeyHash(fresh), 2, pool.get()) == pipeline, "draw pipeline memo: the noted key missed");
+    check(memo.Find(fast, KeyHash(fast), 2, pool.get()) == nullptr, "draw pipeline memo: the fast draw's key was answered by the draw's pipeline");
+    check(memo.Find(fresh, KeyHash(fresh), 3, pool.get()) == nullptr, "draw pipeline memo: an entry answered after the store removed one");
+}
+
 // Native aspect's UI rect (AspectFit): the part of the 16:9 display buffer that is shown undistorted
 // at the window's aspect, and a viewport or scissor carried into it.
 void testUndistortedRect() {
@@ -1209,6 +1253,7 @@ int main() {
         testNewestWriterMemo();
         testHostImportMemo();
         testFastPipelineMemo();
+        testDrawPipelineKey();
         testUndistortedRect();
         LibcRunShutdown_nid_postfix();
         std::puts("AGC driver submit tests passed");

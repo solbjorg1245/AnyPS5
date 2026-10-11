@@ -126,12 +126,18 @@ HostImportMemo& ThreadHostImportMemo();
 // fast draw (its bindings through HostImportResolver, its in-place inputs and indirect records
 // through CopyDrawInput's and indirectPathFor's flags) and the fast dispatch's records (and its
 // elements with APS5_FAST_DISPATCH_PER_ELEMENT=1; batched, they take HostImportsFor) use it; Draw
-// keeps HostImportFor. APS5_NO_IMPORT_MEMO=1 calls HostImportFor.
+// keeps HostImportFor unless APS5_DRAW_MEMOS=1 (DrawMemos). APS5_NO_IMPORT_MEMO=1 calls HostImportFor.
 // A hit reads the registry generation and the published epoch without the registry mutex, so a
 // caller must be serialized with every reconcile and retire (GuestMemory::GpuMutex, held by every
 // caller), as any user of a HostImportFor pointer already must be: an epoch bump that follows an
 // erase on another thread would not stop a hit on the erased import.
 const HostImport* HostImportMemoized(const Context& context, std::uint64_t address, std::size_t bytes);
+// APS5_DRAW_MEMOS=1 (docs/design/parallel-recording-s4-plan.md S4.2, default off): Draw takes the
+// fast draw's per-thread memos: its in-place inputs and indirect records, and PrepareDrawBindings'
+// moved in-place elements, through HostImportMemoized; its pipeline through CachedPipelineMemoized.
+// Draw and DrawWithRecipe run under GuestMemory::GpuMutex (A's lockForDraw, B's hold in
+// runRecordPipe), as HostImportMemoized requires.
+bool DrawMemos();
 
 // Whether an existing import covers [address, address + bytes), without reconciling the imports
 // with the registry or making one (HostImportFor may take a registry lease): a hint for choices

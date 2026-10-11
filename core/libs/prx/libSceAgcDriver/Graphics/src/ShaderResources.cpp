@@ -4241,6 +4241,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     ScratchLease<InPlaceReadsScratch> scratch;
     const auto reads = guestMemory.InPlaceReads(scratch->reads);
     const bool inPlace = InPlaceBindings();
+    // APS5_DRAW_MEMOS=1 (s4-plan S4.2): moved elements find their imports through the thread's memo;
+    // recordDraw (Draw, DrawWithRecipe) runs under GuestMemory::GpuMutex, as HostImportMemoized requires.
+    const bool memoizedImports = DrawMemos();
     // Made once the first element is selected: most draws select none and return nothing.
     std::shared_ptr<DrawBindings> result;
     std::vector<std::size_t> selected;
@@ -4284,7 +4287,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(size) + item.adjustment;
         if (inPlace) {
-            const auto* import = HostImportFor(context, begin, bytes);
+            const auto* import = memoizedImports ? HostImportMemoized(context, begin, bytes) : HostImportFor(context, begin, bytes);
             if (import != nullptr && (begin - import->base) % context.limits.minStorageBufferOffsetAlignment == 0) {
                 select(index, {import->buffer, begin - import->base, bytes});
                 result->inPlaceReads.emplace_back(begin, begin + bytes);

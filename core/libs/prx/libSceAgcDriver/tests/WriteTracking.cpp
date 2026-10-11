@@ -429,6 +429,29 @@ void CheckFreedStores() {
     runs = {{base + 8 * page, base + 12 * page}};
     Require(DropFreedRuns(FreedStoreKind::CopyBack, shrunk, runs) == 2 * page && runs == Runs{{base + 10 * page, base + 12 * page}}, "the removed allocation's pages were stored");
 }
+
+// The calling thread's collect epoch (ThreadCollectEpoch, ResetCollectEpoch; with
+// APS5_RECORD_PIPE_EPOCH=1 the recording thread follows A's): without one every collect walks (each
+// walk moves the generation); within one a repeated collect is the memo's (no walk); a bump walks again.
+void CheckThreadEpoch() {
+    void* memory = AllocateWatched(Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, Block);
+    ResetCollectEpoch();
+    Require(ThreadCollectEpoch() == 0, "a reset thread kept its collect epoch");
+    const auto first = CollectWrites(base, Block);
+    Require(first != 0 && CollectWrites(base, Block) != first, "a thread without a collect epoch reused a walk");
+    BumpCollectEpoch();
+    const auto epoch = ThreadCollectEpoch();
+    Require(epoch != 0, "a bumped thread has no collect epoch");
+    const auto walked = CollectWrites(base, Block);
+    Require(CollectWrites(base, Block) == walked && ThreadCollectEpoch() == epoch, "a collect inside one epoch walked again");
+    BumpCollectEpoch();
+    Require(ThreadCollectEpoch() != epoch && CollectWrites(base, Block) != walked, "a bumped epoch reused the previous epoch's walk");
+    ResetCollectEpoch();
+    const auto again = CollectWrites(base, Block);
+    Require(ThreadCollectEpoch() == 0 && CollectWrites(base, Block) != again, "a reset thread reused a walk");
+}
 }
 
 int main() {
@@ -453,6 +476,7 @@ int main() {
         CheckEqualsSince();
         CheckCpuStoredRuns();
         CheckKeepCpuStores();
+        CheckThreadEpoch();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;

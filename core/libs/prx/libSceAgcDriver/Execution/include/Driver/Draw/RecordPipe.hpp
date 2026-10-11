@@ -30,6 +30,22 @@ bool RecordPipeActive();
 // and APS5_ASPECT_PROBE (their state is A's).
 bool RecordPipeDispatchActive();
 
+// APS5_RECORD_PIPE_EPOCH=1 (read once, only with the pipe on; default off; parallel-recording-s4-plan.md
+// S4.1): B's collect epoch follows A's. A stamps each item with its thread's epoch at hand-over
+// (GuestMemory::ThreadCollectEpoch); B bumps its own before an item whose stamp differs from the
+// previous item's, so B reuses a walk (the collect memo) only among the items A handed over in one
+// epoch: the reuse A had while it recorded them itself. Without it B never bumps (a fresh epoch per
+// collect: no walk is reused).
+bool RecordPipeEpochActive();
+
+// B's collect epoch before an item stamped `stamp`, after one stamped `last` (0: none yet): kept (the
+// same epoch), bumped (A passed an ordering point between the two), or reset to a fresh epoch per
+// collect (A had none, so nothing ordered the CPU's writes for the item).
+enum class RecordPipeEpochStep : std::uint8_t { Keep, Bump, Unordered };
+constexpr RecordPipeEpochStep RecordPipeEpochFor(std::uint64_t stamp, std::uint64_t last) {
+    return stamp == 0 ? RecordPipeEpochStep::Unordered : stamp == last ? RecordPipeEpochStep::Keep : RecordPipeEpochStep::Bump;
+}
+
 // Item serials count from 1 (0: none). `handed` is the last serial A published, `consumed` the last
 // B recorded; 64-bit, so they never wrap. Serial s lives in slot s % Depth: A may fill the next slot
 // only while fewer than Depth items are unrecorded (else B still owns it).
