@@ -85,6 +85,10 @@ The HUD, menus and movies stay 16:9 in a centred region; beside them the 3D show
 a movie). `APS5_NO_NATIVE_ASPECT_UI_RECT=1` stretches the UI across the window with the 3D instead,
 and `APS5_NATIVE_ASPECT_UI_EDGE_STRETCH=1` extends the UI's outermost columns over the side margins
 (menu dims reach the window's edges, but movies smear into streaks there).
+The UI is drawn on the title's 2160p display buffer at every `Resolution` (a smaller window, e.g.
+1280x800, renders its own size inside the WantsHigh tier): the title's 1080p tiers draw the HUD's item
+diamonds and the equipment menu's slot frames too large. `APS5_NO_NATIVE_ASPECT_4K_UI=1` brings back the
+smallest tier.
 Two environment-only switches go further and are experimental: `APS5_NATIVE_ASPECT_RENDER=1` sizes
 the shared render targets at `Resolution` itself (the post effects break: bloom blobs and ghosting),
 and `APS5_NATIVE_ASPECT_UI=1` gives the display buffer the window's shape (the bottom HUD is cut off
