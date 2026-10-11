@@ -4519,6 +4519,76 @@ void awareCommandTests(const Device& device, Recorder& recorder) {
         const unsigned char want = at < 512 ? 0xa5 : fromFirst ? firstByte(at) : fromSecond ? secondByte(at) : 0;
         if (landed[at] != want) throw std::runtime_error("an aware command test copy stored the wrong byte at offset " + std::to_string(at) + ": " + std::to_string(landed[at]) + ", expected " + std::to_string(want));
     }
+    // The dispatch path's barrier merges (Recorder::MergeDispatchBarriers) read the coverage when a
+    // command takes the command buffer. What an aware command records between two dispatches (a
+    // kept copy-back over its ranges, a resident land, recorded at once or by the S11 demotion) ends
+    // with its own trailing barrier and leaves that barrier's coverage, never the earlier
+    // dispatch's; a copy it keeps records nothing, so the dispatch's coverage stays (and the batch
+    // opening's hand-back keeps it); a dispatch's deferred trailing barrier is recorded before the
+    // coverage is read, kept copies or not. The copies land byte-exact at Submit.
+    {
+        const auto merging = madeWith("1", "1");
+        merging->Activate();
+        const auto copyTo = [&](const std::shared_ptr<Buffer>& source, std::uint64_t from, std::uint64_t at, std::uint64_t count) {
+            return std::vector<Recorder::DeferredCopy>{Recorder::DeferredCopy{source, source.get(), source->Handle(), import->buffer, from, address + at - import->base, count, address + at}};
+        };
+        // A copy pass's coverage: what a dispatch's trailing barrier covers, and the indirect
+        // argument reads (which a dispatch's does not).
+        const auto copyPassCoverage = [](VkAccessFlags covered) { return (covered & VK_ACCESS_INDIRECT_COMMAND_READ_BIT) != 0 && LeadingBarrierCovered(covered, StagingCopyAccess) && LeadingBarrierCovered(covered, DispatchLeadingBarrier.destinationAccess); };
+        const auto dispatchTrail = [&](VkCommandBuffer commands) {
+            RecordMemoryBarrier(context, commands, DispatchTrailingBarrier.sourceStages, DispatchTrailingBarrier.destinationStages, DispatchTrailingBarrier.sourceAccess, DispatchTrailingBarrier.destinationAccess);
+            merging->MarkCovered(DispatchTrailingBarrier.destinationAccess);
+        };
+        VkAccessFlags covered = 0;
+        // Dispatch 1 queues its copy-back; dispatch 2 touches other bytes: the copy stays queued,
+        // nothing is recorded between, and dispatch 1's trailing barrier covers dispatch 2's lead.
+        dispatchTrail(merging->Commands(nullptr, Site::Dispatch));
+        merging->DeferCopies(copyTo(first, 0, 16384, 1024));
+        auto commands = merging->CommandsTouching(within(20480, 20544), Site::Dispatch, &covered);
+        Require(merging->DeferredCopyBytes() == 1024 && covered == DispatchTrailingBarrier.destinationAccess, "an aware command that kept a copy-back lost the dispatch's coverage");
+        Require(LeadingBarrierCovered(covered, DispatchLeadingBarrier.destinationAccess), "a dispatch after a kept copy-back kept its leading barrier");
+        dispatchTrail(commands);
+        // A batch opening that records nothing gives the coverage back with the copy still queued.
+        static_cast<void>(merging->CommandsKeepingCopyBacks(&covered));
+        merging->MarkCovered(covered);
+        Require(merging->DeferredCopyBytes() == 1024 && covered == DispatchTrailingBarrier.destinationAccess, "the batch opening did not keep the coverage over a kept copy-back");
+        // Dispatch 2's copy-back pass over the kept copy's bytes: the kept copy lands first with its
+        // own barrier pair, whose trailing barrier is then the coverage.
+        static_cast<void>(merging->CommandsTouching(within(16384, 16896), Site::CopyBack, &covered));
+        Require(!merging->HasDeferredCopies() && copyPassCoverage(covered), "a kept copy-back recorded between two dispatches left the dispatch's coverage");
+        // A resident land recorded at once (queueResidentLands outside deferral) between two dispatches.
+        dispatchTrail(merging->Commands(nullptr, Site::Dispatch));
+        auto land = copyTo(second, 0, 24576, 512);
+        land[0].land = true;
+        merging->RecordCopyBacksNow(std::move(land));
+        static_cast<void>(merging->Commands(&covered, Site::Dispatch));
+        Require(copyPassCoverage(covered), "a land recorded between two dispatches left the earlier dispatch's coverage");
+        // A queued land the S11 demotion records (FlushResidentLand) between two dispatches.
+        dispatchTrail(merging->Commands(nullptr, Site::Dispatch));
+        land = copyTo(second, 1024, 25600, 256);
+        land[0].land = true;
+        merging->DeferCopies(std::move(land));
+        Require(merging->ResidentLandQueued(second.get()), "the land was not queued");
+        merging->FlushResidentLand(second.get(), true);
+        static_cast<void>(merging->CommandsTouchingNothing(Site::Dispatch, &covered));
+        Require(!merging->HasDeferredCopies() && copyPassCoverage(covered), "a land the demotion recorded between two dispatches left the earlier dispatch's coverage");
+        // A deferred dispatch trail (APS5_DISPATCH_OVERLAP) with a copy-back queued after it: an aware
+        // command that keeps the copy records the trail before it reads the coverage.
+        const auto trailsBefore = Recorder::DispatchTrailCounts();
+        static_cast<void>(merging->Commands(nullptr, Site::Dispatch));
+        merging->DeferDispatchTrail(Recorder::GuestOrderKey{1, 1}, DispatchTrailingBarrier.destinationAccess);
+        merging->DeferCopies(copyTo(first, 2048, 28672, 256));
+        static_cast<void>(merging->CommandsTouching(within(32768, 32832), Site::Dispatch, &covered));
+        const auto trails = Recorder::DispatchTrailCounts();
+        Require(trails.command == trailsBefore.command + 1 && merging->DeferredCopyBytes() == 256 && covered == DispatchTrailingBarrier.destinationAccess, "an aware command that kept a copy-back did not record the deferred dispatch trail first");
+        merging->Submit();
+        Require(!merging->HasDeferredCopies(), "Submit left the queued copy-back");
+        merging->Sync();
+        for (std::size_t at = 16384; at < 32768; ++at) {
+            const unsigned char want = at < 17408 ? firstByte(at - 16384) : at >= 24576 && at < 25088 ? secondByte(at - 24576) : at >= 25600 && at < 25856 ? secondByte(at - 24576) : at >= 28672 && at < 28928 ? firstByte(at - 26624) : 0;
+            if (landed[at] != want) throw std::runtime_error("a copy recorded between two dispatches stored the wrong byte at offset " + std::to_string(at) + ": " + std::to_string(landed[at]) + ", expected " + std::to_string(want));
+        }
+    }
     recorder.Activate();
     {
         GuestAllocations::Mutation mutation;
