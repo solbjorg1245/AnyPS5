@@ -38,6 +38,8 @@
 //                             experimental): shared render targets / display buffer at the output's shape
 //                             APS5_NO_NATIVE_ASPECT_UI_RECT=1 (environment only): the 16:9 UI stretched
 //                             with the 3D instead of kept in a centred 16:9 region
+//                             APS5_NO_NATIVE_ASPECT_4K_UI=1 (environment only): the smallest slot again,
+//                             a 1080p UI below 1440p (its HUD item cluster and menu slots drawn too large)
 //   Upscaler = off            APS5_UPSCALER         reserved: fsr, dlss (UpscalerQuality and FrameGeneration: file only, reserved)
 // The title takes one fixed physics step of 1/refresh per rendered frame (59.94 Hz in its 60 FPS mode,
 // 29.97 Hz in its 30 FPS mode), so any other limit, and any frame rate below the limit, changes the game
@@ -65,6 +67,8 @@ struct Settings {
     bool nativeAspect = false;
     bool nativeAspectRender = false;
     bool nativeAspectUi = false;
+    // Native aspect keeps the UI on a 3840x2160 display buffer (PlanNativeAspect); APS5_NO_NATIVE_ASPECT_4K_UI.
+    bool nativeAspect4kUi = true;
     Upscaler upscaler = Upscaler::Off;
     std::string upscalerQuality;
     bool frameGeneration = false;
@@ -316,6 +320,10 @@ inline void ApplyEnvironment(Settings& settings, const std::function<const char*
         const char* value = lookup(variable);
         if (value != nullptr && value[0] != '\0') settings.*field = std::string_view(value) != "0";
     }
+    // Native aspect's 4K UI (s61): APS5_NATIVE_ASPECT_4K_UI=0 or APS5_NO_NATIVE_ASPECT_4K_UI=1 (any value
+    // but 0) brings back the smallest slot that holds the render size (WantsPerf at 1280x800).
+    if (const char* value = lookup("APS5_NATIVE_ASPECT_4K_UI"); value != nullptr && value[0] != '\0') settings.nativeAspect4kUi = std::string_view(value) != "0";
+    if (const char* value = lookup("APS5_NO_NATIVE_ASPECT_4K_UI"); value != nullptr && value[0] != '\0' && std::string_view(value) != "0") settings.nativeAspect4kUi = false;
 }
 
 // A limit other than the title's 30 or 60 without the variable timestep would change the game speed
@@ -368,6 +376,13 @@ inline const RenderTier* SelectRenderTier(const Settings& settings) {
 // presenter shows it at Resolution's aspect. The slot is the first whose own render size holds the
 // planned one (the title also sizes shared targets from the slot's 16:9 render size) and whose display
 // buffer is at least the output in both directions (else the first that holds the render size).
+// With Settings::nativeAspect4kUi (the default) only slots with a 3840x2160 display buffer count
+// (WantsHigh, WantsSuperHigh): the 1080p-display slots (WantsPerf, WantsBase) lay the UI out wrong,
+// with or without native aspect (s58-s61: every r_Wants4K=WantsPerf run, t475 t550 t551 t565 t567
+// t588, draws the HUD item cluster with a second, larger set of diamond frames and the equipment
+// menu's slot frames about twice their size; every 2160p-display run, t549 t585 t587, is right).
+// The render size is the plan's either way: the slot's table entry is rewritten to it.
+inline constexpr std::uint32_t NativeAspectUiDisplayHeight = 2160;
 struct NativeAspectSlot {
     std::uint32_t renderWidth;
     std::uint32_t renderHeight;
@@ -460,7 +475,10 @@ inline NativeAspectPlan PlanNativeAspect(const Settings& settings) {
     plan.renderHeight = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::lround(height / 4.0)) * 4, 180, 2160);
     plan.aspectWidth = settings.width;
     plan.aspectHeight = settings.height;
-    const auto holds = [&](const NativeAspectSlot& slot) { return plan.renderWidth <= slot.renderWidth && plan.renderHeight <= slot.renderHeight; };
+    const auto holds = [&](const NativeAspectSlot& slot) {
+        return plan.renderWidth <= slot.renderWidth && plan.renderHeight <= slot.renderHeight
+            && (!settings.nativeAspect4kUi || slot.displayHeight >= NativeAspectUiDisplayHeight);
+    };
     for (const auto& slot : NativeAspectSlots) {
         if (holds(slot) && settings.width <= slot.displayWidth && settings.height <= slot.displayHeight) {
             plan.slot = &slot;

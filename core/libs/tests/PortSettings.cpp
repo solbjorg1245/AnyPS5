@@ -240,8 +240,10 @@ static void TestNativeAspect() {
     Require(!planFor("Resolution = 2560x1080").Active(), "off by default");
     Require(PortSettings::GameArgs(FromText("Resolution = 2560x1080"))[0] == "+r_Wants4K=WantsBase", "off: stage 1 tier");
     Require(is(native("2560x1080"), 2560, 1080, "WantsHigh"), "21:9 1080p renders 2560x1080 in the 4K-display slot");
-    Require(is(native("1280x800"), 1280, 800, "WantsPerf"), "Steam Deck renders 1280x800 in the 1080p-display slot");
-    Require(is(native("1920x1080"), 1920, 1080, "WantsBase"), "16:9 1080p is the WantsBase tier unchanged");
+    Require(is(native("1280x800"), 1280, 800, "WantsHigh"), "Steam Deck renders 1280x800 in the 4K-display slot (4K UI)");
+    Require(is(native("1920x1080"), 1920, 1080, "WantsHigh"), "16:9 1080p renders 1080p in the 4K-display slot (4K UI)");
+    Require(is(native("1024x768"), 1024, 768, "WantsHigh"), "4:3 in the 4K-display slot");
+    Require(native("1280x800").slot->displayHeight == 2160 && native("1920x1200").slot->displayHeight == 2160, "UI on a 2160p display buffer");
     Require(is(native("3840x2160"), 2560, 1440, "WantsHigh"), "4K renders 1440p as before");
     Require(is(native("1920x1200"), 1920, 1200, "WantsHigh"), "16:10 1200p");
     Require(is(native("3440x1440"), 3440, 1440, "WantsSuperHigh"), "21:9 1440p needs the 3840-wide slot");
@@ -259,6 +261,20 @@ static void TestNativeAspect() {
     PortSettings::Normalize(environment);
     Require(environment.nativeAspect && environment.Any(), "APS5_NATIVE_ASPECT");
 
+    // APS5_NO_NATIVE_ASPECT_4K_UI=1 / APS5_NATIVE_ASPECT_4K_UI=0: the smallest slot holding the render size (s60).
+    const auto smallUi = [](const char* resolution, const char* variable, const char* value) {
+        auto settings = PortSettings::Parse(std::string("NativeAspect = on\nResolution = ") + resolution + "\n", "test.ini");
+        PortSettings::ApplyEnvironment(settings, [&](const char* name) -> const char* { return std::string(name) == variable ? value : nullptr; });
+        PortSettings::Normalize(settings);
+        return PortSettings::PlanNativeAspect(settings);
+    };
+    Require(is(smallUi("1280x800", "APS5_NO_NATIVE_ASPECT_4K_UI", "1"), 1280, 800, "WantsPerf"), "APS5_NO_NATIVE_ASPECT_4K_UI=1: Steam Deck in the 1080p-display slot");
+    Require(is(smallUi("1920x1080", "APS5_NATIVE_ASPECT_4K_UI", "0"), 1920, 1080, "WantsBase"), "APS5_NATIVE_ASPECT_4K_UI=0: 16:9 1080p is the WantsBase tier");
+    Require(is(smallUi("1280x800", "APS5_NO_NATIVE_ASPECT_4K_UI", "0"), 1280, 800, "WantsHigh"), "APS5_NO_NATIVE_ASPECT_4K_UI=0 keeps the 4K UI");
+    Require(is(smallUi("2560x1080", "APS5_NO_NATIVE_ASPECT_4K_UI", "1"), 2560, 1080, "WantsHigh"), "21:9 1080p is WantsHigh either way");
+    Require(is(smallUi("3440x1440", "APS5_NO_NATIVE_ASPECT_4K_UI", "1"), 3440, 1440, "WantsSuperHigh"), "3440x1440 is WantsSuperHigh either way");
+    Require(PortSettings::GameArgs(FromText("NativeAspect = on\nResolution = 1280x800"))[0] == "+r_Wants4K=WantsHigh", "4K UI slot forced");
+
     // The table rewrite touches only the slot's render width and height.
     auto table = PortSettings::TierTable;
     for (const auto& write : PortSettings::TierTableWrites(native("2560x1080"))) table[write.entry] = write.value;
@@ -267,7 +283,9 @@ static void TestNativeAspect() {
         if (entry != 2 && entry != 7) Require(table[entry] == PortSettings::TierTable[entry], "other entries untouched");
     }
     const auto deck = PortSettings::TierTableWrites(native("1280x800"));
-    Require(deck[0].entry == 0 && deck[0].value == 1280 && deck[1].entry == 5 && deck[1].value == 800, "WantsPerf render entries");
+    Require(deck[0].entry == 2 && deck[0].value == 1280 && deck[1].entry == 7 && deck[1].value == 800, "WantsHigh render entries at 16:10");
+    const auto smallDeck = PortSettings::TierTableWrites(smallUi("1280x800", "APS5_NO_NATIVE_ASPECT_4K_UI", "1"));
+    Require(smallDeck[0].entry == 0 && smallDeck[0].value == 1280 && smallDeck[1].entry == 5 && smallDeck[1].value == 800, "WantsPerf render entries");
     Require(PortSettings::AspectBits(16.0f / 9.0f) == PortSettings::Aspect16x9Bits, "16:9 bits");
 
     // The aspect field follows the display mode, and is left alone when it holds anything else.
@@ -282,12 +300,14 @@ static void TestNativeAspect() {
 
     // Part 2 (experimental halves, off by default): the shared targets at the render size, the display
     // buffer at the output's shape inside the slot's display size; nothing where the slot's own size
-    // already is that, or SetMode never runs.
-    const auto halves = [](const char* resolution, bool render, bool ui) {
+    // already is that, or SetMode never runs. Checked with the s60 slot choice (APS5_NO_NATIVE_ASPECT_4K_UI=1);
+    // `fourK` the default 4K-UI slot.
+    const auto halves = [](const char* resolution, bool render, bool ui, bool fourK = false) {
         auto settings = PortSettings::Parse(std::string("NativeAspect = on\nResolution = ") + resolution + "\n", "test.ini");
         PortSettings::ApplyEnvironment(settings, [&](const char* name) -> const char* {
             if (std::string(name) == "APS5_NATIVE_ASPECT_RENDER") return render ? "1" : "0";
             if (std::string(name) == "APS5_NATIVE_ASPECT_UI") return ui ? "1" : nullptr;
+            if (std::string(name) == "APS5_NO_NATIVE_ASPECT_4K_UI") return fourK ? nullptr : "1";
             return nullptr;
         });
         PortSettings::Normalize(settings);
@@ -306,6 +326,11 @@ static void TestNativeAspect() {
     Require(targets("5120x1440", 3840, 1080, 3840, 1080), "32:9: 3840x1080 for both");
     Require(targets("3840x2160", 0, 0, 0, 0), "16:9 4K: the slot's own sizes");
     Require(targets("1920x1080", 0, 0, 0, 0), "WantsBase: Init's sizes kept");
+    const auto deck4k = halves("1280x800", true, true, true);
+    Require(std::string(deck4k.slot->convar) == "WantsHigh" && deck4k.sharedWidth == 1280 && deck4k.sharedHeight == 800 && deck4k.displayWidth == 3456
+        && deck4k.displayHeight == 2160, "4K UI: 16:10 in WantsHigh, display 3456x2160");
+    const auto base4k = halves("1920x1080", true, true, true);
+    Require(std::string(base4k.slot->convar) == "WantsHigh" && base4k.sharedWidth == 1920 && base4k.sharedHeight == 1080 && !base4k.DisplayNative(), "4K UI: 16:9 1080p keeps the 16:9 display");
     for (const char* resolution : {"2560x1080", "1280x800", "1920x1200", "3440x1440", "5120x1440", "1024x768", "800x1280", "7680x2160"}) {
         const auto result = halves(resolution, true, true);
         Require(result.Active() && result.sharedWidth <= 3840 && result.sharedHeight <= 2160 && result.displayWidth <= 3840 && result.displayHeight <= 2160
