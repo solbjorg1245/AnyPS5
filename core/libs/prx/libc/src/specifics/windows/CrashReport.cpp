@@ -1,5 +1,6 @@
 #ifdef _WIN32
 #include <windows.h>
+#include "prx/libc/include/CrashMemory.hpp"
 #include "prx/libc/include/CrashResources.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include <atomic>
@@ -324,6 +325,123 @@ void ReportCxxException(EXCEPTION_POINTERS* info, const char* what) {
     std::fflush(stderr);
 }
 
+// APS5_CRASH_ZERO_EXTENT (on; APS5_NO_CRASH_ZERO_EXTENT=1 turns it off): a FATAL read of null plus
+// an offset, or a fault inside the guest arena, mostly follows a pointer loaded from a guest object
+// that reads back zeros (t525, t571). For each register into the arena the report gives the run of
+// zeros around it, the page's VirtualQuery and the mappings' state of it, then the arena's page
+// replacements near those registers (APS5_MAP_RING, WindowsMappings): a page-aligned run that a
+// reset or map covers is a page replacement, an object-sized one a freed and zero-filled block.
+bool g_crashZeroExtent = true;
+
+// Reads guest words for the zero-run probe without faulting: one 512-byte chunk at a time (inside one
+// page) through ReadProcessMemory, after VirtualQuery says it is readable, so a page another thread
+// releases meanwhile fails the read instead of faulting inside the report.
+struct ChunkReader {
+    std::uint64_t chunk = ~std::uint64_t{0};
+    bool readable = false;
+    std::uint64_t words[64];
+
+    bool operator()(std::uint64_t address, std::uint64_t* word) {
+        const auto base = address & ~static_cast<std::uint64_t>(sizeof(words) - 1);
+        if (base != chunk) {
+            chunk = base;
+            SIZE_T copied = 0;
+            readable = IsReadable(base) && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(base), words, sizeof(words), &copied) && copied == sizeof(words);
+        }
+        if (!readable) return false;
+        *word = words[(address - base) / sizeof(std::uint64_t)];
+        return true;
+    }
+};
+
+const char* MemoryStateName(DWORD state) {
+    return state == MEM_COMMIT ? "commit" : state == MEM_RESERVE ? "reserve" : state == MEM_FREE ? "free" : "?";
+}
+
+const char* MemoryTypeName(DWORD type) {
+    return type == MEM_PRIVATE ? "private" : type == MEM_MAPPED ? "mapped" : type == MEM_IMAGE ? "image" : type == 0 ? "-" : "?";
+}
+
+// The ring's records within 64 MiB of the guest registers (all of them while few), newest last.
+void ReportMapRing(const std::uint64_t* addresses, std::size_t count) {
+    constexpr std::uint64_t Window = 64ull << 20;
+    constexpr std::uint64_t AllBelow = 32;
+    constexpr std::size_t MostPrinted = 48;
+    const auto& ring = CrashMemory::MapHistory();
+    const auto recorded = ring.Recorded();
+    if (recorded == 0) {
+        Report("  page replacements: none recorded (APS5_NO_MAP_RING=1, or none since the start)\n");
+        return;
+    }
+    const auto first = recorded > ring.Size() ? recorded - ring.Size() : 0;
+    const bool all = recorded - first <= AllBelow;
+    const auto wanted = [&](const CrashMemory::MapEntry& entry) {
+        if (all) return true;
+        // No register into the arena: the newest records.
+        if (count == 0) return entry.index + 16 >= recorded;
+        for (std::size_t i = 0; i < count; ++i) {
+            if (CrashMemory::MapEntryNear(entry, addresses[i], Window)) return true;
+        }
+        return false;
+    };
+    std::size_t matches = 0;
+    auto from = recorded;
+    CrashMemory::MapEntry entry;
+    for (auto index = recorded; index > first && matches < MostPrinted;) {
+        --index;
+        if (!ring.Read(index, &entry) || !wanted(entry)) continue;
+        ++matches;
+        from = index;
+    }
+    Report("  page replacements (APS5_MAP_RING, %llu recorded, last %llu kept): %zu %s\n", static_cast<unsigned long long>(recorded), static_cast<unsigned long long>(recorded - first), matches, all ? "(all)" : count == 0 ? "newest" : "within 64 MiB of the guest registers");
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    char callers[CrashMemory::MapCallers][MAX_PATH + 64];
+    for (auto index = from; index < recorded; ++index) {
+        if (!ring.Read(index, &entry) || !wanted(entry)) continue;
+        for (std::size_t caller = 0; caller < CrashMemory::MapCallers; ++caller) {
+            if (entry.callers[caller] == 0) callers[caller][0] = '\0';
+            else DescribeAddress(entry.callers[caller], callers[caller], sizeof(callers[caller]));
+        }
+        const auto age = now - entry.time;
+        Report("  [map] #%llu %s 0x%llx-0x%llx (0x%llx) %lld.%03lld ms ago thread %u from %s %s %s %s\n", static_cast<unsigned long long>(entry.index), CrashMemory::MapKindName(entry.kind), static_cast<unsigned long long>(entry.begin), static_cast<unsigned long long>(entry.begin + entry.bytes), static_cast<unsigned long long>(entry.bytes), static_cast<long long>(age / 1000000), static_cast<long long>((age / 1000) % 1000), entry.thread, callers[0], callers[1], callers[2], callers[3]);
+    }
+}
+
+void ReportZeroExtents(const CONTEXT& context, std::uint64_t faultAddress) {
+    constexpr std::uint64_t Cap = 64 * 1024;
+    const std::pair<const char*, std::uint64_t> registers[] = {{"fault", faultAddress}, {"rax", context.Rax}, {"rbx", context.Rbx}, {"rcx", context.Rcx}, {"rdx", context.Rdx}, {"rsi", context.Rsi}, {"rdi", context.Rdi}, {"rbp", context.Rbp}, {"r8", context.R8}, {"r9", context.R9}, {"r10", context.R10}, {"r11", context.R11}, {"r12", context.R12}, {"r13", context.R13}, {"r14", context.R14}, {"r15", context.R15}};
+    std::uint64_t guest[sizeof(registers) / sizeof(registers[0])];
+    std::size_t guestCount = 0;
+    Report("  zero extents (APS5_NO_CRASH_ZERO_EXTENT=1 turns these off):\n");
+    for (const auto& [name, value] : registers) {
+        if (!GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(value), sizeof(std::uint64_t))) continue;
+        bool repeated = false;
+        for (std::size_t i = 0; i < guestCount; ++i) repeated = repeated || guest[i] == value;
+        if (repeated) {
+            Report("  [zero] %s 0x%llx: as above\n", name, static_cast<unsigned long long>(value));
+            continue;
+        }
+        guest[guestCount++] = value;
+        ChunkReader reader;
+        const auto run = CrashMemory::MeasureZeroRun(value, Cap, reader);
+        if (!run.readable) {
+            Report("  [zero] %s 0x%llx: unreadable\n", name, static_cast<unsigned long long>(value));
+        } else if (!run.zero) {
+            Report("  [zero] %s 0x%llx: word non-zero\n", name, static_cast<unsigned long long>(value));
+        } else {
+            Report("  [zero] %s 0x%llx: zeros 0x%llx-0x%llx (-0x%llx +0x%llx), before %s 0x%016llx, after %s 0x%016llx\n", name, static_cast<unsigned long long>(value), static_cast<unsigned long long>(run.begin), static_cast<unsigned long long>(run.end), static_cast<unsigned long long>(value - run.begin), static_cast<unsigned long long>(run.end - value), CrashMemory::ZeroEdgeName(run.beforeEdge), static_cast<unsigned long long>(run.beforeWord), CrashMemory::ZeroEdgeName(run.afterEdge), static_cast<unsigned long long>(run.afterWord));
+        }
+        MEMORY_BASIC_INFORMATION memory{};
+        if (VirtualQuery(reinterpret_cast<const void*>(value), &memory, sizeof(memory)) == sizeof(memory)) {
+            Report("  [zero]   region 0x%llx+0x%llx allocation 0x%llx %s protect 0x%lx %s\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(memory.BaseAddress)), static_cast<unsigned long long>(memory.RegionSize), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(memory.AllocationBase)), MemoryStateName(memory.State), memory.Protect, MemoryTypeName(memory.Type));
+        }
+        char mapping[512];
+        if (!GuestArena::GuestArenaTryDescribePage_nid_postfix(static_cast<std::uintptr_t>(value), mapping, sizeof(mapping))) std::snprintf(mapping, sizeof(mapping), "mappings busy");
+        Report("  [zero]   mappings: %s\n", mapping);
+    }
+    ReportMapRing(guest, guestCount);
+}
+
 LONG WINAPI ReportUncaught(EXCEPTION_POINTERS* info) {
     if (info->ExceptionRecord->ExceptionCode == GccCxxException) ReportCxxException(info, "FATAL: uncaught");
     return EXCEPTION_CONTINUE_SEARCH;
@@ -398,6 +516,10 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
             Report("  [%s] %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n", name, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
             for (int word = 0; word < 8; ++word) described[describedCount++] = words[word];
         }
+    }
+    if (g_crashZeroExtent && record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
+        const auto faultAddress = static_cast<std::uint64_t>(record->ExceptionInformation[1]);
+        if (faultAddress < 0x10000 || GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(faultAddress), 1)) ReportZeroExtents(*context, faultAddress);
     }
     // APS5_CRASH_RESOURCES=1: the GPU driver names what it tracks over those addresses (its resources
     // and its recent stores into guest memory).
@@ -511,6 +633,7 @@ const bool g_crashReportInstalled = [] {
     BufferLogStreams();
     g_sse4aEmulation = !IsEnvironmentSet("APS5_NO_SSE4A_EMULATION");
     g_sse4aTrace = IsEnvironmentSet("APS5_TRACE_SSE4A");
+    g_crashZeroExtent = !IsEnvironmentSet("APS5_NO_CRASH_ZERO_EXTENT");
     AddVectoredExceptionHandler(1, ReportCrash);
     SetUnhandledExceptionFilter(ReportUncaught);
     std::signal(SIGABRT, AbortSignalHandler);
