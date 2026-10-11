@@ -479,6 +479,46 @@ void testFastCensus() {
     check(FastCensusDescriptorBucket(33) == 4 && FastCensusDescriptorBucket(64) == 5 && FastCensusDescriptorBucket(65) == 6, "census: descriptor buckets over the push limit");
 }
 
+void testPipeCensus() {
+    using namespace AgcDriver::DriverDetail;
+    const auto header = [](std::uint32_t opcode) { return 0xc0000000u | (opcode << 8u); };
+    const auto is = [](const PipeCensusPacket& packet, bool dispatches, bool eligible, std::optional<PipeCensusDrain> drain) {
+        const auto verdict = ClassifyPipeCensus(packet, dispatches);
+        return verdict.eligible == eligible && verdict.drain == drain;
+    };
+    const auto both = [&](const PipeCensusPacket& packet, bool eligible, std::optional<PipeCensusDrain> drain) { return is(packet, false, eligible, drain) && is(packet, true, eligible, drain); };
+    const auto draw = [&](PipeCensusLock lock, bool labels) { return PipeCensusPacket{header(0x27), true, false, false, false, lock, PipeCensusDispatch::None, labels}; };
+    const auto dispatch = [&](PipeCensusDispatch outcome, bool labels) { return PipeCensusPacket{header(0x15), false, false, false, false, PipeCensusLock::None, outcome, labels}; };
+    check(both(draw(PipeCensusLock::Direct, false), true, std::nullopt) && both(draw(PipeCensusLock::None, true), false, std::nullopt), "pipe census: a direct draw is handed over, one that recorded nothing is neutral");
+    check(both(draw(PipeCensusLock::Direct, true), false, PipeCensusDrain::LabelsPending) && both(draw(PipeCensusLock::CpuIndirect, false), false, PipeCensusDrain::CpuIndirect) && both(draw(PipeCensusLock::Stale, false), false, PipeCensusDrain::Stale) && both(draw(PipeCensusLock::Other, false), false, PipeCensusDrain::Other), "pipe census: draws with labels in their lock, cpu-indirect, stale and other locked draws drain");
+    check(is(dispatch(PipeCensusDispatch::Recorded, false), false, false, PipeCensusDrain::Dispatch) && is(dispatch(PipeCensusDispatch::Recorded, false), true, true, std::nullopt) && is(dispatch(PipeCensusDispatch::Recorded, true), true, false, PipeCensusDrain::LabelsPending), "pipe census: a recorded dispatch drains draws only, is handed over with dispatches unless labels record in its lock");
+    check(both(dispatch(PipeCensusDispatch::None, true), false, std::nullopt) && both(dispatch(PipeCensusDispatch::Copy, false), false, PipeCensusDrain::Dma) && both(dispatch(PipeCensusDispatch::Other, false), false, PipeCensusDrain::Other), "pipe census: skipped dispatches are neutral, copy HLE and fast ones drain");
+    check(both({header(0x16)}, false, PipeCensusDrain::IndirectDispatch) && both({header(0x3c)}, false, PipeCensusDrain::Wait) && both({header(0x49)}, false, PipeCensusDrain::Label) && both({header(0x50)}, false, PipeCensusDrain::Dma) && both({header(0x10) | (0x17u << 2u), false, true}, false, PipeCensusDrain::Flip), "pipe census: indirect dispatches, waits, labels, copies and flips drain");
+    check(both({header(0x76)}, false, std::nullopt) && both({header(0x76), false, false, false, true}, false, PipeCensusDrain::Label) && both({header(0x22)}, false, PipeCensusDrain::Other), "pipe census: state packets are neutral, GPU stores and unknown packets drain");
+
+    PipeCensusRuns runs;
+    const PipeCensusVerdict handed{true, std::nullopt};
+    const bool drainedEmpty = runs.Apply({false, PipeCensusDrain::Wait}, false);
+    for (int i = 0; i < 3; ++i) runs.Apply(handed, false);
+    const bool neutralDrained = runs.Apply({}, true);
+    runs.Apply({false, PipeCensusDrain::Dispatch}, false);
+    runs.Apply(handed, false);
+    const bool overlapDrained = runs.Apply(handed, true);
+    runs.Close(PipeCensusDrain::SubmissionEnd);
+    check(drainedEmpty && !neutralDrained && overlapDrained && runs.drains[static_cast<std::size_t>(PipeCensusDrain::Wait)] == 0, "pipe census: a neutral packet keeps the run, a drain without a run is not counted");
+    check(runs.count == 3 && runs.packets == 5 && runs.runs[0] == 2 && runs.runs[1] == 1, "pipe census: runs by length");
+    check(runs.drains[static_cast<std::size_t>(PipeCensusDrain::Dispatch)] == 1 && runs.drains[static_cast<std::size_t>(PipeCensusDrain::Overlap)] == 1 && runs.drains[static_cast<std::size_t>(PipeCensusDrain::SubmissionEnd)] == 1, "pipe census: a capture over the run's writes drains it and starts the next");
+
+    PipeCensusOverlay overlay;
+    constexpr auto write = PipeCensusOverlay::Write, target = PipeCensusOverlay::Target;
+    overlay.Add({0x1000, 0x2000, write});
+    overlay.Add({0x8000, 0x9000, target});
+    check(overlay.Overlaps(0x1fff, 0x2001) == write && overlay.Overlaps(0x2000, 0x8000) == 0 && overlay.Overlaps(0, 0x10000) == (write | target) && overlay.Overlaps(0x9000, 0x10000) == 0, "pipe census: half-open overlaps by kind");
+    overlay.Add({0x1100, 0x1200, write});
+    overlay.Add({0x1800, 0x1900, target});
+    check(overlay.ranges.size() == 3 && overlay.Overlaps(0x1850, 0x1860) == (write | target), "pipe census: a range inside a known one of the same kind is not added again");
+}
+
 // The fast dispatch (F5): the compare its verify mode makes between the old path's capture and the
 // walked variant (APS5_FAST_DISPATCH_VERIFY, CompareWalkedResults), and the push layout key a
 // variant's bindings give, with the bindings it declines (Graphics::FastComputeLayoutKey).
@@ -960,6 +1000,7 @@ int main() {
         testSkippedDispatch();
         testNewDrawKeyTally();
         testFastCensus();
+        testPipeCensus();
         testPollWake();
         testFastDispatchVerify();
         testFastReader();

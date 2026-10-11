@@ -1,5 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastDraw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
@@ -374,6 +377,125 @@ void NoteFastCensusPacket(std::uint32_t queue, std::uint32_t header, bool drawPa
 void NoteFastCensusSubmissionEnd(std::uint32_t queue) {
     if (!FastCensusActive()) return;
     closeRun(queue, FastCensusBreak::SubmissionEnd);
+}
+
+namespace {
+
+// The queue-0 thread's pipe census, the report included (no other thread touches it: no lock): the
+// running packet's notes, each policy's runs and overlay, and the window's counts.
+constexpr std::size_t PipeCensusPolicies = 2;
+struct PipeCensusState {
+    PipeCensusLock lock = PipeCensusLock::None;
+    bool labelsPending = false;
+    std::array<std::uint8_t, PipeCensusPolicies> overlaps{};
+    std::vector<PipeCensusOverlay::Range> writes;
+    std::array<PipeCensusRuns, PipeCensusPolicies> runs{};
+    std::array<PipeCensusOverlay, PipeCensusPolicies> overlays{};
+    // Per policy, the captures over the open run's writes: draws, draws over a target, dispatches,
+    // dispatches over a target.
+    std::array<std::array<std::uint64_t, 4>, PipeCensusPolicies> overlapCounts{};
+    std::uint64_t draws = 0, drawLabels = 0, dispatches = 0, dispatchLabels = 0, ends = 0, endsQueued = 0;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+PipeCensusState& pipeCensus() {
+    static thread_local PipeCensusState census;
+    return census;
+}
+
+void reportPipeCensus(PipeCensusState& census) {
+    if (std::chrono::steady_clock::now() - census.lastReport < std::chrono::seconds(10)) return;
+    char item[256];
+    std::array<std::string, PipeCensusPolicies> policies;
+    for (std::size_t policy = 0; policy < PipeCensusPolicies; ++policy) {
+        const auto& runs = census.runs[policy];
+        const auto& overlaps = census.overlapCounts[policy];
+        std::snprintf(item, sizeof(item), "%llu runs of %llu (mean %.1f), by length:", static_cast<unsigned long long>(runs.count), static_cast<unsigned long long>(runs.packets), runs.count == 0 ? 0.0 : static_cast<double>(runs.packets) / static_cast<double>(runs.count));
+        policies[policy] = item;
+        for (std::size_t bucket = 0; bucket < FastCensusRuns::Buckets; ++bucket) {
+            std::snprintf(item, sizeof(item), " %s %llu", FastCensusRuns::BucketNames[bucket], static_cast<unsigned long long>(runs.runs[bucket]));
+            policies[policy] += item;
+        }
+        policies[policy] += "; drains:";
+        for (std::size_t why = 0; why < PipeCensusDrains; ++why) {
+            std::snprintf(item, sizeof(item), " %s %llu", PipeCensusDrainNames[why], static_cast<unsigned long long>(runs.drains[why]));
+            policies[policy] += item;
+        }
+        std::snprintf(item, sizeof(item), "; captures over unrecorded writes: draws %llu (targets %llu), dispatches %llu (targets %llu)", static_cast<unsigned long long>(overlaps[0]), static_cast<unsigned long long>(overlaps[1]), static_cast<unsigned long long>(overlaps[2]), static_cast<unsigned long long>(overlaps[3]));
+        policies[policy] += item;
+    }
+    std::fprintf(stderr, "[pipe] census queue 0 (10 s): draws %llu (labels pending %llu), dispatches %llu (labels pending %llu), submission ends %llu (%llu with work queued); draws only: %s; draws and dispatches: %s\n", static_cast<unsigned long long>(census.draws), static_cast<unsigned long long>(census.drawLabels), static_cast<unsigned long long>(census.dispatches), static_cast<unsigned long long>(census.dispatchLabels), static_cast<unsigned long long>(census.ends), static_cast<unsigned long long>(census.endsQueued), policies[0].c_str(), policies[1].c_str());
+    // A new window from now; the runs and overlays are empty at a submission end.
+    census = {};
+}
+
+}
+
+bool PipeCensusActive() {
+    static const bool active = std::getenv("APS5_PROFILE_DRAW") != nullptr && std::getenv("APS5_NO_PIPE_CENSUS") == nullptr && !FastDrawEnabled();
+    return active;
+}
+
+void NotePipeCensusCapture(const std::vector<ShaderRecompiler::MemoryRegion>& regions) {
+    auto& census = pipeCensus();
+    for (std::size_t policy = 0; policy < PipeCensusPolicies; ++policy) {
+        for (const auto& region : regions) census.overlaps[policy] = static_cast<std::uint8_t>(census.overlaps[policy] | census.overlays[policy].Overlaps(region.guestAddress, region.guestAddress + region.bytes.size()));
+    }
+}
+
+void NotePipeCensusLock(PipeCensusLock kind) {
+    auto& census = pipeCensus();
+    census.lock = kind;
+    census.labelsPending = census.labelsPending || !deferredLabels().labels.empty();
+    census.writes.clear();
+}
+
+void NotePipeCensusWrite(std::uint64_t begin, std::uint64_t end, bool target) {
+    if (end > begin) pipeCensus().writes.push_back({begin, end, target ? PipeCensusOverlay::Target : PipeCensusOverlay::Write});
+}
+
+void NotePipeCensusTargets(const Graphics::State& graphics) {
+    for (const auto& color : graphics.colors) NotePipeCensusWrite(color.address, color.address + color.bytes, true);
+    if (!graphics.depth) return;
+    // 4 bytes per depth texel and 1 per stencil texel, without tiling padding.
+    const auto texels = static_cast<std::uint64_t>(graphics.depth->extent.width) * graphics.depth->extent.height;
+    if (graphics.depthWrite) NotePipeCensusWrite(graphics.depth->address, graphics.depth->address + texels * 4, true);
+    if (graphics.stencilTest && graphics.depth->stencilAddress != 0) NotePipeCensusWrite(graphics.depth->stencilAddress, graphics.depth->stencilAddress + texels, true);
+}
+
+void NotePipeCensusPacket(std::uint32_t header, bool drawPacket, bool flip, bool renderingWait, bool wroteOnGpu, DispatchOutcome dispatch) {
+    auto& census = pipeCensus();
+    PipeCensusPacket packet{header, drawPacket, flip, renderingWait, wroteOnGpu, drawPacket ? census.lock : PipeCensusLock::None, PipeCensusDispatch::None, census.labelsPending};
+    if (((header >> 8u) & 0xffu) == 0x15) packet.dispatch = dispatch == DispatchOutcome::Real ? PipeCensusDispatch::Recorded : dispatch == DispatchOutcome::CopyHle || dispatch == DispatchOutcome::FillHle ? PipeCensusDispatch::Copy : dispatch == DispatchOutcome::Fast ? PipeCensusDispatch::Other : PipeCensusDispatch::None;
+    // Only a packet that recorded handed its capture to the device.
+    const bool recorded = drawPacket ? packet.lock != PipeCensusLock::None : packet.dispatch == PipeCensusDispatch::Recorded;
+    if (recorded) ++(drawPacket ? census.draws : census.dispatches);
+    if (recorded && packet.labelsPending) ++(drawPacket ? census.drawLabels : census.dispatchLabels);
+    for (std::size_t policy = 0; policy < PipeCensusPolicies; ++policy) {
+        const auto verdict = ClassifyPipeCensus(packet, policy == 1);
+        const auto overlap = recorded ? census.overlaps[policy] : std::uint8_t{0};
+        if (overlap != 0) ++census.overlapCounts[policy][drawPacket ? 0 : 2];
+        if ((overlap & PipeCensusOverlay::Target) != 0) ++census.overlapCounts[policy][drawPacket ? 1 : 3];
+        auto& overlay = census.overlays[policy];
+        if (census.runs[policy].Apply(verdict, overlap != 0)) overlay.ranges.clear();
+        if (!verdict.eligible) continue;
+        for (const auto& write : census.writes) overlay.Add(write);
+    }
+    census.lock = PipeCensusLock::None;
+    census.labelsPending = false;
+    census.overlaps = {};
+    census.writes.clear();
+}
+
+void NotePipeCensusSubmissionEnd(bool workQueued) {
+    auto& census = pipeCensus();
+    for (std::size_t policy = 0; policy < PipeCensusPolicies; ++policy) {
+        census.runs[policy].Close(PipeCensusDrain::SubmissionEnd);
+        census.overlays[policy].ranges.clear();
+    }
+    ++census.ends;
+    if (workQueued) ++census.endsQueued;
+    reportPipeCensus(census);
 }
 
 }
