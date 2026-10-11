@@ -12,6 +12,7 @@
 #include "prx/libScePad/include/PadState.hpp"
 #include "prx/libScePad/include/PadInputTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/UiOverlay.hpp"
 
 #ifdef _WIN32
 #include <process.h>
@@ -229,6 +230,9 @@ PadInputState PadInput::sampleController() const {
     addButton(SDL_CONTROLLER_BUTTON_DPAD_DOWN, Pad::PadButton::Down);
     addButton(SDL_CONTROLLER_BUTTON_DPAD_LEFT, Pad::PadButton::Left);
     addButton(SDL_CONTROLLER_BUTTON_TOUCHPAD, Pad::PadButton::TouchPad);
+    // View (Back) is the touchpad while the prompts show Steam Deck icons (UiOverlay::ViewPressesTouchPad).
+    static const bool viewAsTouchPad = UiOverlay::ViewPressesTouchPad(GetPortSettings_nid_no_patch(), std::getenv(UiOverlay::ViewAsTouchPadSwitch));
+    if (viewAsTouchPad) addButton(SDL_CONTROLLER_BUTTON_BACK, Pad::PadButton::TouchPad);
 
     const auto triggerValue = [this](SDL_GameControllerAxis axis) {
         const auto value = std::clamp<int>(SDL_GameControllerGetAxis(controller, axis), 0, 32767);

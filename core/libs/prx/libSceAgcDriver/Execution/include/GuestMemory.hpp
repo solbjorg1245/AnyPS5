@@ -143,6 +143,12 @@ std::size_t TrackSurfaceEdgeParts(std::uint64_t address, std::size_t bytes);
 // workers bump before every packet as before. CollectEpochBumps counts the bumps ([guestmem] line).
 void BumpCollectEpoch();
 std::uint64_t CollectEpochBumps();
+// The calling thread's collect epoch (0 while it never bumped, or since ResetCollectEpoch), and its
+// return to a fresh epoch per collect. The queue-0 recording thread follows the epochs its items were
+// handed over in (APS5_RECORD_PIPE_EPOCH=1, RecordPipe.cpp): it bumps when an item's differs from
+// the previous item's, and resets for an item handed over without one.
+std::uint64_t ThreadCollectEpoch();
+void ResetCollectEpoch();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // The tracker's current generation (every collect and MarkWritten bumps it): a stamp taken after
 // a set of driver stores, for UnchangedSinceCollected to compare against later. Read under the

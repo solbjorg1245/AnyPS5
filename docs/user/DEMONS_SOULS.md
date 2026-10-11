@@ -123,6 +123,7 @@ by these keys:
 | `FpsLimit` | `APS5_FPS_LIMIT` | `auto`, `30`, `60`; other values (20 to 240) need `Timestep = variable` |
 | `Timestep` | `APS5_TIMESTEP` | `fixed` (the game's own: slow motion below the limit) or `variable` (experimental: the game keeps its speed at any frame rate) |
 | `WindowMode` | `APS5_WINDOW_MODE` | `windowed` or `fullscreen` |
+| `ButtonIcons` | `APS5_BUTTON_ICONS` | `playstation` or `steamdeck` (the prompts show A, B, X, Y, Menu and View; View works as the touchpad) |
 | `NativeAspect` | `APS5_NATIVE_ASPECT` | `off` or `on` (experimental: renders at `Resolution`'s own aspect, e.g. 21:9, instead of letterboxed 16:9) |
 
 The log shows the result in its `[settings]` lines.

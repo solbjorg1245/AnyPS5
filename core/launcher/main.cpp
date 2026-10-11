@@ -617,6 +617,13 @@ Action Draw(Model& model) {
         ImGui::SameLine();
         if (ImGui::RadioButton("Fullscreen", fullscreen)) model.settings.windowMode = PortSettings::WindowMode::Fullscreen;
 
+        Label("Button icons");
+        const bool deck = model.settings.buttonIcons == PortSettings::ButtonIcons::SteamDeck;
+        if (ImGui::RadioButton("PlayStation", !deck)) model.settings.buttonIcons = PortSettings::ButtonIcons::PlayStation;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Steam Deck", deck)) model.settings.buttonIcons = PortSettings::ButtonIcons::SteamDeck;
+        if (deck) Note("A, B, X, Y, Menu and View in the prompts; View works as the touchpad.");
+
         Label("FPS limit");
         static const char* const fpsNames[] = {"Auto (the game's graphics mode)", "30", "60", "Custom"};
         ImGui::Combo("##fps", &model.fpsChoice, fpsNames, IM_ARRAYSIZE(fpsNames));

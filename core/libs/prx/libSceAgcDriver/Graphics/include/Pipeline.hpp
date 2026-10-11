@@ -88,6 +88,12 @@ private:
 // only evicted once no recorded draw holds them. Debug aid: APS5_NO_PIPELINE_CACHE=1 builds one per
 // draw as before.
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+// CachedPipeline's store key built into a per-thread buffer (no allocation per draw), in front of the
+// store a per-thread memo of the last pipelines it answered, by CachedFastPipeline's rules (KeyedMemo:
+// the whole key, the store's removal count, the device instance; a hit stamps the entry's use as a
+// store hit does). Draw with APS5_DRAW_MEMOS=1 (s4-plan S4.2); APS5_NO_PIPELINE_MEMO=1 or
+// APS5_NO_PIPELINE_CACHE=1: CachedPipeline.
+std::shared_ptr<Pipeline> CachedPipelineMemoized(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 // The same for the fast draw path (FastDraw.cpp): on the push layout `layout` of `layoutKey` (the
 // set layout key ShaderResources would make), keyed apart from the set-layout pipelines by the push
 // layout id, which the pipelines share with the FastLayouts that keeps them.
