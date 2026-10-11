@@ -4,11 +4,12 @@
 # First start: ./DemonsSouls.sh --dump /path/to/PPSA01341-app0
 #   1. runs tools/relinker on <dump>/eboot.bin and writes DemonsSouls.elf here (the relinker also
 #      writes the converted game modules into app0/sce_module),
-#   2. patches DemonsSouls.elf with tools/ds_patch.py (python3; refuses an unsupported game version;
-#      skipped with a warning when python3 is missing),
+#   2. patches DemonsSouls.elf with tools/ds_patch.py (python3 3.8+; an unsupported game version is
+#      refused before anything is relinked; skipped with a warning when python3 is missing),
 #   3. symlinks every folder of the dump into app0/ (nothing in the dump is copied or modified; the
 #      few small top-level files are copied),
 #   4. starts the game.
+# Steps 1 and 2 run in a staging folder (setup.tmp): a failed setup leaves an earlier one as it was.
 # Later starts: ./DemonsSouls.sh   (extra arguments after -- go to the game; ./DemonsSouls.sh --launch
 #   skips the settings window, also as Steam launch options: %command% --launch)
 # Options: --dump <dir>, --setup-only, --no-patch, --to-intel (relink for an Intel CPU; untested)
@@ -53,29 +54,48 @@ install_game() {
         [ "$version" = "$supported_build" ] || echo "warning: dump BuildVersion is '$version'; this release supports $supported_build" >&2
     fi
 
+    python=""
+    if [ "$no_patch" = 0 ] && command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' 2>/dev/null; then
+        python=python3
+        # The version check first: an unsupported dump is refused before anything is relinked or replaced.
+        "$python" -I "$here/tools/ds_patch.py" --check "$eboot" || { echo "ds_patch.py refused this dump; nothing was changed" >&2; exit 1; }
+    fi
+
+    # Relinked and patched in a staging folder, then swapped in: a failed setup leaves an earlier one working.
+    stage="$here/setup.tmp"
+    rm -rf "$stage"
+    mkdir -p "$stage"
+    trap 'rm -rf "$stage"' EXIT  # also when the relinker or the patch fails
+    staged_exe="$stage/DemonsSouls.elf"
+
     echo "== relinking $eboot"
-    mkdir -p "$app0"
     relink_args=()
     if [ "$to_intel" = 1 ]; then
         relink_args+=(--to-intel)
     elif grep -q -m 1 '^vendor_id[[:space:]]*:[[:space:]]*GenuineIntel' /proc/cpuinfo 2>/dev/null; then
         echo "warning: Intel CPU: the game uses AMD-only instructions; if it dies with SIGILL, run again with --dump ... --to-intel" >&2
     fi
-    "$here/tools/relinker" ${relink_args[@]+"${relink_args[@]}"} "$eboot" "$exe"
+    "$here/tools/relinker" ${relink_args[@]+"${relink_args[@]}"} "$eboot" "$staged_exe"
 
     if [ "$no_patch" = 1 ]; then
         echo "warning: skipping the executable patch (--no-patch): job workers will spin and starve the game threads" >&2
-    elif command -v python3 >/dev/null 2>&1; then
+    elif [ -n "$python" ]; then
         echo "== patching DemonsSouls.elf"
-        if ! python3 -I "$here/tools/ds_patch.py" "$eboot" "$exe"; then
-            rm -f "$exe"
-            echo "ds_patch.py refused this dump; DemonsSouls.elf was removed" >&2
-            exit 1
-        fi
+        "$python" -I "$here/tools/ds_patch.py" "$eboot" "$staged_exe" || { echo "ds_patch.py refused this dump; an earlier setup is unchanged" >&2; exit 1; }
     else
-        echo "warning: python3 not found: DemonsSouls.elf is NOT patched and will run much slower" >&2
+        echo "warning: python3 3.8+ not found: DemonsSouls.elf is NOT patched and will run much slower" >&2
     fi
-    chmod +x "$exe"
+    chmod +x "$staged_exe"
+
+    # The new executable, then the modules (a link goes as a link, never its target).
+    mkdir -p "$app0"
+    mv -f "$staged_exe" "$exe"
+    if [ -d "$stage/app0/sce_module" ]; then
+        if [ -L "$app0/sce_module" ]; then rm -f "$app0/sce_module"; else rm -rf "$app0/sce_module"; fi
+        mv "$stage/app0/sce_module" "$app0/sce_module"
+    fi
+    rm -rf "$stage"
+    trap - EXIT
 
     echo "== linking the dump into app0"
     for item in "$dump_dir"/*; do

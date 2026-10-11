@@ -6,11 +6,12 @@ Demon's Souls (PPSA01341) launcher for AnyPS5 on Windows.
 First start: pass your own decrypted dump with -Dump. The launcher then
   1. runs tools\relinker.exe on <dump>\eboot.bin and writes DemonsSouls.exe here
      (the relinker also writes the converted game modules into app0\sce_module),
-  2. patches DemonsSouls.exe with tools\ds_patch.py (needs Python 3; skipped with a warning if
-     Python is missing; refuses an unsupported game version),
+  2. patches DemonsSouls.exe with tools\ds_patch.py (needs Python 3.8+; skipped with a warning if
+     Python is missing; an unsupported game version is refused before anything is relinked),
   3. links every folder of the dump into app0\ (directory junctions, nothing is copied or
      modified in the dump; the few small top-level files are copied),
   4. starts the game.
+Steps 1 and 2 run in a staging folder (setup.tmp): a failed setup leaves an earlier one as it was.
 Later starts need no arguments. Run with -Dump again after updating AnyPS5 or the dump.
 Other arguments go to DemonsSouls.exe: --launch skips the settings window (Steam: %command% --launch).
 The settings window (anyps5-launcher.exe) runs this setup itself (-Dump <its game folder> -SetupOnly) when
@@ -44,10 +45,11 @@ $supportedBuild = "2025-10-15.877562"
 
 function Find-Python {
     foreach ($candidate in @(@("py", "-3"), @("python3"), @("python"))) {
-        $command = Get-Command $candidate[0] -ErrorAction SilentlyContinue
+        # The first on PATH that is not the Microsoft Store alias, which opens the Store instead of running
+        # Python (the settings window looks for Python the same way).
+        $command = Get-Command $candidate[0] -CommandType Application -All -ErrorAction SilentlyContinue |
+            Where-Object { $_.Source -notlike "*\WindowsApps\*" } | Select-Object -First 1
         if (-not $command) { continue }
-        # Skip the Microsoft Store alias, which opens the Store instead of running Python.
-        if ($command.Source -like "*\WindowsApps\*") { continue }
         $prefix = @($candidate | Select-Object -Skip 1)
         & $command.Source @prefix -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)" 2>$null
         if ($LASTEXITCODE -eq 0) { return , (@($command.Source) + $prefix) }
@@ -72,33 +74,62 @@ function Install-Game([string]$dumpPath) {
         }
     }
 
-    Write-Host "== relinking $eboot"
-    New-Item -ItemType Directory -Force -Path $app0 | Out-Null
-    $relinkArgs = @("--windows")
-    if ($ToIntel) {
-        $relinkArgs += "--to-intel"
-    } elseif ((Get-CimInstance Win32_Processor | Select-Object -First 1).Manufacturer -eq "GenuineIntel") {
-        Write-Warning "Intel CPU: the game uses AMD-only instructions (emulated, slower); if it crashes with an illegal instruction, run again with -Dump ... -ToIntel"
-    }
-    & (Join-Path $here "tools\relinker.exe") @relinkArgs $eboot $exe
-    if ($LASTEXITCODE -ne 0) { throw "relinker failed with exit code $LASTEXITCODE" }
-
-    if ($NoPatch) {
-        Write-Warning "skipping the executable patch (-NoPatch): job workers will spin and starve the game threads"
-    } else {
+    $python = $null
+    $patcher = Join-Path $here "tools\ds_patch.py"
+    if (-not $NoPatch) {
         $python = Find-Python
         if ($python) {
-            Write-Host "== patching DemonsSouls.exe"
+            # The version check first: an unsupported dump is refused before anything is relinked or replaced.
             $pythonArgs = @($python | Select-Object -Skip 1)
-            & $python[0] @pythonArgs -I (Join-Path $here "tools\ds_patch.py") $eboot $exe
-            if ($LASTEXITCODE -ne 0) {
-                Remove-Item -LiteralPath $exe -Force
-                throw "ds_patch.py refused this dump (exit code $LASTEXITCODE); DemonsSouls.exe was removed"
-            }
+            & $python[0] @pythonArgs -I $patcher --check $eboot
+            if ($LASTEXITCODE -ne 0) { throw "ds_patch.py refused this dump (exit code $LASTEXITCODE); nothing was changed" }
+        }
+    }
+
+    # Relinked and patched in a staging folder, then swapped in: a failed setup leaves an earlier one working.
+    $stage = Join-Path $here "setup.tmp"
+    if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $stage | Out-Null
+    $stagedExe = Join-Path $stage "DemonsSouls.exe"
+    try {
+        Write-Host "== relinking $eboot"
+        $relinkArgs = @("--windows")
+        if ($ToIntel) {
+            $relinkArgs += "--to-intel"
+        } elseif ((Get-CimInstance Win32_Processor | Select-Object -First 1).Manufacturer -eq "GenuineIntel") {
+            Write-Warning "Intel CPU: the game uses AMD-only instructions (emulated, slower); if it crashes with an illegal instruction, run again with -Dump ... -ToIntel"
+        }
+        & (Join-Path $here "tools\relinker.exe") @relinkArgs $eboot $stagedExe
+        if ($LASTEXITCODE -ne 0) { throw "relinker failed with exit code $LASTEXITCODE; an earlier setup is unchanged" }
+
+        if ($NoPatch) {
+            Write-Warning "skipping the executable patch (-NoPatch): job workers will spin and starve the game threads"
+        } elseif ($python) {
+            Write-Host "== patching DemonsSouls.exe"
+            & $python[0] @pythonArgs -I $patcher $eboot $stagedExe
+            if ($LASTEXITCODE -ne 0) { throw "ds_patch.py refused this dump (exit code $LASTEXITCODE); an earlier setup is unchanged" }
         } else {
             Write-Warning "Python 3.8+ not found: DemonsSouls.exe is NOT patched and will run much slower. Install Python (python.org or 'winget install Python.Python.3.12') and run this script with -Dump again."
         }
+    } catch {
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        throw
     }
+
+    # The new executable first (it fails while the game runs, before anything else changed), then the modules.
+    New-Item -ItemType Directory -Force -Path $app0 | Out-Null
+    Move-Item -LiteralPath $stagedExe -Destination $exe -Force
+    $modules = Join-Path $app0 "sce_module"
+    $staged = Join-Path $stage "app0\sce_module"
+    if (Test-Path -LiteralPath $staged) {
+        $existing = Get-Item -LiteralPath $modules -Force -ErrorAction SilentlyContinue
+        if ($existing) {
+            # A link goes as a link (never its target); the relinker's own folder with its files.
+            if ($existing.LinkType) { $existing.Delete() } else { Remove-Item -LiteralPath $modules -Recurse -Force }
+        }
+        Move-Item -LiteralPath $staged -Destination $modules
+    }
+    Remove-Item -LiteralPath $stage -Recurse -Force
 
     Write-Host "== linking the dump into app0"
     foreach ($item in Get-ChildItem -LiteralPath $dumpPath -Force) {
@@ -106,8 +137,9 @@ function Install-Game([string]$dumpPath) {
         if ($item.Name -in @("eboot.bin", "sce_module") -or $item.Name.StartsWith(".")) { continue }
         if ($item.Name -eq "logs") { New-Item -ItemType Directory -Force -Path (Join-Path $app0 "logs") | Out-Null; continue }
         $target = Join-Path $app0 $item.Name
-        if (Test-Path -LiteralPath $target) {
-            $existing = Get-Item -LiteralPath $target -Force
+        # Get-Item, not Test-Path: a junction whose dump was moved or deleted must be found and replaced too.
+        $existing = Get-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+        if ($existing) {
             if ($existing.LinkType) { $existing.Delete() } elseif ($item.PSIsContainer) { continue }
         }
         if ($item.PSIsContainer) {

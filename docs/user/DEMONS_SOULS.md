@@ -35,21 +35,28 @@ The port is a work in progress. Read [Known issues](#known-issues) before you st
    `DemonsSouls.bat` and `DemonsSouls.sh` open it too). In **Game folder**, type or paste the path of
    your dump's `app0` folder, or press **Browse...** (the system's folder picker; on a Steam Deck the
    window's own browser: D-pad moves, A opens a folder, B goes up, Y takes the folder shown). The
-   window checks the folder at once and says what is wrong: `eboot.bin`, `sce_sys` and `sce_module`
-   must be there, `eboot.bin` must be decrypted (an encrypted SELF does not work), the folder must be on
-   a local drive, and it names the game version (a warning for an unknown one). Choosing the folder that
+   window checks the folder and says what is wrong: `eboot.bin`, `sce_sys` and `sce_module` must be
+   there, `eboot.bin` and the modules in `sce_module` must be decrypted (encrypted SELF files do not
+   work), the folder must be on a local drive and given as a full path, and the game must be
+   Demon's Souls PPSA01341 version 01.007.000 (another version is refused). Choosing the folder that
    contains `app0` works too. **Play** stays disabled until the folder is valid.
 3. Press **Play**. The first time, and after you choose another folder, update AnyPS5 or install
-   Python, the window runs the one-time setup and shows its progress (it calls `DemonsSouls.ps1 -Dump
-   <folder> -SetupOnly` / `DemonsSouls.sh --dump <folder> --setup-only`, hidden):
+   Python 3.8+, the window runs the one-time setup and shows its progress (it calls `DemonsSouls.ps1
+   -Dump <folder> -SetupOnly` / `DemonsSouls.sh --dump <folder> --setup-only`, hidden):
    1. `tools/relinker` turns your `eboot.bin` into `DemonsSouls.exe` (Windows) or `DemonsSouls.elf`
       (Linux) and writes converted game modules into `app0/sce_module`,
    2. `tools/ds_patch.py` applies the port's executable patch (it checks the game version and writes
       nothing if the version does not match; skipped with a warning when Python is missing),
    3. every folder of your dump is linked into `app0/`. Your dump is never modified.
 
-   Then the game starts. The setup is recorded in `anyps5-setup.txt` (delete it to run the setup again).
-   Later, **Play** starts the game at once.
+   Steps 1 and 2 run in a `setup.tmp` folder first, so a setup that fails leaves an earlier working
+   one as it was. Then the game starts. The setup is recorded in `anyps5-setup.txt` (delete it to run
+   the setup again). Later, **Play** starts the game at once.
+
+   Started from the window, the game has no console window: its output goes to `anyps5-game.log` in the
+   AnyPS5 folder (the run before is kept as `anyps5-game.old.log`); attach it when you report a
+   problem. If the game ends with an error, a message says so. `APS5_LAUNCHER_CONSOLE=1` gives it its
+   console window back.
 
 ### Steam
 

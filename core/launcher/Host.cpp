@@ -1,11 +1,14 @@
 #include "Host.hpp"
 
 #include "GameFolder.hpp"
+#include "HostText.hpp"
 
 #include <SDL.h>
 #include <SDL_syswm.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -38,14 +41,48 @@ constexpr std::size_t MaxLines = 400;
 constexpr const char* PickerTitle = "Choose the Demon's Souls game folder (app0)";
 
 #ifdef _WIN32
-std::wstring Quote(std::wstring text) {
-    // A trailing backslash would escape the closing quote ("D:\" -> D:\.).
-    if (!text.empty() && text.back() == L'\\') text += L'.';
-    return L"\"" + text + L"\"";
+std::wstring Quote(const std::wstring& text) {
+    return QuoteArgument(text);
 }
 
 std::wstring Wide(const std::string& text) {
     return PathFromText(text).wstring();
+}
+
+HANDLE OpenNul(SECURITY_ATTRIBUTES* inherit) {
+    return CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, inherit, OPEN_EXISTING, 0, nullptr);
+}
+
+// CreateProcessW with standard handles and only those inherited (PROC_THREAD_ATTRIBUTE_HANDLE_LIST): the
+// child gets the pipe or the log file and none of the launcher's other inheritable handles (a log file
+// or pipe of whoever started the launcher). The handles must be inheritable. `error`: GetLastError.
+bool CreateWithHandles(const std::wstring& application, std::wstring& command, DWORD flags, const wchar_t* directory, HANDLE input, HANDLE output, PROCESS_INFORMATION& process,
+    DWORD& error) {
+    std::vector<HANDLE> handles{input, output};
+    handles.erase(std::remove_if(handles.begin(), handles.end(), [](HANDLE handle) { return handle == nullptr || handle == INVALID_HANDLE_VALUE; }), handles.end());
+    std::sort(handles.begin(), handles.end());
+    handles.erase(std::unique(handles.begin(), handles.end()), handles.end());
+    SIZE_T size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
+    std::vector<unsigned char> buffer(size);
+    auto* attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(buffer.data());
+    if (!InitializeProcThreadAttributeList(attributes, 1, 0, &size)) {
+        error = GetLastError();
+        return false;
+    }
+    const bool listed = handles.empty() || UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handles.data(), handles.size() * sizeof(HANDLE), nullptr, nullptr);
+    STARTUPINFOEXW startup{};
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = input;
+    startup.StartupInfo.hStdOutput = output;
+    startup.StartupInfo.hStdError = output;
+    startup.lpAttributeList = attributes;
+    const BOOL created = listed && CreateProcessW(application.c_str(), command.data(), nullptr, nullptr, !handles.empty(), flags | EXTENDED_STARTUPINFO_PRESENT, nullptr, directory,
+                                                  &startup.StartupInfo, &process);
+    error = created ? 0 : GetLastError();
+    DeleteProcThreadAttributeList(attributes);
+    return created;
 }
 
 std::wstring Variable(const wchar_t* name) {
@@ -54,7 +91,8 @@ std::wstring Variable(const wchar_t* name) {
     return length > 0 && length < 64 ? std::wstring(value, length) : std::wstring();
 }
 #else
-// Runs argv[0] from PATH with stdout captured (stderr dropped): its exit code, -1 when it did not start.
+// Runs argv[0] from PATH with stdout captured (stderr dropped), in a process group of its own (`child`
+// gets its id, so kill(-child) ends it with what it started): its exit code, -1 when it did not start.
 int RunCapture(const std::vector<std::string>& args, std::string& out, std::atomic<int>* child = nullptr) {
     int fds[2];
     if (pipe2(fds, O_CLOEXEC) != 0) return -1;
@@ -62,12 +100,17 @@ int RunCapture(const std::vector<std::string>& args, std::string& out, std::atom
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_adddup2(&actions, fds[1], 1);
     posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0);
+    posix_spawnattr_t attributes;
+    posix_spawnattr_init(&attributes);
+    posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP);
+    posix_spawnattr_setpgroup(&attributes, 0);
     std::vector<char*> argv;
     for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
     argv.push_back(nullptr);
     pid_t pid = -1;
-    const int spawned = posix_spawnp(&pid, argv[0], &actions, nullptr, argv.data(), environ);
+    const int spawned = posix_spawnp(&pid, argv[0], &actions, &attributes, argv.data(), environ);
     posix_spawn_file_actions_destroy(&actions);
+    posix_spawnattr_destroy(&attributes);
     close(fds[1]);
     if (spawned != 0) {
         close(fds[0]);
@@ -85,24 +128,6 @@ int RunCapture(const std::vector<std::string>& args, std::string& out, std::atom
     while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
     if (child != nullptr) *child = -1;
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-}
-
-std::string PercentDecode(std::string_view text) {
-    std::string result;
-    for (std::size_t index = 0; index < text.size(); ++index) {
-        if (text[index] == '%' && index + 2 < text.size()) {
-            const auto hex = std::string(text.substr(index + 1, 2));
-            char* end = nullptr;
-            const long value = std::strtol(hex.c_str(), &end, 16);
-            if (end == hex.c_str() + 2) {
-                result += static_cast<char>(value);
-                index += 2;
-                continue;
-            }
-        }
-        result += text[index];
-    }
-    return result;
 }
 
 // xdg-desktop-portal's FileChooser through gdbus: prints the request's Response signal line, exit 3 when
@@ -196,7 +221,7 @@ bool SetupProcess::Start(const std::filesystem::path& installDir, const std::fil
         return false;
     }
     SetHandleInformation(readEnd, HANDLE_FLAG_INHERIT, 0);
-    HANDLE input = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &inherit, OPEN_EXISTING, 0, nullptr);
+    HANDLE input = OpenNul(&inherit);
     // The setup and everything it starts (relinker, Python) end with the launcher.
     HANDLE job = CreateJobObjectW(nullptr, nullptr);
     if (job != nullptr) {
@@ -204,15 +229,9 @@ bool SetupProcess::Start(const std::filesystem::path& installDir, const std::fil
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
     }
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    startup.dwFlags = STARTF_USESTDHANDLES;
-    startup.hStdInput = input;
-    startup.hStdOutput = writeEnd;
-    startup.hStdError = writeEnd;
     PROCESS_INFORMATION process{};
-    const BOOL created = CreateProcessW(powershell.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, installDir.c_str(), &startup, &process);
-    const DWORD createError = GetLastError();
+    DWORD createError = 0;
+    const bool created = CreateWithHandles(powershell, command, CREATE_NO_WINDOW | CREATE_SUSPENDED, installDir.c_str(), input, writeEnd, process, createError);
     CloseHandle(writeEnd);
     if (input != INVALID_HANDLE_VALUE) CloseHandle(input);
     if (!created) {
@@ -290,14 +309,25 @@ std::vector<std::string> SetupProcess::Lines() const {
 void SetupProcess::Read() {
     char buffer[4096];
 #ifdef _WIN32
+    // PowerShell writes redirected output in the console's OEM code page; converted a whole line at a time,
+    // so a multibyte character split between two reads stays whole.
+    const auto convert = [this](const std::string& bytes) {
+        if (bytes.empty()) return;
+        const int wideLength = MultiByteToWideChar(CP_OEMCP, 0, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
+        std::wstring wide(static_cast<std::size_t>(wideLength), L'\0');
+        MultiByteToWideChar(CP_OEMCP, 0, bytes.data(), static_cast<int>(bytes.size()), wide.data(), wideLength);
+        AddText(PortSettings::PathText(std::filesystem::path(wide)));
+    };
+    std::string pending;
     DWORD count = 0;
     while (ReadFile(pipe_, buffer, sizeof(buffer), &count, nullptr) && count > 0) {
-        // PowerShell writes redirected output in the console's OEM code page.
-        const int wideLength = MultiByteToWideChar(CP_OEMCP, 0, buffer, static_cast<int>(count), nullptr, 0);
-        std::wstring wide(static_cast<std::size_t>(wideLength), L'\0');
-        MultiByteToWideChar(CP_OEMCP, 0, buffer, static_cast<int>(count), wide.data(), wideLength);
-        AddText(PortSettings::PathText(std::filesystem::path(wide)));
+        pending.append(buffer, count);
+        const auto end = pending.rfind('\n');
+        if (end == std::string::npos) continue;
+        convert(pending.substr(0, end + 1));
+        pending.erase(0, end + 1);
     }
+    convert(pending);
     WaitForSingleObject(process_, INFINITE);
     DWORD code = 1;
     GetExitCodeProcess(process_, &code);
@@ -357,20 +387,106 @@ std::string MemoryWarning() {
 #endif
 }
 
+bool PythonUsable() {
+    const auto candidates = PythonCandidates([](const char* name) { return std::getenv(name); });
+    for (const auto& candidate : candidates) {
+#ifdef _WIN32
+        std::wstring command = Quote(Wide(candidate[0]));
+        for (std::size_t index = 1; index < candidate.size(); ++index) command += L" " + Quote(Wide(candidate[index]));
+        command += L" -c " + Quote(Wide(PythonVersionProbe));
+        SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
+        HANDLE nul = OpenNul(&inherit);
+        PROCESS_INFORMATION process{};
+        DWORD error = 0;
+        const bool created = CreateWithHandles(Wide(candidate[0]), command, CREATE_NO_WINDOW, nullptr, nul, nul, process, error);
+        if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
+        if (!created) continue;
+        CloseHandle(process.hThread);
+        DWORD code = 1;
+        if (WaitForSingleObject(process.hProcess, 15000) == WAIT_OBJECT_0) GetExitCodeProcess(process.hProcess, &code);
+        else TerminateProcess(process.hProcess, 1);
+        CloseHandle(process.hProcess);
+        if (code == 0) return true;
+#else
+        std::vector<std::string> args = candidate;
+        args.insert(args.end(), {"-c", PythonVersionProbe});
+        std::vector<char*> argv;
+        for (auto& arg : args) argv.push_back(arg.data());
+        argv.push_back(nullptr);
+        posix_spawn_file_actions_t actions;
+        posix_spawn_file_actions_init(&actions);
+        for (const int fd : {0, 1, 2}) posix_spawn_file_actions_addopen(&actions, fd, "/dev/null", fd == 0 ? O_RDONLY : O_WRONLY, 0);
+        pid_t pid = -1;
+        const int spawned = posix_spawn(&pid, argv[0], &actions, nullptr, argv.data(), environ);
+        posix_spawn_file_actions_destroy(&actions);
+        if (spawned != 0) continue;
+        int status = 0;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        pid_t done = 0;
+        while ((done = waitpid(pid, &status, WNOHANG)) == 0 && std::chrono::steady_clock::now() < deadline) usleep(20000);
+        if (done == 0) {
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            continue;
+        }
+        if (done > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0) return true;
+#endif
+    }
+    return false;
+}
+
+namespace {
+
+bool UseConsole() {
+    const char* value = std::getenv("APS5_LAUNCHER_CONSOLE");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+// The game's log file, the previous one kept as anyps5-game.old.log.
+std::filesystem::path RotateGameLog(const std::filesystem::path& installDir) {
+    const auto log = installDir / GameLogName;
+    std::error_code error;
+    if (std::filesystem::exists(log, error)) std::filesystem::rename(log, installDir / "anyps5-game.old.log", error);
+    return log;
+}
+
+}
+
 bool LaunchGame(const std::filesystem::path& installDir, const std::vector<std::string>& args, bool dryRun, GameProcess& game, std::string& error) {
     const auto environment = SetGameEnvironment();
     const auto executable = installDir / GameExecutable;
+    const bool console = UseConsole();
 #ifdef _WIN32
     std::wstring command = Quote(executable.wstring()) + L" --launch";
-    for (const auto& arg : args) command += L" " + (arg.find_first_of(" \t\"") == std::string::npos && !arg.empty() ? Wide(arg) : Quote(Wide(arg)));
-    std::fprintf(stderr, "[launcher] %s %s (%s)\n", dryRun ? "would start" : "starting", PortSettings::PathText(std::filesystem::path(command)).c_str(), environment.c_str());
+    for (const auto& arg : args) command += L" " + Quote(Wide(arg));
+    std::fprintf(stderr, "[launcher] %s %s (%s; output: %s)\n", dryRun ? "would start" : "starting", PortSettings::PathText(std::filesystem::path(command)).c_str(), environment.c_str(),
+        console ? "its own console window" : PortSettings::PathText(installDir / GameLogName).c_str());
     std::fflush(stderr);
     if (dryRun) return true;
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
     PROCESS_INFORMATION process{};
-    if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, installDir.c_str(), &startup, &process)) {
-        error = "Cannot start " + PortSettings::PathText(executable) + " (CreateProcess error " + std::to_string(GetLastError()) + ").";
+    DWORD createError = 0;
+    bool created = false;
+    if (console) {
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        created = CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, installDir.c_str(), &startup, &process);
+        createError = created ? 0 : GetLastError();
+    } else {
+        // No console window: the game's output goes to the log file instead.
+        game.log = RotateGameLog(installDir);
+        SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
+        HANDLE log = CreateFileW(game.log.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, &inherit, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (log == INVALID_HANDLE_VALUE) {
+            error = "Cannot write " + PortSettings::PathText(game.log) + " (error " + std::to_string(GetLastError()) + ").";
+            return false;
+        }
+        HANDLE input = OpenNul(&inherit);
+        created = CreateWithHandles(executable.wstring(), command, CREATE_NO_WINDOW, installDir.c_str(), input, log, process, createError);
+        CloseHandle(log);
+        if (input != INVALID_HANDLE_VALUE) CloseHandle(input);
+    }
+    if (!created) {
+        error = "Cannot start " + PortSettings::PathText(executable) + " (CreateProcess error " + std::to_string(createError) + ").";
         return false;
     }
     CloseHandle(process.hThread);
@@ -381,7 +497,8 @@ bool LaunchGame(const std::filesystem::path& installDir, const std::vector<std::
     argv.insert(argv.end(), args.begin(), args.end());
     std::string shown;
     for (const auto& arg : argv) shown += (shown.empty() ? "" : " ") + arg;
-    std::fprintf(stderr, "[launcher] %s %s (%s)\n", dryRun ? "would start" : "starting", shown.c_str(), environment.c_str());
+    std::fprintf(stderr, "[launcher] %s %s (%s; output: %s)\n", dryRun ? "would start" : "starting", shown.c_str(), environment.c_str(),
+        console ? "the launcher's own" : PortSettings::PathText(installDir / GameLogName).c_str());
     std::fflush(stderr);
     if (dryRun) return true;
     // The game runs in the install folder (the launcher needs no working directory of its own after this).
@@ -392,8 +509,20 @@ bool LaunchGame(const std::filesystem::path& installDir, const std::vector<std::
     std::vector<char*> pointers;
     for (auto& arg : argv) pointers.push_back(arg.data());
     pointers.push_back(nullptr);
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    std::string logText;
+    if (!console) {
+        game.log = RotateGameLog(installDir);
+        logText = PortSettings::PathText(game.log);
+        posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
+        posix_spawn_file_actions_addopen(&actions, 1, logText.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        posix_spawn_file_actions_adddup2(&actions, 1, 2);
+    }
     pid_t pid = -1;
-    if (const int spawned = posix_spawn(&pid, pointers[0], nullptr, nullptr, pointers.data(), environ); spawned != 0) {
+    const int spawned = posix_spawn(&pid, pointers[0], &actions, nullptr, pointers.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (spawned != 0) {
         error = "Cannot start " + argv[0] + ": " + std::strerror(spawned) + ".";
         return false;
     }
@@ -421,22 +550,24 @@ int WaitGame(GameProcess& game) {
 }
 
 NativeFolderPicker::~NativeFolderPicker() {
-    // An open dialog is left to the process exit (joining would wait for the player).
+    // An open dialog is left to the process exit (joining would wait for the player); its thread writes
+    // into the shared state only.
 #ifndef _WIN32
-    if (const int child = pickerChild.load(); child > 0) kill(child, SIGTERM);
+    if (const int child = pickerChild.load(); child > 0) kill(-child, SIGTERM);
 #endif
     if (worker_.joinable()) worker_.detach();
 }
 
 void NativeFolderPicker::Start(SDL_Window* window, const std::filesystem::path& initial) {
     if (worker_.joinable()) worker_.join();
-    outcome_ = OutcomeBusy;
+    auto state = state_;
+    state->outcome = OutcomeBusy;
 #ifdef _WIN32
     HWND owner = nullptr;
     SDL_SysWMinfo info;
     SDL_VERSION(&info.version);
     if (window != nullptr && SDL_GetWindowWMInfo(window, &info)) owner = info.info.win.window;
-    worker_ = std::thread([this, owner, initial] {
+    worker_ = std::thread([state, owner, initial] {
         const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         auto outcome = Outcome::Unavailable;
         IFileOpenDialog* dialog = nullptr;
@@ -460,7 +591,7 @@ void NativeFolderPicker::Start(SDL_Window* window, const std::filesystem::path& 
                 IShellItem* result = nullptr;
                 PWSTR path = nullptr;
                 if (SUCCEEDED(dialog->GetResult(&result)) && SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
-                    folder_ = path;
+                    state->folder = path;
                     outcome = Outcome::Picked;
                     CoTaskMemFree(path);
                 }
@@ -469,27 +600,25 @@ void NativeFolderPicker::Start(SDL_Window* window, const std::filesystem::path& 
             dialog->Release();
         }
         if (SUCCEEDED(initialized)) CoUninitialize();
-        outcome_ = static_cast<int>(outcome);
+        state->outcome = static_cast<int>(outcome);
     });
 #else
     (void)window;
-    worker_ = std::thread([this, initial] {
+    worker_ = std::thread([state, initial] {
         const std::string start = initial.empty() ? std::string(std::getenv("HOME") != nullptr ? std::getenv("HOME") : "/") : PortSettings::PathText(initial);
         std::string out;
         // The desktop portal first (the desktop's own dialog, also for Flatpak), then zenity, then kdialog.
         int code = std::getenv("DBUS_SESSION_BUS_ADDRESS") != nullptr ? RunCapture({"sh", "-c", PortalScript, "sh", PickerTitle}, out, &pickerChild) : -1;
         if (code == 0) {
-            const auto response = out.find("Response (uint32 ");
-            const auto status = response == std::string::npos ? -1 : out[response + 17] - '0';
-            const auto uri = out.find("'file://");
-            if (status == 0 && uri != std::string::npos) {
-                const auto end = out.find('\'', uri + 1);
-                folder_ = PathFromText(PercentDecode(std::string_view(out).substr(uri + 8, end - uri - 8)));
-                outcome_ = static_cast<int>(Outcome::Picked);
+            std::string folder;
+            const auto answer = ParsePortalResponse(out, folder);
+            if (answer == PortalAnswer::Picked) {
+                state->folder = PathFromText(folder);
+                state->outcome = static_cast<int>(Outcome::Picked);
                 return;
             }
-            if (status == 1) {
-                outcome_ = static_cast<int>(Outcome::Cancelled);
+            if (answer == PortalAnswer::Cancelled) {
+                state->outcome = static_cast<int>(Outcome::Cancelled);
                 return;
             }
         }
@@ -500,26 +629,26 @@ void NativeFolderPicker::Start(SDL_Window* window, const std::filesystem::path& 
             out.clear();
             code = RunCapture(tool, out, &pickerChild);
             if (code == 0 && !PortSettings::Trim(out).empty()) {
-                folder_ = PathFromText(PortSettings::Trim(out));
-                outcome_ = static_cast<int>(Outcome::Picked);
+                state->folder = PathFromText(PortSettings::Trim(out));
+                state->outcome = static_cast<int>(Outcome::Picked);
                 return;
             }
             if (code == 1) {
-                outcome_ = static_cast<int>(Outcome::Cancelled);
+                state->outcome = static_cast<int>(Outcome::Cancelled);
                 return;
             }
         }
-        outcome_ = static_cast<int>(Outcome::Unavailable);
+        state->outcome = static_cast<int>(Outcome::Unavailable);
     });
 #endif
 }
 
 NativeFolderPicker::Outcome NativeFolderPicker::Poll(std::filesystem::path& folder) {
-    const auto outcome = static_cast<Outcome>(outcome_.load());
+    const auto outcome = static_cast<Outcome>(state_->outcome.load());
     if (outcome == Outcome::None || outcome == Outcome::Busy) return outcome;
     if (worker_.joinable()) worker_.join();
-    outcome_ = 0;
-    folder = folder_;
+    state_->outcome = 0;
+    folder = state_->folder;
     return outcome;
 }
 

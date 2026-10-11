@@ -1,10 +1,11 @@
 // The settings launcher's host side (s61): the one-time setup as a child process with its output
-// collected for the window, starting the game, the game's environment defaults, the native folder
-// pickers and Steam Deck detection. Windows and Linux.
+// collected for the window, starting the game, the game's environment defaults, the Python check, the
+// native folder pickers and Steam Deck detection. Windows and Linux.
 #pragma once
 
 #include <atomic>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -16,6 +17,9 @@ namespace Launcher {
 
 std::filesystem::path ExecutablePath();
 bool IsSteamDeck();
+// A Python 3.8+ the setup will use (PythonCandidates, each run with PythonVersionProbe, hidden; a
+// candidate that does not answer within 15 s counts as missing). Blocks: call it off the window's thread.
+bool PythonUsable();
 
 // Runs DemonsSouls.ps1 -Dump <dir> -SetupOnly (PowerShell, hidden, execution policy bypassed for this
 // process) or DemonsSouls.sh --dump <dir> --setup-only; stdout and stderr become lines for the window.
@@ -66,10 +70,16 @@ struct GameProcess {
 #else
     int pid = -1;
 #endif
+    std::filesystem::path log;  // its output (empty: it writes to a console of its own)
 };
+
+inline constexpr const char* GameLogName = "anyps5-game.log";
 
 // Starts the game in the install folder with --launch (so it does not open the launcher again) and the
 // environment defaults; false and `error` when it did not start. `dryRun` (tests) only prints the command.
+// Its stdout and stderr go to anyps5-game.log in the install folder (the previous one is kept as
+// anyps5-game.old.log), and on Windows it gets no console window; APS5_LAUNCHER_CONSOLE=1 keeps the old
+// way (a console window on Windows, the launcher's own output on Linux).
 bool LaunchGame(const std::filesystem::path& installDir, const std::vector<std::string>& args, bool dryRun, GameProcess& game, std::string& error);
 // The game's exit code (0 after a dry run).
 int WaitGame(GameProcess& game);
@@ -88,10 +98,16 @@ public:
     // Busy while open; then once Picked (with `folder`), Cancelled or Unavailable; None otherwise.
     Outcome Poll(std::filesystem::path& folder);
 
+    // What the picker's thread reports; shared, so a dialog still open when the window closes writes into
+    // its own copy, not into a destroyed picker.
+    struct State {
+        std::atomic<int> outcome{0};
+        std::filesystem::path folder;
+    };
+
 private:
     std::thread worker_;
-    std::atomic<int> outcome_{0};
-    std::filesystem::path folder_;
+    std::shared_ptr<State> state_ = std::make_shared<State>();
 };
 
 }

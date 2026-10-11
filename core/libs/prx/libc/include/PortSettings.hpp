@@ -760,10 +760,12 @@ inline std::vector<std::pair<std::string, std::string>> LauncherValues(const Set
         {"NativeAspect", settings.nativeAspect ? "on" : "off"}};
 }
 
-// LauncherValues plus the game folder, quoted (a path may hold '#' or ';'); none while it is not set.
-inline std::vector<std::pair<std::string, std::string>> LauncherValuesWithGameDir(const Settings& settings) {
+// LauncherValues plus the game folder, quoted (a path may hold '#' or ';'). An empty folder is written as
+// GameDir = "" with `keepEmpty` (the launcher's own window: a cleared field clears the saved folder), else
+// left out.
+inline std::vector<std::pair<std::string, std::string>> LauncherValuesWithGameDir(const Settings& settings, bool keepEmpty = false) {
     auto values = LauncherValues(settings);
-    if (!settings.gameDir.empty()) values.emplace_back("GameDir", "\"" + settings.gameDir + "\"");
+    if (keepEmpty || !settings.gameDir.empty()) values.emplace_back("GameDir", "\"" + settings.gameDir + "\"");
     return values;
 }
 
