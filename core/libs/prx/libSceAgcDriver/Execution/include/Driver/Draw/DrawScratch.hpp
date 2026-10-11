@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -66,6 +67,26 @@ struct RecordPipeDraw {
     const Submission* submission = nullptr;
     // `consumed` as the draw began: the items after it were in the overlay its captures were checked against.
     std::uint64_t consumed = 0;
+};
+
+// A direct dispatch handed to the recording pipe (stage 3, RecordPipe.cpp): what B's half reads (the
+// device part of Driver::dispatch from PrepareRecipe on). The snapshots and captured regions point
+// into bytes the item owns: the registered program's code, the variants' words, liveWords or the
+// ShaderMemory pages (moving a vector keeps its buffer).
+struct RecordPipeDispatch {
+    std::shared_ptr<VulkanDevice> device;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
+    std::shared_ptr<DispatchVariant> keepVariant, attachVariant;
+    std::shared_ptr<ShaderMemory> shaderMemory;
+    std::shared_ptr<const ShaderSnapshot> program;
+    std::vector<ShaderRecompiler::MemoryRegion> captured;
+    std::vector<Graphics::GuestMemorySnapshot> snapshots;
+    std::vector<std::uint32_t> liveWords;
+    std::array<std::uint32_t, 3> groups{};
+    std::uint64_t address = 0, key = 0;
+    // `consumed` as the dispatch began (as RecordPipeDraw's).
+    std::uint64_t consumed = 0;
+    bool cached = false, dataHit = false;
 };
 
 // Lends the calling thread its DrawScratch while no other lease on this thread holds it; `slot`, the

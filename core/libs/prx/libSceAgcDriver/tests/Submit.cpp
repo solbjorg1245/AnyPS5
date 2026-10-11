@@ -8,8 +8,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastDispatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/KeyedMemo.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -603,9 +605,10 @@ void testRecordPipe() {
     check(RecordPipeDispatchVerdict({.local = true, .window = false, .labelsPending = true}).drain == PipeCensusDrain::IndirectDispatch && RecordPipeDispatchVerdict({.window = false, .labelsPending = true}).drain == PipeCensusDrain::Other && RecordPipeDispatchVerdict({.labelsPending = true, .bda = true}).drain == PipeCensusDrain::LabelsPending && RecordPipeDispatchVerdict({.bda = true}).drain == PipeCensusDrain::Dispatch && RecordPipeDispatchVerdict({.bda = true, .bdaStores = true, .imageWrites = true}).drain == PipeCensusDrain::Dispatch, "record pipe: local packets, no window, labels pending and BDA dispatches drain");
     const auto header = [](std::uint32_t opcode) { return 0xc0000000u | (opcode << 8u); };
     overlay.Add({0x5010, 0x5018, write, 7});
-    const auto top = [&](std::vector<std::uint32_t> words, bool draw = false, bool flip = false) { return RecordPipeTopDrain(words, draw, flip, false, overlay); };
+    const auto top = [&](std::vector<std::uint32_t> words, bool draw = false, bool flip = false, bool dispatches = false) { return RecordPipeTopDrain(words, draw, flip, false, overlay, dispatches); };
     check(!top({header(0x2d)}, true) && !top({header(0x76)}) && !top({header(0x46), 0x04}) && !top({header(0x63), 0x5018, 0, 0, 4}) && !top({header(0x63), 0x5000, 0, 0, 0}), "record pipe: draws, state packets and loads beside the overlay do not drain at the boundary");
     check(top({header(0x15), 1, 1, 1}) == PipeCensusDrain::Dispatch && top({header(0x16)}) == PipeCensusDrain::IndirectDispatch && top({header(0x49)}) == PipeCensusDrain::Label && top({header(0x50)}) == PipeCensusDrain::Dma && top({header(0x10) | (0x17u << 2u)}, false, true) == PipeCensusDrain::Flip && top({header(0x46), 0x39}) == PipeCensusDrain::Other && top({header(0x9f), 0x5000, 0, 0, 3}) == PipeCensusDrain::Overlap, "record pipe: direct and indirect dispatches, labels, copies, flips, sample dumps and loads over the overlay drain");
+    check(!top({header(0x15), 1, 1, 1}, false, false, true) && top({header(0x16)}, false, false, true) == PipeCensusDrain::IndirectDispatch && top({header(0x49)}, false, false, true) == PipeCensusDrain::Label && top({header(0x10) | (0x17u << 2u)}, false, true, true) == PipeCensusDrain::Flip && top({header(0x9f), 0x5000, 0, 0, 3}, false, false, true) == PipeCensusDrain::Overlap, "record pipe: with dispatches on, a direct dispatch decides in the packet; indirect ones, labels, flips and loads over the overlay still drain");
 
     // The stale handshake: B raises k and waits, A redoes k and finishes it, B consumes k; a later
     // raise of another item is a new handshake.
@@ -629,6 +632,50 @@ void testRecordPipe() {
     log.Begin(4 + Ring::Depth).push_back({0x8000, 0x9000});
     check(log.Writer(2, 6, 0x1fff, 0x2000) == 3 && log.Writer(2, 6, 0x1800, 0x1801) == 5 && log.Writer(3, 6, 0x1000, 0x1800) == 0 && log.Writer(2, 5, 0x1800, 0x1801) == 3 && log.Writer(2, 3, 0, ~0ull) == 0 && log.Writer(0, 1, 0, ~0ull) == 0, "record pipe verify: only the items between the check and the item count, the newest first");
     check(log.Writer(2, 6, 0x3000, 0x3100) == 0 && log.Writer(Ring::Depth, 5 + Ring::Depth, 0x8fff, 0x9000) == 4 + Ring::Depth && log.Writer(2, 6, 0x2000, 0x3000) == 0, "record pipe verify: a reused slot answers for its new item only, and ranges are half-open");
+
+    // Stage 3's mixed ring, D C C L D: draws and dispatches share the serials, the overlay (a draw's
+    // targets, a dispatch's buffers) and the prune; the label drains at the top whatever the kinds.
+    Ring mixed;
+    RecordPipeOverlay unrecorded;
+    std::array<RecordPipeKind, Ring::Depth> kinds{};
+    const auto hand = [&](RecordPipeKind kind, std::uint64_t begin, std::uint64_t end) {
+        const auto serial = mixed.NextFree();
+        kinds[Ring::Slot(serial)] = kind;
+        unrecorded.Add({begin, end, kind == RecordPipeKind::Draw ? target : write, serial});
+        mixed.Publish(serial);
+        return serial;
+    };
+    const auto record = [&] {
+        const auto serial = mixed.NextItem();
+        mixed.Consume(serial);
+        unrecorded.Prune(serial);
+        return kinds[Ring::Slot(serial)];
+    };
+    bool mixedOk = hand(RecordPipeKind::Draw, 0x1000, 0x2000) == 1 && hand(RecordPipeKind::Dispatch, 0x2000, 0x2100) == 2 && hand(RecordPipeKind::Dispatch, 0x2080, 0x2180) == 3;
+    mixedOk = mixedOk && record() == RecordPipeKind::Draw && record() == RecordPipeKind::Dispatch && unrecorded.ranges.size() == 1 && unrecorded.Overlaps(0x1000, 0x2080) == 0 && unrecorded.Overlaps(0x2100, 0x2101) == write;
+    mixedOk = mixedOk && RecordPipeTopDrain(std::vector<std::uint32_t>{header(0x49)}, false, false, false, unrecorded, true) == PipeCensusDrain::Label;
+    mixedOk = mixedOk && record() == RecordPipeKind::Dispatch && mixed.NextItem() == 0 && unrecorded.ranges.empty() && hand(RecordPipeKind::Draw, 0x1000, 0x2000) == 4 && kinds[Ring::Slot(4)] == RecordPipeKind::Draw;
+    check(mixedOk, "record pipe: draws and dispatches take serials in order, record in order and prune the overlay by serial whatever the kind");
+
+    // The estimate check: a logged write the item's estimate ranges, joined end to end, cover is no
+    // miss; the first one they do not cover is.
+    using Ranges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    const Ranges estimate{{0x1000, 0x2000}, {0x2000, 0x2800}, {0x4000, 0x5000}};
+    check(!RecordPipeEstimateMiss(Ranges{{0x1800, 0x2400}, {0x4000, 0x5000}, {0x4fff, 0x4fff}}, estimate) && !RecordPipeEstimateMiss(Ranges{}, estimate), "record pipe verify: writes inside the joined estimate are covered");
+    check(RecordPipeEstimateMiss(Ranges{{0x1000, 0x1100}, {0x2700, 0x2900}}, estimate) == std::pair<std::uint64_t, std::uint64_t>{0x2700, 0x2900} && RecordPipeEstimateMiss(Ranges{{0x3000, 0x3001}}, estimate) && RecordPipeEstimateMiss(Ranges{{0x1000, 0x1001}}, Ranges{}), "record pipe verify: the first write past the estimate is the miss");
+
+    // A storage image's estimate: the surface + 64 KiB from its base (a 16x16 linear 2D T#, packed as
+    // tests/GuestTextureResource.cpp does); a null T# none; no words everything.
+    const std::array<std::uint32_t, 8> image{0x123456u, (56u << 20u) | (3u << 30u), 3u | (15u << 14u), 4u | (5u << 3u) | (6u << 6u) | (7u << 9u) | (9u << 28u), 0, 0, 0, 0};
+    const auto surfaceBytes = AgcDriver::Graphics::DescribeSurface(AgcDriver::Graphics::DecodeTextureResource(image)).guestBytes;
+    Ranges ranges;
+    RecordPipeImageRanges(image, ranges);
+    bool imageOk = surfaceBytes >= 1024 && ranges == Ranges{{0x12345600ull, 0x12345600ull + surfaceBytes + 65536}};
+    ranges.clear();
+    RecordPipeImageRanges(std::vector<std::uint32_t>(8, 0), ranges);
+    imageOk = imageOk && ranges.empty();
+    RecordPipeImageRanges({}, ranges);
+    check(imageOk && ranges == Ranges{{0, ~0ull}}, "record pipe: a storage image's estimate is its surface + 64 KiB, a null T# none, an unknown one everything");
 }
 
 // The fast dispatch (F5): the compare its verify mode makes between the old path's capture and the

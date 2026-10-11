@@ -8,7 +8,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "Recompiler.hpp"
 #include <array>
@@ -22,12 +24,16 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
-// Slot k = serial % Depth: the item's whole DrawScratch (stages, results, snapshots and every byte
-// they point into), the rest its locked half reads, and its queue state for a redo.
+// Slot k = serial % Depth: a draw's whole DrawScratch (stages, results, snapshots and every byte they
+// point into), the rest its locked half reads, and its queue state for a redo; or a dispatch (stage 3;
+// the scratch idles). APS5_RECORD_PIPE_VERIFY: the item's overlay estimate.
 struct RecordPipeSlot {
+    RecordPipeKind kind = RecordPipeKind::Draw;
     DrawScratch scratch;
     RecordPipeDraw draw;
     QueueStateMark mark;
+    RecordPipeDispatch dispatch;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> estimate;
 };
 
 // The [pipe] line's dispatch counts (NoteRecordPipeDispatch): handed over (eligible; those writing a
@@ -48,9 +54,9 @@ struct RecordPipeState {
     // APS5_RECORD_PIPE_VERIFY: the write log (B's; A's while it redoes a stale item) and the counts
     // (atomics: A checks the draws it drained for, B the items it records).
     RecordPipeWriteLog writeLog;
-    std::atomic<std::uint64_t> verifyMissTotal{0}, verifyChecks{0}, verifyMisses{0};
+    std::atomic<std::uint64_t> verifyMissTotal{0}, verifyChecks{0}, verifyMisses{0}, verifyEstimateMissTotal{0}, verifyEstimateMisses{0};
     std::unique_ptr<QueueState> redoQueue;
-    std::uint64_t run = 0, items = 0, runs = 0, staleRedos = 0, overlayDraws = 0, overlayLoads = 0;
+    std::uint64_t run = 0, items = 0, runs = 0, staleRedos = 0, overlayDraws = 0, overlayLoads = 0, overlayDispatches = 0;
     std::array<std::uint64_t, PipeCensusDrains> drains{};
     double ringWaitMs = 0, drainWaitMs = 0;
     // The drains that found unrecorded items, and A's wait in them, by reason.
@@ -58,8 +64,10 @@ struct RecordPipeState {
     std::array<double, PipeCensusDrains> drainWaitByReason{};
     // Due batch submits A left to B, and B's.
     std::uint64_t submitsLeft = 0;
-    // S3.0 (APS5_PROFILE_DRAW): queue-0 dispatches at the would-be hand-over, by verdict.
+    // S3.0 (APS5_PROFILE_DRAW): queue-0 dispatches at the would-be hand-over, by verdict; and those
+    // handed over (S3.1).
     std::array<std::uint64_t, PipeDispatchCounts> dispatches{};
+    std::uint64_t dispatchItems = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
     std::atomic<std::uint64_t> holds{0}, busyNs{0}, lockWaitNs{0}, bSubmits{0};
 };
@@ -112,6 +120,28 @@ void verifyPipeReads(RecordPipeState& pipe, std::span<const ShaderRecompiler::Me
         if (total <= 20 || total % 1000 == 0) std::fprintf(stderr, "[pipe] verify miss: %s %llu (opcode 0x%x, key 0x%llx) read [0x%llx,0x%llx) written by item %llu (unrecorded at its capture); overlay estimate had it: no\n", who, static_cast<unsigned long long>(serial), opcode, static_cast<unsigned long long>(key), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), static_cast<unsigned long long>(writer));
         return;
     }
+}
+
+// APS5_RECORD_PIPE_VERIFY, A at hand-over: the overlay ranges left under the item's serial (its own,
+// and the known ranges that took it), the estimate verifyPipeEstimate checks its writes against.
+void notePipeEstimate(const RecordPipeOverlay& overlay, std::uint64_t serial, std::vector<std::pair<std::uint64_t, std::uint64_t>>& estimate) {
+    estimate.clear();
+    for (const auto& range : overlay.ranges) {
+        if (range.serial == serial) estimate.emplace_back(range.begin, range.end);
+    }
+}
+
+// B, after recording item `serial` (and A's redo, if it turned stale): a logged write outside the
+// item's estimate (RecordPipeEstimateMiss) is a gap in the overlay, unless it is a write-back of an
+// older image.
+void verifyPipeEstimate(RecordPipeState& pipe, std::uint64_t serial, std::uint32_t opcode, std::uint64_t key, std::span<const std::pair<std::uint64_t, std::uint64_t>> estimate) {
+    const auto& item = pipe.writeLog.items[RecordPipeRing::Slot(serial)];
+    if (item.serial != serial) return;
+    const auto miss = RecordPipeEstimateMiss(item.ranges, estimate);
+    if (!miss) return;
+    pipe.verifyEstimateMisses.fetch_add(1, std::memory_order_relaxed);
+    const auto total = pipe.verifyEstimateMissTotal.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (total <= 20 || total % 1000 == 0) std::fprintf(stderr, "[pipe] verify estimate miss: item %llu (opcode 0x%x, key 0x%llx) wrote [0x%llx,0x%llx)\n", static_cast<unsigned long long>(serial), opcode, static_cast<unsigned long long>(key), static_cast<unsigned long long>(miss->first), static_cast<unsigned long long>(miss->second));
 }
 
 // B submits a batch whose oldest recorded label is past the deadline (APS5_LABEL_FLUSH_US, 1 ms) after
@@ -193,6 +223,38 @@ bool RecordPipeActive() {
     return active;
 }
 
+bool RecordPipeDispatchActive() {
+    static const bool active = [] {
+        const char* value = std::getenv("APS5_RECORD_PIPE_DISPATCH");
+        if (value == nullptr || std::strcmp(value, "1") != 0 || !RecordPipeActive()) return false;
+        const bool declined = std::getenv("APS5_PROBE_DISPATCH") != nullptr || std::getenv("APS5_ASPECT_PROBE") != nullptr;
+        std::fprintf(stderr, "[pipe] queue 0 recording pipe: direct dispatches %s\n", declined ? "declined: a dispatch or aspect probe is set" : "on");
+        return !declined;
+    }();
+    return active;
+}
+
+void RecordPipeImageRanges(std::span<const std::uint32_t> words, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    if (words.size() >= 8 && words[0] == 0 && (words[1] & 0xffu) == 0) return;
+    std::uint64_t base = 0, bytes = 0, dcc = 0;
+    if (words.size() >= 8) {
+        try {
+            const auto image = Graphics::DecodeTextureResource(words.first(8));
+            base = image.baseAddress;
+            dcc = image.dccAddress;
+            bytes = Graphics::DescribeSurface(image).guestBytes;
+        } catch (const std::exception&) {
+            bytes = 0;
+        }
+    }
+    if (bytes == 0) {
+        ranges.emplace_back(0, ~0ull);
+        return;
+    }
+    ranges.emplace_back(base, base + bytes + 65536);
+    if (dcc != 0) ranges.emplace_back(dcc, dcc + bytes / 256 + 4096);
+}
+
 void NoteRecordPipeDispatch(const RecordPipeDispatchFacts& facts) {
     auto& counts = recordPipe().dispatches;
     if (RecordPipeDispatchVerdict(facts).eligible) {
@@ -207,6 +269,10 @@ bool Driver::recordPipeDrawing(std::uint32_t queue) {
     return queue == 0 && RecordPipeActive() && !recordPipeReplaying();
 }
 
+bool Driver::recordPipeDispatching(std::uint32_t queue) {
+    return queue == 0 && RecordPipeDispatchActive() && !recordPipeReplaying();
+}
+
 DrawScratch* Driver::recordPipeScratch() {
     auto& pipe = recordPipe();
     const auto serial = pipe.ring.NextFree();
@@ -217,15 +283,15 @@ std::uint64_t Driver::recordPipeConsumed() {
     return recordPipe().ring.consumed.load(std::memory_order_acquire);
 }
 
-bool Driver::recordPipeOverlaps(std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t consumed) {
+bool Driver::recordPipeOverlaps(std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t consumed, bool forDispatch) {
     auto& pipe = recordPipe();
-    // `consumed` as the draw began: the items recorded by then were in the pending writes its
+    // `consumed` as the draw or dispatch began: the items recorded by then were in the pending writes its
     // captures and validation consulted.
     pipe.overlay.Prune(consumed);
     if (pipe.overlay.ranges.empty()) return false;
     for (const auto& region : regions) {
         if (pipe.overlay.Overlaps(region.guestAddress, region.guestAddress + region.bytes.size()) == 0) continue;
-        ++pipe.overlayDraws;
+        ++(forDispatch ? pipe.overlayDispatches : pipe.overlayDraws);
         return true;
     }
     return false;
@@ -242,10 +308,37 @@ void Driver::handOverDraw(DrawScratch& scratch, RecordPipeDraw&& draw, const Que
     const auto serial = pipe.ring.handed.load(std::memory_order_relaxed) + 1;
     auto& slot = pipe.slots[RecordPipeRing::Slot(serial)];
     require(&slot.scratch == &scratch && pipe.ring.NextFree() == serial, "recording pipe: the draw's scratch is not the next free slot");
+    slot.kind = RecordPipeKind::Draw;
     slot.draw = std::move(draw);
     slot.mark.Save(queue);
     for (const auto& stage : scratch.stages) notePipeItemWrites(*stage.program, serial, pipe.overlay);
     notePipeTargets(slot.draw.decode->state, serial, pipe.overlay);
+    // Stage 3: the storage images the stages write too (stage 1 left them out).
+    if (RecordPipeDispatchActive()) {
+        for (const auto& stage : scratch.stages) notePipeItemImages(*stage.program, serial, pipe.overlay);
+    }
+    if (recordPipeVerify()) notePipeEstimate(pipe.overlay, serial, slot.estimate);
+    publishRecordPipeItem(serial);
+}
+
+void Driver::handOverDispatch(RecordPipeDispatch&& item) {
+    auto& pipe = recordPipe();
+    const auto serial = pipe.ring.handed.load(std::memory_order_relaxed) + 1;
+    // The packet's boundary waited for the slot (recordPipeBoundary).
+    require(pipe.ring.NextFree() == serial, "recording pipe: the dispatch's slot is not free");
+    auto& slot = pipe.slots[RecordPipeRing::Slot(serial)];
+    slot.kind = RecordPipeKind::Dispatch;
+    slot.dispatch = std::move(item);
+    notePipeItemWrites(*slot.dispatch.compiled, serial, pipe.overlay);
+    notePipeItemImages(*slot.dispatch.compiled, serial, pipe.overlay);
+    if (recordPipeVerify()) notePipeEstimate(pipe.overlay, serial, slot.estimate);
+    ++pipe.dispatchItems;
+    publishRecordPipeItem(serial);
+}
+
+// A, the slot filled: B starts with the first item; the release publishes the slot.
+void Driver::publishRecordPipeItem(std::uint64_t serial) {
+    auto& pipe = recordPipe();
     if (!pipe.thread.joinable()) pipe.thread = HostThread([this] { runRecordPipe(); });
     pipe.ring.Publish(serial);
     recordPipeHandedDraw() = true;
@@ -335,8 +428,10 @@ void Driver::recordPipeBoundary(std::span<const std::uint32_t> packet, std::uint
     auto& pipe = recordPipe();
     serviceRecordPipe();
     const bool special = header == FlipPacketHeader || header == RenderingWaitPacketHeader;
-    if (!special && Pm4::DrawOpcode((header >> 8u) & 0xffu)) {
-        // The draw's lease takes slot handed + 1: wait while B still owns it.
+    const bool dispatches = RecordPipeDispatchActive();
+    const auto opcode = (header >> 8u) & 0xffu;
+    if (!special && (Pm4::DrawOpcode(opcode) || (dispatches && opcode == 0x15))) {
+        // The draw's lease or the dispatch's hand-over takes slot handed + 1: wait while B still owns it.
         const auto handed = pipe.ring.handed.load(std::memory_order_relaxed);
         if (!RecordPipeRing::Full(handed, pipe.ring.consumed.load(std::memory_order_acquire))) return;
         const auto start = recordPipeProfile() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -347,7 +442,7 @@ void Driver::recordPipeBoundary(std::span<const std::uint32_t> packet, std::uint
     // No run open: the ring is empty.
     if (pipe.run == 0) return;
     pipe.overlay.Prune(pipe.ring.consumed.load(std::memory_order_acquire));
-    const auto why = RecordPipeTopDrain(packet, false, header == FlipPacketHeader, header == RenderingWaitPacketHeader, pipe.overlay);
+    const auto why = RecordPipeTopDrain(packet, false, header == FlipPacketHeader, header == RenderingWaitPacketHeader, pipe.overlay, dispatches);
     if (!why) return;
     if (*why == PipeCensusDrain::Overlap) ++pipe.overlayLoads;
     drainRecordPipe(*why);
@@ -370,12 +465,12 @@ void Driver::recordPipeSubmissionEnd() {
     const auto ms = [](std::atomic<std::uint64_t>& ns) { return static_cast<double>(ns.exchange(0, std::memory_order_relaxed)) / 1e6; };
     const auto busyMs = ms(pipe.busyNs), lockWaitMs = ms(pipe.lockWaitNs);
     const auto& counts = pipe.dispatches;
-    char dispatches[256];
-    std::snprintf(dispatches, sizeof(dispatches), ", dispatches: eligible %llu (image writes %llu), bda loads %llu, bda stores %llu, labels pending %llu, local packet %llu, no window %llu", static_cast<unsigned long long>(counts[DispatchEligible]), static_cast<unsigned long long>(counts[DispatchImageWrites]), static_cast<unsigned long long>(counts[DispatchBdaLoads]), static_cast<unsigned long long>(counts[DispatchBdaStores]), static_cast<unsigned long long>(counts[DispatchLabelsPending]), static_cast<unsigned long long>(counts[DispatchLocal]), static_cast<unsigned long long>(counts[DispatchNoWindow]));
-    char verify[80] = "";
-    if (recordPipeVerify()) std::snprintf(verify, sizeof(verify), ", verify: checks %llu, misses %llu", static_cast<unsigned long long>(pipe.verifyChecks.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(pipe.verifyMisses.exchange(0, std::memory_order_relaxed)));
-    std::fprintf(stderr, "[pipe] queue 0 (10 s): items %llu, runs %llu (mean %.1f), holds %llu, drains:%s, A waited ms (ring full) %.1f, A drain wait ms %.1f (by reason, ms/drains that waited:%s), B busy ms %.1f, B lock wait ms %.1f, B deadline submits %llu (A left %llu to B), stale redos %llu, overlay hits %llu (draw %llu, load %llu)%s%s\n", static_cast<unsigned long long>(pipe.items), static_cast<unsigned long long>(pipe.runs), pipe.runs == 0 ? 0.0 : static_cast<double>(pipe.items) / static_cast<double>(pipe.runs), static_cast<unsigned long long>(pipe.holds.exchange(0, std::memory_order_relaxed)), drains.c_str(), pipe.ringWaitMs, pipe.drainWaitMs, waits.c_str(), busyMs, lockWaitMs, static_cast<unsigned long long>(pipe.bSubmits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(pipe.submitsLeft), static_cast<unsigned long long>(pipe.staleRedos), static_cast<unsigned long long>(pipe.overlayDraws + pipe.overlayLoads), static_cast<unsigned long long>(pipe.overlayDraws), static_cast<unsigned long long>(pipe.overlayLoads), dispatches, verify);
-    pipe.items = pipe.runs = pipe.staleRedos = pipe.overlayDraws = pipe.overlayLoads = pipe.submitsLeft = 0;
+    char dispatches[320];
+    std::snprintf(dispatches, sizeof(dispatches), ", dispatches: handed %llu, eligible %llu (image writes %llu), bda loads %llu, bda stores %llu, labels pending %llu, local packet %llu, no window %llu", static_cast<unsigned long long>(pipe.dispatchItems), static_cast<unsigned long long>(counts[DispatchEligible]), static_cast<unsigned long long>(counts[DispatchImageWrites]), static_cast<unsigned long long>(counts[DispatchBdaLoads]), static_cast<unsigned long long>(counts[DispatchBdaStores]), static_cast<unsigned long long>(counts[DispatchLabelsPending]), static_cast<unsigned long long>(counts[DispatchLocal]), static_cast<unsigned long long>(counts[DispatchNoWindow]));
+    char verify[128] = "";
+    if (recordPipeVerify()) std::snprintf(verify, sizeof(verify), ", verify: checks %llu, misses %llu, estimate misses %llu", static_cast<unsigned long long>(pipe.verifyChecks.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(pipe.verifyMisses.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(pipe.verifyEstimateMisses.exchange(0, std::memory_order_relaxed)));
+    std::fprintf(stderr, "[pipe] queue 0 (10 s): items %llu, runs %llu (mean %.1f), holds %llu, drains:%s, A waited ms (ring full) %.1f, A drain wait ms %.1f (by reason, ms/drains that waited:%s), B busy ms %.1f, B lock wait ms %.1f, B deadline submits %llu (A left %llu to B), stale redos %llu, overlay hits %llu (draw %llu, load %llu, dispatch %llu)%s%s\n", static_cast<unsigned long long>(pipe.items), static_cast<unsigned long long>(pipe.runs), pipe.runs == 0 ? 0.0 : static_cast<double>(pipe.items) / static_cast<double>(pipe.runs), static_cast<unsigned long long>(pipe.holds.exchange(0, std::memory_order_relaxed)), drains.c_str(), pipe.ringWaitMs, pipe.drainWaitMs, waits.c_str(), busyMs, lockWaitMs, static_cast<unsigned long long>(pipe.bSubmits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(pipe.submitsLeft), static_cast<unsigned long long>(pipe.staleRedos), static_cast<unsigned long long>(pipe.overlayDraws + pipe.overlayLoads + pipe.overlayDispatches), static_cast<unsigned long long>(pipe.overlayDraws), static_cast<unsigned long long>(pipe.overlayLoads), static_cast<unsigned long long>(pipe.overlayDispatches), dispatches, verify);
+    pipe.items = pipe.runs = pipe.staleRedos = pipe.overlayDraws = pipe.overlayLoads = pipe.overlayDispatches = pipe.submitsLeft = pipe.dispatchItems = 0;
     pipe.drains = pipe.drainsWaited = {};
     pipe.dispatches = {};
     pipe.drainWaitByReason = {};
@@ -384,12 +479,6 @@ void Driver::recordPipeSubmissionEnd() {
 }
 
 bool Driver::recordPipeItem(DrawScratch& scratch, RecordPipeDraw& item) {
-    // As lockForDraw: a device replaced since A prepared the draw (never a windowed one, so rare).
-    if (auto current = device.Load(); current != nullptr && current != item.device) {
-        static std::atomic<std::uint64_t> replaced{0};
-        std::fprintf(stderr, "[pipe] device replaced before recording (%llu)\n", static_cast<unsigned long long>(++replaced));
-        item.device = std::move(current);
-    }
     noteDrawWriters(scratch.stages, 0);
     const auto& graphics = item.decode->state;
     try {
@@ -449,19 +538,32 @@ void Driver::runRecordPipe() noexcept {
                 release();
                 std::this_thread::yield();
             }
+            auto& slot = pipe.slots[RecordPipeRing::Slot(serial)];
+            const bool dispatchItem = slot.kind == RecordPipeKind::Dispatch;
+            const auto opcode = dispatchItem ? 0x15u : slot.draw.opcode;
+            const auto key = dispatchItem ? slot.dispatch.key : slot.draw.key;
             if (!gpuLock.owns_lock()) {
-                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+                // A hold's lock site is its first item's kind.
+                GuestMemory::TagGpuLockSite(dispatchItem ? GuestMemory::GpuLockSite::Dispatch : GuestMemory::GpuLockSite::Draw);
                 const auto start = std::chrono::steady_clock::now();
                 gpuLock.lock();
                 held = std::chrono::steady_clock::now();
                 pipe.holds.fetch_add(1, std::memory_order_relaxed);
                 if (profile) pipe.lockWaitNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(held - start).count()), std::memory_order_relaxed);
             }
-            auto& slot = pipe.slots[RecordPipeRing::Slot(serial)];
-            GuestMemory::SetCurrentPacket(slot.draw.opcode, 0);
-            if (verify) verifyPipeReads(pipe, slot.scratch.memory, slot.draw.consumed, serial, "item", slot.draw.opcode, slot.draw.key);
+            GuestMemory::SetCurrentPacket(opcode, 0);
+            if (verify) verifyPipeReads(pipe, dispatchItem ? slot.dispatch.captured : slot.scratch.memory, dispatchItem ? slot.dispatch.consumed : slot.draw.consumed, serial, "item", opcode, key);
             GuestMemory::recordedWrites = verify ? &pipe.writeLog.Begin(serial) : nullptr;
-            const bool stale = recordPipeItem(slot.scratch, slot.draw);
+            // As lockForDraw: a device replaced since A prepared the item (never a windowed one, so rare).
+            auto& itemDevice = dispatchItem ? slot.dispatch.device : slot.draw.device;
+            if (auto current = device.Load(); current != nullptr && current != itemDevice) {
+                static std::atomic<std::uint64_t> replaced{0};
+                std::fprintf(stderr, "[pipe] device replaced before recording (%llu)\n", static_cast<unsigned long long>(++replaced));
+                itemDevice = std::move(current);
+            }
+            bool stale = false;
+            if (dispatchItem) recordPipeDispatch(slot.dispatch);
+            else stale = recordPipeItem(slot.scratch, slot.draw);
             GuestMemory::recordedWrites = nullptr;
             submitDue();
             if (stale) {
@@ -472,7 +574,9 @@ void Driver::runRecordPipe() noexcept {
                 pipeWait(pipe.bSleeping, pipe.bWake, [&] { return pipe.stopping.load(std::memory_order_acquire) || pipe.stale.Redone(serial); }, [] {});
                 if (!pipe.stale.Redone(serial)) break;
             }
+            if (verify) verifyPipeEstimate(pipe, serial, opcode, key, slot.estimate);
             // The device call published the item's pending writes: release what it held, then the slot.
+            if (dispatchItem) slot.dispatch = {};
             auto& scratch = slot.scratch;
             scratch.results.clear();
             scratch.hits.results.clear();

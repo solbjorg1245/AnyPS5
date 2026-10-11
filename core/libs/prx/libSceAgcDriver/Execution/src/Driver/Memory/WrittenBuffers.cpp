@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include <algorithm>
 
@@ -82,6 +83,12 @@ void Driver::notePipeCensusWrites(const ShaderRecompiler::RecompileResult& compi
 
 void Driver::notePipeItemWrites(const ShaderRecompiler::RecompileResult& compiled, std::uint64_t serial, PipeCensusOverlay& overlay) {
     forEachWrittenBuffer(compiled, [&](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool) { overlay.Add({begin, end, PipeCensusOverlay::Write, serial}); });
+}
+
+void Driver::notePipeItemImages(const ShaderRecompiler::RecompileResult& compiled, std::uint64_t serial, PipeCensusOverlay& overlay) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    forEachWrittenImage(compiled, [&](std::span<const std::uint32_t> words) { RecordPipeImageRanges(words, ranges); });
+    for (const auto& [begin, end] : ranges) overlay.Add({begin, end, PipeCensusOverlay::Target, serial});
 }
 
 std::optional<WrittenBuffer> Driver::newestWriterLocked(std::uint64_t begin, std::uint64_t end) const {

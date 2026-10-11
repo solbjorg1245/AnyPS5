@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
@@ -18,6 +19,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     // APS5_ASPECT_PROBE: the display buffer writes of this dispatch (DepthSurface.hpp).
     const Graphics::AspectProbeDispatch aspectProbe(address);
+    // APS5_RECORD_PIPE_DISPATCH (stage 3): a queue-0 direct dispatch may go to the recording pipe;
+    // B's progress as it begins, for the overlay check of its captures (as Draw.cpp).
+    const bool pipeDispatch = recordPipeDispatching(submission.queue);
+    const auto pipeConsumed = pipeDispatch ? recordPipeConsumed() : 0;
     auto it = submission.shaders->upper_bound(address);
     require(it != submission.shaders->begin(), "compute program does not belong to a registered shader");
     --it;
@@ -272,6 +277,15 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         phaseTiming.Phase(PhaseRecompile);
         insertDispatch(address, key, noDispatchCache, profile, it->second, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming, baseKey, userData, baseCandidates);
     }
+    // A capture or validation over a handed item's unrecorded writes: drain, then the packet again (as
+    // Draw.cpp; before the data-hit check below, whose drain clears the overlay).
+    if (pipeDispatch && recordPipeOverlaps(captured, pipeConsumed, true)) {
+        drainRecordPipe(PipeCensusDrain::Overlap);
+        dispatch(queue, packet, submission, indirectArguments);
+        return;
+    }
+    // APS5_VERIFY_DATA_HITS: its fresh capture sees every write.
+    if (pipeDispatch && verifyDataHits() && (dataHit || relocated != nullptr)) drainRecordPipe(PipeCensusDrain::Other);
     if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, localDevice->Serial(), request, memory, address, *keepVariant, liveWords, *compiledResult);
     if (verifyDataHits() && relocated != nullptr) verifyDataHit(snapshot, codeOffset, localDevice->Serial(), request, memory, address, *relocated, relocated->words, *compiledResult);
 
@@ -315,16 +329,40 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     };
     phaseTiming.Phase(PhaseSnapshots);
 
-    // APS5_RECORD_PIPE with APS5_PROFILE_DRAW: what stage 3 would do with the dispatch here, before
-    // anything records (the [pipe] line's dispatch counts; parallel-recording-s3-plan.md S3.0).
-    if (profile && submission.queue == 0 && RecordPipeActive()) {
+    // APS5_RECORD_PIPE: stage 3's verdict on the dispatch here, before anything records. Handed over
+    // (APS5_RECORD_PIPE_DISPATCH), B runs the rest (recordPipeDispatch) and A's row ends; declined, the
+    // pipe drains first (PrepareDispatch must see every write). APS5_PROFILE_DRAW: the [pipe] line's
+    // dispatch counts (parallel-recording-s3-plan.md S3.0).
+    if (submission.queue == 0 && (pipeDispatch || (profile && RecordPipeActive()))) {
         const auto* const commands = submission.commands.data();
         const bool local = indirectArguments != 0 || packet.data() < commands || packet.data() >= commands + submission.commands.size();
         RecordPipeDispatchFacts facts{!recordPipeDrawing(submission.queue), local, localDevice->Window() != nullptr, !deferredLabels().labels.empty()};
         facts.bda = std::any_of(compiled.bindings.begin(), compiled.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; });
-        facts.bdaStores = facts.bda && Graphics::ProgramStoresThroughBda(compiled);
-        facts.imageWrites = writesStorageImages(compiled);
-        NoteRecordPipeDispatch(facts);
+        if (profile) {
+            facts.bdaStores = facts.bda && Graphics::ProgramStoresThroughBda(compiled);
+            facts.imageWrites = writesStorageImages(compiled);
+            NoteRecordPipeDispatch(facts);
+        }
+        const auto verdict = RecordPipeDispatchVerdict(facts);
+        if (pipeDispatch && verdict.eligible) {
+            handOverDispatch({std::move(localDevice), std::move(compiledResult), std::move(keepVariant), std::move(attachVariant), std::move(shaderMemory), it->second, std::move(captured), std::move(snapshots), std::move(liveWords), groups, address, key, pipeConsumed, cached, dataHit});
+            phaseTiming.Phase(PhaseTail);
+            if (profile) {
+                auto& pending = pendingDispatchPhases();
+                pending.outcome = DispatchOutcome::Real;
+                pending.phases = pending.handed = true;
+                pending.hit = cached;
+                pending.validated = validated;
+                pending.ms = phaseMs;
+                pending.tailAt = phaseLap;
+            }
+            return;
+        }
+        if (pipeDispatch) {
+            drainRecordPipe(verdict.drain.value_or(PipeCensusDrain::Dispatch));
+            verifyRecordPipeDrained(captured, pipeConsumed, 0x15, key);
+            phaseTiming.Phase(PhaseLockWait);
+        }
     }
 
     std::shared_ptr<RecipeHit> recipeHit;
@@ -431,6 +469,109 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         pending.missKind = split.missKind;
     }
     if (profile && ++dispatches % 100 == 0) std::fprintf(stderr, "[gpu] %llu dispatches (%llu dispatch cache hits, %llu evictions, %llu recompile cache hits): capture %.1f s, cache key %.1f s, recompile %.1f s, device %.1f s\n", static_cast<unsigned long long>(dispatches), static_cast<unsigned long long>(dispatchCacheHits), static_cast<unsigned long long>(dispatchCacheEvictions), static_cast<unsigned long long>(cacheHits), captureMs / 1000, keyMs / 1000, recompileMs / 1000, deviceMs / 1000);
+}
+
+// B's half of a handed dispatch (runRecordPipe, under its hold): the device part of dispatch() above
+// from PrepareRecipe on, without the lock and the deferred labels (none were pending at hand-over,
+// and label packets drain before they run); a failure is reported and skipped as tolerate does.
+// Review the two together. APS5_PROFILE_DRAW: the "queue 0 recording pipe" rows of the [dispatch] lines.
+void Driver::recordPipeDispatch(RecordPipeDispatch& item) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto lap = std::chrono::steady_clock::now();
+    std::array<double, DriverPhaseCount> phaseMs{};
+    auto phaseLap = lap;
+    DispatchPhaseTiming phaseTiming{profile, lap, phaseMs, phaseLap};
+    const auto& localDevice = item.device;
+    const auto& compiled = *item.compiled;
+    const auto rethrow = [&](const std::exception& error) {
+        char where[64];
+        std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(item.address));
+        throw std::runtime_error(where + std::string(error.what()));
+    };
+    std::shared_ptr<RecipeHit> recipeHit;
+    try {
+        if (item.cached && item.keepVariant != nullptr && !stampValidate()) {
+            recipeHit = localDevice->PrepareRecipe(item.keepVariant->recipe.load(std::memory_order_acquire), false);
+            phaseTiming.Phase(PhaseRecipePrecheck);
+        }
+        std::shared_ptr<const Recipe> builtRecipe;
+        auto* const attachTo = stampValidate() ? nullptr : item.keepVariant != nullptr ? item.keepVariant.get() : item.attachVariant.get();
+        bool writersNoted = false;
+        const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
+        for (;;) {
+            std::shared_ptr<PreparedDispatch> prepared;
+            if (recipeHit == nullptr || VulkanDevice::VerifyRecipes()) {
+                try {
+                    prepared = localDevice->PrepareDispatch(compiled, item.snapshots);
+                } catch (const std::exception& error) {
+                    rethrow(error);
+                }
+                if (profile) {
+                    const auto now = std::chrono::steady_clock::now();
+                    const auto prepareMs = std::chrono::duration<double, std::milli>(now - phaseLap).count();
+                    phaseLap = now;
+                    double parts = 0;
+                    if (prepared != nullptr) {
+                        const auto phases = VulkanDevice::PreparePhaseMs(*prepared);
+                        phaseMs[PhasePrepareKey] += phases[0];
+                        phaseMs[PhasePrepareFind] += phases[1];
+                        phaseMs[PhasePreparePrecollect] += phases[2];
+                        phaseMs[PhasePreparePresync] += phases[3];
+                        phaseMs[PhasePrepareStageA] += phases[4];
+                        for (const auto part : phases) parts += part;
+                    }
+                    phaseMs[PhasePrepareOther] += std::max(0.0, prepareMs - parts);
+                }
+            }
+            if (profile) VulkanDevice::ThreadDeviceSplit() = {};
+            if (noteWrites && writerKeyedEvidence() && !writersNoted) {
+                noteWrittenBuffers(item.address, 0, compiled);
+                writersNoted = true;
+            }
+            phaseTiming.Phase(PhaseNoteWriters);
+            try {
+                if (recipeHit != nullptr) {
+                    VulkanDevice::IndirectOutcome outcome{0, 0};
+                    if (localDevice->DispatchRecipe(compiled, item.groups[0], item.groups[1], item.groups[2], 0, item.address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, item.dataHit) == RecipeOutcome::Rebuild) {
+                        recipeHit = nullptr;
+                        VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, false);
+                        continue;
+                    }
+                } else {
+                    localDevice->Dispatch(compiled, item.groups[0], item.groups[1], item.groups[2], item.snapshots, item.address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr);
+                }
+            } catch (const std::exception& error) {
+                rethrow(error);
+            }
+            if (builtRecipe != nullptr) {
+                if (item.dataHit) {
+                    auto own = std::make_shared<Recipe>(*builtRecipe);
+                    own->dataWordsHash = Graphics::ShaderResources::DataWordsHash({ShaderRecompiler::ShaderStage::Compute, item.keepVariant->compiled.get(), 0});
+                    builtRecipe = std::move(own);
+                }
+                attachTo->recipe.store(std::move(builtRecipe), std::memory_order_release);
+                VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, false);
+            }
+            break;
+        }
+        phaseTiming.Phase(PhaseDevice);
+        if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(item.address, 0, compiled);
+    } catch (const std::exception& error) {
+        reportSkip("dispatch", error.what());
+        return;
+    }
+    phaseTiming.Phase(PhaseTail);
+    if (!profile) return;
+    PendingDispatchPhases pending;
+    pending.outcome = DispatchOutcome::Real;
+    pending.phases = true;
+    pending.hit = item.cached;
+    pending.ms = phaseMs;
+    const auto& split = VulkanDevice::ThreadDeviceSplit();
+    pending.devicePath = static_cast<std::size_t>(recipeHit != nullptr ? VulkanDevice::DevicePath::Recipe : split.path);
+    pending.deviceSplit = split.ms;
+    pending.missKind = split.missKind;
+    addDriverPhases(Queue0Pipe, pending);
 }
 
 }

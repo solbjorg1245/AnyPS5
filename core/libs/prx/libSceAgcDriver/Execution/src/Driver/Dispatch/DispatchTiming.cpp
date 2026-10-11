@@ -11,11 +11,13 @@ void Driver::addDriverPhases(DispatchClass which, const PendingDispatchPhases& p
     ++totals.dispatches;
     if (pending.hit) ++totals.hits;
     if (pending.validated) ++totals.validations;
-    auto& path = totals.paths[pending.hit ? 1 : 0][std::min(pending.devicePath, DevicePathCount - 1)];
-    ++path.calls;
-    path.deviceMs += ms[PhaseDevice];
-    for (std::size_t i = 0; i < DeviceSplitRows; ++i) path.ms[i] += pending.deviceSplit[i];
-    ++totals.missKinds[std::min<std::size_t>(pending.missKind, 10)];
+    if (!pending.handed) {
+        auto& path = totals.paths[pending.hit ? 1 : 0][std::min(pending.devicePath, DevicePathCount - 1)];
+        ++path.calls;
+        path.deviceMs += ms[PhaseDevice];
+        for (std::size_t i = 0; i < DeviceSplitRows; ++i) path.ms[i] += pending.deviceSplit[i];
+        ++totals.missKinds[std::min<std::size_t>(pending.missKind, 10)];
+    }
     const auto now = std::chrono::steady_clock::now();
     if (now - driverPhasesReport < std::chrono::seconds(10)) return;
     driverPhasesReport = now;

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include <algorithm>
@@ -118,6 +119,8 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     ++fills;
     filledBytes += bytes;
     if (bytes != 0) {
+        // The recording pipe's items record before the fill (stage 3: a 0x15 no longer drains at the top).
+        if (recordPipeDispatching(queueId)) drainRecordPipe(PipeCensusDrain::Dma);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Fill);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         const auto holdStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
