@@ -112,7 +112,7 @@ std::string guestBuildVersion() {
 }
 
 // Stores the entries with the table's page writable only for the stores.
-bool writeTable(std::uint32_t* table, const std::array<PortSettings::TableWrite, 2>& writes) {
+bool writeTable(std::uint32_t* table, const std::vector<PortSettings::TableWrite>& writes) {
 #ifdef _WIN32
     SYSTEM_INFO info{};
     GetSystemInfo(&info);
@@ -140,6 +140,118 @@ bool writeTable(std::uint32_t* table, const std::array<PortSettings::TableWrite,
     mprotect(base, bytes, PROT_READ);
 #endif
     return true;
+}
+
+// Native aspect part 2: the code of the supported build (PE VAs, found at the same distance from the
+// tier table as in the image). CRenderDisplay::SetMode FUN_14091a600 loads a mode's render and display
+// size pairs with `vmovsd xmm0/xmm1, [rip+disp32]` (C5 FB 10 05/0D) from constants other code shares;
+// CRenderDisplay::Init FUN_14091ad80 creates its two 3840x2160 display buffers (mov edi/esi) and their
+// 1920x1080 views (mov edx/ecx); the display-size getters FUN_1409956d0/FUN_140995700 (mov ecx/eax).
+constexpr std::uintptr_t TierTableVa = 0x14251eb48;
+
+struct LoadSite {
+    std::uintptr_t va;
+    unsigned char modrm;
+    std::uintptr_t constant;
+    std::uint32_t width;
+    std::uint32_t height;
+};
+
+struct ImmediateSite {
+    std::uintptr_t va;
+    unsigned char opcode;
+    std::uint32_t value;
+    bool height;
+};
+
+struct TargetSites {
+    LoadSite shared;
+    LoadSite display;
+    std::array<ImmediateSite, 6> immediates;
+};
+
+// WantsPerf (1) and WantsHigh (3); WantsSuperHigh (4) loads one pair for both (its `shared` site, the
+// display one unused) and has WantsHigh's 4K buffers.
+constexpr std::array<ImmediateSite, 6> Display4kSites{{{0x14091af74, 0xbf, 3840, false}, {0x14091af79, 0xbe, 2160, true}, {0x14091b061, 0xbf, 3840, false},
+    {0x14091b066, 0xbe, 2160, true}, {0x1409956d7, 0xb9, 3840, false}, {0x140995707, 0xb9, 2160, true}}};
+constexpr TargetSites PerfSites{{0x14091a663, 0x05, 0x142509230, 1600, 900}, {0x14091a65b, 0x0d, 0x142507810, 1920, 1080},
+    {{{0x14091b00e, 0xba, 1920, false}, {0x14091b013, 0xb9, 1080, true}, {0x14091b0b4, 0xba, 1920, false}, {0x14091b0b9, 0xb9, 1080, true},
+      {0x1409956e8, 0xb8, 1920, false}, {0x140995718, 0xb8, 1080, true}}}};
+constexpr TargetSites HighSites{{0x14091a67f, 0x05, 0x142509550, 2560, 1440}, {0x14091a677, 0x0d, 0x142504830, 3840, 2160}, Display4kSites};
+constexpr TargetSites SuperHighSites{{0x14091a66d, 0x05, 0x142504830, 3840, 2160}, {}, Display4kSites};
+
+std::uint32_t readWord(std::uintptr_t address) {
+    std::uint32_t value = 0;
+    std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+    return value;
+}
+
+// The load's opcode, its target the expected constant, and the constant the expected pair.
+bool loadMatches(std::intptr_t delta, const LoadSite& site) {
+    const auto at = static_cast<std::uintptr_t>(static_cast<std::intptr_t>(site.va) + delta);
+    const auto* bytes = reinterpret_cast<const unsigned char*>(at);
+    if (bytes[0] != 0xc5 || bytes[1] != 0xfb || bytes[2] != 0x10 || bytes[3] != site.modrm) return false;
+    const auto disp = static_cast<std::int32_t>(readWord(at + 4));
+    const auto target = static_cast<std::uintptr_t>(static_cast<std::intptr_t>(at + 8) + disp);
+    if (target != static_cast<std::uintptr_t>(static_cast<std::intptr_t>(site.constant) + delta)) return false;
+    return readWord(target) == site.width && readWord(target + 4) == site.height;
+}
+
+bool immediateMatches(std::intptr_t delta, const ImmediateSite& site) {
+    const auto at = static_cast<std::uintptr_t>(static_cast<std::intptr_t>(site.va) + delta);
+    return *reinterpret_cast<const unsigned char*>(at) == site.opcode && readWord(at + 1) == site.value;
+}
+
+// A committed page for the size pairs within a rel32 of `anchor` (below the image, else above it).
+std::uint32_t* allocateNear(std::uintptr_t anchor) {
+#ifdef _WIN32
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const std::uintptr_t granularity = info.dwAllocationGranularity;
+    constexpr std::uintptr_t reach = 0x70000000;
+    const auto tryAt = [&](std::uintptr_t candidate) -> std::uint32_t* {
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(reinterpret_cast<const void*>(candidate), &region, sizeof(region)) != sizeof(region) || region.State != MEM_FREE) return nullptr;
+        return static_cast<std::uint32_t*>(VirtualAlloc(reinterpret_cast<void*>(candidate), info.dwPageSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    };
+    for (auto candidate = (anchor & ~(granularity - 1)) - granularity; candidate > granularity && anchor - candidate < reach; candidate -= granularity) {
+        if (auto* page = tryAt(candidate)) return page;
+    }
+    for (auto candidate = (anchor & ~(granularity - 1)) + granularity; candidate - anchor < reach; candidate += granularity) {
+        if (auto* page = tryAt(candidate)) return page;
+    }
+#else
+    static_cast<void>(anchor);
+#endif
+    return nullptr;
+}
+
+// Writes `bytes` over code at `address` with its page writable only for the store.
+bool writeCode(std::uintptr_t address, const void* bytes, std::size_t size) {
+#ifdef _WIN32
+    DWORD previous = 0;
+    if (VirtualProtect(reinterpret_cast<void*>(address), size, PAGE_EXECUTE_READWRITE, &previous) == FALSE) return false;
+    std::memcpy(reinterpret_cast<void*>(address), bytes, size);
+    DWORD ignored = 0;
+    VirtualProtect(reinterpret_cast<void*>(address), size, previous, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<const void*>(address), size);
+    return true;
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    static_cast<void>(size);
+    return false;
+#endif
+}
+
+bool pointLoad(std::intptr_t delta, const LoadSite& site, const std::uint32_t* pair) {
+    const auto at = static_cast<std::uintptr_t>(static_cast<std::intptr_t>(site.va) + delta);
+    const auto disp = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(pair) - static_cast<std::intptr_t>(at + 8));
+    return writeCode(at + 4, &disp, sizeof(disp));
+}
+
+bool setImmediate(std::intptr_t delta, const ImmediateSite& site, std::uint32_t value) {
+    return writeCode(static_cast<std::uintptr_t>(static_cast<std::intptr_t>(site.va) + delta) + 1, &value, sizeof(value));
 }
 
 // The display object is 8-aligned and its first 0x40 bytes are committed, writable memory (Windows; Linux
@@ -210,7 +322,10 @@ void NativeAspectPatch::locate() {
         return;
     }
     auto* entries = reinterpret_cast<std::uint32_t*>(search.hit);
-    if (!writeTable(entries, PortSettings::TierTableWrites(plan))) {
+    const auto delta = static_cast<std::intptr_t>(hit) - static_cast<std::intptr_t>(TierTableVa);
+    bool display = false;
+    if (plan.SharedNative() || plan.DisplayNative()) patchTargets(delta, display);
+    if (!writeTable(entries, PortSettings::TierTableWrites(plan, display))) {
         std::fprintf(stderr, "[aspect] cannot make the tier table writable: rendering the 16:9 tier (letterboxed)\n");
         std::fflush(stderr);
         return;
@@ -220,6 +335,61 @@ void NativeAspectPatch::locate() {
     std::fprintf(stderr, "[aspect] render %ux%u in the %s slot (tier table at %p, display half %s), aspect %.4f (%ux%u), display pointer slot %p\n",
         plan.renderWidth, plan.renderHeight, plan.slot->convar, static_cast<void*>(table), displayHalf ? "as expected" : "differs (not written)", plan.Aspect(),
         plan.aspectWidth, plan.aspectHeight, static_cast<void*>(singleton));
+    std::fflush(stderr);
+}
+
+// Part 2: checks every site of the slot's halves, then points SetMode's loads at the planned pairs and
+// rewrites Init's display buffer sizes and the getters. `display`: the display half was written (the
+// table's display entries follow it). A half with any site differing writes nothing.
+void NativeAspectPatch::patchTargets(std::intptr_t delta, bool& display) {
+    const auto mode = plan.slot->mode;
+    const auto& sites = mode == 1 ? PerfSites : mode == 3 ? HighSites : SuperHighSites;
+    const bool joint = mode == 4;
+    const auto refuse = [&](const char* half, std::uintptr_t va) {
+        std::fprintf(stderr, "[aspect] %s: the code at 0x%llx is not the expected build's: kept at the slot's 16:9 size (part 1)\n", half, static_cast<unsigned long long>(va));
+        std::fflush(stderr);
+    };
+    bool shared = plan.SharedNative() && loadMatches(delta, sites.shared);
+    if (plan.SharedNative() && !shared) refuse(joint ? "shared render targets and display buffer" : "shared render targets", sites.shared.va);
+    bool wantDisplay = plan.DisplayNative() && (!joint || shared);
+    if (wantDisplay && !joint && !loadMatches(delta, sites.display)) {
+        refuse("display buffer", sites.display.va);
+        wantDisplay = false;
+    }
+    for (const auto& site : sites.immediates) {
+        if (wantDisplay && !immediateMatches(delta, site)) {
+            refuse(joint ? "shared render targets and display buffer" : "display buffer", site.va);
+            wantDisplay = false;
+            if (joint) shared = false;
+        }
+    }
+    if (!shared && !wantDisplay) return;
+    const auto anchor = static_cast<std::uintptr_t>(static_cast<std::intptr_t>(sites.shared.va) + delta);
+    auto* pairs = allocateNear(anchor);
+    if (pairs == nullptr) {
+        std::fprintf(stderr, "[aspect] no page within reach of CRenderDisplay::SetMode for the size pairs: shared targets and display buffer kept at 16:9 (part 1)\n");
+        std::fflush(stderr);
+        return;
+    }
+    pairs[0] = plan.SharedNative() ? plan.sharedWidth : plan.slot->renderWidth;
+    pairs[1] = plan.SharedNative() ? plan.sharedHeight : plan.slot->renderHeight;
+    pairs[2] = plan.displayWidth;
+    pairs[3] = plan.displayHeight;
+#ifdef _WIN32
+    DWORD previous = 0;
+    VirtualProtect(pairs, 4 * sizeof(std::uint32_t), PAGE_READONLY, &previous);
+#endif
+    if (shared) sharedApplied = pointLoad(delta, sites.shared, pairs);
+    if (wantDisplay) {
+        bool written = joint ? sharedApplied : pointLoad(delta, sites.display, pairs + 2);
+        for (const auto& site : sites.immediates) written = written && setImmediate(delta, site, site.height ? plan.displayHeight : plan.displayWidth);
+        displayApplied = written;
+    }
+    display = displayApplied;
+    std::fprintf(stderr, "[aspect] part 2 in %s: shared render targets %ux%u (%s), display buffer %ux%u (%s); size pairs at %p\n", plan.slot->convar,
+        sharedApplied ? pairs[0] : plan.slot->renderWidth, sharedApplied ? pairs[1] : plan.slot->renderHeight, sharedApplied ? "SetMode's load patched" : "the slot's own",
+        displayApplied ? plan.displayWidth : plan.slot->displayWidth, displayApplied ? plan.displayHeight : plan.slot->displayHeight,
+        displayApplied ? "SetMode, Init's buffers, getters and table patched" : "the slot's own, presenter un-squeezes", static_cast<void*>(pairs));
     std::fflush(stderr);
 }
 
@@ -261,9 +431,9 @@ std::string NativeAspectPatch::Digest() {
     if (table == nullptr) {
         std::snprintf(text, sizeof(text), ", native aspect not applied (%s)", searched ? "see the [aspect] line" : "video out not opened");
     } else {
-        std::snprintf(text, sizeof(text), ", native aspect %.4f (%ux%u in %s): display mode %d, %llu/%llu flips native, %llu field writes%s", plan.Aspect(),
+        std::snprintf(text, sizeof(text), ", native aspect %.4f (%ux%u in %s): display mode %d, %llu/%llu flips native, %llu field writes%s; shared targets %s, display buffer %s", plan.Aspect(),
             plan.renderWidth, plan.renderHeight, plan.slot->convar, mode, static_cast<unsigned long long>(windowWideFlips), static_cast<unsigned long long>(windowFlips),
-            static_cast<unsigned long long>(fieldWrites), fieldRefused ? ", field refused" : "");
+            static_cast<unsigned long long>(fieldWrites), fieldRefused ? ", field refused" : "", sharedApplied ? "native" : "16:9", displayApplied ? "native" : "16:9");
     }
     windowFlips = 0;
     windowWideFlips = 0;

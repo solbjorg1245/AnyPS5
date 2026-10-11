@@ -19,6 +19,11 @@
 // with the table's render half found exactly once in read-only data and the singleton slot inside a
 // writable section; the aspect field is only written while it holds 16:9 or the planned value.
 // Without any of that nothing is written and the game renders its 16:9 tier, letterboxed as before.
+// Part 2 (PortSettings::PlanNativeTargets), also at that first sceVideoOutOpen: CRenderDisplay::SetMode
+// loads the slot's shared render size and display size from 8-byte constants the code shares with other
+// modes, so its two loads are pointed at a pair of sizes in a page allocated within reach; Init's
+// display buffer sizes and the display-size getters are immediates rewritten in place. Every byte is
+// checked against the build first; a half whose bytes differ writes nothing and stays 16:9 (part 1).
 // APS5_PROFILE_DRAW=1 appends the state to the 10 s [timestep] line.
 class NativeAspectPatch {
 public:
@@ -35,6 +40,7 @@ private:
     NativeAspectPatch();
     void locate();
     void follow();
+    void patchTargets(std::intptr_t delta, bool& display);
 
     std::mutex mutex;
     PortSettings::NativeAspectPlan plan;
@@ -45,6 +51,8 @@ private:
     std::int32_t mode = -1;
     bool presenting = false;
     bool fieldRefused = false;
+    bool sharedApplied = false;
+    bool displayApplied = false;
     std::uint64_t windowFlips = 0;
     std::uint64_t windowWideFlips = 0;
     std::uint64_t fieldWrites = 0;

@@ -34,6 +34,8 @@
 //   TimestepMinHz = 19.98     APS5_TIMESTEP_MIN_HZ  slowest step rate; slower frames slow the game down
 //   WindowMode = windowed     APS5_WINDOW_MODE      or fullscreen (desktop size, the frame scaled into it)
 //   NativeAspect = off        APS5_NATIVE_ASPECT    on (1): render at Resolution's aspect, wider view (Hor+)
+//                             APS5_NO_NATIVE_ASPECT_RENDER=1 / APS5_NO_NATIVE_ASPECT_UI=1 (environment only):
+//                             keep the 16:9 shared render targets / the 16:9 display buffer (part 1)
 //   Upscaler = off            APS5_UPSCALER         reserved: fsr, dlss (UpscalerQuality and FrameGeneration: file only, reserved)
 // The title takes one fixed physics step of 1/refresh per rendered frame (59.94 Hz in its 60 FPS mode,
 // 29.97 Hz in its 30 FPS mode), so any other limit, and any frame rate below the limit, changes the game
@@ -59,6 +61,8 @@ struct Settings {
     double timestepMinHz = DefaultTimestepMinHz;
     WindowMode windowMode = WindowMode::Auto;
     bool nativeAspect = false;
+    bool nativeAspectRender = true;
+    bool nativeAspectUi = true;
     Upscaler upscaler = Upscaler::Off;
     std::string upscalerQuality;
     bool frameGeneration = false;
@@ -304,6 +308,11 @@ inline void ApplyEnvironment(Settings& settings, const std::function<const char*
         const char* value = lookup(variable);
         if (value != nullptr && value[0] != '\0') SetKey(settings, key, value, variable);
     }
+    // The halves of native aspect part 2, for A/B runs: any value but 0 brings back part 1's half.
+    for (const auto& [variable, field] : {std::pair{"APS5_NO_NATIVE_ASPECT_RENDER", &Settings::nativeAspectRender}, std::pair{"APS5_NO_NATIVE_ASPECT_UI", &Settings::nativeAspectUi}}) {
+        const char* value = lookup(variable);
+        if (value != nullptr && value[0] != '\0') settings.*field = std::string_view(value) == "0";
+    }
 }
 
 // A limit other than the title's 30 or 60 without the variable timestep would change the game speed
@@ -374,10 +383,54 @@ struct NativeAspectPlan {
     std::uint32_t aspectWidth = 0;
     std::uint32_t aspectHeight = 0;
     const NativeAspectSlot* slot = nullptr;
+    // Part 2 (PlanNativeTargets), 0 where the slot keeps its own 16:9 size: the shared render targets
+    // and the display buffer the UI is drawn on.
+    std::uint32_t sharedWidth = 0;
+    std::uint32_t sharedHeight = 0;
+    std::uint32_t displayWidth = 0;
+    std::uint32_t displayHeight = 0;
 
     bool Active() const { return slot != nullptr; }
+    bool SharedNative() const { return sharedWidth != 0; }
+    bool DisplayNative() const { return displayWidth != 0; }
     float Aspect() const { return aspectHeight == 0 ? 0.0f : static_cast<float>(static_cast<double>(aspectWidth) / aspectHeight); }
 };
+
+// Native aspect part 2. CRenderDisplay::SetMode (FUN_14091a600) sizes the shared render targets (depth,
+// G-buffer: ViewSharedRenderTargets::Resize FUN_140927c30 reads the configuration's render size) and the
+// display buffer, UI targets and upscale (display size) from one render and one display size per mode,
+// not from the tier table, so with the table alone the 3D renders into 16:9 targets and the UI is drawn
+// on a 16:9 canvas the presenter stretches. Here the shared targets take the planned render size and the
+// display buffer Resolution's shape inside the slot's display size (2560x1080 in WantsHigh: 3840x1620;
+// 1280x800 in WantsPerf: 1728x1080). Only the modes SetMode switches to: the title starts in WantsBase,
+// sized by CRenderDisplay::Init. WantsSuperHigh loads one size for both, so it takes the render size
+// for both and only with both halves on. A size equal to the slot's own stays 0 (nothing to patch).
+inline void PlanNativeTargets(const Settings& settings, NativeAspectPlan& plan) {
+    const auto& slot = *plan.slot;
+    std::uint32_t displayWidth = slot.displayWidth;
+    std::uint32_t displayHeight = slot.displayHeight;
+    if (static_cast<std::uint64_t>(plan.aspectWidth) * slot.displayHeight >= static_cast<std::uint64_t>(plan.aspectHeight) * slot.displayWidth) {
+        displayHeight = std::min<std::uint32_t>(slot.displayHeight, static_cast<std::uint32_t>(std::lround(static_cast<double>(slot.displayWidth) * plan.aspectHeight / plan.aspectWidth / 4.0)) * 4);
+    } else {
+        displayWidth = std::min<std::uint32_t>(slot.displayWidth, static_cast<std::uint32_t>(std::lround(static_cast<double>(slot.displayHeight) * plan.aspectWidth / plan.aspectHeight / 8.0)) * 8);
+    }
+    const bool renderDiffers = plan.renderWidth != slot.renderWidth || plan.renderHeight != slot.renderHeight;
+    if (slot.mode == 4) {
+        if (!settings.nativeAspectRender || !settings.nativeAspectUi || !renderDiffers) return;
+        plan.sharedWidth = plan.displayWidth = plan.renderWidth;
+        plan.sharedHeight = plan.displayHeight = plan.renderHeight;
+        return;
+    }
+    if (slot.mode != 1 && slot.mode != 3) return;
+    if (settings.nativeAspectRender && renderDiffers) {
+        plan.sharedWidth = plan.renderWidth;
+        plan.sharedHeight = plan.renderHeight;
+    }
+    if (settings.nativeAspectUi && (displayWidth != slot.displayWidth || displayHeight != slot.displayHeight)) {
+        plan.displayWidth = displayWidth;
+        plan.displayHeight = displayHeight;
+    }
+}
 
 // The render size for Resolution WxH: RenderResolution's height, else the output height up to 1440 (as
 // the tiers: a 2160p output renders 1440p), the width from the aspect; at most 3840x2160 (the title's
@@ -404,12 +457,14 @@ inline NativeAspectPlan PlanNativeAspect(const Settings& settings) {
     for (const auto& slot : NativeAspectSlots) {
         if (holds(slot) && settings.width <= slot.displayWidth && settings.height <= slot.displayHeight) {
             plan.slot = &slot;
+            PlanNativeTargets(settings, plan);
             return plan;
         }
     }
     for (const auto& slot : NativeAspectSlots) {
         if (holds(slot)) {
             plan.slot = &slot;
+            PlanNativeTargets(settings, plan);
             return plan;
         }
     }
@@ -435,10 +490,17 @@ struct TableWrite {
     std::uint32_t value;
 };
 
-// The two entries the plan rewrites: the slot's render width and render height.
-inline std::array<TableWrite, 2> TierTableWrites(const NativeAspectPlan& plan) {
+// The entries the plan rewrites: the slot's render width and render height, and with `display` (the
+// display buffer patched, part 2) its display width and height, which every view's configuration
+// carries for its upscale into the display buffer.
+inline std::vector<TableWrite> TierTableWrites(const NativeAspectPlan& plan, bool display = false) {
     const std::size_t index = plan.slot->mode - 1;
-    return {{{index, plan.renderWidth}, {5 + index, plan.renderHeight}}};
+    std::vector<TableWrite> writes{{index, plan.renderWidth}, {5 + index, plan.renderHeight}};
+    if (display && plan.DisplayNative()) {
+        writes.push_back({10 + index, plan.displayWidth});
+        writes.push_back({15 + index, plan.displayHeight});
+    }
+    return writes;
 }
 
 inline std::uint32_t AspectBits(float aspect) { return std::bit_cast<std::uint32_t>(aspect); }
@@ -509,8 +571,10 @@ inline std::string Describe(const Settings& settings) {
         result += text;
     }
     if (const auto plan = PlanNativeAspect(settings); plan.Active()) {
-        std::snprintf(text, sizeof(text), "native aspect %.4f: render %ux%u in the r_Wants4K=%s slot (display buffer %ux%u), ", plan.Aspect(),
-            plan.renderWidth, plan.renderHeight, plan.slot->convar, plan.slot->displayWidth, plan.slot->displayHeight);
+        std::snprintf(text, sizeof(text), "native aspect %.4f: render %ux%u in the r_Wants4K=%s slot (shared targets %ux%u, display buffer %ux%u), ", plan.Aspect(),
+            plan.renderWidth, plan.renderHeight, plan.slot->convar, plan.SharedNative() ? plan.sharedWidth : plan.slot->renderWidth,
+            plan.SharedNative() ? plan.sharedHeight : plan.slot->renderHeight, plan.DisplayNative() ? plan.displayWidth : plan.slot->displayWidth,
+            plan.DisplayNative() ? plan.displayHeight : plan.slot->displayHeight);
         result += text;
     } else if (const auto* tier = SelectRenderTier(settings)) {
         std::snprintf(text, sizeof(text), "render r_Wants4K=%s (%ux%u), ", tier->convar, tier->width, tier->height);

@@ -49,6 +49,12 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
 // effect: the surface's pending metadata clears are recorded. The fast proof's check of an element
 // a depth surface served (ShaderResources::fastRevalidate).
 bool DepthSurfaceServes(const Context& context, const GuestTextureResource& resource, const Texture* texture);
+// Debug aid (APS5_ASPECT_PROBE=1 with APS5_PROFILE_DRAW=1; Demon's Souls native aspect): notes the
+// viewport and scissor of a draw into a depth surface. DepthViewportDigest returns, for the largest depth
+// extent drawn into since its last call, the draws and their first four distinct viewport/scissor pairs
+// ("; depth viewports ..."), for the 10 s [draw] line; empty when off.
+void NoteDepthViewport(const State& state);
+std::string DepthViewportDigest();
 
 }
 

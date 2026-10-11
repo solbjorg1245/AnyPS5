@@ -9,11 +9,14 @@
 #include <atomic>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -513,6 +516,78 @@ std::uint64_t DepthSurfaceSerial() {
 bool DepthSurfaceAt(std::uint64_t address, std::uint32_t width, std::uint32_t height) {
     std::lock_guard lock(surfacesMutex());
     return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->Covers(address, width, height) && !surface->overwritten; });
+}
+
+namespace {
+
+bool depthProbeOn() {
+    static const bool on = std::getenv("APS5_ASPECT_PROBE") != nullptr && std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return on;
+}
+
+struct ProbedViewport {
+    VkViewport viewport;
+    VkRect2D scissor;
+    std::uint64_t draws;
+};
+
+struct DepthViewportWindow {
+    VkExtent2D extent{};
+    std::uint64_t draws = 0;
+    std::vector<ProbedViewport> viewports;
+};
+
+HostMutex& probeMutex() {
+    static HostMutex mutex;
+    return mutex;
+}
+
+DepthViewportWindow& probeWindow() {
+    static auto* window = new DepthViewportWindow();
+    return *window;
+}
+
+}
+
+void NoteDepthViewport(const State& state) {
+    if (!depthProbeOn() || !state.depth) return;
+    const auto extent = state.depth->extent;
+    const auto area = static_cast<std::uint64_t>(extent.width) * extent.height;
+    std::lock_guard lock(probeMutex());
+    auto& window = probeWindow();
+    const auto largest = static_cast<std::uint64_t>(window.extent.width) * window.extent.height;
+    if (area < largest || (area == largest && extent.width != window.extent.width)) return;
+    if (area > largest) {
+        window = {};
+        window.extent = extent;
+    }
+    ++window.draws;
+    for (auto& entry : window.viewports) {
+        if (std::memcmp(&entry.viewport, &state.viewport, sizeof(VkViewport)) == 0 && std::memcmp(&entry.scissor, &state.scissor, sizeof(VkRect2D)) == 0) {
+            ++entry.draws;
+            return;
+        }
+    }
+    if (window.viewports.size() < 4) window.viewports.push_back({state.viewport, state.scissor, 1});
+}
+
+std::string DepthViewportDigest() {
+    if (!depthProbeOn()) return {};
+    DepthViewportWindow window;
+    {
+        std::lock_guard lock(probeMutex());
+        window = probeWindow();
+        probeWindow() = {};
+    }
+    char text[192];
+    std::snprintf(text, sizeof(text), "; depth viewports (APS5_ASPECT_PROBE): largest surface %ux%u, %llu draws", window.extent.width, window.extent.height, static_cast<unsigned long long>(window.draws));
+    std::string result = text;
+    for (const auto& entry : window.viewports) {
+        std::snprintf(text, sizeof(text), "; viewport %.0f,%.0f %.0fx%.0f scissor %d,%d %ux%u (%llu draws)", entry.viewport.x, entry.viewport.y, entry.viewport.width, entry.viewport.height,
+            entry.scissor.offset.x, entry.scissor.offset.y, entry.scissor.extent.width, entry.scissor.extent.height, static_cast<unsigned long long>(entry.draws));
+        result += text;
+    }
+    return result;
 }
 
 }

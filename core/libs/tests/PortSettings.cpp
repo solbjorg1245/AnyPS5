@@ -279,6 +279,47 @@ static void TestNativeAspect() {
     Require(PortSettings::DisplayAspectBits(PortSettings::Aspect16x9Bits, 2, plan) == PortSettings::Aspect16x9Bits, "other mode: 16:9 kept");
     Require(!PortSettings::DisplayAspectBits(0x3f800000, 3, plan), "unknown value left alone");
     Require(!PortSettings::DisplayAspectBits(PortSettings::Aspect16x9Bits, 9, plan), "unknown mode left alone");
+
+    // Part 2: the shared targets at the render size, the display buffer at the output's shape inside the
+    // slot's display size; nothing where the slot's own size already is that, or SetMode never runs.
+    const auto targets = [&](const char* resolution, std::uint32_t sharedWidth, std::uint32_t sharedHeight, std::uint32_t displayWidth, std::uint32_t displayHeight) {
+        const auto result = native(resolution);
+        return result.sharedWidth == sharedWidth && result.sharedHeight == sharedHeight && result.displayWidth == displayWidth && result.displayHeight == displayHeight;
+    };
+    Require(targets("2560x1080", 2560, 1080, 3840, 1620), "21:9 in WantsHigh: shared 2560x1080, display 3840x1620");
+    Require(targets("1280x800", 1280, 800, 1728, 1080), "16:10 in WantsPerf: shared 1280x800, display 1728x1080");
+    Require(targets("1920x1200", 1920, 1200, 3456, 2160), "16:10 in WantsHigh: display 3456x2160");
+    Require(targets("1024x768", 1024, 768, 1440, 1080), "4:3 in WantsPerf: display 1440x1080");
+    Require(targets("3440x1440", 3440, 1440, 3440, 1440), "WantsSuperHigh: one size for both");
+    Require(targets("5120x1440", 3840, 1080, 3840, 1080), "32:9: 3840x1080 for both");
+    Require(targets("3840x2160", 0, 0, 0, 0), "16:9 4K: the slot's own sizes");
+    Require(targets("1920x1080", 0, 0, 0, 0), "WantsBase: Init's sizes kept");
+    for (const char* resolution : {"2560x1080", "1280x800", "1920x1200", "3440x1440", "5120x1440", "1024x768", "800x1280", "7680x2160"}) {
+        const auto result = native(resolution);
+        Require(result.Active() && result.sharedWidth <= 3840 && result.sharedHeight <= 2160 && result.displayWidth <= 3840 && result.displayHeight <= 2160
+            && result.displayWidth % 8 == 0 && result.displayHeight % 4 == 0, "every size within 3840x2160, aligned");
+    }
+    const auto halves = [](const char* resolution, const char* variable, const char* value) {
+        auto settings = PortSettings::Parse(std::string("NativeAspect = on\nResolution = ") + resolution + "\n", "test.ini");
+        PortSettings::ApplyEnvironment(settings, [&](const char* name) -> const char* { return std::string(name) == variable ? value : nullptr; });
+        PortSettings::Normalize(settings);
+        return PortSettings::PlanNativeAspect(settings);
+    };
+    const auto noUi = halves("2560x1080", "APS5_NO_NATIVE_ASPECT_UI", "1");
+    Require(noUi.SharedNative() && !noUi.DisplayNative() && noUi.renderWidth == 2560, "APS5_NO_NATIVE_ASPECT_UI keeps the 16:9 display buffer");
+    const auto noRender = halves("2560x1080", "APS5_NO_NATIVE_ASPECT_RENDER", "1");
+    Require(!noRender.SharedNative() && noRender.DisplayNative(), "APS5_NO_NATIVE_ASPECT_RENDER keeps the 16:9 shared targets");
+    Require(halves("2560x1080", "APS5_NO_NATIVE_ASPECT_UI", "0").DisplayNative(), "0 keeps part 2");
+    const auto superNoUi = halves("3440x1440", "APS5_NO_NATIVE_ASPECT_UI", "1");
+    Require(superNoUi.Active() && !superNoUi.SharedNative() && !superNoUi.DisplayNative(), "WantsSuperHigh needs both halves");
+    Require(PortSettings::TierTableWrites(native("2560x1080")).size() == 2, "display entries only once the display buffer is patched");
+    auto displayTable = PortSettings::TierTable;
+    for (const auto& write : PortSettings::TierTableWrites(native("2560x1080"), true)) displayTable[write.entry] = write.value;
+    Require(displayTable[2] == 2560 && displayTable[7] == 1080 && displayTable[12] == 3840 && displayTable[17] == 1620, "WantsHigh render and display entries");
+    for (std::size_t entry = 0; entry < displayTable.size(); ++entry) {
+        if (entry != 2 && entry != 7 && entry != 12 && entry != 17) Require(displayTable[entry] == PortSettings::TierTable[entry], "other entries untouched");
+    }
+    Require(PortSettings::Describe(FromText("NativeAspect = on\nResolution = 2560x1080")).find("(shared targets 2560x1080, display buffer 3840x1620)") != std::string::npos, "describe part 2");
 }
 
 int main() {
