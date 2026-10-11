@@ -205,6 +205,9 @@ public:
         // GuestMemory::FreeClock when the copy was first queued (DeferCopies; a claimed copy keeps
         // its own): the pages released since are not copied back (APS5_DROP_FREED_STORES).
         std::uint32_t freeClock = 0xffffffffu;
+        // GuestMemory::TrackerGeneration when the copy was first queued (0: recorded at once), the
+        // decision a plain copy's land is checked from (APS5_LATE_LAND_CHECK=2, LateLandKind::CopyBack).
+        std::uint64_t generation = 0;
     };
     static bool DeferCopyBacks();
     // Copy-back coalescing (on by default; APS5_NO_COALESCE_COPY_BACKS=1 or APS5_COALESCE_COPY_BACKS=0

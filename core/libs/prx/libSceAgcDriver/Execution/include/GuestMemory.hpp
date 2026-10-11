@@ -320,7 +320,7 @@ inline void NoteRecordedWrite(std::uint64_t begin, std::uint64_t end) {
 }
 
 // Late lands over the CPU's stores (APS5_LATE_LAND_CHECK; 1 by default: the driver's own GPU stores
-// into imported guest memory, 2 also the title's fills and copies, 0 off). A store the GPU makes
+// into imported guest memory, 2 also the title's fills and copies and the staging copy-backs, 0 off). A store the GPU makes
 // into the import (a unit shadow's publish copy, a storage write-back's store, a DCC key fill) is
 // decided at one tracker generation and lands when its batch runs, past the page tables: a CPU
 // store in between is lost under older GPU bytes and no later check sees it (the R-crash overwrites).
@@ -328,7 +328,9 @@ inline void NoteRecordedWrite(std::uint64_t begin, std::uint64_t end) {
 // submitted, and after a walk of its range once the batch finished (since the submit's generation
 // only) or once a waited batch returned. Counted on the [guestmem] line; the first hits (then one
 // per kind per 10 s) print a [late-land] line, both under APS5_PROFILE_DRAW.
-enum class LateLandKind : std::uint8_t { ShadowPublish, TextureStore, DccKeys, Fill, Copy, Count };
+// CopyBack: a staged region's plain copy-back (whole written range, no narrow compare), decided when
+// it was deferred (or recorded): a CPU store into the range since is lost under the shadow's bytes.
+enum class LateLandKind : std::uint8_t { ShadowPublish, TextureStore, DccKeys, Fill, Copy, CopyBack, Count };
 enum class LateLandPhase : std::uint8_t { Submit, Finish, Waited, Count };
 struct LateLand {
     std::uint64_t begin = 0;

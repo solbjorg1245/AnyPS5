@@ -1817,7 +1817,9 @@ void Recorder::DeferCopies(std::vector<DeferredCopy> copies) {
     if (copies.empty()) return;
     ensureOpen();
     const auto freeClock = GuestMemory::FreeClock();
+    const auto generation = GuestMemory::LateLandChecked(GuestMemory::LateLandKind::CopyBack) ? GuestMemory::TrackerGeneration() : 0;
     for (auto& copy : copies) {
+        if (copy.generation == 0) copy.generation = generation;
         copyBacksDeferred.fetch_add(1, std::memory_order_relaxed);
         copyBackBytesDeferred.fetch_add(copy.bytes, std::memory_order_relaxed);
         copy.freeClock = std::min(copy.freeClock, freeClock);
@@ -2328,6 +2330,13 @@ std::uint64_t Recorder::recordCopyCommands(VkCommandBuffer commands, std::vector
     std::vector<DeferredCopy> narrow(std::make_move_iterator(narrowFirst), std::make_move_iterator(copies.end()));
     copies.erase(narrowFirst, copies.end());
     std::uint64_t bytes = 0;
+    // APS5_LATE_LAND_CHECK=2: a plain copy stores its whole range (a resident copy's pages are guarded).
+    if (GuestMemory::LateLandChecked(GuestMemory::LateLandKind::CopyBack)) {
+        const auto now = GuestMemory::TrackerGeneration();
+        for (const auto& copy : copies) {
+            if (copy.guard == nullptr) NoteLateLand(GuestMemory::LateLandKind::CopyBack, copy.address, copy.address + copy.bytes, copy.generation != 0 ? copy.generation : now, copy.land ? "land" : "copy-back");
+        }
+    }
     if (coalesceCopyBacks) {
         // Disjoint destinations (DeferCopies): one vkCmdCopyBuffer per (source, destination) pair.
         std::sort(copies.begin(), copies.end(), [](const DeferredCopy& left, const DeferredCopy& right) { return std::tie(left.source, left.destination, left.address) < std::tie(right.source, right.destination, right.address); });

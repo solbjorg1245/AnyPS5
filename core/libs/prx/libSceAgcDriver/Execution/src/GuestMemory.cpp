@@ -3017,7 +3017,7 @@ namespace {
 
 constexpr std::size_t LandKindCount = static_cast<std::size_t>(LateLandKind::Count);
 constexpr std::size_t LandPhaseCount = static_cast<std::size_t>(LateLandPhase::Count);
-constexpr const char* LandKindNames[LandKindCount] = {"shadow", "texture-store", "dcc-keys", "fill", "copy"};
+constexpr const char* LandKindNames[LandKindCount] = {"shadow", "texture-store", "dcc-keys", "fill", "copy", "copy-back"};
 constexpr const char* LandPhaseNames[LandPhaseCount] = {"before submit", "in flight", "waited"};
 // APS5_LATE_LAND_CHECK: -1 until read from the environment (SetLateLandLevel overrides it).
 std::atomic<int> lateLandLevel{-1};
@@ -3048,7 +3048,7 @@ void SetLateLandLevel(int level) {
 
 bool LateLandChecked(LateLandKind kind) {
     const auto level = LateLandLevel();
-    return level >= 2 || (level == 1 && kind != LateLandKind::Fill && kind != LateLandKind::Copy);
+    return level >= 2 || (level == 1 && kind != LateLandKind::Fill && kind != LateLandKind::Copy && kind != LateLandKind::CopyBack);
 }
 
 LateLand MakeLateLand(LateLandKind kind, std::uint64_t begin, std::uint64_t end, std::uint64_t generation, const char* reason) {
