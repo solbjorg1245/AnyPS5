@@ -3653,7 +3653,15 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     const bool keepCopyBacks = recorder.CoalescesCopyBacks();
     if (keepCopyBacks && recorder.HasDeferredCopies()) {
         using FlushReason = Graphics::Recorder::FlushReason;
-        if (resources.HoldsLease()) {
+        if (resources.HoldsLease() && resources.MapsResidentLands()) {
+            // A resident written range's land (APS5_RESIDENT_WRITES) stays queued past an
+            // address-based use whose table maps the range only to its device copy (read-only) or
+            // not at all, with no descriptor or region of its own over it, unless the range holds
+            // its indirect arguments.
+            recorder.FlushDeferredWhere([&](const Graphics::Recorder::DeferredCopy& copy, bool) {
+                return !(copy.land && resources.MapsResidentLand(copy.sourceKey) && !(argumentImport != nullptr && copy.address < arguments + 12 && arguments < copy.address + copy.bytes));
+            }, FlushReason::DispatchLease);
+        } else if (resources.HoldsLease()) {
             recorder.FlushDeferredCopies(FlushReason::DispatchLease);
         } else {
             const auto inPlace = resources.InPlaceReads();

@@ -5649,6 +5649,41 @@ void residentWriteTests(const Device& device, Recorder& recorder) {
     expect(&ResidentWriteStatistics::refreshStamp, 1, "refreshes after a store in the absorb window");
     expect(&ResidentWriteStatistics::both, 1, "both-sides changes (the next check must not count the absorbed store again)");
     Require(boundByte(*tenth, 40000) == 0x77 && boundByte(*tenth, 36864) == 0xF6 && guest[at + 36864] == 0xF6 && guest[at + 40000] == 0x77, "(w) the device copy missed a store collected in the absorb window");
+    // Address-based writers (ShaderResources::Bind of a program that may store through its BDA
+    // table): only a writer whose writable ranges overlap the range owes it a refresh.
+    auto eleventh = build();
+    store(*eleventh, 45056, 0x1B1B1B1Bu);
+    marks(*eleventh);
+    counts = ResidentWriteCounts();
+    {
+        // A build writing only past the range, in the same import: its list misses it.
+        auto elsewhere = std::make_unique<GuestBufferMemory>(context);
+        elsewhere->AddWritable(address + at + span, unit);
+        elsewhere->UploadPrepare(false);
+        elsewhere->UploadFinish(false);
+        elsewhere->NoteResidentWritesWriter();
+    }
+    // Ranges ending at its begin or starting at its end miss it too (half-open).
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> below{{address, address + at}}, above{{address + at + span, address + bytes}}, inside{{address, address + at}, {address + at + 4096, address + at + 8192}};
+    NoteResidentWritesAddressWriter(&below);
+    NoteResidentWritesAddressWriter(&above);
+    expect(&ResidentWriteStatistics::addressElsewhere, 3, "address-based writers elsewhere");
+    expect(&ResidentWriteStatistics::addressOver, 0, "address-based writers over the range");
+    auto twelfth = build();
+    expect(&ResidentWriteStatistics::refreshAddress, 0, "refreshes for writers whose ranges miss the range");
+    Require(twelfth->Descriptor(address + at, span, adjustment).buffer != import->buffer && boundByte(*twelfth, 45056) == 0x1B, "(w) a writer elsewhere unbound the device copy or lost the GPU's bytes");
+    counts = ResidentWriteCounts();
+    NoteResidentWritesAddressWriter(&inside);
+    expect(&ResidentWriteStatistics::addressOver, 1, "address-based writers over the range");
+    auto thirteenth = build();
+    expect(&ResidentWriteStatistics::refreshAddress, 1, "refreshes for a writer over the range");
+    Require(boundByte(*thirteenth, 45056) == 0x1B && guest[at + 45056] == 0x1B, "(w) the refresh for a writer lost the GPU's bytes");
+    // No list (a space built before resident writes were configured): every range.
+    counts = ResidentWriteCounts();
+    NoteResidentWritesAddressWriter(nullptr);
+    auto fourteenth = build();
+    expect(&ResidentWriteStatistics::addressOver, 1, "address-based writers without a list");
+    expect(&ResidentWriteStatistics::refreshAddress, 1, "refreshes for a writer without a list");
     // A changed import (the block registered again): the range is demoted, the build in place.
     second.reset();
     third.reset();
@@ -5659,6 +5694,10 @@ void residentWriteTests(const Device& device, Recorder& recorder) {
     eighth.reset();
     ninth.reset();
     tenth.reset();
+    eleventh.reset();
+    twelfth.reset();
+    thirteenth.reset();
+    fourteenth.reset();
     writes.Sync();
     {
         GuestAllocations::Mutation mutation;
