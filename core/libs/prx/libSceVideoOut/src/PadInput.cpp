@@ -13,9 +13,28 @@
 #include "prx/libScePad/include/PadInputTypes.hpp"
 #include "prx/libc/include/General.hpp"
 
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
+namespace {
+
+int ProcessId() {
+#ifdef _WIN32
+    return _getpid();
+#else
+    return static_cast<int>(getpid());
+#endif
+}
+
+}
+
 PadInput::PadInput()
-    : bindings(Pad::LoadInputMapping()), pressed(bindings.size()), wheelReleaseTimes(bindings.size()) {
+    : bindings(Pad::LoadInputMapping()), pressed(bindings.size()), wheelReleaseTimes(bindings.size()), scriptReleaseTimes(bindings.size()) {
     openFirstAvailableController();
+    openScript();
 }
 
 PadInput::~PadInput() {
@@ -105,6 +124,76 @@ void PadInput::applyOutput() {
             SDL_GameControllerRumbleTriggers(controller, static_cast<Uint16>(outputState.trigger[0].fallback * 257), static_cast<Uint16>(outputState.trigger[1].fallback * 257), triggerRumble ? rumbleMs : 0);
         }
     }
+}
+
+// Scripted input (APS5_INPUT_FILE=<path>, for the test harness): the run tools append lines
+// "<SDL key name> <hold ms>" (e.g. "Return 120") and each one presses that key's bindings for the
+// hold time, as a key down/up would, without the OS keyboard focus. s57: a foreground window the
+// harness could not take kept every SendInput press from the game. Lines already in the file at
+// startup are skipped. "<path>.ready" holds this process id once the file is polled, so the tools
+// use the file only with a build that reads it.
+void PadInput::openScript() {
+    const char* path = std::getenv("APS5_INPUT_FILE");
+    if (path == nullptr || *path == '\0') return;
+    scriptPath = path;
+    if (std::FILE* file = std::fopen(scriptPath.c_str(), "rb")) {
+        std::fseek(file, 0, SEEK_END);
+        const long size = std::ftell(file);
+        scriptOffset = size > 0 ? static_cast<std::uint64_t>(size) : 0;
+        std::fclose(file);
+    }
+    if (std::FILE* ready = std::fopen((scriptPath + ".ready").c_str(), "wb")) {
+        std::fprintf(ready, "%d\n", ProcessId());
+        std::fclose(ready);
+    }
+    std::fprintf(stderr, "[input] scripted input from %s (pid %d, skipping %llu bytes)\n", scriptPath.c_str(), ProcessId(), static_cast<unsigned long long>(scriptOffset));
+}
+
+// Reads the lines appended since the last poll (at most every 15 ms) and starts their presses. True
+// when a binding was pressed.
+bool PadInput::pollScript(std::chrono::steady_clock::time_point now) {
+    if (scriptPath.empty() || now < nextScriptPoll) return false;
+    nextScriptPoll = now + std::chrono::milliseconds(15);
+    std::FILE* file = std::fopen(scriptPath.c_str(), "rb");
+    if (file == nullptr) return false;
+    std::string fresh;
+    std::fseek(file, 0, SEEK_END);
+    const long size = std::ftell(file);
+    if (size >= 0 && static_cast<std::uint64_t>(size) < scriptOffset) {
+        scriptOffset = 0;  // truncated: start over
+        scriptLine.clear();
+    }
+    if (size > 0 && static_cast<std::uint64_t>(size) > scriptOffset && std::fseek(file, static_cast<long>(scriptOffset), SEEK_SET) == 0) {
+        char buffer[512];
+        std::size_t count = 0;
+        while ((count = std::fread(buffer, 1, sizeof(buffer), file)) > 0) fresh.append(buffer, count);
+    }
+    std::fclose(file);
+    if (fresh.empty()) return false;
+    scriptOffset += fresh.size();
+    scriptLine += fresh;
+    bool changed = false;
+    std::size_t end = 0;
+    while ((end = scriptLine.find('\n')) != std::string::npos) {
+        const std::string line = scriptLine.substr(0, end);
+        scriptLine.erase(0, end + 1);
+        char name[32] = {};
+        int holdMs = 0;
+        if (std::sscanf(line.c_str(), "%31s %d", name, &holdMs) != 2 || holdMs <= 0) continue;
+        const SDL_Scancode key = SDL_GetScancodeFromName(name);
+        if (key == SDL_SCANCODE_UNKNOWN) {
+            std::fprintf(stderr, "[input] unknown key '%s' in %s\n", name, scriptPath.c_str());
+            continue;
+        }
+        for (std::size_t index = 0; index < bindings.size(); ++index) {
+            const auto& binding = bindings[index];
+            if (binding.key != key || binding.control == Pad::InputControl::ToggleFullscreen || binding.control == Pad::InputControl::ToggleMouse) continue;
+            pressed[index] = true;
+            scriptReleaseTimes[index] = now + std::chrono::milliseconds(holdMs);
+            changed = true;
+        }
+    }
+    return changed;
 }
 
 void PadInput::setMouseMode(bool enabled) {
@@ -210,6 +299,7 @@ void PadInput::HandleEvent(const SDL_Event& event, DisplayWindow& window) {
     if (event.type == SDL_WINDOWEVENT && (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST || event.window.event == SDL_WINDOWEVENT_CLOSE)) {
         std::fill(pressed.begin(), pressed.end(), false);
         std::fill(wheelReleaseTimes.begin(), wheelReleaseTimes.end(), std::chrono::steady_clock::time_point{});
+        std::fill(scriptReleaseTimes.begin(), scriptReleaseTimes.end(), std::chrono::steady_clock::time_point{});
         if (mouseEnabled) setMouseMode(false);
         publish();
         return;
@@ -269,6 +359,13 @@ void PadInput::Update() {
         wheelReleaseTimes[index] = {};
         released = true;
     }
+    for (std::size_t index = 0; index < scriptReleaseTimes.size(); ++index) {
+        if (scriptReleaseTimes[index] == std::chrono::steady_clock::time_point{} || now < scriptReleaseTimes[index]) continue;
+        pressed[index] = false;
+        scriptReleaseTimes[index] = {};
+        released = true;
+    }
+    if (pollScript(now)) released = true;
     if (released) publish();
     if (!mouseEnabled) return;
     if (SDL_GetKeyboardFocus() == nullptr) {

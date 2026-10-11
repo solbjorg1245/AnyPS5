@@ -9,6 +9,7 @@
 #else
 #include <sys/mman.h>
 #endif
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdlib>
@@ -241,19 +242,94 @@ void CheckEqualsSince() {
     Require(EqualsCommittedSince(base + Block / 2, partial, synced), "a store outside the compared range is compared");
     Require(!EqualsCommittedSince(base, snapshot, synced), "a driver store into a stamped block is not seen");
 }
+
+// The DCC key store guard's question (DccMetadata.cpp): the CPU's stores into a range since a
+// generation by 4 KiB page, without the driver's own stores, merged across a block boundary and
+// clipped to the range.
+void CheckCpuStoredRuns() {
+    void* memory = AllocateWatched(2 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, 2 * Block);
+    const auto synced = CollectWrites(base, 2 * Block);
+    Require(synced != 0, "the CPU-stored runs block is not collected");
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    Require(CpuStoredRuns(base, 2 * Block, synced, runs) == 0 && runs.empty(), "CPU stores older than the generation are listed");
+    bytes[Block - 4096 + 8] = 0x22;
+    bytes[Block + 8] = 0x22;
+    bytes[Block + 3 * 4096 + 8] = 0x22;
+    MarkWritten(base + 4096, 64);
+    Write(base + 2 * 4096, std::array<std::byte, 16>{});
+    CollectWritesUncached(base, 2 * Block);
+    const auto stored = CpuStoredRuns(base + 100, 2 * Block - 200, synced, runs);
+    // APS5_NO_EDGE_PAGE_KEEP=1 keeps no page records: a CPU-stamped block counts whole.
+    if (std::getenv("APS5_NO_EDGE_PAGE_KEEP") != nullptr) {
+        Require(stored == 2 * Block - 200 && runs.size() == 1, "CPU-stamped blocks do not count whole with APS5_NO_EDGE_PAGE_KEEP");
+        return;
+    }
+    Require(stored == 3 * 4096 && runs.size() == 2, "the CPU's pages are not listed alone (" + std::to_string(stored) + " bytes in " + std::to_string(runs.size()) + " runs)");
+    Require(runs[0].first == base + Block - 4096 && runs[0].second == base + Block + 4096, "CPU pages on both sides of a block boundary are not one run");
+    Require(runs[1].first == base + Block + 3 * 4096 && runs[1].second == base + Block + 4 * 4096, "a lone CPU page is not listed");
+    Require(CpuStoredRuns(base + Block - 100, 50, synced, runs) == 50 && runs.size() == 1 && runs[0].first == base + Block - 100 && runs[0].second == base + Block - 50, "a run is not clipped to the range");
+    Require(CpuStoredRuns(base, 3 * 4096, synced, runs) == 0 && runs.empty(), "the driver's own stores are listed as the CPU's");
+    Require(CpuStoredRuns(base, 2 * Block, TrackerGeneration(), runs) == 0 && runs.empty(), "CPU stores older than a later generation are listed");
+    Require(CpuStoredRuns(base, 2 * Block, 0, runs) == 0 && runs.empty(), "a generation of 0 lists stores");
+}
+
+// The crash report's store ring (APS5_CRASH_RESOURCES=1, set by main): the driver's stores of 16
+// bytes or more over an address, newest first, with the thread's StoreTag and the stored span.
+void CheckStoreRing() {
+    Require(CrashResourcesEnabled(), "the store ring is off with APS5_CRASH_RESOURCES=1");
+    void* memory = AllocateWatched(Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0, Block);
+    CollectWrites(base, Block);
+    std::array<std::byte, 256> bytes{};
+    bytes.fill(std::byte{0x5a});
+    {
+        const StoreTag tag("test image", "test reason", base);
+        Write(base + 512, bytes);
+    }
+    MarkWritten(base + 4096, 64);
+    Write(base + 8192, std::array<std::byte, 8>{});
+    std::vector<std::byte> original(1024, std::byte{0});
+    std::vector<std::byte> current(original);
+    std::fill(current.begin() + 100, current.begin() + 300, std::byte{1});
+    WriteChanged(base + 16384, current, original);
+
+    std::array<GuestStoreRecord, 8> found{};
+    auto count = RecentGuestStores(base + 600, 16, found);
+    Require(count == 1 && found[0].begin == base + 512 && found[0].end == base + 768, "the ring does not hold the store over the address");
+    Require(found[0].tag != nullptr && std::strcmp(found[0].tag, "test image") == 0 && found[0].reason != nullptr && std::strcmp(found[0].reason, "test reason") == 0 && found[0].tagAddress == base, "the store's tag is not recorded");
+    Require(found[0].kind != nullptr && std::strcmp(found[0].kind, "driver memcpy") == 0, "a Write is not recorded as a driver memcpy");
+    count = RecentGuestStores(base, Block, found);
+    Require(count == 3, "the ring holds " + std::to_string(count) + " stores over the block, not 3 (an 8-byte store is below the recorded size)");
+    Require(found[0].begin == base + 16384 + 100 && found[0].end == base + 16384 + 300, "WriteChanged is not recorded as its changed span");
+    Require(found[1].begin == base + 4096 && found[1].end == base + 4096 + 64 && found[1].kind != nullptr && std::strcmp(found[1].kind, "gpu (MarkWritten)") == 0 && found[1].tag == nullptr, "MarkWritten is not recorded untagged after the tag's scope");
+    Require(found[2].begin == base + 512, "the stores are not listed newest first");
+    Require(RecentGuestStores(base + 768, 4096 - 768, found) == 0, "a store is listed outside its range");
+}
 }
 
 int main() {
+    // Before the first store: the ring is made then (CheckStoreRing).
+#ifdef _WIN32
+    _putenv_s("APS5_CRASH_RESOURCES", "1");
+#else
+    setenv("APS5_CRASH_RESOURCES", "1", 1);
+#endif
     try {
         if (!WriteWatched()) {
             std::cout << "no write watching: skipped\n";
             return 77;
         }
+        CheckStoreRing();
         CheckSharedBlock();
         CheckUnstoredPages();
         CheckMixedEdge();
         CheckOwnStore();
         CheckEqualsSince();
+        CheckCpuStoredRuns();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;

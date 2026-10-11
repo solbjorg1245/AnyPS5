@@ -208,6 +208,10 @@ void GuestArenaDescribePage_nid_postfix(std::uintptr_t address, char* text, std:
     WindowsMappings::Get().Describe(address, text, size);
 }
 
+bool GuestArenaTryDescribePage_nid_postfix(std::uintptr_t address, char* text, std::size_t size) {
+    return WindowsMappings::Get().TryDescribe(address, text, size);
+}
+
 std::size_t GuestArenaTrackWriteParts_nid_postfix(std::uintptr_t address, std::size_t bytes) {
     return WindowsMappings::Get().TrackParts(address, bytes);
 }

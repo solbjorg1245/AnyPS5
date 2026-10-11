@@ -4,6 +4,46 @@
 
 namespace AgcDriver::DriverDetail {
 
+namespace {
+
+// The validate path's copy counters (APS5_PROFILE_DRAW, ValidateCopyCounters).
+double ElapsedUs(std::chrono::steady_clock::time_point since) {
+    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - since).count();
+}
+
+void NoteResultCopy(ValidateCopyCounters& counters, ResultCopySite site, const ShaderRecompiler::RecompileResult& copy) {
+    const auto cost = ResultCopyCost(copy);
+    ++counters.resultCopies[site];
+    counters.resultBytes[site] += cost.bytes;
+    counters.resultAllocations[site] += cost.allocations;
+}
+
+// The vectors a shifted variant copied from its source (shiftVariant: its words and runs, the data
+// positions and slots, don't-care bits, base slots and, when the page layout kept the runs, the
+// rule), one allocation each when not empty, and the variant itself; relocateVariant's run starts
+// and shiftVariant's run copy before the layout are left out.
+CopyCost ShiftedVariantCost(const DispatchVariant& variant) {
+    CopyCost cost{0, 1};
+    const auto add = [&](const auto& items) {
+        cost.bytes += items.size() * sizeof(*items.data());
+        if (!items.empty()) ++cost.allocations;
+    };
+    add(variant.words);
+    add(variant.runs);
+    add(variant.dataPositions);
+    add(variant.dataSlots);
+    add(variant.ignoredBits);
+    add(variant.baseSlots);
+    add(variant.pointerPositions);
+    add(variant.movedRuns);
+    add(variant.shiftSlots);
+    add(variant.pushShiftSlots);
+    add(variant.innerPointers);
+    return cost;
+}
+
+}
+
 void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering, std::shared_ptr<DispatchVariant>& relocated, std::uint64_t baseKey, std::span<const std::uint32_t> userData, std::vector<UserPointerCandidate>& baseCandidates) {
     if (!noDispatchCache) {
 
@@ -33,11 +73,43 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
             std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
             std::uint64_t relocatedUnordered = 0, relocatedDiffering = 0;
             std::uint64_t relocatedFirst = 0, relocatedFirstDiffering = 0, storedSkipped = 0;
+            // The validate path's copies and sub-steps ([dispatch-cache] validate copies), added to
+            // the counters with the rest under the lock.
+            const bool countCopies = variantCopyCount();
+            ValidateCopyCounters copies;
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             if (!stampValidate()) {
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DispatchCache);
 
                 std::optional<SampledReadScope> sampling;
+
+                // relocateVariant, counted with the copies: the shift copied the RecompileResult when
+                // the candidate holds its own copy (shiftVariant's `patched`); an unordered shift
+                // copied the words and runs before it gave up.
+                const auto relocate = [&](const DispatchVariant& source) {
+                    if (!countCopies) return relocateVariant(source, relocatedUnordered);
+                    const auto unorderedBefore = relocatedUnordered;
+                    const auto started = std::chrono::steady_clock::now();
+                    auto candidate = relocateVariant(source, relocatedUnordered);
+                    const auto us = ElapsedUs(started);
+                    auto kind = RelocateNone;
+                    if (candidate != nullptr) {
+                        kind = candidate->patched != nullptr ? RelocateWithCopy : RelocateWithoutCopy;
+                        ++copies.shiftCalls;
+                        const auto cost = ShiftedVariantCost(*candidate);
+                        copies.shiftedBytes += cost.bytes;
+                        copies.shiftedAllocations += cost.allocations;
+                        if (candidate->patched != nullptr) NoteResultCopy(copies, CopyShift, *candidate->patched);
+                    } else if (relocatedUnordered != unorderedBefore) {
+                        ++copies.shiftCalls;
+                        ++copies.unordered;
+                        copies.shiftedBytes += source.words.size() * sizeof(std::uint32_t) + source.runs.size() * sizeof(std::pair<std::uint64_t, std::uint64_t>);
+                        copies.shiftedAllocations += (source.words.empty() ? 0 : 1) + (source.runs.empty() ? 0 : 1);
+                    }
+                    ++copies.relocateCalls[kind];
+                    copies.relocateUs[kind] += us;
+                    return candidate;
+                };
 
                 // A shifted candidate (relocateVariant) validated like a stored variant; on a hit its
                 // data words are refreshed in place: the shifted compiled copy is the candidate's own
@@ -45,20 +117,34 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 const auto tryRelocated = [&](std::shared_ptr<DispatchVariant> candidate) {
                     regions.clear();
                     appendEntryRegions(*candidate, regions);
+                    const auto compareStarted = countCopies ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                    const auto waitedAtCompare = countCopies ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
                     const auto result = validateVariant(address, submission.queue, *candidate, regions, imagesFlushed, runsSynced, sampling, &liveData);
+                    if (countCopies) {
+                        // Without the GPU waits inside (the phase books them as "validate GPU wait").
+                        copies.compareUs += ElapsedUs(compareStarted) - (Graphics::Recorder::ThreadWaitedMs() - waitedAtCompare) * 1000.0;
+                        ++copies.shiftedCompares;
+                    }
                     if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) {
                         if (result == EntryOutcome::Differing) traceFailedRelocation(address, *candidate);
                         ++relocatedDiffering;
+                        if (countCopies && candidate->patched != nullptr) ++copies.shiftCopiesDiffering;
                         return false;
                     }
                     for (const auto& [position, value] : liveData) candidate->words[position] = value;
                     if (!liveData.empty()) {
+                        const auto patchStarted = countCopies ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                         std::shared_ptr<ShaderRecompiler::RecompileResult> patched;
                         if (relocationFirst() && candidate->patched != nullptr && candidate->patched.get() == candidate->compiled.get()) patched = candidate->patched;
                         else patched = std::make_shared<ShaderRecompiler::RecompileResult>(*candidate->compiled);
                         auto& descriptor = patched->bindings[candidate->flatBinding].guestDescriptor;
                         for (std::size_t k = 0; k < candidate->dataPositions.size(); ++k) {
                             if (candidate->dataSlots[k] < descriptor.size()) descriptor[candidate->dataSlots[k]] = candidate->words[candidate->dataPositions[k]];
+                        }
+                        if (countCopies) {
+                            copies.patchUs += ElapsedUs(patchStarted);
+                            if (patched == candidate->patched) ++copies.shiftCopiesPatched;
+                            else NoteResultCopy(copies, CopyRelocatedData, *patched);
                         }
                         candidate->compiled = std::move(patched);
                     }
@@ -75,7 +161,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 // 60k queue-0 hits per 10 s were relocated after 3.6 differing stored compares each.
                 const bool frontRule = relocatedHits() && !variants.front()->pointerPositions.empty();
                 if (frontRule && relocationFirst()) {
-                    if (auto candidate = relocateVariant(*variants.front(), relocatedUnordered); candidate != nullptr) {
+                    if (auto candidate = relocate(*variants.front()); candidate != nullptr) {
                         ++relocatedFirst;
                         if (tryRelocated(std::move(candidate))) storedSkipped = variants.size();
                         else ++relocatedFirstDiffering;
@@ -87,11 +173,17 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                         regions.clear();
                         appendEntryRegions(*variants[i], regions);
                         ++compared;
+                        const auto compareStarted = countCopies ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                        const auto waitedAtCompare = countCopies ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
                         auto result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData);
 
                         if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) {
                             result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData);
                             ++(result == EntryOutcome::Equal || result == EntryOutcome::EqualData ? retriesEqual : retriesMoved);
+                        }
+                        if (countCopies) {
+                            copies.compareUs += ElapsedUs(compareStarted) - (Graphics::Recorder::ThreadWaitedMs() - waitedAtCompare) * 1000.0;
+                            ++copies.storedCompares;
                         }
                         if (i == 0) outcome = result;
                         if (result == EntryOutcome::Equal || result == EntryOutcome::EqualData) {
@@ -110,7 +202,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 if (!current && relocated == nullptr && relocatedHits() && !(frontRule && relocationFirst())) {
                     for (const auto& stored : variants) {
                         if (stored->pointerPositions.empty()) continue;
-                        auto candidate = relocateVariant(*stored, relocatedUnordered);
+                        auto candidate = relocate(*stored);
                         if (candidate == nullptr) break;
                         tryRelocated(std::move(candidate));
                         break;
@@ -168,6 +260,10 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
             counters.relocatedFirst += relocatedFirst;
             counters.relocatedFirstDiffering += relocatedFirstDiffering;
             counters.storedValidationsSkipped += storedSkipped;
+            if (countCopies) {
+                ++copies.validations;
+                counters.copies.Add(copies);
+            }
             switch (outcome) {
                 case EntryOutcome::Equal: ++counters.equal; break;
                 case EntryOutcome::EqualData: ++counters.equal; break;
@@ -183,7 +279,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 ++counters.variantHitsByRank[rank];
                 compiledResult = variant->compiled;
                 if (dataHit) {
-
+                    const auto patchStarted = countCopies ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                     liveWords = variant->words;
                     for (const auto& [position, value] : liveData) liveWords[position] = value;
                     regions.clear();
@@ -194,6 +290,12 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                         if (variant->dataSlots[k] < descriptor.size()) descriptor[variant->dataSlots[k]] = liveWords[variant->dataPositions[k]];
                     }
                     compiledResult = std::move(patched);
+                    if (countCopies) {
+                        // Under the cache lock (the relock phase).
+                        counters.copies.storedPatchUs += ElapsedUs(patchStarted);
+                        NoteResultCopy(counters.copies, CopyStoredData, *compiledResult);
+                        counters.copies.liveWordsBytes += liveWords.size() * sizeof(std::uint32_t);
+                    }
                     ++counters.dataHits;
                     counters.dataWordsRefreshed += liveData.size();
                     ++counters.dataHitsByRank[rank];

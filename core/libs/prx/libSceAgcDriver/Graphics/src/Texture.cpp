@@ -1803,6 +1803,8 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         refreshGeneration();
     };
     uploadedKeys = ProvedClearKeys(descriptor, guestBytes, keyProof);
+    // The scan's collect stamped the CPU's key stores up to here: the keys the image starts from.
+    if (descriptor.dccAddress != 0) keysSeen = GuestMemory::TrackerGeneration();
     filledKeys = DccKeys::Uncompressed;
     VkClearColorValue clearValue{};
     if (IsDccClear(uploadedKeys) && ClearColorFor(storageFormat, uploadedKeys, clearValue)) {
@@ -3823,8 +3825,33 @@ void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes) {
     writeBackLayers(layers);
 }
 
+// The key store guard of a write-back of `layers`: the oldest generation of the stored units (the
+// one their texels keep the CPU's 64 KiB blocks and edge pages by), raised to keysSeen (CPU key
+// stores the image's upload already took in); 0, unchecked and stored whole as before, when a
+// stored unit is untracked, as its texels then are.
+KeyStoreGuard StorageTexture::keyStoreGuard(const char* caller, const std::vector<bool>& layers) const {
+    std::uint64_t oldest = 0;
+    for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+        if (!layers[layer]) continue;
+        if (layerGeneration[layer] == 0) return {caller, descriptor.baseAddress, 0};
+        oldest = oldest == 0 ? layerGeneration[layer] : std::min(oldest, layerGeneration[layer]);
+    }
+    return {caller, descriptor.baseAddress, oldest == 0 ? 0 : std::max(oldest, keysSeen)};
+}
+
+// The "uncompressed" keys after a write-back of `layers` (not over the clear keys of a keys fill),
+// guarded; keysSeen follows a store that left no key page to the CPU (a page left to it is counted
+// again at the next store, as a kept texel block keeps its unit's old generation).
+void StorageTexture::storeKeys(const char* caller, const std::vector<bool>& layers) {
+    if (IsDccClear(filledKeys)) return;
+    const auto outcome = MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, keyStoreGuard(caller, layers));
+    if (outcome.stored && outcome.kept == 0) keysSeen = outcome.collected != 0 ? outcome.collected : GuestMemory::TrackerGeneration();
+}
+
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
+    // The crash report's store ring names this image for every store below (texels and keys).
+    const GuestMemory::StoreTag storeTag("storage write-back", flushReason, descriptor.baseAddress);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
     struct Account {
@@ -4014,6 +4041,12 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         settle(true);
         return;
     }
+    lastWriteBackMs = GuestMemory::StoreClockMs();
+    lastWriteBackReason = flushReason;
+    lastStoredBegin = keep.front().first;
+    lastStoredEnd = keep.back().second;
+    lastKeysStored = descriptor.dccAddress != 0 && !IsDccClear(filledKeys);
+    ++writeBacks;
     if (const auto* import = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
         if (blockUnits) {
             // The kept blocks alone pass through the retiler (windows of their slices).
@@ -4023,7 +4056,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             if (profile) Profile().storageGpu += timer.lap();
             originalValid = false;
             traceKeyStore("block write-back", descriptor, guestBytes);
-            if (!IsDccClear(filledKeys)) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes);
+            storeKeys("block write-back", layers);
             uploadedKeys = DccKeys::Uncompressed;
             for (const auto& [from, to] : keep) GuestMemory::MarkWritten(from, static_cast<std::size_t>(to - from));
             settle(true);
@@ -4161,7 +4194,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         // metadata is host-imported (no CPU wait for the title's key-writing kernels), else a CPU
         // store (APS5_CPU_DCC_KEYS=1 keeps the CPU store; see DccMetadata.hpp).
         traceKeyStore("layer write-back", descriptor, guestBytes);
-        if (!IsDccClear(filledKeys)) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes);
+        storeKeys("layer write-back", layers);
         uploadedKeys = DccKeys::Uncompressed;
         for (const auto& [from, to] : keep) GuestMemory::MarkWritten(from, static_cast<std::size_t>(to - from));
         // The walk covers this surface's pages only: an adjacent image's later CPU write is stamped
@@ -4271,7 +4304,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // The texels now hold the whole image, so later reads must see them rather than a fast clear
     // (the keys may be host-imported although the texels were not: then a recorded fill, else a CPU store).
     traceKeyStore("cpu write-back", descriptor, guestBytes);
-    if (!IsDccClear(filledKeys)) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes);
+    storeKeys("cpu write-back", layers);
     uploadedKeys = DccKeys::Uncompressed;
     // The store above is the only write to these pages, so `original` is current at a fresh
     // generation, unless blocks were kept for the CPU: then the image is stale there.
@@ -4315,6 +4348,40 @@ void StorageTexture::release() noexcept {
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
     if (memory) FreeDeviceMemory(context, memory);
+}
+
+void StorageTexture::DescribeForCrash(std::uint64_t address, void (*print)(const char* text)) {
+    auto& live = Live();
+    std::unique_lock lock(live.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        print("[crash-resources]   storage images: live registry busy\n");
+        return;
+    }
+    constexpr std::uint64_t block = 65536;
+    const auto now = GuestMemory::StoreClockMs();
+    std::size_t covering = 0;
+    char line[512];
+    for (const auto* texture : live.textures) {
+        const auto& d = texture->descriptor;
+        const auto end = d.baseAddress + texture->guestBytes;
+        const bool inside = address >= d.baseAddress && address < end;
+        const bool edge = !inside && address >= (d.baseAddress & ~(block - 1)) && address < ((end + block - 1) & ~(block - 1));
+        const bool keys = d.dccAddress != 0 && address >= d.dccAddress && address < d.dccAddress + texture->guestBytes / 256;
+        if (!inside && !edge && !keys) continue;
+        if (++covering > 7) continue;
+        const auto unit = inside && texture->trackedLayerBytes != 0 ? std::min<std::uint64_t>((address - d.baseAddress) / texture->trackedLayerBytes, texture->trackedLayers - 1) : 0;
+        const bool unitPending = unit < texture->layerPending.size() && texture->layerPending[unit];
+        const auto unitGeneration = unit < texture->layerGeneration.size() ? texture->layerGeneration[unit] : 0;
+        const auto pendingUnits = std::count(texture->layerPending.begin(), texture->layerPending.end(), true);
+        std::snprintf(line, sizeof(line), "[crash-resources]   storage image 0x%llx+0x%llx (address %s) format %u tile %u %ux%u mips %u dcc 0x%llx: unit %llu of %u pending %d gen %llu (image gen %llu, %lld units pending, dirty %d, released %d); last write-back %s at %llu ms (%llu ms ago) stored 0x%llx-0x%llx keys %d, %u write-backs\n", static_cast<unsigned long long>(d.baseAddress), static_cast<unsigned long long>(texture->guestBytes), inside ? "inside" : keys ? "in its DCC keys" : "in its 64 KiB edge blocks", static_cast<unsigned>(d.format), static_cast<unsigned>(d.tileMode), d.width, d.height, static_cast<unsigned>(d.mipCount), static_cast<unsigned long long>(d.dccAddress), static_cast<unsigned long long>(unit), texture->trackedLayers, unitPending ? 1 : 0, static_cast<unsigned long long>(unitGeneration), static_cast<unsigned long long>(texture->generation), static_cast<long long>(pendingUnits), texture->dirty ? 1 : 0, texture->released ? 1 : 0, texture->lastWriteBackReason != nullptr ? texture->lastWriteBackReason : "-", static_cast<unsigned long long>(texture->lastWriteBackMs), static_cast<unsigned long long>(texture->lastWriteBackMs != 0 ? now - std::min(now, texture->lastWriteBackMs) : 0), static_cast<unsigned long long>(texture->lastStoredBegin), static_cast<unsigned long long>(texture->lastStoredEnd), texture->lastKeysStored ? 1 : 0, texture->writeBacks);
+        print(line);
+    }
+    std::snprintf(line, sizeof(line), "[crash-resources]   storage images: %zu of %zu live cover it%s\n", covering, live.textures.size(), covering > 7 ? " (first 7 shown)" : "");
+    print(line);
+}
+
+namespace {
+const bool storageCrashDescriber = (GuestMemory::AddCrashDescriber(&StorageTexture::DescribeForCrash), true);
 }
 
 std::uint64_t StorageTexture::GuestBytes() const {

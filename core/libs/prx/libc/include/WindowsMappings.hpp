@@ -347,6 +347,20 @@ public:
     // Debug aid: the write-tracking state of the page holding `address`, as one line.
     void Describe(std::uintptr_t address, char* text, std::size_t size) {
         std::lock_guard lock(mutex);
+        describe(address, text, size);
+    }
+
+    // Describe without waiting (the crash report's resource lines): false while another thread
+    // holds the mappings.
+    bool TryDescribe(std::uintptr_t address, char* text, std::size_t size) {
+        std::unique_lock lock(mutex, std::try_to_lock);
+        if (!lock.owns_lock()) return false;
+        describe(address, text, size);
+        return true;
+    }
+
+private:
+    void describe(std::uintptr_t address, char* text, std::size_t size) {
         const auto base = address & ~(pageBytes - 1);
         const bool clean = rangeAt(cleanRanges, address) != cleanRanges.end();
         const bool fresh = rangeAt(freshRanges, address) != freshRanges.end();
@@ -356,8 +370,13 @@ public:
             return;
         }
         const auto& view = found->second;
-        std::snprintf(text, size, "view protection 0x%lx seen %llu generation %llu armed %d host writes %u aliases %zu pins %u guarded parts 0x%x section offset 0x%llx (clean %d fresh %d)", view.protection, static_cast<unsigned long long>(view.seen), static_cast<unsigned long long>(view.page->generation), view.armed ? 1 : 0, view.hostWrites, view.page->aliases.size(), view.page->pins, static_cast<unsigned>(view.guarded), static_cast<unsigned long long>(view.offset), clean ? 1 : 0, fresh ? 1 : 0);
+        // Fine tracking (TrackParts): the 4 KiB parts written since this view last collected them.
+        unsigned unseen = 0;
+        for (std::size_t part = 0; part < guardParts; ++part) unseen |= view.partSeen[part] != view.page->partGeneration[part] ? 1u << part : 0u;
+        std::snprintf(text, size, "view protection 0x%lx seen %llu generation %llu armed %d host writes %u aliases %zu pins %u guarded parts 0x%x section offset 0x%llx (clean %d fresh %d) fine %d open parts 0x%x unseen parts 0x%x", view.protection, static_cast<unsigned long long>(view.seen), static_cast<unsigned long long>(view.page->generation), view.armed ? 1 : 0, view.hostWrites, view.page->aliases.size(), view.page->pins, static_cast<unsigned>(view.guarded), static_cast<unsigned long long>(view.offset), clean ? 1 : 0, fresh ? 1 : 0, view.page->fine ? 1 : 0, static_cast<unsigned>(view.openParts), unseen);
     }
+
+public:
 
     // Page guards over shared views (GuestWriteWatch's PageGuard, APS5_GUARD_SHARED_VIEWS=1). The
     // write tracking re-protects a view's 16 KiB page as a whole (Collect arms it read-only,
