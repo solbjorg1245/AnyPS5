@@ -67,8 +67,27 @@ The launcher sets these unless you already set them yourself:
 Other user settings: `ANYPS5_INPUT_CONFIG` (input file path), `ANYPS5_SHADER_CACHE_DIR` (move the shader
 cache), `ANYPS5_NO_SHADER_CACHE=1` (no disk cache).
 
-Display settings live in `anyps5-settings.ini` next to the game: rename `anyps5-settings.ini.example`
-and edit it. The game's own performance and cinematic modes are replaced by these keys:
+### Settings window
+
+Every start opens a settings window before the game: resolution (the presets, your desktop's size or
+auto), window mode, FPS limit, timestep and native aspect. Use the mouse, the keyboard (arrow keys,
+Enter) or a controller (D-pad, A; Start plays). **Play** saves `anyps5-settings.ini` and starts the
+game; closing the window quits without starting it. Your comments and other keys in the file are kept.
+Upscaler and frame generation are shown greyed out: they come later.
+
+Add `--launch` to start straight away with the saved settings:
+- Steam (a non-Steam game pointing at `DemonsSouls.exe`, `DemonsSouls.bat` or `DemonsSouls.sh`):
+  launch options `%command% --launch`
+- Windows: `DemonsSouls.bat --launch` or `.\DemonsSouls.ps1 --launch`; Linux: `./DemonsSouls.sh --launch`
+
+`APS5_NO_LAUNCHER=1` skips it too. The window is `libs/anyps5-launcher.exe` (Linux:
+`libs/anyps5-launcher`); if it is missing or cannot open, the game starts with the file as it is.
+
+### Settings file
+
+Display settings live in `anyps5-settings.ini` next to the game: the settings window writes it, or rename
+`anyps5-settings.ini.example` and edit it. The game's own performance and cinematic modes are replaced
+by these keys:
 
 | Key | Variable | Values |
 |---|---|---|

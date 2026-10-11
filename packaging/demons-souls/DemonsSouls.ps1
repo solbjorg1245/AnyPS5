@@ -12,6 +12,7 @@ First start: pass your own decrypted dump with -Dump. The launcher then
      modified in the dump; the few small top-level files are copied),
   4. starts the game.
 Later starts need no arguments. Run with -Dump again after updating AnyPS5 or the dump.
+Other arguments go to DemonsSouls.exe: --launch skips the settings window (Steam: %command% --launch).
 
 Runtime settings (an already set environment variable always wins):
   APS5_HOST_IMPORT_MIB  guest memory the GPU may read in place; chosen from installed RAM

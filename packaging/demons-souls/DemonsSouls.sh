@@ -9,7 +9,8 @@
 #   3. symlinks every folder of the dump into app0/ (nothing in the dump is copied or modified; the
 #      few small top-level files are copied),
 #   4. starts the game.
-# Later starts: ./DemonsSouls.sh   (extra arguments after -- go to the game)
+# Later starts: ./DemonsSouls.sh   (extra arguments after -- go to the game; ./DemonsSouls.sh --launch
+#   skips the settings window, also as Steam launch options: %command% --launch)
 # Options: --dump <dir>, --setup-only, --no-patch, --to-intel (relink for an Intel CPU; untested)
 #
 # Runtime settings (an already exported variable always wins):

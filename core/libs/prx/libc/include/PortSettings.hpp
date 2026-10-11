@@ -309,12 +309,14 @@ inline Settings Parse(std::string_view text, const std::string& origin) {
     return settings;
 }
 
+// The variable that overrides each key (the launcher names the ones set, which win over its choices).
+inline constexpr std::array<std::pair<const char*, const char*>, 8> EnvironmentKeys{{
+    {"APS5_RESOLUTION", "Resolution"}, {"APS5_RENDER_RESOLUTION", "RenderResolution"}, {"APS5_FPS_LIMIT", "FpsLimit"},
+    {"APS5_TIMESTEP", "Timestep"}, {"APS5_TIMESTEP_MIN_HZ", "TimestepMinHz"}, {"APS5_WINDOW_MODE", "WindowMode"},
+    {"APS5_NATIVE_ASPECT", "NativeAspect"}, {"APS5_UPSCALER", "Upscaler"}}};
+
 inline void ApplyEnvironment(Settings& settings, const std::function<const char*(const char*)>& lookup) {
-    static constexpr std::array<std::pair<const char*, const char*>, 8> variables{{
-        {"APS5_RESOLUTION", "Resolution"}, {"APS5_RENDER_RESOLUTION", "RenderResolution"}, {"APS5_FPS_LIMIT", "FpsLimit"},
-        {"APS5_TIMESTEP", "Timestep"}, {"APS5_TIMESTEP_MIN_HZ", "TimestepMinHz"}, {"APS5_WINDOW_MODE", "WindowMode"},
-        {"APS5_NATIVE_ASPECT", "NativeAspect"}, {"APS5_UPSCALER", "Upscaler"}}};
-    for (const auto& [variable, key] : variables) {
+    for (const auto& [variable, key] : EnvironmentKeys) {
         const char* value = lookup(variable);
         if (value != nullptr && value[0] != '\0') SetKey(settings, key, value, variable);
     }
@@ -685,6 +687,114 @@ inline std::string Describe(const Settings& settings) {
     result += settings.windowMode == WindowMode::Fullscreen ? ", WindowMode fullscreen" : settings.windowMode == WindowMode::Windowed ? ", WindowMode windowed" : "";
     result += ", Upscaler off";
     result += settings.source.empty() ? " (no settings file)" : " (" + settings.source + ")";
+    return result;
+}
+
+// The settings launcher (s61, core/launcher: anyps5-launcher next to the executable or in its libs folder).
+// libc runs it before the settings load (PortSettings.cpp) and waits; it rewrites the file. Exit code 0 =
+// Play (the game starts and reads the file), LauncherExitQuit = its window was closed (the game exits), any
+// other code = it failed (the game starts with the file as it is).
+inline constexpr const char* LauncherName = "anyps5-launcher";
+inline constexpr const char* LaunchArgument = "--launch";
+inline constexpr int LauncherExitQuit = 3;
+
+// Why the launcher is not shown, nullptr to show it: --launch on the host command line (Steam launch
+// options "%command% --launch"), APS5_NO_LAUNCHER=1 (any value but 0) or APS5_LAUNCHER=0 (the test
+// harness), APS5_SETTINGS=none (no file to edit). `args` is the host argv, argv[0] first.
+inline const char* LauncherSkipReason(const std::vector<std::string>& args, const std::function<const char*(const char*)>& lookup) {
+    for (std::size_t index = 1; index < args.size(); ++index) if (args[index] == LaunchArgument) return LaunchArgument;
+    const auto set = [&](const char* name) -> const char* { const char* value = lookup(name); return value != nullptr && value[0] != '\0' ? value : nullptr; };
+    if (const char* value = set("APS5_NO_LAUNCHER"); value != nullptr && std::string_view(value) != "0") return "APS5_NO_LAUNCHER";
+    if (const char* value = set("APS5_LAUNCHER"); value != nullptr && std::string_view(value) == "0") return "APS5_LAUNCHER=0";
+    if (const char* value = set("APS5_SETTINGS"); value != nullptr && Lower(value) == "none") return "APS5_SETTINGS=none";
+    return nullptr;
+}
+
+// The launcher's choices made consistent the way Normalize would refuse them otherwise: an FpsLimit other
+// than the title's 30 or 60 turns the variable timestep on, native aspect needs an explicit Resolution.
+inline void ApplyLauncherRules(Settings& settings) {
+    if (settings.fpsLimit != 0.0 && !IsGameRate(settings.fpsLimit)) settings.variableTimestep = true;
+    if (settings.width == 0) settings.nativeAspect = false;
+}
+
+// Shortest text that parses back to the same number (locale independent, like ParseNumber).
+inline std::string FormatNumber(double value) {
+    char text[32];
+    const auto result = std::to_chars(text, text + sizeof(text), value);
+    return result.ec == std::errc{} ? std::string(text, result.ptr) : std::string("0");
+}
+
+// The keys the launcher writes, as values Parse reads back to the same settings.
+inline std::vector<std::pair<std::string, std::string>> LauncherValues(const Settings& settings) {
+    return {
+        {"Resolution", settings.width == 0 ? std::string("auto") : std::to_string(settings.width) + "x" + std::to_string(settings.height)},
+        {"WindowMode", settings.windowMode == WindowMode::Fullscreen ? "fullscreen" : "windowed"}, // auto is windowed (DisplayWindow)
+        {"FpsLimit", settings.fpsLimit == 0.0 ? std::string("auto") : FormatNumber(settings.fpsLimit)},
+        {"Timestep", settings.variableTimestep ? "variable" : "fixed"},
+        {"NativeAspect", settings.nativeAspect ? "on" : "off"}};
+}
+
+// The file's text with each key set to its value. Every active "Key = Value" line of a key (any case) gets
+// the new value and keeps its indentation, key spelling and trailing comment; a key without such a line is
+// appended. Comments (also commented-out keys), sections, other keys, a UTF-8 BOM and the line endings stay
+// byte for byte; appended lines use the file's line ending (LF for a new file).
+inline std::string SetIniValues(std::string_view text, const std::vector<std::pair<std::string, std::string>>& values) {
+    const char* const newline = text.find("\r\n") != std::string_view::npos ? "\r\n" : "\n";
+    std::vector<bool> written(values.size(), false);
+    std::string result;
+    result.reserve(text.size() + 32 * values.size());
+    std::size_t start = 0;
+    if (text.starts_with("\xEF\xBB\xBF")) {
+        result += text.substr(0, 3);
+        start = 3;
+    }
+    while (start < text.size()) {
+        const auto end = text.find('\n', start);
+        auto line = text.substr(start, end == std::string_view::npos ? std::string_view::npos : end - start);
+        std::string_view ending = end == std::string_view::npos ? "" : "\n";
+        if (!line.empty() && line.back() == '\r') {
+            line.remove_suffix(1);
+            ending = end == std::string_view::npos ? "\r" : "\r\n";
+        }
+        start = end == std::string_view::npos ? text.size() : end + 1;
+        const auto comment = line.find_first_of("#;");
+        const auto body = line.substr(0, comment);
+        const auto separator = body.find('=');
+        const auto trimmed = Trim(body);
+        std::size_t match = values.size();
+        if (separator != std::string_view::npos && !trimmed.empty() && trimmed.front() != '[') {
+            const auto key = Lower(Trim(body.substr(0, separator)));
+            for (std::size_t index = 0; index < values.size(); ++index) {
+                if (Lower(values[index].first) == key) {
+                    match = index;
+                    break;
+                }
+            }
+        }
+        if (match == values.size()) {
+            result += line;
+            result += ending;
+            continue;
+        }
+        const auto indent = body.find_first_not_of(" \t");
+        result += body.substr(0, indent);
+        result += Trim(body.substr(0, separator));
+        result += " = ";
+        result += values[match].second;
+        if (comment != std::string_view::npos) {
+            result += body.substr(body.find_last_not_of(" \t") + 1);
+            result += line.substr(comment);
+        }
+        result += ending;
+        written[match] = true;
+    }
+    bool open = !result.empty() && result.back() != '\n';
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (written[index]) continue;
+        if (open) result += newline;
+        open = false;
+        result += values[index].first + " = " + values[index].second + newline;
+    }
     return result;
 }
 

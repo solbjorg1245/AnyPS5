@@ -1,6 +1,7 @@
-# AnyPS5 display settings for Demon's Souls. Rename this file to anyps5-settings.ini (next to the game
-# executable) to use it. A key left out, or set to auto, keeps the default: the window opens at 60% of the
-# screen and the game's own graphics mode picks the render resolution and the frame rate.
+# AnyPS5 display settings for Demon's Souls. The settings window at each start writes anyps5-settings.ini
+# (next to the game executable); or rename this file to anyps5-settings.ini and edit it. A key left out,
+# or set to auto, keeps the default: the window opens at 60% of the screen and the game's own graphics
+# mode picks the render resolution and the frame rate.
 # Each key has an environment variable that overrides it (APS5_RESOLUTION, APS5_FPS_LIMIT, ...).
 
 # Output resolution: the window's size (any WIDTHxHEIGHT; the image keeps 16:9 and is letterboxed).

@@ -59,6 +59,9 @@ public:
         while (std::getline(stream, argument, '\0')) {
             if (stream.eof())
                 throw std::runtime_error("Unterminated process argument");
+            // --launch is the host's (it skips the settings launcher, PortSettings.cpp), not the title's.
+            if (!arguments.empty() && argument == "--launch")
+                continue;
             arguments.push_back(argument);
         }
         if (stream.bad() || !stream.eof())

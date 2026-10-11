@@ -182,6 +182,9 @@ static void TestOverlay() {
     { std::ofstream file(root / "app0" / "misc" / "renderconfig_ps5_perf.txt", std::ios::binary); file << "+r_Wants4K = WantsHigh\r\n+TargetFramesPerSecond = 60"; }
     { std::ofstream file(root / "app0" / "misc" / "gamecommandlineargs.txt", std::ios::binary); file << "+untouched"; }
     SetVariable("APS5_SETTINGS", settingsPath.string().c_str());
+    // No settings window here (APS5_NO_LAUNCHER=0 with anyps5-launcher.exe next to the test shows it: a
+    // manual check of the spawn, wait and read-back path).
+    if (std::getenv("APS5_NO_LAUNCHER") == nullptr) SetVariable("APS5_NO_LAUNCHER", "1");
 
     Require(ReadGuest("/app0/misc/RenderConfig_PS5_Perf.txt") == "+r_Wants4K = WantsHigh\r\n+TargetFramesPerSecond = 60\r\n+r_Wants4K=WantsHigh\r\n+TargetFramesPerSecond=30\r\n", "render config overlay");
     Require(ReadGuest("/app0/packagecmdlineargs.txt") == "+cp11_callHomeLockDownEnabled=false +r_Wants4K=WantsHigh +TargetFramesPerSecond=30", "command line overlay");
@@ -413,7 +416,72 @@ static void TestResolution4kUi() {
     Require(std::string(PortSettings::PlanTierRewrite(nativeOff).slot->convar) == "WantsHigh", "native aspect's 4K UI is its own switch");
 }
 
+// The settings launcher (s61): when it is skipped, and the ini read/modify/write round trip it saves with.
+static void TestLauncher() {
+    const auto lookup = [](std::map<std::string, std::string> environment) {
+        return [environment](const char* name) -> const char* {
+            const auto found = environment.find(name);
+            return found == environment.end() ? nullptr : found->second.c_str();
+        };
+    };
+    const auto reason = [](const char* text) { return text == nullptr ? std::string("shown") : std::string(text); };
+    Require(reason(PortSettings::LauncherSkipReason({"DemonsSouls.exe"}, lookup({}))) == "shown", "launcher shown by default");
+    Require(reason(PortSettings::LauncherSkipReason({"DemonsSouls.exe", "--launch"}, lookup({}))) == "--launch", "--launch skips it");
+    Require(reason(PortSettings::LauncherSkipReason({"--launch"}, lookup({}))) == "shown", "argv[0] is not an option");
+    Require(reason(PortSettings::LauncherSkipReason({"x", "--launcher"}, lookup({}))) == "shown", "only --launch itself");
+    Require(reason(PortSettings::LauncherSkipReason({"x"}, lookup({{"APS5_NO_LAUNCHER", "1"}}))) == "APS5_NO_LAUNCHER", "APS5_NO_LAUNCHER=1");
+    Require(reason(PortSettings::LauncherSkipReason({"x"}, lookup({{"APS5_NO_LAUNCHER", "0"}}))) == "shown", "APS5_NO_LAUNCHER=0 shows it");
+    Require(reason(PortSettings::LauncherSkipReason({"x"}, lookup({{"APS5_LAUNCHER", "0"}}))) == "APS5_LAUNCHER=0", "APS5_LAUNCHER=0");
+    Require(reason(PortSettings::LauncherSkipReason({"x"}, lookup({{"APS5_LAUNCHER", "1"}}))) == "shown", "APS5_LAUNCHER=1 shows it");
+    Require(reason(PortSettings::LauncherSkipReason({"x"}, lookup({{"APS5_SETTINGS", "None"}}))) == "APS5_SETTINGS=none", "no file to edit");
+
+    // Existing keys change in place (indentation, spelling, trailing comment kept, every duplicate), comments,
+    // commented-out keys, sections, unknown keys, the BOM and CRLF stay; missing keys are appended with CRLF.
+    const std::string original = "\xEF\xBB\xBF# player settings\r\n[display]\r\n  resolution=1920x1080   ; desk\r\n# FpsLimit = 45\r\nBogus = 7\r\n"
+                                 "TimestepMinHz = 25\r\n\r\nRESOLUTION = 640x360\r\nWindowMode = auto";
+    const std::string edited = PortSettings::SetIniValues(original, {{"Resolution", "1280x800"}, {"WindowMode", "fullscreen"}, {"FpsLimit", "40"}});
+    Require(edited == "\xEF\xBB\xBF# player settings\r\n[display]\r\n  resolution = 1280x800   ; desk\r\n# FpsLimit = 45\r\nBogus = 7\r\n"
+                      "TimestepMinHz = 25\r\n\r\nRESOLUTION = 1280x800\r\nWindowMode = fullscreen\r\nFpsLimit = 40\r\n", "ini edited in place");
+    Require(PortSettings::SetIniValues(edited, {{"Resolution", "1280x800"}, {"WindowMode", "fullscreen"}, {"FpsLimit", "40"}}) == edited, "same values leave the text alone");
+    Require(PortSettings::SetIniValues("", {{"Resolution", "auto"}}) == "Resolution = auto\n", "new file uses LF");
+    Require(PortSettings::SetIniValues("A = 1\n", {{"a", "2"}}) == "A = 2\n", "the line keeps its key spelling");
+    Require(PortSettings::SetIniValues("Timestep = fixed;x\n", {{"Timestep", "variable"}}) == "Timestep = variable;x\n", "comment right after the value");
+    Require(PortSettings::SetIniValues("Timestep\n", {{"Timestep", "variable"}}) == "Timestep\nTimestep = variable\n", "a line without = is not the key");
+
+    // Launcher values -> file -> parser gives the same settings back; the file's other keys survive.
+    PortSettings::Settings chosen;
+    chosen.width = 2560;
+    chosen.height = 1080;
+    chosen.windowMode = PortSettings::WindowMode::Fullscreen;
+    chosen.fpsLimit = 47.5;
+    chosen.nativeAspect = true;
+    PortSettings::ApplyLauncherRules(chosen);
+    Require(chosen.variableTimestep, "a custom limit turns the variable timestep on");
+    const auto saved = PortSettings::SetIniValues(original, PortSettings::LauncherValues(chosen));
+    auto reread = PortSettings::Parse(saved, "test.ini");
+    PortSettings::Normalize(reread);
+    Require(reread.width == 2560 && reread.height == 1080 && reread.windowMode == PortSettings::WindowMode::Fullscreen, "round trip resolution and window");
+    Require(reread.fpsLimit == 47.5 && reread.variableTimestep && reread.nativeAspect, "round trip fps, timestep, native aspect");
+    Require(Near(reread.timestepMinHz, 25.0, 1e-9), "other keys survive the save");
+    Require(saved.find("Bogus = 7\r\n") != std::string::npos && saved.find("# FpsLimit = 45\r\n") != std::string::npos, "unknown key and comment kept");
+    Require(saved.find("NativeAspect = on\r\n") != std::string::npos && saved.find("Timestep = variable\r\n") != std::string::npos, "keys appended with CRLF");
+
+    PortSettings::Settings defaults;
+    PortSettings::ApplyLauncherRules(defaults);
+    const auto plain = PortSettings::Parse(PortSettings::SetIniValues("", PortSettings::LauncherValues(defaults)), "test.ini");
+    // Auto is saved as windowed (what DisplayWindow does for auto), so only the window mode is set.
+    Require(plain.warnings.empty() && plain.windowMode == PortSettings::WindowMode::Windowed && plain.width == 0 && plain.fpsLimit == 0.0 && !plain.variableTimestep && !plain.nativeAspect,
+            "the launcher's defaults are today's behaviour");
+    PortSettings::Settings sixty;
+    sixty.fpsLimit = 60.0;
+    sixty.nativeAspect = true;
+    PortSettings::ApplyLauncherRules(sixty);
+    Require(!sixty.variableTimestep && !sixty.nativeAspect, "60 keeps the fixed step; native aspect needs a resolution");
+    Require(PortSettings::FormatNumber(59.94) == "59.94" && PortSettings::FormatNumber(45.0) == "45", "numbers written short");
+}
+
 int main() {
+    TestLauncher();
     TestReviewFixes();
     TestResolution4kUi();
     TestNativeAspect();

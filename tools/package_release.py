@@ -2,12 +2,12 @@
 
 Default mode (used by .github/workflows/release.yml, unchanged output names):
     package_release.py --platform windows|linux --build <dir> --version <tag> --output <dir>
-        -> prx-<platform>-<tag>.zip / .tar.gz (libs/*.prx) and relinker-<tag>[.exe]
+        -> prx-<platform>-<tag>.zip / .tar.gz (libs/*.prx, libs/anyps5-launcher[.exe]) and relinker-<tag>[.exe]
     package_release.py --docs docs/user --output <dir>
 
 Player archive for Demon's Souls (--game ds, in addition to the files above):
         -> AnyPS5-DemonsSouls-<tag>-<platform>-x64.zip (Windows) / .tar.gz (Linux)
-    The archive holds only files built from this source (relinker, libs/*.prx), the MinGW runtime
+    The archive holds only files built from this source (relinker, libs/*.prx, the settings launcher), the MinGW runtime
     DLLs, launchers, the stdlib-only patch tool, docs and licenses. The player relinks their own
     dump on first start; no game code, firmware or shader cache is ever packaged.
 
@@ -34,7 +34,7 @@ EXTRA_LIBRARIES = {"libcohtml.Prospero.prx"}
 PLAYER_ROOT = "AnyPS5-DemonsSouls"
 PLAYER_FILES = Path("packaging/demons-souls")
 LAUNCHER_NAMES = {"DemonsSouls.ps1", "DemonsSouls.bat", "DemonsSouls.sh"}
-EXECUTABLE_NAMES = {"relinker", "DemonsSouls.sh", "ds_patch.py"}
+EXECUTABLE_NAMES = {"relinker", "anyps5-launcher", "DemonsSouls.sh", "ds_patch.py"}
 
 # --- denylist -----------------------------------------------------------------------------------
 # Path components that only ever hold game data, user data or development output.
@@ -167,7 +167,7 @@ def elf_type(path):
     return struct.unpack_from("<H", head, 0x10)[0]
 
 
-def check_binaries(platform, libraries, runtime_names, relinker=None):
+def check_binaries(platform, libraries, runtime_names, relinker=None, launcher=None):
     bundled = {name.lower() for name in runtime_names} | {lib.name.lower() for lib in libraries}
     problems = []
     for library in libraries:
@@ -179,12 +179,14 @@ def check_binaries(platform, libraries, runtime_names, relinker=None):
                 problems.append(f"{library.name} imports {dll}")
         elif elf_type(library) != 3:  # ET_DYN
             problems.append(f"{library.name} is not a host ELF shared object (e_type {elf_type(library)})")
-    if platform == "windows" and relinker is not None:
-        # The player runs tools/relinker.exe, which does not sit next to the bundled MinGW DLLs.
-        for dll in pe_imports(relinker):
+    # tools/relinker.exe and libs/anyps5-launcher.exe do not sit next to the bundled MinGW DLLs.
+    for executable in (relinker, launcher):
+        if platform != "windows" or executable is None:
+            continue
+        for dll in pe_imports(executable):
             lower = dll.lower()
             if lower not in WINDOWS_SYSTEM_DLLS and not lower.startswith("api-ms-win-"):
-                problems.append(f"{relinker.name} imports {dll}")
+                problems.append(f"{executable.name} imports {dll}")
     if problems:
         raise PackagingError("unexpected library dependencies:\n  " + "\n  ".join(problems))
 
@@ -218,7 +220,7 @@ def license_entries(build, source, root):
     return entries
 
 
-def player_entries(platform, build, source, libraries, runtime, relinker):
+def player_entries(platform, build, source, libraries, runtime, relinker, launcher):
     root = f"{PLAYER_ROOT}/"
     player = source / PLAYER_FILES
     entries = [
@@ -237,6 +239,7 @@ def player_entries(platform, build, source, libraries, runtime, relinker):
     else:
         entries += [(f"{root}DemonsSouls.sh", player / "DemonsSouls.sh")]
     entries += [(f"{root}libs/{lib.name}", lib) for lib in libraries]
+    entries += [(f"{root}libs/{launcher.name}", launcher)]
     entries += license_entries(build, source, root)
     return entries
 
@@ -265,17 +268,18 @@ def package(platform, build, output, version, mingw_bin, game=None, dry_run=Fals
     libraries, skipped = select_libraries(build, source)
     runtime = [mingw_bin / name for name in MINGW_RUNTIME] if platform == "windows" else []
     relinker = build / "core/relinker" / ("relinker.exe" if platform == "windows" else "relinker")
-    for file in [*libraries, *runtime, relinker]:
+    launcher = build / "core/libs/libs" / ("anyps5-launcher.exe" if platform == "windows" else "anyps5-launcher")
+    for file in [*libraries, *runtime, relinker, launcher]:
         if not file.is_file() or file.stat().st_size == 0:
             raise PackagingError(f"Missing or empty release file: {file}")
-    check_binaries(platform, libraries, MINGW_RUNTIME if platform == "windows" else (), relinker)
+    check_binaries(platform, libraries, MINGW_RUNTIME if platform == "windows" else (), relinker, launcher)
 
-    lib_entries = [(f"libs/{file.name}", file) for file in [*libraries, *runtime]]
+    lib_entries = [(f"libs/{file.name}", file) for file in [*libraries, *runtime, launcher]]
     archives = {f"prx-{platform}-{version}.zip": ("zip", lib_entries),
                 f"prx-{platform}-{version}.tar.gz": ("tar", lib_entries)}
     copies = {(f"relinker-{version}.exe" if platform == "windows" else f"relinker-{version}"): relinker}
     if game == "ds":
-        entries = player_entries(platform, build, source, libraries, runtime, relinker)
+        entries = player_entries(platform, build, source, libraries, runtime, relinker, launcher)
         for _, file in entries:
             if not Path(file).is_file():
                 raise PackagingError(f"Missing release file: {file}")
