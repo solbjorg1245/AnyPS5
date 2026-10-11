@@ -44,43 +44,89 @@ static void TestNear() {
     Require(CrashMemory::MapEntryNear(entry, ~std::uint64_t{0} - 1, 0x10000), "window clamps at the top");
 }
 
+// A fake guest range at 0x7000, readable over [0x7000, 0x8000).
+static std::uint8_t g_memory[0x1000];
+constexpr std::uint64_t MemoryBase = 0x7000;
+
+static bool ReadFake(std::uint64_t address, std::uint64_t* word) {
+    if (address < MemoryBase || address + 8 > MemoryBase + sizeof(g_memory)) return false;
+    std::memcpy(word, g_memory + (address - MemoryBase), 8);
+    return true;
+}
+
+static CrashMemory::ValueRun Measure(std::uint64_t offset, std::uint64_t cap, CrashMemory::RunClass runClass = CrashMemory::RunClass::Same) {
+    return CrashMemory::MeasureRun(MemoryBase + offset, cap, runClass, ReadFake);
+}
+
 static void TestZeroRun() {
-    // A fake guest range of 0x200 words at 0x7000: readable over [0x7000, 0x8000).
-    static std::uint8_t memory[0x1000];
-    constexpr std::uint64_t base = 0x7000;
-    const auto read = [&](std::uint64_t address, std::uint64_t* word) {
-        if (address < base || address + 8 > base + sizeof(memory)) return false;
-        std::memcpy(word, memory + (address - base), 8);
-        return true;
-    };
-    memory[0x100 + 5] = 0xab; // the run starts at 0x7106
-    memory[0x340 + 2] = 0xcd; // and ends at 0x7342
-    auto run = CrashMemory::MeasureZeroRun(base + 0x200, 0x10000, read);
-    Require(run.readable && run.zero, "a zero word");
-    Require(run.begin == base + 0x106 && run.end == base + 0x342, "byte-exact edges");
-    Require(run.beforeEdge == CrashMemory::ZeroEdge::NonZero && run.afterEdge == CrashMemory::ZeroEdge::NonZero, "non-zero edges");
+    using CrashMemory::RunEdge;
+    std::memset(g_memory, 0, sizeof(g_memory));
+    g_memory[0x100 + 5] = 0xab; // the run starts at 0x7106
+    g_memory[0x340 + 2] = 0xcd; // and ends at 0x7342
+    auto run = Measure(0x200, 0x10000);
+    Require(run.readable && run.matches && run.value == 0, "a zero word");
+    Require(run.begin == MemoryBase + 0x106 && run.end == MemoryBase + 0x342, "byte-exact edges");
+    Require(run.beforeEdge == RunEdge::Differs && run.afterEdge == RunEdge::Differs, "differing edges");
     Require(run.beforeWord == 0xab0000000000ull && run.afterWord == 0xcd0000ull, "edge words");
 
-    run = CrashMemory::MeasureZeroRun(base + 0x200, 0x40, read);
-    Require(run.begin == base + 0x1c0 && run.end == base + 0x240, "capped both ways");
-    Require(run.beforeEdge == CrashMemory::ZeroEdge::Cap && run.afterEdge == CrashMemory::ZeroEdge::Cap, "cap edges");
+    run = Measure(0x200, 0x40);
+    Require(run.begin == MemoryBase + 0x1c0 && run.end == MemoryBase + 0x240, "capped both ways");
+    Require(run.beforeEdge == RunEdge::Cap && run.afterEdge == RunEdge::Cap, "cap edges");
 
-    std::memset(memory, 0, sizeof(memory));
-    run = CrashMemory::MeasureZeroRun(base + 0x804, 0x10000, read);
-    Require(run.begin == base && run.end == base + sizeof(memory), "the whole readable range");
-    Require(run.beforeEdge == CrashMemory::ZeroEdge::Unreadable && run.afterEdge == CrashMemory::ZeroEdge::Unreadable, "unreadable edges");
+    std::memset(g_memory, 0, sizeof(g_memory));
+    run = Measure(0x804, 0x10000);
+    Require(run.begin == MemoryBase && run.end == MemoryBase + sizeof(g_memory), "the whole readable range");
+    Require(run.beforeEdge == RunEdge::Unreadable && run.afterEdge == RunEdge::Unreadable, "unreadable edges");
 
-    memory[0x808] = 1;
-    run = CrashMemory::MeasureZeroRun(base + 0x808, 0x10000, read);
-    Require(run.readable && !run.zero, "a non-zero word has no run");
-    run = CrashMemory::MeasureZeroRun(base - 0x100, 0x10000, read);
-    Require(!run.readable && !run.zero, "an unreadable address");
+    run = CrashMemory::MeasureRun(MemoryBase - 0x100, 0x10000, CrashMemory::RunClass::Same, ReadFake);
+    Require(!run.readable && !run.matches, "an unreadable address");
+}
+
+static void TestValueRuns() {
+    using CrashMemory::RunClass;
+    // All ones (t582's [rbx]) over [0x400, 0x600), a pointer-sized word right before it.
+    std::memset(g_memory, 0, sizeof(g_memory));
+    std::memset(g_memory + 0x400, 0xff, 0x200);
+    const std::uint64_t pointer = 0x00007ff7ac3d37b0ull;
+    std::memcpy(g_memory + 0x3f8, &pointer, 8);
+    auto run = Measure(0x4f8, 0x10000);
+    Require(run.matches && run.value == ~std::uint64_t{0}, "an all-ones word");
+    Require(run.begin == MemoryBase + 0x400 && run.end == MemoryBase + 0x600, "all-ones run");
+    Require(run.beforeWord == pointer && run.afterWord == 0, "all-ones edge words");
+
+    // A repeated 8-byte fill; the edges match byte for byte against the fill's own offsets.
+    const std::uint64_t fill = 0x1122334455667788ull;
+    for (std::size_t offset = 0x100; offset < 0x300; offset += 8) std::memcpy(g_memory + offset, &fill, 8);
+    g_memory[0x300] = 0x88; // fill byte 0 continues the run
+    g_memory[0x301] = 0x77; // and byte 1
+    g_memory[0xff] = 0x11;  // fill byte 7 before it
+    run = Measure(0x180, 0x10000);
+    Require(run.value == fill && run.begin == MemoryBase + 0xff && run.end == MemoryBase + 0x302, "a repeated fill, byte exact");
+
+    // Pixel-like bytes (t582's [rdi]): not one value, but every byte within 8 of the first.
+    std::memset(g_memory, 0, sizeof(g_memory));
+    const std::uint8_t pixels[] = {0x21, 0x21, 0x21, 0x21, 0x22, 0x22, 0x21, 0x21, 0x22, 0x23, 0x23, 0x22, 0x23, 0x23, 0x23, 0x23};
+    for (std::size_t offset = 0x200; offset < 0x600; offset += sizeof(pixels)) std::memcpy(g_memory + offset, pixels, sizeof(pixels));
+    g_memory[0x600] = 0x28;  // within 8 of 0x21
+    g_memory[0x601] = 0x2a;  // not
+    g_memory[0x1ff] = 0x1a;  // within 8
+    g_memory[0x1fe] = 0x10;  // not
+    run = Measure(0x300, 0x10000);
+    Require(run.matches && run.begin == MemoryBase + 0x300 && run.end == MemoryBase + 0x308, "pixels are no single value");
+    Require(CrashMemory::NearWord(run.value, static_cast<std::uint8_t>(run.value)), "pixels are low entropy");
+    run = Measure(0x300, 0x10000, RunClass::Near);
+    Require(run.matches && run.begin == MemoryBase + 0x1ff && run.end == MemoryBase + 0x601, "the pixel-like run, byte exact");
+    Require(!CrashMemory::NearWord(pointer, static_cast<std::uint8_t>(pointer)), "a pointer is not low entropy");
+    std::memcpy(g_memory + 0x300, &pointer, 8);
+    run = Measure(0x300, 0x10000, RunClass::Near);
+    Require(run.readable && !run.matches, "a word outside the class has no near run");
 }
 
 int main() {
     TestRing();
     TestNear();
     TestZeroRun();
+    TestValueRuns();
     std::printf("crash_memory_tests: ok\n");
     return 0;
 }

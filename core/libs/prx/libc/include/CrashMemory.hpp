@@ -5,10 +5,11 @@
 #include <cstddef>
 #include <cstdint>
 
-// What a FATAL report says about guest memory that reads back zeros (CrashReport.cpp): the run of
-// zeros around a register (APS5_CRASH_ZERO_EXTENT) and the recent page replacements of the arena
-// (APS5_MAP_RING, recorded by WindowsMappings). A page reset or remap zeroes whole 16 KiB pages, a
-// freed and zero-filled block an object-sized run, a GPU store an image's extent.
+// What a FATAL report says about guest memory that reads back as a fill (CrashReport.cpp): the run of
+// one value around a register (APS5_CRASH_RUN_EXTENT: zeros, all ones, a pixel-like pattern) and the
+// recent page replacements of the arena (APS5_MAP_RING, recorded by WindowsMappings). A page reset or
+// remap zeroes whole 16 KiB pages, a freed and filled block an object-sized run, a GPU store an
+// image's extent.
 namespace CrashMemory {
 
 enum class MapKind : std::uint32_t {
@@ -116,58 +117,92 @@ inline ProcessMapRing& MapHistory() {
     return ring;
 }
 
-// Why a zero run stopped on one side.
-enum class ZeroEdge : std::uint32_t {
-    NonZero = 0,    // a non-zero byte (the run's beforeWord / afterWord holds its 8-byte word)
+// How the words of a run match the word at its address: the same 8-byte value (zeros, all ones, a
+// repeated fill), or every byte within NearSpread of that word's first byte (a low-entropy, pixel-like
+// fill such as 2121212122222121, t582).
+enum class RunClass : std::uint32_t {
+    Same = 0,
+    Near = 1,
+};
+
+constexpr unsigned NearSpread = 8;
+
+inline bool NearByte(std::uint8_t byte, std::uint8_t reference) {
+    return static_cast<unsigned>(byte > reference ? byte - reference : reference - byte) <= NearSpread;
+}
+
+// Whether every byte of `word` lies within NearSpread of `reference`.
+inline bool NearWord(std::uint64_t word, std::uint8_t reference) {
+    for (unsigned byte = 0; byte < 8; ++byte) {
+        if (!NearByte(static_cast<std::uint8_t>(word >> (8 * byte)), reference)) return false;
+    }
+    return true;
+}
+
+// Why a run stopped on one side.
+enum class RunEdge : std::uint32_t {
+    Differs = 0,    // a byte that does not match (the run's beforeWord / afterWord holds its 8-byte word)
     Cap = 1,        // the scan's limit
     Unreadable = 2, // memory the reader could not read
 };
 
-inline const char* ZeroEdgeName(ZeroEdge edge) {
+inline const char* RunEdgeName(RunEdge edge) {
     switch (edge) {
-    case ZeroEdge::NonZero: return "non-zero";
-    case ZeroEdge::Cap: return "cap";
-    case ZeroEdge::Unreadable: return "unreadable";
+    case RunEdge::Differs: return "differs";
+    case RunEdge::Cap: return "cap";
+    case RunEdge::Unreadable: return "unreadable";
     }
     return "?";
 }
 
-struct ZeroRun {
+struct ValueRun {
     bool readable = false;   // the 8-byte word at the address could be read
-    bool zero = false;       // and is zero (else the rest is unset)
-    std::uint64_t begin = 0; // [begin, end): the zero bytes around the address
+    bool matches = false;    // and belongs to the class (always for Same; else the rest is unset)
+    std::uint64_t value = 0; // that word
+    std::uint64_t begin = 0; // [begin, end): the matching bytes around the address
     std::uint64_t end = 0;
-    ZeroEdge beforeEdge = ZeroEdge::Cap;
-    ZeroEdge afterEdge = ZeroEdge::Cap;
+    RunEdge beforeEdge = RunEdge::Cap;
+    RunEdge afterEdge = RunEdge::Cap;
     std::uint64_t beforeWord = 0;
     std::uint64_t afterWord = 0;
 };
 
-// The run of zero bytes holding the 8-byte word at `address` (rounded down to 8), scanned up to
+// The run of matching bytes holding the 8-byte word at `address` (rounded down to 8), scanned up to
 // `cap` bytes each way in 8-byte words; `read(address, &word)` reads one aligned word, or returns
-// false where memory cannot be read.
+// false where memory cannot be read. A Same run's edges are byte exact against the value's byte at
+// the same offset (the fill repeats every 8 bytes), a Near run's against the first byte.
 template <class Read>
-ZeroRun MeasureZeroRun(std::uint64_t address, std::uint64_t cap, Read&& read) {
-    ZeroRun run;
+ValueRun MeasureRun(std::uint64_t address, std::uint64_t cap, RunClass runClass, Read&& read) {
+    ValueRun run;
     const auto start = address & ~std::uint64_t{7};
-    std::uint64_t word = 0;
-    if (!read(start, &word)) return run;
+    if (!read(start, &run.value)) return run;
     run.readable = true;
-    if (word != 0) return run;
-    run.zero = true;
+    const auto reference = static_cast<std::uint8_t>(run.value);
+    const auto byteMatches = [&](std::uint64_t word, unsigned byte) {
+        const auto value = static_cast<std::uint8_t>(word >> (8 * byte));
+        return runClass == RunClass::Same ? value == static_cast<std::uint8_t>(run.value >> (8 * byte)) : NearByte(value, reference);
+    };
+    const auto wordMatches = [&](std::uint64_t word) {
+        return runClass == RunClass::Same ? word == run.value : NearWord(word, reference);
+    };
+    if (!wordMatches(run.value)) return run;
+    run.matches = true;
     run.begin = start;
     run.end = start + 8;
+    std::uint64_t word = 0;
     for (;;) {
         if (run.end - start >= cap) break;
         if (!read(run.end, &word)) {
-            run.afterEdge = ZeroEdge::Unreadable;
+            run.afterEdge = RunEdge::Unreadable;
             break;
         }
-        if (word != 0) {
+        if (!wordMatches(word)) {
             // Little endian: the low bytes of the word follow the run.
-            run.afterEdge = ZeroEdge::NonZero;
+            run.afterEdge = RunEdge::Differs;
             run.afterWord = word;
-            run.end += static_cast<std::uint64_t>(__builtin_ctzll(word)) / 8;
+            unsigned byte = 0;
+            while (byteMatches(word, byte)) ++byte;
+            run.end += byte;
             break;
         }
         run.end += 8;
@@ -175,14 +210,16 @@ ZeroRun MeasureZeroRun(std::uint64_t address, std::uint64_t cap, Read&& read) {
     for (;;) {
         if (start - run.begin >= cap || run.begin < 8) break;
         if (!read(run.begin - 8, &word)) {
-            run.beforeEdge = ZeroEdge::Unreadable;
+            run.beforeEdge = RunEdge::Unreadable;
             break;
         }
-        if (word != 0) {
+        if (!wordMatches(word)) {
             // The high bytes of the word precede the run.
-            run.beforeEdge = ZeroEdge::NonZero;
+            run.beforeEdge = RunEdge::Differs;
             run.beforeWord = word;
-            run.begin -= static_cast<std::uint64_t>(__builtin_clzll(word)) / 8;
+            unsigned byte = 0;
+            while (byteMatches(word, 7 - byte)) ++byte;
+            run.begin -= byte;
             break;
         }
         run.begin -= 8;
