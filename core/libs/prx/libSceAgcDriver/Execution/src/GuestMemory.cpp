@@ -1664,7 +1664,7 @@ std::size_t TrackEdgeParts(std::uint64_t address, std::size_t bytes) {
 }
 
 std::size_t TrackSurfaceEdgeParts(std::uint64_t address, std::size_t bytes) {
-    static const bool enabled = std::getenv("APS5_NO_FINE_EDGE_TRACKING") == nullptr && std::getenv("APS5_NO_EARLY_EDGE_TRACKING") == nullptr;
+    static const bool enabled = std::getenv("APS5_NO_FINE_EDGE_TRACKING") == nullptr && std::getenv("APS5_EARLY_EDGE_TRACKING") != nullptr && std::string(std::getenv("APS5_EARLY_EDGE_TRACKING")) == "1";
     if (!enabled || !pageKeepUnits() || bytes == 0) return 0;
 #ifdef _WIN32
     return GuestArena::GuestArenaTrackEdgeWriteParts_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::uintptr_t>(address + bytes));

@@ -93,6 +93,17 @@ std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKep
 // by what stored the surface's pages (PageStoreCause, counted with APS5_FIX_BOOT_STRIP), or merged
 // per page (the pages no store reached since take the GPU's results: the Bink chroma tail).
 std::atomic<std::uint64_t> edgeBlocksToCpu{0}, edgeBlocksMerged{0}, edgeGpuPages{0}, edgeFinePages{0}, edgeFineAtCreation{0};
+
+// Debug aid (APS5_TRACE_EDGE_MERGE): the first 64 surfaces whose view pages were made fine (4 KiB
+// write tracking), when, and over which range: the candidates if a fine page goes wrong.
+std::size_t traceEdgeFine(const char* when, const GuestTextureResource& descriptor, std::uint64_t guestBytes, std::uint64_t address, std::uint64_t bytes, std::size_t made) {
+    static const bool trace = std::getenv("APS5_TRACE_EDGE_MERGE") != nullptr;
+    static std::atomic<int> traced{0};
+    if (trace && made != 0 && traced.fetch_add(1, std::memory_order_relaxed) < 64) {
+        std::fprintf(stderr, "[edge-fine] %s: image 0x%llx+0x%llx (format %u, tile mode %u, %ux%u) range 0x%llx+0x%llx, %zu view pages made fine\n", when, static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned>(descriptor.format), static_cast<unsigned>(descriptor.tileMode), descriptor.width, descriptor.height, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), made);
+    }
+    return made;
+}
 std::array<std::atomic<std::uint64_t>, 5> edgeCauses{};
 // Images stored by a FlushPending after a hook skip of theirs (AccessKeptByCpu), of which by the
 // hook for the read site of the last skip; images evictStale dropped (the [hooksync] and [storage] lines).
@@ -1148,9 +1159,9 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         memoryType = allocation.memoryTypeIndex;
         Check(AllocateDeviceMemory(context, allocation, &memory, VramClass::Textures), "vkAllocateMemory storage texture");
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory storage");
-        // The view pages the surface shares with other data are tracked per 4 KiB before the first
-        // upload's collect arms them (APS5_FIX_BOOT_STRIP: the Bink planes' table neighbours).
-        edgeFineAtCreation.fetch_add(GuestMemory::TrackSurfaceEdgeParts(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)), std::memory_order_relaxed);
+        // APS5_EARLY_EDGE_TRACKING=1 (opt-in, see TrackSurfaceEdgeParts): the view pages the surface
+        // shares with other data are tracked per 4 KiB before the first upload's collect arms them.
+        edgeFineAtCreation.fetch_add(traceEdgeFine("at creation", descriptor, guestBytes, descriptor.baseAddress, guestBytes, GuestMemory::TrackSurfaceEdgeParts(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))), std::memory_order_relaxed);
         uploadReason = "first";
         upload();
         defaultMip = mipLevel;
@@ -3890,7 +3901,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                 if (const auto cpuSurface = cpuPages & surfacePages; cpuSurface != 0) {
                     const auto low = static_cast<std::uint64_t>(std::countr_zero(cpuSurface));
                     const auto high = static_cast<std::uint64_t>(31 - std::countl_zero(cpuSurface));
-                    edgeFinePages.fetch_add(GuestMemory::TrackEdgeParts(at + low * GuestMemory::UnstoredPageBytes, static_cast<std::size_t>((high - low + 1) * GuestMemory::UnstoredPageBytes)), std::memory_order_relaxed);
+                    const auto fineAt = at + low * GuestMemory::UnstoredPageBytes;
+                    const auto fineBytes = (high - low + 1) * GuestMemory::UnstoredPageBytes;
+                    edgeFinePages.fetch_add(traceEdgeFine("after a merge", descriptor, guestBytes, fineAt, fineBytes, GuestMemory::TrackEdgeParts(fineAt, static_cast<std::size_t>(fineBytes))), std::memory_order_relaxed);
                 }
                 // Debug aid: APS5_TRACE_EDGE_MERGE names the first 64 edge blocks whose surface pages
                 // a store record keeps from the results (block, surface pages, GPU pages, CPU and

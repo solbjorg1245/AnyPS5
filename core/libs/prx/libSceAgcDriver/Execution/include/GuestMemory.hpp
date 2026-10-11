@@ -113,7 +113,11 @@ std::size_t TrackEdgeParts(std::uint64_t address, std::size_t bytes);
 // The same, ahead of any merge, for the view pages a GPU-written surface [address, address + bytes)
 // covers only in part (its first and last, when it starts or ends inside one): called when the
 // surface's image is made, so the first frame's CPU stores next door stamp only their own pages.
-// Off with TrackEdgeParts, or alone with APS5_NO_EARLY_EDGE_TRACKING=1.
+// OPT-IN (APS5_EARLY_EDGE_TRACKING=1; off with TrackEdgeParts too): on for every GPU surface it went
+// with a broken, unstreamed-looking world (t511) and a crash on 0xff-filled game data (t513), while
+// the merge-time tracking alone stayed clean (t509, t514). Suspect: a surface whose extent runs past
+// its allocation, so the write-back's per-page merge now stores into neighbours' 4 KiB parts the
+// CPU did not write since (the 16 KiB stamp used to keep them). The trace names the surfaces.
 std::size_t TrackSurfaceEdgeParts(std::uint64_t address, std::size_t bytes);
 // Collect epoch: within one epoch a range already collected is not walked again, CollectWrites
 // returns the current generation instead. A guest write landing between two collects of the same
