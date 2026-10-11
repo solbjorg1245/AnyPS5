@@ -280,12 +280,24 @@ static void TestNativeAspect() {
     Require(!PortSettings::DisplayAspectBits(0x3f800000, 3, plan), "unknown value left alone");
     Require(!PortSettings::DisplayAspectBits(PortSettings::Aspect16x9Bits, 9, plan), "unknown mode left alone");
 
-    // Part 2: the shared targets at the render size, the display buffer at the output's shape inside the
-    // slot's display size; nothing where the slot's own size already is that, or SetMode never runs.
+    // Part 2 (experimental halves, off by default): the shared targets at the render size, the display
+    // buffer at the output's shape inside the slot's display size; nothing where the slot's own size
+    // already is that, or SetMode never runs.
+    const auto halves = [](const char* resolution, bool render, bool ui) {
+        auto settings = PortSettings::Parse(std::string("NativeAspect = on\nResolution = ") + resolution + "\n", "test.ini");
+        PortSettings::ApplyEnvironment(settings, [&](const char* name) -> const char* {
+            if (std::string(name) == "APS5_NATIVE_ASPECT_RENDER") return render ? "1" : "0";
+            if (std::string(name) == "APS5_NATIVE_ASPECT_UI") return ui ? "1" : nullptr;
+            return nullptr;
+        });
+        PortSettings::Normalize(settings);
+        return PortSettings::PlanNativeAspect(settings);
+    };
     const auto targets = [&](const char* resolution, std::uint32_t sharedWidth, std::uint32_t sharedHeight, std::uint32_t displayWidth, std::uint32_t displayHeight) {
-        const auto result = native(resolution);
+        const auto result = halves(resolution, true, true);
         return result.sharedWidth == sharedWidth && result.sharedHeight == sharedHeight && result.displayWidth == displayWidth && result.displayHeight == displayHeight;
     };
+    Require(!native("2560x1080").SharedNative() && !native("2560x1080").DisplayNative() && !native("3440x1440").SharedNative(), "NativeAspect alone is part 1");
     Require(targets("2560x1080", 2560, 1080, 3840, 1620), "21:9 in WantsHigh: shared 2560x1080, display 3840x1620");
     Require(targets("1280x800", 1280, 800, 1728, 1080), "16:10 in WantsPerf: shared 1280x800, display 1728x1080");
     Require(targets("1920x1200", 1920, 1200, 3456, 2160), "16:10 in WantsHigh: display 3456x2160");
@@ -295,31 +307,24 @@ static void TestNativeAspect() {
     Require(targets("3840x2160", 0, 0, 0, 0), "16:9 4K: the slot's own sizes");
     Require(targets("1920x1080", 0, 0, 0, 0), "WantsBase: Init's sizes kept");
     for (const char* resolution : {"2560x1080", "1280x800", "1920x1200", "3440x1440", "5120x1440", "1024x768", "800x1280", "7680x2160"}) {
-        const auto result = native(resolution);
+        const auto result = halves(resolution, true, true);
         Require(result.Active() && result.sharedWidth <= 3840 && result.sharedHeight <= 2160 && result.displayWidth <= 3840 && result.displayHeight <= 2160
             && result.displayWidth % 8 == 0 && result.displayHeight % 4 == 0, "every size within 3840x2160, aligned");
     }
-    const auto halves = [](const char* resolution, const char* variable, const char* value) {
-        auto settings = PortSettings::Parse(std::string("NativeAspect = on\nResolution = ") + resolution + "\n", "test.ini");
-        PortSettings::ApplyEnvironment(settings, [&](const char* name) -> const char* { return std::string(name) == variable ? value : nullptr; });
-        PortSettings::Normalize(settings);
-        return PortSettings::PlanNativeAspect(settings);
-    };
-    const auto noUi = halves("2560x1080", "APS5_NO_NATIVE_ASPECT_UI", "1");
-    Require(noUi.SharedNative() && !noUi.DisplayNative() && noUi.renderWidth == 2560, "APS5_NO_NATIVE_ASPECT_UI keeps the 16:9 display buffer");
-    const auto noRender = halves("2560x1080", "APS5_NO_NATIVE_ASPECT_RENDER", "1");
-    Require(!noRender.SharedNative() && noRender.DisplayNative(), "APS5_NO_NATIVE_ASPECT_RENDER keeps the 16:9 shared targets");
-    Require(halves("2560x1080", "APS5_NO_NATIVE_ASPECT_UI", "0").DisplayNative(), "0 keeps part 2");
-    const auto superNoUi = halves("3440x1440", "APS5_NO_NATIVE_ASPECT_UI", "1");
-    Require(superNoUi.Active() && !superNoUi.SharedNative() && !superNoUi.DisplayNative(), "WantsSuperHigh needs both halves");
-    Require(PortSettings::TierTableWrites(native("2560x1080")).size() == 2, "display entries only once the display buffer is patched");
+    const auto renderOnly = halves("2560x1080", true, false);
+    Require(renderOnly.SharedNative() && !renderOnly.DisplayNative() && renderOnly.renderWidth == 2560, "APS5_NATIVE_ASPECT_RENDER alone");
+    const auto uiOnly = halves("2560x1080", false, true);
+    Require(!uiOnly.SharedNative() && uiOnly.DisplayNative(), "APS5_NATIVE_ASPECT_UI alone ('0' keeps the render half off)");
+    const auto superRenderOnly = halves("3440x1440", true, false);
+    Require(superRenderOnly.Active() && !superRenderOnly.SharedNative() && !superRenderOnly.DisplayNative(), "WantsSuperHigh needs both halves");
+    Require(PortSettings::TierTableWrites(halves("2560x1080", true, true)).size() == 2, "display entries only once the display buffer is patched");
     auto displayTable = PortSettings::TierTable;
-    for (const auto& write : PortSettings::TierTableWrites(native("2560x1080"), true)) displayTable[write.entry] = write.value;
+    for (const auto& write : PortSettings::TierTableWrites(halves("2560x1080", true, true), true)) displayTable[write.entry] = write.value;
     Require(displayTable[2] == 2560 && displayTable[7] == 1080 && displayTable[12] == 3840 && displayTable[17] == 1620, "WantsHigh render and display entries");
     for (std::size_t entry = 0; entry < displayTable.size(); ++entry) {
         if (entry != 2 && entry != 7 && entry != 12 && entry != 17) Require(displayTable[entry] == PortSettings::TierTable[entry], "other entries untouched");
     }
-    Require(PortSettings::Describe(FromText("NativeAspect = on\nResolution = 2560x1080")).find("(shared targets 2560x1080, display buffer 3840x1620)") != std::string::npos, "describe part 2");
+    Require(PortSettings::Describe(FromText("NativeAspect = on\nResolution = 2560x1080")).find("(shared targets 2560x1440, display buffer 3840x2160)") != std::string::npos, "describe: part 1 by default");
 }
 
 int main() {

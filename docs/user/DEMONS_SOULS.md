@@ -80,6 +80,12 @@ and edit it. The game's own performance and cinematic modes are replaced by thes
 
 The log shows the result in its `[settings]` lines.
 
+`NativeAspect = on` widens the camera and presents the 16:9 render targets at the window's shape.
+Two environment-only switches go further and are experimental: `APS5_NATIVE_ASPECT_RENDER=1` sizes
+the shared render targets at `Resolution` itself (the post effects break: bloom blobs and ghosting),
+and `APS5_NATIVE_ASPECT_UI=1` gives the display buffer the window's shape (the bottom HUD is cut off
+when the window is wider than 16:9).
+
 Troubleshooting: GPU-to-guest copy-backs are coalesced and narrowed (only changed dwords are written
 back) by default. `APS5_NO_COALESCE_COPY_BACKS=1` and `APS5_NO_NARROW_COPY_BACKS=1` turn these off
 if you see stale or flickering geometry.

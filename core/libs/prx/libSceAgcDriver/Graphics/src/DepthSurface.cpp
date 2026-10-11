@@ -547,6 +547,118 @@ DepthViewportWindow& probeWindow() {
     return *window;
 }
 
+// A distinct display buffer write: a draw ('D') or a dispatch ('C') of one program, viewport,
+// scissor, blend and extent, with its count and the span of its order within the frames.
+struct DisplayWrite {
+    char kind;
+    std::uint64_t program;
+    VkViewport viewport;
+    VkRect2D scissor;
+    bool blend;
+    VkExtent2D extent;
+    std::uint64_t count = 1;
+    std::uint32_t firstRank = 0;
+    std::uint32_t lastRank = 0;
+    std::uint64_t firstWork = 0;
+    std::uint64_t lastWork = 0;
+};
+
+struct DisplayWriteWindow {
+    // Kept across windows: the registered buffers and the current frame's counters.
+    std::array<std::uint64_t, 4> buffers{};
+    std::size_t nextBuffer = 0;
+    std::uint64_t work = 0;
+    std::uint32_t rank = 0;
+    // Since the last digest.
+    std::uint64_t presents = 0;
+    std::uint64_t frameWork = 0;
+    std::uint64_t draws = 0;
+    std::uint64_t dispatches = 0;
+    std::uint64_t unlisted = 0;
+    std::vector<DisplayWrite> writes;
+};
+
+DisplayWriteWindow& displayWindow() {
+    static auto* window = new DisplayWriteWindow();
+    return *window;
+}
+
+// The dispatch running on this thread (AspectProbeDispatch) and the storage images it has noted.
+struct ProbeDispatchSubject {
+    bool active = false;
+    std::uint64_t program = 0;
+    std::array<std::uint64_t, 4> noted{};
+    std::size_t notedCount = 0;
+};
+
+ProbeDispatchSubject& probeDispatchSubject() {
+    static thread_local ProbeDispatchSubject subject;
+    return subject;
+}
+
+bool isDisplayBuffer(const DisplayWriteWindow& window, std::uint64_t address) {
+    return address != 0 && std::find(window.buffers.begin(), window.buffers.end(), address) != window.buffers.end();
+}
+
+void noteDisplayWrite(DisplayWriteWindow& window, const DisplayWrite& write) {
+    const auto rank = window.rank++;
+    ++(write.kind == 'D' ? window.draws : window.dispatches);
+    for (auto& entry : window.writes) {
+        if (entry.kind == write.kind && entry.program == write.program && entry.blend == write.blend && entry.extent.width == write.extent.width && entry.extent.height == write.extent.height
+            && std::memcmp(&entry.viewport, &write.viewport, sizeof(VkViewport)) == 0 && std::memcmp(&entry.scissor, &write.scissor, sizeof(VkRect2D)) == 0) {
+            ++entry.count;
+            entry.firstRank = std::min(entry.firstRank, rank);
+            entry.lastRank = std::max(entry.lastRank, rank);
+            entry.firstWork = std::min(entry.firstWork, window.work);
+            entry.lastWork = std::max(entry.lastWork, window.work);
+            return;
+        }
+    }
+    if (window.writes.size() >= 12) {
+        ++window.unlisted;
+        return;
+    }
+    auto entry = write;
+    entry.firstRank = entry.lastRank = rank;
+    entry.firstWork = entry.lastWork = window.work;
+    window.writes.push_back(entry);
+}
+
+std::string displayWriteDigest() {
+    DisplayWriteWindow window;
+    {
+        std::lock_guard lock(probeMutex());
+        auto& live = displayWindow();
+        window = live;
+        live.presents = live.frameWork = live.draws = live.dispatches = live.unlisted = 0;
+        live.writes.clear();
+    }
+    std::sort(window.writes.begin(), window.writes.end(), [](const auto& left, const auto& right) { return left.firstRank < right.firstRank; });
+    char text[256];
+    std::snprintf(text, sizeof(text), "; display buffer writes (APS5_ASPECT_PROBE): %llu presents, %.0f draws+dispatches per frame, %llu draws, %llu dispatches, %llu unlisted; buffers",
+        static_cast<unsigned long long>(window.presents), window.presents != 0 ? static_cast<double>(window.frameWork) / static_cast<double>(window.presents) : 0.0,
+        static_cast<unsigned long long>(window.draws), static_cast<unsigned long long>(window.dispatches), static_cast<unsigned long long>(window.unlisted));
+    std::string result = text;
+    for (const auto buffer : window.buffers) {
+        if (buffer == 0) continue;
+        std::snprintf(text, sizeof(text), " 0x%llx", static_cast<unsigned long long>(buffer));
+        result += text;
+    }
+    for (const auto& entry : window.writes) {
+        if (entry.kind == 'D') {
+            std::snprintf(text, sizeof(text), "; #%u-%u @%llu-%llu draw fs %016llx %ux%u viewport %.0f,%.0f %.0fx%.0f scissor %d,%d %ux%u blend %s (%llu)", entry.firstRank, entry.lastRank,
+                static_cast<unsigned long long>(entry.firstWork), static_cast<unsigned long long>(entry.lastWork), static_cast<unsigned long long>(entry.program), entry.extent.width, entry.extent.height,
+                entry.viewport.x, entry.viewport.y, entry.viewport.width, entry.viewport.height, entry.scissor.offset.x, entry.scissor.offset.y, entry.scissor.extent.width, entry.scissor.extent.height,
+                entry.blend ? "on" : "off", static_cast<unsigned long long>(entry.count));
+        } else {
+            std::snprintf(text, sizeof(text), "; #%u-%u @%llu-%llu dispatch cs 0x%llx storage %ux%u (%llu)", entry.firstRank, entry.lastRank, static_cast<unsigned long long>(entry.firstWork),
+                static_cast<unsigned long long>(entry.lastWork), static_cast<unsigned long long>(entry.program), entry.extent.width, entry.extent.height, static_cast<unsigned long long>(entry.count));
+        }
+        result += text;
+    }
+    return result;
+}
+
 }
 
 void NoteDepthViewport(const State& state) {
@@ -587,7 +699,61 @@ std::string DepthViewportDigest() {
             entry.scissor.offset.x, entry.scissor.offset.y, entry.scissor.extent.width, entry.scissor.extent.height, static_cast<unsigned long long>(entry.draws));
         result += text;
     }
-    return result;
+    return result + displayWriteDigest();
+}
+
+void NoteDisplayBufferPresent(std::uint64_t address) {
+    if (!depthProbeOn() || address == 0) return;
+    std::lock_guard lock(probeMutex());
+    auto& window = displayWindow();
+    if (!isDisplayBuffer(window, address)) window.buffers[window.nextBuffer++ % window.buffers.size()] = address;
+    ++window.presents;
+    window.frameWork += window.work;
+    window.work = 0;
+    window.rank = 0;
+}
+
+void NoteDisplayBufferDraw(const State& state, std::span<const CompiledShader> shaders) {
+    if (!depthProbeOn()) return;
+    std::uint64_t program = 0;
+    for (const auto& shader : shaders) {
+        if (shader.stage == ShaderRecompiler::ShaderStage::Fragment && shader.program != nullptr) program = shader.program->variantId;
+    }
+    std::lock_guard lock(probeMutex());
+    auto& window = displayWindow();
+    ++window.work;
+    const auto targets = state.colors.empty() ? (state.hasColorTarget ? 1u : 0u) : state.colors.size();
+    for (std::size_t slot = 0; slot < targets; ++slot) {
+        const auto& color = state.colors.empty() ? state.color : state.colors[slot];
+        if (!isDisplayBuffer(window, color.address) && !isDisplayBuffer(window, color.surfaceAddress)) continue;
+        const auto& blend = slot < state.blends.size() ? state.blends[slot] : state.blend;
+        noteDisplayWrite(window, {'D', program, state.viewport, state.scissor, blend.blendEnable == VK_TRUE, color.extent});
+        return;
+    }
+}
+
+void NoteDisplayBufferStorageWrite(std::uint64_t address, std::uint32_t width, std::uint32_t height) {
+    if (!depthProbeOn()) return;
+    auto& subject = probeDispatchSubject();
+    if (!subject.active) return;
+    std::lock_guard lock(probeMutex());
+    auto& window = displayWindow();
+    if (!isDisplayBuffer(window, address)) return;
+    const auto noted = subject.noted.begin() + static_cast<std::ptrdiff_t>(subject.notedCount);
+    if (std::find(subject.noted.begin(), noted, address) != noted) return;
+    if (subject.notedCount < subject.noted.size()) subject.noted[subject.notedCount++] = address;
+    noteDisplayWrite(window, {'C', subject.program, VkViewport{}, VkRect2D{}, false, VkExtent2D{width, height}});
+}
+
+AspectProbeDispatch::AspectProbeDispatch(std::uint64_t program) {
+    if (!depthProbeOn()) return;
+    probeDispatchSubject() = {true, program, {}, 0};
+    std::lock_guard lock(probeMutex());
+    ++displayWindow().work;
+}
+
+AspectProbeDispatch::~AspectProbeDispatch() {
+    probeDispatchSubject().active = false;
 }
 
 }

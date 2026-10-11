@@ -34,8 +34,8 @@
 //   TimestepMinHz = 19.98     APS5_TIMESTEP_MIN_HZ  slowest step rate; slower frames slow the game down
 //   WindowMode = windowed     APS5_WINDOW_MODE      or fullscreen (desktop size, the frame scaled into it)
 //   NativeAspect = off        APS5_NATIVE_ASPECT    on (1): render at Resolution's aspect, wider view (Hor+)
-//                             APS5_NO_NATIVE_ASPECT_RENDER=1 / APS5_NO_NATIVE_ASPECT_UI=1 (environment only):
-//                             keep the 16:9 shared render targets / the 16:9 display buffer (part 1)
+//                             APS5_NATIVE_ASPECT_RENDER=1 / APS5_NATIVE_ASPECT_UI=1 (environment only,
+//                             experimental): shared render targets / display buffer at the output's shape
 //   Upscaler = off            APS5_UPSCALER         reserved: fsr, dlss (UpscalerQuality and FrameGeneration: file only, reserved)
 // The title takes one fixed physics step of 1/refresh per rendered frame (59.94 Hz in its 60 FPS mode,
 // 29.97 Hz in its 30 FPS mode), so any other limit, and any frame rate below the limit, changes the game
@@ -61,8 +61,8 @@ struct Settings {
     double timestepMinHz = DefaultTimestepMinHz;
     WindowMode windowMode = WindowMode::Auto;
     bool nativeAspect = false;
-    bool nativeAspectRender = true;
-    bool nativeAspectUi = true;
+    bool nativeAspectRender = false;
+    bool nativeAspectUi = false;
     Upscaler upscaler = Upscaler::Off;
     std::string upscalerQuality;
     bool frameGeneration = false;
@@ -308,10 +308,11 @@ inline void ApplyEnvironment(Settings& settings, const std::function<const char*
         const char* value = lookup(variable);
         if (value != nullptr && value[0] != '\0') SetKey(settings, key, value, variable);
     }
-    // The halves of native aspect part 2, for A/B runs: any value but 0 brings back part 1's half.
-    for (const auto& [variable, field] : {std::pair{"APS5_NO_NATIVE_ASPECT_RENDER", &Settings::nativeAspectRender}, std::pair{"APS5_NO_NATIVE_ASPECT_UI", &Settings::nativeAspectUi}}) {
+    // The experimental halves of native aspect part 2 (s59: the render half breaks the post effects,
+    // t557/t558/t560; the UI half cuts the bottom HUD off wider than 16:9): any value but 0 turns one on.
+    for (const auto& [variable, field] : {std::pair{"APS5_NATIVE_ASPECT_RENDER", &Settings::nativeAspectRender}, std::pair{"APS5_NATIVE_ASPECT_UI", &Settings::nativeAspectUi}}) {
         const char* value = lookup(variable);
-        if (value != nullptr && value[0] != '\0') settings.*field = std::string_view(value) == "0";
+        if (value != nullptr && value[0] != '\0') settings.*field = std::string_view(value) != "0";
     }
 }
 
@@ -405,6 +406,10 @@ struct NativeAspectPlan {
 // 1280x800 in WantsPerf: 1728x1080). Only the modes SetMode switches to: the title starts in WantsBase,
 // sized by CRenderDisplay::Init. WantsSuperHigh loads one size for both, so it takes the render size
 // for both and only with both halves on. A size equal to the slot's own stays 0 (nothing to patch).
+// Both halves are experimental and off unless APS5_NATIVE_ASPECT_RENDER / APS5_NATIVE_ASPECT_UI ask:
+// with the shared targets at 2560x1080 the bloom and temporal passes break (s59 t557, t558, t560;
+// cause open), and the UI scales by width and anchors its bottom for a 16:9 height, so a wider
+// display buffer cuts the bottom HUD off (t557).
 inline void PlanNativeTargets(const Settings& settings, NativeAspectPlan& plan) {
     const auto& slot = *plan.slot;
     std::uint32_t displayWidth = slot.displayWidth;

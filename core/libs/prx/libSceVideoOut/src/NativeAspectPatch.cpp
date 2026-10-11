@@ -386,10 +386,10 @@ void NativeAspectPatch::patchTargets(std::intptr_t delta, bool& display) {
         displayApplied = written;
     }
     display = displayApplied;
-    std::fprintf(stderr, "[aspect] part 2 in %s: shared render targets %ux%u (%s), display buffer %ux%u (%s); size pairs at %p\n", plan.slot->convar,
-        sharedApplied ? pairs[0] : plan.slot->renderWidth, sharedApplied ? pairs[1] : plan.slot->renderHeight, sharedApplied ? "SetMode's load patched" : "the slot's own",
+    std::fprintf(stderr, "[aspect] part 2 in %s (experimental): shared render targets %ux%u (%s), display buffer %ux%u (%s); size pairs at %p\n", plan.slot->convar,
+        sharedApplied ? pairs[0] : plan.slot->renderWidth, sharedApplied ? pairs[1] : plan.slot->renderHeight, sharedApplied ? "SetMode's load patched, APS5_NATIVE_ASPECT_RENDER: post effects break, t557/t558/t560" : "the slot's own",
         displayApplied ? plan.displayWidth : plan.slot->displayWidth, displayApplied ? plan.displayHeight : plan.slot->displayHeight,
-        displayApplied ? "SetMode, Init's buffers, getters and table patched" : "the slot's own, presenter un-squeezes", static_cast<void*>(pairs));
+        displayApplied ? "SetMode, Init's buffers, getters and table patched, APS5_NATIVE_ASPECT_UI: the bottom HUD is cut off wider than 16:9" : "the slot's own, presenter un-squeezes", static_cast<void*>(pairs));
     std::fflush(stderr);
 }
 

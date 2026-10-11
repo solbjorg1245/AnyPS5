@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DEPTHSURFACE_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TexelStats.hpp"
 #include <cstddef>
@@ -52,9 +53,27 @@ bool DepthSurfaceServes(const Context& context, const GuestTextureResource& reso
 // Debug aid (APS5_ASPECT_PROBE=1 with APS5_PROFILE_DRAW=1; Demon's Souls native aspect): notes the
 // viewport and scissor of a draw into a depth surface. DepthViewportDigest returns, for the largest depth
 // extent drawn into since its last call, the draws and their first four distinct viewport/scissor pairs
-// ("; depth viewports ..."), for the 10 s [draw] line; empty when off.
+// ("; depth viewports ..."), then the display buffer writes below ("; display buffer writes ..."),
+// for the 10 s [draw] line; empty when off.
 void NoteDepthViewport(const State& state);
 std::string DepthViewportDigest();
+// The same probe's display buffer writes, to tell the UI draws from the 3D composite and upscale:
+// a presented buffer's address is registered (the last four), and every draw whose colour target is
+// one of them and every dispatch whose storage image is one of them is listed by program (fragment
+// variant id, compute program address), viewport, scissor, blend, extent, count and order within the
+// frame (its rank among the frame's display buffer writes and its index among the frame's draws and
+// dispatches). NoteDisplayBufferDraw runs for every draw (prepareDrawInputs), AspectProbeDispatch
+// around every dispatch (Driver::dispatch), NoteDisplayBufferStorageWrite where a storage image is
+// marked written (StorageTexture::MarkDirty), NoteDisplayBufferPresent at every present.
+void NoteDisplayBufferPresent(std::uint64_t address);
+void NoteDisplayBufferDraw(const State& state, std::span<const CompiledShader> shaders);
+void NoteDisplayBufferStorageWrite(std::uint64_t address, std::uint32_t width, std::uint32_t height);
+struct AspectProbeDispatch {
+    explicit AspectProbeDispatch(std::uint64_t program);
+    ~AspectProbeDispatch();
+    AspectProbeDispatch(const AspectProbeDispatch&) = delete;
+    AspectProbeDispatch& operator=(const AspectProbeDispatch&) = delete;
+};
 
 }
 
