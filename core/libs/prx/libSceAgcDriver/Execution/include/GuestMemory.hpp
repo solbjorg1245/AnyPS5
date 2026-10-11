@@ -212,6 +212,9 @@ void TagGpuLockThread(std::uint32_t queue);
 // The presenter stays untagged (its tag is a queue id to the recorder) but takes its own column
 // of the [lock] holder matrix, apart from the game threads.
 void MarkPresenterThread();
+// The queue-0 recording pipe's thread (APS5_RECORD_PIPE): tagged queue 0 for batches, its [lock]
+// line reads "queue 0x0 (recording pipe)" beside the queue-0 worker's.
+void MarkRecordPipeThread();
 // The queue tag of the calling thread (0xffffffff when untagged), for reports that name the thread.
 std::uint32_t GpuLockThreadTag();
 // Lock sites (APS5_PROFILE_DRAW): a caller names the site of its next lock() so the [lock] line
@@ -301,6 +304,14 @@ struct PacketTag {
 constexpr std::uint32_t NoPacket = 0xfffffffeu;
 void SetCurrentPacket(std::uint32_t opcode, std::uint32_t queue);
 PacketTag CurrentPacket();
+// APS5_RECORD_PIPE_VERIFY (RecordPipe.cpp): while a thread points this at a list, each guest range its
+// recording notes as a GPU write (Recorder::noteWrite but labels, StorageTexture::markLayersPending)
+// or a synchronous draw writes back (its buffers and color targets) is appended to it. Null elsewhere:
+// one thread-local test per note.
+inline thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* recordedWrites = nullptr;
+inline void NoteRecordedWrite(std::uint64_t begin, std::uint64_t end) {
+    if (recordedWrites != nullptr) recordedWrites->emplace_back(begin, end);
+}
 
 // Store: a CPU write (Write/WriteChanged) rather than a read; a hook sync made for one orders a
 // write after a pending GPU write, so whether the bytes change says nothing about its necessity.

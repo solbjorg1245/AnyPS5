@@ -4,6 +4,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastWalk.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/PassDump.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -57,10 +59,28 @@ SnapshotRetry& snapshotRetry() {
     return retry;
 }
 
+// Puts this thread's retry state back once a packet run again returns or throws.
+struct RetryRestore {
+    SnapshotRetry& retry;
+    SnapshotRetry state;
+    bool& sync;
+    bool syncBefore;
+    bool& serves;
+    bool servesBefore;
+    ~RetryRestore() {
+        retry = state;
+        sync = syncBefore;
+        serves = servesBefore;
+    }
+};
+
 }
 
-DrawScratchLease::DrawScratchLease() {
-    if (drawScratchEnabled()) {
+DrawScratchLease::DrawScratchLease(DrawScratch* pipeSlot) {
+    if (pipeSlot != nullptr && pipeSlot->depth == 0) {
+        scratch = pipeSlot;
+        slot = true;
+    } else if (drawScratchEnabled()) {
         auto& shared = HostThreadLocal<DrawScratch, DrawScratchTag>();
         if (shared.depth == 0) scratch = &shared;
     }
@@ -77,7 +97,10 @@ DrawScratchLease::~DrawScratchLease() {
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
     PerformanceTimer timing("Driver.Draw");
-    DrawScratchLease scratch;
+    // APS5_RECORD_PIPE: the next free slot's scratch, which the draw hands to the recording thread.
+    const bool recordPipe = recordPipeDrawing(submission.queue);
+    const auto pipeConsumed = recordPipe ? recordPipeConsumed() : 0;
+    DrawScratchLease scratch(recordPipe ? recordPipeScratch() : nullptr);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::array<double, DrawDriverPhaseCount> phaseMs{};
     std::uint64_t captures = 0;
@@ -119,7 +142,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
     std::shared_ptr<VulkanDevice> localDevice;
     if (lockedPrepare) {
-
+        if (recordPipe) drainRecordPipe(retry.level != 0 ? PipeCensusDrain::Stale : PipeCensusDrain::Other);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         gpuLock.lock();
         timing.Mark("gpu_mutex_wait");
@@ -258,7 +281,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (std::size_t i = 0; i < programs.size(); ++i) decodeVertexInfo(i);
         phaseTiming.Phase(DrawRowDecode);
     }
-    ShaderMemory shaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+    std::optional<ShaderMemory> stackShaderMemory;
+    auto& shaderMemory = (scratch.Slot() ? scratch->shaderMemory : stackShaderMemory).emplace(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
     // Shared with the stage captures and the draw cache: a result is immutable once compiled, and
     // the deep copy each stage of each draw made (bindings with their descriptor words) was a fifth
     // of the draw thread. A slot replaced later (rect list, CPU-indirect patching) re-points the
@@ -379,6 +403,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const bool pipeCensus = PipeCensusActive() && submission.queue == 0;
     if (pipeCensus) NotePipeCensusCapture(memory);
     if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(queue, packet, submission, rejected);
+    // A capture or validation over a handed item's unrecorded writes: drain, then the packet again
+    // (its nested lease never hands over).
+    if (recordPipe && recordPipeOverlaps(memory, pipeConsumed)) {
+        drainRecordPipe(PipeCensusDrain::Overlap);
+        return draw(queue, packet, submission, rejected);
+    }
 
     // The device's draw, true when it threw SnapshotStale and the packet is to run again
     // (retryStale); the last retry serves the mismatch, so it never gets here.
@@ -393,22 +423,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return false;
     };
     const auto retryStale = [&](std::uint32_t resume) {
-        struct Restore {
-            SnapshotRetry& retry;
-            SnapshotRetry state;
-            bool& sync;
-            bool syncBefore;
-            bool& serves;
-            bool servesBefore;
-            ~Restore() {
-                retry = state;
-                sync = syncBefore;
-                serves = servesBefore;
-            }
-        };
         auto& sync = forcedSyncReads();
         auto& serves = Graphics::ThreadServesStaleSnapshots();
-        const Restore restore{retry, retry, sync, sync, serves, serves};
+        const RetryRestore restore{retry, retry, sync, sync, serves, serves};
         retry.level = restore.state.level + 1;
         retry.resumeRecord = resume;
         sync = true;
@@ -480,6 +497,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
         }
         if (pipeCensus) NotePipeCensusLock(PipeCensusLock::CpuIndirect);
+        if (recordPipe) drainRecordPipe(PipeCensusDrain::CpuIndirect);
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
         const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
@@ -572,6 +590,18 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (const auto& stage : stages) notePipeCensusWrites(*stage.program);
         NotePipeCensusTargets(graphics);
     }
+    // APS5_RECORD_PIPE: the locked half goes to the recording thread with everything it reads
+    // (the slot's scratch and RecordPipeDraw); any other draw drains first and records here.
+    if (recordPipe && !gpuLock.owns_lock()) {
+        const auto verdict = RecordPipeDrawVerdict(retry.level != 0 ? PipeCensusLock::Stale : lockedPrepare ? PipeCensusLock::Other : PipeCensusLock::Direct, !deferredLabels().labels.empty());
+        if (verdict.eligible && scratch.Slot() && localDevice->Window() != nullptr) {
+            handOverDraw(*scratch, {decode, entry, localDevice, recipe, drawParameters, drawKey.key, (packet[0] >> 8u) & 0xffu, retryable, drawHit || hits.partial, packet, &submission, pipeConsumed}, queue);
+            timing.Mark("draw_and_resource_release");
+            return drawn();
+        }
+        drainRecordPipe(verdict.drain.value_or(PipeCensusDrain::Other));
+        verifyRecordPipeDrained(memory, pipeConsumed, (packet[0] >> 8u) & 0xffu, drawKey.key);
+    }
     lockForDraw();
     noteDrawWriters(stages, submission.queue);
     phaseTiming.Phase(DrawRowVectors);
@@ -592,6 +622,21 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (built != nullptr) attachDrawRecipe(drawKey.key, recipeStages, std::move(built));
     timing.Mark("draw_and_resource_release");
     return drawn();
+}
+
+// The recording pipe's redo of a handed draw the recording thread found stale (RecordPipe.cpp): the
+// packet runs on this thread as retryStale runs it again, from level 1, with the item's queue state.
+DrawVerdict Driver::redrawStale(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected, bool hit) {
+    auto& retry = snapshotRetry();
+    auto& sync = forcedSyncReads();
+    auto& serves = Graphics::ThreadServesStaleSnapshots();
+    const RetryRestore restore{retry, retry, sync, sync, serves, serves};
+    retry.level = 1;
+    retry.resumeRecord = 0;
+    sync = true;
+    serves = retry.level >= SnapshotRetryLevels;
+    Graphics::CountSnapshotRetry(retry.level, hit);
+    return draw(queue, packet, submission, rejected);
 }
 
 }

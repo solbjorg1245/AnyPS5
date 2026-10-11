@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_FASTCENSUS_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -212,9 +213,10 @@ void NoteFastCensusSubmissionEnd(std::uint32_t queue);
 
 // The recording-pipe census (docs/design/parallel-recording.md stage 0; APS5_PROFILE_DRAW, off with
 // APS5_NO_PIPE_CENSUS=1 or APS5_FAST_DRAW): the runs of queue-0 packets a recording thread could take
-// over under two policies (0: direct and GPU-indirect draws; 1: also recorded direct dispatches), the
-// drains that end them (the queue thread waits for the recording thread), and the captures that read
-// a range the open run writes (an upper bound: the whole run counts as unrecorded).
+// over under four policies (direct and GPU-indirect draws; bit 0 adds recorded direct dispatches, bit 1
+// the labels and packet stores stage 2 hands over), the drains that end them (the queue thread waits
+// for the recording thread), and the captures that read a range the open run writes (an upper bound:
+// the whole run counts as unrecorded).
 enum class PipeCensusDrain : std::uint8_t { LabelsPending, CpuIndirect, Dispatch, IndirectDispatch, Wait, Label, Dma, Flip, Stale, Overlap, SubmissionEnd, Other, Count };
 inline constexpr std::size_t PipeCensusDrains = static_cast<std::size_t>(PipeCensusDrain::Count);
 inline constexpr std::array<const char*, PipeCensusDrains> PipeCensusDrainNames{"labels pending", "cpu indirect", "dispatch", "indirect dispatch", "wait", "label", "dma", "flip", "stale", "overlap", "submission end", "other"};
@@ -222,6 +224,10 @@ inline constexpr std::array<const char*, PipeCensusDrains> PipeCensusDrainNames{
 // the CB metadata pass, a locked prepare) and what a DISPATCH_DIRECT did (Copy: the HLE; Other: fast).
 enum class PipeCensusLock : std::uint8_t { None, Direct, CpuIndirect, Stale, Other };
 enum class PipeCensusDispatch : std::uint8_t { None, Recorded, Copy, Other };
+// What stage 2 (parallel-recording-s2-plan.md section 2) would do with a label or store packet
+// (PacketMemory.cpp): Hand (it rides the ring), Neutral (a no-op label or an empty store), None (not
+// a label or store, or one that drains as today).
+enum class PipeCensusLabel : std::uint8_t { None, Hand, Neutral };
 enum class DispatchOutcome : std::size_t;
 
 // A queue-0 packet as the hooks saw it; labelsPending: deferred labels record inside its lock.
@@ -231,6 +237,7 @@ struct PipeCensusPacket {
     PipeCensusLock lock = PipeCensusLock::None;
     PipeCensusDispatch dispatch = PipeCensusDispatch::None;
     bool labelsPending = false;
+    PipeCensusLabel label = PipeCensusLabel::None;
 };
 
 // Handed over (eligible), a drain, or neither (state packets, packets that recorded nothing).
@@ -239,9 +246,11 @@ struct PipeCensusVerdict {
     std::optional<PipeCensusDrain> drain;
 };
 
-inline PipeCensusVerdict ClassifyPipeCensus(const PipeCensusPacket& packet, bool dispatches) {
+// labels: the labels and stores stage 2 hands over ride the ring, so no deferred list records inside
+// a lock.
+inline PipeCensusVerdict ClassifyPipeCensus(const PipeCensusPacket& packet, bool dispatches, bool labels = false) {
     const auto drain = [](PipeCensusDrain why) { return PipeCensusVerdict{false, why}; };
-    const auto handed = packet.labelsPending ? drain(PipeCensusDrain::LabelsPending) : PipeCensusVerdict{true, std::nullopt};
+    const auto handed = packet.labelsPending && !labels ? drain(PipeCensusDrain::LabelsPending) : PipeCensusVerdict{true, std::nullopt};
     const auto opcode = (packet.header >> 8u) & 0xffu;
     if (packet.drawPacket && packet.lock == PipeCensusLock::None) return {};
     if (packet.drawPacket && packet.lock == PipeCensusLock::Direct) return handed;
@@ -250,10 +259,28 @@ inline PipeCensusVerdict ClassifyPipeCensus(const PipeCensusPacket& packet, bool
     if (opcode == 0x15 && packet.dispatch == PipeCensusDispatch::Recorded) return dispatches ? handed : drain(PipeCensusDrain::Dispatch);
     if (opcode == 0x15) return drain(packet.dispatch == PipeCensusDispatch::Copy ? PipeCensusDrain::Dma : PipeCensusDrain::Other);
     if (opcode == 0x16) return drain(PipeCensusDrain::IndirectDispatch);
+    if (labels && packet.label == PipeCensusLabel::Hand) return {true, std::nullopt};
+    if (labels && packet.label == PipeCensusLabel::Neutral) return {};
     // The rest as they end fast-census runs (FastCensusBreak order; a declined draw never comes here).
     constexpr std::array<PipeCensusDrain, FastCensusBreaks> drains{PipeCensusDrain::Dispatch, PipeCensusDrain::Wait, PipeCensusDrain::Label, PipeCensusDrain::Dma, PipeCensusDrain::Flip, PipeCensusDrain::Other, PipeCensusDrain::SubmissionEnd, PipeCensusDrain::Other};
     const auto why = ClassifyFastCensusPacket(packet.header, packet.flip, packet.renderingWait, packet.wroteOnGpu);
     return why ? drain(drains[static_cast<std::size_t>(*why)]) : PipeCensusVerdict{};
+}
+
+// Whether a resolved COPY_DATA, DMA_DATA or DUMP_CONST_RAM store's bytes come from the packet, the
+// GDS or constant RAM (stage 2 copies them at hand-over) rather than guest memory (the queue thread
+// would read a source an unrecorded item may write: it drains). The selectors as Pm4.cpp decodes them.
+inline bool PipeCensusStoreFromPacket(std::span<const std::uint32_t> packet) {
+    switch ((packet[0] >> 8u) & 0xffu) {
+    case 0x83: return true;
+    case 0x40: return packet.size() > 1 && (((packet[1] & 0xfu) << 1u) | ((packet[1] >> 30u) & 1u)) >= 10;
+    case 0x50: {
+        if (packet.size() < 7) return false;
+        const auto source = ((packet[1] >> 29u) & 3u) | ((packet[6] >> 24u) & 4u) | ((packet[6] >> 25u) & 8u);
+        return source == 1 || source == 2;
+    }
+    default: return false;
+    }
 }
 
 // One policy's runs by length (FastCensusRuns' buckets) and the drains that ended them; a drain with
@@ -282,20 +309,29 @@ struct PipeCensusRuns {
 };
 
 // The ranges the open run writes, by kind (shader-written buffers; color and depth targets). A range
-// inside a known one of the same kind is not added again.
+// inside a known one of the same kind is not added again: the known one keeps the newer serial (the
+// recording pipe's item, RecordPipe.hpp; the census leaves it 0), and Prune drops recorded ones.
 struct PipeCensusOverlay {
     static constexpr std::uint8_t Write = 1, Target = 2;
     struct Range {
         std::uint64_t begin, end;
         std::uint8_t kind;
+        std::uint64_t serial = 0;
     };
     std::vector<Range> ranges;
 
     void Add(const Range& range) {
-        for (const auto& known : ranges) {
-            if (known.begin <= range.begin && range.end <= known.end && (known.kind & range.kind) == range.kind) return;
+        for (auto& known : ranges) {
+            if (known.begin <= range.begin && range.end <= known.end && (known.kind & range.kind) == range.kind) {
+                known.serial = std::max(known.serial, range.serial);
+                return;
+            }
         }
         ranges.push_back(range);
+    }
+    // Drops the ranges of the items up to `consumed`.
+    void Prune(std::uint64_t consumed) {
+        std::erase_if(ranges, [consumed](const Range& range) { return range.serial <= consumed; });
     }
     // The kinds of the known ranges [begin, end) overlaps; 0 for none.
     std::uint8_t Overlaps(std::uint64_t begin, std::uint64_t end) const {
@@ -316,6 +352,8 @@ void NotePipeCensusCapture(const std::vector<ShaderRecompiler::MemoryRegion>& re
 void NotePipeCensusLock(PipeCensusLock kind);
 void NotePipeCensusWrite(std::uint64_t begin, std::uint64_t end, bool target);
 void NotePipeCensusTargets(const Graphics::State& graphics);
+// Stage 2's verdict on a label or store packet and the range it writes (empty for an interrupt alone).
+void NotePipeCensusLabel(PipeCensusLabel kind, std::uint64_t begin, std::uint64_t end);
 // After every queue-0 packet, and at each queue-0 submission end (the 10 s report).
 void NotePipeCensusPacket(std::uint32_t header, bool drawPacket, bool flip, bool renderingWait, bool wroteOnGpu, DispatchOutcome dispatch);
 void NotePipeCensusSubmissionEnd(bool workQueued);

@@ -2422,6 +2422,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             binding.resident->MarkDirty();
             continue;
         }
+        GuestMemory::NoteRecordedWrite(binding.color.address, binding.color.address + binding.color.bytes);
         if (binding.gpuTiling) GuestMemory::WriteChanged(binding.color.address, binding.tiled->Bytes(), binding.original);
         else WriteColorTarget(binding.color, binding.transfer->Bytes());
         // The stored texels are the whole target now, so later reads must see them rather than a fast clear.

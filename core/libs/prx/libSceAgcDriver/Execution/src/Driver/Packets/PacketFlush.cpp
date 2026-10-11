@@ -40,6 +40,8 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     if (pending.has_value()) {
         if (!labelPacket && packetFlush) submit = true;
         if (now - *pending >= labelFlushDeadline()) submit = pendingDue = true;
+        // The queue-0 recording pipe: B submits it after its next item (this try would fail under its holds).
+        if (submit && queue == 0 && recordPipeTakesSubmit()) submit = pendingDue = false;
     }
     const auto work = Graphics::Recorder::RecordedWorkSinceSubmit();
     const bool capped = !submit && !record && batchCap() != 0 && work >= batchCap();

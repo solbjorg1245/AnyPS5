@@ -2638,6 +2638,7 @@ void StorageTexture::refreshGeneration() {
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
+    GuestMemory::NoteRecordedWrite(layerBegin(first), std::min(descriptor.baseAddress + guestBytes, layerBegin(first + count)));
     if (GuestMemory::WriteBackRangeTraceOn()) gpuWriteMs = GuestMemory::StoreClockMs();
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     const auto freeClock = GuestMemory::FreeClock();

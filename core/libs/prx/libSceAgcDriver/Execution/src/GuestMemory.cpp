@@ -2337,6 +2337,7 @@ struct GpuLockStats {
     // This thread's column of the holder matrix (-1 until its first hold), and what its contended
     // acquisitions waited behind: holds by (holder, site) that ended during the waits.
     int holderColumn = -1;
+    bool recordPipe = false;
     HolderMatrixValues waitedBehindNs{};
     std::uint64_t tries = 0;
     std::uint64_t triesFailed = 0;
@@ -2551,7 +2552,7 @@ void GpuMutexType::lock() {
         std::snprintf(counts, sizeof(counts), "; lock() %llu / try %llu / try failed %llu; locked GPU waits %llu / %.0f ms", static_cast<unsigned long long>(stats.acquisitions), static_cast<unsigned long long>(stats.tries), static_cast<unsigned long long>(stats.triesFailed), static_cast<unsigned long long>(stats.lockedGpuWaits), stats.lockedGpuWaitMs);
         holds += counts;
         if (stats.tag == 0xffffffffu) std::fprintf(stderr, "[lock] %s waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.holderColumn == PresenterColumn ? "presenter" : "untagged thread", stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
-        else std::fprintf(stderr, "[lock] queue 0x%x waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.tag, stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
+        else std::fprintf(stderr, "[lock] queue 0x%x%s waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.tag, stats.recordPipe ? " (recording pipe)" : "", stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
         stats.waitedMs = 0;
         stats.waits = 0;
         stats.acquisitions = 0;
@@ -2605,6 +2606,10 @@ GpuMutexType& GpuMutex() {
 
 void TagGpuLockThread(std::uint32_t queue) {
     LockStats().tag = queue;
+}
+
+void MarkRecordPipeThread() {
+    LockStats().recordPipe = true;
 }
 
 unsigned long long CodeOffset(const void* address) {

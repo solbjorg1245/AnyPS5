@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -14,6 +15,9 @@ namespace AgcDriver::DriverDetail {
 bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump) {
     static const bool drainAll = std::getenv("APS5_DRAIN_ALL") != nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    // The recording-pipe census notes what stage 2 would hand over (FastCensus.hpp, queue 0 only).
+    static const bool pipeCensus = PipeCensusActive();
+    const bool census = pipeCensus && submission.queue == 0;
     wroteOnGpu = false;
 
     bool orderedAlready = false;
@@ -24,6 +28,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         const auto label = Pm4::DecodeLabelWrite(packet);
         const bool storesNothing = (packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0;
         if (label.has_value() || storesNothing) {
+            if (census) NotePipeCensusLabel(PipeCensusLabel::Hand, label ? label->address : 0, label ? label->address + label->Bytes().size() : 0);
             bumpEpoch(&EpochBumps::drains);
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -58,6 +63,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     if (!drainAll && !endOfPipeInterrupt && (opcode == 0x49 || opcode == 0x37)) {
         if (const auto label = Pm4::DecodeLabelWrite(packet)) {
             const auto bytes = label->Bytes();
+            if (census) NotePipeCensusLabel(bytes.size() <= 65536 && bytes.size() % 4 == 0 && label->address % 4 == 0 ? PipeCensusLabel::Hand : PipeCensusLabel::None, label->address, label->address + bytes.size());
             if (DeferLabels() && bytes.size() <= DeferredLabel::Capacity && bytes.size() % 4 == 0 && label->address % 4 == 0) {
 
                 auto& deferred = deferredLabels();
@@ -90,6 +96,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         } else if (opcode == 0x49 ? ((packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0) : (packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u)) == 0) {
             orderedAlready = true;
             ++noOpLabels;
+            if (census) NotePipeCensusLabel(PipeCensusLabel::Neutral, 0, 0);
         } else {
             ++labelFallbacks[4];
         }
@@ -105,7 +112,9 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
 
                 orderedAlready = true;
                 drained = false;
+                if (census) NotePipeCensusLabel(PipeCensusLabel::Neutral, 0, 0);
             } else {
+                if (census && PipeCensusStoreFromPacket(packet)) NotePipeCensusLabel(PipeCensusLabel::Hand, store->address, store->address + bytes.size());
 
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
                 std::lock_guard gpuLock(GuestMemory::GpuMutex());

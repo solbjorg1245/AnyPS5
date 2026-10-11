@@ -17,6 +17,8 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
     if (const auto pass = Graphics::DecodeColorMetadataPass(queue)) {
         require(!drawParameters.indirect, "indirect CB metadata passes are unsupported");
         if (PipeCensusActive() && submission.queue == 0) NotePipeCensusLock(PipeCensusLock::Other);
+        // The pass records here, under this thread's lock: the recording pipe's items first.
+        if (recordPipeDrawing(submission.queue)) drainRecordPipe(PipeCensusDrain::Other);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         if (device == nullptr) device = std::make_shared<VulkanDevice>();

@@ -42,6 +42,11 @@
 
 namespace AgcDriver::DriverDetail {
 
+struct DrawScratch;
+struct RecordPipeDraw;
+struct PipeCensusOverlay;
+enum class PipeCensusDrain : std::uint8_t;
+
 class Driver {
 public:
     static Driver& Get();
@@ -188,6 +193,29 @@ private:
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);
     std::optional<Graphics::IndirectDrawPath> classifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect);
     DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected);
+    // The queue-0 recording pipe (RecordPipe.cpp, APS5_RECORD_PIPE=1; docs/design/parallel-recording.md
+    // stage 1). A (the queue-0 worker): whether a draw may use it (queue 0, not a stale redo), the next
+    // free slot's scratch, B's progress, the overlay check, the hand-over, the drains and the stale
+    // redo (redrawStale, Draw.cpp: the packet run again from retry level 1). B: runRecordPipe.
+    static bool recordPipeDrawing(std::uint32_t queue);
+    static DrawScratch* recordPipeScratch();
+    static std::uint64_t recordPipeConsumed();
+    bool recordPipeOverlaps(std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t consumed);
+    static void verifyRecordPipeDrained(std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t consumed, std::uint32_t opcode, std::uint64_t key);
+    void handOverDraw(DrawScratch& scratch, RecordPipeDraw&& draw, const QueueState& queue);
+    void serviceRecordPipe();
+    void recordPipeWaitRound();
+    void drainRecordPipe(PipeCensusDrain why);
+    void recordPipeBoundary(std::span<const std::uint32_t> packet, std::uint32_t header);
+    void recordPipeSubmissionEnd();
+    // A's deadline submit on queue 0 goes to B while B has items (S2.1, APS5_RECORD_PIPE_NO_B_SUBMIT=1: off).
+    static bool recordPipeTakesSubmit();
+    // Whether the packet's draw was handed over (cleared by the call): B counts it as recorded work.
+    static bool recordPipeTookDraw();
+    bool recordPipeItem(DrawScratch& scratch, RecordPipeDraw& item);
+    void runRecordPipe() noexcept;
+    void stopRecordPipe();
+    DrawVerdict redrawStale(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected, bool hit);
     void addDriverPhases(DispatchClass which, const PendingDispatchPhases& pending);
     static PendingDispatchPhases& pendingDispatchPhases();
     static std::chrono::steady_clock::time_point& packetStartedAt();
@@ -257,6 +285,8 @@ private:
     void noteDrawWriters(std::span<const Graphics::CompiledShader> stages, std::uint32_t queue);
     // The buffers a queue-0 draw stage or dispatch writes, for the recording-pipe census (FastCensus.hpp).
     static void notePipeCensusWrites(const ShaderRecompiler::RecompileResult& compiled);
+    // The buffers a handed-over draw stage writes, into the recording pipe's overlay under its serial.
+    static void notePipeItemWrites(const ShaderRecompiler::RecompileResult& compiled, std::uint64_t serial, PipeCensusOverlay& overlay);
     std::optional<WrittenBuffer> newestWriterLocked(std::uint64_t begin, std::uint64_t end) const;
     std::optional<WrittenBuffer> newestWriter(std::uint64_t begin, std::uint64_t end);
     std::optional<WrittenBuffer> newestWriterMemoized(std::uint64_t begin, std::uint64_t end, NewestWriterMemos& memos);

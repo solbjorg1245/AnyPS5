@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/NewDrawKeyTally.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastRead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastDispatch.hpp"
@@ -497,6 +498,21 @@ void testPipeCensus() {
     check(both({header(0x16)}, false, PipeCensusDrain::IndirectDispatch) && both({header(0x3c)}, false, PipeCensusDrain::Wait) && both({header(0x49)}, false, PipeCensusDrain::Label) && both({header(0x50)}, false, PipeCensusDrain::Dma) && both({header(0x10) | (0x17u << 2u), false, true}, false, PipeCensusDrain::Flip), "pipe census: indirect dispatches, waits, labels, copies and flips drain");
     check(both({header(0x76)}, false, std::nullopt) && both({header(0x76), false, false, false, true}, false, PipeCensusDrain::Label) && both({header(0x22)}, false, PipeCensusDrain::Other), "pipe census: state packets are neutral, GPU stores and unknown packets drain");
 
+    // The label policies (stage 2): handed labels and stores ride, no-op ones are neutral, the rest drain.
+    const auto with = [](const PipeCensusPacket& packet, bool dispatches, bool labels, bool eligible, std::optional<PipeCensusDrain> drain) {
+        const auto verdict = ClassifyPipeCensus(packet, dispatches, labels);
+        return verdict.eligible == eligible && verdict.drain == drain;
+    };
+    const auto stored = [&](std::uint32_t opcode, PipeCensusLabel kind) {
+        PipeCensusPacket packet{header(opcode), false, false, false, true};
+        packet.label = kind;
+        return packet;
+    };
+    check(with(stored(0x49, PipeCensusLabel::Hand), false, true, true, std::nullopt) && with(stored(0x49, PipeCensusLabel::Hand), true, true, true, std::nullopt) && with(stored(0x49, PipeCensusLabel::Hand), false, false, false, PipeCensusDrain::Label) && with(stored(0x40, PipeCensusLabel::Hand), false, true, true, std::nullopt) && with(stored(0x40, PipeCensusLabel::Hand), true, false, false, PipeCensusDrain::Dma), "pipe census: handed labels and stores ride with labels, drain without");
+    check(with(stored(0x37, PipeCensusLabel::Neutral), false, true, false, std::nullopt) && with(stored(0x37, PipeCensusLabel::None), false, true, false, PipeCensusDrain::Label) && with(stored(0x50, PipeCensusLabel::None), true, true, false, PipeCensusDrain::Dma) && with(draw(PipeCensusLock::Direct, true), false, true, true, std::nullopt) && with(dispatch(PipeCensusDispatch::Recorded, true), true, true, true, std::nullopt) && with(dispatch(PipeCensusDispatch::Recorded, false), false, true, false, PipeCensusDrain::Dispatch), "pipe census: with labels, no-op labels are neutral, other labels and memory stores drain, and nothing records labels inside a lock");
+    const auto fromPacket = [](std::vector<std::uint32_t> words) { return PipeCensusStoreFromPacket(words); };
+    check(fromPacket({header(0x83), 0, 4, 0x1000, 0}) && fromPacket({header(0x40), 5, 7, 0, 0x1000, 0}) && !fromPacket({header(0x40), 1, 0x2000, 0, 0x1000, 0}) && fromPacket({header(0x50), 2u << 29u, 7, 0, 0x1000, 0, 64}) && fromPacket({header(0x50), 1u << 29u, 0, 0, 0x1000, 0, 64}) && !fromPacket({header(0x50), 0, 0x2000, 0, 0x1000, 0, 64}) && !fromPacket({header(0x50), 2u << 29u}) && !fromPacket({header(0x37), 0}), "pipe census: stores from the packet, the GDS or constant RAM can ride, memory-sourced ones drain");
+
     PipeCensusRuns runs;
     const PipeCensusVerdict handed{true, std::nullopt};
     const bool drainedEmpty = runs.Apply({false, PipeCensusDrain::Wait}, false);
@@ -518,6 +534,96 @@ void testPipeCensus() {
     overlay.Add({0x1100, 0x1200, write});
     overlay.Add({0x1800, 0x1900, target});
     check(overlay.ranges.size() == 3 && overlay.Overlaps(0x1850, 0x1860) == (write | target), "pipe census: a range inside a known one of the same kind is not added again");
+}
+
+// The recording pipe's pure core (APS5_RECORD_PIPE, RecordPipe.hpp): the ring's slot math across
+// 2^32, the overlay's serials and pruning, the queue-state mark and the stage-1 drain rules.
+void testRecordPipe() {
+    using namespace AgcDriver::DriverDetail;
+    using Ring = RecordPipeRing;
+    check(Ring::Slot(1) == 1 && Ring::Slot(32) == 0 && Ring::Slot(33) == 1 && Ring::Empty(5, 5) && !Ring::Full(36, 5) && Ring::Full(37, 5) && Ring::Pending(37, 5) == 32, "record pipe: slots, empty and full");
+    Ring ring;
+    const std::uint64_t start = 0x100000000ull - 24;
+    ring.handed = start;
+    ring.consumed = start;
+    bool ok = ring.NextItem() == 0;
+    for (std::uint64_t i = 1; i <= Ring::Depth; ++i) {
+        ok = ok && ring.NextFree() == start + i;
+        ring.Publish(start + i);
+    }
+    ok = ok && ring.NextFree() == 0 && ring.NextItem() == start + 1;
+    for (std::uint64_t i = 0; i < 100; ++i) {
+        const auto item = ring.NextItem();
+        ring.Consume(item);
+        const auto next = ring.NextFree();
+        ok = ok && item == start + 1 + i && next == item + Ring::Depth && Ring::Slot(next) == Ring::Slot(item) && ring.NextFree() == next;
+        ring.Publish(next);
+    }
+    check(ok && ring.handed > 0x100000000ull + 64 && Ring::Pending(ring.handed, ring.consumed) == Ring::Depth, "record pipe: the ring hands slots in order past 2^32");
+
+    RecordPipeOverlay overlay;
+    constexpr auto write = RecordPipeOverlay::Write, target = RecordPipeOverlay::Target;
+    overlay.Add({0x1000, 0x2000, write, 3});
+    overlay.Add({0x1100, 0x1200, write, 5});
+    overlay.Add({0x1000, 0x1800, write, 2});
+    overlay.Add({0x1800, 0x2800, target, 4});
+    check(overlay.ranges.size() == 2 && overlay.ranges[0].serial == 5 && overlay.Overlaps(0x2000, 0x2001) == target, "record pipe: a contained range raises the known one's serial, never lowers it");
+    overlay.Prune(4);
+    check(overlay.ranges.size() == 1 && overlay.Overlaps(0x2000, 0x2800) == 0 && overlay.Overlaps(0x1fff, 0x2000) == write, "record pipe: pruning drops the recorded items' ranges");
+    overlay.Prune(5);
+    check(overlay.ranges.empty(), "record pipe: pruning to the newest serial empties the overlay");
+
+    AgcDriver::QueueState queue;
+    queue.shader.insert_or_assign(0x10c, 7);
+    queue.context.insert_or_assign(0x318, 0x1234);
+    queue.savedContext = queue.context;
+    queue.indexBase = 0x1000, queue.indexType = 1, queue.stateSerial = 9, queue.constantRam[5] = 1;
+    queue.markers = {"pass"};
+    QueueStateMark mark;
+    mark.Save(queue);
+    const auto before = queue;
+    queue.shader.insert_or_assign(0x10d, 8);
+    queue.context.erase(0x318);
+    queue.userConfig.insert_or_assign(0x24b, 2);
+    queue.savedContext.reset();
+    queue.indexBase = 0x2000, queue.drawIndirectBase = 0x3000, queue.dispatchIndirectBase = 0x4000, queue.indexBufferSize = 64, queue.indexType = 0, queue.instanceCount = 4;
+    queue.stateSerial = 12, queue.fastState.serial = 12, queue.constantRam[5] = 2;
+    queue.markers.push_back("draw");
+    mark.Restore(queue);
+    check(queue.shader == before.shader && queue.context == before.context && queue.userConfig == before.userConfig && queue.savedContext.has_value() && *queue.savedContext == *before.savedContext, "record pipe: the mark restores the register files");
+    check(queue.indexBase == 0x1000 && queue.drawIndirectBase == 0 && queue.dispatchIndirectBase == 0 && queue.indexBufferSize == 0 && queue.indexType == 1 && queue.instanceCount == 1 && queue.markers == before.markers && queue.stateSerial == 9, "record pipe: the mark restores the draw state and the serial");
+    check(queue.fastState.serial == ~std::uint64_t{0} && queue.constantRam[5] == 2, "record pipe: the mark resets the memo and leaves constant RAM alone");
+
+    const auto handed = RecordPipeDrawVerdict(PipeCensusLock::Direct, false);
+    check(handed.eligible && !handed.drain && RecordPipeDrawVerdict(PipeCensusLock::Direct, true).drain == PipeCensusDrain::LabelsPending && RecordPipeDrawVerdict(PipeCensusLock::CpuIndirect, false).drain == PipeCensusDrain::CpuIndirect && RecordPipeDrawVerdict(PipeCensusLock::Stale, false).drain == PipeCensusDrain::Stale && RecordPipeDrawVerdict(PipeCensusLock::Other, false).drain == PipeCensusDrain::Other, "record pipe: direct draws are handed over, labels pending, cpu-indirect, stale and other draws drain");
+    const auto header = [](std::uint32_t opcode) { return 0xc0000000u | (opcode << 8u); };
+    overlay.Add({0x5010, 0x5018, write, 7});
+    const auto top = [&](std::vector<std::uint32_t> words, bool draw = false, bool flip = false) { return RecordPipeTopDrain(words, draw, flip, false, overlay); };
+    check(!top({header(0x2d)}, true) && !top({header(0x76)}) && !top({header(0x46), 0x04}) && !top({header(0x63), 0x5018, 0, 0, 4}) && !top({header(0x63), 0x5000, 0, 0, 0}), "record pipe: draws, state packets and loads beside the overlay do not drain at the boundary");
+    check(top({header(0x15), 1, 1, 1}) == PipeCensusDrain::Dispatch && top({header(0x16)}) == PipeCensusDrain::IndirectDispatch && top({header(0x49)}) == PipeCensusDrain::Label && top({header(0x50)}) == PipeCensusDrain::Dma && top({header(0x10) | (0x17u << 2u)}, false, true) == PipeCensusDrain::Flip && top({header(0x46), 0x39}) == PipeCensusDrain::Other && top({header(0x9f), 0x5000, 0, 0, 3}) == PipeCensusDrain::Overlap, "record pipe: direct and indirect dispatches, labels, copies, flips, sample dumps and loads over the overlay drain");
+
+    // The stale handshake: B raises k and waits, A redoes k and finishes it, B consumes k; a later
+    // raise of another item is a new handshake.
+    RecordPipeStale stale;
+    bool handshake = stale.Pending() == 0 && !stale.Redone(7);
+    stale.Raise(7);
+    handshake = handshake && stale.Pending() == 7 && !stale.Redone(7);
+    stale.Finish(7);
+    handshake = handshake && stale.Pending() == 0 && stale.Redone(7);
+    stale.Raise(9);
+    handshake = handshake && stale.Pending() == 9 && !stale.Redone(9);
+    stale.Finish(9);
+    check(handshake && stale.Redone(9) && !stale.Redone(7) && stale.Pending() == 0, "record pipe: a stale item is raised by B, redone and finished by A, then released to B");
+
+    // APS5_RECORD_PIPE_VERIFY: the write log names the newest item in (consumed at the check, item)
+    // whose actual writes a capture overlaps; a slot reused by a later item forgets the older one.
+    RecordPipeWriteLog log;
+    log.Begin(3).push_back({0x1000, 0x2000});
+    log.Begin(4).push_back({0x3000, 0x3100});
+    log.Begin(5).push_back({0x1800, 0x1900});
+    log.Begin(4 + Ring::Depth).push_back({0x8000, 0x9000});
+    check(log.Writer(2, 6, 0x1fff, 0x2000) == 3 && log.Writer(2, 6, 0x1800, 0x1801) == 5 && log.Writer(3, 6, 0x1000, 0x1800) == 0 && log.Writer(2, 5, 0x1800, 0x1801) == 3 && log.Writer(2, 3, 0, ~0ull) == 0 && log.Writer(0, 1, 0, ~0ull) == 0, "record pipe verify: only the items between the check and the item count, the newest first");
+    check(log.Writer(2, 6, 0x3000, 0x3100) == 0 && log.Writer(Ring::Depth, 5 + Ring::Depth, 0x8fff, 0x9000) == 4 + Ring::Depth && log.Writer(2, 6, 0x2000, 0x3000) == 0, "record pipe verify: a reused slot answers for its new item only, and ranges are half-open");
 }
 
 // The fast dispatch (F5): the compare its verify mode makes between the old path's capture and the
@@ -1023,6 +1129,7 @@ int main() {
         testNewDrawKeyTally();
         testFastCensus();
         testPipeCensus();
+        testRecordPipe();
         testPollWake();
         testFastDispatchVerify();
         testFastReader();
