@@ -188,10 +188,13 @@ static void TestOverlay() {
     SetVariable("APS5_SETTINGS", settingsPath.string().c_str());
     // No settings window here (APS5_NO_LAUNCHER=0 with anyps5-launcher.exe next to the test shows it: a
     // manual check of the spawn, wait and read-back path).
+    // The overlay is installed once per process, so the engine switches stay unset here (default: culling off).
+    // APS5_ENGINE_SWITCHES=0 (no engine arguments) is covered by engine_switches_tests.
+    SetVariable("APS5_ENGINE_SWITCHES", "");
     if (std::getenv("APS5_NO_LAUNCHER") == nullptr) SetVariable("APS5_NO_LAUNCHER", "1");
 
-    Require(ReadGuest("/app0/misc/RenderConfig_PS5_Perf.txt") == "+r_Wants4K = WantsHigh\r\n+TargetFramesPerSecond = 60\r\n+r_Wants4K=WantsHigh\r\n+TargetFramesPerSecond=30\r\n", "render config overlay");
-    Require(ReadGuest("/app0/packagecmdlineargs.txt") == "+cp11_callHomeLockDownEnabled=false +r_Wants4K=WantsHigh +TargetFramesPerSecond=30", "command line overlay");
+    Require(ReadGuest("/app0/misc/RenderConfig_PS5_Perf.txt") == "+r_Wants4K = WantsHigh\r\n+TargetFramesPerSecond = 60\r\n+r_Wants4K=WantsHigh\r\n+TargetFramesPerSecond=30\r\n+doIndexBufferCulling=false\r\n", "render config overlay (default engine switch: culling off)");
+    Require(ReadGuest("/app0/packagecmdlineargs.txt") == "+cp11_callHomeLockDownEnabled=false +r_Wants4K=WantsHigh +TargetFramesPerSecond=30 +doIndexBufferCulling=false", "command line overlay");
     Require(ReadGuest("/app0/misc/gamecommandlineargs.txt") == "+untouched", "other files untouched");
     Require(GetPortSettings_nid_no_patch().width == 1280, "process settings");
 

@@ -180,6 +180,11 @@ Troubleshooting: GPU-to-guest copy-backs are coalesced and narrowed (only change
 back) by default. `APS5_NO_COALESCE_COPY_BACKS=1` and `APS5_NO_NARROW_COPY_BACKS=1` turn these off
 if you see stale or flickering geometry.
 
+The game's own GPU index-buffer culling (its `doIndexBufferCulling` setting) is off by default: the draws keep
+their whole index ranges, which a PC GPU draws faster than it runs the cull pass (about +16% frame rate, same
+picture). `APS5_ENGINE_SWITCHES=doIndexBufferCulling=true` turns it back on; `APS5_ENGINE_SWITCHES=0` keeps all of
+the game's own render settings.
+
 ## Controls
 
 Controllers work through SDL: Xbox layout A/B/X/Y = Cross/Circle/Square/Triangle, LB/RB = L1/R1,

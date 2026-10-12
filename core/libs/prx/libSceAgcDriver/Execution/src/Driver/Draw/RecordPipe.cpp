@@ -7,12 +7,15 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/PassDump.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HostHeap.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libc/include/HostMutex.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "Recompiler.hpp"
 #include <array>
@@ -20,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <thread>
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -44,6 +48,9 @@ struct RecordPipeSlot {
     RecordPipeDraw draw;
     QueueStateMark mark;
     RecordPipeDispatch dispatch;
+    // APS5_LAZY_LABELS: a label item's bytes and packet opcode.
+    DeferredLabel label{};
+    std::uint32_t labelOpcode = 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> estimate;
     // APS5_PROFILE_DRAW: when A published the item (B's wake latency).
     std::chrono::steady_clock::time_point published;
@@ -58,8 +65,8 @@ enum PipeDispatchCount : std::size_t { DispatchEligible, DispatchImageWrites, Di
 // The [pipe] B line (S4.0, APS5_PROFILE_DRAW): B's time inside its holds by phase, and its counts
 // (draws by path, then dispatches, hold breaks, idle waits and wakes after one, and B's collect epoch
 // bumps under APS5_RECORD_PIPE_EPOCH).
-enum PipeBPhase : std::size_t { BVerify, BNoteWriters, BRecipe, BRestart, BDraw, BAttach, BDispatch, BSubmitDue, BCleanup, PipeBPhases };
-enum PipeBCount : std::size_t { BItems, BRecipeItems, BRestartItems, BFullItems, BBuiltItems, BStaleItems, BDispatchItems, BHoldBreaks, BIdleWaits, BIdleSlept, BWakes, BEpochs, BImportMemoHits, BImportMemoMisses, PipeBCounts };
+enum PipeBPhase : std::size_t { BVerify, BNoteWriters, BRecipe, BRestart, BDraw, BAttach, BDispatch, BLabel, BSubmitDue, BCleanup, PipeBPhases };
+enum PipeBCount : std::size_t { BItems, BRecipeItems, BRestartItems, BFullItems, BBuiltItems, BStaleItems, BDispatchItems, BLabelItems, BHoldBreaks, BIdleWaits, BIdleSlept, BWakes, BEpochs, BImportMemoHits, BImportMemoMisses, PipeBCounts };
 
 std::uint64_t pipeNs(std::chrono::steady_clock::duration duration) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count());
@@ -131,7 +138,66 @@ struct RecordPipeState {
     std::array<std::atomic<std::uint64_t>, PipeBCounts> bCounts{};
     std::atomic<std::uint64_t> holdBreakNs{0}, holdBreakLockNs{0}, idleNs{0}, wakeNs{0}, wakeMaxNs{0}, bAllocations{0}, bFrees{0}, bCpuNs{0};
     std::array<std::uint64_t, RecordPipeOccupancyBuckets> occupancy{};
+    // P-LABEL (APS5_PROFILE_DRAW, the [pipe] labels line): the last drain's wait (0: it found the ring
+    // empty), the label drains that waited by kind and by their readers (APS5_LABEL_CENSUS), what A did
+    // after them, and the labels handed over (APS5_LAZY_LABELS).
+    double lastDrainMs = 0;
+    std::array<std::uint64_t, RecordPipeLabelKinds> labelDrains{};
+    std::array<double, RecordPipeLabelKinds> labelDrainMs{};
+    std::array<std::uint64_t, RecordPipeLabelReaderCount> readerDrains{};
+    std::array<double, RecordPipeLabelReaderCount> readerDrainMs{};
+    RecordPipeLabelNext labelNext;
+    std::uint64_t labelItems = 0;
+    // APS5_LAZY_LABELS=2: the labels riding the open run (cleared at each drain), and the waits they
+    // satisfied in order.
+    std::vector<RecordPipeRidingLabel> riding;
+    std::uint64_t ridingWaits = 0;
+    // The drains that end a run holding a satisfied wait, by reason (where its label's and wait's drain went).
+    bool runRode = false;
+    std::array<std::uint64_t, PipeCensusDrains> rodeDrains{};
+    std::array<double, PipeCensusDrains> rodeDrainMs{};
 };
+
+// APS5_LABEL_CENSUS=1 (P-LABEL; default off): queue 0's label addresses and their readers
+// (RecordPipeLabelReaders), and every queue's waits by queue / 8: on a queue-0 label, on anything
+// else (count and ms). Under the mutex: A notes labels, each queue's worker its waits.
+bool labelCensus() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_LABEL_CENSUS");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+struct LabelCensusState {
+    HostMutex mutex;
+    RecordPipeLabelReaders readers;
+    std::uint64_t labels = 0;
+    std::array<std::uint64_t, 16> labelWaits{}, otherWaits{};
+    std::array<double, 16> labelWaitMs{}, otherWaitMs{};
+};
+
+LabelCensusState& labelCensusState() {
+    static LabelCensusState* const state = new LabelCensusState;
+    return *state;
+}
+
+// APS5_PROFILE_DRAW: the queue-0 worker's wait for a submission (NoteRecordPipeIdle).
+std::atomic<std::uint64_t> queueZeroIdleNs{0};
+
+// A label packet's facts for RecordPipeLabelRides and the census (0x37 and 0x49 decode; others none).
+RecordPipeLabelFacts recordPipeLabelFacts(std::span<const std::uint32_t> packet) {
+    RecordPipeLabelFacts facts;
+    facts.opcode = (packet[0] >> 8u) & 0xffu;
+    facts.interrupt = facts.opcode == 0x49 && packet.size() > 2 && ((packet[2] >> 24u) & 7u) != 0;
+    if (facts.opcode != 0x37 && facts.opcode != 0x49) return facts;
+    if (const auto label = Pm4::DecodeLabelWrite(packet)) {
+        facts.decoded = true;
+        facts.address = label->address;
+        facts.bytes = label->Bytes().size();
+    }
+    return facts;
+}
 
 // Never destroyed: Driver::stop joins B, and a static's destructor could run before the driver's.
 RecordPipeState& recordPipe() {
@@ -297,6 +363,53 @@ bool RecordPipeActive() {
     return active;
 }
 
+bool RecordPipeLabelsActive() {
+    static const bool active = [] {
+        const char* value = std::getenv("APS5_LAZY_LABELS");
+        if (value == nullptr || std::strcmp(value, "0") == 0 || !RecordPipeActive()) return false;
+        const bool declined = !DeferLabels() || !QueuedLabelTable() || std::getenv("APS5_DRAIN_ALL") != nullptr;
+        std::fprintf(stderr, "[pipe] queue 0 labels ride the recording pipe (APS5_LAZY_LABELS=%s): %s\n", value, declined ? "declined: APS5_LABEL_LOCK_EACH, APS5_DRAIN_COMPLETION_LABELS, APS5_DRAIN_ALL or no queued-label table" : std::strcmp(value, "2") == 0 ? "on, with queue 0's waits on them" : "on");
+        return !declined;
+    }();
+    return active;
+}
+
+bool RecordPipeWaitsActive() {
+    static const bool active = [] {
+        const char* value = std::getenv("APS5_LAZY_LABELS");
+        return value != nullptr && std::strcmp(value, "2") == 0 && RecordPipeLabelsActive();
+    }();
+    return active;
+}
+
+// A: set by the boundary for a wait satisfied in order, read and cleared by its packet (recordPipeTookWait).
+bool& recordPipeWaitRode() {
+    static thread_local bool rode = false;
+    return rode;
+}
+
+bool RecordPipeLabelCensus() {
+    return labelCensus();
+}
+
+void NoteRecordPipeLabelWait(std::uint64_t address, std::uint32_t queue, double ms) {
+    if (!labelCensus()) return;
+    auto& census = labelCensusState();
+    const auto index = static_cast<std::size_t>((queue / 8u) & 15u);
+    std::lock_guard lock(census.mutex);
+    if (census.readers.NoteWait(address, queue)) {
+        ++census.labelWaits[index];
+        census.labelWaitMs[index] += ms;
+    } else {
+        ++census.otherWaits[index];
+        census.otherWaitMs[index] += ms;
+    }
+}
+
+void NoteRecordPipeIdle(std::uint64_t ns) {
+    queueZeroIdleNs.fetch_add(ns, std::memory_order_relaxed);
+}
+
 bool RecordPipeDispatchActive() {
     static const bool active = [] {
         const char* value = std::getenv("APS5_RECORD_PIPE_DISPATCH");
@@ -355,6 +468,20 @@ bool Driver::recordPipeDrawing(std::uint32_t queue) {
 
 bool Driver::recordPipeDispatching(std::uint32_t queue) {
     return queue == 0 && RecordPipeDispatchActive() && !recordPipeReplaying() && !recordPipeTracing();
+}
+
+bool Driver::recordPipeLabeling(std::uint32_t queue) {
+    return queue == 0 && RecordPipeLabelsActive() && !recordPipeReplaying() && !recordPipeTracing();
+}
+
+bool Driver::recordPipeWaiting(std::uint32_t queue) {
+    return queue == 0 && RecordPipeWaitsActive() && !recordPipeReplaying() && !recordPipeTracing();
+}
+
+bool Driver::recordPipeTookWait() {
+    const bool rode = recordPipeWaitRode();
+    recordPipeWaitRode() = false;
+    return rode;
 }
 
 DrawScratch* Driver::recordPipeScratch() {
@@ -420,6 +547,54 @@ void Driver::handOverDispatch(RecordPipeDispatch&& item) {
     publishRecordPipeItem(serial);
 }
 
+bool Driver::handOverLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint32_t opcode) {
+    auto& pipe = recordPipe();
+    // The boundary's verdict (it skipped the drain for exactly these labels).
+    if (!RecordPipeLabelRides({opcode, false, true, address, bytes.size()})) return false;
+    // Nothing unrecorded: the label joins the deferred list as before (the stage-1 rule holds: a
+    // non-empty list means an empty ring).
+    const auto handed = pipe.ring.handed.load(std::memory_order_relaxed);
+    if (RecordPipeRing::Empty(handed, pipe.ring.consumed.load(std::memory_order_acquire)) || !deferredLabels().labels.empty()) return false;
+    const auto serial = handed + 1;
+    // The packet's boundary waited for the slot (recordPipeBoundary).
+    require(pipe.ring.NextFree() == serial, "recording pipe: the label's slot is not free");
+    auto& slot = pipe.slots[RecordPipeRing::Slot(serial)];
+    slot.kind = RecordPipeKind::Label;
+    slot.labelOpcode = opcode;
+    slot.label.address = address;
+    slot.label.size = bytes.size();
+    std::memcpy(slot.label.bytes.data(), bytes.data(), bytes.size());
+    // A capture, validation or indirect read over the label's bytes drains until B records it.
+    pipe.overlay.Add({address, address + bytes.size(), RecordPipeOverlay::Write, serial});
+    if (RecordPipeWaitsActive()) {
+        auto& riding = pipe.riding.emplace_back();
+        riding.address = address;
+        riding.size = bytes.size();
+        std::memcpy(riding.bytes.data(), bytes.data(), bytes.size());
+        riding.serial = serial;
+    }
+    ++pipe.labelItems;
+    publishRecordPipeItem(serial);
+    // Not a draw or dispatch: the packet's recorded-work count is not B's (recordPipeTookDraw).
+    recordPipeHandedDraw() = false;
+    return true;
+}
+
+// B, under the GPU mutex: a label item, as recordDeferredLabels records one (B's label group closes
+// before its next other item or release). No reap first: only the graphics worker runs completions
+// under the mutex (WriteLabelOnGpu); the label goes behind a completion instead where one overlaps.
+void Driver::recordPipeLabel(std::uint64_t address, std::span<const std::byte> bytes) {
+    const auto localDevice = device.Load();
+    const auto stamp = ++eventSerial;
+    const int reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(address, bytes, stamp, 0, false) : 4;
+    countLabelOutcome(reason);
+    if (reason != 0 && reason != 5 && reason != 6) {
+        if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
+        GuestMemory::Write(address, bytes, 4);
+    }
+    noteLabelStore(address, bytes, stamp);
+}
+
 // A, the slot filled: B starts with the first item; the release publishes the slot.
 void Driver::publishRecordPipeItem(std::uint64_t serial) {
     auto& pipe = recordPipe();
@@ -430,7 +605,10 @@ void Driver::publishRecordPipeItem(std::uint64_t serial) {
     // APS5_RECORD_PIPE_EPOCH: the epoch A would have recorded the item in.
     if (RecordPipeEpochActive()) pipe.slots[RecordPipeRing::Slot(serial)].epoch = GuestMemory::ThreadCollectEpoch();
     pipe.ring.Publish(serial);
-    if (profile) ++pipe.occupancy[RecordPipeOccupancyBucket(RecordPipeRing::Pending(serial, pipe.ring.consumed.load(std::memory_order_acquire)))];
+    if (profile) {
+        ++pipe.occupancy[RecordPipeOccupancyBucket(RecordPipeRing::Pending(serial, pipe.ring.consumed.load(std::memory_order_acquire)))];
+        pipe.labelNext.Note(RecordPipeLabelNext::Handed);
+    }
     recordPipeHandedDraw() = true;
     ++pipe.items;
     ++pipe.run;
@@ -495,6 +673,9 @@ void Driver::recordPipeWaitRound() {
 
 void Driver::drainRecordPipe(PipeCensusDrain why) {
     auto& pipe = recordPipe();
+    // P-LABEL census: a drain after a label drain (labels in a row stay one event).
+    if (why != PipeCensusDrain::Label) pipe.labelNext.Note(static_cast<std::size_t>(why));
+    pipe.lastDrainMs = 0;
     if (pipe.run != 0) {
         ++pipe.runs;
         ++pipe.drains[static_cast<std::size_t>(why)];
@@ -510,8 +691,15 @@ void Driver::drainRecordPipe(PipeCensusDrain why) {
         pipe.drainWaitMs += ms;
         pipe.drainWaitByReason[static_cast<std::size_t>(why)] += ms;
         ++pipe.drainsWaited[static_cast<std::size_t>(why)];
+        pipe.lastDrainMs = ms;
+    }
+    if (pipe.runRode) {
+        pipe.runRode = false;
+        ++pipe.rodeDrains[static_cast<std::size_t>(why)];
+        pipe.rodeDrainMs[static_cast<std::size_t>(why)] += pipe.lastDrainMs;
     }
     pipe.overlay.ranges.clear();
+    pipe.riding.clear();
 }
 
 void Driver::recordPipeBoundary(std::span<const std::uint32_t> packet, std::uint32_t header) {
@@ -527,8 +715,33 @@ void Driver::recordPipeBoundary(std::span<const std::uint32_t> packet, std::uint
     const bool special = header == FlipPacketHeader || header == RenderingWaitPacketHeader;
     const bool dispatches = RecordPipeDispatchActive();
     const auto opcode = (header >> 8u) & 0xffu;
-    if (!special && (Pm4::DrawOpcode(opcode) || (dispatches && opcode == 0x15))) {
-        // The draw's lease or the dispatch's hand-over takes slot handed + 1: wait while B still owns it.
+    // A label's facts: APS5_LAZY_LABELS (a label that rides skips the drain and takes a slot), the
+    // census (its kind, its readers).
+    const bool labelPacket = !special && (opcode == 0x37 || opcode == 0x49);
+    const bool labeling = labelPacket && recordPipeLabeling(0);
+    const auto label = labelPacket && (labeling || recordPipeProfile()) ? recordPipeLabelFacts(packet) : RecordPipeLabelFacts{};
+    if (label.decoded && labelCensus()) {
+        auto& census = labelCensusState();
+        std::lock_guard lock(census.mutex);
+        census.readers.NoteLabel(label.address);
+        ++census.labels;
+    }
+    const bool rides = labeling && RecordPipeLabelRides(label);
+    // APS5_LAZY_LABELS=2: a queue-0 wait satisfied in order behind a riding label neither drains nor waits.
+    recordPipeWaitRode() = false;
+    if (!special && (opcode == 0x3c || opcode == 0x93) && packet.size() >= 6 && pipe.run != 0 && !pipe.riding.empty() && recordPipeWaiting(0)) {
+        const auto consumed = pipe.ring.consumed.load(std::memory_order_acquire);
+        pipe.overlay.Prune(consumed);
+        const auto value = RecordPipeRidingValue(pipe.riding, pipe.overlay, consumed, packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), Pm4::WaitAwaitedBytes(packet));
+        if (value && Pm4::WaitComparesValue(packet, *value)) {
+            recordPipeWaitRode() = true;
+            ++pipe.ridingWaits;
+            pipe.runRode = true;
+            return;
+        }
+    }
+    if (!special && (Pm4::DrawOpcode(opcode) || (dispatches && opcode == 0x15) || rides)) {
+        // The draw's lease, the dispatch's or the label's hand-over takes slot handed + 1: wait while B still owns it.
         const auto handed = pipe.ring.handed.load(std::memory_order_relaxed);
         if (!RecordPipeRing::Full(handed, pipe.ring.consumed.load(std::memory_order_acquire))) return;
         const auto start = recordPipeProfile() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -536,13 +749,35 @@ void Driver::recordPipeBoundary(std::span<const std::uint32_t> packet, std::uint
         if (recordPipeProfile()) pipe.ringWaitMs += sinceMs(start);
         return;
     }
-    // No run open: the ring is empty.
-    if (pipe.run == 0) return;
+    // No run open: the ring is empty. The census notes what follows a label drain (a draw decides in
+    // its packet: handed, or a drain).
+    if (pipe.run == 0) {
+        if (pipe.labelNext.armed) {
+            const auto next = RecordPipeTopDrain(packet, false, header == FlipPacketHeader, header == RenderingWaitPacketHeader, pipe.overlay, dispatches);
+            if (next && *next != PipeCensusDrain::Label) pipe.labelNext.Note(static_cast<std::size_t>(*next));
+        }
+        return;
+    }
     pipe.overlay.Prune(pipe.ring.consumed.load(std::memory_order_acquire));
     const auto why = RecordPipeTopDrain(packet, false, header == FlipPacketHeader, header == RenderingWaitPacketHeader, pipe.overlay, dispatches);
     if (!why) return;
     if (*why == PipeCensusDrain::Overlap) ++pipe.overlayLoads;
     drainRecordPipe(*why);
+    // P-LABEL census: a label drain that waited, by kind and readers; what follows it is noted next.
+    if (*why != PipeCensusDrain::Label || pipe.lastDrainMs <= 0 || !recordPipeProfile()) return;
+    const auto kind = static_cast<std::size_t>(RecordPipeLabelKindOf(opcode, label.interrupt));
+    ++pipe.labelDrains[kind];
+    pipe.labelDrainMs[kind] += pipe.lastDrainMs;
+    pipe.labelNext.Arm(pipe.lastDrainMs);
+    if (!labelCensus()) return;
+    auto& census = labelCensusState();
+    std::size_t reader = static_cast<std::size_t>(RecordPipeLabelReader::None);
+    if (label.decoded) {
+        std::lock_guard lock(census.mutex);
+        reader = static_cast<std::size_t>(census.readers.ReaderOf(label.address));
+    }
+    ++pipe.readerDrains[reader];
+    pipe.readerDrainMs[reader] += pipe.lastDrainMs;
 }
 
 void Driver::recordPipeSubmissionEnd() {
@@ -581,12 +816,73 @@ void Driver::recordPipeSubmissionEnd() {
     const auto holdBreakMs = ms(pipe.holdBreakNs), holdBreakLockMs = ms(pipe.holdBreakLockNs), idleMs = ms(pipe.idleNs), wakeMs = ms(pipe.wakeNs), cpuMs = ms(pipe.bCpuNs);
     const auto wakeMaxNs = static_cast<double>(pipe.wakeMaxNs.exchange(0, std::memory_order_relaxed));
     const auto allocations = static_cast<double>(pipe.bAllocations.exchange(0, std::memory_order_relaxed)), frees = static_cast<double>(pipe.bFrees.exchange(0, std::memory_order_relaxed));
-    char rows[320];
-    std::snprintf(rows, sizeof(rows), "verify %.2f, note writers %.2f, recipe %.2f, restart+draw %.2f, draw %.2f, attach %.2f, dispatch %.2f, submit due %.2f, cleanup %.2f, other %.2f", phaseNs[BVerify] / 1e3 / bItems, phaseNs[BNoteWriters] / 1e3 / bItems, phaseNs[BRecipe] / 1e3 / bItems, phaseNs[BRestart] / 1e3 / bItems, phaseNs[BDraw] / 1e3 / bItems, phaseNs[BAttach] / 1e3 / bItems, phaseNs[BDispatch] / 1e3 / bItems, phaseNs[BSubmitDue] / 1e3 / bItems, phaseNs[BCleanup] / 1e3 / bItems, (busyMs * 1e6 - rowsNs) / 1e3 / bItems);
+    char rows[352];
+    std::snprintf(rows, sizeof(rows), "verify %.2f, note writers %.2f, recipe %.2f, restart+draw %.2f, draw %.2f, attach %.2f, dispatch %.2f, label %.2f, submit due %.2f, cleanup %.2f, other %.2f", phaseNs[BVerify] / 1e3 / bItems, phaseNs[BNoteWriters] / 1e3 / bItems, phaseNs[BRecipe] / 1e3 / bItems, phaseNs[BRestart] / 1e3 / bItems, phaseNs[BDraw] / 1e3 / bItems, phaseNs[BAttach] / 1e3 / bItems, phaseNs[BDispatch] / 1e3 / bItems, phaseNs[BLabel] / 1e3 / bItems, phaseNs[BSubmitDue] / 1e3 / bItems, phaseNs[BCleanup] / 1e3 / bItems, (busyMs * 1e6 - rowsNs) / 1e3 / bItems);
     const auto& occupancy = pipe.occupancy;
     char importMemo[96] = "";
     if (Graphics::DrawMemos()) std::snprintf(importMemo, sizeof(importMemo), "; import memo (APS5_DRAW_MEMOS): hits %llu, misses %llu", itemCounts[BImportMemoHits], itemCounts[BImportMemoMisses]);
-    std::fprintf(stderr, "[pipe] B (10 s): items %llu (draws %llu: recipe %llu, restart %llu, full %llu, built %llu, stale %llu; dispatches %llu), us per item: %s (busy minus the rows); hold breaks %llu (%.1f ms, relock wait %.1f ms); idle ms %.1f in %llu waits (%llu slept); wake latency us mean %.1f max %.1f (%llu); heap per item: %.2f allocations, %.2f frees; cpu ms %.1f (busy ms %.1f); ring at hand-over: 1 %llu, 2-4 %llu, 5-16 %llu, 17-31 %llu, full %llu; collect epochs %llu%s\n", itemCounts[BItems], itemCounts[BItems] > itemCounts[BDispatchItems] ? itemCounts[BItems] - itemCounts[BDispatchItems] : 0ull, itemCounts[BRecipeItems], itemCounts[BRestartItems], itemCounts[BFullItems], itemCounts[BBuiltItems], itemCounts[BStaleItems], itemCounts[BDispatchItems], rows, itemCounts[BHoldBreaks], holdBreakMs, holdBreakLockMs, idleMs, itemCounts[BIdleWaits], itemCounts[BIdleSlept], itemCounts[BWakes] == 0 ? 0.0 : wakeMs * 1e3 / static_cast<double>(itemCounts[BWakes]), wakeMaxNs / 1e3, itemCounts[BWakes], allocations / bItems, frees / bItems, cpuMs, busyMs, static_cast<unsigned long long>(occupancy[0]), static_cast<unsigned long long>(occupancy[1]), static_cast<unsigned long long>(occupancy[2]), static_cast<unsigned long long>(occupancy[3]), static_cast<unsigned long long>(occupancy[4]), itemCounts[BEpochs], importMemo);
+    std::fprintf(stderr, "[pipe] B (10 s): items %llu (draws %llu: recipe %llu, restart %llu, full %llu, built %llu, stale %llu; dispatches %llu; labels %llu), us per item: %s (busy minus the rows); hold breaks %llu (%.1f ms, relock wait %.1f ms); idle ms %.1f in %llu waits (%llu slept); wake latency us mean %.1f max %.1f (%llu); heap per item: %.2f allocations, %.2f frees; cpu ms %.1f (busy ms %.1f); ring at hand-over: 1 %llu, 2-4 %llu, 5-16 %llu, 17-31 %llu, full %llu; collect epochs %llu%s\n", itemCounts[BItems], itemCounts[BItems] > itemCounts[BDispatchItems] + itemCounts[BLabelItems] ? itemCounts[BItems] - itemCounts[BDispatchItems] - itemCounts[BLabelItems] : 0ull, itemCounts[BRecipeItems], itemCounts[BRestartItems], itemCounts[BFullItems], itemCounts[BBuiltItems], itemCounts[BStaleItems], itemCounts[BDispatchItems], itemCounts[BLabelItems], rows, itemCounts[BHoldBreaks], holdBreakMs, holdBreakLockMs, idleMs, itemCounts[BIdleWaits], itemCounts[BIdleSlept], itemCounts[BWakes] == 0 ? 0.0 : wakeMs * 1e3 / static_cast<double>(itemCounts[BWakes]), wakeMaxNs / 1e3, itemCounts[BWakes], allocations / bItems, frees / bItems, cpuMs, busyMs, static_cast<unsigned long long>(occupancy[0]), static_cast<unsigned long long>(occupancy[1]), static_cast<unsigned long long>(occupancy[2]), static_cast<unsigned long long>(occupancy[3]), static_cast<unsigned long long>(occupancy[4]), itemCounts[BEpochs], importMemo);
+    // P-LABEL: the label drains that waited (ms/drains) by kind, by what A did next (handed: riding
+    // the ring the label would have joined two runs) and by their readers (APS5_LABEL_CENSUS); the
+    // labels handed over (APS5_LAZY_LABELS); the queue-0 worker's wait for a submission.
+    std::string labelKinds, labelNext, labelReaders;
+    for (std::size_t kind = 0; kind < RecordPipeLabelKinds; ++kind) {
+        if (pipe.labelDrains[kind] == 0) continue;
+        std::snprintf(item, sizeof(item), " %s %.1f/%llu", RecordPipeLabelKindNames[kind], pipe.labelDrainMs[kind], static_cast<unsigned long long>(pipe.labelDrains[kind]));
+        labelKinds += item;
+    }
+    for (std::size_t bucket = 0; bucket < RecordPipeLabelNext::Buckets; ++bucket) {
+        if (pipe.labelNext.counts[bucket] == 0) continue;
+        std::snprintf(item, sizeof(item), " %s %.1f/%llu", bucket == RecordPipeLabelNext::Handed ? "handed" : PipeCensusDrainNames[bucket], pipe.labelNext.ms[bucket], static_cast<unsigned long long>(pipe.labelNext.counts[bucket]));
+        labelNext += item;
+    }
+    for (std::size_t reader = 0; reader < RecordPipeLabelReaderCount; ++reader) {
+        if (pipe.readerDrains[reader] == 0) continue;
+        std::snprintf(item, sizeof(item), " %s %.1f/%llu", RecordPipeLabelReaderNames[reader], pipe.readerDrainMs[reader], static_cast<unsigned long long>(pipe.readerDrains[reader]));
+        labelReaders += item;
+    }
+    std::string rodeEnds;
+    for (std::size_t why = 0; why < PipeCensusDrains; ++why) {
+        if (pipe.rodeDrains[why] == 0) continue;
+        std::snprintf(item, sizeof(item), " %s %.1f/%llu", PipeCensusDrainNames[why], pipe.rodeDrainMs[why], static_cast<unsigned long long>(pipe.rodeDrains[why]));
+        rodeEnds += item;
+    }
+    pipe.rodeDrains = {};
+    pipe.rodeDrainMs = {};
+    std::fprintf(stderr, "[pipe] labels (10 s): label drains that waited (ms/drains):%s; next after them:%s; by readers (APS5_LABEL_CENSUS):%s; labels handed over %llu, waits satisfied behind them %llu (their runs ended by, ms/drains:%s); A idle ms %.1f (no submission)\n", labelKinds.empty() ? " none" : labelKinds.c_str(), labelNext.empty() ? " none" : labelNext.c_str(), labelReaders.empty() ? " none" : labelReaders.c_str(), static_cast<unsigned long long>(pipe.labelItems), static_cast<unsigned long long>(pipe.ridingWaits), rodeEnds.empty() ? " none" : rodeEnds.c_str(), static_cast<double>(queueZeroIdleNs.exchange(0, std::memory_order_relaxed)) / 1e6);
+    pipe.labelDrains = {};
+    pipe.labelDrainMs = {};
+    pipe.readerDrains = {};
+    pipe.readerDrainMs = {};
+    pipe.labelNext.counts = {};
+    pipe.labelNext.ms = {};
+    pipe.labelItems = pipe.ridingWaits = 0;
+    if (labelCensus()) {
+        // APS5_LABEL_CENSUS: every queue's waits (n/ms) on a queue-0 label and on anything else.
+        auto& census = labelCensusState();
+        std::string onLabels, elsewhere;
+        std::uint64_t labels = 0;
+        std::size_t known = 0;
+        {
+            std::lock_guard lock(census.mutex);
+            for (std::size_t index = 0; index < census.labelWaits.size(); ++index) {
+                if (census.labelWaits[index] != 0) {
+                    std::snprintf(item, sizeof(item), " 0x%zx %llu/%.1f", index * 8, static_cast<unsigned long long>(census.labelWaits[index]), census.labelWaitMs[index]);
+                    onLabels += item;
+                }
+                if (census.otherWaits[index] != 0) {
+                    std::snprintf(item, sizeof(item), " 0x%zx %llu/%.1f", index * 8, static_cast<unsigned long long>(census.otherWaits[index]), census.otherWaitMs[index]);
+                    elsewhere += item;
+                }
+            }
+            labels = census.labels;
+            known = census.readers.waiters.size();
+            census.labels = 0;
+            census.labelWaits = census.otherWaits = {};
+            census.labelWaitMs = census.otherWaitMs = {};
+        }
+        std::fprintf(stderr, "[label-census] (10 s): queue-0 label packets %llu (%zu addresses known); waits on them by queue (n/ms):%s; waits on other addresses by queue:%s\n", static_cast<unsigned long long>(labels), known, onLabels.empty() ? " none" : onLabels.c_str(), elsewhere.empty() ? " none" : elsewhere.c_str());
+    }
     pipe.occupancy = {};
     pipe.items = pipe.runs = pipe.staleRedos = pipe.overlayDraws = pipe.overlayLoads = pipe.overlayDispatches = pipe.submitsLeft = pipe.dispatchItems = 0;
     pipe.drains = pipe.drainsWaited = {};
@@ -666,8 +962,17 @@ void Driver::runRecordPipe() noexcept {
     const auto count = [&](PipeBCount which) {
         if (profile) pipe.bCounts[which].fetch_add(1, std::memory_order_relaxed);
     };
+    // APS5_LAZY_LABELS: B's label group (its labels in a row) closes before its next other item and
+    // before it releases the mutex, as recordDeferredLabels closes A's.
+    bool labelGroupOpen = false;
+    const auto closeLabels = [&] {
+        if (!labelGroupOpen) return;
+        labelGroupOpen = false;
+        Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
+    };
     const auto release = [&] {
         if (!gpuLock.owns_lock()) return;
+        closeLabels();
         gpuLock.unlock();
         if (!profile) return;
         pipe.busyNs.fetch_add(pipeNs(std::chrono::steady_clock::now() - held), std::memory_order_relaxed);
@@ -739,12 +1044,13 @@ void Driver::runRecordPipe() noexcept {
                 if (latency > pipe.wakeMaxNs.load(std::memory_order_relaxed)) pipe.wakeMaxNs.store(latency, std::memory_order_relaxed);
                 count(BWakes);
             }
-            const bool dispatchItem = slot.kind == RecordPipeKind::Dispatch;
-            const auto opcode = dispatchItem ? 0x15u : slot.draw.opcode;
-            const auto key = dispatchItem ? slot.dispatch.key : slot.draw.key;
+            const bool dispatchItem = slot.kind == RecordPipeKind::Dispatch, labelItem = slot.kind == RecordPipeKind::Label;
+            const auto opcode = dispatchItem ? 0x15u : labelItem ? slot.labelOpcode : slot.draw.opcode;
+            const auto key = dispatchItem ? slot.dispatch.key : labelItem ? 0 : slot.draw.key;
+            if (!labelItem) closeLabels();
             if (!gpuLock.owns_lock()) {
                 // A hold's lock site is its first item's kind.
-                GuestMemory::TagGpuLockSite(dispatchItem ? GuestMemory::GpuLockSite::Dispatch : GuestMemory::GpuLockSite::Draw);
+                GuestMemory::TagGpuLockSite(dispatchItem ? GuestMemory::GpuLockSite::Dispatch : labelItem ? GuestMemory::GpuLockSite::Label : GuestMemory::GpuLockSite::Draw);
                 const auto start = std::chrono::steady_clock::now();
                 gpuLock.lock();
                 held = std::chrono::steady_clock::now();
@@ -778,6 +1084,23 @@ void Driver::runRecordPipe() noexcept {
                 epochStamp = slot.epoch;
             }
             GuestMemory::SetCurrentPacket(opcode, 0);
+            if (labelItem) {
+                // A label: its bytes in order after the items before it; no capture or device of its own.
+                // APS5_RECORD_PIPE_VERIFY: its write is the item's (verifyPipeReads), with no estimate check.
+                lap.Mark();
+                GuestMemory::recordedWrites = nullptr;
+                if (verify) pipe.writeLog.Begin(serial).emplace_back(slot.label.address, slot.label.address + slot.label.size);
+                recordPipeLabel(slot.label.address, std::span<const std::byte>(slot.label.bytes).first(slot.label.size));
+                labelGroupOpen = true;
+                lap.Lap(pipe.bPhaseNs, BLabel);
+                count(BLabelItems);
+                submitDue();
+                lap.Mark();
+                pipe.ring.Consume(serial);
+                wakeSide(pipe.aSleeping, pipe.aWake);
+                lap.Lap(pipe.bPhaseNs, BCleanup);
+                continue;
+            }
             if (verify) {
                 lap.Mark();
                 verifyPipeReads(pipe, dispatchItem ? slot.dispatch.captured : slot.scratch.memory, dispatchItem ? slot.dispatch.consumed : slot.draw.consumed, serial, "item", opcode, key);
