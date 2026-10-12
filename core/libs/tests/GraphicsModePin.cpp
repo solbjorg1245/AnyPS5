@@ -67,12 +67,13 @@ static void TestPinWithOverlay() {
     { std::ofstream file(root / "app0" / "misc" / "renderconfig_ps5_high.txt", std::ios::binary); file << "+r_Wants4K = WantsSuperHigh\r\n+TargetFramesPerSecond = 30"; }
     { std::ofstream file(root / "app0" / "misc" / "renderconfig_ps5_lowenergy.txt", std::ios::binary); file << "+lowenergy"; }
     SetVariable("APS5_SETTINGS", settingsPath.string().c_str());
+    SetVariable("APS5_ENGINE_SWITCHES", ""); // default engine switch (culling off) is part of the overlay
 
-    const std::string merged = "+r_Wants4K = WantsHigh\r\n+TargetFramesPerSecond = 60\r\n+r_Wants4K=WantsHigh\r\n+TargetFramesPerSecond=30\r\n";
+    const std::string merged = "+r_Wants4K = WantsHigh\r\n+TargetFramesPerSecond = 60\r\n+r_Wants4K=WantsHigh\r\n+TargetFramesPerSecond=30\r\n+doIndexBufferCulling=false\r\n";
     Require(ReadGuest("/app0/misc/RenderConfig_PS5_Perf.txt") == merged, "performance config merged");
     Require(ReadGuest("/app0/misc/RenderConfig_PS5_High.txt") == merged, "cinematic config serves the performance one");
     Require(ReadGuest("/app0/misc/renderconfig_ps5_high.txt") == merged, "the title's spelling");
-    Require(ReadGuest("/app0/misc/RenderConfig_PS5_LowEnergy.txt") == "+lowenergy\r\n+r_Wants4K=WantsHigh\r\n+TargetFramesPerSecond=30\r\n", "other configs keep their own text");
+    Require(ReadGuest("/app0/misc/RenderConfig_PS5_LowEnergy.txt") == "+lowenergy\r\n+r_Wants4K=WantsHigh\r\n+TargetFramesPerSecond=30\r\n+doIndexBufferCulling=false\r\n", "other configs keep their own text");
 
     std::filesystem::remove_all(root / "app0");
     std::filesystem::remove(settingsPath);
