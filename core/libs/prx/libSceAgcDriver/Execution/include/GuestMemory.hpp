@@ -330,7 +330,10 @@ inline void NoteRecordedWrite(std::uint64_t begin, std::uint64_t end) {
 // per kind per 10 s) print a [late-land] line, both under APS5_PROFILE_DRAW.
 // CopyBack: a staged region's plain copy-back (whole written range, no narrow compare), decided when
 // it was deferred (or recorded): a CPU store into the range since is lost under the shadow's bytes.
-enum class LateLandKind : std::uint8_t { ShadowPublish, TextureStore, DccKeys, Fill, Copy, CopyBack, Count };
+// GpuWrite: a shader's in-place write range (Recorder noteWrite, shader-write or untagged), from the
+// note on: the shader stores only some of its bytes, so a hit is an overlap with the CPU, not a loss
+// (the R-crash victims are pages the GPU wrote pixels into after the title's stores).
+enum class LateLandKind : std::uint8_t { ShadowPublish, TextureStore, DccKeys, Fill, Copy, CopyBack, GpuWrite, Count };
 enum class LateLandPhase : std::uint8_t { Submit, Finish, Waited, Count };
 struct LateLand {
     std::uint64_t begin = 0;
@@ -417,6 +420,9 @@ struct GuestStoreRecord {
 std::size_t RecentGuestStores(std::uint64_t address, std::size_t bytes, std::span<GuestStoreRecord> out);
 // A store into guest memory the driver makes outside the paths above (a unit shadow's slab copy).
 void NoteGuestStore(std::uint64_t address, std::size_t bytes, const char* kind);
+// A GPU write range the recorder noted (a shader's in-place stores, Recorder noteWrite): kept for the
+// crash report's per-block memo only (not the ring), with the writer's kind and batch serial.
+void NoteGpuWriteForCrash(std::uint64_t begin, std::uint64_t end, const char* kind, std::uint64_t batch);
 // What a store belongs to, for the write-back range trace (APS5_TRACE_WRITEBACK_RANGE): the
 // resource's guest extent and shape, the write generation its content was current at, and when it
 // was last written on the GPU and last refreshed from guest memory (StoreClockMs; 0 = not known).

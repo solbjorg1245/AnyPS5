@@ -3869,7 +3869,10 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     if (ResidentWritesLive()) NoteResidentWritesWrite(address, address + bytes);
     ensureOpen();
     const auto end = address + bytes;
+    // APS5_LATE_LAND_CHECK=2: a shader's in-place write range, checked from now on (LateLandKind::GpuWrite).
+    if (!ownLabel && (kind == WriteKind::ShaderWrite || kind == WriteKind::Unknown) && GuestMemory::LateLandChecked(GuestMemory::LateLandKind::GpuWrite)) open->lateLands.push_back(GuestMemory::MakeLateLand(GuestMemory::LateLandKind::GpuWrite, address, end, GuestMemory::TrackerGeneration(), WriteKindName(kind)));
     open->writes.emplace_back(address, end);
+    if (!ownLabel) GuestMemory::NoteGpuWriteForCrash(address, end, WriteKindName(kind), submissions + 1);
     open->writeNotes.push_back(++writeNoteCount);
     markPendingBlocks(address, end, submissions + 1);
     // The writer's tag for the [hooksync] attribution: the packet the noting thread executes and

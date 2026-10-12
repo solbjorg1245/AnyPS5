@@ -347,9 +347,9 @@ void CheckLateLands() {
     Require(CheckLandedNow(LateLandKind::TextureStore, base, base + 8 * page, 0, "test") == 0, "an untracked land (generation 0) was reported");
     const auto summary = LateLandSummary();
     Require(summary.find("before submit 1 (4 KiB)") != std::string::npos && summary.find("in flight 1 (4 KiB)") != std::string::npos && summary.find("shadow 2 (8 KiB)") != std::string::npos, "the digest does not count the hits by phase and kind: " + summary);
-    Require(LateLandChecked(LateLandKind::DccKeys) && !LateLandChecked(LateLandKind::Fill) && !LateLandChecked(LateLandKind::Copy) && !LateLandChecked(LateLandKind::CopyBack), "level 1 does not check the driver's lands alone");
+    Require(LateLandChecked(LateLandKind::DccKeys) && !LateLandChecked(LateLandKind::Fill) && !LateLandChecked(LateLandKind::Copy) && !LateLandChecked(LateLandKind::CopyBack) && !LateLandChecked(LateLandKind::GpuWrite), "level 1 does not check the driver's lands alone");
     SetLateLandLevel(2);
-    Require(LateLandChecked(LateLandKind::Fill) && LateLandChecked(LateLandKind::Copy) && LateLandChecked(LateLandKind::CopyBack), "level 2 does not check the title's fills and copies and the copy-backs");
+    Require(LateLandChecked(LateLandKind::Fill) && LateLandChecked(LateLandKind::Copy) && LateLandChecked(LateLandKind::CopyBack) && LateLandChecked(LateLandKind::GpuWrite), "level 2 does not check the title's fills and copies, the copy-backs and the shaders' writes");
     SetLateLandLevel(0);
     Require(CheckLateLand(land, LateLandPhase::Submit, 0, 1) == 0 && LateLandSummary() == "late lands over CPU stores: off", "APS5_LATE_LAND_CHECK=0 still checks");
     SetLateLandLevel(1);
