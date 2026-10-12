@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordCensus.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -1650,6 +1651,7 @@ bool StorageTexture::Refresh() {
         ++Profile().storageReused;
         layerGeneration.assign(trackedLayers, current);
         refreshGeneration();
+        RecordCensus::Touch(RecordCensus::RefreshMemo);
         refreshPassSerial = passSerial;
         if (profile) LookupOutcomes::Add(stamped ? LookupOutcomes::RefreshUnchanged : LookupOutcomes::RefreshCompared, start);
         return true;
@@ -1749,6 +1751,7 @@ bool StorageTexture::Refresh() {
     } else {
         uploadedKeys = keys;
     }
+    RecordCensus::Touch(RecordCensus::RefreshMemo);
     refreshPassSerial = passSerial;
     return false;
 }
@@ -2622,6 +2625,7 @@ bool StorageTexture::overlaps(std::uint64_t address, std::size_t bytes) const {
 }
 
 void StorageTexture::MarkDirty() {
+    RecordCensus::Touch(RecordCensus::TargetState);
     // A depth surface of this memory and extent now holds older depth than this image (the build
     // notes the write too, but a cached build does not run again).
     NoteDepthSurfaceWrite(descriptor.baseAddress, descriptor.width, descriptor.height);

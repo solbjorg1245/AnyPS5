@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordCensus.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -2296,6 +2297,7 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
+    RecordCensus::Touch(RecordCensus::TemplateProof);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
@@ -3235,6 +3237,7 @@ DescriptorCache::Stats DescriptorCache::Counters() const {
 }
 
 VkDescriptorSet DescriptorCache::AllocateTransient(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, Recorder& recorder) {
+    RecordCensus::Touch(RecordCensus::TransientPool);
     if (transient == nullptr) {
         transient = std::make_shared<TransientPools>();
         transient->device = context.device;
@@ -4509,6 +4512,7 @@ void ShaderResources::WriteBack() {
 }
 
 void ShaderResources::MarkGpuWrites(Recorder& recorder) {
+    RecordCensus::Touch(RecordCensus::TemplateWrites);
     // APS5_PROFILE_DRAW: the parts' times accumulate in `timing` (marks...Ms), which the dispatch
     // reads before and after the call for its "record: marks: ..." rows.
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

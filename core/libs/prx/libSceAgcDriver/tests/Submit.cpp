@@ -751,6 +751,27 @@ void testRecordPipe() {
     budgetOk = budgetOk && touched.size() == 4 && touched[2] == lines.data() + 128 && touched[3] == lines.data() + 192 && budget.left == 0;
     budget.Lines(lines.data(), 64, touch);
     check(budgetOk && touched.size() == 4, "record pipe handoff: the prefetch takes whole lines from the first byte's to the last byte's, within its budget");
+
+    // APS5_RECORD_CENSUS: chunks of K=2. Run 1 (a a b c a): [a a] [b c] [a], two pairs, none shared.
+    // Run 2 (a a b a): [a a] [b a], one pair sharing a, none across the runs. Run 3 (nulls): no share.
+    int a = 0, b = 0, c = 0;
+    RecordPipeChunkCensus chunks;
+    chunks.k = 2;
+    for (const void* id : {static_cast<const void*>(&a), static_cast<const void*>(&a), static_cast<const void*>(&b), static_cast<const void*>(&c), static_cast<const void*>(&a)}) chunks.Note(id);
+    chunks.NewRun();
+    bool chunkOk = chunks.chunks == 3 && chunks.pairs == 2 && chunks.sharedPairs == 0;
+    chunks.Note(&a);
+    chunks.Note(&a);
+    chunks.Note(&b);
+    chunks.Note(&a);
+    chunks.NewRun();
+    chunkOk = chunkOk && chunks.chunks == 5 && chunks.pairs == 3 && chunks.sharedPairs == 1;
+    chunks.Note(nullptr);
+    chunks.Note(nullptr);
+    chunks.Note(nullptr);
+    chunks.Close();
+    chunkOk = chunkOk && chunks.chunks == 7 && chunks.pairs == 4 && chunks.sharedPairs == 1;
+    check(chunkOk && RecordPipeRunBucket(0) == 0 && RecordPipeRunBucket(1) == 0 && RecordPipeRunBucket(2) == 1 && RecordPipeRunBucket(7) == 1 && RecordPipeRunBucket(8) == 2 && RecordPipeRunBucket(127) == 3 && RecordPipeRunBucket(128) == 4 && RecordPipeRunBucket(512) == 5, "record census: chunks of K per run, neighbour pairs within a run, shared templates, run buckets");
 }
 
 // The fast dispatch (F5): the compare its verify mode makes between the old path's capture and the

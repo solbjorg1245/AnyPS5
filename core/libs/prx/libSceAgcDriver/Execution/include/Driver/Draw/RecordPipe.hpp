@@ -110,6 +110,48 @@ struct RecordPipePrefetchBudget {
     }
 };
 
+// APS5_RECORD_CENSUS (multi-recorder S0): B's draws by run (a drain ends A's run), cut into chunks of
+// K draws as a dispatcher would hand them alternately to two recorders: the chunks, the neighbouring
+// chunk pairs of one run (recorded at the same time) and those sharing a template (a conflict the
+// per-template lock of S2 would serialise; null templates never conflict).
+struct RecordPipeChunkCensus {
+    std::size_t k = 16;
+    std::uint64_t chunks = 0, pairs = 0, sharedPairs = 0;
+    std::size_t position = 0;
+    std::vector<const void*> current, previous;
+
+    void NewRun() {
+        Close();
+        previous.clear();
+        position = 0;
+    }
+    void Note(const void* templateId) {
+        if (position != 0 && position % k == 0) Close();
+        current.push_back(templateId);
+        ++position;
+    }
+    void Close() {
+        if (current.empty()) return;
+        ++chunks;
+        if (!previous.empty()) {
+            ++pairs;
+            bool shared = false;
+            for (const auto* id : current) {
+                for (const auto* earlier : previous) shared = shared || (id != nullptr && id == earlier);
+            }
+            if (shared) ++sharedPairs;
+        }
+        previous.swap(current);
+        current.clear();
+    }
+};
+
+// The census's run-length buckets (draws per run): 1, 2-7, 8-31, 32-127, 128-511, 512+.
+inline constexpr std::size_t RecordPipeRunBuckets = 6;
+constexpr std::size_t RecordPipeRunBucket(std::uint64_t draws) {
+    return draws <= 1 ? 0 : draws < 8 ? 1 : draws < 32 ? 2 : draws < 128 ? 3 : draws < 512 ? 4 : 5;
+}
+
 // APS5_PROFILE_DRAW, the [pipe] B line: the items unrecorded once A published one (handed minus
 // consumed), bucketed 1, 2-4, 5-16, 17-31 and a full ring (0 counts as 1).
 inline constexpr std::size_t RecordPipeOccupancyBuckets = 5;

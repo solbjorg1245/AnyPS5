@@ -13,6 +13,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordCensus.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libc/include/HostMutex.hpp"
@@ -56,6 +58,29 @@ struct RecordPipeSlot {
     std::chrono::steady_clock::time_point published;
     // APS5_RECORD_PIPE_EPOCH: A's collect epoch at hand-over (RecordPipeEpochFor).
     std::uint64_t epoch = 0;
+    // APS5_RECORD_CENSUS: the item opened A's run (the first after a drain).
+    bool runStart = false;
+};
+
+// APS5_RECORD_CENSUS (multi-recorder S0), the [pipe] census line: B's draws, those recorded with a
+// template and with the template of the draw before, the draws that mutated each structure, the runs
+// by length, and the chunk census for K = 8, 16, 32, 64 (chunks, neighbour pairs, pairs sharing a template).
+inline constexpr std::array<std::size_t, 4> CensusChunkSizes{8, 16, 32, 64};
+struct PipeCensusCounts {
+    std::atomic<std::uint64_t> draws{0}, templated{0}, sameTemplate{0}, runs{0}, runDraws{0};
+    std::array<std::atomic<std::uint64_t>, Graphics::RecordCensus::StructureCount> touched{};
+    std::array<std::atomic<std::uint64_t>, RecordPipeRunBuckets> runLengths{};
+    std::array<std::array<std::atomic<std::uint64_t>, 3>, CensusChunkSizes.size()> chunks{};
+};
+
+// B's own census state between items.
+struct PipeCensusB {
+    const void* lastTemplate = nullptr;
+    std::uint64_t runDraws = 0;
+    std::array<RecordPipeChunkCensus, CensusChunkSizes.size()> chunks;
+    PipeCensusB() {
+        for (std::size_t size = 0; size < chunks.size(); ++size) chunks[size].k = CensusChunkSizes[size];
+    }
 };
 
 // The [pipe] line's dispatch counts (NoteRecordPipeDispatch): handed over (eligible; those writing a
@@ -156,6 +181,7 @@ struct RecordPipeState {
     bool runRode = false;
     std::array<std::uint64_t, PipeCensusDrains> rodeDrains{};
     std::array<double, PipeCensusDrains> rodeDrainMs{};
+    PipeCensusCounts census;
 };
 
 // APS5_LABEL_CENSUS=1 (P-LABEL; default off): queue 0's label addresses and their readers
@@ -369,6 +395,42 @@ std::size_t prefetchPipeItem(const RecordPipeSlot& slot) {
     budget.Lines(scratch.snapshots.data(), scratch.snapshots.size() * sizeof(Graphics::GuestMemorySnapshot), touch);
     for (const auto& snapshot : scratch.snapshots) budget.Lines(snapshot.bytes.data(), snapshot.bytes.size(), touch);
     return lines;
+}
+
+// APS5_RECORD_CENSUS, B after a draw item's device call: the structures its mask holds, its template
+// against the draw before, its run and chunk census (published as deltas for A's digest line).
+void notePipeCensus(PipeCensusCounts& counts, PipeCensusB& b, bool runStart) {
+    auto& thread = Graphics::RecordCensus::Thread();
+    counts.draws.fetch_add(1, std::memory_order_relaxed);
+    for (std::size_t structure = 0; structure < Graphics::RecordCensus::StructureCount; ++structure) {
+        if ((thread.mask >> structure & 1u) != 0) counts.touched[structure].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (runStart && b.runDraws != 0) {
+        counts.runs.fetch_add(1, std::memory_order_relaxed);
+        counts.runDraws.fetch_add(b.runDraws, std::memory_order_relaxed);
+        counts.runLengths[RecordPipeRunBucket(b.runDraws)].fetch_add(1, std::memory_order_relaxed);
+        b.runDraws = 0;
+        b.lastTemplate = nullptr;
+    }
+    ++b.runDraws;
+    const auto* id = thread.templateId;
+    if (id != nullptr) {
+        counts.templated.fetch_add(1, std::memory_order_relaxed);
+        if (id == b.lastTemplate) counts.sameTemplate.fetch_add(1, std::memory_order_relaxed);
+    }
+    b.lastTemplate = id;
+    for (std::size_t size = 0; size < b.chunks.size(); ++size) {
+        auto& chunk = b.chunks[size];
+        const auto before = std::array<std::uint64_t, 3>{chunk.chunks, chunk.pairs, chunk.sharedPairs};
+        if (runStart) chunk.NewRun();
+        chunk.Note(id);
+        const auto after = std::array<std::uint64_t, 3>{chunk.chunks, chunk.pairs, chunk.sharedPairs};
+        for (std::size_t which = 0; which < 3; ++which) {
+            if (after[which] != before[which]) counts.chunks[size][which].fetch_add(after[which] - before[which], std::memory_order_relaxed);
+        }
+    }
+    thread.mask = 0;
+    thread.templateId = nullptr;
 }
 
 // APS5_HANDOFF_FAST's release (A, filling the slot again): what B left of the item recorded from it
@@ -658,6 +720,8 @@ void Driver::publishRecordPipeItem(std::uint64_t serial) {
     if (profile) pipe.slots[RecordPipeRing::Slot(serial)].published = std::chrono::steady_clock::now();
     // APS5_RECORD_PIPE_EPOCH: the epoch A would have recorded the item in.
     if (RecordPipeEpochActive()) pipe.slots[RecordPipeRing::Slot(serial)].epoch = GuestMemory::ThreadCollectEpoch();
+    // APS5_RECORD_CENSUS: the first item since a drain opens a run.
+    if (Graphics::RecordCensus::Enabled()) pipe.slots[RecordPipeRing::Slot(serial)].runStart = pipe.run == 0;
     pipe.ring.Publish(serial);
     if (profile) {
         ++pipe.occupancy[RecordPipeOccupancyBucket(RecordPipeRing::Pending(serial, pipe.ring.consumed.load(std::memory_order_acquire)))];
@@ -940,6 +1004,30 @@ void Driver::recordPipeSubmissionEnd() {
         }
         std::fprintf(stderr, "[label-census] (10 s): queue-0 label packets %llu (%zu addresses known); waits on them by queue (n/ms):%s; waits on other addresses by queue:%s\n", static_cast<unsigned long long>(labels), known, onLabels.empty() ? " none" : onLabels.c_str(), elsewhere.empty() ? " none" : elsewhere.c_str());
     }
+    // Multi-recorder S0 (APS5_RECORD_CENSUS, APS5_RENDER_PASS_SPLIT): B's draws by template, the share
+    // of them that mutated each shared structure, its runs by length, the chunk census and the passes
+    // the split ended.
+    if (Graphics::RecordCensus::Enabled() || Graphics::Recorder::RenderPassSplit() != 0) {
+        auto& census = pipe.census;
+        const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+        const auto draws = take(census.draws), templated = take(census.templated), same = take(census.sameTemplate), runs = take(census.runs), runDraws = take(census.runDraws);
+        const auto share = [&](unsigned long long part) { return draws == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(draws); };
+        std::string structures, lengths, chunks;
+        for (std::size_t structure = 0; structure < Graphics::RecordCensus::StructureCount; ++structure) {
+            std::snprintf(item, sizeof(item), "%s %s %.1f%%", structure == 0 ? "" : ",", Graphics::RecordCensus::StructureNames[structure], share(take(census.touched[structure])));
+            structures += item;
+        }
+        for (std::size_t bucket = 0; bucket < RecordPipeRunBuckets; ++bucket) {
+            std::snprintf(item, sizeof(item), "%s%llu", bucket == 0 ? "" : " / ", take(census.runLengths[bucket]));
+            lengths += item;
+        }
+        for (std::size_t size = 0; size < CensusChunkSizes.size(); ++size) {
+            const auto made = take(census.chunks[size][0]), pairs = take(census.chunks[size][1]), shared = take(census.chunks[size][2]);
+            std::snprintf(item, sizeof(item), "%s K=%zu %llu/%llu/%llu (%.1f%%)", size == 0 ? "" : ",", CensusChunkSizes[size], made, pairs, shared, pairs == 0 ? 0.0 : 100.0 * static_cast<double>(shared) / static_cast<double>(pairs));
+            chunks += item;
+        }
+        std::fprintf(stderr, "[pipe] census (APS5_RECORD_CENSUS, 10 s): B draws %llu, with a template %llu, same template as the draw before %.1f%%; mutated by share of draws:%s; runs ended %llu (draws per run mean %.1f; 1 / 2-7 / 8-31 / 32-127 / 128-511 / 512+: %s); chunks/neighbour pairs/pairs sharing a template:%s; render pass split (APS5_RENDER_PASS_SPLIT=%u): passes ended %llu\n", draws, templated, share(same), structures.c_str(), runs, runs == 0 ? 0.0 : static_cast<double>(runDraws) / static_cast<double>(runs), lengths.c_str(), chunks.c_str(), Graphics::Recorder::RenderPassSplit(), static_cast<unsigned long long>(Graphics::Recorder::TakeForcedPassSplits()));
+    }
     pipe.occupancy = {};
     pipe.items = pipe.runs = pipe.staleRedos = pipe.overlayDraws = pipe.overlayLoads = pipe.overlayDispatches = pipe.submitsLeft = pipe.dispatchItems = 0;
     pipe.drains = pipe.drainsWaited = {};
@@ -1001,6 +1089,9 @@ void Driver::runRecordPipe() noexcept {
     auto& pipe = recordPipe();
     static const auto hold = pipeMicros("APS5_RECORD_PIPE_HOLD_US", 200);
     const bool profile = recordPipeProfile(), verify = recordPipeVerify(), bSubmit = recordPipeBSubmit(), epochs = RecordPipeEpochActive();
+    // APS5_RECORD_CENSUS: B's census state between items.
+    const bool census = Graphics::RecordCensus::Enabled();
+    PipeCensusB censusB;
     // APS5_HANDOFF_FAST: B leaves an item's references to A, and prefetches the next item.
     const bool releaseOnA = (RecordPipeHandoff() & HandoffRelease) != 0, prefetchNext = (RecordPipeHandoff() & HandoffPrefetch) != 0;
     // APS5_RECORD_PIPE_EPOCH: the hand-over epoch of the last item B recorded (0: none yet).
@@ -1188,7 +1279,9 @@ void Driver::runRecordPipe() noexcept {
                 lap.Lap(pipe.bPhaseNs, BDispatch);
                 count(BDispatchItems);
             } else {
+                if (census) Graphics::RecordCensus::Thread() = {};
                 stale = recordPipeItem(slot.scratch, slot.draw);
+                if (census) notePipeCensus(pipe.census, censusB, slot.runStart);
             }
             GuestMemory::recordedWrites = nullptr;
             submitDue();
