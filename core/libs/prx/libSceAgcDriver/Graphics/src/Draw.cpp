@@ -472,6 +472,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     }
     std::fprintf(stderr, "%s\n", line);
     RecordProfile::Report();
+    ReportDrawRepeat();
     // The skipped packets by reason head: the top 8 per kind with their time (APS5_NO_DRAW_SKIP_REASONS=1: no line).
     bool anyReason = false;
     for (const auto& tally : profile.skipReasons) anyReason = anyReason || tally.Keys() != 0 || tally.Overflow() != 0;
@@ -624,12 +625,9 @@ std::uint32_t FragmentOutputMask(const std::set<std::uint32_t>& locations) {
     return mask;
 }
 
-// `key` is the caller's scratch for the memo key (cleared first, keeping its capacity).
-std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, std::vector<std::uint64_t>& key, bool& memoized, bool& hit) {
-    memoized = false;
-    hit = false;
-    key.clear();
-    const bool keyed = ValidationKey(context, shaders, state, key);
+// The shared memo's answer for `key` (ValidationKey's, `keyed` whether it is one), else the
+// validation's, noted in the memo (a failure in validationFailures, then rethrown).
+std::uint32_t sharedFragmentOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, const std::vector<std::uint64_t>& key, bool keyed, bool& memoized, bool& hit) {
     static std::map<std::vector<std::uint64_t>, std::uint32_t> memo;
     if (keyed) {
         memoized = true;
@@ -657,6 +655,44 @@ std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const Comp
         if (memo.size() >= 1024) memo.clear();
         memo.emplace(key, outputs);
     }
+    return outputs;
+}
+
+// APS5_DRAW_REPEAT: the calling thread's answers by key hash (direct-mapped) in front of the shared
+// memo, whose mutex and map walk every draw paid. The same key gives the same outputs (the shared
+// memo's own rule); only answers that validated are kept, so a failing key still throws.
+struct FragmentOutputsMemo {
+    struct Entry {
+        std::uint64_t hash = 0;
+        std::vector<std::uint64_t> key;
+        std::uint32_t outputs = 0;
+    };
+    std::array<Entry, 256> entries{};
+};
+
+// `key` is the caller's scratch for the memo key (cleared first, keeping its capacity).
+std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, std::vector<std::uint64_t>& key, bool& memoized, bool& hit) {
+    memoized = false;
+    hit = false;
+    key.clear();
+    const bool keyed = ValidationKey(context, shaders, state, key);
+    if (!keyed || !DrawRepeat()) return sharedFragmentOutputs(context, shaders, state, key, keyed, memoized, hit);
+    auto& thread = HostThreadLocal<FragmentOutputsMemo, FragmentOutputsMemo>();
+    std::uint64_t hash = 14695981039346656037ull;
+    for (const auto word : key) hash = (hash ^ word) * 1099511628211ull;
+    auto& entry = thread.entries[static_cast<std::size_t>(hash ^ (hash >> 32u)) % thread.entries.size()];
+    if (entry.hash == hash && entry.key == key) {
+        memoized = true;
+        hit = true;
+        if (!DrawRepeatVerify()) return entry.outputs;
+        const auto shared = sharedFragmentOutputs(context, shaders, state, key, keyed, memoized, hit);
+        NoteDrawRepeatVerify(DrawRepeatCheck::Outputs, shared == entry.outputs, hash);
+        return shared;
+    }
+    const auto outputs = sharedFragmentOutputs(context, shaders, state, key, keyed, memoized, hit);
+    entry.hash = hash;
+    entry.key.assign(key.begin(), key.end());
+    entry.outputs = outputs;
     return outputs;
 }
 
@@ -700,6 +736,39 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
     }
     return key;
 }
+
+// DrawResourceKey built into `key` (APS5_DRAW_REPEAT: the recording thread's buffer, which keeps
+// its capacity from draw to draw): the same words in the same layout, each stage's part appended
+// in place behind its length word instead of returned in a vector of its own.
+void DrawResourceKeyInto(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges, ResourceCache::Key& key) {
+    key.clear();
+    key.push_back(0xffffffffu);
+    const auto append64 = [&](std::uint64_t value) {
+        key.push_back(static_cast<std::uint32_t>(value));
+        key.push_back(static_cast<std::uint32_t>(value >> 32u));
+    };
+    append64(reinterpret_cast<std::uint64_t>(context.device));
+    key.push_back(static_cast<std::uint32_t>(shaders.size()));
+    static const bool rebase = RebasedTemplates();
+    for (const auto& shader : shaders) {
+        const auto at = key.size();
+        key.push_back(0);
+        ShaderResources::ContentKeyInto(shader, true, rebase, key);
+        key[at] = static_cast<std::uint32_t>(key.size() - at - 1);
+    }
+    if (ranges) {
+        append64(target.address);
+        append64(target.bytes);
+        append64(indexAddress);
+        append64(indexBytes);
+    }
+}
+
+// The draw key's buffer on the recording thread (APS5_DRAW_REPEAT, ScratchLease).
+struct DrawKeyScratch {
+    ResourceCache::Key key;
+    unsigned depth = 0;
+};
 
 // The alias checks the build makes for every guest buffer descriptor (ShaderResources::
 // addGuestBuffer), repeated for a cached build whose own checks compared the buffers against
@@ -1286,11 +1355,15 @@ bool recordDeferredFlat(const Context& context, Recorder& recorder, const Shader
 struct ResolvedResources {
     std::shared_ptr<ShaderResources> resources;
     ResourceCache::Key contentKey;
+    // APS5_DRAW_REPEAT: the key lives in the caller's DrawKeyScratch instead of `contentKey`.
+    const ResourceCache::Key* scratchKey = nullptr;
     bool cacheable = false;
     const ShaderResources::BuildTiming* built = nullptr;
+    const ResourceCache::Key& Key() const { return scratchKey != nullptr ? *scratchKey : contentKey; }
 };
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, const Recorder* recorder, DrawOutcome& outcome, DrawTimer& timer) {
+// `keyScratch` (APS5_DRAW_REPEAT): the key is built into it (DrawResourceKeyInto) and stays there.
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, const Recorder* recorder, DrawOutcome& outcome, DrawTimer& timer, ResourceCache::Key* keyScratch) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
@@ -1307,10 +1380,22 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->variantId != 0; });
     if (resolved.cacheable) {
         RecordProfile::Scope keySpan(RecordProfile::LookupKey);
-        resolved.contentKey = DrawResourceKey(context, shaders, state.color, draw.indexAddress, indexBytes, !trimKey);
+        if (keyScratch != nullptr) {
+            DrawResourceKeyInto(context, shaders, state.color, draw.indexAddress, indexBytes, !trimKey, *keyScratch);
+            resolved.scratchKey = keyScratch;
+            if (DrawRepeatVerify()) {
+                // The old path's key beside it; on a disagreement the old one is used.
+                resolved.contentKey = DrawResourceKey(context, shaders, state.color, draw.indexAddress, indexBytes, !trimKey);
+                const bool same = resolved.contentKey == *keyScratch;
+                NoteDrawRepeatVerify(DrawRepeatCheck::Key, same, shaders.empty() || shaders.front().program == nullptr ? 0 : shaders.front().program->variantId);
+                if (!same) resolved.scratchKey = nullptr;
+            }
+        } else {
+            resolved.contentKey = DrawResourceKey(context, shaders, state.color, draw.indexAddress, indexBytes, !trimKey);
+        }
         keySpan.Stop();
         RecordProfile::Scope findSpan(RecordProfile::LookupFind);
-        auto cached = SharedResourceCache().Find(resolved.contentKey);
+        auto cached = SharedResourceCache().Find(resolved.Key());
         findSpan.Stop();
         if (cached != nullptr) {
             bool rebased = false;
@@ -1331,7 +1416,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 countCache(&DrawProfile::cacheHits);
                 if (rebased) countCache(&DrawProfile::cacheRebased);
             } else {
-                SharedResourceCache().Remove(resolved.contentKey);
+                SharedResourceCache().Remove(resolved.Key());
                 countCache(&DrawProfile::cacheInvalidated);
             }
         }
@@ -2012,8 +2097,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     ScratchLease<DrawInputScratch> inputScratch;
     // APS5_DRAW_MEMOS=1 (DrawMemos, s4-plan S4.2): the in-place inputs through the thread's import
     // memo, as DrawFast's (this thread holds GuestMemory::GpuMutex for the whole draw).
+    // The repeat path (APS5_DRAW_REPEAT, default on) likewise.
     RecordProfile::Scope inputsSpan(RecordProfile::Inputs);
-    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, *inputScratch, DrawMemos());
+    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, *inputScratch, DrawMemos() || DrawRepeat());
     inputsSpan.Stop();
     if (inputs.nothing) return;
     const auto* args = draw.indirect ? &*draw.indirect : nullptr;
@@ -2046,8 +2132,33 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const int dumpLimit = DumpTargetLimit();
     static HostMutex dumpMutex;
     static std::map<std::uint64_t, int> dumped;
-    std::vector<TargetBinding> targets(state.colors.size());
-    std::vector<VkImageView> targetViews;
+    // APS5_DRAW_REPEAT: the bindings and views in the thread's scratch, kept with their capacity;
+    // the bindings are cleared on the way out (no target is held there past the draw).
+    const bool repeat = DrawRepeat();
+    struct TargetScratch {
+        std::vector<TargetBinding> targets;
+        std::vector<VkImageView> views;
+        unsigned depth = 0;
+    };
+    std::optional<ScratchLease<TargetScratch>> targetScratch;
+    std::vector<TargetBinding> ownTargets;
+    std::vector<VkImageView> ownViews;
+    if (repeat) {
+        targetScratch.emplace();
+        (*targetScratch)->targets.clear();
+        (*targetScratch)->targets.resize(state.colors.size());
+        (*targetScratch)->views.clear();
+    } else {
+        ownTargets.resize(state.colors.size());
+    }
+    struct ClearTargets {
+        std::vector<TargetBinding>* targets;
+        ~ClearTargets() {
+            if (targets != nullptr) targets->clear();
+        }
+    } clearTargets{repeat ? &(*targetScratch)->targets : nullptr};
+    auto& targets = repeat ? (*targetScratch)->targets : ownTargets;
+    auto& targetViews = repeat ? (*targetScratch)->views : ownViews;
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
         auto& binding = targets[index];
         binding.color = state.colors[index];
@@ -2121,10 +2232,12 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // APS5_FAST_DRAW_VERIFY: a draw the fast path would have taken is built afresh (no template) and
     // compared with the fast path's bindings of the same stages.
     const bool verifyFast = ThreadFastVerifyArmed();
-    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable && !verifyFast, recorder, outcome, timer);
+    std::optional<ScratchLease<DrawKeyScratch>> keyScratch;
+    if (repeat) keyScratch.emplace();
+    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable && !verifyFast, recorder, outcome, timer, repeat ? &(*keyScratch)->key : nullptr);
     auto& resources = resolved.resources;
     if (verifyFast) VerifyFastBindings(context, *resources, shaders, state.color);
-    const auto& contentKey = resolved.contentKey;
+    const auto& contentKey = resolved.Key();
     const bool cacheable = resolved.cacheable;
     built = resolved.built;
     // The memory-state decision of an indirect draw, made here after the resource build (which may
@@ -2142,8 +2255,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     RecordProfile::Scope decideSpan(RecordProfile::IndirectDecide);
     if (args != nullptr) {
         static const bool gpuIndirectDraws = std::getenv("APS5_NO_GPU_INDIRECT_DRAW") == nullptr;
-        // APS5_DRAW_MEMOS=1: the imports through the thread's memo, as DrawFast decides.
-        const bool memoized = DrawMemos();
+        // APS5_DRAW_MEMOS=1 (or the repeat path, APS5_DRAW_REPEAT): the imports through the thread's memo, as DrawFast decides.
+        const bool memoized = DrawMemos() || repeat;
         const auto decide = [&](std::uint64_t address, std::size_t bytes, const HostImport*& import) { return indirectPathFor(context, recorder, address, bytes, import, memoized); };
         const auto rangeBytes = args->RangeBytes();
         if (rangeBytes == 0) {
@@ -2239,8 +2352,14 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const State& pipelineState = masked.has_value() ? *masked : state;
     // APS5_DRAW_MEMOS=1: the same store key through the thread's key buffer and pipeline memo.
     const auto attachmentLayout = lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    // The repeat path likewise (with APS5_DRAW_REPEAT_VERIFY=1 the store's answer is compared and used).
     RecordProfile::Scope pipelineSpan(RecordProfile::PipelineLookup);
-    auto pipeline = DrawMemos() ? CachedPipelineMemoized(context, pipelineState, *inputs.vertexInput, *resources, shaders, attachmentLayout) : CachedPipeline(context, pipelineState, *inputs.vertexInput, *resources, shaders, attachmentLayout);
+    auto pipeline = DrawMemos() || repeat ? CachedPipelineMemoized(context, pipelineState, *inputs.vertexInput, *resources, shaders, attachmentLayout) : CachedPipeline(context, pipelineState, *inputs.vertexInput, *resources, shaders, attachmentLayout);
+    if (repeat && DrawRepeatVerify()) {
+        auto stored = CachedPipeline(context, pipelineState, *inputs.vertexInput, *resources, shaders, attachmentLayout);
+        NoteDrawRepeatVerify(DrawRepeatCheck::Pipeline, stored == pipeline, shaders.empty() || shaders.front().program == nullptr ? 0 : shaders.front().program->variantId);
+        pipeline = std::move(stored);
+    }
     pipelineSpan.Stop();
     RecordProfile::Scope framebufferSpan(RecordProfile::PipelineFramebuffer);
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
@@ -2259,7 +2378,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         record.pipeline = pipeline;
         record.framebuffer = framebuffer;
         record.targetViews = targetViews;
-        record.targets = owners;
+        // APS5_DRAW_REPEAT: the record takes the list (the recipe below reads the bindings).
+        if (repeat) record.targets = std::move(owners);
+        else record.targets = owners;
         record.indirect = args != nullptr ? &indirect : nullptr;
         record.listed = listed;
         record.completion = completion;
@@ -2277,7 +2398,11 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             recipe->key = contentKey;
             recipe->pipeline = pipeline;
             recipe->framebuffer = framebuffer;
-            for (const auto& owner : owners) recipe->targets.emplace_back(owner);
+            if (repeat) {
+                for (const auto& binding : targets) recipe->targets.emplace_back(binding.resident);
+            } else {
+                for (const auto& owner : owners) recipe->targets.emplace_back(owner);
+            }
             recipe->targetViews = targetViews;
             std::uint64_t passKey = 14695981039346656037ull;
             for (const auto view : targetViews) passKey = (passKey ^ reinterpret_cast<std::uint64_t>(view)) * 1099511628211ull;

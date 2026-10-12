@@ -57,6 +57,7 @@ enum Span : std::size_t {
     PipelineFramebuffer,
     StoreFlushes,
     SetSelect,
+    SetDataCopy,
     SetAllocate,
     SetCopy,
     SetWrite,
@@ -71,7 +72,7 @@ enum Span : std::size_t {
     SpanCount
 };
 
-constexpr std::array<const char*, SpanCount> SpanNames{"total (Graphics::Draw)", "inputs (validate+vertex)", "target refresh", "target refresh with a page walk", "target clear check", "clear check: keys", "clear check: keys pending", "clear check: keys sync", "clear check: keys read", "clear check: materialize", "target view", "lookup: key", "lookup: find", "lookup: rebase check", "lookup: revalidate", "lookup: aliases", "resources build", "indirect decision", "pipeline lookup", "framebuffer", "store flushes", "set copy: select", "set copy: allocate", "set copy: copy", "set copy: write", "set copy: keep", "deferred flat", "commands (pass, barrier, indirect args)", "bind+push", "draw command and notes", "keep", "recipe", "profile bookkeeping"};
+constexpr std::array<const char*, SpanCount> SpanNames{"total (Graphics::Draw)", "inputs (validate+vertex)", "target refresh", "target refresh with a page walk", "target clear check", "clear check: keys", "clear check: keys pending", "clear check: keys sync", "clear check: keys read", "clear check: materialize", "target view", "lookup: key", "lookup: find", "lookup: rebase check", "lookup: revalidate", "lookup: aliases", "resources build", "indirect decision", "pipeline lookup", "framebuffer", "store flushes", "set copy: select", "set copy: select: data copy", "set copy: allocate", "set copy: copy", "set copy: write", "set copy: keep", "deferred flat", "commands (pass, barrier, indirect args)", "bind+push", "draw command and notes", "keep", "recipe", "profile bookkeeping"};
 
 inline bool Enabled() {
     static const bool enabled = [] {

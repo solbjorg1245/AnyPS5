@@ -500,7 +500,7 @@ void reportPipelines(PipelineStore& store) {
     store.lastReport = now;
     const auto lookups = store.hits + store.misses + store.uncached;
     char drawMemo[160] = "";
-    if (DrawMemos()) std::snprintf(drawMemo, sizeof(drawMemo), "; Draw (APS5_DRAW_MEMOS): %llu lookups answered by the thread memo (not counted above), %llu missed it", static_cast<unsigned long long>(store.drawMemoHits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(store.drawMemoMisses.exchange(0, std::memory_order_relaxed)));
+    if (DrawMemos() || DrawRepeat()) std::snprintf(drawMemo, sizeof(drawMemo), "; Draw (APS5_DRAW_MEMOS): %llu lookups answered by the thread memo (not counted above), %llu missed it", static_cast<unsigned long long>(store.drawMemoHits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(store.drawMemoMisses.exchange(0, std::memory_order_relaxed)));
     std::fprintf(stderr, "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached; %llu framebuffers made; %llu fast lookups answered by the thread memo (not counted above)%s\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size(), static_cast<unsigned long long>(framebuffersMade.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(store.memoHits.exchange(0, std::memory_order_relaxed)), drawMemo);
     store.hits = store.misses = store.uncached = store.evicted = 0;
 }
