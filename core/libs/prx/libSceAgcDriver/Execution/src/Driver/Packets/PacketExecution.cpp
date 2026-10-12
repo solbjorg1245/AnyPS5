@@ -149,6 +149,7 @@ void Driver::sendDeferredEnd(std::uint32_t queue) {
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
     if (!gpuLock.owns_lock()) return;
     if (Graphics::Recorder::PendingLabelSince() == since) {
+        const Graphics::SubmitCauseScope submitCause(Graphics::SubmitCause::DeferredEnd);
         if (const auto localDevice = device.Load()) localDevice->SubmitRecorded(false);
         ++submissionCosts(queue).endDeferredSent;
     }
@@ -169,6 +170,7 @@ void Driver::execute(const Submission& submission) {
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
             if (const auto localDevice = device.Load()) {
                 recordDeferredLabels(localDevice.get(), submission.queue);
+                const Graphics::SubmitCauseScope submitCause(Graphics::SubmitCause::Suspend);
                 if (suspendDrain) localDevice->WaitIdle();
                 else localDevice->SubmitRecorded(submission.queue == 0);
             }
@@ -317,7 +319,10 @@ void Driver::execute(const Submission& submission) {
                 std::lock_guard gpuLock(GuestMemory::GpuMutex());
                 const auto localDevice = device.Load();
 
-                if (!recordLabelsForPacket(localDevice.get(), submission.queue) && localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
+                if (!recordLabelsForPacket(localDevice.get(), submission.queue) && localDevice != nullptr) {
+                    const Graphics::SubmitCauseScope submitCause(Graphics::SubmitCause::Flip);
+                    localDevice->SubmitRecorded(submission.queue == 0);
+                }
                 if (localDevice != nullptr) localDevice->FlipBatches(batchesAtFlip, unsignaledAtFlip);
             }
             ++flipsCounted;
@@ -496,6 +501,7 @@ void Driver::execute(const Submission& submission) {
             }
             ++costs.endSubmits;
         }
+        const Graphics::SubmitCauseScope submitCause(Graphics::SubmitCause::SubmissionEnd);
         if (localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
     }
     if (submission.rewindTail != nullptr) executeRewindTail(submission);

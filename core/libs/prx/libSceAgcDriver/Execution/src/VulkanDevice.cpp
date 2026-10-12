@@ -2235,7 +2235,10 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     // The frame's recorded work (and a refresh of the resident image) must reach the queue before the
     // presentation's own submission, which reads the image in queue order. No reap first: queue 0
     // reaps at its next packet, so the presenter's hold carries no completions.
-    SubmitRecorded(false);
+    {
+        const Graphics::SubmitCauseScope submitCause(Graphics::SubmitCause::Present);
+        SubmitRecorded(false);
+    }
     std::chrono::steady_clock::time_point lastSubmittedAt{};
     const std::uint64_t batchesAtBlit = state->recorder ? state->recorder->NewestSubmitted(&lastSubmittedAt) : 0;
     CaptureTrace::Log("blit dump=%d batch=%llu slot=%zu image=%u direct=%d", dumpFrame ? state->nextDumpIndex : -1, static_cast<unsigned long long>(batchesAtBlit), state->presentCursor, index, direct);
@@ -3243,7 +3246,10 @@ std::uint64_t VulkanDevice::presync(std::span<const std::pair<std::uint64_t, std
                 open = open || info->open;
                 serial = std::max(serial, info->serial);
             }
-            if (open) serial = state->recorder->SubmitAndEpoch();
+            if (open) {
+                const Graphics::SubmitCauseScope submitCause(Graphics::SubmitCause::Presync);
+                serial = state->recorder->SubmitAndEpoch();
+            }
         }
     }
     if (serial != 0) {

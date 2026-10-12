@@ -1455,6 +1455,8 @@ std::uint64_t Recorder::RecordedWorkSinceSubmit() {
 
 void Recorder::CountRecordedWork() {
     workSinceSubmit.fetch_add(1, std::memory_order_relaxed);
+    // APS5_LANE_CENSUS: a recorded draw or dispatch of the calling thread's lane.
+    if (LaneCensusOn) LaneCensus::Shared().Item(LaneOf(GuestMemory::GpuLockThreadTag()));
 }
 
 Recorder* Recorder::Active() {
@@ -1722,6 +1724,9 @@ VkCommandBuffer Recorder::commandsTouching(const std::function<bool(std::uint64_
 
 VkCommandBuffer Recorder::commandsFor(VkAccessFlags* coveredAccess, bool keepCopyBacks) {
     ensureOpen();
+    // APS5_LANE_CENSUS: the pass this call ends and the copies it flushes, when the last recorded
+    // item was the other lane's.
+    if (LaneCensusOn) LaneCensus::Shared().Commands(LaneOf(GuestMemory::GpuLockThreadTag()), open->renderPass.open, !keepCopyBacks && HasDeferredCopies());
     // Coalescing: a caller that checks nothing may touch any queued copy's bytes, claimed or not.
     if (!keepCopyBacks) flushDeferredCopies(coalesceCopyBacks, FlushReason::Command);
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
@@ -2147,7 +2152,10 @@ bool Recorder::resolveResident(std::uintptr_t address, bool owner) {
         return false;
     }
     const auto landStart = std::chrono::steady_clock::now();
-    if (ofOpenBatch) Submit();
+    if (ofOpenBatch) {
+        const SubmitCauseScope submitCause(SubmitCause::Land);
+        Submit();
+    }
     // Oldest first, so a newer guard's bytes win; a copy whose recording batch completed landed.
     std::sort(found.begin(), found.end(), [](const Found& left, const Found& right) { return left.sequence < right.sequence; });
     std::vector<DeferredCopy> copies;
@@ -3774,6 +3782,7 @@ void Recorder::BoundKeptBytes() {
     if (budget == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return;
     if (open != nullptr && open->keptBytes >= budget) {
         ++keptBound.submits;
+        const SubmitCauseScope submitCause(SubmitCause::KeptBound);
         Submit();
     }
     if (DeferredBytes() != 0 && inFlightKeptBytes + DeferredBytes() > 2 * budget) {
@@ -3875,6 +3884,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     if (!ownLabel) GuestMemory::NoteGpuWriteForCrash(address, end, WriteKindName(kind), submissions + 1);
     open->writeNotes.push_back(++writeNoteCount);
     markPendingBlocks(address, end, submissions + 1);
+    if (LaneCensusOn && !ownLabel) LaneCensus::Shared().Access(LaneOf(GuestMemory::GpuLockThreadTag()), submissions + 1, address, end, true);
     // The writer's tag for the [hooksync] attribution: the packet the noting thread executes and
     // the note's kind (a label when the caller marked the range as its own and named no kind).
     const auto packet = GuestMemory::CurrentPacket();
@@ -4063,6 +4073,7 @@ void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKin
     if (bytes == 0 || !ReadTrackingEnabled()) return;
     ensureOpen();
     open->reads.push_back({address, address + bytes, kind});
+    if (LaneCensusOn) LaneCensus::Shared().Access(LaneOf(GuestMemory::GpuLockThreadTag()), submissions + 1, address, address + bytes, false);
     readsNoted.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -4073,6 +4084,7 @@ void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::ui
         CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%llu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<int>(kind));
         if (end > begin) open->reads.push_back({begin, end, kind});
     }
+    if (LaneCensusOn) LaneCensus::Shared().Accesses(LaneOf(GuestMemory::GpuLockThreadTag()), submissions + 1, ranges, false);
     readsNoted.fetch_add(ranges.size(), std::memory_order_relaxed);
 }
 
@@ -4090,6 +4102,7 @@ void Recorder::NotePendingReadSet(std::shared_ptr<const std::vector<std::pair<st
         return;
     }
     CaptureTrace::Log("buffer-read-set batch=%llu ranges=%zu kind=%d", static_cast<unsigned long long>(submissions + 1), ranges->size(), static_cast<int>(kind));
+    if (LaneCensusOn) LaneCensus::Shared().Accesses(LaneOf(GuestMemory::GpuLockThreadTag()), submissions + 1, *ranges, false);
     open->readSets.emplace_back(std::move(ranges), kind);
     readSetsNoted.fetch_add(1, std::memory_order_relaxed);
 }
@@ -4278,7 +4291,7 @@ bool Recorder::PendingLabelIn(std::uint64_t address, std::size_t bytes) const {
 std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal, bool countHits) const {
     if (refusal != nullptr) *refusal = LabelRefusal::None;
     if ((labels.empty() && queuedLabels.empty()) || (bytes != 4 && bytes != 8) || address % 4 != 0) return std::nullopt;
-    LabelHit hit{0, 0, 0, false, std::numeric_limits<std::uint64_t>::max()};
+    LabelHit hit{0, 0, 0, false, std::numeric_limits<std::uint64_t>::max(), 0, false};
     bool queued = false;
     bool candidate = false;
     const auto tag = GuestMemory::GpuLockThreadTag();
@@ -4318,6 +4331,10 @@ std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, s
         if (offset == 0) {
             hit.queue = entry->queue;
             hit.stamp = entry->stamp;
+            if (LaneCensusOn && entry->batch != nullptr) {
+                hit.open = !entry->batch->submitted;
+                hit.serial = hit.open ? submissions + 1 : entry->batch->serial;
+            }
         }
     }
     if (!hit.late) hit.generation = 0;
@@ -4433,6 +4450,9 @@ void Recorder::Submit() {
     if (activeRecorder == this) workSinceSubmit.store(0, std::memory_order_relaxed);
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    // APS5_LANE_CENSUS: the pass and the copies this submit closes, taken before it does.
+    std::array<bool, 2> censusCloses{};
+    if (LaneCensusOn) censusCloses = {open->renderPass.open, HasDeferredCopies()};
     if (residentBuffers) flushKeepingResident(FlushReason::Submit, [](std::uint64_t, std::uint64_t) { return false; });
     else flushDeferredCopies(true, FlushReason::Submit);
     if (!open->keyStores.empty()) recordKeyStores(false);
@@ -4492,6 +4512,7 @@ void Recorder::Submit() {
     Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
     batch->submitted = true;
     batch->serial = ++submissions;
+    if (LaneCensusOn) LaneCensus::Shared().Submit(CurrentSubmitCause(), LaneOf(GuestMemory::GpuLockThreadTag()), censusCloses[0], batch->hostReadOwed && !hostReadCovered, censusCloses[1]);
     batch->submittedAt = std::chrono::steady_clock::now();
     if (DrawProfiled()) {
         const auto us = std::chrono::duration<double, std::micro>(batch->submittedAt - submitStart).count();
@@ -4584,7 +4605,10 @@ void Recorder::FinishUpTo(std::uint64_t serial) {
 void Recorder::Sync() {
     const auto source = std::exchange(announcedSource, 4);
     const void* site = std::exchange(announcedSite, nullptr);
-    Submit();
+    {
+        const SubmitCauseScope submitCause(SubmitCause::Sync);
+        Submit();
+    }
     // Counted only when something is waited for: an idle recorder's Sync is free and would only
     // swamp the site table with the callers that check nothing first.
     const auto previousSite = inFlight.empty() ? activeSyncSite : BeginSyncSite(source, site != nullptr ? site : __builtin_return_address(0));
@@ -4644,6 +4668,7 @@ void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUn
         if (open != nullptr || (!inFlight.empty() && unsignaled(inFlight.back()->serial))) ++hookRealWaits;
         // Resident written ranges: the lands this sync records are a CPU reader's.
         const RestoreLandReason reader{landReason, std::exchange(landReason, std::uint8_t{6})};
+        const SubmitCauseScope submitCause(SubmitCause::SyncThrough);
         Sync();
         return;
     }
@@ -4739,6 +4764,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     std::uint64_t targetSerial = 0;
     if (!SyncThroughEnabled() || (open != nullptr && overlaps(*open, address, end))) {
         const RestoreLandReason reader{landReason, std::exchange(landReason, std::uint8_t{6})};
+        const SubmitCauseScope submitCause(SubmitCause::SyncThrough);
         Submit();
         targetSerial = submissions;
     } else {
@@ -4880,6 +4906,7 @@ bool Recorder::Reap() {
 }
 
 void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
+    if (LaneCensusOn && batch->submitted) LaneCensus::Shared().Retired(batch->serial);
     inFlightKeptBytes -= batch->keptBytes;
     // The batch's writes stay published until its completions ran, on every exit path.
     struct Finishing {
@@ -4933,6 +4960,11 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                     std::fprintf(stderr, "[recorder] %llu syncs waited %.1f s for the GPU in total (sources, count/wait: idle %llu/%.1fs, pending write %llu/%.1fs, recorded store %llu/%.1fs, address-based %llu/%.1fs, other %llu/%.1fs); hook %llu calls, %llu locked; %llu targeted syncs left %llu batches in flight; snapshot %llu rebuilds (%llu incremental) %.0f ms, %llu notes covered; %llu unlocked timeline waits %.1f s; %llu submissions, %zu label entries, %llu completion labels pending; fence waits by thread (count/wait):%s; top sync sites (source@caller syncs/batches/wait):%s; under holds (cumulative): %llu completions ran %.0f ms (kept objects released %.0f ms), pending-write syncs from completions: %llu skipped, %llu waited %.0f ms; %llu reaps (%llu with work) retired %llu batches in %.0f ms; hook waits unlocked %llu / %.0f ms GPU (pending write %llu / %.0f ms, recorded store %llu / %.0f ms) + %.0f ms relock (%llu found the recorder torn down), locked %llu; deferred releases: on the release thread %llu batches (%llu objects) in %.0f ms, inline %llu batches (%llu objects) in %.0f ms (%llu batches over the queue bound of %zu), queue max %llu batches, %llu pending\n",static_cast<unsigned long long>(waits), waitedMs / 1000, static_cast<unsigned long long>(syncCounts[0]), syncWaitedMs[0] / 1000, static_cast<unsigned long long>(syncCounts[1]), syncWaitedMs[1] / 1000, static_cast<unsigned long long>(syncCounts[2]), syncWaitedMs[2] / 1000, static_cast<unsigned long long>(syncCounts[3]), syncWaitedMs[3] / 1000, static_cast<unsigned long long>(syncCounts[4]), syncWaitedMs[4] / 1000, static_cast<unsigned long long>(hookCalls.load()), static_cast<unsigned long long>(hookLocks.load()), static_cast<unsigned long long>(targetedSyncs.load()), static_cast<unsigned long long>(batchesLeftInFlight.load()), static_cast<unsigned long long>(snapshotRebuilds), static_cast<unsigned long long>(snapshotIncremental), snapshotRebuildMs, static_cast<unsigned long long>(snapshotCovered), static_cast<unsigned long long>(unlockedWaits.load()), unlockedWaitedUs.load() / 1e6, static_cast<unsigned long long>(recorder.submissions), recorder.PendingLabels(), static_cast<unsigned long long>(completionLabels.load()), ThreadSyncReport().c_str(), SyncSiteReport().c_str(), static_cast<unsigned long long>(h.completions), h.completionMs, h.keptReleaseMs, static_cast<unsigned long long>(h.completionSyncsSkipped), static_cast<unsigned long long>(h.completionSyncsWaited), h.completionSyncWaitMs, static_cast<unsigned long long>(h.reaps), static_cast<unsigned long long>(h.reapsWithWork), static_cast<unsigned long long>(h.reapBatches), h.reapMs, static_cast<unsigned long long>(h.hookUnlockedWaits), h.hookUnlockedWaitMs, static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[1]), h.hookUnlockedWaitMsBySource[1], static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[2]), h.hookUnlockedWaitMsBySource[2], h.hookRelockMs, static_cast<unsigned long long>(h.hookUnlockedTornDown), static_cast<unsigned long long>(h.hookLockedWaits), static_cast<unsigned long long>(threadReleases.load()), static_cast<unsigned long long>(threadObjects.load()), threadReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineReleases.load()), static_cast<unsigned long long>(inlineObjects.load()), inlineReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineOverBound.load()), ReleaseQueueBound(), static_cast<unsigned long long>(releaseQueueMax.load()), static_cast<unsigned long long>(deferredPending.load()));
                     std::fprintf(stderr, "[recorder] completion label stores: %llu run, %llu skipped (no CPU write-back overlapped them); %llu counted pending at a write-back; %llu write-backs over a tracked label; %llu write-back completions pending\n", static_cast<unsigned long long>(completionStoresRun.load()), static_cast<unsigned long long>(completionStoresSkipped.load()), static_cast<unsigned long long>(completionLabelsCountedLate.load()), static_cast<unsigned long long>(writeBacksOverLabels.load()), static_cast<unsigned long long>(writeBackCompletions.load()));
                     std::fprintf(stderr, "[recorder] submits %llu, vkQueueSubmit mean %.1f us, max %.1f us\n", static_cast<unsigned long long>(submitCount), submitCount != 0 ? submitUs / static_cast<double>(submitCount) : 0.0, submitMaxUs);
+                    if (LaneCensusOn) {
+                        const auto census = LaneCensus::Shared().Take();
+                        std::fprintf(stderr, "%s\n", LaneCensus::CausesLine(census).c_str());
+                        std::fprintf(stderr, "%s\n", LaneCensus::LanesLine(census).c_str());
+                    }
                     if (const auto budget = Recorder::KeptBytesBudget(); budget != 0) {
                         const auto& kept = keptBound;
                         std::fprintf(stderr, "[recorder] kept-bytes bound (budget %zu MiB, %zu MiB in flight now): %llu open batches submitted, %llu waits for %llu batches %.1f ms, %llu early deferred releases; peaks: %.1f MiB kept in flight, %.1f MiB in one batch\n", budget >> 20u, recorder.InFlightKeptBytes() >> 20u, static_cast<unsigned long long>(kept.submits), static_cast<unsigned long long>(kept.waits), static_cast<unsigned long long>(kept.waitedBatches), kept.waitedMs, static_cast<unsigned long long>(kept.deferredFlushes), kept.peakInFlight / 1048576.0, kept.peakBatch / 1048576.0);

@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LaneCensus.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include <atomic>
 #include <chrono>
@@ -623,6 +624,11 @@ public:
         // Taken under the late rule: `generation` is the oldest group generation of the dwords.
         bool late;
         std::uint64_t generation;
+        // APS5_LANE_CENSUS only (0 and false otherwise): the first dword's batch serial (the open
+        // batch's is Submissions() + 1) and whether that batch was still open. The unlocked lookup
+        // reads them without the GPU mutex: diagnostic only.
+        std::uint64_t serial;
+        bool open;
     };
     // Why a lookup refused a late candidate (an entry with stamp <= afterStamp), for the trace.
     // BehindCompletion replaces the other reasons when the refused entry's value reaches memory

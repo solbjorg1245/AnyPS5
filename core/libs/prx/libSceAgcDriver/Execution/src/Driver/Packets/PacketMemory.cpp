@@ -53,7 +53,10 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             if (reason == 0 || reason == 5 || reason == 6) {
                 const auto queueId = submission.queue;
                 interruptDeferred = localDevice->AfterRecordedWork([queueId] { AgcDriverDeliverEopInterrupt(queueId); }, submission.queue == 0);
-                if (interruptDeferred && workOpen) localDevice->SubmitRecorded(submission.queue == 0);
+                if (interruptDeferred && workOpen) {
+                    const Graphics::SubmitCauseScope submitCause(Graphics::SubmitCause::Eop);
+                    localDevice->SubmitRecorded(submission.queue == 0);
+                }
                 wroteOnGpu = true;
             } else if (reason == 1) {
                 wroteOnGpu = true;
@@ -191,6 +194,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
 
             recordDeferredLabels(draining.get(), submission.queue);
             if (draining != nullptr) {
+                const Graphics::SubmitCauseScope submitCause(Graphics::SubmitCause::Drain);
                 if (unlockedDrain && draining->CanWaitUnlocked()) epoch = draining->SubmitAndEpoch();
                 else draining->WaitIdle();
             }

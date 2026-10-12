@@ -142,6 +142,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/LaneCensus.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderInputState.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/VramReclaimers.cpp
@@ -238,6 +239,7 @@ endforeach()
 
 add_test_executable(agc_driver_tests EXCLUDE_FROM_ALL
         tests/Submit.cpp
+        tests/LaneCensus.cpp
 )
 
 target_include_directories(agc_driver_tests PRIVATE
@@ -507,6 +509,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/UnitShadow.cpp
         Graphics/src/Sampler.cpp
         Graphics/src/Recorder.cpp
+        Graphics/src/LaneCensus.cpp
         Graphics/src/ShaderInputState.cpp
         ${agcTextureDetileShaderHeader}
         ${agcCopyBackDiffShaderHeader}
@@ -699,6 +702,7 @@ if(AGC_BUILD_VISUAL_TEST)
             Graphics/src/VramReclaimers.cpp
             Graphics/src/ShaderAddressResources.cpp
             Graphics/src/GuestBufferMemory.cpp
+            Graphics/src/LaneCensus.cpp
             Graphics/src/BdaResources.cpp
             Graphics/src/BufferAddress.cpp
             Graphics/src/ShaderValidation.cpp

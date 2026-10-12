@@ -1194,7 +1194,10 @@ bool WaitForLeases() noexcept {
             if (recorder != nullptr && recorder == state.leaseRecorder && target > state.finishedLeaseSerial) {
                 // The open batch may be the target; FinishUpTo waits front to back up to it only.
                 Recorder::CountSync(4);
-                recorder->Submit();
+                {
+                    const SubmitCauseScope submitCause(SubmitCause::Lease);
+                    recorder->Submit();
+                }
                 recorder->FinishUpTo(target);
                 state.finishedLeaseSerial = target;
                 synced = true;
@@ -2643,7 +2646,10 @@ std::shared_ptr<Buffer> takeStagedShadow(const Recorder* recorder, std::uint64_t
             }
         }
     }
-    if (source != nullptr && GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(end - begin), generation)) return source;
+    if (source != nullptr && GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(end - begin), generation)) {
+        if (LaneCensusOn) LaneCensus::Shared().ShadowTaken(LaneOf(GuestMemory::GpuLockThreadTag()), begin, end);
+        return source;
+    }
     // No shadow to chain from: no baseline either.
     if (baselineDelta != nullptr) *baselineDelta = 0;
     if (baselineTrusted != nullptr) *baselineTrusted = false;
@@ -2697,6 +2703,7 @@ VramCacheCensus stagedShadowCensus() {
 }
 
 void registerStagedShadow(const Recorder* recorder, std::uint64_t begin, std::uint64_t end, std::shared_ptr<Buffer> buffer, std::uint64_t generation, VkDeviceSize baselineDelta = 0, bool baselineTrusted = false) {
+    if (LaneCensusOn) LaneCensus::Shared().ShadowRegistered(LaneOf(GuestMemory::GpuLockThreadTag()), begin, end);
     auto& shadows = stagedShadows();
     std::lock_guard lock(shadows.mutex);
     // A few hundred ranges in practice; a runaway set starts over.
