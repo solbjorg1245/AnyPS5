@@ -2,6 +2,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -92,6 +93,12 @@ int APS5_VABI sceVideoOutSetFlipRate(int handle, int rate) try {
     }
     std::lock_guard lock(cfg->mutex);
     cfg->Check();
+    // The title's frame-rate mode (Demon's Souls: TargetFramesPerSecond 60 -> 0, 30 -> 1, 20 -> 2), so a
+    // run shows which render config is in effect (GraphicsModePin, Visual Mode checks).
+    if (cfg->flipRate != rate) {
+        std::fprintf(stderr, "[videoout] flip rate %d -> %d (%s FPS mode)\n", cfg->flipRate, rate, rate == 0 ? "60" : rate == 1 ? "30" : "20");
+        std::fflush(stderr);
+    }
     cfg->flipRate = rate;
     return 0;
 } catch (const ProcessShutdown&) {
