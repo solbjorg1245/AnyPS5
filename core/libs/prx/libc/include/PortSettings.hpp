@@ -33,6 +33,7 @@
 //   Timestep = fixed          APS5_TIMESTEP         variable (1): the frame step follows the frame time
 //   TimestepMinHz = 19.98     APS5_TIMESTEP_MIN_HZ  slowest step rate; slower frames slow the game down
 //   WindowMode = windowed     APS5_WINDOW_MODE      or fullscreen (desktop size, the frame scaled into it)
+//   ButtonIcons = playstation APS5_BUTTON_ICONS     steamdeck: the prompts show Steam Deck buttons (UiOverlay.hpp)
 //   NativeAspect = off        APS5_NATIVE_ASPECT    on (1): render at Resolution's aspect, wider view (Hor+)
 //                             APS5_NATIVE_ASPECT_RENDER=1 / APS5_NATIVE_ASPECT_UI=1 (environment only,
 //                             experimental): shared render targets / display buffer at the output's shape
@@ -60,6 +61,7 @@ inline constexpr double DefaultTimestepMinHz = 20000.0 / 1001.0;
 
 enum class WindowMode { Auto, Windowed, Fullscreen };
 enum class Upscaler { Off, Fsr, Dlss };
+enum class ButtonIcons { PlayStation, SteamDeck };
 enum class DeluxeEdition { Auto, Off };
 
 struct Settings {
@@ -71,6 +73,7 @@ struct Settings {
     bool variableTimestep = false;
     double timestepMinHz = DefaultTimestepMinHz;
     WindowMode windowMode = WindowMode::Auto;
+    ButtonIcons buttonIcons = ButtonIcons::PlayStation;
     bool nativeAspect = false;
     bool nativeAspectRender = false;
     bool nativeAspectUi = false;
@@ -299,6 +302,10 @@ inline void SetKey(Settings& settings, std::string_view key, std::string_view va
         else if (text == "windowed") settings.windowMode = WindowMode::Windowed;
         else if (text == "fullscreen") settings.windowMode = WindowMode::Fullscreen;
         else refuse("auto, windowed or fullscreen");
+    } else if (name == "buttonicons") {
+        if (text == "playstation" || text == "ps" || text == "ps5") settings.buttonIcons = ButtonIcons::PlayStation;
+        else if (text == "steamdeck" || text == "deck") settings.buttonIcons = ButtonIcons::SteamDeck;
+        else refuse("playstation or steamdeck");
     } else if (name == "nativeaspect") {
         if (text == "off" || text == "0" || text == "false") settings.nativeAspect = false;
         else if (text == "on" || text == "1" || text == "true") settings.nativeAspect = true;
@@ -348,10 +355,11 @@ inline Settings Parse(std::string_view text, const std::string& origin) {
 }
 
 // The variable that overrides each key (the launcher names the ones set, which win over its choices).
-inline constexpr std::array<std::pair<const char*, const char*>, 9> EnvironmentKeys{{
+inline constexpr std::array<std::pair<const char*, const char*>, 10> EnvironmentKeys{{
     {"APS5_RESOLUTION", "Resolution"}, {"APS5_RENDER_RESOLUTION", "RenderResolution"}, {"APS5_FPS_LIMIT", "FpsLimit"},
     {"APS5_TIMESTEP", "Timestep"}, {"APS5_TIMESTEP_MIN_HZ", "TimestepMinHz"}, {"APS5_WINDOW_MODE", "WindowMode"},
-    {"APS5_NATIVE_ASPECT", "NativeAspect"}, {"APS5_UPSCALER", "Upscaler"}, {"APS5_DELUXE_EDITION", "DeluxeEdition"}}};
+    {"APS5_NATIVE_ASPECT", "NativeAspect"}, {"APS5_UPSCALER", "Upscaler"}, {"APS5_BUTTON_ICONS", "ButtonIcons"},
+    {"APS5_DELUXE_EDITION", "DeluxeEdition"}}};
 
 inline void ApplyEnvironment(Settings& settings, const std::function<const char*(const char*)>& lookup) {
     for (const auto& [variable, key] : EnvironmentKeys) {
@@ -724,6 +732,7 @@ inline std::string Describe(const Settings& settings) {
     }
     result += settings.windowMode == WindowMode::Fullscreen ? ", WindowMode fullscreen" : settings.windowMode == WindowMode::Windowed ? ", WindowMode windowed" : "";
     result += ", Upscaler off";
+    if (settings.buttonIcons == ButtonIcons::SteamDeck) result += ", ButtonIcons steamdeck";
     if (settings.deluxeEdition == DeluxeEdition::Off) result += ", Deluxe Edition content off";
     result += settings.source.empty() ? " (no settings file)" : " (" + settings.source + ")";
     return result;
@@ -771,6 +780,7 @@ inline std::vector<std::pair<std::string, std::string>> LauncherValues(const Set
         {"FpsLimit", settings.fpsLimit == 0.0 ? std::string("auto") : FormatNumber(settings.fpsLimit)},
         {"Timestep", settings.variableTimestep ? "variable" : "fixed"},
         {"NativeAspect", settings.nativeAspect ? "on" : "off"},
+        {"ButtonIcons", settings.buttonIcons == ButtonIcons::SteamDeck ? "steamdeck" : "playstation"},
         {"DeluxeEdition", settings.deluxeEdition == DeluxeEdition::Off ? "off" : "auto"}};
 }
 
@@ -885,5 +895,7 @@ extern "C" const PortSettings::Settings& GetPortSettings_nid_no_patch();
 // the settings' arguments appended (anyps5-overrides next to the executable); `resolve` maps a guest path
 // to its host file. Nothing happens when the settings imply no arguments.
 void InstallPortSettingsOverlay(const std::function<std::filesystem::path(const char*)>& resolve);
+// The folders override files go to, in order of preference (OverrideDirectories for this executable).
+std::vector<std::filesystem::path> PortOverrideDirectories();
 
 #endif

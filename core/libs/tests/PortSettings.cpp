@@ -453,12 +453,14 @@ static void TestLauncher() {
     Require(PortSettings::SetIniValues("Timestep\n", {{"Timestep", "variable"}}) == "Timestep\nTimestep = variable\n", "a line without = is not the key");
 
     // Launcher values -> file -> parser gives the same settings back; the file's other keys survive.
+    const PortSettings::Settings defaults0;
     PortSettings::Settings chosen;
     chosen.width = 2560;
     chosen.height = 1080;
     chosen.windowMode = PortSettings::WindowMode::Fullscreen;
     chosen.fpsLimit = 47.5;
     chosen.nativeAspect = true;
+    chosen.buttonIcons = PortSettings::ButtonIcons::SteamDeck;
     PortSettings::ApplyLauncherRules(chosen);
     Require(chosen.variableTimestep, "a custom limit turns the variable timestep on");
     const auto saved = PortSettings::SetIniValues(original, PortSettings::LauncherValues(chosen));
@@ -466,6 +468,8 @@ static void TestLauncher() {
     PortSettings::Normalize(reread);
     Require(reread.width == 2560 && reread.height == 1080 && reread.windowMode == PortSettings::WindowMode::Fullscreen, "round trip resolution and window");
     Require(reread.fpsLimit == 47.5 && reread.variableTimestep && reread.nativeAspect, "round trip fps, timestep, native aspect");
+    Require(PortSettings::Describe(chosen).find(", ButtonIcons steamdeck") != std::string::npos && PortSettings::Describe(defaults0).find("ButtonIcons") == std::string::npos, "describe: button icons");
+    Require(reread.buttonIcons == PortSettings::ButtonIcons::SteamDeck && saved.find("ButtonIcons = steamdeck\r\n") != std::string::npos, "round trip button icons");
     Require(Near(reread.timestepMinHz, 25.0, 1e-9), "other keys survive the save");
     Require(saved.find("Bogus = 7\r\n") != std::string::npos && saved.find("# FpsLimit = 45\r\n") != std::string::npos, "unknown key and comment kept");
     Require(saved.find("NativeAspect = on\r\n") != std::string::npos && saved.find("Timestep = variable\r\n") != std::string::npos, "keys appended with CRLF");

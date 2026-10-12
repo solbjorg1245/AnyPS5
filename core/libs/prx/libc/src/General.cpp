@@ -13,6 +13,7 @@
 #include "prx/libc/include/GraphicsModePin.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
 #include "prx/libc/include/PortSettings.hpp"
+#include "prx/libc/include/UiOverlay.hpp"
 
 namespace {
 // Guest prefixes (without leading slashes) mapped to host directories, e.g. save-data mount points:
@@ -173,6 +174,7 @@ extern "C" std::filesystem::path ResolvePath_nid_no_patch(const char* path) {
     auto& state = Directories();
     // The player settings' title arguments alias the command-line and render-config files to merged
     // copies before the first guest path resolves (PortSettings.cpp); without settings nothing changes.
+    // The UI overlays (button icons, the Visual Mode row) alias their generated files (UiOverlay.hpp).
     // Then the title's cinematic render config is aliased to the performance one (GraphicsModePin.hpp).
     static std::once_flag settingsOverlay;
     std::call_once(settingsOverlay, [&state] {
@@ -182,6 +184,7 @@ extern "C" std::filesystem::path ResolvePath_nid_no_patch(const char* path) {
         };
         InstallPortSettingsOverlay(resolve);
         InstallGraphicsModePin(resolve);
+        InstallUiOverlay(resolve);
     });
     std::lock_guard lock(state.mutex);
     return Resolve(state, path);

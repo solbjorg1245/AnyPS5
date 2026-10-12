@@ -256,6 +256,10 @@ extern "C" const PortSettings::Settings& GetPortSettings_nid_no_patch() {
     return settings;
 }
 
+std::vector<std::filesystem::path> PortOverrideDirectories() {
+    return PortSettings::OverrideDirectories(ExecutableDirectory(), UserSettingsDirectory());
+}
+
 void InstallPortSettingsOverlay(const std::function<std::filesystem::path(const char*)>& resolve) {
     auto args = PortSettings::GameArgs(GetPortSettings_nid_no_patch());
     // The engine switches (EngineSwitches.hpp, APS5_ENGINE_SWITCHES) follow the settings' own arguments.

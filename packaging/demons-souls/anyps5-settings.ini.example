@@ -31,6 +31,10 @@
 # windowed or fullscreen (fullscreen uses the desktop resolution; F11 toggles it).
 # WindowMode = windowed
 
+# Button icons in the prompts: playstation or steamdeck (A, B, X, Y, Menu and View, drawn by the port;
+# View then works as the touchpad).
+# ButtonIcons = playstation
+
 # Upscaler: off. AMD FSR and NVIDIA DLSS are planned.
 # Upscaler = off
 

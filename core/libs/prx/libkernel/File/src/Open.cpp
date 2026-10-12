@@ -1,6 +1,7 @@
 #include "prx/libkernel/File/include/FileFlags.hpp"
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/ReadPatch.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libkernel/File/include/File.hpp"
@@ -11,6 +12,7 @@
 
 #include <cerrno>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -112,6 +114,7 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
         return SceErrorFromErrno(errno);
     }
     if (File::ReadTraceEnabled()) File::TraceOpen(fd, native.string());
+    TrackReadPatchDescriptor_nid_no_patch(fd, native);
     return fd;
 }
 
@@ -119,6 +122,7 @@ int APS5_VABI sceKernelClose(int d) {
 #ifdef _WIN32
     File::ForgetDirectoryDescriptor(d);
 #endif
+    ForgetReadPatchDescriptor_nid_no_patch(d);
     if (NativeClose(d) != 0) {
         throw std::runtime_error(std::string(__func__) + ": close failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
     }
@@ -132,10 +136,21 @@ std::int64_t APS5_VABI sceKernelRead(int d, void* buf, std::size_t nbytes) {
     const GuestArena::HostWrite destination(buf, nbytes);
     if (!destination.Open()) errno = EFAULT;
     if (File::ReadTraceEnabled()) File::TraceReadInto("read", File::TracedPath(d).c_str(), -1, buf, nbytes, __builtin_return_address(0));
+    // A patched file (ReadPatch.hpp) needs the position the read starts at.
+    // The position and the read are two calls: a patched descriptor serialises them (one lock for all of
+    // them: only the atlas is patched), so a second reader cannot move the position in between and get the
+    // patch at the wrong offset. Unpatched files take no lock.
+    const auto patches = ReadPatchesForDescriptor_nid_no_patch(d);
+    static std::mutex patchedReadMutex;
+    std::unique_lock<std::mutex> patchedReadLock(patchedReadMutex, std::defer_lock);
+    if (patches) patchedReadLock.lock();
+    const std::int64_t position = patches ? NativeLseek(d, 0, SEEK_CUR) : -1;
     auto n = destination.Open() ? NativeRead(d, buf, nbytes) : -1;
     if (n < 0) {
         throw std::runtime_error(std::string(__func__) + ": read failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
     }
+    if (patches && position >= 0) ApplyReadPatches_nid_no_patch(*patches, "read", static_cast<std::uint64_t>(position), buf, static_cast<std::uint64_t>(n));
+    if (patchedReadLock.owns_lock()) patchedReadLock.unlock();
     return static_cast<std::int64_t>(n);
 }
 
