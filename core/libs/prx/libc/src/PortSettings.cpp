@@ -1,4 +1,5 @@
 #include "prx/libc/include/PortSettings.hpp"
+#include "prx/libc/include/EngineSwitches.hpp"
 #include "prx/libc/include/General.hpp"
 
 #include <cerrno>
@@ -256,7 +257,13 @@ extern "C" const PortSettings::Settings& GetPortSettings_nid_no_patch() {
 }
 
 void InstallPortSettingsOverlay(const std::function<std::filesystem::path(const char*)>& resolve) {
-    const auto args = PortSettings::GameArgs(GetPortSettings_nid_no_patch());
+    auto args = PortSettings::GameArgs(GetPortSettings_nid_no_patch());
+    // The engine switches (EngineSwitches.hpp, APS5_ENGINE_SWITCHES) follow the settings' own arguments.
+    const auto engine = EngineSwitches::PlanSwitches(std::getenv(EngineSwitches::SwitchName));
+    for (const auto& warning : engine.warnings) std::fprintf(stderr, "%s\n", warning.c_str());
+    std::fprintf(stderr, "%s\n", engine.line.c_str());
+    std::fflush(stderr);
+    args.insert(args.end(), engine.args.begin(), engine.args.end());
     if (args.empty()) return;
     std::string joined;
     for (const auto& arg : args) joined += (joined.empty() ? "" : " ") + arg;
