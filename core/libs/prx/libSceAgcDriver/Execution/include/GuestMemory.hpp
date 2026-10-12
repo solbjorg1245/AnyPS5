@@ -319,6 +319,46 @@ inline void NoteRecordedWrite(std::uint64_t begin, std::uint64_t end) {
     if (recordedWrites != nullptr) recordedWrites->emplace_back(begin, end);
 }
 
+// Late lands over the CPU's stores (APS5_LATE_LAND_CHECK; 1 by default: the driver's own GPU stores
+// into imported guest memory, 2 also the title's fills and copies and the staging copy-backs, 0 off). A store the GPU makes
+// into the import (a unit shadow's publish copy, a storage write-back's store, a DCC key fill) is
+// decided at one tracker generation and lands when its batch runs, past the page tables: a CPU
+// store in between is lost under older GPU bytes and no later check sees it (the R-crash overwrites).
+// Detection only: each land is checked with CpuStoredRuns from the stamps alone before its batch is
+// submitted, and after a walk of its range once the batch finished (since the submit's generation
+// only) or once a waited batch returned. Counted on the [guestmem] line; the first hits (then one
+// per kind per 10 s) print a [late-land] line, both under APS5_PROFILE_DRAW.
+// CopyBack: a staged region's plain copy-back (whole written range, no narrow compare), decided when
+// it was deferred (or recorded): a CPU store into the range since is lost under the shadow's bytes.
+// GpuWrite: a shader's in-place write range (Recorder noteWrite, shader-write or untagged), from the
+// note on: the shader stores only some of its bytes, so a hit is an overlap with the CPU, not a loss
+// (the R-crash victims are pages the GPU wrote pixels into after the title's stores).
+enum class LateLandKind : std::uint8_t { ShadowPublish, TextureStore, DccKeys, Fill, Copy, CopyBack, GpuWrite, Count };
+enum class LateLandPhase : std::uint8_t { Submit, Finish, Waited, Count };
+struct LateLand {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    // The generation the landed bytes were decided at: a CPU stamp newer than it is a store under them.
+    std::uint64_t generation = 0;
+    LateLandKind kind = LateLandKind::ShadowPublish;
+    // Why the land was made (a publish or write-back reason), for the line.
+    const char* reason = nullptr;
+    PacketTag packet{NoPacket, 0};
+    std::uint64_t notedMs = 0;
+};
+int LateLandLevel();
+void SetLateLandLevel(int level);
+bool LateLandChecked(LateLandKind kind);
+// A land of [begin, end) decided at `generation`, tagged with this thread's packet and the store clock.
+LateLand MakeLateLand(LateLandKind kind, std::uint64_t begin, std::uint64_t end, std::uint64_t generation, const char* reason);
+// The bytes of the land CPU-stored since max(generation, since), counted under `phase` (Finish and
+// Waited walk the range first). `serial` is the land's batch, for the line (0 for a waited batch).
+std::uint64_t CheckLateLand(const LateLand& land, LateLandPhase phase, std::uint64_t since, std::uint64_t serial);
+// A land whose batch was waited for already (no recorder): MakeLateLand, then the Waited check.
+std::uint64_t CheckLandedNow(LateLandKind kind, std::uint64_t begin, std::uint64_t end, std::uint64_t generation, const char* reason);
+// The [guestmem] line's part: lands checked, hits by phase and by kind.
+std::string LateLandSummary();
+
 // Store: a CPU write (Write/WriteChanged) rather than a read; a hook sync made for one orders a
 // write after a pending GPU write, so whether the bytes change says nothing about its necessity.
 // MirrorRefresh: an address-based build bringing an image mirror up to date with guest memory
@@ -380,6 +420,9 @@ struct GuestStoreRecord {
 std::size_t RecentGuestStores(std::uint64_t address, std::size_t bytes, std::span<GuestStoreRecord> out);
 // A store into guest memory the driver makes outside the paths above (a unit shadow's slab copy).
 void NoteGuestStore(std::uint64_t address, std::size_t bytes, const char* kind);
+// A GPU write range the recorder noted (a shader's in-place stores, Recorder noteWrite): kept for the
+// crash report's per-block memo only (not the ring), with the writer's kind and batch serial.
+void NoteGpuWriteForCrash(std::uint64_t begin, std::uint64_t end, const char* kind, std::uint64_t batch);
 // What a store belongs to, for the write-back range trace (APS5_TRACE_WRITEBACK_RANGE): the
 // resource's guest extent and shape, the write generation its content was current at, and when it
 // was last written on the GPU and last refreshed from guest memory (StoreClockMs; 0 = not known).

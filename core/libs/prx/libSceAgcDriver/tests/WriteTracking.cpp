@@ -315,6 +315,46 @@ void CheckKeepCpuStores() {
     SetKeepCpuStores(true);
 }
 
+// The late-land check (APS5_LATE_LAND_CHECK): a GPU land decided at a generation finds the CPU's
+// stores under its range since then: before the submit from the collected stamps alone, after it
+// (in flight, waited) by a walk of the range and only since the submit's generation; never the
+// driver's own stores or older ones. Level 0 checks nothing, level 1 not the title's fills/copies.
+void CheckLateLands() {
+    constexpr std::uint64_t page = 4096;
+    void* memory = AllocateWatched(Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x33, Block);
+    CollectWritesUncached(base, Block);
+    const auto decided = TrackerGeneration();
+    Require(decided != 0, "the late land block is not collected");
+    SetLateLandLevel(1);
+    const auto land = MakeLateLand(LateLandKind::ShadowPublish, base, base + 8 * page, decided, "test");
+    Require(CheckLateLand(land, LateLandPhase::Submit, 0, 1) == 0, "a land with no CPU store since its decision was reported");
+    bytes[3 * page + 4] = 0x44;
+    MarkWritten(base + 5 * page, 64);
+    CollectWritesUncached(base, Block);
+    if (std::getenv("APS5_NO_EDGE_PAGE_KEEP") != nullptr) {
+        Require(CheckLateLand(land, LateLandPhase::Submit, 0, 1) == 8 * page, "a CPU-stamped block is not reported whole with APS5_NO_EDGE_PAGE_KEEP");
+        return;
+    }
+    Require(CheckLateLand(land, LateLandPhase::Submit, 0, 1) == page, "the CPU's page since the decision was not found before the submit");
+    const auto submitted = TrackerGeneration();
+    Require(CheckLateLand(land, LateLandPhase::Finish, submitted, 1) == 0, "a store before the submit was counted in flight");
+    bytes[6 * page + 8] = 0x55;
+    Require(CheckLateLand(land, LateLandPhase::Finish, submitted, 1) == page, "the finish check did not walk to the store in flight");
+    Require(CheckLandedNow(LateLandKind::TextureStore, base, base + 8 * page, TrackerGeneration(), "test") == 0, "a land decided after the stores was reported");
+    Require(CheckLandedNow(LateLandKind::TextureStore, base, base + 8 * page, 0, "test") == 0, "an untracked land (generation 0) was reported");
+    const auto summary = LateLandSummary();
+    Require(summary.find("before submit 1 (4 KiB)") != std::string::npos && summary.find("in flight 1 (4 KiB)") != std::string::npos && summary.find("shadow 2 (8 KiB)") != std::string::npos, "the digest does not count the hits by phase and kind: " + summary);
+    Require(LateLandChecked(LateLandKind::DccKeys) && !LateLandChecked(LateLandKind::Fill) && !LateLandChecked(LateLandKind::Copy) && !LateLandChecked(LateLandKind::CopyBack) && !LateLandChecked(LateLandKind::GpuWrite), "level 1 does not check the driver's lands alone");
+    SetLateLandLevel(2);
+    Require(LateLandChecked(LateLandKind::Fill) && LateLandChecked(LateLandKind::Copy) && LateLandChecked(LateLandKind::CopyBack) && LateLandChecked(LateLandKind::GpuWrite), "level 2 does not check the title's fills and copies, the copy-backs and the shaders' writes");
+    SetLateLandLevel(0);
+    Require(CheckLateLand(land, LateLandPhase::Submit, 0, 1) == 0 && LateLandSummary() == "late lands over CPU stores: off", "APS5_LATE_LAND_CHECK=0 still checks");
+    SetLateLandLevel(1);
+}
+
 // The write-back range trace's switch (APS5_TRACE_WRITEBACK_RANGE=<lo>-<hi>, hex): the range is
 // [lo, hi), and a store is traced only when one of its bytes lies inside it.
 void CheckRangeTraceFilter() {
@@ -476,6 +516,7 @@ int main() {
         CheckEqualsSince();
         CheckCpuStoredRuns();
         CheckKeepCpuStores();
+        CheckLateLands();
         CheckThreadEpoch();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";

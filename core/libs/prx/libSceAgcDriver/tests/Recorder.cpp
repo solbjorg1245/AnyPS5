@@ -2540,16 +2540,24 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     Require(words[3 * unit] == 0x33 && words[4 * unit - 1] == 0x33 && words[4 * unit] == 0x11, "the partial publish's bytes are wrong");
     // A CPU write into a page of unit 4 makes it stale: the publish collects the unit itself (no
     // walk saw the store before it) and drops it. The pages the store missed still publish the
-    // retile's bytes (APS5_FIX_BOOT_STRIP; =0 or APS5_NO_EDGE_PAGE_KEEP: nothing is copied).
+    // retile's bytes (APS5_FIX_BOOT_STRIP; =0 or APS5_NO_EDGE_PAGE_KEEP: nothing is copied), unless
+    // the store reached a retiled page (APS5_FIX_KEPT_REUSE: the game took the memory back, the
+    // unit is dropped whole).
     const char* bootStrip = std::getenv("APS5_FIX_BOOT_STRIP");
     const bool pageKeep = (bootStrip == nullptr || std::string(bootStrip) != "0") && std::getenv("APS5_NO_EDGE_PAGE_KEEP") == nullptr;
+    const char* keptReuseText = std::getenv("APS5_FIX_KEPT_REUSE");
+    const bool keptReuse = keptReuseText == nullptr || std::string(keptReuseText) != "0";
+    const bool reusedKeep = pageKeep && !keptReuse;
+    Require(StaleKeptPages(0xfffdu, 0xffffu, 0xffffu, true) == 0 && StaleKeptPages(0xfffdu, 0xffffu, 0xffffu, false) == 0xfffdu, "a store into a retiled page did not drop the unit whole");
+    Require(StaleKeptPages(0xefffu, 0x00ffu, 0xffffu, true) == 0x00ffu && StaleKeptPages(0x0fffu, 0x0ff0u, 0x0ff0u, true) == 0x0ff0u, "a store beside the retiled pages dropped them");
+    Require(StaleKeptPages(0xfff0u, 0xfff0u, 0xfff0u, true) == 0xfff0u && StaleKeptPages(0, 0xffffu, 0xffffu, false) == 0, "the unit's own pages are misread");
     static_cast<void>(CollectWritesUncached(unit4, unit));
     *static_cast<volatile std::uint8_t*>(static_cast<void*>(static_cast<std::uint8_t*>(block) + 4 * unit + 4096)) = 0x55;
-    Require(PublishShadow(unit4, unit, PublishScope::Whole, PublishReason::Hook) == (pageKeep ? 1u : 0u), pageKeep ? "a stale unit's unstored pages were not published" : "a stale unit was published");
+    Require(PublishShadow(unit4, unit, PublishScope::Whole, PublishReason::Hook) == (reusedKeep ? 1u : 0u), reusedKeep ? "a stale unit's unstored pages were not published" : "a stale unit was published");
     Require(!AnyShadowedOverlaps(unit4, unit), "a stale unit still counts as shadowed after its publish");
     recorder.Sync();
     Require(words[4 * unit + 4096] == 0x55 && words[4 * unit + 4096 + 1] == 0x11, "a stale unit's publish overwrote the CPU's page");
-    const std::uint8_t unstored = pageKeep ? 0x44 : 0x11;
+    const std::uint8_t unstored = reusedKeep ? 0x44 : 0x11;
     Require(words[4 * unit] == unstored && words[4 * unit + 4095] == unstored && words[4 * unit + 2 * 4096] == unstored && words[5 * unit - 1] == unstored && words[5 * unit] == 0x11, "a stale unit's unstored pages are wrong");
     {
         // A half-unit retile whose seeded half holds bytes older than the import (0x99 stands in
@@ -2563,9 +2571,9 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
         retile(*lower, unit20 + unit / 2, unit / 2, 0x99, false, false);
         lower.reset();
         *static_cast<volatile std::uint8_t*>(static_cast<void*>(static_cast<std::uint8_t*>(block) + 20 * unit + 4096 + 8)) = 0x56;
-        Require(PublishShadow(unit20, unit, PublishScope::Whole, PublishReason::Hook) == (pageKeep ? 1u : 0u), "a stale half-retiled unit's publish count is wrong");
+        Require(PublishShadow(unit20, unit, PublishScope::Whole, PublishReason::Hook) == (reusedKeep ? 1u : 0u), "a stale half-retiled unit's publish count is wrong");
         recorder.Sync();
-        const std::uint8_t retiled = pageKeep ? 0x77 : 0x11;
+        const std::uint8_t retiled = reusedKeep ? 0x77 : 0x11;
         Require(words[20 * unit + 4096 + 8] == 0x56 && words[20 * unit + 4096] == 0x11, "a stale half-retiled unit's publish overwrote the CPU's page");
         Require(words[20 * unit] == retiled && words[20 * unit + 2 * 4096] == retiled && words[20 * unit + unit / 2 - 1] == retiled, "a stale half-retiled unit's retiled pages are wrong");
         Require(words[20 * unit + unit / 2] == 0x11 && words[21 * unit - 1] == 0x11, "a stale unit published its seeded pages");
@@ -2580,6 +2588,20 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
         Require(!AnyShadowedOverlaps(unit21, unit), "a unit a driver store reached still counts as shadowed");
         recorder.Sync();
         Require(words[21 * unit] == 0x11 && words[22 * unit - 1] == 0x11, "a driver-stored unit's publish overwrote the import");
+        // A CPU store into the seeded half only (the table after the Bink chroma plane's tail): the
+        // retiled half publishes with APS5_FIX_KEPT_REUSE too, the stored page stays the CPU's.
+        const auto unit24 = address + 24 * unit;
+        static_cast<void>(CollectWritesUncached(unit24, unit));
+        auto edge = ShadowDestinationFor(context, *import, unit24, unit24 + unit / 2);
+        Require(edge.has_value() && edge->seedUnits.size() == 1, "unit 24's half retile does not seed");
+        retile(*edge, unit24, unit / 2, 0x7b, true);
+        edge.reset();
+        *static_cast<volatile std::uint8_t*>(static_cast<void*>(static_cast<std::uint8_t*>(block) + 24 * unit + unit / 2 + 4096 + 8)) = 0x57;
+        Require(PublishShadow(unit24, unit, PublishScope::Whole, PublishReason::Hook) == (pageKeep ? 1u : 0u), "a unit stored beside its retiled half has the wrong publish count");
+        recorder.Sync();
+        const std::uint8_t beside = pageKeep ? 0x7b : 0x11;
+        Require(words[24 * unit] == beside && words[24 * unit + unit / 2 - 1] == beside, "a unit stored beside its retiled half did not publish them");
+        Require(words[24 * unit + unit / 2 + 4096 + 8] == 0x57 && words[24 * unit + unit / 2] == 0x11 && words[25 * unit - 1] == 0x11, "a unit stored beside its retiled half overwrote the seeded half");
     }
     // The slab boundary: a piece over units 127 and 128 is refused, each alone lands in its slab.
     const auto unit127 = address + 127 * unit;

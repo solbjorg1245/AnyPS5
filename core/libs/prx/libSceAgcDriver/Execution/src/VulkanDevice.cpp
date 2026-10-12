@@ -1601,7 +1601,9 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     recorder.MarkCovered(filledAccess);
     phase(recordMs);
     recorder.NotePendingWrite(address, bytes, Graphics::Recorder::WriteKind::Fill);
-    GuestMemory::MarkWritten(address, bytes);
+    const auto filled = GuestMemory::MarkWritten(address, bytes);
+    // APS5_LATE_LAND_CHECK=2 only: the title's own fill races the CPU on the console as well.
+    recorder.NoteLateLand(GuestMemory::LateLandKind::Fill, address, address + bytes, filled, "title fill");
     phase(notesMs);
     return true;
 }
@@ -1840,6 +1842,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     const bool sourceCurrent = bytes <= knownMax && generation != 0 && !recorder.PendingWriteOverlaps(source, bytes) && !recorder.PendingLabelIn(source, bytes) && !completionStoreOverlaps(source) && !Graphics::StorageTexture::AnyPendingOverlaps(sourceRange) && !Graphics::AnyShadowedOverlaps(sourceRange);
     noteWriter(sourceCurrent ? std::span(reinterpret_cast<const std::byte*>(source), bytes) : std::span<const std::byte>{}, sourceCurrent ? generation : 0);
     recorder.NotePendingWrite(destination, bytes, Graphics::Recorder::WriteKind::Copy);
+    recorder.NoteLateLand(GuestMemory::LateLandKind::Copy, destination, destination + bytes, generation, "title copy");
     outcome.path = 1;
     return outcome;
 }

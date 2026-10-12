@@ -1817,7 +1817,9 @@ void Recorder::DeferCopies(std::vector<DeferredCopy> copies) {
     if (copies.empty()) return;
     ensureOpen();
     const auto freeClock = GuestMemory::FreeClock();
+    const auto generation = GuestMemory::LateLandChecked(GuestMemory::LateLandKind::CopyBack) ? GuestMemory::TrackerGeneration() : 0;
     for (auto& copy : copies) {
+        if (copy.generation == 0) copy.generation = generation;
         copyBacksDeferred.fetch_add(1, std::memory_order_relaxed);
         copyBackBytesDeferred.fetch_add(copy.bytes, std::memory_order_relaxed);
         copy.freeClock = std::min(copy.freeClock, freeClock);
@@ -2328,6 +2330,13 @@ std::uint64_t Recorder::recordCopyCommands(VkCommandBuffer commands, std::vector
     std::vector<DeferredCopy> narrow(std::make_move_iterator(narrowFirst), std::make_move_iterator(copies.end()));
     copies.erase(narrowFirst, copies.end());
     std::uint64_t bytes = 0;
+    // APS5_LATE_LAND_CHECK=2: a plain copy stores its whole range (a resident copy's pages are guarded).
+    if (GuestMemory::LateLandChecked(GuestMemory::LateLandKind::CopyBack)) {
+        const auto now = GuestMemory::TrackerGeneration();
+        for (const auto& copy : copies) {
+            if (copy.guard == nullptr) NoteLateLand(GuestMemory::LateLandKind::CopyBack, copy.address, copy.address + copy.bytes, copy.generation != 0 ? copy.generation : now, copy.land ? "land" : "copy-back");
+        }
+    }
     if (coalesceCopyBacks) {
         // Disjoint destinations (DeferCopies): one vkCmdCopyBuffer per (source, destination) pair.
         std::sort(copies.begin(), copies.end(), [](const DeferredCopy& left, const DeferredCopy& right) { return std::tie(left.source, left.destination, left.address) < std::tie(right.source, right.destination, right.address); });
@@ -3844,6 +3853,12 @@ void Recorder::OnComplete(std::function<void()> action) {
     writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
 }
 
+void Recorder::NoteLateLand(GuestMemory::LateLandKind kind, std::uint64_t begin, std::uint64_t end, std::uint64_t generation, const char* reason) {
+    if (end <= begin || generation == 0 || !GuestMemory::LateLandChecked(kind)) return;
+    ensureOpen();
+    open->lateLands.push_back(GuestMemory::MakeLateLand(kind, begin, end, generation, reason));
+}
+
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, WriteKind kind) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
@@ -3854,7 +3869,10 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     if (ResidentWritesLive()) NoteResidentWritesWrite(address, address + bytes);
     ensureOpen();
     const auto end = address + bytes;
+    // APS5_LATE_LAND_CHECK=2: a shader's in-place write range, checked from now on (LateLandKind::GpuWrite).
+    if (!ownLabel && (kind == WriteKind::ShaderWrite || kind == WriteKind::Unknown) && GuestMemory::LateLandChecked(GuestMemory::LateLandKind::GpuWrite)) open->lateLands.push_back(GuestMemory::MakeLateLand(GuestMemory::LateLandKind::GpuWrite, address, end, GuestMemory::TrackerGeneration(), WriteKindName(kind)));
     open->writes.emplace_back(address, end);
+    if (!ownLabel) GuestMemory::NoteGpuWriteForCrash(address, end, WriteKindName(kind), submissions + 1);
     open->writeNotes.push_back(++writeNoteCount);
     markPendingBlocks(address, end, submissions + 1);
     // The writer's tag for the [hooksync] attribution: the packet the noting thread executes and
@@ -4448,6 +4466,12 @@ void Recorder::Submit() {
             for (const auto& [begin, finish] : *set.first) open->readGeneration = std::max(open->readGeneration, GuestMemory::CollectWrites(begin, finish - begin));
         }
     }
+    if (!open->lateLands.empty()) {
+        // APS5_LATE_LAND_CHECK: CPU stores collected since a land's decision lie under it already;
+        // the ones stamped after this generation are checked when the batch finishes.
+        for (const auto& land : open->lateLands) GuestMemory::CheckLateLand(land, GuestMemory::LateLandPhase::Submit, 0, submissions + 1);
+        open->lateLandGeneration = GuestMemory::TrackerGeneration();
+    }
     auto batch = std::move(open);
     Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
     VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -4950,6 +4974,11 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             for (const auto& read : batch->reads) entry.reads.emplace_back(read.begin, read.end);
             for (const auto& set : batch->readSets) entry.reads.insert(entry.reads.end(), set.first->begin(), set.first->end());
         }
+    }
+    if (batch->lateLandGeneration != 0) {
+        // APS5_LATE_LAND_CHECK: the lands are in host memory now; a CPU store since the submit may lie
+        // under them (or have come after the GPU's copy: "in flight" is an upper bound).
+        for (const auto& land : batch->lateLands) GuestMemory::CheckLateLand(land, GuestMemory::LateLandPhase::Finish, batch->lateLandGeneration, batch->serial);
     }
     // Completions store GPU results to guest memory; a failing one is reported, the rest still run.
     // Timed (APS5_PROFILE_DRAW) with the release of the kept objects: both run under whichever hold
