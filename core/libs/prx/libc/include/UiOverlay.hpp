@@ -259,8 +259,9 @@ inline std::string GlyphTexture(std::string_view original, Glyph glyph) {
 // a UV quad of 4 float pairs, u32 page) over ui/textures/_ps5/_ps5/global_pages.ctxr, 5 pages of 4096x4096
 // R8G8B8A8_SRGB SW_64KB_S in the ctxr layout above (+0x18 holds one page's size; no mips). A copy of the
 // 335 MB file for two 70x70 sprites is not worth it: the 64 KiB blocks under them are redrawn once and
-// replace the file's bytes as the title reads them (ReadPatch.hpp). The title's rings stay; the white face
-// inside AtlasFaceRadius gets the Deck letter in black instead of the PlayStation symbol.
+// replace the file's bytes as the title reads them (ReadPatch.hpp). The title's rings stay; the face
+// inside AtlasFaceRadius is drawn like the bar icons (a dark disc shaded top to bottom) with the Deck letter in
+// near-white instead of the PlayStation symbol.
 inline constexpr const char* AtlasGuest = "/app0/ui/textures/_ps5/global.ctal";
 inline constexpr const char* AtlasPagesGuest = "/app0/ui/textures/_ps5/_ps5/global_pages.ctxr";
 inline constexpr std::uint32_t AtlasPageSize = 4096;
@@ -376,13 +377,14 @@ inline std::uint64_t SpriteHash(const std::vector<std::uint32_t>& texels) {
     return hash;
 }
 
-// In a 70-texel sprite the white face ends at radius 19.5 (the symbol reaches 18, the rings start at 20);
+// In a 70-texel sprite the face ends at radius 19.5 (the symbol reaches 18, the rings start at 20);
 // the letter is drawn at 0.45 texels per glyph unit (28 texels tall).
 inline constexpr float AtlasFaceRadius = 19.5f;
 inline constexpr float AtlasGlyphScale = 0.45f;
 
 // The sprite (`size` texels square) with its symbol redrawn: texels whose centre lies inside the face
-// become white with `glyph`'s strokes in black (4x4 samples, opaque); the rings and corners stay.
+// become the bar icons' dark disc with `glyph`'s strokes in near-white (4x4 samples, opaque); the rings and
+// corners stay.
 inline std::vector<std::uint32_t> RedrawCircledSprite(std::vector<std::uint32_t> texels, std::uint32_t size, Glyph glyph) {
     constexpr int samples = 4;
     const auto strokes = GlyphStrokes(glyph);
@@ -403,8 +405,11 @@ inline std::vector<std::uint32_t> RedrawCircledSprite(std::vector<std::uint32_t>
                     if (OnStroke(strokes, gx, gy)) ++covered;
                 }
             }
-            const auto value = static_cast<std::uint32_t>(std::lround(255.0f * (1.0f - static_cast<float>(covered) / (samples * samples))));
-            texels[static_cast<std::size_t>(py) * size + px] = value | (value << 8u) | (value << 16u) | 0xff000000u;
+            // The disc is GlyphSample's body (0.20/0.21/0.23 shaded by 0.08 over the face) and the letter its ink (0.95).
+            const float t = std::clamp((static_cast<float>(py) + 0.5f - (centre - face)) / (2.0f * face), 0.0f, 1.0f);
+            const float cover = static_cast<float>(covered) / (samples * samples);
+            const auto channel = [&](float body) { return static_cast<std::uint32_t>(std::lround(255.0f * (body + (0.95f - body) * cover))); };
+            texels[static_cast<std::size_t>(py) * size + px] = channel(0.20f - 0.08f * t) | (channel(0.21f - 0.08f * t) << 8u) | (channel(0.23f - 0.08f * t) << 16u) | 0xff000000u;
         }
     }
     return texels;

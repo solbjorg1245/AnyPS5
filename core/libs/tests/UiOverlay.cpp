@@ -230,7 +230,7 @@ static void TestAtlas() {
         for (std::size_t i = 0; i < block.size(); ++i) block[i] = static_cast<char>((i * 7 + offset) & 0xffu);
     }
     const auto before = blocks;
-    // A sprite like the title's: transparent corners, grey rings from radius 20, a white face, a black symbol.
+    // A sprite like the title's: transparent corners, grey rings from radius 20, a white face, a black symbol (the redraw makes it a dark disc, light letter).
     std::vector<std::uint32_t> title(70 * 70);
     for (std::uint32_t y = 0; y < 70; ++y) {
         for (std::uint32_t x = 0; x < 70; ++x) {
@@ -267,9 +267,9 @@ static void TestAtlas() {
             }
         }
     }
-    Require((redrawn[35 * 70 + 35] & 0xffu) < 60, "the X crosses at the centre");
-    Require((redrawn[23 * 70 + 35] & 0xffu) > 200, "the face is white between the X's arms");
-    Require((redrawn[35 * 70 + 46] & 0xffu) > 200 && (title[35 * 70 + 46] & 0xffu) == 0, "the title's symbol is gone");
+    Require((redrawn[35 * 70 + 35] & 0xffu) > 200, "the X crosses at the centre (light letter)");
+    Require((redrawn[23 * 70 + 35] & 0xffu) < 80, "the face is a dark disc between the X's arms");
+    Require((redrawn[35 * 70 + 46] & 0xffu) < 80 && (title[35 * 70 + 46] & 0xffu) == 0, "the title's symbol is gone");
     Require(UiOverlay::RedrawCircledSprite(title, 70, UiOverlay::Glyph::Y) != redrawn, "X and Y differ");
 
     Require(UiOverlay::SpriteHash({}) == 0xcbf29ce484222325ull && UiOverlay::SpriteHash({0x04030201u}) == 0xbe7a5e775165785dull,

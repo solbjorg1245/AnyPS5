@@ -719,6 +719,7 @@ inline std::string Describe(const Settings& settings) {
     }
     result += settings.windowMode == WindowMode::Fullscreen ? ", WindowMode fullscreen" : settings.windowMode == WindowMode::Windowed ? ", WindowMode windowed" : "";
     result += ", Upscaler off";
+    if (settings.buttonIcons == ButtonIcons::SteamDeck) result += ", ButtonIcons steamdeck";
     result += settings.source.empty() ? " (no settings file)" : " (" + settings.source + ")";
     return result;
 }

@@ -12,6 +12,7 @@
 
 #include <cerrno>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -136,13 +137,20 @@ std::int64_t APS5_VABI sceKernelRead(int d, void* buf, std::size_t nbytes) {
     if (!destination.Open()) errno = EFAULT;
     if (File::ReadTraceEnabled()) File::TraceReadInto("read", File::TracedPath(d).c_str(), -1, buf, nbytes, __builtin_return_address(0));
     // A patched file (ReadPatch.hpp) needs the position the read starts at.
+    // The position and the read are two calls: a patched descriptor serialises them (one lock for all of
+    // them: only the atlas is patched), so a second reader cannot move the position in between and get the
+    // patch at the wrong offset. Unpatched files take no lock.
     const auto patches = ReadPatchesForDescriptor_nid_no_patch(d);
+    static std::mutex patchedReadMutex;
+    std::unique_lock<std::mutex> patchedReadLock(patchedReadMutex, std::defer_lock);
+    if (patches) patchedReadLock.lock();
     const std::int64_t position = patches ? NativeLseek(d, 0, SEEK_CUR) : -1;
     auto n = destination.Open() ? NativeRead(d, buf, nbytes) : -1;
     if (n < 0) {
         throw std::runtime_error(std::string(__func__) + ": read failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
     }
     if (patches && position >= 0) ApplyReadPatches_nid_no_patch(*patches, "read", static_cast<std::uint64_t>(position), buf, static_cast<std::uint64_t>(n));
+    if (patchedReadLock.owns_lock()) patchedReadLock.unlock();
     return static_cast<std::int64_t>(n);
 }
 

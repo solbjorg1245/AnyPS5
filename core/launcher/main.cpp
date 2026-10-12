@@ -618,10 +618,18 @@ Action Draw(Model& model) {
         if (ImGui::RadioButton("Fullscreen", fullscreen)) model.settings.windowMode = PortSettings::WindowMode::Fullscreen;
 
         Label("Button icons");
-        const bool deck = model.settings.buttonIcons == PortSettings::ButtonIcons::SteamDeck;
+        // APS5_BUTTON_ICONS wins over the ini (the game reads it): the row shows what the game will do.
+        const char* iconsEnvironment = std::getenv("APS5_BUTTON_ICONS");
+        const bool iconsOverridden = iconsEnvironment != nullptr && iconsEnvironment[0] != '\0';
+        PortSettings::Settings iconsFromEnvironment;
+        if (iconsOverridden) PortSettings::SetKey(iconsFromEnvironment, "ButtonIcons", iconsEnvironment, "APS5_BUTTON_ICONS");
+        const bool deck = (iconsOverridden ? iconsFromEnvironment.buttonIcons : model.settings.buttonIcons) == PortSettings::ButtonIcons::SteamDeck;
+        ImGui::BeginDisabled(iconsOverridden);
         if (ImGui::RadioButton("PlayStation", !deck)) model.settings.buttonIcons = PortSettings::ButtonIcons::PlayStation;
         ImGui::SameLine();
         if (ImGui::RadioButton("Steam Deck", deck)) model.settings.buttonIcons = PortSettings::ButtonIcons::SteamDeck;
+        ImGui::EndDisabled();
+        if (iconsOverridden) Note((std::string("(set by APS5_BUTTON_ICONS=") + iconsEnvironment + ")").c_str());
         if (deck) Note("A, B, X, Y, Menu and View in the prompts; View works as the touchpad.");
 
         Label("FPS limit");
