@@ -64,7 +64,11 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         if (const auto label = Pm4::DecodeLabelWrite(packet)) {
             const auto bytes = label->Bytes();
             if (census) NotePipeCensusLabel(bytes.size() <= 65536 && bytes.size() % 4 == 0 && label->address % 4 == 0 ? PipeCensusLabel::Hand : PipeCensusLabel::None, label->address, label->address + bytes.size());
-            if (DeferLabels() && bytes.size() <= DeferredLabel::Capacity && bytes.size() % 4 == 0 && label->address % 4 == 0) {
+            // APS5_LAZY_LABELS: with unrecorded items in the recording pipe, the label rides it (its
+            // boundary skipped the drain); B records it after them.
+            if (submission.queue == 0 && recordPipeLabeling(0) && handOverLabel(label->address, bytes, opcode)) {
+                wroteOnGpu = true;
+            } else if (DeferLabels() && bytes.size() <= DeferredLabel::Capacity && bytes.size() % 4 == 0 && label->address % 4 == 0) {
 
                 auto& deferred = deferredLabels();
                 if (deferred.labels.empty()) deferred.since = std::chrono::steady_clock::now();

@@ -2,14 +2,17 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_RECORDPIPE_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -85,8 +88,9 @@ constexpr std::size_t RecordPipeOccupancyBucket(std::uint64_t outstanding) {
 // hand-over and prunes by `consumed` before a capture, validation or indirect read checks it.
 using RecordPipeOverlay = PipeCensusOverlay;
 
-// What a slot holds: a draw (its DrawScratch and RecordPipeDraw) or a dispatch (RecordPipeDispatch).
-enum class RecordPipeKind : std::uint8_t { Draw, Dispatch };
+// What a slot holds: a draw (its DrawScratch and RecordPipeDraw), a dispatch (RecordPipeDispatch) or
+// a label (APS5_LAZY_LABELS: its bytes, a DeferredLabel).
+enum class RecordPipeKind : std::uint8_t { Draw, Dispatch, Label };
 
 // An item's queue state at hand-over, for A's redo of a stale item: QueueState without constantRam
 // (draws never read it; DUMP_CONST_RAM, its only reader, drains) and without the fastState memo
@@ -173,6 +177,130 @@ inline std::optional<PipeCensusDrain> RecordPipeTopDrain(std::span<const std::ui
     }
     return ClassifyPipeCensus({packet[0], false, flip, renderingWait}, false).drain;
 }
+
+// APS5_LAZY_LABELS=1 (P-LABEL; read once, only with the pipe on; default off): a queue-0 label the
+// deferred list would take (WRITE_DATA or RELEASE_MEM without an EOP interrupt, <= 32 dword-aligned
+// bytes) no longer drains the pipe while it holds unrecorded items: it rides the ring as a label item
+// that B records in order after them (parallel-recording-s2-plan.md S2.2, plain labels only), so A
+// goes on with the next packet. With the ring empty it joins the deferred list as before; EOP
+// interrupts, stores and custom labels drain as before. Declined (old path) under
+// APS5_LABEL_LOCK_EACH, APS5_DRAIN_COMPLETION_LABELS and without the queued-label table.
+bool RecordPipeLabelsActive();
+
+// APS5_LAZY_LABELS=2 (P-LABEL; default off): labels ride as with =1, and so does a queue-0 wait whose
+// awaited bytes a riding label wrote last (RecordPipeRidingValue) with a value it accepts: its label
+// is recorded before the items after the wait, so it is satisfied in order, as a same-queue hit in
+// the recorder's label table satisfies it today (WaitMemory.cpp), without draining. Any other wait
+// drains as before.
+bool RecordPipeWaitsActive();
+
+// A label riding the ring (A, from its hand-over until the next drain).
+struct RecordPipeRidingLabel {
+    std::uint64_t address = 0;
+    std::size_t size = 0;
+    std::array<std::byte, DeferredLabel::Capacity> bytes{};
+    std::uint64_t serial = 0;
+};
+
+// A label packet as the ride verdict sees it: its opcode, whether a RELEASE_MEM raises an EOP
+// interrupt, and what Pm4::DecodeLabelWrite made of it (decoded false: nothing).
+struct RecordPipeLabelFacts {
+    std::uint32_t opcode = 0;
+    bool interrupt = false, decoded = false;
+    std::uint64_t address = 0;
+    std::size_t bytes = 0;
+};
+
+// Whether the label rides the ring (A's boundary skips the drain and PacketMemory hands it over):
+// exactly the labels PacketMemory.cpp defers, so a label that does not ride drains as before.
+constexpr bool RecordPipeLabelRides(const RecordPipeLabelFacts& facts) {
+    return (facts.opcode == 0x37 || facts.opcode == 0x49) && !facts.interrupt && facts.decoded && facts.bytes != 0 && facts.bytes <= DeferredLabel::Capacity && facts.bytes % 4 == 0 && facts.address % 4 == 0;
+}
+
+// The label census (P-LABEL; APS5_PROFILE_DRAW, the [pipe] labels line): each label drain that found
+// unrecorded items, by the label's kind, and by what A did next: hand an item over (riding the ring,
+// the label would have joined two runs and saved the whole wait) or drain for another reason (riding
+// moves the wait there). Labels in a row stay one event. Custom: PM4 0x10 labels.
+enum class RecordPipeLabelKind : std::uint8_t { WriteData, ReleaseMem, EopInterrupt, Custom, Count };
+inline constexpr std::size_t RecordPipeLabelKinds = static_cast<std::size_t>(RecordPipeLabelKind::Count);
+inline constexpr std::array<const char*, RecordPipeLabelKinds> RecordPipeLabelKindNames{"write data", "release mem", "eop interrupt", "custom"};
+constexpr RecordPipeLabelKind RecordPipeLabelKindOf(std::uint32_t opcode, bool interrupt) {
+    return opcode == 0x37 ? RecordPipeLabelKind::WriteData : opcode == 0x49 ? (interrupt ? RecordPipeLabelKind::EopInterrupt : RecordPipeLabelKind::ReleaseMem) : RecordPipeLabelKind::Custom;
+}
+
+struct RecordPipeLabelNext {
+    // Buckets: the drain reasons (PipeCensusDrain), then Handed.
+    static constexpr std::size_t Handed = PipeCensusDrains, Buckets = PipeCensusDrains + 1;
+    std::optional<double> armed;
+    std::array<std::uint64_t, Buckets> counts{};
+    std::array<double, Buckets> ms{};
+    // A label drain waited `waitMs`; an armed one before it had nothing handed in between.
+    void Arm(double waitMs) {
+        Note(static_cast<std::size_t>(PipeCensusDrain::Label));
+        armed = waitMs;
+    }
+    // The next event after the armed drain (none armed: nothing).
+    void Note(std::size_t bucket) {
+        if (!armed) return;
+        ++counts[bucket];
+        ms[bucket] += *armed;
+        armed.reset();
+    }
+};
+
+// APS5_LABEL_CENSUS=1 (P-LABEL; default off): who waits on queue 0's labels. The addresses queue-0
+// label packets wrote (forgotten past Limit) and, per address, the queues whose WAIT_REG_MEM polled
+// it (bit queue / 8). A label drain is then counted by its address's readers so far.
+enum class RecordPipeLabelReader : std::uint8_t { OtherQueue, QueueZero, None, Count };
+inline constexpr std::size_t RecordPipeLabelReaderCount = static_cast<std::size_t>(RecordPipeLabelReader::Count);
+inline constexpr std::array<const char*, RecordPipeLabelReaderCount> RecordPipeLabelReaderNames{"awaited by another queue", "awaited by queue 0 only", "never awaited"};
+
+struct RecordPipeLabelReaders {
+    static constexpr std::size_t Limit = std::size_t{1} << 16u;
+    std::unordered_map<std::uint64_t, std::uint32_t> waiters;
+
+    void NoteLabel(std::uint64_t address) {
+        if (waiters.size() >= Limit && !waiters.contains(address)) waiters.clear();
+        waiters.try_emplace(address, 0u);
+    }
+    // Whether `address` is a queue-0 label's; the waiting queue joins its readers.
+    bool NoteWait(std::uint64_t address, std::uint32_t queue) {
+        const auto found = waiters.find(address);
+        if (found == waiters.end()) return false;
+        found->second |= 1u << ((queue / 8u) & 31u);
+        return true;
+    }
+    RecordPipeLabelReader ReaderOf(std::uint64_t address) const {
+        const auto found = waiters.find(address);
+        if (found == waiters.end() || found->second == 0) return RecordPipeLabelReader::None;
+        return (found->second & ~1u) != 0 ? RecordPipeLabelReader::OtherQueue : RecordPipeLabelReader::QueueZero;
+    }
+};
+
+// The value a queue-0 wait on [awaited, awaited + bytes) reads in order when a label riding the ring
+// wrote those bytes last: the newest unrecorded riding label (serial > consumed) that holds them all,
+// with no unrecorded item's overlay range over them newer than it (a later draw, dispatch or label
+// writing there; the overlay pruned to `consumed`). nullopt: the wait drains as before.
+inline std::optional<std::uint64_t> RecordPipeRidingValue(std::span<const RecordPipeRidingLabel> riding, const RecordPipeOverlay& overlay, std::uint64_t consumed, std::uint64_t awaited, std::size_t bytes) {
+    if (bytes == 0 || bytes > sizeof(std::uint64_t)) return std::nullopt;
+    for (auto label = riding.rbegin(); label != riding.rend(); ++label) {
+        if (label->serial <= consumed) return std::nullopt;
+        if (awaited < label->address || awaited + bytes > label->address + label->size) continue;
+        for (const auto& range : overlay.ranges) {
+            if (awaited < range.end && range.begin < awaited + bytes && range.serial > label->serial) return std::nullopt;
+        }
+        std::uint64_t value = 0;
+        std::memcpy(&value, label->bytes.data() + (awaited - label->address), bytes);
+        return value;
+    }
+    return std::nullopt;
+}
+
+// APS5_LABEL_CENSUS, any queue's worker after a WAIT_REG_MEM: the wait on `address` took `ms`.
+bool RecordPipeLabelCensus();
+void NoteRecordPipeLabelWait(std::uint64_t address, std::uint32_t queue, double ms);
+// APS5_PROFILE_DRAW, the queue-0 worker: time it waited for a submission (the [pipe] labels line).
+void NoteRecordPipeIdle(std::uint64_t ns);
 
 // The stale handshake: B, whose device call threw SnapshotStale for item k, records nothing for it,
 // releases the GPU mutex, raises k and waits; A, at its next service point (a packet boundary or any

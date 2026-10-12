@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
@@ -78,6 +79,8 @@ void Driver::run(std::uint32_t id) noexcept {
                     return changed.wait_for(lock, std::chrono::milliseconds(1), done);
                 };
 
+                // APS5_PROFILE_DRAW: queue 0's wait for a submission, reaps included (the [pipe] labels line).
+                const auto idleStart = profile && id == 0 && !ready() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 while (!ready()) {
                     if (!completionsPending() || (id != 0 && Graphics::Recorder::PendingCompletionLabels() == 0)) {
                         if (id == 0) queue0Dormant.store(true, std::memory_order_relaxed);
@@ -90,6 +93,7 @@ void Driver::run(std::uint32_t id) noexcept {
                     reapCompletionLabels();
                     lock.lock();
                 }
+                if (idleStart != std::chrono::steady_clock::time_point{}) NoteRecordPipeIdle(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - idleStart).count()));
                 rethrowFailure();
                 if (stopping || shutdownToken.stop_requested() || pending.empty()) {
                     break;

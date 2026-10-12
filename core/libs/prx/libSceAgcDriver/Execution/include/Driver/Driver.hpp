@@ -207,6 +207,16 @@ private:
     static void verifyRecordPipeDrained(std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t consumed, std::uint32_t opcode, std::uint64_t key);
     void handOverDraw(DrawScratch& scratch, RecordPipeDraw&& draw, const QueueState& queue);
     void handOverDispatch(RecordPipeDispatch&& item);
+    // APS5_LAZY_LABELS (P-LABEL): whether a queue-0 label may ride the pipe (not a stale redo or a
+    // trace), its hand-over (false: the ring is empty, so the label takes the deferred list), and B's
+    // record of it.
+    static bool recordPipeLabeling(std::uint32_t queue);
+    // APS5_LAZY_LABELS=2: whether queue 0's waits may ride, and (read once per wait packet) whether
+    // its boundary found this one satisfied in order behind a riding label.
+    static bool recordPipeWaiting(std::uint32_t queue);
+    static bool recordPipeTookWait();
+    bool handOverLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint32_t opcode);
+    void recordPipeLabel(std::uint64_t address, std::span<const std::byte> bytes);
     void publishRecordPipeItem(std::uint64_t serial);
     void serviceRecordPipe();
     void recordPipeWaitRound();
