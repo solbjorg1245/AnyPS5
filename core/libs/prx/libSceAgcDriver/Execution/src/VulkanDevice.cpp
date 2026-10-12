@@ -1179,6 +1179,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     }
     // APS5_ASYNC_COMPUTE needs the second queue (the recorder prints the line when it is on).
     if (const int level = Graphics::AsyncComputeLevel(); level != 0 && queueInfo.queueCount != 2) std::fprintf(stderr, "[recorder] async compute: off, %s (APS5_ASYNC_COMPUTE=%d)\n", Graphics::ComputeQueueAsked() ? "no second queue" : "APS5_COMPUTE_QUEUE=1 is not set", level);
+    // APS5_IMAGE_EDGES needs APS5_ASYNC_COMPUTE=1 (the recorder prints the line when it is on).
+    if (Graphics::ImageEdgesAsked() && (Graphics::AsyncComputeLevel() == 0 || queueInfo.queueCount != 2)) std::fprintf(stderr, "[recorder] image edges: off, APS5_ASYNC_COMPUTE=1 is not on (APS5_IMAGE_EDGES=1)\n");
     if (checkpoints) Graphics::InstallCheckpoints(state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV"), state->DeviceFunction<PFN_vkGetQueueCheckpointDataNV>("vkGetQueueCheckpointDataNV"), state->queue, state->computeQueue);
     else if (Graphics::CheckpointsRequested()) std::fprintf(stderr, "[checkpoints] VK_NV_device_diagnostic_checkpoints unavailable\n");
     APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family);
@@ -3729,13 +3731,15 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     const auto guestOrder = Graphics::Recorder::DispatchOverlap() && argumentImport == nullptr && !resources.HoldsLease() ? Graphics::Recorder::GuestOrder() : Graphics::Recorder::GuestOrderKey{};
     const bool holdsTrail = recorder.HoldDispatchTrail(guestOrder);
     VkAccessFlags covered = 0;
-    const auto commands = keepCopyBacks ? recorder.CommandsKeepingCopyBacks(&covered) : recorder.Commands(&covered, Graphics::Recorder::CommandSite::Dispatch);
+    const auto commands = keepCopyBacks ? recorder.CommandsKeepingCopyBacks(&covered, Graphics::Recorder::CommandSite::Dispatch) : recorder.Commands(&covered, Graphics::Recorder::CommandSite::Dispatch);
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
     recorder.Keep(record.resources);
     recordStep(PhaseRecordKeeps);
     // APS5_TEMPLATE_REFRESH_RING: the set bound in place of the template's (ForkData's copy).
     VkDescriptorSet forkedSet = VK_NULL_HANDLE;
+    // APS5_IMAGE_EDGES: whether RefreshData recorded a write of the template's data buffers.
+    bool dataWritten = false;
     if (record.dataRefresh != RecordedDispatch::DataRefresh::None) {
         // The template's data buffers take this dispatch's words: a transfer write the pre-dispatch
         // barrier makes visible (so it is recorded whatever the previous command covered), ordered
@@ -3778,6 +3782,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             ++d.templateRefreshed;
             d.templateRevalidateMs += record.revalidateMs;
             record.refreshed = true;
+            dataWritten = true;
         } else {
             ++d.templateSameWords;
         }
@@ -3799,6 +3804,10 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         const auto images = resources.StorageImages();
         recorder.NoteAccess(CommandClass::DispatchLeading, Graphics::Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, resources.HoldsLease()});
     }
+    // APS5_IMAGE_EDGES: the object's data buffers (a template's are shared by its uses on either
+    // lane), by its address: every use reads them (a fork keeps the bindings whose words are
+    // equal), a recorded refresh writes them.
+    if (recorder.ImageEdges()) recorder.NoteImageEdge(reinterpret_cast<std::uint64_t>(&resources), dataWritten, Graphics::Recorder::ImageNote::Template);
     if (argumentImport != nullptr) {
         // The group counts were stored by earlier recorded work (a dispatch in place, a fill) or the
         // host; the indirect read follows all of it.

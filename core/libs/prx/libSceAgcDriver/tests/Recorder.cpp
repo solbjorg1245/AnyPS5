@@ -1124,7 +1124,7 @@ void storeRunTests(const Device& device, Recorder& recorder) {
     const std::pair<std::uint64_t, std::uint64_t> range{address, address + 64};
     recorder.NoteAccess(Recorder::CommandClass::Fill, Recorder::Access{{}, std::span(&range, 1), {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     recorder.NoteAccess(Recorder::CommandClass::DispatchLeading, Recorder::Access{std::span(&range, 1), {}, {}, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT});
-    Require(recorder.Recording() == Recorder::BarrierValidate(), "a noted access opened a batch with the tracker off (or none with it on)");
+    Require(recorder.Recording() == Recorder::HazardCounting(), "a noted access opened a batch with the tracker off (or none with it on)");
     recorder.Sync();
     {
         GuestAllocations::Mutation mutation;

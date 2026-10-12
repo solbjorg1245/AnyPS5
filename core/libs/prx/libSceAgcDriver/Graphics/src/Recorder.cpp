@@ -222,6 +222,23 @@ struct AsyncComputeCounts {
     std::uint64_t coarseOnly = 0;
     std::array<std::uint64_t, LaneEdges::SourceCount> sources{};
 } asyncComputeCounts;
+// APS5_IMAGE_EDGES, per 10 s beside it (under the GpuMutex; cleared when printed): chain waits the
+// fine edges need too, fine waits where the chain made none, the fine waits by source
+// (LaneEdges::FineSource order; a wait counts once per source that asked) and those only the
+// producer asked for; the images noted by noter (Recorder::ImageNote) and kind (read, written);
+// continued draws, and those of the fast path (whose sampled images are noted).
+struct ImageEdgeCounts {
+    std::uint64_t needed = 0;
+    std::uint64_t edgeOnly = 0;
+    std::uint64_t producerOnly = 0;
+    std::array<std::uint64_t, LaneEdges::FineSourceCount> sources{};
+    std::array<std::array<std::uint64_t, 2>, static_cast<std::size_t>(Recorder::ImageNote::Count)> notes{};
+    std::uint64_t continued = 0;
+    std::uint64_t fastContinued = 0;
+} imageEdgeCounts;
+// APS5_IMAGE_EDGES: the images the thread's next draw or dispatch accesses beyond its access note
+// (Recorder::PendImageEdge), as (image, written).
+thread_local std::vector<std::pair<std::uint64_t, bool>> pendingImageEdges;
 // Blocks lane switches while it lives (Recorder::switchLane): its holder keeps a reference into the
 // open batch or is submitting it.
 struct LaneSwitchBlock {
@@ -1405,16 +1422,24 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
         if (context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore")(context.device, &info, nullptr, &computeTimeline) != VK_SUCCESS) {
             computeTimeline = VK_NULL_HANDLE;
             std::fprintf(stderr, "[recorder] async compute: off, no second timeline semaphore (APS5_ASYNC_COMPUTE=%d)\n", context.asyncCompute);
+            if (ImageEdgesAsked()) std::fprintf(stderr, "[recorder] image edges: off, APS5_ASYNC_COMPUTE=1 is not on (APS5_IMAGE_EDGES=1)\n");
             return;
         }
         twoTimelines = true;
         counterValue = context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR");
         std::fprintf(stderr, "[recorder] async compute: each lane signals a timeline of its own; the edges a batch would need without the serial chain are counted, the chain still orders every batch (APS5_ASYNC_COMPUTE=%d%s)\n", context.asyncCompute, context.asyncCompute == 2 ? "; 2, edges in place of the chain, is not built yet and runs as 1" : "");
+        // APS5_IMAGE_EDGES: the images the commands report, counted per image beside the coarse rule.
+        if (ImageEdgesAsked()) {
+            imageEdges = true;
+            edges.EnableImages();
+            std::fprintf(stderr, "[recorder] image edges: the waits a batch would need per image (the images each command reports as read or written) are counted beside S4a's coarse rule; nothing waits for them (APS5_IMAGE_EDGES=1)\n");
+        }
         return;
     }
     oneShotTimeline = VK_NULL_HANDLE;
     std::fprintf(stderr, "[recorder] compute queue: off, no timeline semaphore; every batch goes to the first queue (APS5_COMPUTE_QUEUE=1)\n");
     if (context.asyncCompute != 0) std::fprintf(stderr, "[recorder] async compute: off, no timeline semaphore (APS5_ASYNC_COMPUTE=%d)\n", context.asyncCompute);
+    if (context.asyncCompute != 0 && ImageEdgesAsked()) std::fprintf(stderr, "[recorder] image edges: off, APS5_ASYNC_COMPUTE=1 is not on (APS5_IMAGE_EDGES=1)\n");
 }
 
 Recorder::~Recorder() {
@@ -1754,9 +1779,9 @@ VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess, CommandSite sit
     return commandsFor(coveredAccess, false);
 }
 
-VkCommandBuffer Recorder::CommandsKeepingCopyBacks(VkAccessFlags* coveredAccess) {
+VkCommandBuffer Recorder::CommandsKeepingCopyBacks(VkAccessFlags* coveredAccess, CommandSite site) {
     commandSite = static_cast<std::uint8_t>(CommandSite::Other);
-    return commandsFor(coveredAccess, coalesceCopyBacks);
+    return commandsFor(coveredAccess, coalesceCopyBacks, site == CommandSite::Dispatch);
 }
 
 VkCommandBuffer Recorder::commandsTouching(const std::function<bool(std::uint64_t, std::uint64_t)>* touches, CommandSite site, VkAccessFlags* coveredAccess) {
@@ -1784,7 +1809,7 @@ VkCommandBuffer Recorder::commandsTouching(const std::function<bool(std::uint64_
     return commandsFor(coveredAccess, true);
 }
 
-VkCommandBuffer Recorder::commandsFor(VkAccessFlags* coveredAccess, bool keepCopyBacks) {
+VkCommandBuffer Recorder::commandsFor(VkAccessFlags* coveredAccess, bool keepCopyBacks, bool dispatch) {
     ensureOpen();
     // APS5_ASYNC_COMPUTE: work the noted ranges may miss, by site (LaneEdges): draws, dispatches
     // and depth work touch images; the other sites may write memory no range notes.
@@ -1792,6 +1817,13 @@ VkCommandBuffer Recorder::commandsFor(VkAccessFlags* coveredAccess, bool keepCop
         const auto site = static_cast<CommandSite>(commandSite);
         const bool image = site == CommandSite::Draw || site == CommandSite::DrawOther || site == CommandSite::Dispatch || site == CommandSite::Depth;
         (image ? open->edgeImage : open->edgeProducer) = true;
+        // APS5_IMAGE_EDGES: those sites (and a dispatch that kept the queued copy-backs, site Other
+        // here) report their images; a draw or dispatch takes its thread's pending ones.
+        if (imageEdges) {
+            if (!image && !dispatch) open->edgeFineProducer = true;
+            continuedDraw = false;
+            if ((image && site != CommandSite::Depth) || dispatch) notePendingImages();
+        }
     }
     // APS5_LANE_CENSUS: the pass this call ends and the copies it flushes, when the last recorded
     // item was the other lane's.
@@ -2368,7 +2400,7 @@ void Recorder::recordDeferredCopies(std::vector<DeferredCopy> copies, FlushReaso
     copyBackFlushes[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     if (reason == FlushReason::Command) commandPasses[commandSite].fetch_add(1, std::memory_order_relaxed);
     copyBacksRecorded.fetch_add(copies.size(), std::memory_order_relaxed);
-    if (twoTimelines) open->edgeProducer = true;
+    if (twoTimelines) open->edgeProducer = open->edgeFineProducer = true;
     if (open->renderPass.open) endOpenRenderPass();
     if (open->trail.pending) recordDispatchTrail(TrailReason::Other);
     copyBackBytesRecorded.fetch_add(recordCopyPass(open->commands, std::move(copies)), std::memory_order_relaxed);
@@ -2724,6 +2756,13 @@ bool Recorder::ContinuesRenderPass(std::uint64_t key) const {
 
 VkCommandBuffer Recorder::CommandsInRenderPass() {
     Require(open != nullptr && open->renderPass.open, "no render pass is open in the recorder");
+    // APS5_IMAGE_EDGES: a continued draw takes its pending images (its pass's depth attachment, the
+    // depth it samples) as the pass's first draw did.
+    if (imageEdges) {
+        ++imageEdgeCounts.continued;
+        continuedDraw = true;
+        notePendingImages();
+    }
     return open->commands;
 }
 
@@ -3035,7 +3074,7 @@ bool Recorder::closeStoreRun(bool atSubmit) {
         if (open->trail.pending) recordDispatchTrail(TrailReason::Other);
         const auto commands = open->commands;
         run.timing = beginTiming(ClassKey(CommandClass::LabelRun), TimingKind::Class);
-        if (BarrierValidate()) {
+        if (HazardCounting()) {
             std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
             for (const auto& store : stores) ranges.emplace_back(store.address, store.address + store.bytes.size());
             NoteAccess(CommandClass::LabelRun, Access{{}, ranges, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
@@ -3163,7 +3202,7 @@ void reportBarriers() {
         std::fprintf(stderr, "; dispatch overlap: %llu trails deferred, %llu elided, recorded late by command %llu, refresh %llu, submit %llu, other %llu", static_cast<unsigned long long>(trails.deferred - last.deferred), static_cast<unsigned long long>(trails.elided - last.elided), static_cast<unsigned long long>(trails.command - last.command), static_cast<unsigned long long>(trails.refresh - last.refresh), static_cast<unsigned long long>(trails.submit - last.submit), static_cast<unsigned long long>(trails.other - last.other));
         last = trails;
     }
-    if (Recorder::BarrierValidate()) {
+    if (Recorder::HazardCounting()) {
         std::uint64_t emitted = 0, skipped = 0;
         std::string classes, kinds;
         for (std::size_t i = 0; i < CommandClasses; ++i) {
@@ -3290,13 +3329,54 @@ void Recorder::CountMerged(CommandClass which) {
     classMerged[static_cast<std::size_t>(which)].fetch_add(1, std::memory_order_relaxed);
 }
 
-bool Recorder::BarrierValidate() {
+bool Recorder::HazardCounting() {
     static const bool validate = std::getenv("APS5_BARRIER_VALIDATE") != nullptr;
     return validate;
 }
 
+bool Recorder::BarrierValidate() {
+    // The image edges need the two timelines too (NoteAccess hands them nothing without).
+    static const bool report = HazardCounting() || (ImageEdgesAsked() && AsyncComputeLevel() != 0 && ComputeQueueAsked());
+    return report;
+}
+
+void Recorder::NoteImageEdge(std::uint64_t image, bool written, ImageNote note) {
+    if (!imageEdges || open == nullptr || image == 0) return;
+    edges.ImageAccess(open->lane, submissions + 1, image, written);
+    ++imageEdgeCounts.notes[static_cast<std::size_t>(note)][written ? 1 : 0];
+}
+
+void Recorder::pendImageEdge(std::uint64_t image, bool written) {
+    const auto* recorder = Active();
+    if (recorder == nullptr || !recorder->imageEdges || image == 0) return;
+    for (auto& [pending, write] : pendingImageEdges) {
+        if (pending != image) continue;
+        write = write || written;
+        return;
+    }
+    pendingImageEdges.emplace_back(image, written);
+}
+
+void Recorder::notePendingImages() {
+    if (pendingImageEdges.empty()) return;
+    for (const auto& [image, written] : pendingImageEdges) NoteImageEdge(image, written, ImageNote::Depth);
+    pendingImageEdges.clear();
+}
+
+bool Recorder::NotesContinuedDraw() {
+    if (!imageEdges || !continuedDraw) return false;
+    ++imageEdgeCounts.fastContinued;
+    return true;
+}
+
 void Recorder::NoteAccess(CommandClass which, const Access& access) {
     if (!BarrierValidate()) return;
+    // APS5_IMAGE_EDGES: the images, for the open batch (the command took its buffer from it; the
+    // image edges alone never open one).
+    if (imageEdges) {
+        for (const auto& [image, written] : access.images) NoteImageEdge(ImageKey(image), written);
+    }
+    if (!HazardCounting()) return;
     ensureOpen();
     auto& tracker = open->tracker;
     const auto overlapsAny = [](const auto& ranges, const std::pair<std::uint64_t, std::uint64_t>& range) {
@@ -4595,7 +4675,7 @@ void Recorder::Submit() {
     if (open->trail.pending) recordDispatchTrail(TrailReason::Submit);
     if (open->samples != VK_NULL_HANDLE) context.Function<PFN_vkCmdEndQuery>("vkCmdEndQuery")(open->commands, open->samples, 0);
     const bool hostReadCovered = (open->run.open || !open->run.queued.empty()) && closeStoreRun(true);
-    if (BarrierValidate()) validateBatchEnds.fetch_add(1, std::memory_order_relaxed);
+    if (HazardCounting()) validateBatchEnds.fetch_add(1, std::memory_order_relaxed);
     if (open->hostReadOwed && !hostReadCovered) {
         // A fence makes nothing visible to the host: a lean draw's writes (no download barrier of
         // its own) get the batch's one here.
@@ -4757,7 +4837,8 @@ void Recorder::noteEdges(const Batch& batch, std::uint64_t serial, bool chained)
     const auto self = LaneIndex(batch.lane);
     edges.Need(batch.lane, labelNeeds[self].exchange(0, std::memory_order_relaxed), LaneEdges::Source::Label);
     if (shadowTakes[self].exchange(false, std::memory_order_relaxed)) edges.NeedNewest(batch.lane, LaneEdges::Source::Shadow);
-    const auto wait = edges.Submit(batch.lane, serial, batch.edgeProducer, batch.edgeImage);
+    LaneEdges::Wait fine;
+    const auto wait = edges.Submit(batch.lane, serial, batch.edgeProducer, batch.edgeImage, batch.edgeFineProducer, &fine);
     auto& counts = asyncComputeCounts;
     if (chained) ++(wait.serial != 0 ? counts.edgeNeeded : counts.droppable);
     else if (wait.serial != 0) ++counts.edgeOnly;
@@ -4765,6 +4846,14 @@ void Recorder::noteEdges(const Batch& batch, std::uint64_t serial, bool chained)
     if (wait.sources != 0 && (wait.sources & ~coarse) == 0) ++counts.coarseOnly;
     for (std::size_t source = 0; source < LaneEdges::SourceCount; ++source) {
         if ((wait.sources & (1u << source)) != 0) ++counts.sources[source];
+    }
+    if (!imageEdges) return;
+    // APS5_IMAGE_EDGES: the same batch as the images would wait.
+    auto& fineCounts = imageEdgeCounts;
+    if (fine.serial != 0) ++(chained ? fineCounts.needed : fineCounts.edgeOnly);
+    if (fine.sources == 1u << static_cast<unsigned>(LaneEdges::FineSource::Producer)) ++fineCounts.producerOnly;
+    for (std::size_t source = 0; source < LaneEdges::FineSourceCount; ++source) {
+        if ((fine.sources & (1u << source)) != 0) ++fineCounts.sources[source];
     }
 }
 
@@ -5235,6 +5324,20 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                             auto& edgeCounts = asyncComputeCounts;
                             const auto& by = edgeCounts.sources;
                             std::fprintf(stderr, "[recorder] async compute (10 s, APS5_ASYNC_COMPUTE=%d): batches C %llu / G %llu, chain waits %llu, of which edge-needed %llu, droppable %llu; edge waits where the chain made none %llu; edge waits by source (a wait counts once per source that asked): label %llu, RAW %llu, WAW %llu, WAR %llu, producer %llu, image %llu, shadow %llu; %llu asked for by producer or image alone; registry %zu blocks\n", recorder.context.asyncCompute, static_cast<unsigned long long>(counts.batches[0]), static_cast<unsigned long long>(counts.batches[1]), static_cast<unsigned long long>(counts.chainWaits), static_cast<unsigned long long>(edgeCounts.edgeNeeded), static_cast<unsigned long long>(edgeCounts.droppable), static_cast<unsigned long long>(edgeCounts.edgeOnly), static_cast<unsigned long long>(by[0]), static_cast<unsigned long long>(by[1]), static_cast<unsigned long long>(by[2]), static_cast<unsigned long long>(by[3]), static_cast<unsigned long long>(by[4]), static_cast<unsigned long long>(by[5]), static_cast<unsigned long long>(by[6]), static_cast<unsigned long long>(edgeCounts.coarseOnly), recorder.edges.Blocks());
+                            if (recorder.imageEdges) {
+                                // APS5_IMAGE_EDGES: the same batches as the images would wait.
+                                auto& image = imageEdgeCounts;
+                                const auto& fine = image.sources;
+                                const auto& notes = image.notes;
+                                const auto kind = [&](std::size_t written) {
+                                    std::uint64_t total = 0;
+                                    for (const auto& note : notes) total += note[written];
+                                    return static_cast<unsigned long long>(total);
+                                };
+                                const auto note = [&](Recorder::ImageNote noter, std::size_t written) { return static_cast<unsigned long long>(notes[static_cast<std::size_t>(noter)][written]); };
+                                std::fprintf(stderr, "[recorder] image edges (10 s, APS5_IMAGE_EDGES=1): chain waits %llu; needed with image edges %llu (S4a coarse %llu), droppable %llu; fine waits by source: label %llu, RAW %llu, WAW %llu, WAR %llu, producer %llu, shadow %llu, image RAW %llu, image WAW %llu, image WAR %llu; asked for by producer alone %llu; images noted %llu (reads %llu, writes %llu, of which fast-draw reads %llu, depth writes %llu); image table %zu entries; fine waits where the chain made none %llu; depth reads %llu, template notes %llu; continued draws %llu (fast path %llu)\n", static_cast<unsigned long long>(counts.chainWaits), static_cast<unsigned long long>(image.needed), static_cast<unsigned long long>(edgeCounts.edgeNeeded), static_cast<unsigned long long>(counts.chainWaits - image.needed), static_cast<unsigned long long>(fine[0]), static_cast<unsigned long long>(fine[1]), static_cast<unsigned long long>(fine[2]), static_cast<unsigned long long>(fine[3]), static_cast<unsigned long long>(fine[4]), static_cast<unsigned long long>(fine[5]), static_cast<unsigned long long>(fine[6]), static_cast<unsigned long long>(fine[7]), static_cast<unsigned long long>(fine[8]), static_cast<unsigned long long>(image.producerOnly), kind(0) + kind(1), kind(0), kind(1), note(Recorder::ImageNote::FastDraw, 0), note(Recorder::ImageNote::Depth, 1), recorder.edges.Images(), static_cast<unsigned long long>(image.edgeOnly), note(Recorder::ImageNote::Depth, 0), note(Recorder::ImageNote::Template, 0) + note(Recorder::ImageNote::Template, 1), static_cast<unsigned long long>(image.continued), static_cast<unsigned long long>(image.fastContinued));
+                                image = {};
+                            }
                             edgeCounts = {};
                         }
                         counts = {};

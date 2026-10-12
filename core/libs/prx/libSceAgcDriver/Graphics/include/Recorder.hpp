@@ -352,8 +352,10 @@ public:
     };
     static ResidentStatistics ResidentCounts();
     // Commands() that leaves the queued copy-backs alone under coalescing (the caller recorded
-    // those its command touches); Commands() otherwise.
-    VkCommandBuffer CommandsKeepingCopyBacks(VkAccessFlags* coveredAccess = nullptr);
+    // those its command touches); Commands() otherwise. The census counts the call under site
+    // Other; `site` Dispatch tells the image edges (APS5_IMAGE_EDGES) a dispatch, which reports its
+    // images, from the producing sites.
+    VkCommandBuffer CommandsKeepingCopyBacks(VkAccessFlags* coveredAccess = nullptr, CommandSite site = CommandSite::Other);
     bool HasDeferredCopies() const { return !deferredCopies.empty() || !claimedCopies.empty(); }
     // Why queued copy-backs were recorded (the [barriers] digest under deferral).
     enum class FlushReason : std::uint8_t { Submit = 0, StoreRun, Command, Dispatch, DispatchLease, CopyIn, Count };
@@ -936,6 +938,26 @@ public:
     };
     static bool BarrierValidate();
     void NoteAccess(CommandClass which, const Access& access);
+    // BarrierValidate(): the commands report their accesses (NoteAccess) for the hazard tracker
+    // (HazardCounting: APS5_BARRIER_VALIDATE) or for the image edges (APS5_IMAGE_EDGES=1 with
+    // APS5_ASYNC_COMPUTE=1 and APS5_COMPUTE_QUEUE=1: LaneEdges.hpp), which take the images only.
+    static bool HazardCounting();
+    // APS5_IMAGE_EDGES (with the two timelines): an image the open batch's last command reads or
+    // writes that its access note leaves out (`image`: a VkImage's ImageKey, or a dispatch
+    // template's address for its data buffers); the digest line counts the notes by noter.
+    enum class ImageNote : std::uint8_t { Command = 0, FastDraw, Depth, Template, Count };
+    static std::uint64_t ImageKey(VkImage image) { return reinterpret_cast<std::uint64_t>(image); }
+    bool ImageEdges() const { return imageEdges; }
+    void NoteImageEdge(std::uint64_t image, bool written, ImageNote note = ImageNote::Command);
+    // An image the calling thread's next draw or dispatch reads or writes that no access note names
+    // (a depth surface attached or sampled: DepthSurface.cpp): noted when that command takes its
+    // command buffer (Commands at a draw or dispatch site, CommandsInRenderPass), in its batch.
+    static void PendImageEdge(std::uint64_t image, bool written) {
+        if (ImageEdgesAsked()) pendImageEdge(image, written);
+    }
+    // Whether the command buffer last handed out continued a draw's render pass: a fast draw notes
+    // its sampled images then (Draw.cpp notes the images of a pass's first draw only). Counted.
+    bool NotesContinuedDraw();
     // A range timed outside the recorder's batches (the presenter's blit, stamped into its own
     // pool and read after its fence): enters the class totals like a recorded one.
     static void AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_t bytes);
@@ -1038,6 +1060,8 @@ private:
         // or drew or dispatched (`edgeImage`): the other lane's next batch needs it (LaneEdges).
         bool edgeProducer = false;
         bool edgeImage = false;
+        // APS5_IMAGE_EDGES: a producer by the fine rule (a dispatch is none: it reports its images).
+        bool edgeFineProducer = false;
         std::chrono::steady_clock::time_point submittedAt{};
         VkQueryPool queries = VK_NULL_HANDLE;
         VkQueryPool samples = VK_NULL_HANDLE;
@@ -1235,8 +1259,9 @@ private:
     std::uint32_t narrowStoredSeen = 0;
     std::uint32_t narrowStaleSeen = 0;
     bool narrowStaleDescribed = false;
-    // Commands() with the queued copy-backs recorded first unless `keepCopyBacks`.
-    VkCommandBuffer commandsFor(VkAccessFlags* coveredAccess, bool keepCopyBacks);
+    // Commands() with the queued copy-backs recorded first unless `keepCopyBacks` (`dispatch`: a
+    // dispatch that kept them, for the image edges).
+    VkCommandBuffer commandsFor(VkAccessFlags* coveredAccess, bool keepCopyBacks, bool dispatch = false);
     bool coalesceCopyBacks = false;
     // Aware commands (AwareCommands), and the CommandSite of the Commands() call in progress (the
     // census counts the pass it records under it).
@@ -1340,6 +1365,13 @@ private:
     VkSemaphore laneTimeline(Lane lane) const { return twoTimelines && lane == Lane::C ? computeTimeline : timeline; }
     // Submit's edge count for `batch` (to be serial `serial`; `chained`: the chain makes it wait).
     void noteEdges(const Batch& batch, std::uint64_t serial, bool chained);
+    // APS5_IMAGE_EDGES (set by the constructor with the two timelines): the images noted go into
+    // `edges`; whether the last command buffer handed out continued a render pass; the calling
+    // thread's pending images (PendImageEdge), noted for the open batch.
+    bool imageEdges = false;
+    bool continuedDraw = false;
+    static void pendImageEdge(std::uint64_t image, bool written);
+    void notePendingImages();
     int laneSwitchBlocked = 0;
     std::vector<std::shared_ptr<void>> handedOver;
     std::size_t handedOverBytes = 0;

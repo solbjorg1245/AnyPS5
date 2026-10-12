@@ -64,6 +64,8 @@ struct Scratch {
     std::vector<StorageImageElement> storage;
     // (byte, adjustment) patches of the shader data words.
     std::vector<std::pair<std::uint32_t, std::uint32_t>> dataPatches;
+    // APS5_IMAGE_EDGES: (image, written) for the access note, as ShaderResources::StorageImages.
+    std::vector<std::pair<VkImage, bool>> accessed;
 };
 struct ScratchTag {};
 
@@ -218,6 +220,9 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
     scratch.keep.clear();
     scratch.dirty.clear();
     scratch.dataPatches.clear();
+    scratch.accessed.clear();
+    // The image edges take the accessed images (the hazard tracker keeps the old path: debugMode).
+    const bool noteImages = recorder.ImageEdges();
     // The images and samplers resolved are the batch's once recorded (moved out below); on every
     // other return they go now, not at this thread's next fast dispatch (VRAM held by an idle
     // thread, objects outliving their device).
@@ -290,6 +295,7 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
                     bool firstLayer = false;
                     auto texture = ResolveSampledImage(context, binding, element, firstLayer, &nullBound);
                     scratch.images.push_back({VK_NULL_HANDLE, firstLayer ? texture->FirstLayerView() : texture->View(), texture->Layout()});
+                    if (noteImages && texture->StorageSource() != nullptr) scratch.accessed.emplace_back(texture->StorageSource()->Image(), false);
                     scratch.keep.push_back(std::move(texture));
                 }
             } else if (binding.role == Role::GuestImages && binding.kind == Kind::StorageImage) {
@@ -302,6 +308,7 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
                     auto& resolved = scratch.storage.back();
                     scratch.images.push_back({VK_NULL_HANDLE, resolved.firstLayer ? resolved.image->FirstLayerView(resolved.mip) : resolved.image->View(resolved.mip), VK_IMAGE_LAYOUT_GENERAL});
                     if (resolved.written) scratch.dirty.push_back(resolved.image.get());
+                    if (noteImages) scratch.accessed.emplace_back(resolved.image->Image(), resolved.written);
                     scratch.keep.push_back(resolved.image);
                 }
             } else if (binding.role == Role::GuestSamplers) {
@@ -466,13 +473,15 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
     const auto guestOrder = Recorder::DispatchOverlap() && !indirect ? Recorder::GuestOrder() : Recorder::GuestOrderKey{};
     const bool holdsTrail = recorder.HoldDispatchTrail(guestOrder);
     VkAccessFlags covered = 0;
-    const auto commands = keepCopyBacks ? recorder.CommandsKeepingCopyBacks(&covered) : recorder.Commands(&covered, Recorder::CommandSite::Dispatch);
+    const auto commands = keepCopyBacks ? recorder.CommandsKeepingCopyBacks(&covered, Recorder::CommandSite::Dispatch) : recorder.Commands(&covered, Recorder::CommandSite::Dispatch);
     // The ring regions belong to the open batch (nothing above submits).
     if (!scratch.data.empty() && recorder.Submissions() + 1 != serial) return Decline::Ring;
     timing.recorded = true;
     if (holdsTrail) recorder.ElideDispatchTrail();
     for (auto& object : scratch.keep) recorder.Keep(std::move(object));
     using CommandClass = Recorder::CommandClass;
+    // APS5_IMAGE_EDGES: the accesses, as VulkanDevice::recordDispatch notes them.
+    if (noteImages) recorder.NoteAccess(CommandClass::DispatchLeading, Recorder::Access{scratch.reads, scratch.written, scratch.accessed, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT});
     if (indirect) {
         const auto argumentTiming = recorder.BeginGpuTiming(CommandClass::IndirectArguments);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);

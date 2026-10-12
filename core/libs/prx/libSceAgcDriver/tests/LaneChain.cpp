@@ -7,8 +7,8 @@
 #include <string>
 
 // The compute queue's chain (APS5_COMPUTE_QUEUE, docs/design/fewer-submits.md S3), and S4's timeline
-// per lane and edges (APS5_ASYNC_COMPUTE), on synthetic submissions: no device, no recorder. Run
-// from tests/Submit.cpp's main.
+// per lane and edges (APS5_ASYNC_COMPUTE, and per image: APS5_IMAGE_EDGES), on synthetic
+// submissions: no device, no recorder. Run from tests/Submit.cpp's main.
 
 namespace {
 
@@ -191,6 +191,126 @@ void testEdges() {
     }
 }
 
+// What Recorder::noteEdges does with the image edges on: S4a's wait, and the fine one beside it.
+LaneEdges::Wait submitFine(LaneEdges& edges, Lane lane, std::uint64_t serial, LaneEdges::Wait& fine, bool producer = false, bool image = true, bool fineProducer = false) {
+    fine = {};
+    return edges.Submit(lane, serial, producer, image, fineProducer, &fine);
+}
+
+// S4c: the fine wait (LaneEdges::EnableImages): S4a's needs without the image site rule, the fine
+// producers, and the images the batches read and write.
+void testImageEdges() {
+    using Source = LaneEdges::Source;
+    using Fine = LaneEdges::FineSource;
+    const auto bit = [](Fine source) { return 1u << static_cast<unsigned>(source); };
+    LaneEdges::Wait fine;
+    {
+        // Image RAW across lanes: a compute batch writes image A, lane G's next batch samples it.
+        LaneEdges edges;
+        edges.EnableImages();
+        edges.ImageAccess(Lane::C, 1, 0xA0, true);
+        submitFine(edges, Lane::C, 1, fine);
+        check(fine.serial == 0, "image edges: the first batch waits for nothing");
+        edges.ImageAccess(Lane::G, 2, 0xA0, false);
+        const auto wait = submitFine(edges, Lane::G, 2, fine);
+        check(wait.serial == 1 && fine.serial == 1 && fine.sources == bit(Fine::ImageRaw), "image edges: a read of the other lane's image write waits for it (image RAW)");
+        edges.ImageAccess(Lane::G, 3, 0xA0, false);
+        submitFine(edges, Lane::G, 3, fine);
+        check(fine.serial == 0, "image edges: a lane's later batch is covered by its earlier fine wait");
+    }
+    {
+        // Disjoint images: the coarse rule waits, the fine one does not.
+        LaneEdges edges;
+        edges.EnableImages();
+        edges.ImageAccess(Lane::C, 1, 0xA0, true);
+        submitFine(edges, Lane::C, 1, fine);
+        edges.ImageAccess(Lane::G, 2, 0xB0, false);
+        edges.ImageAccess(Lane::G, 2, 0xC0, true);
+        const auto wait = submitFine(edges, Lane::G, 2, fine);
+        check(wait.serial == 1 && wait.sources == 1u << static_cast<unsigned>(Source::Image), "image edges: S4a's image site rule still waits for the other lane's image batch");
+        check(fine.serial == 0, "image edges: disjoint images need no fine wait (the chain's wait is droppable)");
+    }
+    {
+        // WAR: lane C samples A, lane G then writes it; then WAW back on lane C.
+        LaneEdges edges;
+        edges.EnableImages();
+        edges.ImageAccess(Lane::C, 1, 0xA0, false);
+        submitFine(edges, Lane::C, 1, fine);
+        edges.ImageAccess(Lane::G, 2, 0xA0, true);
+        submitFine(edges, Lane::G, 2, fine);
+        check(fine.serial == 1 && fine.sources == bit(Fine::ImageWar), "image edges: a write over the other lane's read waits for the reader (image WAR)");
+        edges.ImageAccess(Lane::C, 3, 0xA0, true);
+        submitFine(edges, Lane::C, 3, fine);
+        check(fine.serial == 2 && fine.sources == bit(Fine::ImageWaw), "image edges: a write over the other lane's write waits for it (image WAW)");
+    }
+    {
+        // A retired writer is dropped; fine producers, and a dispatch that kept the copy-backs.
+        LaneEdges edges;
+        edges.EnableImages();
+        edges.ImageAccess(Lane::G, 1, 0xA0, true);
+        submitFine(edges, Lane::G, 1, fine, true, false, true);
+        edges.Retired(1);
+        edges.ImageAccess(Lane::C, 2, 0xA0, false);
+        auto wait = submitFine(edges, Lane::C, 2, fine);
+        check(wait.serial == 0 && fine.serial == 0, "image edges: a need on a retired batch is dropped (coarse and fine)");
+        submitFine(edges, Lane::G, 3, fine, true, false, true);
+        wait = submitFine(edges, Lane::C, 4, fine, false, false);
+        check(wait.serial == 3 && fine.serial == 3 && fine.sources == bit(Fine::Producer), "image edges: the other lane's next batch waits for a fine producer");
+        submitFine(edges, Lane::G, 5, fine, true, false, false);
+        wait = submitFine(edges, Lane::C, 6, fine, false, false);
+        check(wait.serial == 5 && wait.sources == 1u << static_cast<unsigned>(Source::Producer) && fine.serial == 0, "image edges: a dispatch that kept the copy-backs is a producer to S4a only");
+    }
+    {
+        // Label, RAW and shadow needs reach the fine wait as they reach S4a's.
+        LaneEdges edges;
+        edges.EnableImages();
+        edges.Access(Lane::G, 1, 0x10000, 0x10100, true);
+        submitFine(edges, Lane::G, 1, fine, false, false);
+        edges.Access(Lane::C, 2, 0x10000, 0x10004, false);
+        submitFine(edges, Lane::C, 2, fine, false, false);
+        check(fine.serial == 1 && fine.sources == bit(Fine::Raw), "image edges: a range RAW asks for the fine wait too");
+        edges.Need(Lane::G, 2, Source::Label);
+        submitFine(edges, Lane::G, 3, fine, false, false);
+        check(fine.serial == 2 && fine.sources == bit(Fine::Label), "image edges: a label taken asks for the fine wait too");
+        edges.NeedNewest(Lane::C, Source::Shadow);
+        submitFine(edges, Lane::C, 4, fine, false, false);
+        check(fine.serial == 3 && fine.sources == bit(Fine::Shadow), "image edges: a cross-lane shadow take asks for the fine wait too");
+    }
+    {
+        // S4a's waits are the same with the image edges on, whatever images the batches touch.
+        LaneEdges plain;
+        LaneEdges images;
+        images.EnableImages();
+        const std::array<Lane, 6> lanes{Lane::G, Lane::C, Lane::C, Lane::G, Lane::C, Lane::G};
+        for (std::uint64_t serial = 1; serial <= lanes.size(); ++serial) {
+            const auto lane = lanes[serial - 1];
+            for (auto* edges : {&plain, &images}) edges->Access(lane, serial, serial << 16, (serial << 16) + 0x100, serial % 2 == 0);
+            images.ImageAccess(lane, serial, 0xA0 + serial % 3, serial % 2 == 1);
+            const bool producer = serial == 4;
+            const bool image = serial != 4;
+            const auto expected = plain.Submit(lane, serial, producer, image);
+            const auto wait = submitFine(images, lane, serial, fine, producer, image, producer);
+            check(wait.serial == expected.serial && wait.sources == expected.sources, "image edges: S4a's coarse wait is unchanged by the image accesses");
+        }
+        check(plain.Images() == 0 && images.Images() == 3, "image edges: only an object with the image edges on keeps the image table");
+    }
+    {
+        // The image table is pruned like the blocks: the live entries stay and still give waits.
+        LaneEdges edges;
+        edges.EnableImages();
+        for (std::uint64_t image = 1; image <= 5000; ++image) edges.ImageAccess(Lane::G, 1, image, true);
+        submitFine(edges, Lane::G, 1, fine);
+        edges.ImageAccess(Lane::C, 2, 0x100000, true);
+        submitFine(edges, Lane::C, 2, fine);
+        check(edges.Images() == 5001, "image edges: the image table holds the marks");
+        edges.Retired(1);
+        check(edges.Images() == 1, "image edges: the entries only retired batches marked are pruned, the live one stays");
+        edges.ImageAccess(Lane::G, 3, 0x100000, false);
+        submitFine(edges, Lane::G, 3, fine);
+        check(fine.serial == 2 && fine.sources == bit(Fine::ImageRaw), "image edges: an entry the prune kept still gives its wait");
+    }
+}
+
 }
 
 void testLaneChain() {
@@ -200,4 +320,5 @@ void testLaneChain() {
     testSwitchCause();
     testHistory();
     testEdges();
+    testImageEdges();
 }
