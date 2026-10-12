@@ -27,6 +27,10 @@ struct Switch {
     const char* value;
 };
 
+// doIndexBufferCulling=false (s61 H2, t746-t755): the title skips its GPU index-buffer cull job
+// (XPR_IndexCullObjectsNormal, gated per frame by FUN_140a186b0): queue-0 dispatches 2,112 -> 420 per present,
+// GPU busy 137 -> 108 ms, presents 50.5 -> 58.8 per 10 s; draws +13% (uncut index ranges), picture identical.
+// The async-compute switches (enableAsyncCompute, r_*/fog_/particle*/GI*) stay the title's: no FPS gain.
 inline constexpr std::array<Switch, 1> Defaults{{
     {"doIndexBufferCulling", "false"}}};
 
