@@ -127,6 +127,34 @@ void Driver::tolerate(const char* kind, TWork&& work) {
     }
 }
 
+// APS5_COMPUTE_END_DEFER: the oldest pending label as this worker's submission end deferred.
+std::optional<std::chrono::steady_clock::time_point>& Driver::deferredEndSince() {
+    static thread_local std::optional<std::chrono::steady_clock::time_point> since;
+    return since;
+}
+
+// Whether that label is still pending: any submit since cleared it, and a label after that is newer.
+bool Driver::deferredEndOpen() {
+    auto& since = deferredEndSince();
+    if (since.has_value() && Graphics::Recorder::PendingLabelSince() != since) since.reset();
+    return since.has_value();
+}
+
+// The idle deferring worker's deadline submit (QueueWorker.cpp): a try, as the idle reap's, retried
+// after the next poll sleep.
+void Driver::sendDeferredEnd(std::uint32_t queue) {
+    auto& since = deferredEndSince();
+    if (!since.has_value() || std::chrono::steady_clock::now() - *since < labelFlushDeadline()) return;
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
+    if (!gpuLock.owns_lock()) return;
+    if (Graphics::Recorder::PendingLabelSince() == since) {
+        if (const auto localDevice = device.Load()) localDevice->SubmitRecorded(false);
+        ++submissionCosts(queue).endDeferredSent;
+    }
+    since.reset();
+}
+
 void Driver::execute(const Submission& submission) {
     if (submission.suspend) {
 
@@ -449,12 +477,25 @@ void Driver::execute(const Submission& submission) {
             ++costs.endSkipped;
             return;
         }
-        ++costs.endSubmits;
+        static const bool endDefer = ComputeEndDefer();
+        const bool deferable = endDefer && !submitAtEnd && submission.queue != 0;
+        if (!deferable) ++costs.endSubmits;
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::End);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         const auto localDevice = device.Load();
 
         recordDeferredLabels(localDevice.get(), submission.queue);
+        if (deferable) {
+            // APS5_COMPUTE_END_DEFER: decided after the labels are recorded, so a queue-0 end that
+            // follows sees them (ComputeEndDefers); counted as skipped on this queue's line.
+            const auto* queued = queue0Queued.load(std::memory_order_acquire);
+            if (ComputeEndDefers(true, submission.queue, queued != nullptr ? queued->load(std::memory_order_acquire) : 0, queue0Running.load(std::memory_order_acquire), submission.rewindTail != nullptr)) {
+                ++costs.endSkipped;
+                deferredEndSince() = Graphics::Recorder::PendingLabelSince();
+                return;
+            }
+            ++costs.endSubmits;
+        }
         if (localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
     }
     if (submission.rewindTail != nullptr) executeRewindTail(submission);

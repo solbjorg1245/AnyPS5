@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastRead.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastDispatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -380,6 +381,19 @@ void testNewDrawKeyTally() {
     check(tally.Top(1).size() == 1, "tally top keeps the count asked for");
     tally.Reset();
     check(tally.keys == 0 && tally.bases.empty() && tally.Top(10).empty(), "tally reset");
+}
+
+// APS5_COMPUTE_END_DEFER (fewer-submits.md S2): only a compute queue's end defers, never with the
+// switch off or a rewind tail, and only while queue 0 has a submission queued or runs one.
+void testComputeEndDefer() {
+    using namespace AgcDriver::DriverDetail;
+    static_assert(ComputeEndDefers(true, 0x20, 1, false, false) && ComputeEndDefers(true, 0x57, 0, true, false));
+    check(ComputeEndDefers(true, 0x38, 3, true, false), "compute end defer: a busy queue 0 did not defer a compute end");
+    check(!ComputeEndDefers(false, 0x38, 3, true, false), "compute end defer: deferred with the switch off");
+    check(!ComputeEndDefers(true, 0x38, 0, false, false), "compute end defer: deferred while queue 0 is idle");
+    check(!ComputeEndDefers(true, 0x38, 1, true, true), "compute end defer: deferred with a rewind tail");
+    check(!ComputeEndDefers(true, 0, 1, true, false), "compute end defer: deferred queue 0's own end");
+    check(!ComputeEndDefers(true, 0x1f, 1, true, false) && !ComputeEndDefers(true, 0x58, 1, true, false), "compute end defer: deferred outside the compute queues");
 }
 
 // The idle queue worker's sleep between completion reaps (QueueWorker.cpp): on Windows a wake
@@ -1305,6 +1319,7 @@ int main() {
         testPipeCensus();
         testRecordPipe();
         testPollWake();
+        testComputeEndDefer();
         testFastDispatchVerify();
         testFastReader();
         testFastReaderLabels();
