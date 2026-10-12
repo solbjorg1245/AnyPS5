@@ -3688,6 +3688,53 @@ void bufferBaseWordsTests() {
     }
 }
 
+// ContentKeyInto (APS5_DRAW_REPEAT's draw key in a thread buffer) appends exactly ContentKey's
+// words behind what the buffer holds, for every combination of data words and rebased read-only
+// bases, so the repeat path's draw key equals the old one word for word.
+void contentKeyIntoTests() {
+    ShaderRecompiler::RecompileResult program;
+    program.variantId = 0x123456789abcull;
+    ShaderRecompiler::DescriptorBinding buffers;
+    buffers.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    buffers.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    buffers.binding = 0;
+    buffers.count = 2;
+    buffers.guestDescriptor = {0x4ee7fc40, 0x00040002, 0x10, 0x16204, 0x5ee7fc40, 0x00040002, 0x20, 0x16204};
+    buffers.bufferWritten = {true, false};
+    ShaderRecompiler::DescriptorBinding flat;
+    flat.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    flat.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+    flat.binding = 1;
+    flat.count = 1;
+    flat.guestDescriptor = {1, 2, 3, 4, 5};
+    ShaderRecompiler::DescriptorBinding images;
+    images.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+    images.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    images.binding = 2;
+    images.count = 1;
+    images.guestDescriptor.assign(8, 0x77u);
+    images.imageWritten.assign(33, false);
+    images.imageWritten[32] = true;
+    program.bindings = {buffers, flat, images};
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Fragment, &program, 0};
+    for (const bool dataWords : {false, true}) {
+        for (const bool rebase : {false, true}) {
+            const auto expected = ShaderResources::ContentKey(shader, dataWords, rebase);
+            std::vector<std::uint32_t> key{7u, 8u};
+            ShaderResources::ContentKeyInto(shader, dataWords, rebase, key);
+            Require(key.size() == expected.size() + 2 && key[0] == 7u && key[1] == 8u && std::equal(expected.begin(), expected.end(), key.begin() + 2), "ContentKeyInto differs from ContentKey");
+            // Twice into one buffer: the second part is the same words again.
+            ShaderResources::ContentKeyInto(shader, dataWords, rebase, key);
+            Require(key.size() == 2 * expected.size() + 2 && std::equal(expected.begin(), expected.end(), key.begin() + 2 + static_cast<std::ptrdiff_t>(expected.size())), "a second ContentKeyInto part differs");
+        }
+    }
+    // The rebased key hides the read-only base (element 1) but keeps the written one (element 0).
+    const auto plain = ShaderResources::ContentKey(shader, true, false);
+    const auto rebased = ShaderResources::ContentKey(shader, true, true);
+    const auto holds = [](const std::vector<std::uint32_t>& key, std::uint32_t word) { return std::find(key.begin(), key.end(), word) != key.end(); };
+    Require(plain != rebased && holds(plain, 0x5ee7fc40u) && holds(rebased, 0x4ee7fc40u) && !holds(rebased, 0x5ee7fc40u), "the rebased key kept the read-only base");
+}
+
 // What a deep copy of a compiled result copies (ResultCopyCost, the dispatch cache's copy
 // counters): the bindings and every non-empty vector's bytes with one allocation each, a
 // vector<bool> at a bit per element rounded up to bytes; the shared SPIR-V counts nowhere.
@@ -7295,6 +7342,7 @@ int main() {
         ignoredWordBitsTests();
         deferredRunsTests();
         bufferBaseWordsTests();
+        contentKeyIntoTests();
         resultCopyCostTests();
         dataRefreshTests(device, recorder);
         minLodTests(device, recorder);

@@ -323,6 +323,8 @@ public:
     // With `rebaseReadOnly` the base address of read-only guest buffer elements stays out (only
     // whether it is null remains): see RebaseEligible.
     static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool rebaseReadOnly = false);
+    // ContentKey appended to `key` (APS5_DRAW_REPEAT: a draw key built in a thread buffer).
+    static void ContentKeyInto(const CompiledShader& shader, bool dataWords, bool rebaseReadOnly, std::vector<std::uint32_t>& key);
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers
     // (vkCmdUpdateBuffer, a transfer write the caller's pre-dispatch barrier makes visible; a
     // buffer already holding the words is left alone). Returns whether anything was recorded. With
