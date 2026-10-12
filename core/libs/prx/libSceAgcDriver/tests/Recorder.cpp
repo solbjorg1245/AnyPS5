@@ -90,9 +90,15 @@ void ReleaseWatched(void* block, std::size_t bytes) {
 
 // A compute-capable device with host imports (VK_EXT_external_memory_host) when the host offers
 // them, as the driver creates its own; the recorder's batches need a real queue and real fences.
+struct SkipTest {
+    std::string reason;
+};
+
 class Device {
 public:
-    Device() {
+    // `twoQueues` (APS5_COMPUTE_QUEUE tests): timeline semaphores enabled and two queues of the compute
+    // family, the second one in context.computeQueue; throws SkipTest when the host has neither.
+    explicit Device(bool twoQueues = false) {
 #ifdef _WIN32
         library = SDL_LoadObject("vulkan-1.dll");
 #else
@@ -133,11 +139,21 @@ public:
             std::uint32_t family = 0;
             while (family < count && (families[family].queueFlags & VK_QUEUE_COMPUTE_BIT) == 0) ++family;
             Require(family < count, "no Vulkan compute queue");
-            const float priority = 1;
+            const float priority[2] = {1, 1};
             VkDeviceQueueCreateInfo queue{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
             queue.queueFamilyIndex = family;
-            queue.queueCount = 1;
-            queue.pQueuePriorities = &priority;
+            queue.queueCount = twoQueues ? 2 : 1;
+            queue.pQueuePriorities = priority;
+            VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timelineFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            if (twoQueues) {
+                if (families[family].queueCount < 2) throw SkipTest{"the compute queue family has one queue"};
+                if (!hasExtension(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME)) throw SkipTest{"no timeline semaphores"};
+                VkPhysicalDeviceFeatures2 supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &timelineFeatures};
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &supported);
+                if (timelineFeatures.timelineSemaphore != VK_TRUE) throw SkipTest{"the timeline semaphore feature is off"};
+                timelineFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+                timelineFeatures.timelineSemaphore = VK_TRUE;
+            }
             VkPhysicalDeviceFeatures enabled{};
             enabled.shaderInt64 = VK_TRUE;
             address.pNext = &bytes;
@@ -162,6 +178,11 @@ public:
                 minLod.pNext = address.pNext;
                 address.pNext = &minLod;
             }
+            if (twoQueues) {
+                extensionsEnabled.push_back(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+                timelineFeatures.pNext = address.pNext;
+                address.pNext = &timelineFeatures;
+            }
             VkDeviceCreateInfo device{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &address};
             device.queueCreateInfoCount = 1;
             device.pQueueCreateInfos = &queue;
@@ -177,6 +198,7 @@ public:
             context.bufferDeviceAddress = true;
             context.formatProperties = function<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties");
             context.Function<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(context.device, family, 0, &context.queue);
+            if (twoQueues) context.Function<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(context.device, family, 1, &context.computeQueue);
             VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
             pool.queueFamilyIndex = family;
             Check(context.Function<PFN_vkCreateCommandPool>("vkCreateCommandPool")(context.device, &pool, nullptr, &context.pool), "vkCreateCommandPool");
@@ -7095,8 +7117,120 @@ void gpuTimingRecorderTests(const Device& device, Recorder& recorder) {
     std::cout << "gpu timing under coalescing checked\n";
 }
 
+// APS5_COMPUTE_QUEUE (phase fewer-submits S3): lane C's batches go to a second queue of the family,
+// lane G's to the first, chained by the recorder's timelines in the one serial order of a single
+// queue. Its own device and recorder (timeline semaphores, two queues), not the main one.
+void computeQueueTests() {
+    std::unique_ptr<Device> device;
+    try {
+        device = std::make_unique<Device>(true);
+    } catch (const SkipTest& skip) {
+        std::cout << "compute queue tests skipped: " << skip.reason << '\n';
+        return;
+    }
+    const auto& context = device->GetContext();
+    std::lock_guard gpu(GpuMutex());
+    Recorder recorder(context, true);
+    Require(recorder.HasTimeline(), "the compute queue recorder has no timeline");
+    const auto tag = AgcDriver::GuestMemory::GpuLockThreadTag();
+    const auto laneC = [] { AgcDriver::GuestMemory::TagGpuLockThread(0x20); };
+    const auto laneG = [] { AgcDriver::GuestMemory::TagGpuLockThread(0x0); };
+    constexpr std::size_t rounds = 200;
+    constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    Buffer deviceLocal(context, 16, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    Buffer host(context, (rounds + 2) * sizeof(std::uint32_t), usage);
+    const auto slot = [&](std::size_t index) {
+        std::uint32_t value = 0;
+        std::memcpy(&value, host.Bytes().data() + index * sizeof(value), sizeof(value));
+        return value;
+    };
+    constexpr VkAccessFlags anyWrite = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT;
+    // Records into `commands`: a fill of the device-local buffer / a copy of it into the host slot.
+    const auto recordFill = [&](VkCommandBuffer commands, std::uint32_t value) {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, anyWrite | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, deviceLocal.Handle(), 0, 16, value);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    };
+    const auto recordCopy = [&](VkCommandBuffer commands, std::size_t index) {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, anyWrite, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, commands, deviceLocal.Handle(), 0, host.Handle(), index * sizeof(std::uint32_t), sizeof(std::uint32_t));
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    };
+    std::memset(host.Bytes().data(), 0, host.Bytes().size());
+
+    // a. Alternating lanes: every lane switch submits, and the copy of round i sees fill i.
+    const auto submissionsBefore = recorder.Submissions();
+    for (std::size_t round = 0; round < rounds; ++round) {
+        laneC();
+        recordFill(recorder.Commands(), static_cast<std::uint32_t>(round + 1000));
+        laneG();
+        recordCopy(recorder.Commands(), round);
+    }
+    recorder.Sync();
+    for (std::size_t round = 0; round < rounds; ++round) Require(slot(round) == round + 1000, "a lane G copy did not see the lane C fill of its round (queues out of order)");
+    Require(recorder.Submissions() >= submissionsBefore + 2 * rounds - 1, "lane switches did not submit one batch per switch");
+    Require(recorder.InFlightBatches() == 0, "batches are in flight after Sync");
+
+    // b. WaitSerial on a compute batch's serial, then its in-order completion.
+    laneC();
+    recordFill(recorder.Commands(), 0x1111u);
+    const auto computeSerial = recorder.Submissions() + 1;
+    laneG();
+    recordCopy(recorder.Commands(), rounds);
+    recorder.Submit();
+    Require(recorder.Submissions() == computeSerial + 1, "the compute batch and the copy batch are not two submissions");
+    recorder.WaitSerial(computeSerial);
+    recorder.FinishUpTo(computeSerial);
+    Require(recorder.InFlightBatches() <= 1, "the compute batch was not completed in order after WaitSerial");
+    recorder.WaitSerial(computeSerial + 1);
+    Require(recorder.Reap() && recorder.InFlightBatches() == 0, "the batches were not reaped after WaitSerial");
+    Require(slot(rounds) == 0x1111u, "the copy batch after a compute batch read the wrong value");
+
+    // c. A one-shot (queue 0, own command buffer and fence) between compute batches.
+    const auto oneShotCopy = [&](std::size_t index) {
+        VkCommandBuffer commands = VK_NULL_HANDLE;
+        VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocation.commandPool = context.pool;
+        allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocation.commandBufferCount = 1;
+        Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &commands), "vkAllocateCommandBuffers one-shot");
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        Check(context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands, &begin), "vkBeginCommandBuffer one-shot");
+        recordCopy(commands, index);
+        Check(context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands), "vkEndCommandBuffer one-shot");
+        VkFence fence = VK_NULL_HANDLE;
+        VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        Check(context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &fenceInfo, nullptr, &fence), "vkCreateFence one-shot");
+        VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submission.commandBufferCount = 1;
+        submission.pCommandBuffers = &commands;
+        const auto submitted = recorder.SubmitOneShot(submission, fence);
+        const auto waited = submitted == VK_SUCCESS ? context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, 10000000000ull) : submitted;
+        context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
+        context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
+        Check(submitted, "SubmitOneShot");
+        Check(waited, "vkWaitForFences one-shot");
+    };
+    laneC();
+    recordFill(recorder.Commands(), 0xa1a1u);
+    recorder.Submit();
+    oneShotCopy(rounds);
+    Require(slot(rounds) == 0xa1a1u, "a one-shot after a compute batch did not see its fill");
+    // A compute batch after the one-shot writes the buffer it read; a lane G copy then shows it.
+    recordFill(recorder.Commands(), 0xb2b2u);
+    laneG();
+    recordCopy(recorder.Commands(), rounds + 1);
+    recorder.Sync();
+    Require(slot(rounds + 1) == 0xb2b2u, "a compute batch after a one-shot did not run after it, or lane G read a stale value");
+    Require(slot(rounds) == 0xa1a1u, "the one-shot's copy was overwritten");
+    AgcDriver::GuestMemory::TagGpuLockThread(tag);
+    std::cout << "compute queue chain checked\n";
+}
+
 int main() {
     try {
+        computeQueueTests();
         gpuTimingDigestTests();
         retileRowDigestTests();
         Device device;
