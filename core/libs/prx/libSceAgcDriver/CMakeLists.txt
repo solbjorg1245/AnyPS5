@@ -240,6 +240,7 @@ endforeach()
 add_test_executable(agc_driver_tests EXCLUDE_FROM_ALL
         tests/Submit.cpp
         tests/LaneCensus.cpp
+        tests/LaneChain.cpp
 )
 
 target_include_directories(agc_driver_tests PRIVATE

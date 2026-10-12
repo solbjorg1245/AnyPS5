@@ -271,6 +271,8 @@ struct VulkanDevice::State {
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
+    // APS5_COMPUTE_QUEUE: index 1 of the queue's family, lane C's (Graphics::LaneChain); null when off.
+    VkQueue computeQueue = VK_NULL_HANDLE;
     VkCommandPool pool = VK_NULL_HANDLE;
     void* window = nullptr;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
@@ -1005,11 +1007,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         state->spirvExtensions.push_back("SPV_EXT_mesh_shader");
     }
     APS5_LOG_OUT("Vulkan features tessellationAvailable=%u mesh=%u depthClip=%u depthRangeUnrestricted=%u", static_cast<unsigned>(state->tessellationShader), static_cast<unsigned>(state->meshShader), static_cast<unsigned>(state->depthClipControl), static_cast<unsigned>(state->depthRangeUnrestricted));
-    const float priority = 1.0f;
+    const float priorities[2] = {1.0f, 1.0f};
     VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queueInfo.queueFamilyIndex = family;
     queueInfo.queueCount = 1;
-    queueInfo.pQueuePriorities = &priority;
+    queueInfo.pQueuePriorities = priorities;
     VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
@@ -1156,10 +1158,26 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     }
     bdaFeatures.pNext = &byteFeatures;
     deviceInfo.pNext = &bdaFeatures;
+    if (Graphics::ComputeQueueAsked()) {
+        // APS5_COMPUTE_QUEUE=1: a second queue of the same family (no ownership transfers, one command
+        // pool) for lane C's batches, chained to the first in serial order by the recorder's timeline.
+        std::uint32_t familyCount = 0;
+        auto listFamilies = state->InstanceFunction<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
+        listFamilies(selected, &familyCount, nullptr);
+        std::vector<VkQueueFamilyProperties> familyList(familyCount);
+        listFamilies(selected, &familyCount, familyList.data());
+        const char* off = !state->timelineSemaphores ? "no timeline semaphores" : family >= familyCount || familyList[family].queueCount < 2 ? "the queue family has one queue" : nullptr;
+        if (off == nullptr) queueInfo.queueCount = 2;
+        else std::fprintf(stderr, "[recorder] compute queue: off, %s; lane C stays on queue family %u index 0 (APS5_COMPUTE_QUEUE=1)\n", off, family);
+    }
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
     if (deviceFault) InstallDeviceFaultReport(state->device, state->DeviceFunction<PFN_vkGetDeviceFaultInfoEXT>("vkGetDeviceFaultInfoEXT"), faultBinary);
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
-    if (checkpoints) Graphics::InstallCheckpoints(state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV"), state->DeviceFunction<PFN_vkGetQueueCheckpointDataNV>("vkGetQueueCheckpointDataNV"), state->queue);
+    if (queueInfo.queueCount == 2) {
+        state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 1, &state->computeQueue);
+        std::fprintf(stderr, "[recorder] compute queue: lane C submits to queue family %u index 1, chained in serial order (APS5_COMPUTE_QUEUE=1)\n", family);
+    }
+    if (checkpoints) Graphics::InstallCheckpoints(state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV"), state->DeviceFunction<PFN_vkGetQueueCheckpointDataNV>("vkGetQueueCheckpointDataNV"), state->queue, state->computeQueue);
     else if (Graphics::CheckpointsRequested()) std::fprintf(stderr, "[checkpoints] VK_NV_device_diagnostic_checkpoints unavailable\n");
     APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family);
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -2384,7 +2402,9 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     timing.Mark("command_record_scale");
     // The slot's fence signaled (retired above) or was never used: the reset cannot block.
     check(state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence), "vkResetFences present");
-    check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
+    // APS5_COMPUTE_QUEUE: chained to the recorder's batches (Recorder::SubmitOneShot).
+    const bool chained = state->recorder != nullptr && state->recorder->ChainsOneShots(state->queue);
+    check(chained ? state->recorder->SubmitOneShot(submit, slot.fence) : state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
     const auto submittedAt = std::chrono::steady_clock::now();
     timing.Mark("queue_submit");
     APS5_LOG_CHARS_OUT_DEBUG("Presentation vkQueueSubmit OK");
@@ -2584,6 +2604,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.softwareDevice = state->properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
     context.memoryBudget = state->memoryBudget;
     context.memoryProperties2 = state->memoryProperties2;
+    context.computeQueue = state->computeQueue;
     return context;
 }
 

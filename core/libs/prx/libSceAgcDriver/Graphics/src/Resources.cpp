@@ -444,7 +444,10 @@ void CommandBatch::Submit() {
     submission.commandBufferCount = 1;
     submission.pCommandBuffers = &commands;
     timing.Mark("command_end");
-    Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
+    // APS5_COMPUTE_QUEUE: chained to the recorder's batches (Recorder::SubmitOneShot).
+    auto* recorder = Recorder::Active();
+    if (recorder != nullptr && recorder->ChainsOneShots(context.queue)) Check(recorder->SubmitOneShot(submission, fence), "vkQueueSubmit graphics");
+    else Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
     timing.Mark("queue_submit");
     pending = true;
     submitted = true;

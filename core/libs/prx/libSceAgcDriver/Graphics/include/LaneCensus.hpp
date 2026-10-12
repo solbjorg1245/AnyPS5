@@ -44,12 +44,12 @@ constexpr Lane LaneOf(std::uint32_t tag) {
 // Why a submit happened, by the call that reached Recorder::Submit (a SubmitCauseScope around it).
 enum class SubmitCause : std::uint8_t {
     Other, Deadline, SizeCap, NextPacket, LabelPacket, Suspend, Flip, SubmissionEnd, DeferredEnd, Eop, Drain,
-    WaitEntry, WaitPoll, WaitPollDue, PipeDeadline, Sync, SyncThrough, Land, KeptBound, Lease, CommandBatch, Present, Presync,
+    WaitEntry, WaitPoll, WaitPollDue, PipeDeadline, Sync, SyncThrough, Land, KeptBound, Lease, CommandBatch, Present, Presync, LaneSwitch,
 };
-inline constexpr std::size_t SubmitCauses = static_cast<std::size_t>(SubmitCause::Presync) + 1;
+inline constexpr std::size_t SubmitCauses = static_cast<std::size_t>(SubmitCause::LaneSwitch) + 1;
 inline constexpr std::array<const char*, SubmitCauses> SubmitCauseNames{
     "other", "deadline", "size cap", "next packet", "label packet", "suspend", "flip", "submission end", "deferred end", "eop", "drain",
-    "wait entry", "wait poll", "wait poll due", "pipe deadline", "sync", "sync through", "land", "kept bound", "lease", "command batch", "present", "presync",
+    "wait entry", "wait poll", "wait poll due", "pipe deadline", "sync", "sync through", "land", "kept bound", "lease", "command batch", "present", "presync", "lane switch",
 };
 
 inline SubmitCause& CurrentSubmitCause() {

@@ -344,6 +344,9 @@ std::optional<FastDispatchDecline> RecordFastDispatch(const Context& context, Re
         // The old path's build throws the same and reports it (a skipped dispatch).
         return Decline::Image;
     }
+    // APS5_COMPUTE_QUEUE: the other lane's open batch is submitted first, so the serial below names
+    // the batch this dispatch records into.
+    recorder.ClaimLane();
     // 2. The ring regions of the data words, tagged with the open batch's serial: a full ring
     // reclaims the regions of the batches that already finished (ReclaimFastRing: the reap alone
     // frees nothing, their releases wait for this thread's unlock) and asks once more, then

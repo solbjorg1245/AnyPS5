@@ -40,6 +40,8 @@ extern "C" int APS5_VABI sceKernelCreateEqueue(KernelEqueue* eq, const char* nam
 extern "C" int APS5_VABI sceKernelDeleteEqueue(KernelEqueue eq);
 // tests/LaneCensus.cpp
 void testLaneCensus();
+// tests/LaneChain.cpp
+void testLaneChain();
 
 static_assert(sizeof(Packet) == 16);
 static_assert(offsetof(Packet, addr) == 0);
@@ -1323,6 +1325,7 @@ int main() {
         testPollWake();
         testComputeEndDefer();
         testLaneCensus();
+        testLaneChain();
         testFastDispatchVerify();
         testFastReader();
         testFastReaderLabels();

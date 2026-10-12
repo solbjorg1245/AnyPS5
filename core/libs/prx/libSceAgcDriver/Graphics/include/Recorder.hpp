@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LaneCensus.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LaneChain.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include <atomic>
 #include <chrono>
@@ -561,6 +562,20 @@ public:
     // Completes batches that already finished; returns whether nothing is in flight.
     bool Reap();
     std::uint64_t Submissions() const { return submissions; }
+    // APS5_COMPUTE_QUEUE (LaneChain.hpp): submits the open batch when it is the other lane's, so the
+    // caller's work opens a batch of its own lane (ensureOpen calls it; FastDispatch before it tags
+    // ring regions with the open serial). Nothing with the switch off or no batch open.
+    void ClaimLane() {
+        if (lanes.Enabled() && open != nullptr) switchLane();
+    }
+    // Whether a one-shot submission to `queue` (a resident land, a CommandBatch, the presentation
+    // blit) goes through SubmitOneShot: the compute queue is in use and `queue` is the first one.
+    bool ChainsOneShots(VkQueue queue) const { return lanes.Enabled() && queue == context.queue; }
+    // Submits a one-shot command buffer to the first queue (no wait semaphore, at most one signal
+    // semaphore of its own), chained to the batches: it waits for the newest one when that went to
+    // the compute queue, and signals the one-shot timeline the next compute batch waits for. Under
+    // GuestMemory::GpuMutex. Off: the plain vkQueueSubmit.
+    VkResult SubmitOneShot(VkSubmitInfo submission, VkFence fence);
     // Batches submitted and not yet finished (what a full Sync() waits for); under GuestMemory::GpuMutex.
     std::size_t InFlightBatches() const { return inFlight.size(); }
     // Reaps that retired at least one batch so far (the [recorder] line's 'with work' count).
@@ -994,6 +1009,11 @@ private:
         // The GpuMutex queue tag of the thread that opened the batch, and when it was submitted
         // (the [syncwait] line reports what a wait's target and the batches ahead of it were).
         std::uint32_t queue = 0xffffffffu;
+        // APS5_COMPUTE_QUEUE: that thread's lane (LaneOf), which picks the queue, and the kept objects
+        // a lane switch handed over to the batch (the first `inherited` of `kept`, and their bytes).
+        Lane lane = Lane::G;
+        std::size_t inherited = 0;
+        std::size_t inheritedBytes = 0;
         std::chrono::steady_clock::time_point submittedAt{};
         VkQueryPool queries = VK_NULL_HANDLE;
         VkQueryPool samples = VK_NULL_HANDLE;
@@ -1133,6 +1153,8 @@ private:
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
+    // APS5_COMPUTE_QUEUE: submits the open batch of the other lane (ClaimLane), unless blocked.
+    void switchLane();
     // Records the run's pending store (vkCmdUpdateBuffer), if any.
     void flushPendingStore();
     // Records the pending store and the run's trailing barrier; the next store starts a new run.
@@ -1270,6 +1292,15 @@ private:
 
     Context context;
     VkSemaphore timeline = VK_NULL_HANDLE;
+    // APS5_COMPUTE_QUEUE (enabled with a compute queue and the timeline): the waits between the two
+    // queues; the one-shot timeline (the one-shots signal 1, 2, ...); lane switches, blocked while a
+    // caller holds the open batch or submits it; the kept objects a switch handed over, which the
+    // next batch takes.
+    LaneChain lanes;
+    VkSemaphore oneShotTimeline = VK_NULL_HANDLE;
+    int laneSwitchBlocked = 0;
+    std::vector<std::shared_ptr<void>> handedOver;
+    std::size_t handedOverBytes = 0;
     // Identity for a thread that released the mutex around a wait (syncThroughUnlocked): the
     // recorder may have been torn down meanwhile, so it is looked up by this id, not by pointer.
     std::uint64_t id = 0;
