@@ -514,6 +514,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Execution/src/ShaderMemory.cpp
         Execution/src/Pm4.cpp
         Execution/src/Driver/FrameTrace.cpp
+        Execution/src/HostStubs.cpp
 )
 
 target_include_directories(agc_driver_graphics_tests PRIVATE
