@@ -814,6 +814,19 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         throw std::runtime_error(window ? "Vulkan: no Vulkan 1.1 device with graphics, compute and swapchain presentation" : "Vulkan: no Vulkan 1.1 graphics and compute queue");
     }
     APS5_LOG_OUT("Physical device selected physical=%p queueFamily=%u", reinterpret_cast<void*>(selected), family);
+    if (Graphics::LaneCensusOn) {
+        // APS5_LANE_CENSUS (docs/design/fewer-submits.md S3): the selected device's queue families, so the
+        // second queue's source (another queue of this family or a compute-only family) is known before S3.
+        std::uint32_t familyCount = 0;
+        auto listFamilies = state->InstanceFunction<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
+        listFamilies(selected, &familyCount, nullptr);
+        std::vector<VkQueueFamilyProperties> familyList(familyCount);
+        listFamilies(selected, &familyCount, familyList.data());
+        for (std::uint32_t i = 0; i < familyCount; ++i) {
+            const auto flags = familyList[i].queueFlags;
+            std::fprintf(stderr, "[recorder] lane census: queue family %u%s: %u queues, flags 0x%x (graphics %d, compute %d, transfer %d), timestamp bits %u\n", i, i == family ? " (used)" : "", familyList[i].queueCount, static_cast<unsigned>(flags), (flags & VK_QUEUE_GRAPHICS_BIT) != 0 ? 1 : 0, (flags & VK_QUEUE_COMPUTE_BIT) != 0 ? 1 : 0, (flags & VK_QUEUE_TRANSFER_BIT) != 0 ? 1 : 0, familyList[i].timestampValidBits);
+        }
+    }
     VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     properties.pNext = &state->subgroup;
     state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &properties);
