@@ -1368,6 +1368,12 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                 Check(context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(context.device, &allocation, &_set), "vkAllocateDescriptorSets");
             }
         }
+        // APS5_DRAW_BINDINGS_TRIM=1 (s4-plan S4.3): the draw set copy's pool sizes and copy list,
+        // from the layout bindings that stay as they are from here on (PrepareDrawBindings).
+        if (_set != VK_NULL_HANDLE && DrawBindingsTrim()) {
+            DrawSetPoolSizes(description, drawSetSizes);
+            DrawSetCopies(_set, description, drawSetCopies);
+        }
         timing.descriptorsMs = phase(BuildPhase::Descriptors);
         if (BuildProfiled()) {
             timing.prepareMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stageStart).count();
@@ -4195,6 +4201,22 @@ struct InPlaceReadsScratch {
     unsigned depth = 0;
 };
 
+// PrepareDrawBindings' per-draw lists under APS5_DRAW_BINDINGS_TRIM (s4-plan S4.3), kept with their
+// capacity on the calling thread: the old path makes each of them fresh per set copy.
+struct DrawBindingsScratch {
+    std::vector<std::size_t> selected;
+    std::vector<VkDescriptorBufferInfo> infos;
+    std::vector<VkCopyDescriptorSet> copies;
+    std::vector<VkWriteDescriptorSet> writes;
+    unsigned depth = 0;
+    void Reset() {
+        selected.clear();
+        infos.clear();
+        copies.clear();
+        writes.clear();
+    }
+};
+
 }
 
 bool ShaderResources::RebaseEligible(std::span<const CompiledShader> shaders, const Recorder& recorder, bool& rebased) const {
@@ -4236,19 +4258,68 @@ bool ShaderResources::InPlaceBindings() {
     return inPlace;
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const CompiledShader> shaders) const {
+bool ShaderResources::DrawBindingsTrim() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_DRAW_BINDINGS_TRIM");
+        if (value == nullptr || std::strcmp(value, "1") != 0) return false;
+        std::fprintf(stderr, "[draws] draw bindings trim on (APS5_DRAW_BINDINGS_TRIM=1): unmoved elements dropped first, set sizes and copies from the build, lists from the thread's scratch\n");
+        return true;
+    }();
+    return enabled;
+}
+
+void ShaderResources::DrawSetPoolSizes(std::span<const VkDescriptorSetLayoutBinding> layouts, std::vector<VkDescriptorPoolSize>& sizes) {
+    sizes.clear();
+    for (const auto& layout : layouts) {
+        const auto at = std::lower_bound(sizes.begin(), sizes.end(), layout.descriptorType, [](const VkDescriptorPoolSize& size, VkDescriptorType type) { return size.type < type; });
+        if (at == sizes.end() || at->type != layout.descriptorType) {
+            sizes.insert(at, VkDescriptorPoolSize{layout.descriptorType, layout.descriptorCount});
+        } else {
+            at->descriptorCount += layout.descriptorCount;
+        }
+    }
+}
+
+void ShaderResources::DrawSetCopies(VkDescriptorSet source, std::span<const VkDescriptorSetLayoutBinding> layouts, std::vector<VkCopyDescriptorSet>& copies) {
+    copies.clear();
+    for (const auto& layout : layouts) {
+        VkCopyDescriptorSet copy{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
+        copy.srcSet = source;
+        copy.srcBinding = layout.binding;
+        copy.dstBinding = layout.binding;
+        copy.descriptorCount = layout.descriptorCount;
+        copies.push_back(copy);
+    }
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const CompiledShader> shaders, DrawBindingsSplit* split) const {
     if (_set == VK_NULL_HANDLE || usesBda) return {};
+    // APS5_PROFILE_DRAW (`split`): one clock read per part, two per data copy, none per element.
+    using Clock = std::chrono::steady_clock;
+    const auto since = [](Clock::time_point from, Clock::time_point to) { return std::chrono::duration<double, std::micro>(to - from).count(); };
+    auto mark = split != nullptr ? Clock::now() : Clock::time_point{};
+    double dataUs = 0;
     ScratchLease<InPlaceReadsScratch> scratch;
     const auto reads = guestMemory.InPlaceReads(scratch->reads);
     const bool inPlace = InPlaceBindings();
     // APS5_DRAW_MEMOS=1 (s4-plan S4.2): moved elements find their imports through the thread's memo;
     // recordDraw (Draw, DrawWithRecipe) runs under GuestMemory::GpuMutex, as HostImportMemoized requires.
     const bool memoizedImports = DrawMemos();
+    // APS5_DRAW_BINDINGS_TRIM=1 (DrawBindingsTrim, s4-plan S4.3): the lists below are the thread's
+    // scratch, the pool sizes and copy list the build's.
+    const bool trim = DrawBindingsTrim();
+    std::optional<ScratchLease<DrawBindingsScratch>> lists;
+    if (trim) {
+        lists.emplace();
+        (*lists)->Reset();
+    }
     // Made once the first element is selected: most draws select none and return nothing.
     std::shared_ptr<DrawBindings> result;
-    std::vector<std::size_t> selected;
+    std::vector<std::size_t> ownSelected;
     // The descriptor each selected element gets in the draw's set copy, in `selected` order.
-    std::vector<VkDescriptorBufferInfo> infos;
+    std::vector<VkDescriptorBufferInfo> ownInfos;
+    auto& selected = trim ? (*lists)->selected : ownSelected;
+    auto& infos = trim ? (*lists)->infos : ownInfos;
     const auto select = [&](std::size_t index, const VkDescriptorBufferInfo& info) {
         if (result == nullptr) result = std::make_shared<DrawBindings>();
         selected.push_back(index);
@@ -4262,6 +4333,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             bool unknown = false;
             if (!DataMoved(shaders, item.sourceShader, item.sourceBinding, item.dataWords, unknown)) continue;
             Require(!unknown, "a rebased data buffer without recorded words");
+            const auto dataStart = split != nullptr ? Clock::now() : Clock::time_point{};
             const auto words = SourceWords(shaders, item.sourceShader, item.sourceBinding);
             Require(words.size() * sizeof(std::uint32_t) == item.size, "a rebased data buffer changed size");
             auto buffer = std::make_shared<Buffer>(context, item.size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -4271,12 +4343,20 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             select(index, {buffer->Handle(), 0, buffer->Bytes().size()});
             ++result->dataCopies;
             result->snapshots.push_back({0, std::move(buffer), index});
+            if (split != nullptr) dataUs += since(dataStart, Clock::now());
             continue;
         }
-        if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
+        if (!item.guest || item.written) continue;
+        // APS5_DRAW_BINDINGS_TRIM in place: an unmoved element is dropped below whatever the write,
+        // direct and pending-write checks find, and those are queries without effects
+        // (GuestBufferMemory::WritesOverlap, the scan of `reads`, Recorder::PendingWriteOverlaps;
+        // the Require holds for it), so it is dropped first.
+        const bool movedFirst = trim && inPlace;
+        if (!movedFirst && guestMemory.WritesOverlap(item.address, item.size)) continue;
         // A rebased hit (RebaseEligible proved the moved range) binds the draw's own range.
         const auto [address, size] = SourceRange(shaders, item.sourceShader, item.sourceBinding, item.sourceElement, {item.address, item.size});
         const bool moved = address != item.address || size != item.size;
+        if (movedFirst && (!moved || guestMemory.WritesOverlap(item.address, item.size))) continue;
         const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
         if (!moved && (!direct || recorder.PendingWriteOverlaps(item.address, item.size))) continue;
         Require(!moved || direct, "a rebased guest buffer is not one the template snapshots");
@@ -4312,28 +4392,56 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         result->snapshots.push_back({begin, std::move(buffer), index});
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
+    if (split != nullptr) {
+        const auto now = Clock::now();
+        split->loopUs += since(mark, now) - dataUs;
+        split->dataUs += dataUs;
+        mark = now;
+    }
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
+    // APS5_DRAW_BINDINGS_TRIM: the build's sizes and copy list (DrawSetPoolSizes, DrawSetCopies:
+    // what the old path builds here from the same bindings).
+    const bool cached = trim && !drawSetCopies.empty();
     std::map<VkDescriptorType, std::uint32_t> counts;
-    for (const auto& binding : bindings) counts[binding.layout.descriptorType] += binding.layout.descriptorCount;
     std::vector<VkDescriptorPoolSize> sizes;
-    for (const auto& [type, count] : counts) sizes.push_back({type, count});
+    if (!cached) {
+        for (const auto& binding : bindings) counts[binding.layout.descriptorType] += binding.layout.descriptorCount;
+        for (const auto& [type, count] : counts) sizes.push_back({type, count});
+    }
     result->cache = context.descriptorCache;
-    result->allocation = result->cache->Allocate(_layout, sizes);
+    result->allocation = result->cache->Allocate(_layout, cached ? std::span<const VkDescriptorPoolSize>(drawSetSizes) : std::span<const VkDescriptorPoolSize>(sizes));
     Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
-    std::vector<VkCopyDescriptorSet> copies;
-    for (const auto& binding : bindings) {
-        VkCopyDescriptorSet copy{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
-        copy.srcSet = _set;
-        copy.srcBinding = binding.layout.binding;
-        copy.dstSet = result->allocation.set;
-        copy.dstBinding = binding.layout.binding;
-        copy.descriptorCount = binding.layout.descriptorCount;
-        copies.push_back(copy);
+    if (split != nullptr) {
+        const auto now = Clock::now();
+        split->allocateUs += since(mark, now);
+        mark = now;
+    }
+    std::vector<VkCopyDescriptorSet> ownCopies;
+    auto& copies = trim ? (*lists)->copies : ownCopies;
+    if (cached) {
+        copies.assign(drawSetCopies.begin(), drawSetCopies.end());
+        for (auto& copy : copies) copy.dstSet = result->allocation.set;
+    } else {
+        for (const auto& binding : bindings) {
+            VkCopyDescriptorSet copy{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
+            copy.srcSet = _set;
+            copy.srcBinding = binding.layout.binding;
+            copy.dstSet = result->allocation.set;
+            copy.dstBinding = binding.layout.binding;
+            copy.descriptorCount = binding.layout.descriptorCount;
+            copies.push_back(copy);
+        }
     }
     const auto update = context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets");
     update(context.device, 0, nullptr, static_cast<std::uint32_t>(copies.size()), copies.data());
-    std::vector<VkWriteDescriptorSet> writes;
+    if (split != nullptr) {
+        const auto now = Clock::now();
+        split->copyUs += since(mark, now);
+        mark = now;
+    }
+    std::vector<VkWriteDescriptorSet> ownWrites;
+    auto& writes = trim ? (*lists)->writes : ownWrites;
     for (const auto& binding : bindings) {
         for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
             const auto found = std::find(selected.begin(), selected.end(), binding.allocations[element]);
@@ -4349,6 +4457,28 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
     }
     update(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    if (split != nullptr) {
+        split->writeUs += since(mark, Clock::now());
+        // The set's content: each selected element's descriptor, a data copy's by the draw's words
+        // (its buffer is new per draw), against the template's previous profiled set.
+        std::uint64_t content = 14695981039346656037ull;
+        const auto mix = [&](std::uint64_t value) {
+            content ^= value;
+            content *= 1099511628211ull;
+        };
+        for (std::size_t i = 0; i < selected.size(); ++i) {
+            const auto& item = allocations[selected[i]];
+            mix(selected[i]);
+            if (!item.guest && item.buffer != nullptr && DataRole(item.role)) {
+                for (const auto word : SourceWords(shaders, item.sourceShader, item.sourceBinding)) mix(word);
+                continue;
+            }
+            mix(reinterpret_cast<std::uint64_t>(infos[i].buffer));
+            mix(infos[i].offset);
+            mix(infos[i].range);
+        }
+        if (lastDrawSet.exchange(content, std::memory_order_relaxed) == content) ++split->equalSets;
+    }
     recorder.Keep(result);
     return result;
 }

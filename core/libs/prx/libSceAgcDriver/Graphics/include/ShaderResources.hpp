@@ -208,10 +208,32 @@ public:
         std::uint32_t refusedAlignment = 0;
         ~DrawBindings();
     };
+    // APS5_PROFILE_DRAW: PrepareDrawBindings' time by part (s4-plan S4.3, the [draws] line's draw
+    // bindings split): the element loop without the data copies, the data copies (buffer, memcpy,
+    // patch), the set allocation with its pool sizes, the whole-set copy with its copy list, the
+    // element writes; and the sets whose content (each selected element's descriptor, a data copy's
+    // by the draw's words) equals the template's previous profiled set's (what S4.4 could reuse).
+    struct DrawBindingsSplit {
+        double loopUs = 0;
+        double dataUs = 0;
+        double allocateUs = 0;
+        double copyUs = 0;
+        double writeUs = 0;
+        std::uint64_t equalSets = 0;
+        void Add(const DrawBindingsSplit& other) {
+            loopUs += other.loopUs;
+            dataUs += other.dataUs;
+            allocateUs += other.allocateUs;
+            copyUs += other.copyUs;
+            writeUs += other.writeUs;
+            equalSets += other.equalSets;
+        }
+    };
     // With `shaders` (the draw's own stages, which may be a rebased hit, see RebaseEligible), each
     // read-only guest buffer is snapshot from the address the draw's descriptor names, which can
-    // differ from the one the object was built for.
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const CompiledShader> shaders = {}) const;
+    // differ from the one the object was built for. `split` (APS5_PROFILE_DRAW) gets the call's
+    // time by part added.
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const CompiledShader> shaders = {}, DrawBindingsSplit* split = nullptr) const;
     // Read-only guest buffer elements a draw binds in place through their host import instead of
     // snapshotting them (the default; APS5_NO_INPLACE_BINDINGS=1 restores the snapshots, and
     // APS5_CAPTURE_INPUTS keeps them since the capture samples the snapshots): an unmoved element
@@ -221,6 +243,17 @@ public:
     // overwrite the range before the batch ran, which the game's own fences keep (the copy HLE
     // refuses its CPU path on a noted read); APS5_FLIP_READ_CHECK=1 checks it at the flip.
     static bool InPlaceBindings();
+    // APS5_DRAW_BINDINGS_TRIM=1 (s4-plan S4.3, default off): PrepareDrawBindings in place drops an
+    // unmoved guest element before its write, direct and pending-write checks (the old loop drops it
+    // after them; they are queries without effects), takes the set's pool sizes and whole-set copy
+    // list from the build (DrawSetPoolSizes, DrawSetCopies) and its lists from the thread's scratch:
+    // the same descriptors with fewer heap allocations.
+    static bool DrawBindingsTrim();
+    // The pool sizes a set of `layouts` needs: one per descriptor type, ascending, with the type's
+    // summed count (PrepareDrawBindings' per-draw map); and the copy of every binding of `source`
+    // into a set of the same layout, in binding order, its dstSet left null for the draw's set.
+    static void DrawSetPoolSizes(std::span<const VkDescriptorSetLayoutBinding> layouts, std::vector<VkDescriptorPoolSize>& sizes);
+    static void DrawSetCopies(VkDescriptorSet source, std::span<const VkDescriptorSetLayoutBinding> layouts, std::vector<VkCopyDescriptorSet>& copies);
     // The data buffer a draw binds at Vulkan binding `vulkanBinding` (a ShaderData/FlattenedSrt
     // role): the snapshot PrepareDrawBindings made for it (`hostBytes` then points at its mapped
     // bytes, which only this draw uses), else the object's own (`hostBytes` null); VK_NULL_HANDLE
@@ -712,6 +745,13 @@ private:
     // still to look up (index into `bindings`; the DescriptorBinding lives in the compiled shader),
     // the descriptor counts the set was sized for, and the compute stage of a deferred build.
     std::vector<Binding> bindings;
+    // APS5_DRAW_BINDINGS_TRIM (DrawBindingsTrim): the draw set copy's pool sizes and copy list of
+    // `bindings`, filled at the end of stage A (buildPrepare), before the object is published, and
+    // never changed after: draws on any thread read them without a lock.
+    std::vector<VkDescriptorPoolSize> drawSetSizes;
+    std::vector<VkCopyDescriptorSet> drawSetCopies;
+    // APS5_PROFILE_DRAW: the content hash of the last set copy a profiled draw made (0: none).
+    mutable std::atomic<std::uint64_t> lastDrawSet{0};
     struct DeferredImages {
         const ShaderRecompiler::DescriptorBinding* binding;
         std::size_t index;

@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/KeyedMemo.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libc/include/Shutdown.hpp"
@@ -28,6 +29,7 @@
 #include <deque>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <optional>
 #include <memory>
 #include <stdexcept>
@@ -1187,6 +1189,46 @@ void testDrawPipelineKey() {
     check(memo.Find(fresh, KeyHash(fresh), 3, pool.get()) == nullptr, "draw pipeline memo: an entry answered after the store removed one");
 }
 
+// A draw set copy's pool sizes and copy list from the build (APS5_DRAW_BINDINGS_TRIM, s4-plan S4.3):
+// DrawSetPoolSizes and DrawSetCopies give, into used vectors, what PrepareDrawBindings' old path
+// builds per draw from the same bindings (a std::map by type, a copy per binding in order).
+void testDrawSetCopyLists() {
+    using namespace AgcDriver::Graphics;
+    const std::array<VkDescriptorSetLayoutBinding, 6> layouts{{
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3, VK_SHADER_STAGE_ALL, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2, VK_SHADER_STAGE_ALL, nullptr},
+        {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_SAMPLER, 4, VK_SHADER_STAGE_ALL, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, VK_SHADER_STAGE_ALL, nullptr},
+        {5, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_ALL, nullptr},
+    }};
+    std::map<VkDescriptorType, std::uint32_t> counts;
+    for (const auto& layout : layouts) counts[layout.descriptorType] += layout.descriptorCount;
+    std::vector<VkDescriptorPoolSize> expected;
+    for (const auto& [type, count] : counts) expected.push_back({type, count});
+    std::vector<VkDescriptorPoolSize> sizes(9, VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 77});
+    ShaderResources::DrawSetPoolSizes(layouts, sizes);
+    check(sizes.size() == expected.size(), "draw set copy: pool sizes differ in count from the per-draw map's");
+    for (std::size_t i = 0; i < sizes.size(); ++i) check(sizes[i].type == expected[i].type && sizes[i].descriptorCount == expected[i].descriptorCount, "draw set copy: a pool size differs from the per-draw map's");
+    const auto source = reinterpret_cast<VkDescriptorSet>(std::uintptr_t{0x2000});
+    const auto target = reinterpret_cast<VkDescriptorSet>(std::uintptr_t{0x3000});
+    std::vector<VkCopyDescriptorSet> copies(2);
+    ShaderResources::DrawSetCopies(source, layouts, copies);
+    check(copies.size() == layouts.size(), "draw set copy: not one copy per binding");
+    for (std::size_t i = 0; i < copies.size(); ++i) {
+        auto copy = copies[i];
+        check(copy.dstSet == VK_NULL_HANDLE, "draw set copy: the build's copy names a target set");
+        copy.dstSet = target;
+        VkCopyDescriptorSet old{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
+        old.srcSet = source;
+        old.srcBinding = layouts[i].binding;
+        old.dstSet = target;
+        old.dstBinding = layouts[i].binding;
+        old.descriptorCount = layouts[i].descriptorCount;
+        check(std::memcmp(&copy, &old, sizeof(copy)) == 0, "draw set copy: a copy differs from the per-draw one");
+    }
+}
+
 // Native aspect's UI rect (AspectFit): the part of the 16:9 display buffer that is shown undistorted
 // at the window's aspect, and a viewport or scissor carried into it.
 void testUndistortedRect() {
@@ -1254,6 +1296,7 @@ int main() {
         testHostImportMemo();
         testFastPipelineMemo();
         testDrawPipelineKey();
+        testDrawSetCopyLists();
         testUndistortedRect();
         LibcRunShutdown_nid_postfix();
         std::puts("AGC driver submit tests passed");
