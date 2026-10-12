@@ -74,6 +74,11 @@ target_include_directories(relinker PRIVATE
 )
 
 if(WIN32)
+    # The UTF-8 process code page (relinker.rc): paths outside the ANSI code page work through char argv.
+    enable_language(RC)
+    target_sources(relinker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/relinker.rc)
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/relinker.rc PROPERTIES INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR})
+
     add_test_executable(windows_dependency_diagnostics_tests EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/tests/WindowsDependencyDiagnosticsTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/windows/WindowsDependencyStubBuilder.cpp

@@ -256,7 +256,8 @@ if(BUILD_TESTING)
 endif()
 
 add_test_executable(port_settings_tests EXCLUDE_FROM_ALL ${LIBS_INCLUDE_DIR}/tests/PortSettings.cpp)
-target_include_directories(port_settings_tests PRIVATE ${LIBS_INCLUDE_DIR})
+# ../launcher: the settings launcher's game folder checks (GameFolder.hpp) are tested here too.
+target_include_directories(port_settings_tests PRIVATE ${LIBS_INCLUDE_DIR} ${LIBS_INCLUDE_DIR}/../launcher)
 target_link_libraries(port_settings_tests PRIVATE libc libkernel)
 set_target_properties(port_settings_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(port_settings_tests)

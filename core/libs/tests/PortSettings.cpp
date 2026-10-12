@@ -1,4 +1,5 @@
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/AddonContent.hpp"
 #include "prx/libc/include/PortSettings.hpp"
 #include "SceTypes.hpp"
 #include "prx/libkernel/File/include/FileFlags.hpp"
@@ -12,6 +13,9 @@
 #include <iterator>
 #include <map>
 #include <string>
+
+#include "GameFolder.hpp"
+#include "HostText.hpp"
 
 extern "C" {
 int APS5_VABI sceKernelOpen(const char*, int, std::uint16_t);
@@ -182,6 +186,9 @@ static void TestOverlay() {
     { std::ofstream file(root / "app0" / "misc" / "renderconfig_ps5_perf.txt", std::ios::binary); file << "+r_Wants4K = WantsHigh\r\n+TargetFramesPerSecond = 60"; }
     { std::ofstream file(root / "app0" / "misc" / "gamecommandlineargs.txt", std::ios::binary); file << "+untouched"; }
     SetVariable("APS5_SETTINGS", settingsPath.string().c_str());
+    // No settings window here (APS5_NO_LAUNCHER=0 with anyps5-launcher.exe next to the test shows it: a
+    // manual check of the spawn, wait and read-back path).
+    if (std::getenv("APS5_NO_LAUNCHER") == nullptr) SetVariable("APS5_NO_LAUNCHER", "1");
 
     Require(ReadGuest("/app0/misc/RenderConfig_PS5_Perf.txt") == "+r_Wants4K = WantsHigh\r\n+TargetFramesPerSecond = 60\r\n+r_Wants4K=WantsHigh\r\n+TargetFramesPerSecond=30\r\n", "render config overlay");
     Require(ReadGuest("/app0/packagecmdlineargs.txt") == "+cp11_callHomeLockDownEnabled=false +r_Wants4K=WantsHigh +TargetFramesPerSecond=30", "command line overlay");
@@ -413,7 +420,377 @@ static void TestResolution4kUi() {
     Require(std::string(PortSettings::PlanTierRewrite(nativeOff).slot->convar) == "WantsHigh", "native aspect's 4K UI is its own switch");
 }
 
+// The settings launcher (s61): when it is skipped, and the ini read/modify/write round trip it saves with.
+static void TestLauncher() {
+    const auto lookup = [](std::map<std::string, std::string> environment) {
+        return [environment](const char* name) -> const char* {
+            const auto found = environment.find(name);
+            return found == environment.end() ? nullptr : found->second.c_str();
+        };
+    };
+    const auto reason = [](const char* text) { return text == nullptr ? std::string("shown") : std::string(text); };
+    Require(reason(PortSettings::LauncherSkipReason({"DemonsSouls.exe"}, lookup({}))) == "shown", "launcher shown by default");
+    Require(reason(PortSettings::LauncherSkipReason({"DemonsSouls.exe", "--launch"}, lookup({}))) == "--launch", "--launch skips it");
+    Require(reason(PortSettings::LauncherSkipReason({"--launch"}, lookup({}))) == "shown", "argv[0] is not an option");
+    Require(reason(PortSettings::LauncherSkipReason({"x", "--launcher"}, lookup({}))) == "shown", "only --launch itself");
+    Require(reason(PortSettings::LauncherSkipReason({"x"}, lookup({{"APS5_NO_LAUNCHER", "1"}}))) == "APS5_NO_LAUNCHER", "APS5_NO_LAUNCHER=1");
+    Require(reason(PortSettings::LauncherSkipReason({"x"}, lookup({{"APS5_NO_LAUNCHER", "0"}}))) == "shown", "APS5_NO_LAUNCHER=0 shows it");
+    Require(reason(PortSettings::LauncherSkipReason({"x"}, lookup({{"APS5_LAUNCHER", "0"}}))) == "APS5_LAUNCHER=0", "APS5_LAUNCHER=0");
+    Require(reason(PortSettings::LauncherSkipReason({"x"}, lookup({{"APS5_LAUNCHER", "1"}}))) == "shown", "APS5_LAUNCHER=1 shows it");
+    Require(reason(PortSettings::LauncherSkipReason({"x"}, lookup({{"APS5_SETTINGS", "None"}}))) == "APS5_SETTINGS=none", "no file to edit");
+
+    // Existing keys change in place (indentation, spelling, trailing comment kept, every duplicate), comments,
+    // commented-out keys, sections, unknown keys, the BOM and CRLF stay; missing keys are appended with CRLF.
+    const std::string original = "\xEF\xBB\xBF# player settings\r\n[display]\r\n  resolution=1920x1080   ; desk\r\n# FpsLimit = 45\r\nBogus = 7\r\n"
+                                 "TimestepMinHz = 25\r\n\r\nRESOLUTION = 640x360\r\nWindowMode = auto";
+    const std::string edited = PortSettings::SetIniValues(original, {{"Resolution", "1280x800"}, {"WindowMode", "fullscreen"}, {"FpsLimit", "40"}});
+    Require(edited == "\xEF\xBB\xBF# player settings\r\n[display]\r\n  resolution = 1280x800   ; desk\r\n# FpsLimit = 45\r\nBogus = 7\r\n"
+                      "TimestepMinHz = 25\r\n\r\nRESOLUTION = 1280x800\r\nWindowMode = fullscreen\r\nFpsLimit = 40\r\n", "ini edited in place");
+    Require(PortSettings::SetIniValues(edited, {{"Resolution", "1280x800"}, {"WindowMode", "fullscreen"}, {"FpsLimit", "40"}}) == edited, "same values leave the text alone");
+    Require(PortSettings::SetIniValues("", {{"Resolution", "auto"}}) == "Resolution = auto\n", "new file uses LF");
+    Require(PortSettings::SetIniValues("A = 1\n", {{"a", "2"}}) == "A = 2\n", "the line keeps its key spelling");
+    Require(PortSettings::SetIniValues("Timestep = fixed;x\n", {{"Timestep", "variable"}}) == "Timestep = variable;x\n", "comment right after the value");
+    Require(PortSettings::SetIniValues("Timestep\n", {{"Timestep", "variable"}}) == "Timestep\nTimestep = variable\n", "a line without = is not the key");
+
+    // Launcher values -> file -> parser gives the same settings back; the file's other keys survive.
+    PortSettings::Settings chosen;
+    chosen.width = 2560;
+    chosen.height = 1080;
+    chosen.windowMode = PortSettings::WindowMode::Fullscreen;
+    chosen.fpsLimit = 47.5;
+    chosen.nativeAspect = true;
+    PortSettings::ApplyLauncherRules(chosen);
+    Require(chosen.variableTimestep, "a custom limit turns the variable timestep on");
+    const auto saved = PortSettings::SetIniValues(original, PortSettings::LauncherValues(chosen));
+    auto reread = PortSettings::Parse(saved, "test.ini");
+    PortSettings::Normalize(reread);
+    Require(reread.width == 2560 && reread.height == 1080 && reread.windowMode == PortSettings::WindowMode::Fullscreen, "round trip resolution and window");
+    Require(reread.fpsLimit == 47.5 && reread.variableTimestep && reread.nativeAspect, "round trip fps, timestep, native aspect");
+    Require(Near(reread.timestepMinHz, 25.0, 1e-9), "other keys survive the save");
+    Require(saved.find("Bogus = 7\r\n") != std::string::npos && saved.find("# FpsLimit = 45\r\n") != std::string::npos, "unknown key and comment kept");
+    Require(saved.find("NativeAspect = on\r\n") != std::string::npos && saved.find("Timestep = variable\r\n") != std::string::npos, "keys appended with CRLF");
+
+    PortSettings::Settings defaults;
+    PortSettings::ApplyLauncherRules(defaults);
+    const auto plain = PortSettings::Parse(PortSettings::SetIniValues("", PortSettings::LauncherValues(defaults)), "test.ini");
+    // Auto is saved as windowed (what DisplayWindow does for auto), so only the window mode is set.
+    Require(plain.warnings.empty() && plain.windowMode == PortSettings::WindowMode::Windowed && plain.width == 0 && plain.fpsLimit == 0.0 && !plain.variableTimestep && !plain.nativeAspect,
+            "the launcher's defaults are today's behaviour");
+    PortSettings::Settings sixty;
+    sixty.fpsLimit = 60.0;
+    sixty.nativeAspect = true;
+    PortSettings::ApplyLauncherRules(sixty);
+    Require(!sixty.variableTimestep && !sixty.nativeAspect, "60 keeps the fixed step; native aspect needs a resolution");
+    Require(PortSettings::FormatNumber(59.94) == "59.94" && PortSettings::FormatNumber(45.0) == "45", "numbers written short");
+}
+
+// A minimal ELF64 eboot.bin: one executable PT_LOAD at 0x83b000 holding ds_patch.py's patch site.
+static std::string FakeEboot(bool knownVersion) {
+    std::string data(0x2000, '\0');
+    const auto put = [&](std::size_t offset, std::uint64_t value, int size) {
+        for (int index = 0; index < size; ++index) data[offset + static_cast<std::size_t>(index)] = static_cast<char>((value >> (8 * index)) & 0xff);
+    };
+    data[0] = 0x7f;
+    data[1] = 'E';
+    data[2] = 'L';
+    data[3] = 'F';
+    data[4] = 2;
+    data[5] = 1;
+    put(0x20, 64, 8);
+    put(0x36, 56, 2);
+    put(0x38, 1, 2);
+    put(64 + 0x00, 1, 4);
+    put(64 + 0x04, 5, 4);
+    put(64 + 0x08, 0x1000, 8);
+    put(64 + 0x10, 0x83b000, 8);
+    put(64 + 0x20, 0x1000, 8);
+    for (std::size_t index = 0; index < Launcher::PatchSiteBytes.size(); ++index) data[0x16b3 + index] = static_cast<char>(knownVersion ? Launcher::PatchSiteBytes[index] : 0x90);
+    return data;
+}
+
+static void WriteFile(const std::filesystem::path& path, const std::string& text) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream(path, std::ios::binary) << text;
+}
+
+static const std::string ElfModule = std::string("\x7f" "ELF", 4) + std::string(60, '\0');
+static const std::string SelfModule = std::string("\x54\x14\xf5\xee", 4) + std::string(60, '\0');
+
+static void MakeDump(const std::filesystem::path& app0, const std::string& eboot, const char* title = "PPSA01341") {
+    WriteFile(app0 / "eboot.bin", eboot);
+    WriteFile(app0 / "sce_sys" / "param.json", std::string("{\n  \"contentVersion\": \"01.007.000\",\n  \"titleId\" : \"") + title + "\"\n}\n");
+    WriteFile(app0 / "gameversion.txt", "+BuildVersion=2025-10-15.877562\r\n");
+    WriteFile(app0 / "sce_module" / "libc.prx", ElfModule);
+}
+
+static bool Mentions(const std::vector<std::string>& lines, const char* text) {
+    for (const auto& line : lines) {
+        if (line.find(text) != std::string::npos) return true;
+    }
+    return false;
+}
+
+// GameDir in the settings file and the launcher's game folder checks and setup stamp (core/launcher/GameFolder.hpp).
+static void TestGameFolder() {
+    // A quoted path keeps '#' and ';'; the comment after it stays a comment.
+    const auto parsed = FromText("GameDir = \"D:\\Games #1; old\\PPSA01341-app0\" ; my dump\n");
+    Require(parsed.gameDir == "D:\\Games #1; old\\PPSA01341-app0" && parsed.warnings.empty(), "GameDir parsed with # and ; inside quotes");
+    PortSettings::Settings chosen;
+    chosen.gameDir = "E:\\New #2\\app0";
+    const auto saved = PortSettings::SetIniValues("GameDir = \"D:\\Old;1\" ; my dump\nBogus = 1\n", PortSettings::LauncherValuesWithGameDir(chosen));
+    Require(saved.starts_with("GameDir = \"E:\\New #2\\app0\" ; my dump\nBogus = 1\n"), "GameDir replaced in place, comment kept");
+    Require(PortSettings::Parse(saved, "test.ini").gameDir == "E:\\New #2\\app0", "GameDir round trip");
+    Require(PortSettings::SetIniValues("", PortSettings::LauncherValuesWithGameDir(PortSettings::Settings{})).find("GameDir") == std::string::npos, "no GameDir key while unset");
+    // The launcher's window writes an empty folder too: clearing the field clears the file's folder.
+    const auto cleared = PortSettings::SetIniValues("GameDir = \"D:\\Old\"\n", PortSettings::LauncherValuesWithGameDir(PortSettings::Settings{}, true));
+    Require(cleared.starts_with("GameDir = \"\"\n"), "cleared GameDir written as \"\"");
+    const auto reread = PortSettings::Parse(cleared, "test.ini");
+    Require(reread.gameDir.empty() && reread.warnings.empty(), "an empty GameDir reads back empty, without a warning");
+    Require(FromText("FpsLimit = 45 # \"quoted\" comment\nTimestep = variable\n").fpsLimit == 45.0, "comment with quotes after a plain value");
+
+    Require(Launcher::CleanFolderText("  \"C:\\Games\\dump\\\"  ") == "C:\\Games\\dump", "pasted path: quotes and trailing separator dropped");
+    Require(Launcher::CleanFolderText("C:\\") == "C:\\" && Launcher::CleanFolderText("/home/deck/app0/") == "/home/deck/app0", "roots kept, trailing slash dropped");
+    Require(Launcher::CleanFolderText("D:\\Games\n\\app0\r\n") == "D:\\Games\\app0", "pasted line breaks dropped");
+
+    const auto base = std::filesystem::temp_directory_path() / "aps5-gamefolder-test";
+    std::error_code error;
+    std::filesystem::remove_all(base, error);
+    const auto install = base / "install";
+    std::filesystem::create_directories(install);
+
+    Require(Launcher::CheckGameFolder("", install).state == Launcher::FolderState::Empty, "empty folder text");
+    Require(Launcher::CheckGameFolder(PortSettings::PathText(base / "missing"), install).state == Launcher::FolderState::Invalid, "missing folder");
+    // A relative path names another folder for the setup (its working directory differs): refused.
+    auto check = Launcher::CheckGameFolder("PPSA01341/app0", install);
+    Require(check.state == Launcher::FolderState::Invalid && Mentions(check.errors, "full path"), "relative path refused");
+    check = Launcher::CheckGameFolder(PortSettings::PathText(base) + "/dump \"1\"", install);
+    Require(check.state == Launcher::FolderState::Invalid && Mentions(check.errors, "double quote"), "a path with a double quote refused");
+#ifdef _WIN32
+    check = Launcher::CheckGameFolder("\\\\nas\\games\\PPSA01341-app0", install);
+    Require(check.state == Launcher::FolderState::Invalid && Mentions(check.errors, "network folder"), "network share refused without touching it");
+#endif
+
+    // The parent of app0 is taken as its app0; a supported dump has no warnings.
+    const auto good = base / "PPSA01341" / "app0";
+    MakeDump(good, FakeEboot(true));
+    const auto bytes = Launcher::ReadTextBytes(good / "eboot.bin", Launcher::PatchSiteVaddr, Launcher::PatchSiteBytes.size());
+    Require(bytes.size() == Launcher::PatchSiteBytes.size() && std::equal(bytes.begin(), bytes.end(), Launcher::PatchSiteBytes.begin()), "patch site read from the ELF");
+    check = Launcher::CheckGameFolder("\"" + PortSettings::PathText(base / "PPSA01341") + "/\"", install);
+    Require(check.state == Launcher::FolderState::Valid && check.errors.empty() && check.warnings.empty(), "valid dump through its parent folder");
+    Require(std::filesystem::equivalent(check.folder, good) && check.summary.find("PPSA01341") != std::string::npos && check.summary.find("(supported)") != std::string::npos, "app0 used, title and version shown");
+    Require(Launcher::CheckGameFolder(PortSettings::PathText(good / "eboot.bin"), install).state == Launcher::FolderState::Valid, "eboot.bin itself picked");
+
+    // A folder name outside the ANSI code page (the relinker reads it through its UTF-8 manifest).
+    const auto cyrillic = base / Launcher::PathFromText("\xd0\x94\xd0\xb5\xd0\xbc\xd0\xbe\xd0\xbd") / "app0";
+    MakeDump(cyrillic, FakeEboot(true));
+    check = Launcher::CheckGameFolder(PortSettings::PathText(cyrillic), install);
+    Require(check.state == Launcher::FolderState::Valid && PortSettings::PathText(check.folder) == PortSettings::PathText(cyrillic), "non-ANSI folder name");
+
+    // An unsupported version or another game is refused before any setup (the setup would relink it first).
+    const auto unknown = base / "unknown";
+    MakeDump(unknown, FakeEboot(false));
+    check = Launcher::CheckGameFolder(PortSettings::PathText(unknown), install);
+    Require(check.state == Launcher::FolderState::Invalid && Mentions(check.errors, "Unsupported game version"), "unknown version refused");
+    const auto other = base / "other";
+    MakeDump(other, FakeEboot(true), "PPSA01342");
+    check = Launcher::CheckGameFolder(PortSettings::PathText(other), install);
+    Require(check.state == Launcher::FolderState::Invalid && Mentions(check.errors, "PPSA01342, not Demon's Souls"), "another title refused");
+
+    // sce_module must hold decrypted modules only.
+    const auto selfModules = base / "selfmodules";
+    MakeDump(selfModules, FakeEboot(true));
+    WriteFile(selfModules / "sce_module" / "libSceNpCppWebApi.prx", SelfModule);
+    check = Launcher::CheckGameFolder(PortSettings::PathText(selfModules), install);
+    Require(check.state == Launcher::FolderState::Invalid && Mentions(check.errors, "1 encrypted module"), "an encrypted module refused");
+    std::filesystem::remove(selfModules / "sce_module" / "libSceNpCppWebApi.prx", error);
+    std::filesystem::remove(selfModules / "sce_module" / "libc.prx", error);
+    check = Launcher::CheckGameFolder(PortSettings::PathText(selfModules), install);
+    Require(check.state == Launcher::FolderState::Invalid && Mentions(check.errors, "no decrypted game module"), "an empty sce_module refused");
+
+    // AnyPS5 unpacked inside the dump would be written into it.
+    Require(Launcher::IsInside(good / "AnyPS5", good) && Launcher::IsInside(good, good) && !Launcher::IsInside(base / "PPSA013410", base / "PPSA01341"), "IsInside");
+    std::filesystem::create_directories(good / "AnyPS5");
+    check = Launcher::CheckGameFolder(PortSettings::PathText(good), good / "AnyPS5");
+    Require(check.state == Launcher::FolderState::Invalid && Mentions(check.errors, "inside this dump"), "AnyPS5 inside the dump refused");
+    std::filesystem::remove(good / "AnyPS5", error);
+
+    const auto encrypted = base / "encrypted";
+    MakeDump(encrypted, std::string("\x4f\x15\x3d\x1d", 4) + std::string(60, '\0'));
+    check = Launcher::CheckGameFolder(PortSettings::PathText(encrypted), install);
+    Require(check.state == Launcher::FolderState::Invalid && Mentions(check.errors, "encrypted"), "encrypted SELF refused");
+
+    const auto partial = base / "partial";
+    WriteFile(partial / "eboot.bin", FakeEboot(true));
+    std::filesystem::create_directories(partial / "sce_sys");
+    check = Launcher::CheckGameFolder(PortSettings::PathText(partial), install);
+    Require(check.state == Launcher::FolderState::Invalid && Mentions(check.errors, "sce_module is missing"), "missing sce_module named");
+
+    MakeDump(install / "app0", FakeEboot(true));
+    check = Launcher::CheckGameFolder(PortSettings::PathText(install / "app0"), install);
+    Require(check.state == Launcher::FolderState::Invalid && Mentions(check.errors, "AnyPS5's own folder"), "AnyPS5's own app0 refused");
+    std::filesystem::remove_all(install / "app0", error);
+
+    // The release folder, the setup stamp and why the setup is due.
+    Require(Launcher::FindInstallDir(install).empty(), "no release folder without the setup script and relinker");
+    WriteFile(install / Launcher::SetupScript, "setup");
+    WriteFile(install / "tools" / Launcher::RelinkerName, "relinker");
+    WriteFile(install / "tools" / "ds_patch.py", "patch");
+    std::filesystem::create_directories(install / "libs");
+    Require(Launcher::FindInstallDir(install) == install && Launcher::FindInstallDir(install / "libs") == install, "release folder from the root or libs/");
+    Require(Launcher::SetupReason(install, good, true).find("first start") != std::string::npos, "setup due: no executable");
+    WriteFile(install / Launcher::GameExecutable, "exe");
+    std::filesystem::create_directories(install / "app0" / "sce_sys");
+    Require(Launcher::SetupReason(install, good, true).find("no record") != std::string::npos, "setup due: no stamp");
+    const auto stamp = [&](bool patched) { return Launcher::SetupStamp(good, Launcher::ToolsFingerprint(install), Launcher::DumpFingerprint(good), patched); };
+    WriteFile(install / Launcher::StampName, stamp(true));
+    Require(Launcher::SetupReason(install, good, true).empty() && Launcher::SetupReason(install, good, false).empty(), "patched stamp holds");
+    WriteFile(install / Launcher::StampName, stamp(false));
+    Require(Launcher::SetupReason(install, good, false).empty(), "unpatched stamp holds without Python 3.8+");
+    Require(Launcher::SetupReason(install, good, true).find("Python 3.8") != std::string::npos, "setup due: Python 3.8+ installed since");
+    Require(Launcher::SetupReason(install, unknown, false).find("game folder changed") != std::string::npos, "setup due: other game folder");
+    WriteFile(good / "eboot.bin", FakeEboot(true) + "updated in place");
+    Require(Launcher::SetupReason(install, good, false).find("eboot.bin changed") != std::string::npos, "setup due: dump updated in place");
+    WriteFile(install / Launcher::StampName, stamp(false));
+    WriteFile(install / "tools" / Launcher::RelinkerName, "a newer relinker");
+    Require(Launcher::SetupReason(install, good, false).find("updated") != std::string::npos, "setup due: AnyPS5 updated");
+    // Patched=no only when the setup said so (its own Python check decides).
+    Require(Launcher::SetupLeftUnpatched({"== relinking x", "WARNING: Python 3.8+ not found: DemonsSouls.exe is NOT patched and will run much slower."}) &&
+                !Launcher::SetupLeftUnpatched({"== patching DemonsSouls.exe", "applied  job-worker-spin"}),
+        "unpatched setup output recognised");
+
+    // Python as DemonsSouls.ps1 / .sh find it, never the Store alias.
+#ifdef _WIN32
+    const char* pythonName = "python.exe";
+    const std::string pathText = PortSettings::PathText(base / "WindowsApps") + ";" + PortSettings::PathText(base / "bin");
+#else
+    const char* pythonName = "python3";
+    const std::string pathText = PortSettings::PathText(base / "WindowsApps") + ":" + PortSettings::PathText(base / "bin");
+#endif
+    const auto lookup = [&](const char* name) -> const char* { return std::string_view(name) == "PATH" ? pathText.c_str() : nullptr; };
+    WriteFile(base / "WindowsApps" / pythonName, "");
+    Require(Launcher::PythonCandidates(lookup).empty(), "the WindowsApps alias is not Python");
+    WriteFile(base / "bin" / pythonName, "");
+    auto candidates = Launcher::PythonCandidates(lookup);
+    Require(candidates.size() == 1 && candidates[0].size() == 1 && std::filesystem::equivalent(Launcher::PathFromText(candidates[0][0]), base / "bin" / pythonName), "Python on PATH");
+#ifdef _WIN32
+    WriteFile(base / "bin" / "py.exe", "");
+    candidates = Launcher::PythonCandidates(lookup);
+    Require(candidates.size() == 2 && candidates[0].size() == 2 && candidates[0][1] == "-3" && candidates[0][0].ends_with("py.exe"), "py -3 tried first, as DemonsSouls.ps1 does");
+#endif
+    std::filesystem::remove_all(base, error);
+}
+
+// The launcher's process and picker text helpers (core/launcher/HostText.hpp).
+static void TestHostText() {
+    using Launcher::QuoteArgument;
+    Require(QuoteArgument(std::string("plain")) == "plain" && QuoteArgument(std::string("")) == "\"\"", "plain and empty arguments");
+    Require(QuoteArgument(std::string("D:\\")) == "D:\\" && QuoteArgument(std::string("D:\\My Games\\")) == "\"D:\\My Games\\\\\"", "a trailing backslash doubled only when quoted");
+    Require(QuoteArgument(std::string("say \"hi\"")) == "\"say \\\"hi\\\"\"" && QuoteArgument(std::string("a\\\"b")) == "\"a\\\\\\\"b\"", "quotes escaped, backslashes before them doubled");
+    Require(QuoteArgument(std::wstring(L"C:\\Program Files\\x")) == L"\"C:\\Program Files\\x\"", "wide text");
+    Require(Launcher::PercentDecode("/home/deck/My%20Games/%41") == "/home/deck/My Games/A" && Launcher::PercentDecode("50%zz%4") == "50%zz%4", "percent decoding, a trailing escape too");
+    std::string folder;
+    Require(Launcher::ParsePortalResponse("/org/freedesktop/portal/desktop/request/1_2/t: org.freedesktop.portal.Request.Response (uint32 0, {'uris': <['file:///run/media/deck/SD%20card/app0']>, 'choices': <@a(ss) []>})", folder) ==
+                    Launcher::PortalAnswer::Picked &&
+                folder == "/run/media/deck/SD card/app0",
+        "portal answer: picked folder");
+    Require(Launcher::ParsePortalResponse("x: org.freedesktop.portal.Request.Response (uint32 1, @a{sv} {})", folder) == Launcher::PortalAnswer::Cancelled, "portal answer: cancelled");
+    Require(Launcher::ParsePortalResponse("garbage", folder) == Launcher::PortalAnswer::Unreadable, "portal answer: unreadable");
+}
+
+// DeluxeEdition / AddonDir and the add-on search the entitlement query answers from (AddonContent.hpp, s61).
+static void TestAddonContent() {
+    Require(FromText("").deluxeEdition == PortSettings::DeluxeEdition::Auto, "DeluxeEdition defaults to auto");
+    Require(FromText("DeluxeEdition = off").deluxeEdition == PortSettings::DeluxeEdition::Off && FromText("DeluxeEdition = on").deluxeEdition == PortSettings::DeluxeEdition::Auto, "DeluxeEdition off / on");
+    const auto bad = FromText("DeluxeEdition = owned");
+    Require(bad.deluxeEdition == PortSettings::DeluxeEdition::Auto && bad.warnings.size() == 1, "DeluxeEdition: a bad value refused");
+    auto environment = PortSettings::Parse("DeluxeEdition = auto\n", "test.ini");
+    PortSettings::ApplyEnvironment(environment, [](const char* name) -> const char* { return std::string(name) == "APS5_DELUXE_EDITION" ? "0" : nullptr; });
+    Require(environment.deluxeEdition == PortSettings::DeluxeEdition::Off, "APS5_DELUXE_EDITION=0");
+    Require(FromText("AddonDir = \"D:\\Dumps #2\\PPSA01341-ac\" ; mine\n").addonDir == "D:\\Dumps #2\\PPSA01341-ac", "AddonDir quoted");
+    PortSettings::Settings off;
+    off.deluxeEdition = PortSettings::DeluxeEdition::Off;
+    const auto saved = PortSettings::SetIniValues("", PortSettings::LauncherValues(off));
+    Require(saved.find("DeluxeEdition = off\n") != std::string::npos && PortSettings::Parse(saved, "test.ini").deluxeEdition == PortSettings::DeluxeEdition::Off, "launcher round trip: off");
+    Require(PortSettings::SetIniValues("", PortSettings::LauncherValues(PortSettings::Settings{})).find("DeluxeEdition = auto\n") != std::string::npos, "launcher writes auto");
+    Require(PortSettings::Describe(off).find("Deluxe Edition content off") != std::string::npos && PortSettings::Describe(PortSettings::Settings{}).find("Deluxe") == std::string::npos, "describe");
+
+    Require(AddonContent::ContentIdIs("EP9000-PPSA01341_00-DEMONSSOULSGIFT2", AddonContent::DeluxeEditionLabel) && AddonContent::ContentIdIs("up9000-ppsa01342_00-demonssoulsgift2", AddonContent::DeluxeEditionLabel), "content ids of both regions");
+    Require(!AddonContent::ContentIdIs("EP9000-PPSA99999_00-DEMONSSOULSGIFT2", AddonContent::DeluxeEditionLabel) && !AddonContent::ContentIdIs("EP9000-PPSA01341_00-XDEMONSSOULSGIFT2", AddonContent::DeluxeEditionLabel), "another title's or label's id");
+
+    const auto base = std::filesystem::temp_directory_path() / "aps5-addon-test";
+    std::error_code error;
+    std::filesystem::remove_all(base, error);
+    const auto dumps = base / "dumps";
+    const auto app0 = dumps / "PPSA01341-app0";
+    MakeDump(app0, FakeEboot(true));
+    MakeDump(dumps / "PPSA21567-app0", FakeEboot(true), "PPSA21567");
+    const auto find = [&](const std::filesystem::path& addonDir = {}) { return AddonContent::Find(AddonContent::DumpFolders(app0), addonDir); };
+    Require(find().empty() && AddonContent::DumpFolders(app0).size() == 1, "a plain dump holds no add-on");
+
+    // Not an add-on: an empty folder named after the label, a non-empty one with only the name (no
+    // metadata, also "...GIFT20" and a prefixed name), the wrong title id, GIFT1 metadata in a GIFT2-named
+    // folder, the base game folder, another title's content id, a folder inside another dump (another
+    // region's app0 is not looked into).
+    std::filesystem::create_directories(dumps / "DEMONSSOULSGIFT2");
+    WriteFile(dumps / "EP9000-PPSA01341_00-DEMONSSOULSGIFT2" / "readme.txt", "just a file");
+    WriteFile(dumps / "XDEMONSSOULSGIFT2 old" / "license.dat", "x");
+    WriteFile(dumps / "DEMONSSOULSGIFT20" / "sce_sys" / "param.json", "{}");
+    WriteFile(dumps / "wrongtitle-DEMONSSOULSGIFT2" / "sce_sys" / "param.json", "{\"contentId\": \"EP9000-PPSA99999_00-DEMONSSOULSGIFT2\"}");
+    WriteFile(dumps / "gift1-DEMONSSOULSGIFT2" / "sce_sys" / "param.json", "{\"contentId\": \"EP9000-PPSA01341_00-DEMONSSOULSGIFT1\"}");
+    WriteFile(dumps / "sfo-wrongtitle" / "sce_sys" / "param.sfo", std::string(8, '\0') + "CONTENT_ID" + std::string(2, '\0') + "EP9000-PPSA99999_00-DEMONSSOULSGIFT2" + std::string(3, '\0'));
+    WriteFile(dumps / "other" / "sce_sys" / "param.json", "{\"contentId\": \"EP9000-PPSA99999_00-DEMONSSOULSGIFT2\"}");
+    MakeDump(dumps / "PPSA01342-app0", FakeEboot(true), "PPSA01342");
+    WriteFile(dumps / "PPSA01342-app0" / "DEMONSSOULSGIFT2" / "license.dat", "x");
+    auto junk = find();
+    Require(junk.size() == 1 && junk[0].label == AddonContent::PreOrderLabel && junk[0].folder.filename() == "gift1-DEMONSSOULSGIFT2", "name-only, wrong-title, empty, foreign and in-dump folders are no add-on; GIFT1 metadata is only GIFT1");
+    Require(AddonContent::FindLabel(find(dumps / "DEMONSSOULSGIFT2"), AddonContent::DeluxeEditionLabel) == nullptr && AddonContent::FindLabel(find(dumps / "gift1-DEMONSSOULSGIFT2"), AddonContent::DeluxeEditionLabel) == nullptr, "AddonDir: a bare named folder, or GIFT1 metadata in a GIFT2-named folder, is not the Deluxe Edition");
+    std::filesystem::remove_all(dumps / "gift1-DEMONSSOULSGIFT2", error);
+    // The base game folder is not an add-on even with the label in its metadata.
+    WriteFile(app0 / "sce_sys" / "param.json", "{\"contentId\": \"EP9000-PPSA01341_00-DEMONSSOULSGIFT2\", \"titleId\": \"PPSA01341\"}");
+    Require(AddonContent::FindLabel(find(), AddonContent::DeluxeEditionLabel) == nullptr, "the base game folder is no add-on");
+    MakeDump(app0, FakeEboot(true));
+
+    // Next to app0 by its metadata (content id in param.json); the pre-order gift by param.sfo two levels into an addcont folder.
+    std::filesystem::remove_all(dumps / "EP9000-PPSA01341_00-DEMONSSOULSGIFT2", error);
+    WriteFile(dumps / "EP9000-PPSA01341_00-DEMONSSOULSGIFT2" / "sce_sys" / "param.json", "{\"contentId\": \"EP9000-PPSA01341_00-DEMONSSOULSGIFT2\"}");
+    WriteFile(dumps / "addcont" / "PPSA01341" / "gift" / "sce_sys" / "param.sfo", std::string(8, '\0') + "CONTENT_ID" + std::string(2, '\0') + "EP9000-PPSA01341_00-DEMONSSOULSGIFT1" + std::string(3, '\0'));
+    auto found = find();
+    const auto* deluxe = AddonContent::FindLabel(found, AddonContent::DeluxeEditionLabel);
+    const auto* preOrder = AddonContent::FindLabel(found, AddonContent::PreOrderLabel);
+    Require(found.size() == 2 && deluxe != nullptr && deluxe->reason == "its sce_sys/param.json" && deluxe->folder.filename() == "EP9000-PPSA01341_00-DEMONSSOULSGIFT2", "Deluxe Edition next to app0 by param.json");
+    Require(preOrder != nullptr && preOrder->reason == "its param.sfo" && preOrder->folder.filename() == "gift", "pre-order gift by param.sfo in addcont");
+
+    // By param.json in a folder named with the title id; and in the player's AddonDir anywhere else.
+    std::filesystem::remove_all(dumps / "EP9000-PPSA01341_00-DEMONSSOULSGIFT2", error);
+    std::filesystem::remove_all(dumps / "addcont", error);
+    WriteFile(dumps / "PPSA01341-ac" / "1" / "sce_sys" / "param.json", "{\n  \"contentId\" : \"EP9000-PPSA01341_00-DEMONSSOULSGIFT2\",\n  \"titleId\": \"PPSA01341\"\n}\n");
+    found = find();
+    Require(found.size() == 1 && found[0].label == AddonContent::DeluxeEditionLabel && found[0].reason == "its sce_sys/param.json", "Deluxe Edition by param.json in PPSA01341-ac");
+    std::filesystem::remove_all(dumps / "PPSA01341-ac", error);
+    WriteFile(base / "elsewhere" / "EP9000-PPSA01341_00-DEMONSSOULSGIFT2" / "license.dat", "x");
+    Require(find().empty() && find(base / "elsewhere").empty(), "AddonDir: a named folder without metadata is not it");
+    WriteFile(base / "elsewhere" / "EP9000-PPSA01341_00-DEMONSSOULSGIFT2" / "sce_sys" / "param.json", "{\"contentId\": \"EP9000-PPSA01341_00-DEMONSSOULSGIFT2\"}");
+    Require(find().empty() && find(base / "elsewhere").size() == 1, "AddonDir names a folder elsewhere");
+
+    // What the query answers: the file's labels but its Deluxe Edition, then the dump's (Deluxe only when on).
+    const std::vector<AddonContent::Found> both{{AddonContent::PreOrderLabel, "a", "its name"}, {AddonContent::DeluxeEditionLabel, "b", "its name"}};
+    std::vector<std::string> notes;
+    auto labels = AddonContent::AnsweredLabels({"OTHERADDON", AddonContent::DeluxeEditionLabel}, both, true, notes);
+    Require(labels == std::vector<std::string>{"OTHERADDON", AddonContent::PreOrderLabel, AddonContent::DeluxeEditionLabel} && notes.size() == 1, "found: owned");
+    notes.clear();
+    labels = AddonContent::AnsweredLabels({AddonContent::DeluxeEditionLabel}, {}, true, notes);
+    Require(labels.empty() && notes.size() == 1, "the entitlements file alone does not make it owned");
+    notes.clear();
+    labels = AddonContent::AnsweredLabels({}, both, false, notes);
+    Require(labels == std::vector<std::string>{AddonContent::PreOrderLabel} && notes.size() == 1, "DeluxeEdition = off: not owned");
+    std::filesystem::remove_all(base, error);
+}
+
 int main() {
+    TestAddonContent();
+    TestLauncher();
+    TestGameFolder();
+    TestHostText();
     TestReviewFixes();
     TestResolution4kUi();
     TestNativeAspect();

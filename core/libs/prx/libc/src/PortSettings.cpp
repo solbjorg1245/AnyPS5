@@ -1,9 +1,11 @@
 #include "prx/libc/include/PortSettings.hpp"
 #include "prx/libc/include/General.hpp"
 
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <sstream>
@@ -16,8 +18,12 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <shellapi.h>
 #else
+#include <spawn.h>
+#include <sys/wait.h>
 #include <unistd.h>
+extern char** environ;
 #endif
 
 namespace {
@@ -77,6 +83,114 @@ std::string ReadFile(const std::filesystem::path& path, bool& found) {
     return text.str();
 }
 
+// The host command line, argv[0] first (the guest sees only argv[0] on Windows).
+std::vector<std::string> HostArguments() {
+    std::vector<std::string> args;
+#ifdef _WIN32
+    int count = 0;
+    wchar_t** wide = CommandLineToArgvW(GetCommandLineW(), &count);
+    if (wide == nullptr) return args;
+    for (int index = 0; index < count; ++index) args.push_back(PortSettings::PathText(std::filesystem::path(wide[index])));
+    LocalFree(wide);
+#else
+    std::ifstream stream("/proc/self/cmdline", std::ios::binary);
+    for (std::string argument; std::getline(stream, argument, '\0');) args.push_back(argument);
+#endif
+    return args;
+}
+
+// anyps5-launcher next to the executable, else in its libs folder (the release layout); empty when missing.
+std::filesystem::path FindLauncher() {
+#ifdef _WIN32
+    const std::string name = std::string(PortSettings::LauncherName) + ".exe";
+#else
+    const std::string name = PortSettings::LauncherName;
+#endif
+    const auto directory = ExecutableDirectory();
+    for (const auto& candidate : {directory / name, directory / "libs" / name}) {
+        std::error_code error;
+        if (std::filesystem::is_regular_file(candidate, error)) return candidate;
+    }
+    return {};
+}
+
+// Runs the launcher on the settings file and waits for it (its lines go to this process's stderr): its
+// exit code, -1 when it did not start or ended on a signal.
+int SpawnLauncher(const std::filesystem::path& launcher, const std::filesystem::path& file, std::string& error) {
+#ifdef _WIN32
+    std::wstring command = L"\"" + launcher.wstring() + L"\" --settings \"" + file.wstring() + L"\"";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(launcher.c_str(), command.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &startup, &process)) {
+        error = "CreateProcess error " + std::to_string(GetLastError());
+        return -1;
+    }
+    WaitForSingleObject(process.hProcess, INFINITE);
+    DWORD code = 0;
+    if (!GetExitCodeProcess(process.hProcess, &code)) code = static_cast<DWORD>(-1);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return static_cast<int>(code);
+#else
+    std::string program = launcher.string();
+    std::string option = "--settings";
+    std::string path = file.string();
+    char* argv[] = {program.data(), option.data(), path.data(), nullptr};
+    pid_t child = 0;
+    if (const int result = posix_spawn(&child, program.c_str(), nullptr, nullptr, argv, environ); result != 0) {
+        error = std::string("posix_spawn: ") + std::strerror(result);
+        return -1;
+    }
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) {
+            error = std::string("waitpid: ") + std::strerror(errno);
+            return -1;
+        }
+    }
+    if (!WIFEXITED(status)) error = "ended on signal " + std::to_string(WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+}
+
+// The settings launcher (s61, default on; --launch, APS5_NO_LAUNCHER=1 or APS5_LAUNCHER=0 skip it): runs
+// before the file is read, so its choices apply to this start. Closing its window ends the process here,
+// before the window, Vulkan or the path overlay exist; a launcher that fails or is missing leaves the file
+// as it is and the game starts.
+void RunLauncher(const std::filesystem::path& file) {
+    if (const char* reason = PortSettings::LauncherSkipReason(HostArguments(), [](const char* name) { return static_cast<const char*>(std::getenv(name)); })) {
+        std::fprintf(stderr, "[launcher] not shown (%s)\n", reason);
+        return;
+    }
+    const auto launcher = FindLauncher();
+    if (launcher.empty()) {
+        std::fprintf(stderr, "[launcher] not shown: %s not found next to the executable or in its libs folder\n", PortSettings::LauncherName);
+        return;
+    }
+    std::fflush(stderr);
+    std::string error;
+    const int code = SpawnLauncher(launcher, file, error);
+    if (code == 0) {
+        std::fprintf(stderr, "[launcher] Play\n");
+    } else if (code == PortSettings::LauncherExitQuit) {
+        std::fprintf(stderr, "[launcher] closed without Play: exiting\n");
+        std::fflush(stderr);
+        std::fflush(stdout);
+#ifdef _WIN32
+        TerminateProcess(GetCurrentProcess(), 0);
+#endif
+        std::_Exit(0);
+    } else {
+        std::fprintf(stderr, "[launcher] %s failed (%s): starting with %s as it is\n", PortSettings::PathText(launcher).c_str(),
+            error.empty() ? ("exit code " + std::to_string(code)).c_str() : error.c_str(), PortSettings::PathText(file).c_str());
+    }
+}
+
 PortSettings::Settings Load() {
     PortSettings::Settings settings;
     const char* configured = std::getenv("APS5_SETTINGS");
@@ -84,6 +198,7 @@ PortSettings::Settings Load() {
     if (!explicitPath || PortSettings::Lower(configured) != "none") {
         const auto path = explicitPath ? EnvironmentPath("APS5_SETTINGS") : ExecutableDirectory() / PortSettings::FileName;
         const std::string display = PortSettings::PathText(path);
+        RunLauncher(path);
         try {
             bool found = false;
             const auto text = ReadFile(path, found);
