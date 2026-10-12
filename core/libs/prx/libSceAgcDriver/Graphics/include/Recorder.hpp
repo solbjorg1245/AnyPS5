@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LaneCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LaneChain.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LaneEdges.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include <atomic>
 #include <chrono>
@@ -576,6 +577,19 @@ public:
     // the compute queue, and signals the one-shot timeline the next compute batch waits for. Under
     // GuestMemory::GpuMutex. Off: the plain vkQueueSubmit.
     VkResult SubmitOneShot(VkSubmitInfo submission, VkFence fence);
+    // The timeline values that mean "every batch up to `serial` completed" (WaitSerial and the
+    // hook's unlocked wait): the one timeline at `serial`, or with APS5_ASYNC_COMPUTE each lane's
+    // timeline at its value (LaneHistory; a lane with nothing to wait for is left out).
+    struct TimelineWait {
+        std::array<VkSemaphore, 2> semaphores{};
+        std::array<std::uint64_t, 2> values{};
+        std::array<Lane, 2> lanes{};
+        std::uint32_t count = 0;
+    };
+    TimelineWait TimelineWaitFor(std::uint64_t serial) const;
+    // APS5_ASYNC_COMPUTE: the calling thread's lane took a staged shadow lane `registered` filled
+    // (GuestBufferMemory.cpp): its next batch would wait for the other lane's newest (LaneEdges).
+    void NoteShadowTake(Lane registered) const;
     // Batches submitted and not yet finished (what a full Sync() waits for); under GuestMemory::GpuMutex.
     std::size_t InFlightBatches() const { return inFlight.size(); }
     // Reaps that retired at least one batch so far (the [recorder] line's 'with work' count).
@@ -644,7 +658,13 @@ public:
         // reads them without the GPU mutex: diagnostic only.
         std::uint64_t serial;
         bool open;
+        // APS5_ASYNC_COMPUTE only (zero otherwise): per lane (LaneIndex), the newest batch whose
+        // label store makes up the value (an open batch's serial is Submissions() + 1).
+        std::array<std::uint64_t, 2> producers{};
     };
+    // APS5_ASYNC_COMPUTE (LaneEdges.hpp): a wait of lane `waiter` took `hit` (WaitMemory.cpp), so its
+    // lane's next batch would wait for the other lane's batch that stores it. Any thread.
+    static void NoteLabelEdge(Lane waiter, const LabelHit& hit);
     // Why a lookup refused a late candidate (an entry with stamp <= afterStamp), for the trace.
     // BehindCompletion replaces the other reasons when the refused entry's value reaches memory
     // only through a completion action of its batch (AfterCompletions: the GPU has no view of the
@@ -1014,6 +1034,10 @@ private:
         Lane lane = Lane::G;
         std::size_t inherited = 0;
         std::size_t inheritedBytes = 0;
+        // APS5_ASYNC_COMPUTE: it recorded commands whose writes no noted range covers (`edgeProducer`),
+        // or drew or dispatched (`edgeImage`): the other lane's next batch needs it (LaneEdges).
+        bool edgeProducer = false;
+        bool edgeImage = false;
         std::chrono::steady_clock::time_point submittedAt{};
         VkQueryPool queries = VK_NULL_HANDLE;
         VkQueryPool samples = VK_NULL_HANDLE;
@@ -1123,6 +1147,10 @@ private:
         bool overwritten = false;
         // The value lands in memory only when the batch's completion actions run (LabelRefusal::BehindCompletion).
         bool behindCompletion = false;
+        // APS5_ASYNC_COMPUTE: the batch's serial (an open batch's is the one it will get) and lane,
+        // copied at the note, so a lookup without the GPU mutex never reads the batch.
+        std::uint64_t serial = 0;
+        Lane lane = Lane::G;
     };
     void readGpuTiming(Batch& batch);
     void beginSamples(Batch& batch);
@@ -1298,6 +1326,20 @@ private:
     // next batch takes.
     LaneChain lanes;
     VkSemaphore oneShotTimeline = VK_NULL_HANDLE;
+    // APS5_ASYNC_COMPUTE (LaneEdges.hpp; set by the constructor, so read without the mutex too): lane
+    // C's timeline (lane G's is `timeline`) and the counter query for the hang line; the history
+    // mapping a serial to both lanes' values (under completedMutex); the edges counted (under the
+    // GpuMutex); the label and shadow needs any thread notes, taken by the lane's next submit.
+    VkSemaphore computeTimeline = VK_NULL_HANDLE;
+    bool twoTimelines = false;
+    PFN_vkGetSemaphoreCounterValueKHR counterValue = nullptr;
+    LaneHistory history;
+    LaneEdges edges;
+    std::array<std::atomic<std::uint64_t>, 2> labelNeeds{};
+    mutable std::array<std::atomic<bool>, 2> shadowTakes{};
+    VkSemaphore laneTimeline(Lane lane) const { return twoTimelines && lane == Lane::C ? computeTimeline : timeline; }
+    // Submit's edge count for `batch` (to be serial `serial`; `chained`: the chain makes it wait).
+    void noteEdges(const Batch& batch, std::uint64_t serial, bool chained);
     int laneSwitchBlocked = 0;
     std::vector<std::shared_ptr<void>> handedOver;
     std::size_t handedOverBytes = 0;

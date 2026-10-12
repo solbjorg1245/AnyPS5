@@ -7120,15 +7120,10 @@ void gpuTimingRecorderTests(const Device& device, Recorder& recorder) {
 // APS5_COMPUTE_QUEUE (phase fewer-submits S3): lane C's batches go to a second queue of the family,
 // lane G's to the first, chained by the recorder's timelines in the one serial order of a single
 // queue. Its own device and recorder (timeline semaphores, two queues), not the main one.
-void computeQueueTests() {
-    std::unique_ptr<Device> device;
-    try {
-        device = std::make_unique<Device>(true);
-    } catch (const SkipTest& skip) {
-        std::cout << "compute queue tests skipped: " << skip.reason << '\n';
-        return;
-    }
-    const auto& context = device->GetContext();
+// `asyncCompute` (APS5_ASYNC_COMPUTE, S4a): 1 gives each lane a timeline of its own; the chain still
+// orders the batches, so every check holds as with one timeline.
+void computeQueueRun(Context context, int asyncCompute) {
+    context.asyncCompute = asyncCompute;
     std::lock_guard gpu(GpuMutex());
     Recorder recorder(context, true);
     Require(recorder.HasTimeline(), "the compute queue recorder has no timeline");
@@ -7179,6 +7174,14 @@ void computeQueueTests() {
     recordCopy(recorder.Commands(), rounds);
     recorder.Submit();
     Require(recorder.Submissions() == computeSerial + 1, "the compute batch and the copy batch are not two submissions");
+    if (asyncCompute != 0) {
+        // A timeline per lane: the copy's serial on lane G with the compute batch's on lane C; the
+        // compute serial with lane G's batch before it (part a's last copy).
+        const auto both = recorder.TimelineWaitFor(computeSerial + 1);
+        Require(both.count == 2 && both.lanes[0] == Lane::G && both.values[0] == computeSerial + 1 && both.lanes[1] == Lane::C && both.values[1] == computeSerial, "a lane G serial's wait does not name lane C's newest batch below it");
+        const auto compute = recorder.TimelineWaitFor(computeSerial);
+        Require(compute.count == 2 && compute.values[0] == computeSerial - 1 && compute.values[1] == computeSerial, "a compute serial's wait does not name lane G's newest batch below it");
+    }
     recorder.WaitSerial(computeSerial);
     recorder.FinishUpTo(computeSerial);
     Require(recorder.InFlightBatches() <= 1, "the compute batch was not completed in order after WaitSerial");
@@ -7225,7 +7228,19 @@ void computeQueueTests() {
     Require(slot(rounds + 1) == 0xb2b2u, "a compute batch after a one-shot did not run after it, or lane G read a stale value");
     Require(slot(rounds) == 0xa1a1u, "the one-shot's copy was overwritten");
     AgcDriver::GuestMemory::TagGpuLockThread(tag);
-    std::cout << "compute queue chain checked\n";
+    std::cout << "compute queue chain checked" << (asyncCompute != 0 ? " with a timeline per lane (APS5_ASYNC_COMPUTE=1)" : "") << '\n';
+}
+
+void computeQueueTests() {
+    std::unique_ptr<Device> device;
+    try {
+        device = std::make_unique<Device>(true);
+    } catch (const SkipTest& skip) {
+        std::cout << "compute queue tests skipped: " << skip.reason << '\n';
+        return;
+    }
+    computeQueueRun(device->GetContext(), 0);
+    computeQueueRun(device->GetContext(), 1);
 }
 
 int main() {

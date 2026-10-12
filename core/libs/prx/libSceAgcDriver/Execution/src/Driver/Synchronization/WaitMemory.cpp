@@ -173,6 +173,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             using Census = Graphics::LaneCensus;
             Census::Shared().LabelHit(Graphics::LaneOf(queue), Graphics::LaneOf(hit->queue), hit->late ? Census::LabelState::Late : hit->open ? Census::LabelState::Open : Census::LabelState::InFlight, hit->serial);
         }
+        // APS5_ASYNC_COMPUTE: what this queue records next follows the batch storing the label.
+        if (Graphics::AsyncComputeLevel() != 0) Graphics::Recorder::NoteLabelEdge(Graphics::LaneOf(queue), *hit);
         if (hit->queue == queue) {
             ++outcomes.fromRecorderSameQueue;
             if (!hit->late) epochPoint.bump = false;

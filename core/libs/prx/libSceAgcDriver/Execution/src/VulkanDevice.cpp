@@ -1177,6 +1177,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 1, &state->computeQueue);
         std::fprintf(stderr, "[recorder] compute queue: lane C submits to queue family %u index 1, chained in serial order (APS5_COMPUTE_QUEUE=1)\n", family);
     }
+    // APS5_ASYNC_COMPUTE needs the second queue (the recorder prints the line when it is on).
+    if (const int level = Graphics::AsyncComputeLevel(); level != 0 && queueInfo.queueCount != 2) std::fprintf(stderr, "[recorder] async compute: off, %s (APS5_ASYNC_COMPUTE=%d)\n", Graphics::ComputeQueueAsked() ? "no second queue" : "APS5_COMPUTE_QUEUE=1 is not set", level);
     if (checkpoints) Graphics::InstallCheckpoints(state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV"), state->DeviceFunction<PFN_vkGetQueueCheckpointDataNV>("vkGetQueueCheckpointDataNV"), state->queue, state->computeQueue);
     else if (Graphics::CheckpointsRequested()) std::fprintf(stderr, "[checkpoints] VK_NV_device_diagnostic_checkpoints unavailable\n");
     APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family);
@@ -2605,6 +2607,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.memoryBudget = state->memoryBudget;
     context.memoryProperties2 = state->memoryProperties2;
     context.computeQueue = state->computeQueue;
+    context.asyncCompute = state->computeQueue != VK_NULL_HANDLE ? Graphics::AsyncComputeLevel() : 0;
     return context;
 }
 
