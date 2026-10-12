@@ -1,0 +1,4 @@
+// The relinker's Windows manifest (s61): the process code page is UTF-8 (Windows 10 1903 and later), so its
+// char argv, std::filesystem paths and fopen take a dump or AnyPS5 folder whose name is outside the ANSI
+// code page (the launcher and DemonsSouls.ps1 pass such paths on).
+1 24 "relinker.manifest"

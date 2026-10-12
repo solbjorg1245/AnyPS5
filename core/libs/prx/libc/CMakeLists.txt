@@ -1,6 +1,7 @@
 target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/Export.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/General.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/GraphicsModePin.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/PortSettings.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/gcc/StackGuard.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/windows/CrashReport.cpp
@@ -240,8 +241,37 @@ if(BUILD_TESTING)
     add_test(NAME crash_memory COMMAND crash_memory_tests)
 endif()
 
+add_test_executable(engine_switches_tests EXCLUDE_FROM_ALL ${LIBS_INCLUDE_DIR}/tests/EngineSwitches.cpp)
+target_include_directories(engine_switches_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(engine_switches_tests PRIVATE libc libkernel)
+set_target_properties(engine_switches_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(engine_switches_tests)
+if(BUILD_TESTING)
+    set_target_properties(engine_switches_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME engine_switches COMMAND engine_switches_tests)
+    if(WIN32)
+        set_tests_properties(engine_switches PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(graphics_mode_pin_tests EXCLUDE_FROM_ALL ${LIBS_INCLUDE_DIR}/tests/GraphicsModePin.cpp)
+target_include_directories(graphics_mode_pin_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(graphics_mode_pin_tests PRIVATE libc libkernel)
+set_target_properties(graphics_mode_pin_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(graphics_mode_pin_tests)
+if(BUILD_TESTING)
+    set_target_properties(graphics_mode_pin_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME graphics_mode_pin COMMAND graphics_mode_pin_tests)
+    if(WIN32)
+        set_tests_properties(graphics_mode_pin PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(port_settings_tests EXCLUDE_FROM_ALL ${LIBS_INCLUDE_DIR}/tests/PortSettings.cpp)
-target_include_directories(port_settings_tests PRIVATE ${LIBS_INCLUDE_DIR})
+# ../launcher: the settings launcher's game folder checks (GameFolder.hpp) are tested here too.
+target_include_directories(port_settings_tests PRIVATE ${LIBS_INCLUDE_DIR} ${LIBS_INCLUDE_DIR}/../launcher)
 target_link_libraries(port_settings_tests PRIVATE libc libkernel)
 set_target_properties(port_settings_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(port_settings_tests)

@@ -23,8 +23,8 @@
 #include <vector>
 
 // Player settings: anyps5-settings.ini next to the executable (APS5_SETTINGS=<file> names another one,
-// APS5_SETTINGS=none skips it), one "Key = Value" per line, '#' or ';' starts a comment, [sections] are
-// ignored. The APS5_* variable after each key overrides it. A key left out keeps today's behaviour: the
+// APS5_SETTINGS=none skips it), one "Key = Value" per line, '#' or ';' starts a comment (not inside a
+// "quoted" value), [sections] are ignored. The APS5_* variable after each key overrides it. A key left out keeps today's behaviour: the
 // window opens at 60% of the screen and the title's render config (its performance or cinematic mode)
 // picks the render resolution and the frame rate.
 //   Resolution = 1280x800     APS5_RESOLUTION       output size: window client area (letterboxed), render tier
@@ -43,6 +43,10 @@
 //                             APS5_NO_RESOLUTION_4K_UI=1 (environment only): Resolution or RenderResolution
 //                             up to 1080p runs its tier's own 1080p-display slot again (same HUD fault)
 //   Upscaler = off            APS5_UPSCALER         reserved: fsr, dlss (UpscalerQuality and FrameGeneration: file only, reserved)
+//   GameDir = "D:\PPSA01341-app0"                   the player's dump (app0), set by the launcher; the game ignores it
+//   DeluxeEdition = auto      APS5_DELUXE_EDITION   the Deluxe Edition add-on, owned when the dump holds it
+//                                                   (AddonContent.hpp); off answers 'not owned' even then
+//   AddonDir = "D:\PPSA01341-ac"                    a folder holding the dumped add-ons, when not next to app0
 // The title takes one fixed physics step of 1/refresh per rendered frame (59.94 Hz in its 60 FPS mode,
 // 29.97 Hz in its 30 FPS mode), so any other limit, and any frame rate below the limit, changes the game
 // speed unless Timestep = variable (libSceVideoOut TimestepPatch) feeds it the measured frame rate.
@@ -56,6 +60,7 @@ inline constexpr double DefaultTimestepMinHz = 20000.0 / 1001.0;
 
 enum class WindowMode { Auto, Windowed, Fullscreen };
 enum class Upscaler { Off, Fsr, Dlss };
+enum class DeluxeEdition { Auto, Off };
 
 struct Settings {
     std::string source;
@@ -76,6 +81,9 @@ struct Settings {
     Upscaler upscaler = Upscaler::Off;
     std::string upscalerQuality;
     bool frameGeneration = false;
+    std::string gameDir;  // UTF-8, without the quotes
+    DeluxeEdition deluxeEdition = DeluxeEdition::Auto;
+    std::string addonDir;  // UTF-8, without the quotes
     std::vector<std::string> warnings;
 
     bool Any() const { return width != 0 || renderHeight != 0 || fpsLimit != 0.0 || variableTimestep || windowMode != WindowMode::Auto || nativeAspect; }
@@ -136,18 +144,40 @@ inline std::string PathText(const std::filesystem::path& path) {
 // The only game build the timestep patch's table layout is known for (gameversion.txt of the title).
 inline constexpr const char* SupportedBuildVersion = "2025-10-15.877562";
 
-// True when gameversion.txt text has a "BuildVersion=<id>" line (a leading '+' is the title's own
-// argument syntax) with exactly the supported id.
-inline bool BuildVersionSupported(std::string_view text) {
+// The id of gameversion.txt text's "BuildVersion=<id>" line (a leading '+' is the title's own argument
+// syntax), empty without one.
+inline std::string_view BuildVersionOf(std::string_view text) {
     while (!text.empty()) {
         const auto end = text.find('\n');
         auto line = Trim(text.substr(0, end));
         text = end == std::string_view::npos ? std::string_view{} : text.substr(end + 1);
         if (line.starts_with('+')) line.remove_prefix(1);
         constexpr std::string_view key = "BuildVersion=";
-        if (line.starts_with(key)) return Trim(line.substr(key.size())) == SupportedBuildVersion;
+        if (line.starts_with(key)) return Trim(line.substr(key.size()));
     }
-    return false;
+    return {};
+}
+
+// True when gameversion.txt text names exactly the supported build.
+inline bool BuildVersionSupported(std::string_view text) {
+    return BuildVersionOf(text) == SupportedBuildVersion;
+}
+
+// Where a line's comment starts ('#' or ';' outside "double quotes", so a quoted path may hold them), npos without one.
+inline std::size_t CommentStart(std::string_view line) {
+    bool quoted = false;
+    for (std::size_t index = 0; index < line.size(); ++index) {
+        if (line[index] == '"') quoted = !quoted;
+        else if (!quoted && (line[index] == '#' || line[index] == ';')) return index;
+    }
+    return std::string_view::npos;
+}
+
+// A value without its surrounding double quotes (GameDir is written quoted).
+inline std::string_view Unquote(std::string_view value) {
+    value = Trim(value);
+    if (value.size() >= 2 && value.front() == '"' && value.back() == '"') value = value.substr(1, value.size() - 2);
+    return value;
 }
 
 // Writes `content` to a temporary sibling and renames it over `target`, so a reader (or a second
@@ -282,6 +312,14 @@ inline void SetKey(Settings& settings, std::string_view key, std::string_view va
     } else if (name == "framegeneration") {
         if (text == "off" || text == "0") settings.frameGeneration = false;
         else settings.warnings.push_back(origin + ": FrameGeneration is not implemented yet; using off");
+    } else if (name == "gamedir") {
+        settings.gameDir = std::string(Unquote(value));
+    } else if (name == "deluxeedition") {
+        if (text == "auto" || text == "on" || text == "1" || text == "true") settings.deluxeEdition = DeluxeEdition::Auto;
+        else if (text == "off" || text == "0" || text == "false") settings.deluxeEdition = DeluxeEdition::Off;
+        else refuse("auto or off");
+    } else if (name == "addondir") {
+        settings.addonDir = std::string(Unquote(value));
     } else {
         settings.warnings.push_back(origin + ": unknown key '" + std::string(Trim(key)) + "'");
     }
@@ -296,7 +334,7 @@ inline Settings Parse(std::string_view text, const std::string& origin) {
         auto line = text.substr(0, end);
         text = end == std::string_view::npos ? std::string_view{} : text.substr(end + 1);
         ++lineNumber;
-        line = Trim(line.substr(0, line.find_first_of("#;")));
+        line = Trim(line.substr(0, CommentStart(line)));
         if (line.empty() || line.front() == '[') continue;
         const auto separator = line.find('=');
         const auto where = origin + ":" + std::to_string(lineNumber);
@@ -309,12 +347,14 @@ inline Settings Parse(std::string_view text, const std::string& origin) {
     return settings;
 }
 
+// The variable that overrides each key (the launcher names the ones set, which win over its choices).
+inline constexpr std::array<std::pair<const char*, const char*>, 9> EnvironmentKeys{{
+    {"APS5_RESOLUTION", "Resolution"}, {"APS5_RENDER_RESOLUTION", "RenderResolution"}, {"APS5_FPS_LIMIT", "FpsLimit"},
+    {"APS5_TIMESTEP", "Timestep"}, {"APS5_TIMESTEP_MIN_HZ", "TimestepMinHz"}, {"APS5_WINDOW_MODE", "WindowMode"},
+    {"APS5_NATIVE_ASPECT", "NativeAspect"}, {"APS5_UPSCALER", "Upscaler"}, {"APS5_DELUXE_EDITION", "DeluxeEdition"}}};
+
 inline void ApplyEnvironment(Settings& settings, const std::function<const char*(const char*)>& lookup) {
-    static constexpr std::array<std::pair<const char*, const char*>, 8> variables{{
-        {"APS5_RESOLUTION", "Resolution"}, {"APS5_RENDER_RESOLUTION", "RenderResolution"}, {"APS5_FPS_LIMIT", "FpsLimit"},
-        {"APS5_TIMESTEP", "Timestep"}, {"APS5_TIMESTEP_MIN_HZ", "TimestepMinHz"}, {"APS5_WINDOW_MODE", "WindowMode"},
-        {"APS5_NATIVE_ASPECT", "NativeAspect"}, {"APS5_UPSCALER", "Upscaler"}}};
-    for (const auto& [variable, key] : variables) {
+    for (const auto& [variable, key] : EnvironmentKeys) {
         const char* value = lookup(variable);
         if (value != nullptr && value[0] != '\0') SetKey(settings, key, value, variable);
     }
@@ -684,7 +724,126 @@ inline std::string Describe(const Settings& settings) {
     }
     result += settings.windowMode == WindowMode::Fullscreen ? ", WindowMode fullscreen" : settings.windowMode == WindowMode::Windowed ? ", WindowMode windowed" : "";
     result += ", Upscaler off";
+    if (settings.deluxeEdition == DeluxeEdition::Off) result += ", Deluxe Edition content off";
     result += settings.source.empty() ? " (no settings file)" : " (" + settings.source + ")";
+    return result;
+}
+
+// The settings launcher (s61, core/launcher: anyps5-launcher next to the executable or in its libs folder).
+// libc runs it before the settings load (PortSettings.cpp) and waits; it rewrites the file. Exit code 0 =
+// Play (the game starts and reads the file), LauncherExitQuit = its window was closed (the game exits), any
+// other code = it failed (the game starts with the file as it is).
+inline constexpr const char* LauncherName = "anyps5-launcher";
+inline constexpr const char* LaunchArgument = "--launch";
+inline constexpr int LauncherExitQuit = 3;
+
+// Why the launcher is not shown, nullptr to show it: --launch on the host command line (Steam launch
+// options "%command% --launch"), APS5_NO_LAUNCHER=1 (any value but 0) or APS5_LAUNCHER=0 (the test
+// harness), APS5_SETTINGS=none (no file to edit). `args` is the host argv, argv[0] first.
+inline const char* LauncherSkipReason(const std::vector<std::string>& args, const std::function<const char*(const char*)>& lookup) {
+    for (std::size_t index = 1; index < args.size(); ++index) if (args[index] == LaunchArgument) return LaunchArgument;
+    const auto set = [&](const char* name) -> const char* { const char* value = lookup(name); return value != nullptr && value[0] != '\0' ? value : nullptr; };
+    if (const char* value = set("APS5_NO_LAUNCHER"); value != nullptr && std::string_view(value) != "0") return "APS5_NO_LAUNCHER";
+    if (const char* value = set("APS5_LAUNCHER"); value != nullptr && std::string_view(value) == "0") return "APS5_LAUNCHER=0";
+    if (const char* value = set("APS5_SETTINGS"); value != nullptr && Lower(value) == "none") return "APS5_SETTINGS=none";
+    return nullptr;
+}
+
+// The launcher's choices made consistent the way Normalize would refuse them otherwise: an FpsLimit other
+// than the title's 30 or 60 turns the variable timestep on, native aspect needs an explicit Resolution.
+inline void ApplyLauncherRules(Settings& settings) {
+    if (settings.fpsLimit != 0.0 && !IsGameRate(settings.fpsLimit)) settings.variableTimestep = true;
+    if (settings.width == 0) settings.nativeAspect = false;
+}
+
+// Shortest text that parses back to the same number (locale independent, like ParseNumber).
+inline std::string FormatNumber(double value) {
+    char text[32];
+    const auto result = std::to_chars(text, text + sizeof(text), value);
+    return result.ec == std::errc{} ? std::string(text, result.ptr) : std::string("0");
+}
+
+// The keys the launcher writes, as values Parse reads back to the same settings.
+inline std::vector<std::pair<std::string, std::string>> LauncherValues(const Settings& settings) {
+    return {
+        {"Resolution", settings.width == 0 ? std::string("auto") : std::to_string(settings.width) + "x" + std::to_string(settings.height)},
+        {"WindowMode", settings.windowMode == WindowMode::Fullscreen ? "fullscreen" : "windowed"}, // auto is windowed (DisplayWindow)
+        {"FpsLimit", settings.fpsLimit == 0.0 ? std::string("auto") : FormatNumber(settings.fpsLimit)},
+        {"Timestep", settings.variableTimestep ? "variable" : "fixed"},
+        {"NativeAspect", settings.nativeAspect ? "on" : "off"},
+        {"DeluxeEdition", settings.deluxeEdition == DeluxeEdition::Off ? "off" : "auto"}};
+}
+
+// LauncherValues plus the game folder, quoted (a path may hold '#' or ';'). An empty folder is written as
+// GameDir = "" with `keepEmpty` (the launcher's own window: a cleared field clears the saved folder), else
+// left out.
+inline std::vector<std::pair<std::string, std::string>> LauncherValuesWithGameDir(const Settings& settings, bool keepEmpty = false) {
+    auto values = LauncherValues(settings);
+    if (keepEmpty || !settings.gameDir.empty()) values.emplace_back("GameDir", "\"" + settings.gameDir + "\"");
+    return values;
+}
+
+// The file's text with each key set to its value. Every active "Key = Value" line of a key (any case) gets
+// the new value and keeps its indentation, key spelling and trailing comment; a key without such a line is
+// appended. Comments (also commented-out keys), sections, other keys, a UTF-8 BOM and the line endings stay
+// byte for byte; appended lines use the file's line ending (LF for a new file).
+inline std::string SetIniValues(std::string_view text, const std::vector<std::pair<std::string, std::string>>& values) {
+    const char* const newline = text.find("\r\n") != std::string_view::npos ? "\r\n" : "\n";
+    std::vector<bool> written(values.size(), false);
+    std::string result;
+    result.reserve(text.size() + 32 * values.size());
+    std::size_t start = 0;
+    if (text.starts_with("\xEF\xBB\xBF")) {
+        result += text.substr(0, 3);
+        start = 3;
+    }
+    while (start < text.size()) {
+        const auto end = text.find('\n', start);
+        auto line = text.substr(start, end == std::string_view::npos ? std::string_view::npos : end - start);
+        std::string_view ending = end == std::string_view::npos ? "" : "\n";
+        if (!line.empty() && line.back() == '\r') {
+            line.remove_suffix(1);
+            ending = end == std::string_view::npos ? "\r" : "\r\n";
+        }
+        start = end == std::string_view::npos ? text.size() : end + 1;
+        const auto comment = CommentStart(line);
+        const auto body = line.substr(0, comment);
+        const auto separator = body.find('=');
+        const auto trimmed = Trim(body);
+        std::size_t match = values.size();
+        if (separator != std::string_view::npos && !trimmed.empty() && trimmed.front() != '[') {
+            const auto key = Lower(Trim(body.substr(0, separator)));
+            for (std::size_t index = 0; index < values.size(); ++index) {
+                if (Lower(values[index].first) == key) {
+                    match = index;
+                    break;
+                }
+            }
+        }
+        if (match == values.size()) {
+            result += line;
+            result += ending;
+            continue;
+        }
+        const auto indent = body.find_first_not_of(" \t");
+        result += body.substr(0, indent);
+        result += Trim(body.substr(0, separator));
+        result += " = ";
+        result += values[match].second;
+        if (comment != std::string_view::npos) {
+            result += body.substr(body.find_last_not_of(" \t") + 1);
+            result += line.substr(comment);
+        }
+        result += ending;
+        written[match] = true;
+    }
+    bool open = !result.empty() && result.back() != '\n';
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (written[index]) continue;
+        if (open) result += newline;
+        open = false;
+        result += values[index].first + " = " + values[index].second + newline;
+    }
     return result;
 }
 

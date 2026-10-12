@@ -30,22 +30,47 @@ The port is a work in progress. Read [Known issues](#known-issues) before you st
 
 1. Unpack the archive into its own folder, for example `C:\Games\AnyPS5-DemonsSouls`. Do not
    unpack it into the dump folder. On Windows, keep the folder and the dump on local NTFS drives,
-   because the launcher links the dump with directory junctions.
-2. First start, with the path to your dump:
-   - Windows: open PowerShell in the folder and run
-     `.\DemonsSouls.ps1 -Dump "D:\Games\PPSA01341-app0"`, or run
-     `DemonsSouls.bat -Dump "D:\Games\PPSA01341-app0"` from a command prompt.
-   - Linux: `./DemonsSouls.sh --dump /path/to/PPSA01341-app0`
-   The launcher then
-   1. runs `tools/relinker` on your `eboot.bin` and writes `DemonsSouls.exe` (Windows) or
-      `DemonsSouls.elf` (Linux). The relinker also writes converted game modules into
-      `app0/sce_module`,
-   2. applies the port's executable patch with `tools/ds_patch.py` (it checks the game version and
-      writes nothing if the version does not match),
-   3. links every folder of your dump into `app0/`. Your dump is never modified,
-   4. starts the game.
-3. Later starts: `DemonsSouls.bat` / `.\DemonsSouls.ps1` on Windows, `./DemonsSouls.sh` on Linux.
-   Run with `-Dump` / `--dump` again after updating AnyPS5.
+   because the setup links the dump with directory junctions.
+2. Start **`anyps5-launcher.exe`** in that folder (Linux: `./anyps5-launcher`; on a fresh install
+   `DemonsSouls.bat` and `DemonsSouls.sh` open it too). In **Game folder**, type or paste the path of
+   your dump's `app0` folder, or press **Browse...** (the system's folder picker; on a Steam Deck the
+   window's own browser: D-pad moves, A opens a folder, B goes up, Y takes the folder shown). The
+   window checks the folder and says what is wrong: `eboot.bin`, `sce_sys` and `sce_module` must be
+   there, `eboot.bin` and the modules in `sce_module` must be decrypted (encrypted SELF files do not
+   work), the folder must be on a local drive and given as a full path, and the game must be
+   Demon's Souls PPSA01341 version 01.007.000 (another version is refused). Choosing the folder that
+   contains `app0` works too. **Play** stays disabled until the folder is valid.
+3. Press **Play**. The first time, and after you choose another folder, update AnyPS5 or install
+   Python 3.8+, the window runs the one-time setup and shows its progress (it calls `DemonsSouls.ps1
+   -Dump <folder> -SetupOnly` / `DemonsSouls.sh --dump <folder> --setup-only`, hidden):
+   1. `tools/relinker` turns your `eboot.bin` into `DemonsSouls.exe` (Windows) or `DemonsSouls.elf`
+      (Linux) and writes converted game modules into `app0/sce_module`,
+   2. `tools/ds_patch.py` applies the port's executable patch (it checks the game version and writes
+      nothing if the version does not match; skipped with a warning when Python is missing),
+   3. every folder of your dump is linked into `app0/`. Your dump is never modified.
+
+   Steps 1 and 2 run in a `setup.tmp` folder first, so a setup that fails leaves an earlier working
+   one as it was. Then the game starts. The setup is recorded in `anyps5-setup.txt` (delete it to run
+   the setup again). Later, **Play** starts the game at once.
+
+   Started from the window, the game has no console window: its output goes to `anyps5-game.log` in the
+   AnyPS5 folder (the run before is kept as `anyps5-game.old.log`); attach it when you report a
+   problem. If the game ends with an error, a message says so. `APS5_LAUNCHER_CONSOLE=1` gives it its
+   console window back.
+
+### Steam
+
+Add `anyps5-launcher.exe` (Linux and Steam Deck: `anyps5-launcher`) as a non-Steam game. Without launch
+options the settings window opens on every start. With the launch options **`%command% --launch`** the
+game starts straight away once the game folder is set up (otherwise the window opens). On a Steam Deck,
+unpack the archive and add the launcher in Desktop Mode, then play from Game Mode.
+
+### Without the window
+
+`.\DemonsSouls.ps1 -Dump "D:\Games\PPSA01341-app0"` (PowerShell), `DemonsSouls.bat -Dump
+"D:\Games\PPSA01341-app0"` (command prompt) or `./DemonsSouls.sh --dump /path/to/PPSA01341-app0` (Linux)
+runs the same setup in a console and starts the game. Later starts: `DemonsSouls.bat` /
+`.\DemonsSouls.ps1` / `./DemonsSouls.sh`; run with `-Dump` / `--dump` again after updating AnyPS5.
 
 Options: `-SetupOnly` / `--setup-only` prepares without starting; `-NoPatch` / `--no-patch` skips the
 patch (slow; for troubleshooting only). On an Intel CPU, `-ToIntel` / `--to-intel` (together with
@@ -67,8 +92,31 @@ The launcher sets these unless you already set them yourself:
 Other user settings: `ANYPS5_INPUT_CONFIG` (input file path), `ANYPS5_SHADER_CACHE_DIR` (move the shader
 cache), `ANYPS5_NO_SHADER_CACHE=1` (no disk cache).
 
-Display settings live in `anyps5-settings.ini` next to the game: rename `anyps5-settings.ini.example`
-and edit it. The game's own performance and cinematic modes are replaced by these keys:
+### Settings window
+
+`anyps5-launcher` is the settings window: game folder (see [Install](#install)), resolution (the
+presets, your desktop's size or auto), window mode, FPS limit, timestep, native aspect and the Deluxe
+Edition content (see [Deluxe Edition content](#deluxe-edition-content)). Use the mouse,
+the keyboard (arrow keys, Enter) or a controller (D-pad, A; Start plays). **Play** saves
+`anyps5-settings.ini`, runs the setup when it is due and starts the game; **Quit** or closing the window
+exits. Your comments and other keys in the file are kept. Upscaler and frame generation are shown greyed
+out: they come later.
+
+Starting `DemonsSouls.exe` itself (or `DemonsSouls.bat` / `.sh` after the setup) opens the same window
+first; there the game folder is shown but not changed. Add `--launch` to start straight away with the
+saved settings:
+- Steam (a non-Steam game pointing at `anyps5-launcher.exe`, `DemonsSouls.exe`, `DemonsSouls.bat` or
+  `DemonsSouls.sh`): launch options `%command% --launch`
+- Windows: `DemonsSouls.bat --launch` or `.\DemonsSouls.ps1 --launch`; Linux: `./DemonsSouls.sh --launch`
+
+`APS5_NO_LAUNCHER=1` skips the window when the game starts on its own. If `anyps5-launcher.exe` is
+missing (next to the game or in `libs/`) or cannot open, the game starts with the file as it is.
+
+### Settings file
+
+Display settings live in `anyps5-settings.ini` next to the game: the settings window writes it, or rename
+`anyps5-settings.ini.example` and edit it. The game's own performance and cinematic modes are replaced
+by these keys:
 
 | Key | Variable | Values |
 |---|---|---|
@@ -77,6 +125,8 @@ and edit it. The game's own performance and cinematic modes are replaced by thes
 | `Timestep` | `APS5_TIMESTEP` | `fixed` (the game's own: slow motion below the limit) or `variable` (experimental: the game keeps its speed at any frame rate) |
 | `WindowMode` | `APS5_WINDOW_MODE` | `windowed` or `fullscreen` |
 | `NativeAspect` | `APS5_NATIVE_ASPECT` | `off` or `on` (experimental: renders at `Resolution`'s own aspect, e.g. 21:9, instead of letterboxed 16:9) |
+| `DeluxeEdition` | `APS5_DELUXE_EDITION` | `auto` (the Deluxe Edition add-on is owned when your dump holds it) or `off` (not owned, even then); see [Deluxe Edition content](#deluxe-edition-content) |
+| `AddonDir` | | a folder holding your dumped add-ons, when they are not next to the game folder |
 
 The log shows the result in its `[settings]` lines.
 
@@ -99,6 +149,31 @@ Two environment-only switches go further and are experimental: `APS5_NATIVE_ASPE
 the shared render targets at `Resolution` itself (the post effects break: bloom blobs and ghosting),
 and `APS5_NATIVE_ASPECT_UI=1` gives the display buffer the window's shape (the bottom HUD is cut off
 when the window is wider than 16:9).
+
+### Deluxe Edition content
+
+The Digital Deluxe Edition's in-game items (the Fluted armour set) come with an add-on the game asks the
+system for (entitlement `DEMONSSOULSGIFT2`; the pre-order gift is `DEMONSSOULSGIFT1`). AnyPS5 answers
+from what your dump holds: the add-on counts as owned only when your dump contains it, and nothing is
+ever written into your dump. When it is owned, the game offers the Deluxe items when you create a
+character and puts them into that character's inventory.
+
+What counts as the add-on in your dump: a folder whose `sce_sys/param.json` or `param.sfo` names the
+add-on's content id, this title's id and the label (for example `EP9000-PPSA01341_00-DEMONSSOULSGIFT2`).
+A folder's name alone is not enough, and an empty folder or one with other metadata (another title, another
+add-on) is ignored. The same rule decides the pre-order gift (`DEMONSSOULSGIFT1`): it is owned when your
+dump holds it (or you list it in `anyps5-entitlements.ini`); the launcher has no switch for it. It is looked for next to the game folder (the dump's `app0`), up to
+two levels into a folder named with the title id or `addcont` / `dlc` there (`PPSA01341-ac\...`,
+`addcont\PPSA01341\...`), and in `AddonDir` when you set one. Other game dumps (folders with an
+`eboot.bin`) are not looked into.
+
+The settings window shows the row **Deluxe Edition content**: "Found in your dump" with a checkbox to
+turn the owned add-on off (and on again), or "Not found in your dump", greyed out. Turning it off makes
+the game take the Deluxe items away from a character that has them (as on a console without the
+add-on); turning it on again gives them back. The log line `[settings] deluxe edition: ...` says what was
+found and whether it is enabled, and the `[entitlement] owned add-ons` line lists everything answered
+(the pre-order gift included). If reading the add-ons fails, the log says so and the game boots with none owned.
+`APS5_DELUXE_EDITION`, when set, wins over the window's box, which then shows "(set by APS5_DELUXE_EDITION=...)". An `anyps5-entitlements.ini` entry for `DEMONSSOULSGIFT2` is ignored.
 
 Troubleshooting: GPU-to-guest copy-backs are coalesced and narrowed (only changed dwords are written
 back) by default. `APS5_NO_COALESCE_COPY_BACKS=1` and `APS5_NO_NARROW_COPY_BACKS=1` turn these off

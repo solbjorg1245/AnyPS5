@@ -14,7 +14,8 @@ the PE mapping the relinker uses (ELF vaddr V at RVA V + 0x10000), and a search 
 windows of the eboot text around each site (the only way for the ELF output).
 
 usage: ds_patch.py [--check] <eboot.bin> <DemonsSouls.exe|DemonsSouls.elf>
-exit codes: 0 patched or already present, 1 usage, 2 refused (nothing written)
+       ds_patch.py --check <eboot.bin>   (the version check alone, before relinking)
+exit codes: 0 patched or already present (or supported), 1 usage, 2 refused (nothing written)
 """
 import argparse
 import os
@@ -177,6 +178,9 @@ def apply(eboot_path, exe_path, check_only=False):
             raise PatchError(f"{name}: this eboot.bin has {found.hex()} at {vaddr:#x}, expected {original.hex()}: "
                              "unsupported game version (the port supports BuildVersion 2025-10-15.877562)")
         plans.append((name, vaddr, original, build(eboot)))
+    if exe_path is None:
+        print("supported eboot.bin")
+        return
 
     with open(exe_path, "rb") as f:
         data = bytearray(f.read())
@@ -228,8 +232,10 @@ def main():
     parser = argparse.ArgumentParser(description="Patch a relinked Demon's Souls executable (stdlib only).")
     parser.add_argument("--check", action="store_true", help="verify only, write nothing")
     parser.add_argument("eboot")
-    parser.add_argument("executable")
+    parser.add_argument("executable", nargs="?", help="the relinked executable (left out with --check: check eboot.bin alone)")
     args = parser.parse_args()
+    if args.executable is None and not args.check:
+        parser.error("the executable is needed unless --check is given")
     try:
         apply(args.eboot, args.executable, args.check)
     except (PatchError, OSError) as error:
