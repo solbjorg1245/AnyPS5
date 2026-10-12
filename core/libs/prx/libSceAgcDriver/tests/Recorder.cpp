@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastDispatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastRing.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordProfile.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
@@ -2095,12 +2096,18 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         Recorder snapshotRecorder(snapshotContext);
         snapshotRecorder.Activate();
         ShaderResources resources(snapshotContext, compute);
+        const auto chainSetsBefore = cache.Counters().sets;
+        const auto transientSetsBefore = cache.TransientCounters().sets;
         auto first = resources.PrepareDrawBindings(snapshotRecorder);
         Require(first != nullptr && first->snapshots.size() == 1, "read-only draw input was not snapshotted");
         std::memset(reinterpret_cast<void*>(element), 0x22, elementBytes);
         auto second = resources.PrepareDrawBindings(snapshotRecorder);
         Require(second != nullptr && second->snapshots.size() == 1, "cached draw input was not snapshotted again");
         Require(first->allocation.set != second->allocation.set, "in-flight draws share mutable descriptor bindings");
+        // APS5_RECORD_FAST (the default): both sets come from the open batch's transient pool, which
+        // the batch keeps (reset once it completed); neither is freed on its own, none from the chain.
+        if (RecordFast()) Require(first->cache == nullptr && second->cache == nullptr && first->allocation.pool == VK_NULL_HANDLE && cache.TransientCounters().sets - transientSetsBefore == 2 && cache.TransientCounters().pools == 1 && cache.Counters().sets == chainSetsBefore, "draw bindings did not take the open batch's transient sets");
+        else Require(first->cache == &cache && cache.Counters().sets - chainSetsBefore == 2 && cache.TransientCounters().sets == transientSetsBefore, "APS5_RECORD_FAST=0 did not take the chain pools");
         std::memset(reinterpret_cast<void*>(element), 0x33, elementBytes);
         auto downloaded = std::make_shared<Buffer>(snapshotContext, elementBytes * 2, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         const auto commands = snapshotRecorder.Commands();

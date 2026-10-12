@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DrawScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawSkipReasons.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastDraw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordProfile.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ScratchLease.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
@@ -121,7 +122,11 @@ void storeClearTexels(const Context& context, const ColorTarget& color, const st
 
 void materializeRegisterClear(const Context& context, const ColorTarget& color, StorageTexture& resident) {
     if (color.dccAddress == 0 || resident.Descriptor().dccAddress != color.dccAddress) return;
-    if (CurrentDccKeys(color.dccAddress, color.bytes) != DccKeys::ClearRegister) return;
+    RecordProfile::Scope keysSpan(RecordProfile::ClearKeys);
+    const auto keys = CurrentDccKeys(color.dccAddress, color.bytes);
+    keysSpan.Stop();
+    if (keys != DccKeys::ClearRegister) return;
+    RecordProfile::Scope materializeSpan(RecordProfile::ClearMaterialize);
     const auto keysSeen = CollectKeys(color.dccAddress, color.bytes);
     const auto texel = clearTexel(color, DccKeys::ClearRegister);
     const char* refusal = nullptr;
@@ -466,6 +471,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     std::fprintf(stderr, "%s\n", line);
+    RecordProfile::Report();
     // The skipped packets by reason head: the top 8 per kind with their time (APS5_NO_DRAW_SKIP_REASONS=1: no line).
     bool anyReason = false;
     for (const auto& tally : profile.skipReasons) anyReason = anyReason || tally.Keys() != 0 || tally.Overflow() != 0;
@@ -1092,7 +1098,14 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
     std::shared_ptr<StorageTexture> resident;
     try {
-        resident = lookup();
+        {
+            // APS5_RECORD_PROFILE: a refresh whose collects walked pages is booked apart.
+            const auto collectedBefore = RecordProfile::Enabled() ? GuestMemory::ThreadCollectedBytes() : 0;
+            RecordProfile::Scope refreshSpan(RecordProfile::TargetRefresh);
+            resident = lookup();
+            if (RecordProfile::Enabled() && GuestMemory::ThreadCollectedBytes() != collectedBefore) refreshSpan.Stop(RecordProfile::TargetRefreshWalked);
+        }
+        RecordProfile::Scope clearSpan(RecordProfile::TargetClear);
         if (resident != nullptr) materializeRegisterClear(context, color, *resident);
     } catch (const std::exception& error) {
         static HostMutex reportMutex;
@@ -1293,14 +1306,26 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->variantId != 0; });
     if (resolved.cacheable) {
+        RecordProfile::Scope keySpan(RecordProfile::LookupKey);
         resolved.contentKey = DrawResourceKey(context, shaders, state.color, draw.indexAddress, indexBytes, !trimKey);
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+        keySpan.Stop();
+        RecordProfile::Scope findSpan(RecordProfile::LookupFind);
+        auto cached = SharedResourceCache().Find(resolved.contentKey);
+        findSpan.Stop();
+        if (cached != nullptr) {
             bool rebased = false;
-            if (recorder != nullptr && !cached->RebaseEligible(shaders, *recorder, rebased)) {
+            RecordProfile::Scope rebaseSpan(RecordProfile::LookupRebase);
+            const bool rebaseRefused = recorder != nullptr && !cached->RebaseEligible(shaders, *recorder, rebased);
+            rebaseSpan.Stop();
+            RecordProfile::Scope revalidateSpan(RecordProfile::LookupRevalidate);
+            if (rebaseRefused) {
                 // Still valid for draws at its own addresses: the fresh build below replaces it.
                 countCache(&DrawProfile::cacheRebaseRefused);
             } else if (cached->Revalidate(shaders)) {
+                revalidateSpan.Stop();
+                RecordProfile::Scope aliasSpan(RecordProfile::LookupAliases);
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                aliasSpan.Stop();
                 resolved.resources = std::move(cached);
                 outcome.kind = KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
@@ -1315,6 +1340,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     }
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
+        RecordProfile::Scope buildSpan(RecordProfile::Build);
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
@@ -1733,9 +1759,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (!gpuIndirect) return false;
         return (begin < args->arguments + args->RangeBytes() && args->arguments < end) || (args->countIndirect && begin < args->countAddress + 4 && args->countAddress < end);
     };
+    RecordProfile::Scope flushSpan(RecordProfile::StoreFlushes);
     if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
+    flushSpan.Stop();
     const auto bindingsStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, shaders);
     if (timer.profile) {
@@ -1752,7 +1780,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     // Deferred flat slots: the words a stage's capture left to the GPU are copied into the data
     // buffer now, behind the work that writes them (recordDeferredFlat ends an open pass).
+    RecordProfile::Scope flatSpan(RecordProfile::DeferredFlat);
     const bool deferredFlat = recordDeferredFlat(context, *recorder, resources, drawBindings.get(), shaders, outcome);
+    flatSpan.Stop();
+    RecordProfile::Scope commandsSpan(RecordProfile::Commands);
     const bool capture = CaptureInputsEnabled();
     // A GPU-side draw whose records need no rewrite reads them in place, covered by the pass's
     // opening barrier, so it continues the pass like any other draw.
@@ -1807,6 +1838,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, UiRectViewport(state), UiRectScissor(state));
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
+    commandsSpan.Stop();
+    RecordProfile::Scope bindSpan(RecordProfile::BindPush);
     if (drawBindings != nullptr) {
         const auto set = drawBindings->allocation.set;
         context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
@@ -1816,6 +1849,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
+    bindSpan.Stop();
+    RecordProfile::Scope drawSpan(RecordProfile::DrawCommands);
     // Inputs read in place from their imports when the batch runs (CopyDrawInput).
     if (!inputs.inPlaceRanges.empty()) recorder->NotePendingReads(inputs.inPlaceRanges, Recorder::ReadKind::DrawInput);
     // Moved read-only elements a rebased hit reads in place (PrepareDrawBindings), noted like the
@@ -1834,8 +1869,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // draw class range) before anything else is recorded. A draw that wrote memory owes the next
     // one a barrier, so its pass cannot be continued.
     recorder->LeaveRenderPassOpen(passKey, drawTiming, !resources.WritesMemory());
+    drawSpan.Stop();
     timer.phase(PhaseRecord);
+    RecordProfile::Scope keepSpan(RecordProfile::Keep);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
+    keepSpan.Stop();
     timer.phase(PhaseKeep);
     if (record.waited) {
         // The wait the dispatch path makes for such work (source 3, "address-based"): the
@@ -1952,6 +1990,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     PerformanceTimer timing("Graphics.Draw");
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    RecordProfile::NoteDraw();
+    RecordProfile::Scope totalSpan(RecordProfile::DrawTotal);
     DrawTimer timer(profile);
     // APS5_TRACE_DRAWS (together with APS5_PROFILE_DRAW; alone it only enables Driver.cpp's own
     // [draw] lines) additionally prints one line per draw with its phases and, for synchronous
@@ -1965,11 +2005,16 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // (nested in the draw's hold, see DrawOutcome::hookWaitUs).
     const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
     double ownWaitedMs = 0;
-    const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
+    const auto report = [&](const char* suffix) {
+        RecordProfile::Scope reportSpan(RecordProfile::Bookkeeping);
+        reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix);
+    };
     ScratchLease<DrawInputScratch> inputScratch;
     // APS5_DRAW_MEMOS=1 (DrawMemos, s4-plan S4.2): the in-place inputs through the thread's import
     // memo, as DrawFast's (this thread holds GuestMemory::GpuMutex for the whole draw).
+    RecordProfile::Scope inputsSpan(RecordProfile::Inputs);
     auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, *inputScratch, DrawMemos());
+    inputsSpan.Stop();
     if (inputs.nothing) return;
     const auto* args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
@@ -2030,6 +2075,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         }
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);
+            RecordProfile::Scope viewSpan(RecordProfile::TargetView);
             targetViews.push_back(binding.resident->AttachmentView(color.format, color.mip));
             continue;
         }
@@ -2093,6 +2139,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     IndirectRecord indirect;
     indirect.args = args;
     std::vector<Pm4::DrawArguments> records;
+    RecordProfile::Scope decideSpan(RecordProfile::IndirectDecide);
     if (args != nullptr) {
         static const bool gpuIndirectDraws = std::getenv("APS5_NO_GPU_INDIRECT_DRAW") == nullptr;
         // APS5_DRAW_MEMOS=1: the imports through the thread's memo, as DrawFast decides.
@@ -2126,6 +2173,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             }
         }
     }
+    decideSpan.Stop();
     // A draw whose only completion work is a BDA fault check (the rect-list stages carry a fault
     // buffer, so every rect-list draw needed one) is recorded too, with the check as a completion
     // action like a dispatch's write-back: its own batch would first wait for everything recorded
@@ -2191,13 +2239,17 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const State& pipelineState = masked.has_value() ? *masked : state;
     // APS5_DRAW_MEMOS=1: the same store key through the thread's key buffer and pipeline memo.
     const auto attachmentLayout = lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    RecordProfile::Scope pipelineSpan(RecordProfile::PipelineLookup);
     auto pipeline = DrawMemos() ? CachedPipelineMemoized(context, pipelineState, *inputs.vertexInput, *resources, shaders, attachmentLayout) : CachedPipeline(context, pipelineState, *inputs.vertexInput, *resources, shaders, attachmentLayout);
+    pipelineSpan.Stop();
+    RecordProfile::Scope framebufferSpan(RecordProfile::PipelineFramebuffer);
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     std::vector<std::shared_ptr<StorageTexture>> owners;
     owners.reserve(targets.size());
     for (const auto& binding : targets) owners.push_back(binding.resident);
     auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent);
+    framebufferSpan.Stop();
     timer.phase(PhasePipeline);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline created");
     if (lean) {
@@ -2213,6 +2265,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         record.completion = completion;
         record.waited = outcome.waited;
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs);
+        RecordProfile::Scope recipeSpan(RecordProfile::Recipe);
         // The recipe for the caller's draw-cache entry (design_cpu_final M8, rule R3 for draws):
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
@@ -2242,6 +2295,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             recipe->shaderStages = inputs.shaderStages;
             *recipeOut = std::move(recipe);
         }
+        recipeSpan.Stop();
         timing.Mark("draw_and_resource_release");
         report(outcome.waited ? (outcome.reason == SyncLease ? " recorded then waited (lease)" : " recorded then waited (copied writes)") : completion ? " recorded with completion" : " recorded");
         return;
