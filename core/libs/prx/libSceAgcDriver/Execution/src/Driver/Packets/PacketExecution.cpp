@@ -324,7 +324,11 @@ void Driver::execute(const Submission& submission) {
         } else if (opcode == 0x3c || opcode == 0x93) {
             static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
             const auto waitStart = std::chrono::steady_clock::now();
-            timed(&WorkerProfile::waitMs, [&] { waitMemory(packet, submission.queue, recent, submission.received, submission.heldAtSubmit.contains(cursor)); });
+            // APS5_LAZY_LABELS=2: satisfied in order behind a label riding the recording pipe (its boundary).
+            if (!(recordPipe && submission.queue == 0 && recordPipeTookWait())) timed(&WorkerProfile::waitMs, [&] { waitMemory(packet, submission.queue, recent, submission.received, submission.heldAtSubmit.contains(cursor)); });
+            // APS5_LABEL_CENSUS: the wait, on a queue-0 label or not (the [label-census] line).
+            static const bool labelCensus = RecordPipeLabelCensus();
+            if (labelCensus) NoteRecordPipeLabelWait(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), submission.queue, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count());
             if (traceGpu && std::chrono::steady_clock::now() - waitStart > std::chrono::milliseconds(200)) {
 
                 for (std::size_t next = cursor + count, shown = 0; next < submission.commands.size() && shown < 48; ++shown) {

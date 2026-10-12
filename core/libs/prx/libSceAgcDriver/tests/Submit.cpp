@@ -659,6 +659,63 @@ void testRecordPipe() {
     mixedOk = mixedOk && record() == RecordPipeKind::Dispatch && mixed.NextItem() == 0 && unrecorded.ranges.empty() && hand(RecordPipeKind::Draw, 0x1000, 0x2000) == 4 && kinds[Ring::Slot(4)] == RecordPipeKind::Draw;
     check(mixedOk, "record pipe: draws and dispatches take serials in order, record in order and prune the overlay by serial whatever the kind");
 
+    // APS5_LAZY_LABELS (P-LABEL): exactly the labels the deferred list takes ride the ring (small,
+    // dword-aligned WRITE_DATA and RELEASE_MEM without an EOP interrupt); D L D keeps the order, and
+    // the label's bytes join the overlay so a later read of them drains.
+    using Facts = RecordPipeLabelFacts;
+    check(RecordPipeLabelRides(Facts{0x37, false, true, 0x1000, 4}) && RecordPipeLabelRides(Facts{0x49, false, true, 0x1000, 8}) && RecordPipeLabelRides(Facts{0x37, false, true, 0x1000, DeferredLabel::Capacity}), "record pipe labels: small aligned WRITE_DATA and RELEASE_MEM ride");
+    check(!RecordPipeLabelRides(Facts{0x49, true, true, 0x1000, 8}) && !RecordPipeLabelRides(Facts{0x10, false, true, 0x1000, 4}) && !RecordPipeLabelRides(Facts{0x37, false, true, 0x1000, DeferredLabel::Capacity + 4}) && !RecordPipeLabelRides(Facts{0x37, false, true, 0x1002, 4}) && !RecordPipeLabelRides(Facts{0x37, false, true, 0x1000, 6}) && !RecordPipeLabelRides(Facts{0x37, false, false, 0x1000, 4}) && !RecordPipeLabelRides(Facts{0x37, false, true, 0x1000, 0}), "record pipe labels: EOP interrupts, custom, wide, misaligned, undecoded and empty labels drain");
+    bool labelsOk = hand(RecordPipeKind::Draw, 0x1000, 0x2000) == 5 && hand(RecordPipeKind::Label, 0x9000, 0x9004) == 6 && hand(RecordPipeKind::Draw, 0x3000, 0x4000) == 7;
+    labelsOk = labelsOk && unrecorded.Overlaps(0x9000, 0x9004) == write && record() == RecordPipeKind::Draw && record() == RecordPipeKind::Label && unrecorded.Overlaps(0x9000, 0x9004) == 0 && record() == RecordPipeKind::Draw && mixed.NextItem() == 0;
+    check(labelsOk, "record pipe labels: a label item records between its draws and leaves the overlay once recorded");
+    // APS5_LAZY_LABELS=2: a queue-0 wait reads the newest unrecorded riding label holding its bytes,
+    // unless a newer unrecorded item writes over them; recorded labels and other bytes drain.
+    const auto ridingLabel = [](std::uint64_t address, std::vector<std::uint8_t> bytes, std::uint64_t serial) {
+        RecordPipeRidingLabel label;
+        label.address = address;
+        label.size = bytes.size();
+        for (std::size_t index = 0; index < bytes.size(); ++index) label.bytes[index] = static_cast<std::byte>(bytes[index]);
+        label.serial = serial;
+        return label;
+    };
+    const std::vector<RecordPipeRidingLabel> riding{ridingLabel(0x9000, {1, 0, 0, 0, 2, 0, 0, 0}, 6), ridingLabel(0x9004, {3, 0, 0, 0}, 8)};
+    RecordPipeOverlay ridden;
+    ridden.Add({0x9000, 0x9008, write, 6});
+    bool ridingOk = RecordPipeRidingValue(std::vector<RecordPipeRidingLabel>{riding[0]}, ridden, 5, 0x9000, 4) == 1u;
+    // The second label's range joins the first's (the overlay keeps the newer serial): conservative, its neighbour drains.
+    ridden.Add({0x9004, 0x9008, write, 8});
+    ridingOk = ridingOk && RecordPipeRidingValue(riding, ridden, 5, 0x9004, 4) == 3u && RecordPipeRidingValue(riding, ridden, 5, 0x9000, 4) == std::nullopt && RecordPipeRidingValue(riding, ridden, 5, 0x9000, 8) == std::nullopt;
+    ridingOk = ridingOk && RecordPipeRidingValue(riding, ridden, 8, 0x9000, 4) == std::nullopt && RecordPipeRidingValue(riding, ridden, 5, 0x9010, 4) == std::nullopt && RecordPipeRidingValue({}, ridden, 0, 0x9000, 4) == std::nullopt;
+    RecordPipeOverlay overwritten = ridden;
+    overwritten.Add({0x8000, 0xa000, target, 9});
+    ridingOk = ridingOk && RecordPipeRidingValue(riding, overwritten, 5, 0x9004, 4) == std::nullopt;
+    RecordPipeOverlay wide;
+    wide.Add({0x9000, 0x9008, write, 6});
+    ridingOk = ridingOk && RecordPipeRidingValue(std::vector<RecordPipeRidingLabel>{riding[0]}, wide, 5, 0x9000, 8) == 0x0000000200000001ull;
+    check(ridingOk, "record pipe labels: a queue-0 wait is satisfied in order only by the newest unrecorded label over its bytes");
+    check(RecordPipeLabelKindOf(0x37, false) == RecordPipeLabelKind::WriteData && RecordPipeLabelKindOf(0x49, false) == RecordPipeLabelKind::ReleaseMem && RecordPipeLabelKindOf(0x49, true) == RecordPipeLabelKind::EopInterrupt && RecordPipeLabelKindOf(0x10, false) == RecordPipeLabelKind::Custom, "record pipe labels: census kinds");
+
+    // The census's next event after a label drain that waited: labels in a row stay one event (the
+    // first one's wait), a hand-over or another drain closes it, and nothing armed notes nothing.
+    RecordPipeLabelNext next;
+    next.Note(RecordPipeLabelNext::Handed);
+    next.Arm(2.0);
+    next.Note(RecordPipeLabelNext::Handed);
+    next.Arm(1.0);
+    next.Arm(0.5);
+    next.Note(static_cast<std::size_t>(PipeCensusDrain::Dispatch));
+    next.Note(static_cast<std::size_t>(PipeCensusDrain::Wait));
+    check(next.counts[RecordPipeLabelNext::Handed] == 1 && next.ms[RecordPipeLabelNext::Handed] == 2.0 && next.counts[static_cast<std::size_t>(PipeCensusDrain::Label)] == 1 && next.ms[static_cast<std::size_t>(PipeCensusDrain::Label)] == 1.0 && next.counts[static_cast<std::size_t>(PipeCensusDrain::Dispatch)] == 1 && next.ms[static_cast<std::size_t>(PipeCensusDrain::Dispatch)] == 0.5 && next.counts[static_cast<std::size_t>(PipeCensusDrain::Wait)] == 0 && !next.armed, "record pipe labels: what follows a label drain");
+
+    // The census's readers: a queue-0 label's address awaited by another queue, by queue 0 only, or
+    // never; a wait on an unknown address is not a label's.
+    RecordPipeLabelReaders readers;
+    readers.NoteLabel(0x100);
+    readers.NoteLabel(0x200);
+    readers.NoteLabel(0x300);
+    const bool waitsOk = readers.NoteWait(0x100, 0x40) && readers.NoteWait(0x100, 0) && readers.NoteWait(0x200, 0) && !readers.NoteWait(0x400, 0x40);
+    check(waitsOk && readers.ReaderOf(0x100) == RecordPipeLabelReader::OtherQueue && readers.ReaderOf(0x200) == RecordPipeLabelReader::QueueZero && readers.ReaderOf(0x300) == RecordPipeLabelReader::None && readers.ReaderOf(0x400) == RecordPipeLabelReader::None, "record pipe labels: census readers by queue");
+
     // The estimate check: a logged write the item's estimate ranges, joined end to end, cover is no
     // miss; the first one they do not cover is.
     using Ranges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;

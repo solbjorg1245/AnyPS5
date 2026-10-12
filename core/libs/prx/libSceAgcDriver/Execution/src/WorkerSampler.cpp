@@ -26,6 +26,121 @@ namespace {
 
 HostStopThread processSamplerThread;
 HostStopThread workerSamplerThread;
+HostStopThread threadCensusThread;
+
+bool threadCensus() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_LABEL_CENSUS");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+// The driver's named threads (NameCensusThread), by id.
+std::mutex censusRolesMutex;
+std::map<DWORD, std::string> censusRoles;
+
+std::uint64_t fileTimeTicks(const FILETIME& time) {
+    return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32u) | time.dwLowDateTime;
+}
+
+// Every 10 s: each thread's kernel + user time since the last round (a thread born in it: all of
+// it), by class: the driver's named threads, threads with a description (the guest's, named by
+// libkernel's pthreads, and libc's few), the rest (unnamed: host runtime and Vulkan driver threads).
+void StartThreadCensus() {
+    if (!threadCensus() || threadCensusThread.joinable()) return;
+    threadCensusThread = HostStopThread([](std::stop_token token) {
+        struct Entry {
+            std::string name;
+            DWORD id;
+            double ms;
+        };
+        std::map<DWORD, std::uint64_t> last;
+        std::uint64_t lastProcess = 0;
+        bool baseline = true;
+        auto next = std::chrono::steady_clock::now();
+        const auto process = GetCurrentProcessId();
+        while (!token.stop_requested()) {
+            if (std::chrono::steady_clock::now() < next) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            next += std::chrono::seconds(10);
+            HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if (snapshot == INVALID_HANDLE_VALUE) continue;
+            std::map<DWORD, std::uint64_t> now;
+            std::vector<Entry> entries;
+            double driverMs = 0, guestMs = 0, unnamedMs = 0;
+            std::size_t driverThreads = 0, guestThreads = 0, unnamedThreads = 0;
+            THREADENTRY32 entry{};
+            entry.dwSize = sizeof(entry);
+            for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+                if (entry.th32OwnerProcessID != process) continue;
+                HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
+                if (thread == nullptr) continue;
+                FILETIME created, exited, kernel, user;
+                if (!GetThreadTimes(thread, &created, &exited, &kernel, &user)) {
+                    CloseHandle(thread);
+                    continue;
+                }
+                const auto total = fileTimeTicks(kernel) + fileTimeTicks(user);
+                now[entry.th32ThreadID] = total;
+                const auto known = last.find(entry.th32ThreadID);
+                const auto delta = known != last.end() && known->second <= total ? total - known->second : total;
+                Entry item{{}, entry.th32ThreadID, static_cast<double>(delta) / 1e4};
+                bool driver = false;
+                {
+                    std::lock_guard lock(censusRolesMutex);
+                    if (const auto role = censusRoles.find(entry.th32ThreadID); role != censusRoles.end()) {
+                        item.name = role->second;
+                        driver = true;
+                    }
+                }
+                if (!driver) {
+                    PWSTR description = nullptr;
+                    if (SUCCEEDED(GetThreadDescription(thread, &description)) && description != nullptr) {
+                        char name[64];
+                        const int bytes = WideCharToMultiByte(CP_UTF8, 0, description, -1, name, sizeof(name), nullptr, nullptr);
+                        if (bytes > 1) item.name.assign(name, static_cast<std::size_t>(bytes - 1));
+                        LocalFree(description);
+                    }
+                }
+                CloseHandle(thread);
+                if (driver) {
+                    driverMs += item.ms;
+                    ++driverThreads;
+                } else if (!item.name.empty()) {
+                    guestMs += item.ms;
+                    ++guestThreads;
+                } else {
+                    unnamedMs += item.ms;
+                    ++unnamedThreads;
+                    item.name = "?";
+                }
+                entries.push_back(std::move(item));
+            }
+            CloseHandle(snapshot);
+            FILETIME created, exited, kernel, user;
+            std::uint64_t processTicks = 0;
+            if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) processTicks = fileTimeTicks(kernel) + fileTimeTicks(user);
+            last.swap(now);
+            const auto processMs = static_cast<double>(processTicks - lastProcess) / 1e4;
+            lastProcess = processTicks;
+            if (baseline) {
+                baseline = false;
+                continue;
+            }
+            std::sort(entries.begin(), entries.end(), [](const Entry& left, const Entry& right) { return left.ms > right.ms; });
+            std::string top;
+            char text[128];
+            for (std::size_t index = 0; index < entries.size() && index < 16; ++index) {
+                std::snprintf(text, sizeof(text), "%s %s(%lu) %.0f", index == 0 ? "" : ",", entries[index].name.c_str(), static_cast<unsigned long>(entries[index].id), entries[index].ms);
+                top += text;
+            }
+            std::fprintf(stderr, "[threads] (10 s): process cpu ms %.0f; driver threads %zu ms %.0f, described threads %zu ms %.0f, unnamed %zu ms %.0f; top:%s\n", processMs, driverThreads, driverMs, guestThreads, guestMs, unnamedThreads, unnamedMs, top.c_str());
+        }
+    });
+}
 
 // Debug aid: APS5_SAMPLE_WORKER=<file> samples the calling thread every millisecond and, every 20 s,
 // writes "module+offset self inclusive" lines to <file> for offline symbolization with nm.
@@ -167,7 +282,14 @@ void StartProcessSampler() {
 
 }
 
+void NameCensusThread(const char* role) {
+    if (!threadCensus()) return;
+    std::lock_guard lock(censusRolesMutex);
+    censusRoles[GetCurrentThreadId()] = role;
+}
+
 void StartWorkerSampler() {
+    StartThreadCensus();
     StartProcessSampler();
     const char* path = std::getenv("APS5_SAMPLE_WORKER");
     if (path == nullptr) return;
@@ -189,6 +311,8 @@ void StartWorkerSampler() {
 }
 
 void StopWorkerSampler() {
+    threadCensusThread.request_stop();
+    if (threadCensusThread.joinable()) threadCensusThread.join();
     processSamplerThread.request_stop();
     workerSamplerThread.request_stop();
     if (processSamplerThread.joinable()) processSamplerThread.join();
@@ -197,6 +321,7 @@ void StopWorkerSampler() {
 #else
 void StartWorkerSampler() {}
 void StopWorkerSampler() {}
+void NameCensusThread(const char*) {}
 #endif
 
 }
