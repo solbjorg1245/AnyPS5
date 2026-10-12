@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/ExposureWatch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/FrameTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/PassDump.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -311,6 +312,7 @@ void Driver::execute(const Submission& submission) {
             if (PassDump::FrameActive()) PassDump::BeforeWork(device.Load().get(), submission.queue);
             timed(&WorkerProfile::dispatchMs, [&] { tolerate("dispatch", [&] { dispatch(queue, packet, submission); }); });
             traceDispatch(queue, packet, submission.queue);
+            if (ExposureWatch::Enabled()) ExposureWatch::AtDispatch(queue, submission.queue);
             // A dispatch handed to the recording pipe is counted by B once it records it (as a draw, below).
             if (!(recordPipe && submission.queue == 0 && recordPipeTookDraw())) Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(false);
@@ -319,6 +321,7 @@ void Driver::execute(const Submission& submission) {
             if (PassDump::FrameActive()) PassDump::BeforeWork(device.Load().get(), submission.queue);
             timed(&WorkerProfile::dispatchMs, [&] { tolerate("dispatch", [&] { dispatchIndirect(queue, packet, submission); }); });
             traceDispatch(queue, packet, submission.queue);
+            if (ExposureWatch::Enabled()) ExposureWatch::AtDispatch(queue, submission.queue);
             Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(true);
         } else if (opcode == 0x3c || opcode == 0x93) {
