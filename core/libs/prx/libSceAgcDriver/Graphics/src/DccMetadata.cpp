@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordProfile.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -553,12 +554,17 @@ DccKeys ReadDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes) {
 DccKeys CurrentDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes) {
     const auto count = static_cast<std::size_t>(surfaceBytes / KeyBytes);
     if (metaAddress != 0 && count != 0 && GuestMemory::GpuMutex().HeldByThisThread()) {
+        // APS5_RECORD_PROFILE: the draw's register-clear check by part (pending store, sync, read).
+        RecordProfile::Scope pendingSpan(RecordProfile::ClearKeysPending);
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count)) {
             if (const auto keys = PendingStoreKeys(*recorder, metaAddress, count)) return *keys;
+            pendingSpan.Stop();
+            RecordProfile::Scope syncSpan(RecordProfile::ClearKeysSync);
             Recorder::CountSync(2);
             recorder->SyncThrough(metaAddress, count);
         }
     }
+    RecordProfile::Scope readSpan(RecordProfile::ClearKeysRead);
     return ReadDccKeys(metaAddress, surfaceBytes);
 }
 

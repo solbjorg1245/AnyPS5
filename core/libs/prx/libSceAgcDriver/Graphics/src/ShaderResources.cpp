@@ -2,6 +2,7 @@
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/FrameTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -4195,6 +4196,16 @@ struct InPlaceReadsScratch {
     unsigned depth = 0;
 };
 
+// PrepareDrawBindings' per-draw lists kept with their capacity on the calling thread
+// (APS5_RECORD_FAST): the selected elements and their descriptors, the set's copies and writes.
+struct DrawSetScratch {
+    std::vector<std::size_t> selected;
+    std::vector<VkDescriptorBufferInfo> infos;
+    std::vector<VkCopyDescriptorSet> copies;
+    std::vector<VkWriteDescriptorSet> writes;
+    unsigned depth = 0;
+};
+
 }
 
 bool ShaderResources::RebaseEligible(std::span<const CompiledShader> shaders, const Recorder& recorder, bool& rebased) const {
@@ -4238,6 +4249,7 @@ bool ShaderResources::InPlaceBindings() {
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const CompiledShader> shaders) const {
     if (_set == VK_NULL_HANDLE || usesBda) return {};
+    RecordProfile::Scope selectSpan(RecordProfile::SetSelect);
     ScratchLease<InPlaceReadsScratch> scratch;
     const auto reads = guestMemory.InPlaceReads(scratch->reads);
     const bool inPlace = InPlaceBindings();
@@ -4246,9 +4258,23 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     const bool memoizedImports = DrawMemos();
     // Made once the first element is selected: most draws select none and return nothing.
     std::shared_ptr<DrawBindings> result;
-    std::vector<std::size_t> selected;
+    // APS5_RECORD_FAST: the lists below live in the thread's scratch.
+    const bool fast = RecordFast();
+    std::optional<ScratchLease<DrawSetScratch>> setScratch;
+    std::vector<std::size_t> ownSelected;
+    std::vector<VkDescriptorBufferInfo> ownInfos;
+    std::vector<VkCopyDescriptorSet> ownCopies;
+    std::vector<VkWriteDescriptorSet> ownWrites;
+    if (fast) {
+        setScratch.emplace();
+        (*setScratch)->selected.clear();
+        (*setScratch)->infos.clear();
+        (*setScratch)->copies.clear();
+        (*setScratch)->writes.clear();
+    }
+    auto& selected = fast ? (*setScratch)->selected : ownSelected;
     // The descriptor each selected element gets in the draw's set copy, in `selected` order.
-    std::vector<VkDescriptorBufferInfo> infos;
+    auto& infos = fast ? (*setScratch)->infos : ownInfos;
     const auto select = [&](std::size_t index, const VkDescriptorBufferInfo& info) {
         if (result == nullptr) result = std::make_shared<DrawBindings>();
         selected.push_back(index);
@@ -4290,6 +4316,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             const auto* import = memoizedImports ? HostImportMemoized(context, begin, bytes) : HostImportFor(context, begin, bytes);
             if (import != nullptr && (begin - import->base) % context.limits.minStorageBufferOffsetAlignment == 0) {
                 select(index, {import->buffer, begin - import->base, bytes});
+                if (fast && result->inPlaceReads.empty()) result->inPlaceReads.reserve(allocations.size() - index);
                 result->inPlaceReads.emplace_back(begin, begin + bytes);
                 ++result->boundInPlace;
                 CaptureTrace::Log("draw-inplace batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
@@ -4313,15 +4340,42 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (selected.empty()) return {};
+    selectSpan.Stop();
+    RecordProfile::Scope allocateSpan(RecordProfile::SetAllocate);
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
-    std::map<VkDescriptorType, std::uint32_t> counts;
-    for (const auto& binding : bindings) counts[binding.layout.descriptorType] += binding.layout.descriptorCount;
-    std::vector<VkDescriptorPoolSize> sizes;
-    for (const auto& [type, count] : counts) sizes.push_back({type, count});
-    result->cache = context.descriptorCache;
-    result->allocation = result->cache->Allocate(_layout, sizes);
+    if (fast) {
+        // APS5_RECORD_FAST: the set from the open batch's transient pool (AllocateTransient, as
+        // ForkData's), sized without a map: the batch keeps the pool as it keeps these bindings
+        // (recorder.Keep below, nothing submits in between), so the set is never freed on its own
+        // (no cache: ~DrawBindings frees nothing). A refused set takes the chain pools below.
+        std::array<VkDescriptorPoolSize, 4> sizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 0}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0}, {VK_DESCRIPTOR_TYPE_SAMPLER, 0}}};
+        bool sized = true;
+        for (const auto& binding : bindings) {
+            const auto entry = std::find_if(sizes.begin(), sizes.end(), [&](const auto& size) { return size.type == binding.layout.descriptorType; });
+            if (entry == sizes.end()) {
+                sized = false;
+                break;
+            }
+            entry->descriptorCount += binding.layout.descriptorCount;
+        }
+        if (sized) {
+            const auto used = static_cast<std::size_t>(std::remove_if(sizes.begin(), sizes.end(), [](const auto& size) { return size.descriptorCount == 0; }) - sizes.begin());
+            const auto set = context.descriptorCache->AllocateTransient(_layout, std::span<const VkDescriptorPoolSize>(sizes.data(), used), recorder);
+            if (set != VK_NULL_HANDLE) result->allocation = {set, VK_NULL_HANDLE};
+        }
+    }
+    if (result->allocation.set == VK_NULL_HANDLE) {
+        std::map<VkDescriptorType, std::uint32_t> counts;
+        for (const auto& binding : bindings) counts[binding.layout.descriptorType] += binding.layout.descriptorCount;
+        std::vector<VkDescriptorPoolSize> sizes;
+        for (const auto& [type, count] : counts) sizes.push_back({type, count});
+        result->cache = context.descriptorCache;
+        result->allocation = result->cache->Allocate(_layout, sizes);
+    }
     Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
-    std::vector<VkCopyDescriptorSet> copies;
+    allocateSpan.Stop();
+    RecordProfile::Scope copySpan(RecordProfile::SetCopy);
+    auto& copies = fast ? (*setScratch)->copies : ownCopies;
     for (const auto& binding : bindings) {
         VkCopyDescriptorSet copy{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
         copy.srcSet = _set;
@@ -4333,7 +4387,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     const auto update = context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets");
     update(context.device, 0, nullptr, static_cast<std::uint32_t>(copies.size()), copies.data());
-    std::vector<VkWriteDescriptorSet> writes;
+    copySpan.Stop();
+    RecordProfile::Scope writeSpan(RecordProfile::SetWrite);
+    auto& writes = fast ? (*setScratch)->writes : ownWrites;
     for (const auto& binding : bindings) {
         for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
             const auto found = std::find(selected.begin(), selected.end(), binding.allocations[element]);
@@ -4349,6 +4405,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
     }
     update(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    writeSpan.Stop();
+    RecordProfile::Scope keepSpan(RecordProfile::SetKeep);
     recorder.Keep(result);
     return result;
 }
