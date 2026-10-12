@@ -14,7 +14,7 @@
 // r_ForceGpuWaitForPrevFrame: 0xce6, read at 0x14091361f and 0x140913920). InstallPortSettingsOverlay
 // appends the switches to the render-config copies and the package command line, after the settings'
 // own arguments, so they load after the title's lines and win.
-// APS5_ENGINE_SWITCHES: unset, empty or 1 = Defaults (none yet); 0 = none (the title's own values, the old path);
+// APS5_ENGINE_SWITCHES: unset, empty or 1 = Defaults (doIndexBufferCulling=false); 0 = none (the title's own values, the old path);
 // otherwise a list "name=value,name=value" (',' or ';' between entries, a leading '+' allowed) that
 // replaces Defaults, with the entry "defaults" to keep them as well. port/reports/s61-h2-engine-switches.md
 // and docs/design/engine-switches.md have the inventory and the measurements.
@@ -27,13 +27,14 @@ struct Switch {
     const char* value;
 };
 
-// None by default. Measured (s61 H2, t746-t762, same binary, interleaved): doIndexBufferCulling=false makes the
-// title skip its GPU index-buffer cull job (XPR_IndexCullObjectsNormal, gated per frame by FUN_140a186b0): queue-0
-// dispatches 2,112 -> 420 per present, GPU busy 135 -> 108 ms, presents 50.3 -> 58.3 per 10 s, picture identical;
-// but 4 of 9 such runs died in the job-worker luma-overwrite crash class (R-crash: +0xa95f00, +0x924234, +0x6d5eb9)
-// against 0 of 6 base runs, so it becomes the default only once that class is fixed. The async-compute switches
-// (enableAsyncCompute, r_water/fog_/particle/GI/r_collision*) gave no FPS gain and stay the title's.
-inline constexpr std::array<Switch, 0> Defaults{};
+// doIndexBufferCulling=false (s61 H2, t746-t762, same binary, interleaved) makes the title skip its GPU index-buffer
+// cull job (XPR_IndexCullObjectsNormal, gated per frame by FUN_140a186b0): queue-0 dispatches 2,112 -> 420 per
+// present, GPU busy 135 -> 108 ms, presents 50.3 -> 58.3 per 10 s, picture identical. It was held back while 4 of 9
+// such runs died in the job-worker luma-overwrite crash class; that class is fixed (APS5_FIX_KEPT_REUSE, s61
+// R-crash), so it is the default since s61 PERF-DEFAULTS. "doIndexBufferCulling=true" (a list replaces the
+// defaults) or 0 brings the cull job back. The async-compute switches (enableAsyncCompute, r_water/fog_/particle/
+// GI/r_collision*) gave no FPS gain and stay the title's.
+inline constexpr std::array<Switch, 1> Defaults{{{"doIndexBufferCulling", "false"}}};
 
 struct Plan {
     // The title arguments, "+name=value" each.

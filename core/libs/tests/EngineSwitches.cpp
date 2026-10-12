@@ -45,6 +45,22 @@ static void TestList() {
     Require(Joined(withDefaults) == (DefaultArgs().empty() ? std::string() : DefaultArgs() + " ") + "+r_tessellationEnableAsyncCompute=true", "defaults entry");
 }
 
+// The shipped default (s61 PERF-DEFAULTS): unset = doIndexBufferCulling=false and the line shows it; 0 = nothing;
+// an explicit list replaces it (doIndexBufferCulling=true turns the cull job back on, another name drops it); the
+// "defaults" entry keeps it, and a later entry for the same name wins either way.
+static void TestDefaultPrecedence() {
+    Require(EngineSwitches::Defaults.size() == 1 && std::string(EngineSwitches::Defaults[0].name) == "doIndexBufferCulling" && std::string(EngineSwitches::Defaults[0].value) == "false", "the cull default");
+    const auto unset = EngineSwitches::PlanSwitches(nullptr);
+    Require(Joined(unset) == "+doIndexBufferCulling=false" && unset.line.find("(defaults): +doIndexBufferCulling=false") != std::string::npos, "unset applies and shows the default");
+    Require(EngineSwitches::PlanSwitches("0").args.empty(), "=0 drops the default");
+    const auto on = EngineSwitches::PlanSwitches("doIndexBufferCulling=true");
+    Require(Joined(on) == "+doIndexBufferCulling=true" && on.line.find("(defaults)") == std::string::npos && on.line.find("+doIndexBufferCulling=true") != std::string::npos, "an override turns culling back on");
+    Require(Joined(EngineSwitches::PlanSwitches("r_dofEnable=false")) == "+r_dofEnable=false", "a list replaces the default");
+    Require(Joined(EngineSwitches::PlanSwitches("defaults,doIndexBufferCulling=true")) == "+doIndexBufferCulling=true", "an entry after defaults wins");
+    Require(Joined(EngineSwitches::PlanSwitches("doIndexBufferCulling=true,defaults")) == "+doIndexBufferCulling=false", "defaults after an entry wins");
+    Require(Joined(EngineSwitches::PlanSwitches("defaults,r_dofEnable=false")) == "+doIndexBufferCulling=false +r_dofEnable=false", "defaults plus another switch");
+}
+
 // Bad entries are refused one by one; the rest apply.
 static void TestRefused() {
     const auto plan = EngineSwitches::PlanSwitches("noValue,=1,9name=1,a b=1,name=two words,name=x\"y,good=1,dangling=");
@@ -60,6 +76,7 @@ static void TestRefused() {
 int main() {
     TestSwitch();
     TestList();
+    TestDefaultPrecedence();
     TestRefused();
     std::printf("engine_switches_tests: ok\n");
     return 0;
