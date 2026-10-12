@@ -151,6 +151,15 @@ std::string ShadowReport();
 // APS5_SHADOW_VERIFY=1: after a shadow-sourced upload, the units read must carry no stamp newer
 // than their generation (counted as mismatches otherwise).
 bool ShadowVerify();
+// The pages a stale unit still publishes (APS5_FIX_BOOT_STRIP): its retiled pages no store reached
+// since its retile (`unstored`, PagesUnstoredSince over the unit's pages `unitPages`). With
+// `dropReused` none once a store reached a retiled page: the game took the surface's memory back
+// (its objects in a released target's pages), and the retiled pages the store missed hold the
+// surface's older bytes there, not results; only stores beside the surface (the Bink chroma
+// plane's tail and the table after it) leave the retiled pages to publish.
+std::uint32_t StaleKeptPages(std::uint32_t unstored, std::uint32_t retiled, std::uint32_t unitPages, bool dropReused);
+// APS5_FIX_KEPT_REUSE (default on; =0 publishes every unstored retiled page of a stale unit).
+bool KeptReuseFix();
 
 }
 

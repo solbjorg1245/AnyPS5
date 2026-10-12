@@ -59,8 +59,10 @@ struct Statistics {
     std::atomic<std::uint64_t> detiledShadow{0}, detiledShadowBytes{0}, detiledImport{0}, detiledImportBytes{0}, tailPublishes{0};
     std::array<std::atomic<std::uint64_t>, ReasonCount> published{}, publishedBytes{};
     std::atomic<std::uint64_t> staleDroppedCpu{0}, staleDroppedDriver{0}, skippedInCompletion{0}, evictions{0}, lostOnRetire{0}, droppedOnRetire{0}, slabLost{0}, verified{0}, mismatches{0};
-    // Stale-dropped units whose unstored pages were published anyway (APS5_FIX_BOOT_STRIP).
-    std::atomic<std::uint64_t> pageKeptUnits{0}, pageKeptPages{0};
+    // Stale-dropped units whose unstored pages were published anyway (APS5_FIX_BOOT_STRIP), and
+    // the stale units a store reached in a retiled page while others stayed unstored (the game took
+    // the memory back): dropped whole with APS5_FIX_KEPT_REUSE, their unstored pages landed with =0.
+    std::atomic<std::uint64_t> pageKeptUnits{0}, pageKeptPages{0}, pageKeptReused{0};
 };
 
 Statistics& Stats() {
@@ -448,7 +450,11 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
                 const auto [unitBegin, unitEnd] = shadow->UnitRange(unit);
                 const auto& keptSlab = shadow->slabs[static_cast<std::size_t>(unit / SlabUnits())];
                 const auto retiled = shadow->retiledPages[unit];
-                const auto kept = keptSlab != nullptr && retiled != 0 && unitEnd > unitBegin ? GuestMemory::PagesUnstoredSince(unitBegin, static_cast<std::size_t>(unitEnd - unitBegin), shadow->generation[unit]) & retiled : 0u;
+                const auto unstored = keptSlab != nullptr && retiled != 0 && unitEnd > unitBegin ? GuestMemory::PagesUnstoredSince(unitBegin, static_cast<std::size_t>(unitEnd - unitBegin), shadow->generation[unit]) : 0u;
+                std::uint32_t unitPages = 0;
+                for (auto p = (unitBegin - shadow->UnitBegin(unit)) / GuestMemory::UnstoredPageBytes; unitEnd > unitBegin && p <= (unitEnd - 1 - shadow->UnitBegin(unit)) / GuestMemory::UnstoredPageBytes; ++p) unitPages |= 1u << p;
+                const auto kept = StaleKeptPages(unstored, retiled, unitPages, KeptReuseFix());
+                if ((unstored & retiled) != 0 && StaleKeptPages(unstored, retiled, unitPages, true) == 0) Stats().pageKeptReused.fetch_add(1, std::memory_order_relaxed);
                 if (kept != 0) {
                     constexpr std::uint64_t page = GuestMemory::UnstoredPageBytes;
                     const auto blockBegin = shadow->UnitBegin(unit);
@@ -622,6 +628,19 @@ bool UnitShadowEnabled() {
 bool ShadowVerify() {
     static const bool verify = std::getenv("APS5_SHADOW_VERIFY") != nullptr;
     return verify;
+}
+
+std::uint32_t StaleKeptPages(std::uint32_t unstored, std::uint32_t retiled, std::uint32_t unitPages, bool dropReused) {
+    if (dropReused && (retiled & unitPages & ~unstored) != 0) return 0;
+    return unstored & retiled;
+}
+
+bool KeptReuseFix() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_FIX_KEPT_REUSE");
+        return text == nullptr || std::strcmp(text, "0") != 0;
+    }();
+    return enabled;
 }
 
 void NoteShadowSeed(std::uint64_t begin, std::uint64_t end) {
@@ -1081,7 +1100,7 @@ std::string ShadowReport() {
     }
     std::snprintf(text, sizeof(text), " %llu/%.1f by reason {%s }, stale-dropped %llu (cpu %llu, driver %llu), skipped-in-completion %llu, slabs %llu live %.1f MiB / peak %.1f MiB, evictions %llu, slab lost %llu, retired %llu, dropped on retire %llu, lost on retire %llu", publishedTotal, mib(publishedBytesTotal), reasons.c_str(), cpuDropped + driverDropped, cpuDropped, driverDropped, take(statistics.skippedInCompletion), liveSlabs, mib(liveBytes), mib(peakBytes), take(statistics.evictions), take(statistics.slabLost), retired, take(statistics.droppedOnRetire), take(statistics.lostOnRetire));
     line += text;
-    std::snprintf(text, sizeof(text), ", stale page-kept %llu units/%llu pages", take(statistics.pageKeptUnits), take(statistics.pageKeptPages));
+    std::snprintf(text, sizeof(text), ", stale page-kept %llu units/%llu pages (%llu units on reuse)", take(statistics.pageKeptUnits), take(statistics.pageKeptPages), take(statistics.pageKeptReused));
     line += text;
     if (ShadowVerify()) {
         std::snprintf(text, sizeof(text), ", verified %llu, mismatches %llu", take(statistics.verified), take(statistics.mismatches));
