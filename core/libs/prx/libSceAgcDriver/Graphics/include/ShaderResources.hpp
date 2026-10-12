@@ -328,8 +328,8 @@ public:
     // buffer already holding the words is left alone). Returns whether anything was recorded. With
     // `recorder` the updates are one [gputime] range of class TemplateDataRefresh.
     bool RefreshData(VkCommandBuffer commands, const CompiledShader& shader, Recorder* recorder = nullptr);
-    // The data refresh without a transfer (APS5_TEMPLATE_REFRESH_RING=1, VulkanDevice::
-    // recordDispatch; default off, RefreshData stays the fallback): when the shader's ShaderData /
+    // The data refresh without a transfer (APS5_TEMPLATE_REFRESH_RING, VulkanDevice::
+    // recordDispatch; default on, =0 or a copy that cannot be made keeps RefreshData): when the shader's ShaderData /
     // FlattenedSrt words differ from what this object's data buffers hold, a copy of this object's
     // set for the recorder's open batch (DescriptorCache::AllocateTransient) whose differing data
     // bindings read the shader's words (patched like the buffers) from the device's fast ring

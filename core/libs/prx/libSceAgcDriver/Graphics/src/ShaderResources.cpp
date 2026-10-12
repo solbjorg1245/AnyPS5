@@ -3492,7 +3492,7 @@ void ShaderResources::patchDataWords(std::size_t allocation, std::span<std::byte
 
 namespace {
 
-// ForkData's two ways to avoid a fork (APS5_TEMPLATE_REFRESH_RING only; each on unless set to 0):
+// ForkData's two ways to avoid a fork (under APS5_TEMPLATE_REFRESH_RING, default on; each on unless set to 0):
 // bind the open batch's last fork again when the words are its words, and write the words into an
 // idle template's own buffers.
 bool TemplateRefreshReuse() {

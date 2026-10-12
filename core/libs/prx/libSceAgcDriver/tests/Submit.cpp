@@ -665,7 +665,8 @@ void testRecordPipe() {
     using Facts = RecordPipeLabelFacts;
     check(RecordPipeLabelRides(Facts{0x37, false, true, 0x1000, 4}) && RecordPipeLabelRides(Facts{0x49, false, true, 0x1000, 8}) && RecordPipeLabelRides(Facts{0x37, false, true, 0x1000, DeferredLabel::Capacity}), "record pipe labels: small aligned WRITE_DATA and RELEASE_MEM ride");
     check(!RecordPipeLabelRides(Facts{0x49, true, true, 0x1000, 8}) && !RecordPipeLabelRides(Facts{0x10, false, true, 0x1000, 4}) && !RecordPipeLabelRides(Facts{0x37, false, true, 0x1000, DeferredLabel::Capacity + 4}) && !RecordPipeLabelRides(Facts{0x37, false, true, 0x1002, 4}) && !RecordPipeLabelRides(Facts{0x37, false, true, 0x1000, 6}) && !RecordPipeLabelRides(Facts{0x37, false, false, 0x1000, 4}) && !RecordPipeLabelRides(Facts{0x37, false, true, 0x1000, 0}), "record pipe labels: EOP interrupts, custom, wide, misaligned, undecoded and empty labels drain");
-    bool labelsOk = hand(RecordPipeKind::Draw, 0x1000, 0x2000) == 5 && hand(RecordPipeKind::Label, 0x9000, 0x9004) == 6 && hand(RecordPipeKind::Draw, 0x3000, 0x4000) == 7;
+    // The mixed ring's last draw (serial 4) records first, so the ring holds D L D only.
+    bool labelsOk = record() == RecordPipeKind::Draw && hand(RecordPipeKind::Draw, 0x1000, 0x2000) == 5 && hand(RecordPipeKind::Label, 0x9000, 0x9004) == 6 && hand(RecordPipeKind::Draw, 0x3000, 0x4000) == 7;
     labelsOk = labelsOk && unrecorded.Overlaps(0x9000, 0x9004) == write && record() == RecordPipeKind::Draw && record() == RecordPipeKind::Label && unrecorded.Overlaps(0x9000, 0x9004) == 0 && record() == RecordPipeKind::Draw && mixed.NextItem() == 0;
     check(labelsOk, "record pipe labels: a label item records between its draws and leaves the overlay once recorded");
     // APS5_LAZY_LABELS=2: a queue-0 wait reads the newest unrecorded riding label holding its bytes,
