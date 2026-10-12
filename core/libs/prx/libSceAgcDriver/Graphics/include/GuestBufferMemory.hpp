@@ -138,6 +138,25 @@ const HostImport* HostImportMemoized(const Context& context, std::uint64_t addre
 // Draw and DrawWithRecipe run under GuestMemory::GpuMutex (A's lockForDraw, B's hold in
 // runRecordPipe), as HostImportMemoized requires.
 bool DrawMemos();
+// APS5_DRAW_REPEAT (P-REPEAT, s61, default on; =0 the old path): what Draw derives the same way
+// for every repeat of a draw comes from the recording thread instead of the heap and the shared
+// stores: the resource-cache key built in a thread buffer (ShaderResources::ContentKeyInto, no
+// allocation per stage), the fragment outputs through a thread memo in front of the shared one
+// (CachedFragmentOutputs), the pipeline through CachedPipelineMemoized and the imports of the in-place
+// inputs, the indirect records and PrepareDrawBindings' moved elements through HostImportMemoized
+// (S4.2's exact rules: store removals + device, allocation generation + published epoch; Draw runs
+// under GuestMemory::GpuMutex), and the draw's target lists in thread scratch. Same answers, no
+// time-based reuse (t852: 0 mismatches over 16.5M draws under APS5_DRAW_REPEAT_VERIFY=1).
+bool DrawRepeat();
+// APS5_DRAW_REPEAT_VERIFY=1 (with the repeat path on): the old path's key, outputs, pipeline and import are
+// taken too and compared with the repeat path's; the old answer is used, a disagreement is counted
+// on the [draws] repeat line and the first 16 print as "[draws] repeat verify MISMATCH".
+bool DrawRepeatVerify();
+enum class DrawRepeatCheck { Key, Pipeline, Import, Outputs, Count };
+void NoteDrawRepeatVerify(DrawRepeatCheck check, bool same, std::uint64_t detail = 0);
+// The [draws] repeat line (APS5_PROFILE_DRAW, with the [draws] line every 10 s, under
+// APS5_DRAW_REPEAT_VERIFY=1 only): compared and mismatched per check over the window and since the start.
+void ReportDrawRepeat();
 
 // Whether an existing import covers [address, address + bytes), without reconciling the imports
 // with the registry or making one (HostImportFor may take a registry lease): a hint for choices

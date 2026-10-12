@@ -1532,7 +1532,12 @@ const HostImport* HostImportMemoized(const Context& context, std::uint64_t addre
     const auto epoch = state.publishedEpoch.load(std::memory_order_acquire);
     if (const auto* import = memo.Find(context.device, generation, epoch, address, bytes)) {
         ++memo.hits;
-        return import;
+        if (!DrawRepeatVerify()) return import;
+        // APS5_DRAW_REPEAT_VERIFY: the registry's answer beside the memo's, which it replaces.
+        std::lock_guard lock(state.mutex);
+        const auto* slow = hostImportLocked(context, state, address, bytes);
+        NoteDrawRepeatVerify(DrawRepeatCheck::Import, slow == import, address);
+        return slow;
     }
     ++memo.misses;
     std::lock_guard lock(state.mutex);
@@ -1551,6 +1556,70 @@ bool DrawMemos() {
         return true;
     }();
     return enabled;
+}
+
+bool DrawRepeat() {
+    static const bool enabled = [] {
+        // Default on (P-REPEAT, s61); =0 the old path.
+        const char* value = std::getenv("APS5_DRAW_REPEAT");
+        if (value != nullptr && std::strcmp(value, "0") == 0) {
+            std::fprintf(stderr, "[draws] repeat path off (APS5_DRAW_REPEAT=0): the old draw path\n");
+            return false;
+        }
+        return true;
+    }();
+    return enabled;
+}
+
+bool DrawRepeatVerify() {
+    static const bool enabled = DrawRepeat() && [] {
+        const char* value = std::getenv("APS5_DRAW_REPEAT_VERIFY");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+namespace {
+
+struct DrawRepeatCounts {
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawRepeatCheck::Count)> compared{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawRepeatCheck::Count)> mismatched{};
+    std::array<std::uint64_t, static_cast<std::size_t>(DrawRepeatCheck::Count)> totalCompared{};
+    std::array<std::uint64_t, static_cast<std::size_t>(DrawRepeatCheck::Count)> totalMismatched{};
+    std::atomic<std::uint32_t> printed{0};
+};
+
+DrawRepeatCounts& drawRepeatCounts() {
+    static DrawRepeatCounts counts;
+    return counts;
+}
+
+constexpr std::array<const char*, static_cast<std::size_t>(DrawRepeatCheck::Count)> DrawRepeatCheckNames{"keys", "pipelines", "imports", "fragment outputs"};
+
+}
+
+void NoteDrawRepeatVerify(DrawRepeatCheck check, bool same, std::uint64_t detail) {
+    auto& counts = drawRepeatCounts();
+    const auto index = static_cast<std::size_t>(check);
+    counts.compared[index].fetch_add(1, std::memory_order_relaxed);
+    if (same) return;
+    counts.mismatched[index].fetch_add(1, std::memory_order_relaxed);
+    if (counts.printed.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[draws] repeat verify MISMATCH: %s (0x%llx)\n", DrawRepeatCheckNames[index], static_cast<unsigned long long>(detail));
+}
+
+void ReportDrawRepeat() {
+    if (!DrawRepeatVerify()) return;
+    auto& counts = drawRepeatCounts();
+    char line[512];
+    int n = std::snprintf(line, sizeof(line), "[draws] repeat path (APS5_DRAW_REPEAT, 10 s): verify on (compared/mismatched, window; since start):");
+    for (std::size_t i = 0; i < DrawRepeatCheckNames.size() && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++i) {
+        const auto compared = counts.compared[i].exchange(0, std::memory_order_relaxed);
+        const auto mismatched = counts.mismatched[i].exchange(0, std::memory_order_relaxed);
+        counts.totalCompared[i] += compared;
+        counts.totalMismatched[i] += mismatched;
+        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu/%llu; %llu/%llu;", DrawRepeatCheckNames[i], static_cast<unsigned long long>(compared), static_cast<unsigned long long>(mismatched), static_cast<unsigned long long>(counts.totalCompared[i]), static_cast<unsigned long long>(counts.totalMismatched[i]));
+    }
+    std::fprintf(stderr, "%s\n", line);
 }
 
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes) {

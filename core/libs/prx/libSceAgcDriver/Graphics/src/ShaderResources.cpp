@@ -1567,9 +1567,15 @@ void ShaderResources::reportDescriptorCaches() const {
 
 std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool rebaseReadOnly) {
     Require(shader.program != nullptr, "missing compiled shader");
-    const auto& program = *shader.program;
     std::vector<std::uint32_t> key;
-    key.reserve(8 + program.bindings.size() * 12);
+    key.reserve(8 + shader.program->bindings.size() * 12);
+    ContentKeyInto(shader, dataWords, rebaseReadOnly, key);
+    return key;
+}
+
+void ShaderResources::ContentKeyInto(const CompiledShader& shader, bool dataWords, bool rebaseReadOnly, std::vector<std::uint32_t>& key) {
+    Require(shader.program != nullptr, "missing compiled shader");
+    const auto& program = *shader.program;
     key.push_back(dataWords ? 1u : 0u);
     key.push_back(static_cast<std::uint32_t>(shader.stage));
     key.push_back(static_cast<std::uint32_t>(program.variantId));
@@ -1614,7 +1620,6 @@ std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& sha
         // must not serve a build with another (the variant implies it, this makes it explicit).
         packBits(binding.bufferWritten);
     }
-    return key;
 }
 
 namespace {
@@ -4255,7 +4260,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     const bool inPlace = InPlaceBindings();
     // APS5_DRAW_MEMOS=1 (s4-plan S4.2): moved elements find their imports through the thread's memo;
     // recordDraw (Draw, DrawWithRecipe) runs under GuestMemory::GpuMutex, as HostImportMemoized requires.
-    const bool memoizedImports = DrawMemos();
+    // The repeat path (APS5_DRAW_REPEAT, default on) likewise.
+    const bool memoizedImports = DrawMemos() || DrawRepeat();
     // Made once the first element is selected: most draws select none and return nothing.
     std::shared_ptr<DrawBindings> result;
     // APS5_RECORD_FAST: the lists below live in the thread's scratch.
@@ -4290,6 +4296,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             Require(!unknown, "a rebased data buffer without recorded words");
             const auto words = SourceWords(shaders, item.sourceShader, item.sourceBinding);
             Require(words.size() * sizeof(std::uint32_t) == item.size, "a rebased data buffer changed size");
+            RecordProfile::Scope dataSpan(RecordProfile::SetDataCopy);
             auto buffer = std::make_shared<Buffer>(context, item.size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             auto* bytes = buffer->Bytes().data();
             std::memcpy(bytes, words.data(), item.size);
