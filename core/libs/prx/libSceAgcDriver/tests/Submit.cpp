@@ -736,6 +736,21 @@ void testRecordPipe() {
     imageOk = imageOk && ranges.empty();
     RecordPipeImageRanges({}, ranges);
     check(imageOk && ranges == Ranges{{0, ~0ull}}, "record pipe: a storage image's estimate is its surface + 64 KiB, a null T# none, an unknown one everything");
+
+    // APS5_HANDOFF_FAST: the parts ("1" both, else a mask), and the prefetch budget's lines.
+    check(RecordPipeHandoffParts(nullptr) == 0 && RecordPipeHandoffParts("") == 0 && RecordPipeHandoffParts("0") == 0 && RecordPipeHandoffParts("1") == (HandoffRelease | HandoffPrefetch) && RecordPipeHandoffParts("2") == HandoffRelease && RecordPipeHandoffParts("4") == HandoffPrefetch && RecordPipeHandoffParts("6") == (HandoffRelease | HandoffPrefetch) && RecordPipeHandoffParts("3") == HandoffRelease && RecordPipeHandoffParts("x") == 0 && RecordPipeHandoffParts("99999999999") == 0, "record pipe handoff: 1 takes both parts, other numbers are a mask, junk is off");
+    alignas(64) static std::array<std::byte, 512> lines{};
+    std::vector<const void*> touched;
+    const auto touch = [&](const void* line) { touched.push_back(line); };
+    RecordPipePrefetchBudget budget{4 * RecordPipePrefetchBudget::Line};
+    budget.Lines(lines.data() + 10, 100, touch);
+    bool budgetOk = touched == std::vector<const void*>{lines.data(), lines.data() + 64} && budget.left == 2 * RecordPipePrefetchBudget::Line;
+    budget.Lines(nullptr, 64, touch);
+    budget.Lines(lines.data(), 0, touch);
+    budget.Lines(lines.data() + 128, 512 - 128, touch);
+    budgetOk = budgetOk && touched.size() == 4 && touched[2] == lines.data() + 128 && touched[3] == lines.data() + 192 && budget.left == 0;
+    budget.Lines(lines.data(), 64, touch);
+    check(budgetOk && touched.size() == 4, "record pipe handoff: the prefetch takes whole lines from the first byte's to the last byte's, within its budget");
 }
 
 // The fast dispatch (F5): the compare its verify mode makes between the old path's capture and the
