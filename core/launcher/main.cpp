@@ -27,6 +27,7 @@
 #include "imgui.h"
 #include "backends/imgui_impl_sdl2.h"
 #include "backends/imgui_impl_sdlrenderer2.h"
+#include "prx/libc/include/AddonContent.hpp"
 #include "prx/libc/include/PortSettings.hpp"
 
 #include "FolderBrowser.hpp"
@@ -167,9 +168,12 @@ struct CheckJob {
     std::filesystem::path installDir;
     std::filesystem::path settings;
     bool release = false;
+    bool fromGame = false;
+    std::string addonDir;
     std::optional<bool> python;
     Launcher::FolderCheck folder;
     std::string setupReason;
+    std::vector<AddonContent::Found> addons;
     std::atomic<bool> done{false};
 };
 
@@ -181,6 +185,12 @@ void RunCheck(CheckJob& job) {
     }
     if (!job.python) job.python = Launcher::PythonUsable();
     job.setupReason = job.release && job.folder.state == Launcher::FolderState::Valid ? Launcher::SetupReason(job.installDir, job.folder.folder, *job.python) : std::string();
+    // The add-ons near the dump (the game's own search): the checked folder, or from the game without a
+    // saved folder, the app0 next to the settings file whose folders link into the dump.
+    std::vector<std::filesystem::path> dumps;
+    if (job.folder.state == Launcher::FolderState::Valid) dumps = AddonContent::DumpFolders(job.folder.folder);
+    else if (job.fromGame) dumps = AddonContent::DumpFolders(std::filesystem::absolute(job.settings).parent_path() / "app0");
+    job.addons = dumps.empty() && job.addonDir.empty() ? std::vector<AddonContent::Found>() : AddonContent::Find(dumps, AddonContent::PathFromText(job.addonDir));
 }
 
 // What the window edits; `settings` holds the choices as the parser's values.
@@ -205,6 +215,7 @@ struct Model {
     std::string setupReason;     // why Play runs the setup first; empty when it is done
     std::optional<bool> python;  // a Python 3.8+ for the setup's patch; unknown until the first check
     std::shared_ptr<CheckJob> check;  // the check running on its thread
+    std::vector<AddonContent::Found> addons;  // the title's add-ons the checked folder's dump holds
     std::string editedText;           // the text as last edited, checked once it stays for a moment
     double editTime = 0.0;
     double checkTime = 0.0;  // when `check` started
@@ -236,6 +247,8 @@ std::shared_ptr<CheckJob> NewCheck(const Model& model, const std::string& text) 
     job->installDir = model.installDir;
     job->settings = model.options.settings;
     job->release = Release(model);
+    job->fromGame = model.options.fromGame;
+    job->addonDir = model.settings.addonDir;
     job->python = model.python;
     return job;
 }
@@ -245,6 +258,7 @@ void ApplyCheck(Model& model, const CheckJob& job) {
     model.folder = job.folder;
     model.python = job.python;
     model.setupReason = job.setupReason;
+    model.addons = job.addons;
 }
 
 // Checks the game folder (and whether the setup is due) on this thread: at the start, for Play, after the setup.
@@ -497,6 +511,31 @@ void Colored(const ImVec4& color, const std::string& text) {
     ImGui::PopStyleColor();
 }
 
+// The Deluxe Edition add-on (s61 T-deluxe): it can be on only when the dump holds it (AddonContent.hpp,
+// the same search the game's entitlement query answers from); the checkbox turns an owned add-on off.
+void DrawDeluxe(Model& model) {
+    Label("Deluxe Edition content");
+    const auto* found = Checking(model) ? nullptr : AddonContent::FindLabel(model.addons, AddonContent::DeluxeEditionLabel);
+    // APS5_DELUXE_EDITION wins over the ini (the game reads it): the box shows what the game will do.
+    const char* environment = std::getenv("APS5_DELUXE_EDITION");
+    const bool overridden = environment != nullptr && environment[0] != '\0';
+    const std::string value = overridden ? AddonContent::Upper(environment) : std::string();
+    const auto effective = overridden ? (value == "OFF" || value == "0" || value == "FALSE" ? PortSettings::DeluxeEdition::Off : PortSettings::DeluxeEdition::Auto) : model.settings.deluxeEdition;
+    ImGui::BeginDisabled(found == nullptr || overridden);
+    bool enabled = found != nullptr && effective != PortSettings::DeluxeEdition::Off;
+    if (ImGui::Checkbox("Deluxe Edition items (Fluted armour set)##deluxe", &enabled)) model.settings.deluxeEdition = enabled ? PortSettings::DeluxeEdition::Auto : PortSettings::DeluxeEdition::Off;
+    ImGui::EndDisabled();
+    if (overridden) Note((std::string("(set by APS5_DELUXE_EDITION=") + environment + ")").c_str());
+    if (Checking(model)) {
+        Note("Checking the folder...");
+    } else if (found != nullptr) {
+        Colored(Good, "Found in your dump");
+        Note((PortSettings::PathText(found->folder) + " (" + found->reason + "). Offered when creating a character; turned off, the game takes the items away from a character that has them.").c_str());
+    } else {
+        Note("Not found in your dump");
+    }
+}
+
 // The setup script's current step ("== relinking ...") in plain words.
 std::string SetupStep(const std::vector<std::string>& lines) {
     for (auto line = lines.rbegin(); line != lines.rend(); ++line) {
@@ -671,6 +710,8 @@ Action Draw(Model& model) {
         bool frameGeneration = false;
         ImGui::Checkbox("Coming later", &frameGeneration);
         ImGui::EndDisabled();
+
+        DrawDeluxe(model);
         ImGui::EndTable();
     }
     ImGui::EndDisabled();

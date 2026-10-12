@@ -353,7 +353,7 @@ public:
         std::fprintf(stderr, " collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
         std::fprintf(stderr, " collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
         std::fprintf(stderr, " | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
-        std::fprintf(stderr, " %s | %s", FreedStoreSummary().c_str(), KeptCpuStoreSummary().c_str());
+        std::fprintf(stderr, " %s | %s | %s", FreedStoreSummary().c_str(), KeptCpuStoreSummary().c_str(), LateLandSummary().c_str());
         {
             std::lock_guard lock(state.callersMutex);
             std::fprintf(stderr, " | read callers:");
@@ -1532,6 +1532,51 @@ StoreSlot* StoreSlots() {
 }
 
 std::atomic<std::uint64_t> storeRingNext{0};
+
+// The per-block memo beside the ring (R-crash): the ring keeps 1-2 s of stores, while a crash may
+// read a word stored 10 s or more before. For each 64 KiB block, direct-mapped and tagged, the
+// newest recorded store covering it whole, the newest covering part of it and the newest GPU write
+// range the recorder noted over it (NoteGpuWriteForCrash). Kept like ring slots (a record whose
+// sequence changed during the copy is skipped); best effort under concurrent writers of one slot.
+constexpr std::size_t BlockMemoBlocks = std::size_t{1} << 18;
+constexpr std::uint64_t BlockMemoBytes = 65536;
+// Blocks one store notes at most (1 GiB from its start).
+constexpr std::uint64_t BlockMemoSpan = 16384;
+enum BlockMemoKind : std::size_t { BlockMemoWhole, BlockMemoPart, BlockMemoGpu, BlockMemoKinds };
+constexpr const char* BlockMemoNames[BlockMemoKinds] = {"whole", "part", "gpu-noted"};
+
+struct BlockMemoSlot {
+    std::atomic<std::uint64_t> sequence{0};
+    // The block's index + 1 (0: empty).
+    std::uint64_t block = 0;
+    GuestStoreRecord record;
+};
+
+std::atomic<std::uint64_t> blockMemoNext{0};
+
+// Made with the ring (APS5_CRASH_RESOURCES=1; ~90 MiB).
+BlockMemoSlot* BlockMemo() {
+    static BlockMemoSlot* const slots = StoreSlots() != nullptr ? new BlockMemoSlot[BlockMemoBlocks * BlockMemoKinds] : nullptr;
+    return slots;
+}
+
+void noteBlockMemo(const GuestStoreRecord& record, bool gpu) {
+    auto* slots = BlockMemo();
+    if (slots == nullptr || record.end <= record.begin) return;
+    const auto first = record.begin / BlockMemoBytes;
+    const auto last = std::min((record.end - 1) / BlockMemoBytes, first + BlockMemoSpan - 1);
+    for (auto block = first; block <= last; ++block) {
+        const bool whole = record.begin <= block * BlockMemoBytes && (block + 1) * BlockMemoBytes <= record.end;
+        auto& slot = slots[(block % BlockMemoBlocks) * BlockMemoKinds + (gpu ? BlockMemoGpu : whole ? BlockMemoWhole : BlockMemoPart)];
+        const auto ticket = blockMemoNext.fetch_add(1, std::memory_order_relaxed);
+        slot.sequence.store(2 * ticket + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        slot.block = block + 1;
+        slot.record = record;
+        slot.sequence.store(2 * ticket + 2, std::memory_order_release);
+    }
+}
+
 thread_local const char* storeTag = nullptr;
 thread_local const char* storeReason = nullptr;
 thread_local std::uint64_t storeTagAddress = 0;
@@ -1667,6 +1712,7 @@ void recordStore(std::uint64_t begin, std::uint64_t end, std::uint32_t generatio
     record.tagAddress = storeTagAddress;
     CaptureCallerOffsets(std::span(record.callers), 1);
     slot.sequence.store(2 * index + 2, std::memory_order_release);
+    noteBlockMemo(record, false);
 }
 
 #ifdef _WIN32
@@ -1716,6 +1762,19 @@ void describeAddress(std::uint64_t address, std::uint64_t now, CrashPrint print)
         crashLine(print, "[crash-resources]   store %s 0x%llx+0x%llx at %llu ms (%llu ms ago) thread %u gen %u by %s/%s 0x%llx; callers +0x%llx +0x%llx +0x%llx +0x%llx +0x%llx +0x%llx\n", store.kind != nullptr ? store.kind : "?", static_cast<unsigned long long>(store.begin), static_cast<unsigned long long>(store.end - store.begin), static_cast<unsigned long long>(store.milliseconds), static_cast<unsigned long long>(now - std::min(now, store.milliseconds)), store.thread, store.generation, store.tag != nullptr ? store.tag : "-", store.reason != nullptr ? store.reason : "-", static_cast<unsigned long long>(store.tagAddress), store.callers[0], store.callers[1], store.callers[2], store.callers[3], store.callers[4], store.callers[5]);
     }
     if (found == 0) print("[crash-resources]   no recorded driver store over its 64 bytes\n");
+    if (const auto* memo = BlockMemo()) {
+        const auto block = address / BlockMemoBytes;
+        for (std::size_t kind = 0; kind < BlockMemoKinds; ++kind) {
+            const auto& slot = memo[(block % BlockMemoBlocks) * BlockMemoKinds + kind];
+            const auto sequence = slot.sequence.load(std::memory_order_acquire);
+            if (sequence == 0 || (sequence & 1) != 0 || slot.block != block + 1) continue;
+            const GuestStoreRecord store = slot.record;
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (slot.sequence.load(std::memory_order_relaxed) != sequence) continue;
+            const bool covers = store.begin <= address && address < store.end;
+            crashLine(print, "[crash-resources]   block memo %s: %s 0x%llx+0x%llx (%s the address) at %llu ms (%llu ms ago) thread %u gen %u by %s/%s 0x%llx; callers +0x%llx +0x%llx +0x%llx +0x%llx +0x%llx +0x%llx\n", BlockMemoNames[kind], store.kind != nullptr ? store.kind : "?", static_cast<unsigned long long>(store.begin), static_cast<unsigned long long>(store.end - store.begin), covers ? "covers" : "misses", static_cast<unsigned long long>(store.milliseconds), static_cast<unsigned long long>(now - std::min(now, store.milliseconds)), store.thread, store.generation, store.tag != nullptr ? store.tag : "-", store.reason != nullptr ? store.reason : "-", static_cast<unsigned long long>(store.tagAddress), store.callers[0], store.callers[1], store.callers[2], store.callers[3], store.callers[4], store.callers[5]);
+        }
+    }
     const auto describers = std::min(crashDescriberCount.load(std::memory_order_acquire), std::size(crashDescribers));
     for (std::size_t i = 0; i < describers; ++i) {
         if (const auto describer = crashDescribers[i].load(std::memory_order_acquire)) describer(address, print);
@@ -1786,6 +1845,22 @@ std::size_t RecentGuestStores(std::uint64_t address, std::size_t bytes, std::spa
         out[found++] = record;
     }
     return found;
+}
+
+void NoteGpuWriteForCrash(std::uint64_t begin, std::uint64_t end, const char* kind, std::uint64_t batch) {
+    if (BlockMemo() == nullptr || end <= begin) return;
+    GuestStoreRecord record;
+    record.begin = begin;
+    record.end = end;
+    record.milliseconds = StoreClockMs();
+    record.generation = static_cast<std::uint32_t>(Tracker().generation.load(std::memory_order_relaxed));
+#ifdef _WIN32
+    record.thread = static_cast<std::uint32_t>(GetCurrentThreadId());
+#endif
+    record.kind = kind;
+    record.tag = "batch";
+    record.tagAddress = batch;
+    noteBlockMemo(record, true);
 }
 
 void NoteGuestStore(std::uint64_t address, std::size_t bytes, const char* kind) {
@@ -3009,6 +3084,116 @@ std::string KeptCpuStoreSummary() {
     auto used = static_cast<std::size_t>(std::snprintf(text, sizeof(text), "late stores over CPU-stored pages: %s %llu (%llu KiB) by kind", KeepCpuStores() ? "kept" : "would keep", static_cast<unsigned long long>(count), static_cast<unsigned long long>(bytes / 1024)));
     for (std::size_t k = 0; k < LateKindCount && used < sizeof(text); ++k) {
         used += static_cast<std::size_t>(std::snprintf(text + used, sizeof(text) - used, " %s %llu (%llu KiB)", LateKindNames[k], static_cast<unsigned long long>(keptStores[k].load(std::memory_order_relaxed)), static_cast<unsigned long long>(keptStoreBytes[k].load(std::memory_order_relaxed) / 1024)));
+    }
+    return text;
+}
+
+namespace {
+
+constexpr std::size_t LandKindCount = static_cast<std::size_t>(LateLandKind::Count);
+constexpr std::size_t LandPhaseCount = static_cast<std::size_t>(LateLandPhase::Count);
+constexpr const char* LandKindNames[LandKindCount] = {"shadow", "texture-store", "dcc-keys", "fill", "copy", "copy-back", "gpu-write"};
+constexpr const char* LandPhaseNames[LandPhaseCount] = {"before submit", "in flight", "waited"};
+// APS5_LATE_LAND_CHECK: -1 until read from the environment (SetLateLandLevel overrides it).
+std::atomic<int> lateLandLevel{-1};
+std::atomic<std::uint64_t> landsChecked{0};
+std::atomic<std::uint64_t> landChecks{0};
+std::atomic<std::uint64_t> landCheckNs{0};
+std::array<std::array<std::atomic<std::uint64_t>, LandKindCount>, LandPhaseCount> landHits{};
+std::array<std::array<std::atomic<std::uint64_t>, LandKindCount>, LandPhaseCount> landHitBytes{};
+// The [late-land] lines: the first 24 hits, then one per kind per 10 s.
+std::atomic<int> landLinesLeft{24};
+std::array<std::atomic<std::uint64_t>, LandKindCount> landLineMs{};
+
+}
+
+int LateLandLevel() {
+    auto value = lateLandLevel.load(std::memory_order_relaxed);
+    if (value < 0) {
+        const char* text = std::getenv("APS5_LATE_LAND_CHECK");
+        value = text == nullptr ? 1 : std::clamp(std::atoi(text), 0, 2);
+        lateLandLevel.store(value, std::memory_order_relaxed);
+    }
+    return value;
+}
+
+void SetLateLandLevel(int level) {
+    lateLandLevel.store(std::clamp(level, 0, 2), std::memory_order_relaxed);
+}
+
+bool LateLandChecked(LateLandKind kind) {
+    const auto level = LateLandLevel();
+    return level >= 2 || (level == 1 && kind != LateLandKind::Fill && kind != LateLandKind::Copy && kind != LateLandKind::CopyBack && kind != LateLandKind::GpuWrite);
+}
+
+LateLand MakeLateLand(LateLandKind kind, std::uint64_t begin, std::uint64_t end, std::uint64_t generation, const char* reason) {
+    LateLand land;
+    land.begin = begin;
+    land.end = end;
+    land.generation = generation;
+    land.kind = kind;
+    land.reason = reason;
+    land.packet = CurrentPacket();
+    land.notedMs = StoreClockMs();
+    return land;
+}
+
+std::uint64_t CheckLateLand(const LateLand& land, LateLandPhase phase, std::uint64_t since, std::uint64_t serial) {
+    if (land.end <= land.begin || !LateLandChecked(land.kind)) return 0;
+    const auto start = std::chrono::steady_clock::now();
+    const auto bytes = static_cast<std::size_t>(land.end - land.begin);
+    // Once the GPU may have landed, the CPU's stores since are stamped only by a walk.
+    if (phase != LateLandPhase::Submit) CollectWritesUncached(land.begin, bytes);
+    const auto from = std::max(land.generation, since);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    const auto stored = CpuStoredRuns(land.begin, bytes, from, runs);
+    if (phase != LateLandPhase::Finish) landsChecked.fetch_add(1, std::memory_order_relaxed);
+    landChecks.fetch_add(1, std::memory_order_relaxed);
+    landCheckNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    if (stored == 0) return 0;
+    const auto p = static_cast<std::size_t>(phase);
+    const auto k = static_cast<std::size_t>(land.kind);
+    landHits[p][k].fetch_add(1, std::memory_order_relaxed);
+    landHitBytes[p][k].fetch_add(stored, std::memory_order_relaxed);
+    if (!MemoryProfiled()) return stored;
+    const auto now = StoreClockMs();
+    bool print = landLinesLeft.load(std::memory_order_relaxed) > 0 && landLinesLeft.fetch_sub(1, std::memory_order_relaxed) > 0;
+    if (!print) {
+        auto last = landLineMs[k].load(std::memory_order_relaxed);
+        print = now - std::min(now, last) >= 10000 && landLineMs[k].compare_exchange_strong(last, now);
+    }
+    if (!print) return stored;
+    std::fprintf(stderr, "[late-land] %s %s 0x%llx+0x%llx (%s): %llu KiB CPU-stored since gen %llu (decided %llu, now %llu) in %zu runs, first 0x%llx+0x%llx; batch %llu, packet 0x%x queue 0x%x, noted %llu ms ago\n", LandKindNames[k], LandPhaseNames[p], static_cast<unsigned long long>(land.begin), static_cast<unsigned long long>(land.end - land.begin), land.reason != nullptr ? land.reason : "-", static_cast<unsigned long long>((stored + 1023) / 1024), static_cast<unsigned long long>(from), static_cast<unsigned long long>(land.generation), static_cast<unsigned long long>(TrackerGeneration()), runs.size(), static_cast<unsigned long long>(runs.front().first), static_cast<unsigned long long>(runs.front().second - runs.front().first), static_cast<unsigned long long>(serial), land.packet.opcode, land.packet.queue, static_cast<unsigned long long>(now - std::min(now, land.notedMs)));
+    return stored;
+}
+
+std::uint64_t CheckLandedNow(LateLandKind kind, std::uint64_t begin, std::uint64_t end, std::uint64_t generation, const char* reason) {
+    if (end <= begin || generation == 0 || !LateLandChecked(kind)) return 0;
+    return CheckLateLand(MakeLateLand(kind, begin, end, generation, reason), LateLandPhase::Waited, 0, 0);
+}
+
+std::string LateLandSummary() {
+    if (LateLandLevel() == 0) return "late lands over CPU stores: off";
+    char text[640];
+    auto used = static_cast<std::size_t>(std::snprintf(text, sizeof(text), "late lands over CPU stores: checked %llu lands (%llu checks, %.0f ms);", static_cast<unsigned long long>(landsChecked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(landChecks.load(std::memory_order_relaxed)), landCheckNs.load(std::memory_order_relaxed) / 1e6));
+    std::array<std::uint64_t, LandKindCount> kindHits{};
+    std::array<std::uint64_t, LandKindCount> kindBytes{};
+    for (std::size_t p = 0; p < LandPhaseCount && used < sizeof(text); ++p) {
+        std::uint64_t hits = 0;
+        std::uint64_t bytes = 0;
+        for (std::size_t k = 0; k < LandKindCount; ++k) {
+            const auto h = landHits[p][k].load(std::memory_order_relaxed);
+            const auto b = landHitBytes[p][k].load(std::memory_order_relaxed);
+            hits += h;
+            bytes += b;
+            kindHits[k] += h;
+            kindBytes[k] += b;
+        }
+        used += static_cast<std::size_t>(std::snprintf(text + used, sizeof(text) - used, "%s %s %llu (%llu KiB)", p == 0 ? "" : ",", LandPhaseNames[p], static_cast<unsigned long long>(hits), static_cast<unsigned long long>(bytes / 1024)));
+    }
+    if (used < sizeof(text)) used += static_cast<std::size_t>(std::snprintf(text + used, sizeof(text) - used, "; by kind"));
+    for (std::size_t k = 0; k < LandKindCount && used < sizeof(text); ++k) {
+        used += static_cast<std::size_t>(std::snprintf(text + used, sizeof(text) - used, " %s %llu (%llu KiB)", LandKindNames[k], static_cast<unsigned long long>(kindHits[k]), static_cast<unsigned long long>(kindBytes[k] / 1024)));
     }
     return text;
 }

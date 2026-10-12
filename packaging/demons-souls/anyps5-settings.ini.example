@@ -37,3 +37,9 @@
 
 # Upscaler: off. AMD FSR and NVIDIA DLSS are planned.
 # Upscaler = off
+
+# The Deluxe Edition add-on (Fluted armour set): auto = owned when your dump holds it (a folder next to
+# the game folder named with DEMONSSOULSGIFT2 or its content id), off = not owned even then. Nothing is
+# written into the dump. AddonDir names a folder holding your dumped add-ons when they are elsewhere.
+# DeluxeEdition = auto
+# AddonDir = "D:\Dumps\PPSA01341-ac"

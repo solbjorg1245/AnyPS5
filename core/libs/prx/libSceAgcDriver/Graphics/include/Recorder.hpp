@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include <atomic>
 #include <chrono>
@@ -204,6 +205,9 @@ public:
         // GuestMemory::FreeClock when the copy was first queued (DeferCopies; a claimed copy keeps
         // its own): the pages released since are not copied back (APS5_DROP_FREED_STORES).
         std::uint32_t freeClock = 0xffffffffu;
+        // GuestMemory::TrackerGeneration when the copy was first queued (0: recorded at once), the
+        // decision a plain copy's land is checked from (APS5_LATE_LAND_CHECK=2, LateLandKind::CopyBack).
+        std::uint64_t generation = 0;
     };
     static bool DeferCopyBacks();
     // Copy-back coalescing (on by default; APS5_NO_COALESCE_COPY_BACKS=1 or APS5_COALESCE_COPY_BACKS=0
@@ -433,6 +437,9 @@ public:
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr);
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
     void OnComplete(std::function<void()> action);
+    // APS5_LATE_LAND_CHECK (GuestMemory::CheckLateLand): a GPU store into the import decided at
+    // `generation`, checked for CPU stores under it before the open batch's submit and after it finished.
+    void NoteLateLand(GuestMemory::LateLandKind kind, std::uint64_t begin, std::uint64_t end, std::uint64_t generation, const char* reason);
     // What a noted pending write is, for the [hooksync] attribution (the writer of the range a
     // CPU access waited for, see DescribePendingWrite): a shader's writable element (a dispatch or
     // a draw, MarkGpuWrites), a buffer fill, a buffer copy (its destination) or a whole-surface
@@ -998,6 +1005,9 @@ private:
         std::uint32_t completionLabelCount = 0;
         // Write-back completions (OnComplete), likewise.
         std::uint32_t writeBackCompletionCount = 0;
+        // Late lands (NoteLateLand) and the tracker generation at the submit (0: not submitted with any).
+        std::vector<GuestMemory::LateLand> lateLands;
+        std::uint64_t lateLandGeneration = 0;
         // The ranges of the completion labels also stored on the GPU, and whether each entered the
         // pending count (NoteWrittenBack counts one the first time a write-back overlaps it).
         struct CompletionLabel {

@@ -59,8 +59,10 @@ struct Statistics {
     std::atomic<std::uint64_t> detiledShadow{0}, detiledShadowBytes{0}, detiledImport{0}, detiledImportBytes{0}, tailPublishes{0};
     std::array<std::atomic<std::uint64_t>, ReasonCount> published{}, publishedBytes{};
     std::atomic<std::uint64_t> staleDroppedCpu{0}, staleDroppedDriver{0}, skippedInCompletion{0}, evictions{0}, lostOnRetire{0}, droppedOnRetire{0}, slabLost{0}, verified{0}, mismatches{0};
-    // Stale-dropped units whose unstored pages were published anyway (APS5_FIX_BOOT_STRIP).
-    std::atomic<std::uint64_t> pageKeptUnits{0}, pageKeptPages{0};
+    // Stale-dropped units whose unstored pages were published anyway (APS5_FIX_BOOT_STRIP), and
+    // the stale units a store reached in a retiled page while others stayed unstored (the game took
+    // the memory back): dropped whole with APS5_FIX_KEPT_REUSE, their unstored pages landed with =0.
+    std::atomic<std::uint64_t> pageKeptUnits{0}, pageKeptPages{0}, pageKeptReused{0};
 };
 
 Statistics& Stats() {
@@ -241,8 +243,9 @@ struct SlabCopies {
 };
 
 // Records the copies as one command group into the active recorder's open batch (a waited batch
-// without one). `ranges` are the guest ranges copied, for the note and the hazard tracker.
-void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copies, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t bytes) {
+// without one). `ranges` are the guest ranges copied, for the note and the hazard tracker; `decided`
+// the generation the publish chose them at and `reason` its name (APS5_LATE_LAND_CHECK).
+void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copies, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t bytes, std::uint64_t decided, const char* reason) {
     const auto& context = shadow.context;
     using CommandClass = Recorder::CommandClass;
     auto* recorder = Recorder::Active();
@@ -276,6 +279,7 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     Recorder::CountBarriers(CommandClass::ShadowPublish);
     if (batch) {
         batch->SubmitAndWait();
+        for (const auto& [begin, end] : ranges) GuestMemory::CheckLandedNow(GuestMemory::LateLandKind::ShadowPublish, begin, end, decided, reason);
         return;
     }
     recorder->EndGpuTiming(timing, bytes);
@@ -283,6 +287,7 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     for (const auto& entry : copies) recorder->Keep(entry.slab);
     // CPU readers reach the import's bytes only after the hook's SyncThrough waits by this note.
     recorder->NotePendingWrites(ranges, Recorder::WriteKind::ShadowPublish);
+    for (const auto& [begin, end] : ranges) recorder->NoteLateLand(GuestMemory::LateLandKind::ShadowPublish, begin, end, decided, reason);
 }
 
 // APS5_SHADOW_VERIFY=1: the published bytes read back from the slabs equal the guest bytes.
@@ -445,7 +450,11 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
                 const auto [unitBegin, unitEnd] = shadow->UnitRange(unit);
                 const auto& keptSlab = shadow->slabs[static_cast<std::size_t>(unit / SlabUnits())];
                 const auto retiled = shadow->retiledPages[unit];
-                const auto kept = keptSlab != nullptr && retiled != 0 && unitEnd > unitBegin ? GuestMemory::PagesUnstoredSince(unitBegin, static_cast<std::size_t>(unitEnd - unitBegin), shadow->generation[unit]) & retiled : 0u;
+                const auto unstored = keptSlab != nullptr && retiled != 0 && unitEnd > unitBegin ? GuestMemory::PagesUnstoredSince(unitBegin, static_cast<std::size_t>(unitEnd - unitBegin), shadow->generation[unit]) : 0u;
+                std::uint32_t unitPages = 0;
+                for (auto p = (unitBegin - shadow->UnitBegin(unit)) / GuestMemory::UnstoredPageBytes; unitEnd > unitBegin && p <= (unitEnd - 1 - shadow->UnitBegin(unit)) / GuestMemory::UnstoredPageBytes; ++p) unitPages |= 1u << p;
+                const auto kept = StaleKeptPages(unstored, retiled, unitPages, KeptReuseFix());
+                if ((unstored & retiled) != 0 && StaleKeptPages(unstored, retiled, unitPages, true) == 0) Stats().pageKeptReused.fetch_add(1, std::memory_order_relaxed);
                 if (kept != 0) {
                     constexpr std::uint64_t page = GuestMemory::UnstoredPageBytes;
                     const auto blockBegin = shadow->UnitBegin(unit);
@@ -502,7 +511,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         landOnCpu(*shadow, cpuCopies, decided);
     }
     if (ranges.empty()) return units;
-    recordCopies(*shadow, copies, ranges, bytes);
+    recordCopies(*shadow, copies, ranges, bytes, decided, ReasonNames[static_cast<std::size_t>(reason)]);
     if (!wouldLand.empty()) {
         // APS5_KEEP_CPU_STORES=0: what the CPU would have kept of the late pieces, counted ("would
         // keep") from the stamps collected by the time their copy's batch finishes (no walk here).
@@ -619,6 +628,19 @@ bool UnitShadowEnabled() {
 bool ShadowVerify() {
     static const bool verify = std::getenv("APS5_SHADOW_VERIFY") != nullptr;
     return verify;
+}
+
+std::uint32_t StaleKeptPages(std::uint32_t unstored, std::uint32_t retiled, std::uint32_t unitPages, bool dropReused) {
+    if (dropReused && (retiled & unitPages & ~unstored) != 0) return 0;
+    return unstored & retiled;
+}
+
+bool KeptReuseFix() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_FIX_KEPT_REUSE");
+        return text == nullptr || std::strcmp(text, "0") != 0;
+    }();
+    return enabled;
 }
 
 void NoteShadowSeed(std::uint64_t begin, std::uint64_t end) {
@@ -1078,7 +1100,7 @@ std::string ShadowReport() {
     }
     std::snprintf(text, sizeof(text), " %llu/%.1f by reason {%s }, stale-dropped %llu (cpu %llu, driver %llu), skipped-in-completion %llu, slabs %llu live %.1f MiB / peak %.1f MiB, evictions %llu, slab lost %llu, retired %llu, dropped on retire %llu, lost on retire %llu", publishedTotal, mib(publishedBytesTotal), reasons.c_str(), cpuDropped + driverDropped, cpuDropped, driverDropped, take(statistics.skippedInCompletion), liveSlabs, mib(liveBytes), mib(peakBytes), take(statistics.evictions), take(statistics.slabLost), retired, take(statistics.droppedOnRetire), take(statistics.lostOnRetire));
     line += text;
-    std::snprintf(text, sizeof(text), ", stale page-kept %llu units/%llu pages", take(statistics.pageKeptUnits), take(statistics.pageKeptPages));
+    std::snprintf(text, sizeof(text), ", stale page-kept %llu units/%llu pages (%llu units on reuse)", take(statistics.pageKeptUnits), take(statistics.pageKeptPages), take(statistics.pageKeptReused));
     line += text;
     if (ShadowVerify()) {
         std::snprintf(text, sizeof(text), ", verified %llu, mismatches %llu", take(statistics.verified), take(statistics.mismatches));

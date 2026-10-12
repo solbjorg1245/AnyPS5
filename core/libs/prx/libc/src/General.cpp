@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GraphicsModePin.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
 #include "prx/libc/include/PortSettings.hpp"
 #include "prx/libc/include/UiOverlay.hpp"
@@ -174,16 +175,16 @@ extern "C" std::filesystem::path ResolvePath_nid_no_patch(const char* path) {
     // The player settings' title arguments alias the command-line and render-config files to merged
     // copies before the first guest path resolves (PortSettings.cpp); without settings nothing changes.
     // The UI overlays (button icons, the Visual Mode row) alias their generated files (UiOverlay.hpp).
+    // Then the title's cinematic render config is aliased to the performance one (GraphicsModePin.hpp).
     static std::once_flag settingsOverlay;
     std::call_once(settingsOverlay, [&state] {
-        InstallPortSettingsOverlay([&state](const char* guest) {
+        const auto resolve = [&state](const char* guest) {
             std::lock_guard lock(state.mutex);
             return Resolve(state, guest);
-        });
-        InstallUiOverlay([&state](const char* guest) {
-            std::lock_guard lock(state.mutex);
-            return Resolve(state, guest);
-        });
+        };
+        InstallPortSettingsOverlay(resolve);
+        InstallGraphicsModePin(resolve);
+        InstallUiOverlay(resolve);
     });
     std::lock_guard lock(state.mutex);
     return Resolve(state, path);
