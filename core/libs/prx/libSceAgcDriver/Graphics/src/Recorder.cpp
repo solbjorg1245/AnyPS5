@@ -1289,7 +1289,7 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
     // Resident read-only copies (KeepsResidentReads): plain GPU copies, independent of the
     // copy-back switches above.
     const char* residentReadsSwitch = std::getenv("APS5_RESIDENT_READS");
-    residentReads.enabled = residentReadsSwitch != nullptr && *residentReadsSwitch != '\0' && std::strcmp(residentReadsSwitch, "0") != 0;
+    residentReads.enabled = (residentReadsSwitch != nullptr && *residentReadsSwitch != '\0' && std::strcmp(residentReadsSwitch, "0") != 0) || VramFloor(VramFloorDispatchReads);
     if (residentReads.enabled) {
         residentReadsConfigured.store(true, std::memory_order_relaxed);
         const auto kib = [](const char* name, std::uint64_t fallback) {
@@ -1301,6 +1301,12 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
         residentReads.limitBytes = kib("APS5_RESIDENT_READS_MIB", 1024) << 10u;
         residentReads.minBytes = kib("APS5_RESIDENT_READS_MIN_KIB", 4);
         residentReads.maxBytes = kib("APS5_RESIDENT_READS_MAX_KIB", 16384);
+        if (VramFloor(VramFloorDispatchReads)) {
+            residentReads.limitBytes = kib("APS5_RESIDENT_READS_MIB", 2048) << 10u;
+            residentReads.minBytes = kib("APS5_RESIDENT_READS_MIN_KIB", 0);
+            residentReads.maxBytes = kib("APS5_RESIDENT_READS_MAX_KIB", 1048576);
+            residentReads.demote = false;
+        }
     }
     if (residentBuffers) {
         coalesceCopyBacks = true;

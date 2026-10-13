@@ -50,21 +50,44 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         // The CPU reads most of these buffers back (write-back, diffs), which is very slow from
         // write-combined memory, so the default host properties prefer cached host memory.
         constexpr VkMemoryPropertyFlags hostDefault = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        if (properties == hostDefault) {
+        constexpr VkMemoryPropertyFlags videoHost = hostDefault | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        const auto hostType = [&] {
             try {
-                allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, hostDefault | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+                return context.MemoryType(requirements.memoryTypeBits, hostDefault | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
             } catch (const std::runtime_error&) {
-                allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, hostDefault);
+                return context.MemoryType(requirements.memoryTypeBits, hostDefault);
+            }
+        };
+        bool videoHostType = false;
+        if (properties == hostDefault) {
+            allocation.memoryTypeIndex = hostType();
+        } else if (properties == videoHost) {
+            // APS5_VRAM_FLOOR (GpuReadHostProperties): host-visible video memory, else host memory.
+            try {
+                allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, videoHost);
+                videoHostType = true;
+            } catch (const std::runtime_error&) {
+                allocation.memoryTypeIndex = hostType();
+                NoteVramFloorBuffer(requirements.size, false);
             }
         } else {
             allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, properties);
         }
-        epoch = VideoMemory::Epoch();
-        memoryType = allocation.memoryTypeIndex;
         // Device-local buffers under the thread's class (staging shadows unless a scope says
         // otherwise, see VramClassScope).
         const bool deviceOnly = (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0;
-        Check(AllocateDeviceMemory(context, allocation, &memory, deviceOnly ? CurrentVramClass() : VramClass::Other), "vkAllocateMemory buffer");
+        auto allocated = AllocateDeviceMemory(context, allocation, &memory, deviceOnly ? CurrentVramClass() : VramClass::Other);
+        if (videoHostType && allocated != VK_SUCCESS) {
+            allocation.memoryTypeIndex = hostType();
+            allocated = AllocateDeviceMemory(context, allocation, &memory, VramClass::Other);
+            videoHostType = false;
+            NoteVramFloorBuffer(requirements.size, false);
+        } else if (videoHostType) {
+            NoteVramFloorBuffer(requirements.size, true);
+        }
+        epoch = VideoMemory::Epoch();
+        memoryType = allocation.memoryTypeIndex;
+        Check(allocated, "vkAllocateMemory buffer");
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory");
         initializeAddress(usage);
         if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) Check(context.Function<PFN_vkMapMemory>("vkMapMemory")(context.device, memory, 0, VK_WHOLE_SIZE, 0, &mapping), "vkMapMemory");
@@ -202,6 +225,51 @@ void recordPoolPoison(const Context& context, VkCommandBuffer commands, VkBuffer
     counters.sites[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
 }
 
+struct VramFloorCounters {
+    std::atomic<std::uint64_t> placed{0}, placedBytes{0}, fellBack{0}, fellBackBytes{0};
+};
+
+VramFloorCounters& vramFloorCounters() {
+    static VramFloorCounters counters;
+    return counters;
+}
+
+}
+
+unsigned VramFloorPartsFrom(const char* enabled, const char* parts) {
+    if (enabled == nullptr || *enabled == '\0' || std::strcmp(enabled, "0") == 0) return 0;
+    if (parts == nullptr || *parts == '\0') return VramFloorAll;
+    return static_cast<unsigned>(std::strtoul(parts, nullptr, 0)) & VramFloorAll;
+}
+
+bool VramFloor(unsigned part) {
+    static const unsigned parts = VramFloorPartsFrom(std::getenv("APS5_VRAM_FLOOR"), std::getenv("APS5_VRAM_FLOOR_PARTS"));
+    return (parts & part) != 0;
+}
+
+VkMemoryPropertyFlags GpuReadHostProperties() {
+    constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    return VramFloor(VramFloorBar) ? host | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : host;
+}
+
+void NoteVramFloorBuffer(std::uint64_t bytes, bool placed) noexcept {
+    auto& counters = vramFloorCounters();
+    (placed ? counters.placed : counters.fellBack).fetch_add(1, std::memory_order_relaxed);
+    (placed ? counters.placedBytes : counters.fellBackBytes).fetch_add(bytes, std::memory_order_relaxed);
+}
+
+std::string VramFloorReport() {
+    if (!VramFloor(VramFloorAll)) return {};
+    auto& counters = vramFloorCounters();
+    const auto placed = counters.placed.exchange(0, std::memory_order_relaxed);
+    const auto placedBytes = counters.placedBytes.exchange(0, std::memory_order_relaxed);
+    const auto fellBack = counters.fellBack.exchange(0, std::memory_order_relaxed);
+    const auto fellBackBytes = counters.fellBackBytes.exchange(0, std::memory_order_relaxed);
+    unsigned parts = 0;
+    for (unsigned part = 1; part <= VramFloorAll; part <<= 1u) parts |= VramFloor(part) ? part : 0u;
+    char text[256];
+    std::snprintf(text, sizeof(text), "; floor (APS5_VRAM_FLOOR parts 0x%x): video-memory host buffers made %llu (%.0f MiB), fell back to host memory %llu (%.0f MiB)", parts, static_cast<unsigned long long>(placed), static_cast<double>(placedBytes) / 1048576.0, static_cast<unsigned long long>(fellBack), static_cast<double>(fellBackBytes) / 1048576.0);
+    return text;
 }
 
 bool PoisonPool() {

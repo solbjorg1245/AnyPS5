@@ -61,4 +61,11 @@ void RunImageMemoryPoolTests() {
     std::array<std::byte, 10> filled{};
     FillPoolPoison(filled, word);
     require(filled[0] == std::byte{0xff} && filled[1] == std::byte{0x00} && filled[3] == std::byte{0x40} && filled[4] == std::byte{0xff} && filled[8] == std::byte{0xff} && filled[9] == std::byte{0x00}, "pool poison fill repeats the word");
+
+    // APS5_VRAM_FLOOR's parts (Resources.hpp): off unless set and not 0, all parts without a mask,
+    // a mask (decimal or hex) limited to the known parts.
+    using AgcDriver::Graphics::VramFloorPartsFrom;
+    require(VramFloorPartsFrom(nullptr, "3") == 0 && VramFloorPartsFrom("0", nullptr) == 0 && VramFloorPartsFrom("", "1") == 0, "vram floor off");
+    require(VramFloorPartsFrom("1", nullptr) == AgcDriver::Graphics::VramFloorAll && VramFloorPartsFrom("1", "") == AgcDriver::Graphics::VramFloorAll, "vram floor all parts");
+    require(VramFloorPartsFrom("1", "5") == 5u && VramFloorPartsFrom("1", "0x8") == 8u && VramFloorPartsFrom("1", "0x30") == 0u, "vram floor parts mask");
 }
