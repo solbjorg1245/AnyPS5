@@ -302,4 +302,110 @@ std::optional<Upscale::Skip> TemporalUpscaler::Record(const Context& context, co
     return std::nullopt;
 }
 
+PluginUpscaler::PluginUpscaler(const Context& context, const Upscale::LoadedPlugin& plugin, const Device& device) : context(context), plugin(plugin), device(device) {
+    this->context.bufferPool.reset();
+}
+
+PluginUpscaler::~PluginUpscaler() {
+    if (handle != nullptr) plugin.api.release(handle);
+}
+
+std::optional<Upscale::Skip> PluginUpscaler::Record(const Context& context, const Upscale::TemporalPlan& plan, std::string& detail) {
+    using Skip = Upscale::Skip;
+    using ShaderRecompiler::DescriptorImageShape;
+    Require(context.recorder != nullptr, "the upscale pass needs the device's recorder");
+    // The output as the port passes need it: a storage image of the T#'s own format (the one handed over).
+    const auto outputFormat = plan.base.output.format;
+    if (!StorageFormatAvailable(context, outputFormat) || StorageFormatForGuest(context, outputFormat) != ResolveTextureFormat(outputFormat)) return Skip::OutputFormat;
+    // 1. The context, at the first pass: MainColor's size the most it renders, this output. A failed
+    // create is not retried, and a frame of other sizes is the port's.
+    const std::uint32_t flags = (plan.smallestNearest ? 0u : APS5_UPSCALER_FLAG_DEPTH_INVERTED) | APS5_UPSCALER_FLAG_MOTION_RENDER_PIXELS;
+    if (handle == nullptr && !createFailed) {
+        Aps5UpscalerCreateInfo info{sizeof(info)};
+        info.flags = flags;
+        info.instance = device.instance;
+        info.physical_device = context.physical;
+        info.device = context.device;
+        info.get_instance_proc_addr = device.instanceProc;
+        info.get_device_proc_addr = context.deviceProc;
+        info.queue_family = device.family;
+        info.api_version = device.apiVersion;
+        info.max_render_width = plan.base.color.width;
+        info.max_render_height = plan.base.color.height;
+        info.output_width = plan.base.output.width;
+        info.output_height = plan.base.output.height;
+        if (plugin.api.create(&info, &handle) != APS5_UPSCALER_OK || handle == nullptr) {
+            handle = nullptr;
+            createFailed = true;
+            detail = Upscale::PluginError(plugin, nullptr);
+            return Skip::PluginCreate;
+        }
+        sizes = {info.max_render_width, info.max_render_height, info.output_width, info.output_height};
+    }
+    if (handle == nullptr) return Skip::PluginCreate;
+    if (plan.base.render[0] > sizes[0] || plan.base.render[1] > sizes[1] || plan.base.output.width != sizes[2] || plan.base.output.height != sizes[3]) return Skip::PluginSizes;
+    // 2. The lookups (TemporalUpscaler::Record's), then the images as handed over: the image, the view
+    // the port passes bind, its first mip and layer, the T#'s size and the layout the image is kept in
+    // (the plugin leaves it there; storage images and render targets stay GENERAL).
+    bool colorFirst = false, motionFirst = false, depthFirst = false, undecodable = false;
+    auto color = FastSampledTexture(context, plan.base.colorWords, DescriptorImageShape::Image2D, false, colorFirst, undecodable);
+    if (color == nullptr) return Skip::ColorUnresolved;
+    auto motion = FastSampledTexture(context, plan.motionWords, DescriptorImageShape::Image2D, false, motionFirst, undecodable);
+    auto depth = FastSampledTexture(context, plan.depthWords, DescriptorImageShape::Image2D, false, depthFirst, undecodable);
+    if (motion == nullptr || depth == nullptr) return Skip::InputUnresolved;
+    ShaderRecompiler::DescriptorBinding target{ShaderRecompiler::DescriptorKind::StorageImage, ShaderRecompiler::DescriptorRole::GuestImages, 0, 1, 1, {plan.base.outputWords.begin(), plan.base.outputWords.end()}};
+    target.imageShape = DescriptorImageShape::Image2D;
+    target.imageWritten = {true};
+    const auto output = ResolveStorageImage(context, target, 0, nullptr);
+    const auto sampled = [](const Texture& texture, bool firstLayer, const MfsrPacket::Descriptor& words) {
+        const auto& viewed = texture.ViewedImage();
+        const auto size = MfsrPacket::DecodeImageSize(words);
+        return Aps5UpscalerImage{sizeof(Aps5UpscalerImage), viewed.image, firstLayer ? texture.FirstLayerView() : texture.View(), viewed.format, viewed.usage,
+            {viewed.range.aspectMask, viewed.range.baseMipLevel, 1, viewed.range.baseArrayLayer, 1}, {size.width, size.height}, texture.Layout()};
+    };
+    Aps5UpscalerEvaluateInfo info{sizeof(info)};
+    info.flags = flags | (plan.reset ? APS5_UPSCALER_FLAG_RESET : 0u);
+    info.color = sampled(*color, colorFirst, plan.base.colorWords);
+    info.depth = sampled(*depth, depthFirst, plan.depthWords);
+    info.motion = sampled(*motion, motionFirst, plan.motionWords);
+    info.output = {sizeof(Aps5UpscalerImage), output.image->Image(), output.firstLayer ? output.image->FirstLayerView(output.mip) : output.image->View(output.mip), ResolveTextureFormat(outputFormat), StorageImageUsage,
+        {VK_IMAGE_ASPECT_COLOR_BIT, output.mip, 1, 0, 1}, {plan.base.output.width, plan.base.output.height}, VK_IMAGE_LAYOUT_GENERAL};
+    info.render_width = plan.base.render[0];
+    info.render_height = plan.base.render[1];
+    info.output_width = plan.base.output.width;
+    info.output_height = plan.base.output.height;
+    info.jitter_x = plan.jitter[0];
+    info.jitter_y = plan.jitter[1];
+    info.motion_scale_x = plan.motionScale[0];
+    info.motion_scale_y = plan.motionScale[1];
+    // +0x118 is 1.0 so far (the port pass's exposure); no frame time is known here.
+    info.exposure = info.pre_exposure = 1.0f;
+    // 3. The command buffer (after the lookups), a full barrier, the evaluate timed under
+    // PluginTimingKey, a full barrier and its mark. The recorder keeps no bound state from one command
+    // to the next (each draw and dispatch binds its pipeline, descriptors, push constants and dynamic
+    // state: FastDispatch.cpp, Pipeline::Continue, Draw.cpp), and Commands() ended any render pass left
+    // open, so after the plugin's own binds the trailing barrier's mark is all the recorder resets.
+    auto& recorder = *context.recorder;
+    const auto commands = recorder.Commands(nullptr, Recorder::CommandSite::Dispatch);
+    recorder.Keep(color);
+    recorder.Keep(motion);
+    recorder.Keep(depth);
+    recorder.Keep(output.image);
+    info.command_buffer = commands;
+    constexpr VkAccessFlags written = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT;
+    constexpr VkAccessFlags reached = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, written, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    const auto timing = recorder.BeginGpuTiming(Upscale::PluginTimingKey);
+    const auto status = plugin.api.evaluate(handle, &info);
+    recorder.EndGpuTiming(timing);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT, reached);
+    recorder.MarkCovered(reached);
+    if (status != APS5_UPSCALER_OK) {
+        detail = Upscale::PluginError(plugin, handle);
+        return Skip::PluginFailed;
+    }
+    output.image->MarkDirty();
+    return std::nullopt;
+}
+
 }

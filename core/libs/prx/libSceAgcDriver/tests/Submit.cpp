@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastRead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Upscale/Plugin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Upscale/Upscale.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastDispatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -1484,6 +1485,50 @@ void testUpscaleTemporalPlan() {
     check(skipOf() == Upscale::Skip::Parameters, "upscale port: a jitter that is not finite, bilinear instead");
 }
 
+// APS5_UPSCALER_PLUGIN (docs/design/dlss.md S4): the in-tree blit plugin loaded and queried (no device),
+// each load failure's reason, the extension merge and the frame's backend choice.
+void testUpscalerPlugin() {
+    using namespace AgcDriver;
+    auto loaded = Upscale::LoadPlugin(APS5_UPSCALER_BLIT_PLUGIN_PATH);
+    const auto* reason = std::get_if<std::string>(&loaded);
+    check(reason == nullptr, reason != nullptr ? reason->c_str() : "");
+    const auto& plugin = *std::get<std::shared_ptr<Upscale::LoadedPlugin>>(loaded);
+    check(plugin.name == "aps5-blit" && plugin.version == 1 && plugin.api.abi_version == APS5_UPSCALER_PLUGIN_ABI_VERSION && plugin.api.struct_size == sizeof(Aps5UpscalerPluginApi), "upscaler plugin: the blit sample loads with its name, version and ABI");
+    Aps5UpscalerExtensions wanted{sizeof(wanted)};
+    check(plugin.api.get_instance_extensions(&wanted) == APS5_UPSCALER_OK && wanted.required_count == 0 && wanted.optional_count == 0, "upscaler plugin: the blit sample wants no instance extensions");
+    Aps5UpscalerCreateInfo create{sizeof(create)};
+    Aps5UpscalerContext* context = nullptr;
+    check(plugin.api.create(&create, &context) != APS5_UPSCALER_OK && context == nullptr && std::string(Upscale::PluginError(plugin, nullptr)) == "no device", "upscaler plugin: create without a device fails with its reason");
+    const auto refusal = [](std::variant<std::shared_ptr<Upscale::LoadedPlugin>, std::string> result) {
+        const auto* text = std::get_if<std::string>(&result);
+        return text != nullptr ? *text : std::string();
+    };
+    check(refusal(Upscale::LoadPlugin(APS5_UPSCALER_BLIT_PLUGIN_PATH, APS5_UPSCALER_PLUGIN_QUERY_NAME, APS5_UPSCALER_PLUGIN_ABI_VERSION + 1)).starts_with("ABI version 1 (the port's 2)"), "upscaler plugin: another ABI version is refused");
+    check(refusal(Upscale::LoadPlugin("aps5_no_such_plugin.dll")).starts_with("cannot load aps5_no_such_plugin.dll"), "upscaler plugin: a missing file is refused");
+    check(refusal(Upscale::LoadPlugin(APS5_UPSCALER_BLIT_PLUGIN_PATH, "APS5_NoSuchEntry")).starts_with("no APS5_NoSuchEntry in "), "upscaler plugin: a missing entry point is refused");
+    // The merge: what is offered and not enabled yet is added once, the rest reported missing.
+    const std::array<const char*, 3> required{"VK_A", "VK_B", "VK_A"};
+    const std::array<const char*, 2> optional{"VK_C", "VK_D"};
+    std::array<VkExtensionProperties, 3> offered{};
+    std::strcpy(offered[0].extensionName, "VK_A");
+    std::strcpy(offered[1].extensionName, "VK_C");
+    std::strcpy(offered[2].extensionName, "VK_E");
+    const std::array<const char*, 1> enabled{"VK_C"};
+    const Aps5UpscalerExtensions lists{sizeof(lists), 3, required.data(), 2, optional.data()};
+    const auto merge = Upscale::MergeExtensions(lists, offered, enabled);
+    check(merge.added.size() == 1 && std::string(merge.added[0]) == "VK_A" && merge.missingRequired == std::vector<std::string>{"VK_B"} && merge.missingOptional == std::vector<std::string>{"VK_D"}, "upscaler plugin: extensions merged once, missing ones reported");
+    check(Upscale::JoinNames({"VK_B", "VK_D"}) == "VK_B, VK_D", "upscaler plugin: missing names joined for the log");
+    // The choice: the plugin only with the switch, a path, Upscaler = fsr or dlss under the settings, and its device.
+    using PortSettings::Upscaler;
+    check(Upscale::ChooseBackend(false, "x.dll", true, Upscaler::Dlss, true) == Upscale::Backend::Port, "upscaler plugin: the switch off is the port's");
+    check(Upscale::ChooseBackend(true, "x.dll", true, Upscaler::Dlss, true) == Upscale::Backend::Plugin && Upscale::ChooseBackend(true, "x.dll", true, Upscaler::Fsr, true) == Upscale::Backend::Plugin, "upscaler plugin: dlss and fsr take the plugin");
+    check(Upscale::ChooseBackend(true, "x.dll", true, Upscaler::Dlss, false) == Upscale::Backend::Port, "upscaler plugin: a device without its extensions is the port's");
+    check(Upscale::ChooseBackend(true, "x.dll", true, Upscaler::Port, true) == Upscale::Backend::Port && Upscale::ChooseBackend(true, "x.dll", false, Upscaler::Dlss, true) == Upscale::Backend::Port
+            && Upscale::ChooseBackend(true, "", true, Upscaler::Dlss, true) == Upscale::Backend::Port, "upscaler plugin: Upscaler = port, no settings or no path is the port's");
+    check(std::string(Upscale::PluginRefusal(false, "", false, Upscaler::Off)).empty() && std::string(Upscale::PluginRefusal(true, "", true, Upscaler::Dlss)).starts_with("no path")
+            && std::string(Upscale::PluginRefusal(true, "x.dll", true, Upscaler::Port)).starts_with("Upscaler is not fsr or dlss") && Upscale::PluginRefusal(true, "x.dll", true, Upscaler::Fsr) == nullptr, "upscaler plugin: the off reasons");
+}
+
 // Native aspect's UI rect (AspectFit): the part of the 16:9 display buffer that is shown undistorted
 // at the window's aspect, and a viewport or scissor carried into it.
 void testUndistortedRect() {
@@ -1556,6 +1601,7 @@ int main() {
         testMfsrPacket();
         testUpscalePlan();
         testUpscaleTemporalPlan();
+        testUpscalerPlugin();
         LibcRunShutdown_nid_postfix();
         std::puts("AGC driver submit tests passed");
         return 0;

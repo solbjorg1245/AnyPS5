@@ -150,6 +150,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/SynchronizationStatistics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitStatistics.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Upscale/Plugin.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Upscale/Upscale.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/WorkerSampler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
@@ -286,6 +287,26 @@ target_link_libraries(agc_driver_tests PRIVATE
 
 set_target_properties(agc_driver_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_tests)
+
+# APS5_UPSCALER_PLUGIN's in-tree sample (docs/design/dlss.md S4): aps5_upscaler_blit.dll, plain C on
+# Execution/include/UpscalerPlugin.h, beside the test binaries and built with agc_driver_tests, which
+# loads it by its path.
+enable_language(C)
+add_library(aps5_upscaler_blit SHARED EXCLUDE_FROM_ALL
+        tests/plugin/UpscalerBlitPlugin.c
+)
+target_include_directories(aps5_upscaler_blit PRIVATE
+        ${LIBS_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include
+)
+set_target_properties(aps5_upscaler_blit PROPERTIES PREFIX ""
+        RUNTIME_OUTPUT_DIRECTORY "$<1:${ANYPS5_TEST_OUTPUT_DIRECTORY}>"
+        LIBRARY_OUTPUT_DIRECTORY "$<1:${ANYPS5_TEST_OUTPUT_DIRECTORY}>")
+if(MINGW)
+    target_link_options(aps5_upscaler_blit PRIVATE -static-libgcc)
+endif()
+add_dependencies(agc_driver_tests aps5_upscaler_blit)
+target_compile_definitions(agc_driver_tests PRIVATE "APS5_UPSCALER_BLIT_PLUGIN_PATH=\"$<TARGET_FILE:aps5_upscaler_blit>\"")
 
 add_test_executable(agc_driver_recompiler_tests EXCLUDE_FROM_ALL
         tests/Recompiler.cpp

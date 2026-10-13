@@ -34,6 +34,8 @@ struct HostImport;
 // Throws when the format has no storage form; the query is cached per format (a lookup cost a
 // vkGetPhysicalDeviceFormatProperties call before).
 VkFormat StorageFormatForGuest(const Context& context, std::uint32_t guestFormat);
+// A storage image's usage (StorageTexture's image; an attachable one adds the color attachment).
+inline constexpr VkImageUsageFlags StorageImageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
 // Whether StorageFormatForGuest would succeed, without throwing (unknown guest formats included).
 bool StorageFormatAvailable(const Context& context, std::uint32_t guestFormat);
 // Whether a storage image of the guest format takes DCC clear `keys` as a GPU clear (see
@@ -88,6 +90,15 @@ public:
     VkImageView FirstLayerView() const { return firstLayerView; }
     // The layout the image is kept in while sampled.
     VkImageLayout Layout() const { return layout; }
+    // The image the views select from, for code handed the VkImage itself (an upscaler plugin,
+    // docs/design/dlss.md S4): View()'s image and subresource range, its format, the image's usage.
+    struct Viewed {
+        VkImage image = VK_NULL_HANDLE;
+        VkImageSubresourceRange range{};
+        VkFormat format = VK_FORMAT_UNDEFINED;
+        VkImageUsageFlags usage = 0;
+    };
+    const Viewed& ViewedImage() const { return viewed; }
     VkDeviceSize AllocationBytes() const { return allocationBytes; }
     // Its image lives in a block of the image pool (freeing it leaves a hole there, see VramBudget).
     bool PooledMemory() const { return owned != nullptr && owned->allocation.pooled; }
@@ -113,6 +124,7 @@ private:
     VkImageView view = VK_NULL_HANDLE;
     VkImageView firstLayerView = VK_NULL_HANDLE;
     VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    Viewed viewed;
     VkDeviceSize allocationBytes = 0;
     // The snapshot image's surface and how it was made, for views sharing it (empty: none).
     std::optional<GuestTextureResource> imageDescriptor;

@@ -1,10 +1,12 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_UPSCALE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_UPSCALE_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/Driver/Upscale/Plugin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Upscale/Upscale.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include <memory>
 #include <optional>
+#include <string>
 
 namespace AgcDriver::Graphics {
 
@@ -54,6 +56,34 @@ private:
     // The image the next pass reads.
     std::size_t newest = 0;
     void release() noexcept;
+};
+
+// APS5_UPSCALER_PLUGIN's pass (docs/design/dlss.md S4, UpscalerPlugin.h): a loaded plugin's context, made
+// at the first pass for its sizes (VulkanDevice keeps it; released with the device, idle), and its
+// evaluate recorded into the open batch between two full barriers, kept and marked as the port passes.
+class PluginUpscaler {
+public:
+    // What the Graphics context does not carry.
+    struct Device {
+        VkInstance instance;
+        PFN_vkGetInstanceProcAddr instanceProc;
+        std::uint32_t family, apiVersion;
+    };
+    PluginUpscaler(const Context& context, const Upscale::LoadedPlugin& plugin, const Device& device);
+    ~PluginUpscaler();
+    PluginUpscaler(const PluginUpscaler&) = delete;
+    PluginUpscaler& operator=(const PluginUpscaler&) = delete;
+    // As TemporalUpscaler::Record (the plugin's failure: PluginFailed, its error in `detail`).
+    std::optional<Upscale::Skip> Record(const Context& context, const Upscale::TemporalPlan& plan, std::string& detail);
+
+private:
+    Context context;
+    const Upscale::LoadedPlugin& plugin;
+    Device device;
+    Aps5UpscalerContext* handle = nullptr;
+    // The sizes it was made for: the render maxima, the output.
+    std::array<std::uint32_t, 4> sizes{};
+    bool createFailed = false;
 };
 
 }

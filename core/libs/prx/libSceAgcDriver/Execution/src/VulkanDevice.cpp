@@ -374,6 +374,11 @@ struct VulkanDevice::State {
     std::unique_ptr<Graphics::BilinearUpscaler> upscaler;
     // APS5_UPSCALER_PORT's pass and history images (UpscaleTemporal), made on first use.
     std::unique_ptr<Graphics::TemporalUpscaler> temporalUpscaler;
+    // APS5_UPSCALER_PLUGIN (Upscale::ActivePlugin): the plugin while this device enabled its extensions,
+    // the queue family it is told, and its pass (UpscalePlugin), made on first use.
+    const Upscale::LoadedPlugin* plugin = nullptr;
+    std::uint32_t pluginFamily = 0;
+    std::unique_ptr<Graphics::PluginUpscaler> pluginUpscaler;
     std::shared_ptr<Graphics::BufferPool> bufferPool;
     std::unique_ptr<Graphics::Buffer> emptyBuffer;
     std::unique_ptr<Graphics::TextureCache> textureCache;
@@ -682,6 +687,7 @@ struct VulkanDevice::State {
             patternBuffers.clear();
             upscaler.reset();
             temporalUpscaler.reset();
+            pluginUpscaler.reset();
             fastRing.reset();
             fastLayouts.reset();
             descriptorCache.reset();
@@ -765,6 +771,21 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         }
         create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
         create.ppEnabledExtensionNames = instanceExtensions.data();
+    }
+    // APS5_UPSCALER_PLUGIN: the plugin's instance extensions the loader offers (a required one missing
+    // turns it off); without the plugin the instance is made as before.
+    state->plugin = Upscale::ActivePlugin();
+    if (state->plugin != nullptr) {
+        std::uint32_t availableCount = 0;
+        const auto enumerateExtensions = state->InstanceFunction<PFN_vkEnumerateInstanceExtensionProperties>("vkEnumerateInstanceExtensionProperties");
+        check(enumerateExtensions(nullptr, &availableCount, nullptr), "vkEnumerateInstanceExtensionProperties");
+        std::vector<VkExtensionProperties> available(availableCount);
+        check(enumerateExtensions(nullptr, &availableCount, available.data()), "vkEnumerateInstanceExtensionProperties");
+        Aps5UpscalerExtensions wanted{sizeof(wanted)};
+        const auto status = state->plugin->api.get_instance_extensions(&wanted);
+        if (!Upscale::AddPluginExtensions(*state->plugin, "instance", status, wanted, available, instanceExtensions)) state->plugin = nullptr;
+        create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
+        create.ppEnabledExtensionNames = instanceExtensions.empty() ? nullptr : instanceExtensions.data();
     }
     check(state->InstanceFunction<PFN_vkCreateInstance>("vkCreateInstance")(&create, nullptr, &state->instance), "vkCreateInstance");
     APS5_LOG_OUT("Vulkan instance created instance=%p", reinterpret_cast<void*>(state->instance));
@@ -1165,6 +1186,15 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         byteFeatures.pNext = &timelineFeatures;
     } else {
         std::fprintf(stderr, "[gpu] timeline semaphores unavailable or disabled; drains wait under the GPU mutex\n");
+    }
+    // APS5_UPSCALER_PLUGIN: the plugin's device extensions this device offers, as for the instance.
+    if (state->plugin != nullptr) {
+        Aps5UpscalerExtensions wanted{sizeof(wanted)};
+        const auto status = state->plugin->api.get_device_extensions(state->instance, selected, state->instanceProc, &wanted);
+        if (!Upscale::AddPluginExtensions(*state->plugin, "device", status, wanted, availableExtensions, deviceExtensions)) state->plugin = nullptr;
+        state->pluginFamily = family;
+        deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
+        deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
     }
     bdaFeatures.pNext = &byteFeatures;
     deviceInfo.pNext = &bdaFeatures;
@@ -2618,6 +2648,16 @@ std::optional<Upscale::Skip> VulkanDevice::UpscaleTemporal(const Upscale::Tempor
     const auto context = graphicsContext();
     if (state->temporalUpscaler == nullptr) state->temporalUpscaler = std::make_unique<Graphics::TemporalUpscaler>(context);
     return state->temporalUpscaler->Record(context, plan);
+}
+
+bool VulkanDevice::UpscalerPluginReady() const {
+    return state->plugin != nullptr;
+}
+
+std::optional<Upscale::Skip> VulkanDevice::UpscalePlugin(const Upscale::TemporalPlan& plan, std::string& detail) {
+    const auto context = graphicsContext();
+    if (state->pluginUpscaler == nullptr) state->pluginUpscaler = std::make_unique<Graphics::PluginUpscaler>(context, *state->plugin, Graphics::PluginUpscaler::Device{state->instance, state->instanceProc, state->pluginFamily, VK_API_VERSION_1_1});
+    return state->pluginUpscaler->Record(context, plan, detail);
 }
 
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {

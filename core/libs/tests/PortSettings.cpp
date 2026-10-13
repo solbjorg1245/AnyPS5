@@ -618,6 +618,14 @@ static void TestUpscalerSettings() {
         Require(missing.upscaler == Upscaler::Port && missing.warnings.size() == 1 && missing.warnings[0].find("not available yet; using port") != std::string::npos, "fsr and dlss: port, one line");
     }
     Require(parsed("Upscaler = bogus\n", true).warnings[0].find("refused (off, port, fsr or dlss)") != std::string::npos, "unknown upscaler refused");
+    // The backend as written, for APS5_UPSCALER_PLUGIN (dlss.md S4); the plugin's path, unquoted.
+    Require(parsed("Upscaler = DLSS\n", true).upscalerBackend == Upscaler::Dlss && parsed("Upscaler = fsr\n", true).upscalerBackend == Upscaler::Fsr && port.upscalerBackend == Upscaler::Port
+            && parsed("Upscaler = dlss\nUpscaler = off\n", true).upscalerBackend == Upscaler::Off && parsed("Upscaler = dlss\n", false).upscalerBackend == Upscaler::Off, "the backend as written");
+    const auto pluginPath = parsed("UpscalerPlugin = \"C:\\Mods\\aps5 dlss.dll\"\n", false);
+    Require(pluginPath.upscalerPlugin == "C:\\Mods\\aps5 dlss.dll" && pluginPath.warnings.empty(), "the plugin path, unquoted");
+    PortSettings::Settings fromEnvironment;
+    PortSettings::ApplyEnvironment(fromEnvironment, [](const char* name) { return std::string_view(name) == "APS5_UPSCALER_PLUGIN_PATH" ? "D:\\aps5_dlss.dll" : nullptr; });
+    Require(fromEnvironment.upscalerPlugin == "D:\\aps5_dlss.dll", "APS5_UPSCALER_PLUGIN_PATH sets the plugin path");
     const auto ultra = parsed("Upscaler = port\nUpscalerQuality = ultra\n", true);
     Require(ultra.upscalerQuality == UpscalerQuality::Native && ultra.warnings.size() == 1 && ultra.warnings[0].find("using native") != std::string::npos, "unknown quality: native");
 

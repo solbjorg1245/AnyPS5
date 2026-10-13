@@ -347,6 +347,10 @@ public:
     std::optional<Upscale::Skip> UpscaleBilinear(const Upscale::Plan& plan);
     // APS5_UPSCALER_PORT's pass (Graphics::TemporalUpscaler, made on first use), as UpscaleBilinear.
     std::optional<Upscale::Skip> UpscaleTemporal(const Upscale::TemporalPlan& plan);
+    // APS5_UPSCALER_PLUGIN's pass (Graphics::PluginUpscaler, made on first use), as UpscaleTemporal, when
+    // this device enabled the plugin's extensions (UpscalerPluginReady); `detail`: the plugin's error.
+    bool UpscalerPluginReady() const;
+    std::optional<Upscale::Skip> UpscalePlugin(const Upscale::TemporalPlan& plan, std::string& detail);
     // A draw-cache hit recorded from its recipe (Graphics::DrawWithRecipe), under the mutex after
     // the packet's labels; Rebuild when the recipe's device is not this one or DrawWithRecipe
     // missed (nothing recorded: the caller runs Draw with the hit's stages and re-attaches).

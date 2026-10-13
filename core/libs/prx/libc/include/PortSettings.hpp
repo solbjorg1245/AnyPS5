@@ -50,6 +50,9 @@
 //   Upscaler = off            APS5_UPSCALER         reserved: fsr, dlss (FrameGeneration: file only, reserved); with
 //                             APS5_UPSCALER_SETTINGS=1 (environment only, experimental) port: the port's temporal
 //                             upscaler in the PS5 Pro seam (fsr and dlss take it until they exist)
+//   UpscalerPlugin = "D:\aps5_dlss.dll" APS5_UPSCALER_PLUGIN_PATH  with APS5_UPSCALER_PLUGIN=1 (environment
+//                                                   only, experimental) and Upscaler = fsr or dlss: that DLL
+//                                                   upscales instead of port (docs/design/dlss.md S4)
 //   UpscalerQuality = native  APS5_UPSCALER_QUALITY native 2688x1512, quality 2560x1440, balanced 2224x1252 or
 //                                                   performance 1920x1080 rendered, 3840x2160 out (PlanUpscaler)
 //   GameDir = "D:\PPSA01341-app0"                   the player's dump (app0), set by the launcher; the game ignores it
@@ -97,6 +100,10 @@ struct Settings {
     UpscalerQuality upscalerQuality = UpscalerQuality::Native;
     // APS5_UPSCALER_SETTINGS (ApplyEnvironment, and Parse's argument for the file): Upscaler = port applies.
     bool upscalerSettings = false;
+    // Upscaler as written under APS5_UPSCALER_SETTINGS (fsr and dlss run as port in `upscaler`): what
+    // APS5_UPSCALER_PLUGIN takes, and its DLL (UTF-8, without the quotes).
+    Upscaler upscalerBackend = Upscaler::Off;
+    std::string upscalerPlugin;
     bool frameGeneration = false;
     std::string gameDir;  // UTF-8, without the quotes
     DeluxeEdition deluxeEdition = DeluxeEdition::Auto;
@@ -380,9 +387,10 @@ inline void SetKey(Settings& settings, std::string_view key, std::string_view va
     } else if (name == "upscaler") {
         // Without APS5_UPSCALER_SETTINGS only off (port is refused, fsr and dlss warn); with it port, which fsr
         // and dlss take until their backends exist.
-        if (text == "off") settings.upscaler = Upscaler::Off;
+        if (text == "off") settings.upscaler = settings.upscalerBackend = Upscaler::Off;
         else if (settings.upscalerSettings && (text == "port" || text == "fsr" || text == "dlss")) {
             settings.upscaler = Upscaler::Port;
+            settings.upscalerBackend = text == "fsr" ? Upscaler::Fsr : text == "dlss" ? Upscaler::Dlss : Upscaler::Port;
             if (text != "port") settings.warnings.push_back(origin + ": Upscaler = " + text + " is not available yet; using port (the port upscaler)");
         } else if (text == "fsr" || text == "dlss") settings.warnings.push_back(origin + ": Upscaler = " + text + " is not implemented yet; using off");
         else refuse(settings.upscalerSettings ? "off, port, fsr or dlss" : "off, fsr or dlss");
@@ -406,6 +414,8 @@ inline void SetKey(Settings& settings, std::string_view key, std::string_view va
         else refuse("auto or off");
     } else if (name == "addondir") {
         settings.addonDir = std::string(Unquote(value));
+    } else if (name == "upscalerplugin") {
+        settings.upscalerPlugin = std::string(Unquote(value));
     } else {
         settings.warnings.push_back(origin + ": unknown key '" + std::string(Trim(key)) + "'");
     }
@@ -435,11 +445,12 @@ inline Settings Parse(std::string_view text, const std::string& origin, bool ups
 }
 
 // The variable that overrides each key (the launcher names the ones set, which win over its choices).
-inline constexpr std::array<std::pair<const char*, const char*>, 12> EnvironmentKeys{{
+inline constexpr std::array<std::pair<const char*, const char*>, 13> EnvironmentKeys{{
     {"APS5_RESOLUTION", "Resolution"}, {"APS5_RENDER_RESOLUTION", "RenderResolution"}, {"APS5_FPS_LIMIT", "FpsLimit"},
     {"APS5_TIMESTEP", "Timestep"}, {"APS5_TIMESTEP_MIN_HZ", "TimestepMinHz"}, {"APS5_WINDOW_MODE", "WindowMode"},
     {"APS5_NATIVE_ASPECT", "NativeAspect"}, {"APS5_UPSCALER", "Upscaler"}, {"APS5_UPSCALER_QUALITY", "UpscalerQuality"},
-    {"APS5_BUTTON_ICONS", "ButtonIcons"}, {"APS5_DELUXE_EDITION", "DeluxeEdition"}, {"APS5_PRESENT_MODE", "PresentMode"}}};
+    {"APS5_BUTTON_ICONS", "ButtonIcons"}, {"APS5_DELUXE_EDITION", "DeluxeEdition"}, {"APS5_PRESENT_MODE", "PresentMode"},
+    {"APS5_UPSCALER_PLUGIN_PATH", "UpscalerPlugin"}}};
 
 inline void ApplyEnvironment(Settings& settings, const std::function<const char*(const char*)>& lookup) {
     // First: the Upscaler keys below parse by it.

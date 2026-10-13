@@ -814,6 +814,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
 
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView");
         createFirstLayerView(descriptor, viewInfo);
+        viewed = {image, viewInfo.subresourceRange, vkFormat, imageInfo.usage};
         imageDescriptor = descriptor;
         imageFormat = vkFormat;
         imageAspect = aspect;
@@ -864,6 +865,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<const Texture>& s
         VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
         ChainMinLod(context, descriptor, viewInfo, minLod);
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView shared");
+        viewed = {image, viewInfo.subresourceRange, imageFormat, shared->viewed.usage};
         createFirstLayerView(descriptor, viewInfo);
     } catch (...) {
         release();
@@ -903,6 +905,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
         ChainMinLod(context, descriptor, viewInfo, minLod);
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView storage view");
+        viewed = {source->Image(), viewInfo.subresourceRange, vkFormat, StorageImageUsage};
         createFirstLayerView(descriptor, viewInfo);
         if (profile) {
             auto& totals = Profile();
@@ -926,6 +929,8 @@ Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthForma
     viewInfo.subresourceRange = {aspect, 0, 1, baseLayer, layerCount};
     try {
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView depth plane");
+        // DepthSurface's image usage.
+        viewed = {depthImage, viewInfo.subresourceRange, depthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
         if (array) {
             viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
             viewInfo.subresourceRange.layerCount = 1;
@@ -1143,7 +1148,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         imageInfo.arrayLayers = geometry.imageLayers;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-        imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        imageInfo.usage = StorageImageUsage;
         {
             VkFormatProperties properties{};
             context.formatProperties(context.physical, vkFormat, &properties);

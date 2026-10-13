@@ -17,11 +17,12 @@
 namespace AgcDriver::Upscale {
 
 // Why a pass records nothing (one stderr line per reason): the packet's (PlanBilinear), then the device's;
-// from NoMotion on, why the temporal pass did not (PlanTemporal, then the device's: bilinear instead).
-enum class Skip : std::uint8_t { NoOutput, NoColor, RenderSize, RenderOutsideColor, NoPushDescriptors, ColorFormat, OutputFormat, ColorUnresolved, Failed, NoMotion, NoDepth, Parameters, InputUnresolved, History, Count };
+// from NoMotion on, why the temporal pass did not (PlanTemporal, then the device's: bilinear instead);
+// from PluginCreate on, why APS5_UPSCALER_PLUGIN's evaluate did not (Plugin.hpp: the port's passes instead).
+enum class Skip : std::uint8_t { NoOutput, NoColor, RenderSize, RenderOutsideColor, NoPushDescriptors, ColorFormat, OutputFormat, ColorUnresolved, Failed, NoMotion, NoDepth, Parameters, InputUnresolved, History, PluginCreate, PluginSizes, PluginFailed, Count };
 
 inline const char* SkipName(Skip skip) {
-    static constexpr std::array<const char*, static_cast<std::size_t>(Skip::Count)> names{"no output T#", "no MainColor T#", "render size zero or above 16384", "render rectangle larger than MainColor", "no push descriptors", "MainColor format cannot be filtered", "output format has no float storage view", "MainColor T# undecodable or not 2D", "record failed", "no Motion T#", "no MainDepth T#", "jitter or MV scale not finite", "Motion or MainDepth T# undecodable or not 2D", "history images could not be made"};
+    static constexpr std::array<const char*, static_cast<std::size_t>(Skip::Count)> names{"no output T#", "no MainColor T#", "render size zero or above 16384", "render rectangle larger than MainColor", "no push descriptors", "MainColor format cannot be filtered", "output format has no float storage view", "MainColor T# undecodable or not 2D", "record failed", "no Motion T#", "no MainDepth T#", "jitter or MV scale not finite", "Motion or MainDepth T# undecodable or not 2D", "history images could not be made", "plugin context could not be made", "sizes other than the plugin context's", "plugin evaluate failed"};
     return names[static_cast<std::size_t>(skip)];
 }
 
