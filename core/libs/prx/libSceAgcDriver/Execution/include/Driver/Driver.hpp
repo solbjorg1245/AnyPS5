@@ -334,6 +334,7 @@ private:
     static PollStats& pollStats();
     static WaitOutcomes& waitOutcomes();
     static int waitPatientMs();
+    static bool waitPipeProgress();
     static Graphics::Recorder::LateStatistics& lateCountsSeen();
     static EpochBumps& epochBumps();
     static void bumpEpoch(std::uint64_t EpochBumps::*counter);

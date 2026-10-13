@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -32,6 +33,13 @@ PacketTimer::~PacketTimer() {
         char text[160];
         std::snprintf(text, sizeof(text), " (waited on %llu: satisfied %llu, gave up %llu, longest %.0f ms past the timeout)", static_cast<unsigned long long>(waits.patientWaits), static_cast<unsigned long long>(waits.patientSatisfied), static_cast<unsigned long long>(waits.patientGaveUp), waits.patientLongestMs);
         patientText = text;
+    }
+    // APS5_WAIT_PIPE_PROGRESS (s62 R-WAITS): with the recording pipe on, the timeouts while it worked and
+    // the waits the switch kept past the old timeout.
+    if (RecordPipeActive()) {
+        char text[200];
+        std::snprintf(text, sizeof(text), " (%llu with the record pipe recording; %llu held past the timeout by it, longest %.0f ms; APS5_WAIT_PIPE_PROGRESS %s)", static_cast<unsigned long long>(waits.timedOutPipeBusy), static_cast<unsigned long long>(waits.pipeHeld), waits.pipeHeldLongestMs, Driver::waitPipeProgress() ? "on" : "off");
+        patientText += text;
     }
 
     const auto late = Graphics::Recorder::LateCounts();
