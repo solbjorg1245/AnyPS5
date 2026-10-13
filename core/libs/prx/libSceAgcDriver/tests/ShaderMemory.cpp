@@ -11,6 +11,7 @@
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "Optimization/SrtWalker/WalkProgram.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
+#include "SpirvBackend/SpirvBda.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
@@ -1175,7 +1176,9 @@ void verifyRuntimeKeyTable() {
     std::array<std::uint32_t, 12> srt{static_cast<std::uint32_t>(tableAddress), static_cast<std::uint32_t>(tableAddress >> 32u), 0u, 0u, 0u, 0u, 0u, 0u, static_cast<std::uint32_t>(outputAddress), static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu), 16u, 0xfacu};
     const auto srtAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(srt.data()));
     const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(srtAddress), static_cast<std::uint32_t>(srtAddress >> 32u)};
-    const std::array<std::uint32_t, 1> capabilities{29u};
+    // The table and record reads through raw addresses compile to buffer-device-address loads.
+    const std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
 
     // s_load_dwordx2 s[2:3], s[0:1], 0; s_load_dwordx4 s[8:11], s[0:1], 0x10 (S#);
     // s_load_dwordx4 s[28:31], s[0:1], 0x20 (output V#); s_waitcnt lgkmcnt(0);
@@ -1194,6 +1197,8 @@ void verifyRuntimeKeyTable() {
     request.target.spirvVersion = 0x00010300u;
     request.target.subgroupSize = 32;
     request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
+    request.target.bdaAbiVersion = BdaAbi::Version;
     request.target.fragmentShaderBarycentricEnabled = false;
     request.layout.pushConstantSizeBytes = 128;
 
@@ -1285,7 +1290,9 @@ void verifyRecordKeyTable() {
     std::array<std::uint32_t, 12> srt{static_cast<std::uint32_t>(tableAddress), static_cast<std::uint32_t>(tableAddress >> 32u), 0u, 0u, 0u, 0u, 0u, 0u, static_cast<std::uint32_t>(outputAddress), static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu), 16u, 0xfacu};
     const auto srtAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(srt.data()));
     const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(srtAddress), static_cast<std::uint32_t>(srtAddress >> 32u)};
-    const std::array<std::uint32_t, 1> capabilities{29u};
+    // The table and record reads through raw addresses compile to buffer-device-address loads.
+    const std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
 
     // s_load_dwordx2 s[2:3], s[0:1], 0; s_load_dwordx4 s[8:11], s[0:1], 0x10 (S#);
     // s_load_dwordx4 s[28:31], s[0:1], 0x20 (output V#); s_waitcnt lgkmcnt(0);
@@ -1305,6 +1312,8 @@ void verifyRecordKeyTable() {
     request.target.spirvVersion = 0x00010300u;
     request.target.subgroupSize = 32;
     request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
+    request.target.bdaAbiVersion = BdaAbi::Version;
     request.target.fragmentShaderBarycentricEnabled = false;
     request.layout.pushConstantSizeBytes = 128;
 

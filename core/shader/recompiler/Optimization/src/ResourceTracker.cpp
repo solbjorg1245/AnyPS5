@@ -692,7 +692,9 @@ private:
             table.entryLimit = RecordKeyEntryLimit;
             materialSource = recordSource;
         }
-        if (table.entryLimit == 0u) {
+        // An address table's waterfall key with no records and no span stays unbound (a V# table
+        // is bounded by its V#).
+        if (addressTable && table.entryLimit == 0u) {
             return false;
         }
         std::uint32_t materialMemoryIndex = 0;
