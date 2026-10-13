@@ -93,10 +93,13 @@ public:
     // at or above every table's slots cuts nothing.
     static std::uint32_t LoopTableSpan(std::uint32_t fixedSlots, const std::vector<std::uint32_t>& loopSlots, std::uint32_t limit);
     // Whether a T# table behind a raw address keyed by v_readfirstlane of a per-lane value (a
-    // waterfall loop) binds as a bindless table of the bindless slots, its entries past them
-    // unmapped (APS5_LOOP_TABLE_RUN, default on; =0 fails the dispatch as before: "GetImageResource
-    // dword 0 is not a valid runtime value").
+    // waterfall loop) binds through the records the key is read from, every key they hold mapped
+    // (APS5_LOOP_TABLE_RUN, default on; =0 fails the dispatch as before: "GetImageResource dword 0
+    // is not a valid runtime value").
     static bool RuntimeKeyTables();
+    // APS5_LOOP_TABLE_RUN=2 only: a waterfall key that is no record read spans the bindless slots
+    // (inexact: a key past the span samples zeros; the valid T#s just past it are counted).
+    static bool RuntimeKeySpan();
     struct RuntimeKeyCounts {
         // Tables keyed through their records (every key a record holds mapped: exact), and the
         // distinct keys mapped.

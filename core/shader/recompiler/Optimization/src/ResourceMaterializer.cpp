@@ -531,7 +531,9 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         // unset; t386 counted ~3k of them per 10 s as nulled, with the same unmapped totals and
         // keys as t385. Only one the table would map reaches the driver's decoder (below).
         const bool undecodable = !nullImageDescriptor(candidate) && undecodableImageBits(candidate, image.r128);
-        if (undecodable && (table.loopKey || !ResourceMaterializer::StrictTableEntries())) {
+        // A runtime-key table's records include volumes no lane is in (all of them are read): an
+        // undecodable entry there binds null rather than failing the dispatch.
+        if (undecodable && (table.loopKey || table.runtimeKey || !ResourceMaterializer::StrictTableEntries())) {
             // A loop-counter table's loop samples every entry from its start up to its count, so
             // such an entry is no key the draw leaves unselected: bound null, the loop sampled zeros
             // in its place (t378: a white blob and blue splotches). The draw fails as before WP7
@@ -558,6 +560,12 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         }
         if (decoded.conversionFormat != IrBufferFormat::Invalid || decoded.fmask) {
             paddedConversion++;
+            continue;
+        }
+        // Nor does a T# of another dimension than the sample's (a 2D T# under a 3D sample) decide
+        // a runtime-key table's shape: it is no texture a lane samples, and stays unmapped.
+        if (table.runtimeKey && image.dimension != RdnaImageDimension::Unknown && decoded.dimension != image.dimension) {
+            paddedShape++;
             continue;
         }
         if (shape.has_value() && (decoded.numericClass != shape->numericClass || decoded.dimension != shape->dimension || decoded.cube != shape->cube)) {
@@ -1251,6 +1259,14 @@ bool ResourceMaterializer::RuntimeKeyTables() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_LOOP_TABLE_RUN");
         return value == nullptr || *value == '\0' || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool ResourceMaterializer::RuntimeKeySpan() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_LOOP_TABLE_RUN");
+        return value != nullptr && std::strcmp(value, "2") == 0;
     }();
     return enabled;
 }

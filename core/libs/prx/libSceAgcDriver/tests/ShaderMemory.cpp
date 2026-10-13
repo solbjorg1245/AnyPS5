@@ -1197,6 +1197,18 @@ void verifyRuntimeKeyTable() {
     request.target.fragmentShaderBarycentricEnabled = false;
     request.layout.pushConstantSizeBytes = 128;
 
+    // The span is opt-in (APS5_LOOP_TABLE_RUN=2): by default a waterfall key that is no record
+    // read fails the plan as before.
+    if (!ResourceMaterializer::RuntimeKeySpan()) {
+        bool failed = false;
+        try {
+            static_cast<void>(GetResourcePlan(request));
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        require(failed, "runtime-key table: the span fallback ran without APS5_LOOP_TABLE_RUN=2");
+        return;
+    }
     const auto plan = GetResourcePlan(request);
     std::size_t tables = 0;
     for (const auto& source : plan->descriptorSources) {
@@ -1333,6 +1345,53 @@ void verifyRecordKeyTable() {
     const auto nextMapping = mappingOf(nextMemory.Capture(request)->snapshot);
     require(std::vector<std::uint32_t>(nextMapping.begin(), nextMapping.begin() + 7) == std::vector<std::uint32_t>{3u, 2u, 0u, 5u, 1u, 9u, 2u}, "record-key table: a changed record was not mapped");
     static_cast<void>(ResourceMaterializer::TakeRuntimeKeyTables());
+}
+
+// A record offset built as a DAG with shared operands (`v9 = v9 + v9`, k times) costs 2^k values
+// to evaluate as a tree: the probe stops at its budget (256 values) and the plan fails as before
+// (or spans, with APS5_LOOP_TABLE_RUN=2) instead of hanging translation.
+void verifyRecordOffsetBudget() {
+    using namespace ShaderRecompiler;
+    if (!ResourceMaterializer::RuntimeKeyTables()) return;
+    std::array<std::uint32_t, 4> srt{};
+    const auto srtAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(srt.data()));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(srtAddress), static_cast<std::uint32_t>(srtAddress >> 32u)};
+    const std::array<std::uint32_t, 1> capabilities{29u};
+    const auto planFor = [&](std::uint32_t doublings, bool& failed) {
+        // As verifyRecordKeyTable's shader, with `v_add_nc_u32 v9, v9, v9` x doublings after the
+        // record index's shift.
+        std::vector<std::uint32_t> code{0xf4040080u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000020u, 0xbf8cc07fu, 0x36100083u, 0x34121084u};
+        code.insert(code.end(), doublings, 0x4a121309u);
+        code.insert(code.end(), {0x4a1212ffu, 0x00000400u, 0xdc308008u, 0x0a020009u, 0xbf8c3f70u, 0x7e20050au, 0x8f118510u, 0xf40c0501u, 0x22000000u, 0xbf8cc07fu, 0xf09c0f08u, 0x00450400u, 0xbf8c3f70u, 0xe0700000u, 0x80070400u, 0xbf810000u});
+        RecompileRequest request{};
+        request.shader = {ShaderStage::Compute, 0x20000u, code, 0, {}};
+        request.context.waveSize = 64;
+        request.context.userDataBaseRegister = 0;
+        request.context.userData = userData;
+        request.context.compute = ShaderComputeStageInfo{{64u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = 32;
+        request.target.supportedCapabilities = capabilities;
+        request.target.fragmentShaderBarycentricEnabled = false;
+        request.layout.pushConstantSizeBytes = 128;
+        std::optional<DescriptorSource::IndirectImage> table;
+        failed = false;
+        try {
+            const auto plan = GetResourcePlan(request);
+            for (const auto& source : plan->descriptorSources) {
+                if (source.indirectImage.has_value()) table = source.indirectImage;
+            }
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        return table;
+    };
+    bool failed = false;
+    const auto cheap = planFor(5u, failed);
+    require(!failed && cheap.has_value() && cheap->materialRecords == 4u && cheap->selectorStride == (16u << 5u), "record offset budget: a 129-value offset was not probed");
+    const auto costly = planFor(12u, failed);
+    require(ResourceMaterializer::RuntimeKeySpan() ? (!failed && costly.has_value() && costly->materialRecords == 0u) : failed, "record offset budget: a 4096-value offset was probed past the budget");
 }
 
 void verifyDescriptorPhis() {
@@ -1880,6 +1939,7 @@ int main() {
         verifyLoopCounterTable();
         verifyRuntimeKeyTable();
         verifyRecordKeyTable();
+        verifyRecordOffsetBudget();
         verifyLoopTableSpan();
         verifyDescriptorPhis();
         verifyProgramCounterRelativeData();

@@ -41,8 +41,8 @@ struct DescriptorSource {
         bool loopKey = false;
         // The key is v_readfirstlane of a per-lane value (a waterfall loop: Demon's Souls' particle
         // passes pick a 3D texture per force volume from a T# table behind an SRT pointer). When
-        // the value is a record read (`materialRecords`), the records' keys are mapped; else the
-        // table spans the bindless slots (ResourceMaterializer::RuntimeKeyTables).
+        // the value is a record read (`materialRecords`), the records' keys are mapped; else, with
+        // APS5_LOOP_TABLE_RUN=2 only, the table spans the bindless slots (RuntimeKeySpan).
         bool runtimeKey = false;
         // The material is `materialRecords` records behind a raw 64-bit address (materialSource is
         // a GetAddressResource): a waterfall key's records, read at `i * selectorStride +

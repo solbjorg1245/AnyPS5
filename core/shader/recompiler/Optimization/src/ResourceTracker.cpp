@@ -320,13 +320,15 @@ private:
     // How many values a table key can take when nothing else bounds the table (0: unknown): a bit
     // index (the light and decal loops walk a wave-uniform mask with s_ff1), a masked value or a
     // loop counter. A waterfall key (v_readfirstlane of a per-lane value) has no bound of its own:
-    // read from records (MatchRecordProbe) it takes the records' values; else the table spans the
-    // bindless slots (ResourceMaterializer::RuntimeKeyTables), which also counts the valid T#s
-    // past them.
+    // read from records (MatchRecordProbe) it takes the records' values; else the dispatch fails as
+    // before, or with APS5_LOOP_TABLE_RUN=2 the table spans the bindless slots
+    // (ResourceMaterializer::RuntimeKeySpan: inexact, keys past the span sample zeros).
     // A record probe reads at most this many records; a key it finds at or past this many
     // entries samples zeros (counted out of range).
     static constexpr std::uint32_t RecordProbeLimit = 256;
     static constexpr std::uint32_t RecordKeyEntryLimit = 4096;
+    // The values one evaluation of a record offset may visit (EvaluateRecordOffset).
+    static constexpr std::uint32_t RecordOffsetBudget = 256;
 
     static std::uint32_t KeyRange(IrValue* key, const IrProgram& program) {
         key = key->Resolve();
@@ -341,7 +343,7 @@ private:
                 return mask < 0x10000u ? mask + 1u : 0u;
             }
             case IrOpcode::Phi: return LoopTableLimit() != 0u ? Detail::LoopCounterRange(key, LoopTableLimit(), LoopExitBound() ? &program : nullptr) : 0u;
-            case IrOpcode::ReadFirstLane: return ResourceMaterializer::RuntimeKeyTables() ? ResourceMaterializer::BindlessSlots() : 0u;
+            case IrOpcode::ReadFirstLane: return ResourceMaterializer::RuntimeKeySpan() ? ResourceMaterializer::BindlessSlots() : 0u;
             default: return 0u;
         }
     }
@@ -426,23 +428,25 @@ private:
     // `value` at `index = at`, `value` built from one leaf (`index`: the first value met that is
     // no immediate or arithmetic) with adds, subtracts, multiplies and left shifts, through the
     // selects a predicated v_* write leaves (`select(exec, new, previous)`) whose exec the record
-    // read's `enable` implies.
-    static bool EvaluateRecordOffset(IrValue* value, const std::vector<IrValue*>& enable, IrValue*& index, std::uint32_t at, std::uint32_t& result, std::uint32_t depth = 0) {
+    // read's `enable` implies. `budget` caps the values visited (an expression DAG with shared
+    // operands would otherwise cost 2^depth): spent, the probe fails and the dispatch with it.
+    static bool EvaluateRecordOffset(IrValue* value, const std::vector<IrValue*>& enable, IrValue*& index, std::uint32_t at, std::uint32_t& result, std::uint32_t& budget, std::uint32_t depth = 0) {
         value = value->Resolve();
-        if (depth > 32u) {
+        if (depth > 32u || budget == 0u) {
             return false;
         }
+        budget--;
         if (immediateU32(value, result)) {
             return true;
         }
         const auto op = value->Opcode();
         if (op == IrOpcode::SelectU32 && value->ArgumentCount() == 3u) {
-            return ImpliedBy(value->Argument(0), enable) && EvaluateRecordOffset(value->Argument(1), enable, index, at, result, depth + 1u);
+            return ImpliedBy(value->Argument(0), enable) && EvaluateRecordOffset(value->Argument(1), enable, index, at, result, budget, depth + 1u);
         }
         if ((op == IrOpcode::IAdd32 || op == IrOpcode::ISub32 || op == IrOpcode::IMul32 || op == IrOpcode::ShiftLeftLogical32) && value->ArgumentCount() == 2u) {
             std::uint32_t a = 0;
             std::uint32_t b = 0;
-            if (!EvaluateRecordOffset(value->Argument(0), enable, index, at, a, depth + 1u) || !EvaluateRecordOffset(value->Argument(1), enable, index, at, b, depth + 1u)) {
+            if (!EvaluateRecordOffset(value->Argument(0), enable, index, at, a, budget, depth + 1u) || !EvaluateRecordOffset(value->Argument(1), enable, index, at, b, budget, depth + 1u)) {
                 return false;
             }
             switch (op) {
@@ -516,7 +520,8 @@ private:
         }
         IrValue* index = nullptr;
         std::uint32_t first = 0;
-        if (!EvaluateRecordOffset(read->Argument(1), enable, index, 0u, first)) {
+        std::uint32_t budget = RecordOffsetBudget;
+        if (!EvaluateRecordOffset(read->Argument(1), enable, index, 0u, first, budget)) {
             return false;
         }
         records = index != nullptr ? RecordIndexRange(index, enable) : 1u;
@@ -526,13 +531,16 @@ private:
         stride = sizeof(std::uint32_t);
         if (records > 1u) {
             std::uint32_t second = 0;
-            if (!EvaluateRecordOffset(read->Argument(1), enable, index, 1u, second) || second == first) {
+            budget = RecordOffsetBudget;
+            // Ascending records only: a descending stride wraps in 32 bits.
+            if (!EvaluateRecordOffset(read->Argument(1), enable, index, 1u, second, budget) || second <= first) {
                 return false;
             }
             stride = second - first;
             for (std::uint32_t record = 2; record < records; record++) {
                 std::uint32_t at = 0;
-                if (!EvaluateRecordOffset(read->Argument(1), enable, index, record, at) || at != first + record * stride) {
+                budget = RecordOffsetBudget;
+                if (!EvaluateRecordOffset(read->Argument(1), enable, index, record, at, budget) || at != first + record * stride) {
                     return false;
                 }
             }
@@ -643,11 +651,12 @@ private:
             }
             table.heapAddress = true;
             table.entryLimit = KeyRange(key, m_program);
-            if (table.entryLimit == 0u) {
+            table.loopKey = key->Resolve()->Opcode() == IrOpcode::Phi;
+            table.runtimeKey = key->Resolve()->Opcode() == IrOpcode::ReadFirstLane && ResourceMaterializer::RuntimeKeyTables();
+            // A waterfall key without the span needs its records (below).
+            if (table.entryLimit == 0u && !table.runtimeKey) {
                 return false;
             }
-            table.loopKey = key->Resolve()->Opcode() == IrOpcode::Phi;
-            table.runtimeKey = key->Resolve()->Opcode() == IrOpcode::ReadFirstLane;
         }
         DescriptorSource heapSource;
         std::uint32_t heapSourceIndex = 0;
@@ -682,6 +691,9 @@ private:
             table.materialRecords = records;
             table.entryLimit = RecordKeyEntryLimit;
             materialSource = recordSource;
+        }
+        if (table.entryLimit == 0u) {
+            return false;
         }
         std::uint32_t materialMemoryIndex = 0;
         const MemoryInfo* materialMemory = addressTable ? nullptr : ScalarReadMemory(*key, materialMemoryIndex);
