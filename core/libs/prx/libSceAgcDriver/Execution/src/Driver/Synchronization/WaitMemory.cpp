@@ -397,7 +397,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (const auto pipeNow = RecordPipeProgressNow(); RecordPipeProgressed(pipeNow, pipeSeen)) {
             pipeSeen = pipeNow.consumed;
             pipeAt = now;
-            if (pipeProgress) start = now;
+            // Capped at 30 s without packet progress: a B that never finishes its item cannot hold a wait for good.
+            if (pipeProgress && now - packetStart < std::chrono::seconds(30)) start = now;
         }
         if (pipeProgress && !warned && pipeHold.since == std::chrono::steady_clock::time_point{} && now - packetStart > std::chrono::milliseconds(waitTimeoutMs())) {
             pipeHold.since = now;
