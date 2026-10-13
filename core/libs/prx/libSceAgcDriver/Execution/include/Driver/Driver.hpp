@@ -360,6 +360,9 @@ private:
     void tolerate(const char* kind, TWork&& work);
     void traceDispatch(const QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t queueId);
     void execute(const Submission& submission);
+    static std::optional<std::chrono::steady_clock::time_point>& deferredEndSince();
+    static bool deferredEndOpen();
+    void sendDeferredEnd(std::uint32_t queue);
     void markCompleted(std::uint64_t serial);
     static const std::atomic<std::uint64_t>*& workerQueued();
     void reapCompletionLabels();

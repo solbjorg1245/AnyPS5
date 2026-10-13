@@ -43,6 +43,7 @@ public:
             allocate(target.slice + 1u);
             Commands commands(context);
             prepare(commands.handle, 0);
+            commands.Note(image, true);
             RecordMemoryBarrier(context, commands.handle, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
             commands.Finish(2);
             std::fprintf(stderr, "[gpu] depth surface 0x%llx (stencil 0x%llx, %ux%u, vk format %d) created\n", static_cast<unsigned long long>(target.address), static_cast<unsigned long long>(target.stencilAddress), target.extent.width, target.extent.height, static_cast<int>(target.format));
@@ -134,6 +135,8 @@ public:
         context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands.handle, buffer->Handle(), image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
         RecordMemoryBarrier(context, commands.handle, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
         if (commands.recorder != nullptr) commands.recorder->Keep(buffer);
+        commands.Note(source->Image(), false);
+        commands.Note(image, true);
         commands.Finish(3);
     }
 
@@ -174,6 +177,7 @@ public:
             else ranges.push_back({aspects(), 0, 1, slice, 1});
         }
         if (!ranges.empty()) context.Function<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage")(commands.handle, image, VK_IMAGE_LAYOUT_GENERAL, &clear, static_cast<std::uint32_t>(ranges.size()), ranges.data());
+        if (!ranges.empty()) commands.Note(image, true);
         RecordMemoryBarrier(context, commands.handle, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
         commands.Finish(2);
         static std::atomic<int> reports{0};
@@ -213,6 +217,10 @@ private:
         void Finish(std::uint32_t barriers) {
             if (batch) batch->SubmitAndWait();
             else Recorder::CountBarriers(Recorder::CommandClass::Draw, barriers);
+        }
+        // APS5_IMAGE_EDGES: an image the commands read or write, for the recorder's open batch.
+        void Note(VkImage image, bool written) const {
+            if (recorder != nullptr && recorder->ImageEdges()) recorder->NoteImageEdge(Recorder::ImageKey(image), written, Recorder::ImageNote::Depth);
         }
         Recorder* recorder;
         std::unique_ptr<CommandBatch> batch;
@@ -300,6 +308,8 @@ private:
             regions.push_back(region);
         }
         context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands.handle, retired.back().image, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+        commands.Note(retired.back().image, false);
+        commands.Note(image, true);
         RecordMemoryBarrier(context, commands.handle, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
         commands.Finish(3);
         std::fprintf(stderr, "[gpu] depth surface 0x%llx (%ux%u) grew from %u to %u slices\n", static_cast<unsigned long long>(target.address != 0 ? target.address : target.stencilAddress), target.extent.width, target.extent.height, previous, layers);
@@ -366,6 +376,8 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
         surface->clearStencil = target.clearStencil;
         const auto view = surface->LayerView(target.slice);
         surface->ApplyMetadataClears(target.clearDepth, target.clearStencil);
+        // APS5_IMAGE_EDGES: the attachment the draw tests and writes, noted with its commands.
+        Recorder::PendImageEdge(Recorder::ImageKey(surface->image), true);
         return view;
     }
     surfaces().push_back(std::make_unique<DepthSurface>(context, target));
@@ -376,7 +388,9 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
     surface.htileAddress = target.htileAddress;
     surface.clearDepth = target.clearDepth;
     surface.clearStencil = target.clearStencil;
-    return surface.LayerView(target.slice);
+    const auto view = surface.LayerView(target.slice);
+    Recorder::PendImageEdge(Recorder::ImageKey(surface.image), true);
+    return view;
 }
 
 void NoteDepthMetadataClear(std::uint64_t begin, std::uint64_t end) {
@@ -409,6 +423,8 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     if (found == list.rend() || (*found)->overwritten) return nullptr;
     auto texture = (*found)->Sampled(words, resource, components);
     (*found)->ApplyMetadataClears((*found)->clearDepth, (*found)->clearStencil);
+    // APS5_IMAGE_EDGES: the draw or dispatch about to bind it samples the surface.
+    Recorder::PendImageEdge(Recorder::ImageKey((*found)->image), false);
     return texture;
 }
 
@@ -420,6 +436,7 @@ bool DepthSurfaceServes(const Context& context, const GuestTextureResource& reso
     });
     if (found == list.rend() || (*found)->overwritten || !(*found)->Serves(texture)) return false;
     (*found)->ApplyMetadataClears((*found)->clearDepth, (*found)->clearStencil);
+    Recorder::PendImageEdge(Recorder::ImageKey((*found)->image), false);
     return true;
 }
 

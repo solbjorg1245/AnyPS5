@@ -3,6 +3,9 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LaneCensus.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LaneChain.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LaneEdges.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include <atomic>
 #include <chrono>
@@ -355,8 +358,10 @@ public:
     };
     static ResidentStatistics ResidentCounts();
     // Commands() that leaves the queued copy-backs alone under coalescing (the caller recorded
-    // those its command touches); Commands() otherwise.
-    VkCommandBuffer CommandsKeepingCopyBacks(VkAccessFlags* coveredAccess = nullptr);
+    // those its command touches); Commands() otherwise. The census counts the call under site
+    // Other; `site` Dispatch tells the image edges (APS5_IMAGE_EDGES) a dispatch, which reports its
+    // images, from the producing sites.
+    VkCommandBuffer CommandsKeepingCopyBacks(VkAccessFlags* coveredAccess = nullptr, CommandSite site = CommandSite::Other);
     bool HasDeferredCopies() const { return !deferredCopies.empty() || !claimedCopies.empty(); }
     // Why queued copy-backs were recorded (the [barriers] digest under deferral).
     enum class FlushReason : std::uint8_t { Submit = 0, StoreRun, Command, Dispatch, DispatchLease, CopyIn, Count };
@@ -566,6 +571,33 @@ public:
     // Completes batches that already finished; returns whether nothing is in flight.
     bool Reap();
     std::uint64_t Submissions() const { return submissions; }
+    // APS5_COMPUTE_QUEUE (LaneChain.hpp): submits the open batch when it is the other lane's, so the
+    // caller's work opens a batch of its own lane (ensureOpen calls it; FastDispatch before it tags
+    // ring regions with the open serial). Nothing with the switch off or no batch open.
+    void ClaimLane() {
+        if (lanes.Enabled() && open != nullptr) switchLane();
+    }
+    // Whether a one-shot submission to `queue` (a resident land, a CommandBatch, the presentation
+    // blit) goes through SubmitOneShot: the compute queue is in use and `queue` is the first one.
+    bool ChainsOneShots(VkQueue queue) const { return lanes.Enabled() && queue == context.queue; }
+    // Submits a one-shot command buffer to the first queue (no wait semaphore, at most one signal
+    // semaphore of its own), chained to the batches: it waits for the newest one when that went to
+    // the compute queue, and signals the one-shot timeline the next compute batch waits for. Under
+    // GuestMemory::GpuMutex. Off: the plain vkQueueSubmit.
+    VkResult SubmitOneShot(VkSubmitInfo submission, VkFence fence);
+    // The timeline values that mean "every batch up to `serial` completed" (WaitSerial and the
+    // hook's unlocked wait): the one timeline at `serial`, or with APS5_ASYNC_COMPUTE each lane's
+    // timeline at its value (LaneHistory; a lane with nothing to wait for is left out).
+    struct TimelineWait {
+        std::array<VkSemaphore, 2> semaphores{};
+        std::array<std::uint64_t, 2> values{};
+        std::array<Lane, 2> lanes{};
+        std::uint32_t count = 0;
+    };
+    TimelineWait TimelineWaitFor(std::uint64_t serial) const;
+    // APS5_ASYNC_COMPUTE: the calling thread's lane took a staged shadow lane `registered` filled
+    // (GuestBufferMemory.cpp): its next batch would wait for the other lane's newest (LaneEdges).
+    void NoteShadowTake(Lane registered) const;
     // Batches submitted and not yet finished (what a full Sync() waits for); under GuestMemory::GpuMutex.
     std::size_t InFlightBatches() const { return inFlight.size(); }
     // Reaps that retired at least one batch so far (the [recorder] line's 'with work' count).
@@ -629,7 +661,18 @@ public:
         // Taken under the late rule: `generation` is the oldest group generation of the dwords.
         bool late;
         std::uint64_t generation;
+        // APS5_LANE_CENSUS only (0 and false otherwise): the first dword's batch serial (the open
+        // batch's is Submissions() + 1) and whether that batch was still open. The unlocked lookup
+        // reads them without the GPU mutex: diagnostic only.
+        std::uint64_t serial;
+        bool open;
+        // APS5_ASYNC_COMPUTE only (zero otherwise): per lane (LaneIndex), the newest batch whose
+        // label store makes up the value (an open batch's serial is Submissions() + 1).
+        std::array<std::uint64_t, 2> producers{};
     };
+    // APS5_ASYNC_COMPUTE (LaneEdges.hpp): a wait of lane `waiter` took `hit` (WaitMemory.cpp), so its
+    // lane's next batch would wait for the other lane's batch that stores it. Any thread.
+    static void NoteLabelEdge(Lane waiter, const LabelHit& hit);
     // Why a lookup refused a late candidate (an entry with stamp <= afterStamp), for the trace.
     // BehindCompletion replaces the other reasons when the refused entry's value reaches memory
     // only through a completion action of its batch (AfterCompletions: the GPU has no view of the
@@ -901,6 +944,27 @@ public:
     };
     static bool BarrierValidate();
     void NoteAccess(CommandClass which, const Access& access);
+    // BarrierValidate(): the commands report their accesses (NoteAccess) for the hazard tracker
+    // (HazardCounting: APS5_BARRIER_VALIDATE) or for the image edges (APS5_IMAGE_EDGES=1 with
+    // APS5_ASYNC_COMPUTE=1 and APS5_COMPUTE_QUEUE=1: LaneEdges.hpp), which take the images only.
+    static bool HazardCounting();
+    // APS5_IMAGE_EDGES (with the two timelines): an image the open batch's last command reads or
+    // writes that its access note leaves out (`image`: a VkImage's ImageKey, or a dispatch
+    // template's address for its data buffers); the digest line counts the notes by noter.
+    enum class ImageNote : std::uint8_t { Command = 0, FastDraw, Depth, Template, SlowDraw, Count };
+    static std::uint64_t ImageKey(VkImage image) { return reinterpret_cast<std::uint64_t>(image); }
+    bool ImageEdges() const { return imageEdges; }
+    void NoteImageEdge(std::uint64_t image, bool written, ImageNote note = ImageNote::Command);
+    // An image the calling thread's next draw or dispatch reads or writes that no access note names
+    // (a depth surface attached or sampled: DepthSurface.cpp): noted when that command takes its
+    // command buffer (Commands at a draw or dispatch site, CommandsInRenderPass), in its batch.
+    static void PendImageEdge(std::uint64_t image, bool written) {
+        if (ImageEdgesAsked()) pendImageEdge(image, written);
+    }
+    // Whether the command buffer last handed out continued a draw's render pass: the draw notes its
+    // images then (`fast`: its sampled images, FastDraw.cpp; else its storage images, Draw.cpp), as
+    // the pass's first draw noted its own and the attachments. Counted per path.
+    bool NotesContinuedDraw(bool fast);
     // A range timed outside the recorder's batches (the presenter's blit, stamped into its own
     // pool and read after its fence): enters the class totals like a recorded one.
     static void AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_t bytes);
@@ -994,6 +1058,17 @@ private:
         // The GpuMutex queue tag of the thread that opened the batch, and when it was submitted
         // (the [syncwait] line reports what a wait's target and the batches ahead of it were).
         std::uint32_t queue = 0xffffffffu;
+        // APS5_COMPUTE_QUEUE: that thread's lane (LaneOf), which picks the queue, and the kept objects
+        // a lane switch handed over to the batch (the first `inherited` of `kept`, and their bytes).
+        Lane lane = Lane::G;
+        std::size_t inherited = 0;
+        std::size_t inheritedBytes = 0;
+        // APS5_ASYNC_COMPUTE: it recorded commands whose writes no noted range covers (`edgeProducer`),
+        // or drew or dispatched (`edgeImage`): the other lane's next batch needs it (LaneEdges).
+        bool edgeProducer = false;
+        bool edgeImage = false;
+        // APS5_IMAGE_EDGES: a producer by the fine rule (a dispatch is none: it reports its images).
+        bool edgeFineProducer = false;
         std::chrono::steady_clock::time_point submittedAt{};
         VkQueryPool queries = VK_NULL_HANDLE;
         VkQueryPool samples = VK_NULL_HANDLE;
@@ -1105,6 +1180,10 @@ private:
         bool overwritten = false;
         // The value lands in memory only when the batch's completion actions run (LabelRefusal::BehindCompletion).
         bool behindCompletion = false;
+        // APS5_ASYNC_COMPUTE: the batch's serial (an open batch's is the one it will get) and lane,
+        // copied at the note, so a lookup without the GPU mutex never reads the batch.
+        std::uint64_t serial = 0;
+        Lane lane = Lane::G;
     };
     void readGpuTiming(Batch& batch);
     void beginSamples(Batch& batch);
@@ -1135,6 +1214,8 @@ private:
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
+    // APS5_COMPUTE_QUEUE: submits the open batch of the other lane (ClaimLane), unless blocked.
+    void switchLane();
     // Records the run's pending store (vkCmdUpdateBuffer), if any.
     void flushPendingStore();
     // Records the pending store and the run's trailing barrier; the next store starts a new run.
@@ -1187,8 +1268,9 @@ private:
     std::uint32_t narrowStoredSeen = 0;
     std::uint32_t narrowStaleSeen = 0;
     bool narrowStaleDescribed = false;
-    // Commands() with the queued copy-backs recorded first unless `keepCopyBacks`.
-    VkCommandBuffer commandsFor(VkAccessFlags* coveredAccess, bool keepCopyBacks);
+    // Commands() with the queued copy-backs recorded first unless `keepCopyBacks` (`dispatch`: a
+    // dispatch that kept them, for the image edges).
+    VkCommandBuffer commandsFor(VkAccessFlags* coveredAccess, bool keepCopyBacks, bool dispatch = false);
     bool coalesceCopyBacks = false;
     // Aware commands (AwareCommands), and the CommandSite of the Commands() call in progress (the
     // census counts the pass it records under it).
@@ -1272,6 +1354,36 @@ private:
 
     Context context;
     VkSemaphore timeline = VK_NULL_HANDLE;
+    // APS5_COMPUTE_QUEUE (enabled with a compute queue and the timeline): the waits between the two
+    // queues; the one-shot timeline (the one-shots signal 1, 2, ...); lane switches, blocked while a
+    // caller holds the open batch or submits it; the kept objects a switch handed over, which the
+    // next batch takes.
+    LaneChain lanes;
+    VkSemaphore oneShotTimeline = VK_NULL_HANDLE;
+    // APS5_ASYNC_COMPUTE (LaneEdges.hpp; set by the constructor, so read without the mutex too): lane
+    // C's timeline (lane G's is `timeline`) and the counter query for the hang line; the history
+    // mapping a serial to both lanes' values (under completedMutex); the edges counted (under the
+    // GpuMutex); the label and shadow needs any thread notes, taken by the lane's next submit.
+    VkSemaphore computeTimeline = VK_NULL_HANDLE;
+    bool twoTimelines = false;
+    PFN_vkGetSemaphoreCounterValueKHR counterValue = nullptr;
+    LaneHistory history;
+    LaneEdges edges;
+    std::array<std::atomic<std::uint64_t>, 2> labelNeeds{};
+    mutable std::array<std::atomic<bool>, 2> shadowTakes{};
+    VkSemaphore laneTimeline(Lane lane) const { return twoTimelines && lane == Lane::C ? computeTimeline : timeline; }
+    // Submit's edge count for `batch` (to be serial `serial`; `chained`: the chain makes it wait).
+    void noteEdges(const Batch& batch, std::uint64_t serial, bool chained);
+    // APS5_IMAGE_EDGES (set by the constructor with the two timelines): the images noted go into
+    // `edges`; whether the last command buffer handed out continued a render pass; the calling
+    // thread's pending images (PendImageEdge), noted for the open batch.
+    bool imageEdges = false;
+    bool continuedDraw = false;
+    static void pendImageEdge(std::uint64_t image, bool written);
+    void notePendingImages();
+    int laneSwitchBlocked = 0;
+    std::vector<std::shared_ptr<void>> handedOver;
+    std::size_t handedOverBytes = 0;
     // Identity for a thread that released the mutex around a wait (syncThroughUnlocked): the
     // recorder may have been torn down meanwhile, so it is looked up by this id, not by pointer.
     std::uint64_t id = 0;

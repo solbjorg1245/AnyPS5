@@ -154,6 +154,11 @@ struct Context {
     // vkGetPhysicalDeviceMemoryProperties2: the video memory guard's sample. Off and null in tests.
     bool memoryBudget = false;
     PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
+    // APS5_COMPUTE_QUEUE: lane C's queue, index 1 of `queue`'s family (the recorder submits the
+    // compute queue workers' batches to it, chained in serial order). Null when off and in tests.
+    VkQueue computeQueue = VK_NULL_HANDLE;
+    // APS5_ASYNC_COMPUTE (LaneEdges.hpp): its level while the compute queue is in use, else 0.
+    int asyncCompute = 0;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

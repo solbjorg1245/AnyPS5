@@ -289,6 +289,12 @@ bool FastBindings::ReadsImage(const StorageTexture* image) const {
 
 void FastBindings::KeepObjects(std::vector<std::shared_ptr<void>>& hold) const {
     hold.insert(hold.end(), objects.begin(), objects.end());
+    // APS5_IMAGE_EDGES: the storage images a draw that continued its pass samples, for the open
+    // batch the hold belongs to (Draw.cpp notes those of the draw that began the pass).
+    if (!ImageEdgesAsked()) return;
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || !recorder->NotesContinuedDraw(true)) return;
+    for (const auto* source : viewed) recorder->NoteImageEdge(Recorder::ImageKey(source->Image()), false, Recorder::ImageNote::FastDraw);
 }
 
 std::span<const std::uint32_t> FastBindings::DataWords(const Binding& binding) const {

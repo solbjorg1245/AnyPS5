@@ -1148,7 +1148,7 @@ void Driver::runRecordPipe() noexcept {
         if (!since.has_value() || std::chrono::steady_clock::now() - *since < labelFlushDeadline()) return;
         const auto localDevice = device.Load();
         if (localDevice == nullptr) return;
-        localDevice->SubmitRecorded(true);
+        { const Graphics::SubmitCauseScope submitCause(Graphics::SubmitCause::PipeDeadline); localDevice->SubmitRecorded(true); }
         pipe.bSubmits.fetch_add(1, std::memory_order_relaxed);
     };
     // APS5_PROFILE_DRAW: timed while B holds the mutex (without it the check returns at once).

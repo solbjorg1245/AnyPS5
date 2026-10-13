@@ -1911,6 +1911,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     VkDeviceSize argumentOffset = 0;
     bool rewritten = false;
     if (continued) {
+        // APS5_IMAGE_EDGES: the storage images this draw samples or writes (the pass's first draw
+        // noted its own and the attachments).
+        if (recorder->NotesContinuedDraw(false)) {
+            for (const auto& [image, written] : resources.StorageImages()) recorder->NoteImageEdge(Recorder::ImageKey(image), written, Recorder::ImageNote::SlowDraw);
+        }
         if (gpuIndirect) rewritten = recordIndirectArguments(context, commands, recorder, true, *record.indirect, scratch, argumentBuffer, argumentOffset, countBarrier, true);
         record.pipeline->Continue(commands, UiRectViewport(state), UiRectScissor(state));
     } else {

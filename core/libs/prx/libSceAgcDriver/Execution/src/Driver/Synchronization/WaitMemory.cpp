@@ -205,6 +205,12 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
         ++(polling ? outcomes.fromRecorderPolling : outcomes.fromRecorder);
         if (unlockedHit) ++outcomes.fromRecorderUnlocked;
+        if (Graphics::LaneCensusOn) {
+            using Census = Graphics::LaneCensus;
+            Census::Shared().LabelHit(Graphics::LaneOf(queue), Graphics::LaneOf(hit->queue), hit->late ? Census::LabelState::Late : hit->open ? Census::LabelState::Open : Census::LabelState::InFlight, hit->serial);
+        }
+        // APS5_ASYNC_COMPUTE: what this queue records next follows the batch storing the label.
+        if (Graphics::AsyncComputeLevel() != 0) Graphics::Recorder::NoteLabelEdge(Graphics::LaneOf(queue), *hit);
         if (hit->queue == queue) {
             ++outcomes.fromRecorderSameQueue;
             if (!hit->late) epochPoint.bump = false;
@@ -244,7 +250,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                 if (takeLabel(localDevice->PendingLabel(awaited, awaitedBytes, received, &refusal), refusal, false, false)) return;
             }
 
-            if (!overlapSubmit || localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) localDevice->SubmitRecorded(false);
+            if (!overlapSubmit || localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) {
+                const Graphics::SubmitCauseScope submitCause(Graphics::SubmitCause::WaitEntry);
+                localDevice->SubmitRecorded(false);
+            }
         }
     }
 
@@ -316,11 +325,13 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                 pollRefused(refusal);
             }
             if (localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) {
+                const Graphics::SubmitCauseScope submitCause(Graphics::SubmitCause::WaitPoll);
                 localDevice->SubmitRecorded(false);
                 submitted = true;
             }
         }
         if (labelDue && !submitted && Graphics::Recorder::PendingLabelSince().has_value()) {
+            const Graphics::SubmitCauseScope submitCause(Graphics::SubmitCause::WaitPollDue);
             localDevice->SubmitRecorded(false);
             submitted = true;
         }
