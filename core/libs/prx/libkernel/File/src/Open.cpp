@@ -2,6 +2,7 @@
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/ReadPatch.hpp"
+#include "prx/libc/include/MovieWatch.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libkernel/File/include/File.hpp"
@@ -115,6 +116,7 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
     }
     if (File::ReadTraceEnabled()) File::TraceOpen(fd, native.string());
     TrackReadPatchDescriptor_nid_no_patch(fd, native);
+    TrackMovieDescriptor_nid_no_patch(fd, native);
     return fd;
 }
 
@@ -123,6 +125,7 @@ int APS5_VABI sceKernelClose(int d) {
     File::ForgetDirectoryDescriptor(d);
 #endif
     ForgetReadPatchDescriptor_nid_no_patch(d);
+    ForgetMovieDescriptor_nid_no_patch(d);
     if (NativeClose(d) != 0) {
         throw std::runtime_error(std::string(__func__) + ": close failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
     }
@@ -151,6 +154,7 @@ std::int64_t APS5_VABI sceKernelRead(int d, void* buf, std::size_t nbytes) {
     }
     if (patches && position >= 0) ApplyReadPatches_nid_no_patch(*patches, "read", static_cast<std::uint64_t>(position), buf, static_cast<std::uint64_t>(n));
     if (patchedReadLock.owns_lock()) patchedReadLock.unlock();
+    NoteMovieDescriptorRead_nid_no_patch(d, "read", position, static_cast<std::uint64_t>(n));
     return static_cast<std::int64_t>(n);
 }
 

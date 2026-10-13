@@ -5,6 +5,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/ReadPatch.hpp"
+#include "prx/libc/include/MovieWatch.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libkernel/File/include/File.hpp"
@@ -167,6 +168,7 @@ int APS5_VABI chmod_nid_postfix(const char* path, int mode) {
 int APS5_VABI close_nid_postfix(int d) {
     if (d >= GuestSockets::FirstDescriptor) return GuestSockets::Close(d);
     ForgetReadPatchDescriptor_nid_no_patch(d);
+    ForgetMovieDescriptor_nid_no_patch(d);
 #ifdef _WIN32
     File::ForgetDirectoryDescriptor(d);
     return _close(d);
@@ -273,6 +275,7 @@ int64_t APS5_VABI pread_nid_postfix(int d, void* buf, size_t nbytes, int64_t off
     }
     if (n > 0) {
         if (const auto patches = ReadPatchesForDescriptor_nid_no_patch(d)) ApplyReadPatches_nid_no_patch(*patches, "pread", static_cast<std::uint64_t>(offset), buf, static_cast<std::uint64_t>(n));
+        NoteMovieDescriptorRead_nid_no_patch(d, "pread", offset, static_cast<std::uint64_t>(n));
     }
     return n;
 }
@@ -437,6 +440,7 @@ int64_t APS5_VABI sceKernelPread(int d, void* buf, size_t nbytes, int64_t offset
     const auto result = NativePread(d, buf, nbytes, offset);
     if (result > 0) {
         if (const auto patches = ReadPatchesForDescriptor_nid_no_patch(d)) ApplyReadPatches_nid_no_patch(*patches, "pread", static_cast<std::uint64_t>(offset), buf, static_cast<std::uint64_t>(result));
+        NoteMovieDescriptorRead_nid_no_patch(d, "pread", offset, static_cast<std::uint64_t>(result));
     }
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }

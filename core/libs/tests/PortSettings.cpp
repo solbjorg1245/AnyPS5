@@ -1,6 +1,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/AddonContent.hpp"
 #include "prx/libc/include/PortSettings.hpp"
+#include "prx/libc/include/MovieWatch.hpp"
 #include "prx/libSceVideoOut/include/TitleJobBudget.hpp"
 #include "prx/libSceVideoOut/include/TitleRefreshField.hpp"
 #include "prx/libSceVideoOut/include/TitleRefreshTable.hpp"
@@ -1056,6 +1057,57 @@ static void TestAddonContent() {
     std::filesystem::remove_all(base, error);
 }
 
+// APS5_MOVIE_WATCH (MovieWatch.hpp): the Bink 2 header and the speed of one pass from its reads.
+static void TestMovieWatch() {
+    // logo_intro.bk2's header: 360 frames, 3840x2160, 30/1 fps.
+    unsigned char header[MovieWatch::HeaderBytes] = {'K', 'B', '2', 'm'};
+    const auto put = [&](std::size_t at, std::uint32_t value) {
+        for (std::size_t i = 0; i < 4; ++i) header[at + i] = static_cast<unsigned char>(value >> (8u * i));
+    };
+    put(4, 71054660u - 8u);
+    put(8, 360);
+    put(12, 1u << 20u);
+    put(16, 360);
+    put(20, 3840);
+    put(24, 2160);
+    put(28, 30);
+    put(32, 1);
+    const auto parsed = MovieWatch::ParseHeader(header, sizeof(header));
+    Require(parsed.valid && parsed.frames == 360 && parsed.width == 3840 && parsed.height == 2160, "Bink 2 header fields");
+    Require(Near(parsed.Fps(), 30.0, 1e-9) && Near(parsed.Seconds(), 12.0, 1e-9), "Bink 2 frame rate and length");
+    Require(!MovieWatch::ParseHeader(header, MovieWatch::HeaderBytes - 1).valid, "a short header is no header");
+    header[0] = 'B';
+    Require(!MovieWatch::ParseHeader(header, sizeof(header)).valid, "another signature is not followed");
+    Require(MovieWatch::IsMovie("movies/logo_intro.bk2") && MovieWatch::IsMovie("A/B.BK2") && !MovieWatch::IsMovie("a.bk2x") && !MovieWatch::IsMovie("bk2"),
+        "movie file names");
+
+    // A 12 s, 72 MB movie streamed in 1 MB reads after a 6 MB preload, at 1x (6 MB/s) and at 2x.
+    const std::uint64_t mb = 1u << 20u, size = 72 * mb;
+    for (const double rate : {1.0, 2.0}) {
+        MovieWatch::Pass pass(size, 12.0);
+        Require(!pass.Read(0.0, 0, 6 * mb), "a preload does not measure");
+        int measured = 0;
+        double seconds = 0.0;
+        for (std::uint64_t at = 6 * mb; at < size; at += mb) {
+            seconds += 1.0 / (6.0 * rate);
+            if (pass.Read(seconds, at, at + mb)) ++measured;
+        }
+        Require(measured == 1 && pass.Measured(), "the stream crosses three quarters once");
+        Require(Near(pass.Speed(), rate, 0.03 * rate), "speed from the middle half");
+        Require(pass.Bytes() == size && pass.Reached() == size, "bytes of the pass");
+        Require(pass.Loops(0) && !pass.Loops(size / 2), "a read at the start after the end half is a loop");
+        pass.Restart();
+        Require(!pass.Measured() && pass.Bytes() == 0 && !pass.Loops(0), "a restarted pass starts clean");
+    }
+    // A whole file read at once: measured, but the speed is not measurable.
+    MovieWatch::Pass whole(size, 12.0);
+    Require(whole.Read(1.0, 0, size) && whole.Speed() == 0.0, "a whole-file read has no speed");
+    // An earlier range again does not move the crossings back.
+    MovieWatch::Pass repeat(size, 12.0);
+    repeat.Read(0.0, 0, size / 2);
+    Require(!repeat.Read(1.0, 0, mb) && repeat.Reached() == size / 2, "an earlier range does not move the furthest end");
+}
+
 int main() {
     TestUpscalerSettings();
     TestAddonContent();
@@ -1074,6 +1126,7 @@ int main() {
     TestRefreshField();
     TestJobBudget();
     TestTableCompat();
+    TestMovieWatch();
     TestPresentMode();
     TestDisplayFpsLimit();
     TestWindowSize();
