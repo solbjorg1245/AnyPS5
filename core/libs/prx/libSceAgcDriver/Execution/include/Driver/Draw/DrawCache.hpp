@@ -179,6 +179,10 @@ struct DrawStageHits {
     // the stages without a match are captured again. APS5_NO_PARTIAL_DRAW_HITS=1 captures every
     // stage of a miss.
     bool partial = false;
+    // APS5_PREPARE_FAST: lookupDraw's per-draw vectors (the variant rank per stage, the live data
+    // words a data hit refreshed per stage), kept with the draw's scratch for their buffers.
+    std::vector<std::size_t> ranks;
+    std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> liveData;
 };
 
 struct StageCapture {

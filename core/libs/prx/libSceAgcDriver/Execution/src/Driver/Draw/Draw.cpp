@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastWalk.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepareFast.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepareProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
@@ -320,7 +321,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     matchedRegions.resize(programs.size());
     for (auto& regions : matchedRegions) regions.clear();
     auto& hits = scratch->hits;
-    hits.liveWords.clear();
+    // APS5_PREPARE_FAST: the live words vectors are emptied, their buffers kept for the lookup.
+    if (PrepareFast::Enabled()) {
+        for (auto& words : hits.liveWords) words.clear();
+    } else {
+        hits.liveWords.clear();
+    }
     hits.results.clear();
     hits.data = false;
     hits.partial = false;

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepareFast.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepareProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/HostMutex.hpp"
@@ -210,16 +211,24 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
         if (entry != nullptr) {
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             std::optional<DrawMiss> miss;
-            std::vector<std::size_t> ranks(programs.size(), 0);
+            // APS5_PREPARE_FAST: the rank and live-data vectors are the draw scratch's (hits), their
+            // buffers kept from draw to draw; else this lookup's own.
+            const bool fast = PrepareFast::Enabled();
+            std::vector<std::size_t> ownRanks;
+            std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> ownLiveData;
+            auto& ranks = fast ? hits.ranks : ownRanks;
             // Per stage, the live words of the leaves a data hit refreshed (validateVariant).
-            std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> liveData(programs.size());
+            auto& liveData = fast ? hits.liveData : ownLiveData;
+            ranks.assign(programs.size(), 0);
+            liveData.resize(programs.size());
+            for (auto& data : liveData) data.clear();
             const bool dataAllowed = dataHits() && !verifyDrawEntries();
             const bool runsCheck = drawEntryRunsCheck();
             std::uint64_t runsLapsed = 0;
             std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0;
             std::uint64_t relocatedStages = 0, relocatedInPlace = 0, relocationNoRule = 0, relocationDiffering = 0, relocationUnordered = 0;
             double compareUs = 0, patchUs = 0;
-            std::uint64_t compareCalls = 0, patchedMade = 0, patchedReused = 0;
+            std::uint64_t compareCalls = 0, patchedMade = 0, patchedReused = 0, pooledReused = 0, pooledMade = 0, unpooled = 0, verified = 0, mismatches = 0;
             if (entry->stages.size() != programs.size()) miss = DrawMiss::Stages;
 
             std::uint32_t cursor = 0;
@@ -331,7 +340,13 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             PrepareProfile::Scope patchSpan(PrepareProfile::DPatch, submission.queue == 0);
             if (drawHit || hits.partial) {
                 const auto patchStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                hits.liveWords.assign(programs.size(), {});
+                if (fast) {
+                    // The words vectors keep their buffers (Driver::draw emptied them, not dropped).
+                    hits.liveWords.resize(programs.size());
+                    for (auto& words : hits.liveWords) words.clear();
+                } else {
+                    hits.liveWords.assign(programs.size(), {});
+                }
                 hits.results.assign(programs.size(), nullptr);
                 hits.data = false;
                 for (std::size_t i = 0; i < programs.size(); ++i) {
@@ -356,6 +371,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     // results are cleared before this lookup; a holder elsewhere gets its own copy,
                     // which the variant then keeps instead).
                     std::shared_ptr<ShaderRecompiler::RecompileResult> patched;
+                    bool pooled = false;
                     if (shifted && variant.patched != nullptr && variant.patched.get() == variant.compiled.get()) {
                         // The shifted copy is the fresh variant's own (shiftVariant): patched in place.
                         patched = variant.patched;
@@ -363,22 +379,52 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     } else if (patchedResultReuse() && variant.patched != nullptr && variant.patched.use_count() == 1) {
                         patched = variant.patched;
                         ++patchedReused;
+                    } else if (fast && patchedResultReuse() && variant.patched != nullptr && (patched = PrepareFast::TakeUnheld(variant.patchedPool)) != nullptr) {
+                        // APS5_PREPARE_FAST: `patched` is still held (by an item in the ring); a pooled
+                        // copy no one holds serves instead of a deep copy.
+                        pooled = true;
+                        ++patchedReused;
+                        ++pooledReused;
                     } else {
                         patched = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
-                        if (patchedResultReuse()) variant.patched = patched;
+                        if (fast && patchedResultReuse() && variant.patched != nullptr) {
+                            // The variant keeps its copy; this one joins the pool while it has room.
+                            if (variant.patchedPool.size() < PrepareFast::PoolLimit) {
+                                variant.patchedPool.push_back(patched);
+                                ++pooledMade;
+                            } else {
+                                ++unpooled;
+                            }
+                        } else if (patchedResultReuse()) {
+                            variant.patched = patched;
+                        }
                         ++patchedMade;
                     }
-                    if (flat) {
-                        auto& descriptor = patched->bindings[variant.flatBinding].guestDescriptor;
-                        for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
-                            if (variant.dataSlots[k] < descriptor.size()) descriptor[variant.dataSlots[k]] = words[variant.dataPositions[k]];
+                    // Only the flat binding's data slots and the buffer base slots differ from `compiled`,
+                    // and they are rewritten on every hit, so a reused copy reads as a fresh one.
+                    const auto patch = [&](ShaderRecompiler::RecompileResult& result) {
+                        if (flat) {
+                            auto& descriptor = result.bindings[variant.flatBinding].guestDescriptor;
+                            for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
+                                if (variant.dataSlots[k] < descriptor.size()) descriptor[variant.dataSlots[k]] = words[variant.dataPositions[k]];
+                            }
                         }
-                    }
-                    // The buffer base slots: each moved V# base into its binding (BufferBaseWords),
-                    // the base bits only (the shader may have patched the rest of word 1).
-                    for (const auto& slot : variant.baseSlots) {
-                        auto& descriptor = patched->bindings[slot.binding].guestDescriptor;
-                        if (slot.word < descriptor.size()) descriptor[slot.word] = (descriptor[slot.word] & ~slot.mask) | (words[slot.position] & slot.mask);
+                        // The buffer base slots: each moved V# base into its binding (BufferBaseWords),
+                        // the base bits only (the shader may have patched the rest of word 1).
+                        for (const auto& slot : variant.baseSlots) {
+                            auto& descriptor = result.bindings[slot.binding].guestDescriptor;
+                            if (slot.word < descriptor.size()) descriptor[slot.word] = (descriptor[slot.word] & ~slot.mask) | (words[slot.position] & slot.mask);
+                        }
+                    };
+                    patch(*patched);
+                    // APS5_PREPARE_FAST_VERIFY: the pooled copy against a fresh copy patched the same way.
+                    if (pooled && PrepareFast::Verify()) {
+                        ShaderRecompiler::RecompileResult fresh = *variant.compiled;
+                        patch(fresh);
+                        bool same = fresh.bindings.size() == patched->bindings.size() && fresh.pushConstants.size() == patched->pushConstants.size();
+                        for (std::size_t b = 0; same && b < fresh.bindings.size(); ++b) same = fresh.bindings[b].guestDescriptor == patched->bindings[b].guestDescriptor;
+                        ++verified;
+                        if (!same) ++mismatches;
                     }
                     if (!variant.baseSlots.empty() && std::any_of(liveData[i].begin(), liveData[i].end(), [&](const std::pair<std::uint32_t, std::uint32_t>& item) { return PatchMaskAt(variant.baseSlots, item.first) != 0; })) ++baseStages;
                     hits.results[i] = std::move(patched);
@@ -400,6 +446,14 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             counters.patchUs += patchUs;
             counters.patchedMade += patchedMade;
             counters.patchedReused += patchedReused;
+            if (fast) {
+                auto& fastCounters = PrepareFast::Get();
+                if (pooledReused != 0) fastCounters.pooledReused.fetch_add(pooledReused, std::memory_order_relaxed);
+                if (pooledMade != 0) fastCounters.pooledMade.fetch_add(pooledMade, std::memory_order_relaxed);
+                if (unpooled != 0) fastCounters.unpooled.fetch_add(unpooled, std::memory_order_relaxed);
+                if (verified != 0) fastCounters.verified.fetch_add(verified, std::memory_order_relaxed);
+                if (mismatches != 0) fastCounters.mismatches.fetch_add(mismatches, std::memory_order_relaxed);
+            }
             if (relocation != nullptr) {
                 counters.relocatedStages += relocatedStages;
                 counters.relocatedInPlace += relocatedInPlace;

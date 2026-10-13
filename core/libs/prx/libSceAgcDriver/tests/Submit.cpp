@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/NewDrawKeyTally.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepareFast.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastRead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
@@ -1281,6 +1282,48 @@ void testDrawPipelineKey() {
     check(memo.Find(fresh, KeyHash(fresh), 3, pool.get()) == nullptr, "draw pipeline memo: an entry answered after the store removed one");
 }
 
+// APS5_PREPARE_FAST's patched-result pool (PrepareFast.hpp, DrawLookup.cpp): a pooled copy serves
+// only while no one else holds it, and a variant drawn into every slot of the recording pipe's
+// 32-item ring settles at one copy per slot instead of a deep copy per draw.
+void testPreparePool() {
+    using namespace AgcDriver::DriverDetail;
+    std::vector<std::shared_ptr<int>> pool;
+    check(PrepareFast::TakeUnheld(pool) == nullptr, "prepare pool: nothing from an empty pool");
+    pool.push_back(nullptr);
+    pool.push_back(std::make_shared<int>(1));
+    pool.push_back(std::make_shared<int>(2));
+    auto held = pool[1];
+    auto taken = PrepareFast::TakeUnheld(pool);
+    check(taken != nullptr && *taken == 2, "prepare pool: the first unheld copy, past a null and a held one");
+    check(PrepareFast::TakeUnheld(pool) == nullptr, "prepare pool: a taken copy is held until let go");
+    held.reset();
+    check(PrepareFast::TakeUnheld(pool) == pool[1], "prepare pool: a copy let go serves again");
+    taken.reset();
+    // The ring: draw n empties slot n % 32 (its scratch is cleared before the lookup), then binds
+    // the variant's copy, its pooled one, or a new copy that joins the pool, as lookupDraw does.
+    constexpr std::size_t Slots = 32;
+    std::array<std::shared_ptr<int>, Slots> ring{};
+    std::shared_ptr<int> patched;
+    pool.clear();
+    std::size_t made = 0, beyond = 0;
+    for (std::size_t n = 0; n < 4096; ++n) {
+        ring[n % Slots].reset();
+        std::shared_ptr<int> copy;
+        if (patched != nullptr && patched.use_count() == 1) copy = patched;
+        else if (patched != nullptr && (copy = PrepareFast::TakeUnheld(pool)) != nullptr) {
+        } else {
+            copy = std::make_shared<int>(0);
+            ++made;
+            if (patched == nullptr) patched = copy;
+            else if (pool.size() < PrepareFast::PoolLimit) pool.push_back(copy);
+            else ++beyond;
+        }
+        ring[n % Slots] = std::move(copy);
+    }
+    check(made == Slots && beyond == 0 && pool.size() == Slots - 1, "prepare pool: one copy per ring slot, all pooled");
+    check(PrepareFast::PoolLimit + 1 >= Slots, "prepare pool: the limit covers the ring");
+}
+
 // Native aspect's UI rect (AspectFit): the part of the 16:9 display buffer that is shown undistorted
 // at the window's aspect, and a viewport or scissor carried into it.
 void testUndistortedRect() {
@@ -1349,6 +1392,7 @@ int main() {
         testFastPipelineMemo();
         testDrawPipelineKey();
         testUndistortedRect();
+        testPreparePool();
         LibcRunShutdown_nid_postfix();
         std::puts("AGC driver submit tests passed");
         return 0;

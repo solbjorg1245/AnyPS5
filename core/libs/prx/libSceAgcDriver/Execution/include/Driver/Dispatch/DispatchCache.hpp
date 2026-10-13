@@ -88,6 +88,10 @@ struct DispatchVariant {
     // binding's data slots and the buffer base slots are rewritten. APS5_NO_PATCHED_RESULT_REUSE=1
     // copies per hit again.
     std::shared_ptr<ShaderRecompiler::RecompileResult> patched;
+    // APS5_PREPARE_FAST (PrepareFast.hpp): further patched copies for the hits made while `patched`
+    // is still held (the recording pipe's ring keeps each draw's results until A refills the slot),
+    // each reused once no one holds it; at most PrepareFast::PoolLimit.
+    std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>> patchedPool;
 };
 
 struct DispatchEntry {

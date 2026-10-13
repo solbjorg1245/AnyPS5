@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastDraw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepareFast.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepareProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/FrameTrace.hpp"
@@ -908,6 +909,7 @@ void Driver::recordPipeSubmissionEnd() {
     auto& pipe = recordPipe();
     if (!recordPipeProfile() || std::chrono::steady_clock::now() - pipe.lastReport < std::chrono::seconds(10)) return;
     PrepareProfile::Report();
+    PrepareFast::Report();
     std::string drains, waits;
     char item[64];
     for (std::size_t why = 0; why < PipeCensusDrains; ++why) {
