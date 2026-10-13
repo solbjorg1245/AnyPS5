@@ -380,6 +380,21 @@ void NoteRecordPipeLabelWait(std::uint64_t address, std::uint32_t queue, double 
 // APS5_PROFILE_DRAW, the queue-0 worker: time it waited for a submission (the [pipe] labels line).
 void NoteRecordPipeIdle(std::uint64_t ns);
 
+// APS5_WAIT_PIPE_PROGRESS (s62 R-WAITS; Driver::waitMemory): the ring's serials now ({0, 0} while the
+// pipe is off). A cross-queue wait times out after 1000 ms in which no packet finished or ran on any
+// queue. B recording a handed draw is queue-0 work in flight, as the draw packet was before the pipe,
+// but A sits in a drain outside any packet meanwhile, so a load's long recordings (pipeline builds)
+// timed the compute queues out while queue 0 was still on its way to the labels they wait for.
+struct RecordPipeProgress {
+    std::uint64_t handed = 0, consumed = 0;
+};
+RecordPipeProgress RecordPipeProgressNow();
+// Whether the pipe showed queue-0 work since a wait last saw `seenConsumed`: an item still unrecorded,
+// or one recorded since.
+constexpr bool RecordPipeProgressed(RecordPipeProgress now, std::uint64_t seenConsumed) {
+    return !RecordPipeRing::Empty(now.handed, now.consumed) || now.consumed != seenConsumed;
+}
+
 // The stale handshake: B, whose device call threw SnapshotStale for item k, records nothing for it,
 // releases the GPU mutex, raises k and waits; A, at its next service point (a packet boundary or any
 // of its pipe waits), redoes k through the retry ladder and finishes it; B then consumes k and goes on

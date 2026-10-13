@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -100,6 +101,19 @@ int Driver::waitPatientMs() {
     if (text == nullptr || text[0] == '\0' || std::strcmp(text, "0") == 0) return 0;
     const int ms = std::atoi(text);
     return ms > 1 ? ms : 30000;
+}
+
+// APS5_WAIT_PIPE_PROGRESS=1 (s62 R-WAITS; default off while measured): the timeout above also restarts
+// while the queue-0 recording pipe has a handed draw unrecorded or recorded one since the wait last looked
+// (RecordPipe.hpp). Before the pipe that draw was a packet in flight; with it A waits in a drain outside
+// any packet, and at loads B's pipeline builds ran past 1000 ms, so every compute queue waiting for a
+// queue-0 label timed out and ran on without its input. Unset / 0 = the old rule (packets only).
+bool Driver::waitPipeProgress() {
+    static const bool on = [] {
+        const char* text = std::getenv("APS5_WAIT_PIPE_PROGRESS");
+        return text != nullptr && std::strcmp(text, "1") == 0;
+    }();
+    return on;
 }
 
 bool Driver::pollReapAll() {
@@ -343,6 +357,21 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
 
     if (entryTryFailed && pollService(false)) return;
 
+    // APS5_WAIT_PIPE_PROGRESS: the old rule's start (packets only), the pipe's consumed serial as last
+    // seen and when it last showed work; pipeHold marks a wait the switch kept past the old rule's timeout.
+    static const bool pipeProgress = waitPipeProgress();
+    auto packetStart = start;
+    std::uint64_t pipeSeen = RecordPipeProgressNow().consumed;
+    std::chrono::steady_clock::time_point pipeAt{};
+    struct PipeHold {
+        WaitOutcomes& outcomes;
+        std::chrono::steady_clock::time_point since{};
+        ~PipeHold() {
+            if (since == std::chrono::steady_clock::time_point{}) return;
+            outcomes.pipeHeldLongestMs = std::max(outcomes.pipeHeldLongestMs, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - since).count());
+        }
+    } pipeHold{outcomes};
+
     static const bool pauseSpin = std::getenv("APS5_NO_PAUSE_SPIN") == nullptr;
     const auto spinLimit = queue == 0 ? std::chrono::microseconds(1500) : std::chrono::microseconds(100);
     const auto spinStart = std::chrono::steady_clock::now();
@@ -362,14 +391,26 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
         CheckFailure();
         if (pollService(!spinning)) return;
+        const auto now = std::chrono::steady_clock::now();
         if (const auto done = packetsDone.load(); done != lastDone || packetsInFlight.load() != 0) {
             lastDone = done;
-            start = std::chrono::steady_clock::now();
+            start = packetStart = now;
+        }
+        // APS5_WAIT_PIPE_PROGRESS: B's recording is queue-0 work in flight (switch off: noted for the report).
+        if (const auto pipeNow = RecordPipeProgressNow(); RecordPipeProgressed(pipeNow, pipeSeen)) {
+            pipeSeen = pipeNow.consumed;
+            pipeAt = now;
+            if (pipeProgress) start = now;
+        }
+        if (pipeProgress && !warned && pipeHold.since == std::chrono::steady_clock::time_point{} && now - packetStart > std::chrono::milliseconds(waitTimeoutMs())) {
+            pipeHold.since = now;
+            ++outcomes.pipeHeld;
         }
 
-        if (!warned && std::chrono::steady_clock::now() - start > std::chrono::milliseconds(waitTimeoutMs())) {
+        if (!warned && now - start > std::chrono::milliseconds(waitTimeoutMs())) {
             warned = true;
             ++outcomes.timedOut;
+            if (pipeAt != std::chrono::steady_clock::time_point{} && pipeAt >= packetStart) ++outcomes.timedOutPipeBusy;
             patientMs = queue != 0 ? waitPatientMs() : 0;
             patient = patientMs > 0;
             if (patient) {
@@ -410,6 +451,11 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                                  hit.has_value() ? "hit" : "miss", static_cast<unsigned>(refusal), reportDevice->OpenWriteOverlaps(awaited, awaitedBytes) ? 1 : 0, Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes) ? 1 : 0,
                                  static_cast<unsigned long long>(Graphics::Recorder::PendingCompletionLabels()), static_cast<unsigned long long>(Graphics::Recorder::PendingWriteBackCompletions()), age,
                                  static_cast<unsigned long long>(Graphics::Recorder::WriteGeneration()), static_cast<unsigned long long>(seenGeneration), queue0Dormant.load(std::memory_order_relaxed) ? 1 : 0, completionsPending() ? 1 : 0, labelFlushDue() ? 1 : 0);
+                }
+                if (RecordPipeActive()) {
+                    const auto pipeNow = RecordPipeProgressNow();
+                    std::fprintf(stderr, "[gpu]   record pipe: %llu handed draws unrecorded, B last seen recording %.0f ms ago (-1: not since the wait began), last packet progress %.0f ms ago (APS5_WAIT_PIPE_PROGRESS %s)\n", static_cast<unsigned long long>(RecordPipeRing::Pending(pipeNow.handed, pipeNow.consumed)),
+                                 pipeAt == std::chrono::steady_clock::time_point{} ? -1.0 : std::chrono::duration<double, std::milli>(now - pipeAt).count(), std::chrono::duration<double, std::milli>(now - packetStart).count(), pipeProgress ? "on" : "off");
                 }
                 context.Print(stderr, "[gpu]   preceding packet %s\n");
                 if (patient) std::fprintf(stderr, "[gpu]   waiting on for up to %d ms (APS5_WAIT_PATIENT)\n", patientMs);
