@@ -13,6 +13,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordCensus.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libc/include/HostMutex.hpp"
@@ -56,6 +58,29 @@ struct RecordPipeSlot {
     std::chrono::steady_clock::time_point published;
     // APS5_RECORD_PIPE_EPOCH: A's collect epoch at hand-over (RecordPipeEpochFor).
     std::uint64_t epoch = 0;
+    // APS5_RECORD_CENSUS: the item opened A's run (the first after a drain).
+    bool runStart = false;
+};
+
+// APS5_RECORD_CENSUS (multi-recorder S0), the [pipe] census line: B's draws, those recorded with a
+// template and with the template of the draw before, the draws that mutated each structure, the runs
+// by length, and the chunk census for K = 8, 16, 32, 64 (chunks, neighbour pairs, pairs sharing a template).
+inline constexpr std::array<std::size_t, 4> CensusChunkSizes{8, 16, 32, 64};
+struct PipeCensusCounts {
+    std::atomic<std::uint64_t> draws{0}, templated{0}, sameTemplate{0}, runs{0}, runDraws{0};
+    std::array<std::atomic<std::uint64_t>, Graphics::RecordCensus::StructureCount> touched{};
+    std::array<std::atomic<std::uint64_t>, RecordPipeRunBuckets> runLengths{};
+    std::array<std::array<std::atomic<std::uint64_t>, 3>, CensusChunkSizes.size()> chunks{};
+};
+
+// B's own census state between items.
+struct PipeCensusB {
+    const void* lastTemplate = nullptr;
+    std::uint64_t runDraws = 0;
+    std::array<RecordPipeChunkCensus, CensusChunkSizes.size()> chunks;
+    PipeCensusB() {
+        for (std::size_t size = 0; size < chunks.size(); ++size) chunks[size].k = CensusChunkSizes[size];
+    }
 };
 
 // The [pipe] line's dispatch counts (NoteRecordPipeDispatch): handed over (eligible; those writing a
@@ -66,7 +91,7 @@ enum PipeDispatchCount : std::size_t { DispatchEligible, DispatchImageWrites, Di
 // (draws by path, then dispatches, hold breaks, idle waits and wakes after one, and B's collect epoch
 // bumps under APS5_RECORD_PIPE_EPOCH).
 enum PipeBPhase : std::size_t { BVerify, BNoteWriters, BRecipe, BRestart, BDraw, BAttach, BDispatch, BLabel, BSubmitDue, BCleanup, PipeBPhases };
-enum PipeBCount : std::size_t { BItems, BRecipeItems, BRestartItems, BFullItems, BBuiltItems, BStaleItems, BDispatchItems, BLabelItems, BHoldBreaks, BIdleWaits, BIdleSlept, BWakes, BEpochs, BImportMemoHits, BImportMemoMisses, PipeBCounts };
+enum PipeBCount : std::size_t { BItems, BRecipeItems, BRestartItems, BFullItems, BBuiltItems, BStaleItems, BDispatchItems, BLabelItems, BHoldBreaks, BIdleWaits, BIdleSlept, BWakes, BEpochs, BImportMemoHits, BImportMemoMisses, BPrefetchItems, BPrefetchLines, PipeBCounts };
 
 std::uint64_t pipeNs(std::chrono::steady_clock::duration duration) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count());
@@ -156,6 +181,7 @@ struct RecordPipeState {
     bool runRode = false;
     std::array<std::uint64_t, PipeCensusDrains> rodeDrains{};
     std::array<double, PipeCensusDrains> rodeDrainMs{};
+    PipeCensusCounts census;
 };
 
 // APS5_LABEL_CENSUS=1 (P-LABEL; default off): queue 0's label addresses and their readers
@@ -346,6 +372,92 @@ void notePipeTargets(const Graphics::State& graphics, std::uint64_t serial, Reco
     if (graphics.depthWrite || graphics.stencilTest) add(depth.htileAddress, texels / 16 + 4096);
 }
 
+// APS5_HANDOFF_FAST's prefetch (B, before recording the item before it): a published draw item's lines
+// in the order its recording first reads them, within the budget; the lines prefetched.
+std::size_t prefetchPipeItem(const RecordPipeSlot& slot) {
+    static const std::size_t budgetBytes = [] {
+        const char* text = std::getenv("APS5_HANDOFF_PREFETCH_KB");
+        return static_cast<std::size_t>(text != nullptr ? std::strtoull(text, nullptr, 10) : 16ull) * 1024;
+    }();
+    if (slot.kind != RecordPipeKind::Draw) return 0;
+    RecordPipePrefetchBudget budget{budgetBytes};
+    std::size_t lines = 0;
+    const auto touch = [&](const void* line) {
+        __builtin_prefetch(line, 0, 3);
+        ++lines;
+    };
+    const auto& draw = slot.draw;
+    const auto& scratch = slot.scratch;
+    budget.Lines(&draw, sizeof(draw), touch);
+    budget.Lines(scratch.stages.data(), scratch.stages.size() * sizeof(Graphics::CompiledShader), touch);
+    for (const auto& stage : scratch.stages) budget.Lines(stage.program, 2 * RecordPipePrefetchBudget::Line, touch);
+    if (draw.decode != nullptr) budget.Lines(draw.decode.get(), sizeof(DrawDecode), touch);
+    budget.Lines(scratch.snapshots.data(), scratch.snapshots.size() * sizeof(Graphics::GuestMemorySnapshot), touch);
+    for (const auto& snapshot : scratch.snapshots) budget.Lines(snapshot.bytes.data(), snapshot.bytes.size(), touch);
+    return lines;
+}
+
+// APS5_RECORD_CENSUS, B after a draw item's device call: the structures its mask holds, its template
+// against the draw before, its run and chunk census (published as deltas for A's digest line).
+void notePipeCensus(PipeCensusCounts& counts, PipeCensusB& b, bool runStart) {
+    auto& thread = Graphics::RecordCensus::Thread();
+    counts.draws.fetch_add(1, std::memory_order_relaxed);
+    for (std::size_t structure = 0; structure < Graphics::RecordCensus::StructureCount; ++structure) {
+        if ((thread.mask >> structure & 1u) != 0) counts.touched[structure].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (runStart && b.runDraws != 0) {
+        counts.runs.fetch_add(1, std::memory_order_relaxed);
+        counts.runDraws.fetch_add(b.runDraws, std::memory_order_relaxed);
+        counts.runLengths[RecordPipeRunBucket(b.runDraws)].fetch_add(1, std::memory_order_relaxed);
+        b.runDraws = 0;
+        b.lastTemplate = nullptr;
+    }
+    ++b.runDraws;
+    const auto* id = thread.templateId;
+    if (id != nullptr) {
+        counts.templated.fetch_add(1, std::memory_order_relaxed);
+        if (id == b.lastTemplate) counts.sameTemplate.fetch_add(1, std::memory_order_relaxed);
+    }
+    b.lastTemplate = id;
+    for (std::size_t size = 0; size < b.chunks.size(); ++size) {
+        auto& chunk = b.chunks[size];
+        const auto before = std::array<std::uint64_t, 3>{chunk.chunks, chunk.pairs, chunk.sharedPairs};
+        if (runStart) chunk.NewRun();
+        chunk.Note(id);
+        const auto after = std::array<std::uint64_t, 3>{chunk.chunks, chunk.pairs, chunk.sharedPairs};
+        for (std::size_t which = 0; which < 3; ++which) {
+            if (after[which] != before[which]) counts.chunks[size][which].fetch_add(after[which] - before[which], std::memory_order_relaxed);
+        }
+    }
+    thread.mask = 0;
+    thread.templateId = nullptr;
+}
+
+// APS5_HANDOFF_FAST's release (A, filling the slot again): what B left of the item recorded from it
+// before. A draw's hand-over keeps the scratch (A's prepare cleared and refilled it) and replaces the
+// draw; a dispatch or a label releases both.
+void releasePipeSlot(RecordPipeSlot& slot, bool draw) {
+    if (slot.dispatch.device != nullptr || slot.dispatch.compiled != nullptr || slot.dispatch.shaderMemory != nullptr) slot.dispatch = {};
+    if (draw) return;
+    auto& scratch = slot.scratch;
+    scratch.results.clear();
+    scratch.hits.results.clear();
+    scratch.matched.clear();
+    scratch.fresh.clear();
+    scratch.recipeStages.clear();
+    scratch.stageCaptures.clear();
+    scratch.shaderMemory.reset();
+    slot.draw.decode.reset();
+    slot.draw.entry.reset();
+    slot.draw.device.reset();
+    slot.draw.recipe.reset();
+}
+
+}
+
+unsigned RecordPipeHandoff() {
+    static const unsigned parts = RecordPipeActive() ? RecordPipeHandoffParts(std::getenv("APS5_HANDOFF_FAST")) : 0;
+    return parts;
 }
 
 bool RecordPipeActive() {
@@ -519,6 +631,8 @@ void Driver::handOverDraw(DrawScratch& scratch, RecordPipeDraw&& draw, const Que
     const auto serial = pipe.ring.handed.load(std::memory_order_relaxed) + 1;
     auto& slot = pipe.slots[RecordPipeRing::Slot(serial)];
     require(&slot.scratch == &scratch && pipe.ring.NextFree() == serial, "recording pipe: the draw's scratch is not the next free slot");
+    // APS5_HANDOFF_FAST: the item before in this slot lets go here (the draw's move releases its own).
+    if ((RecordPipeHandoff() & HandoffRelease) != 0) releasePipeSlot(slot, true);
     slot.kind = RecordPipeKind::Draw;
     slot.draw = std::move(draw);
     slot.mark.Save(queue);
@@ -538,6 +652,7 @@ void Driver::handOverDispatch(RecordPipeDispatch&& item) {
     // The packet's boundary waited for the slot (recordPipeBoundary).
     require(pipe.ring.NextFree() == serial, "recording pipe: the dispatch's slot is not free");
     auto& slot = pipe.slots[RecordPipeRing::Slot(serial)];
+    if ((RecordPipeHandoff() & HandoffRelease) != 0) releasePipeSlot(slot, false);
     slot.kind = RecordPipeKind::Dispatch;
     slot.dispatch = std::move(item);
     notePipeItemWrites(*slot.dispatch.compiled, serial, pipe.overlay);
@@ -559,6 +674,7 @@ bool Driver::handOverLabel(std::uint64_t address, std::span<const std::byte> byt
     // The packet's boundary waited for the slot (recordPipeBoundary).
     require(pipe.ring.NextFree() == serial, "recording pipe: the label's slot is not free");
     auto& slot = pipe.slots[RecordPipeRing::Slot(serial)];
+    if ((RecordPipeHandoff() & HandoffRelease) != 0) releasePipeSlot(slot, false);
     slot.kind = RecordPipeKind::Label;
     slot.labelOpcode = opcode;
     slot.label.address = address;
@@ -604,6 +720,8 @@ void Driver::publishRecordPipeItem(std::uint64_t serial) {
     if (profile) pipe.slots[RecordPipeRing::Slot(serial)].published = std::chrono::steady_clock::now();
     // APS5_RECORD_PIPE_EPOCH: the epoch A would have recorded the item in.
     if (RecordPipeEpochActive()) pipe.slots[RecordPipeRing::Slot(serial)].epoch = GuestMemory::ThreadCollectEpoch();
+    // APS5_RECORD_CENSUS: the first item since a drain opens a run.
+    if (Graphics::RecordCensus::Enabled()) pipe.slots[RecordPipeRing::Slot(serial)].runStart = pipe.run == 0;
     pipe.ring.Publish(serial);
     if (profile) {
         ++pipe.occupancy[RecordPipeOccupancyBucket(RecordPipeRing::Pending(serial, pipe.ring.consumed.load(std::memory_order_acquire)))];
@@ -821,7 +939,10 @@ void Driver::recordPipeSubmissionEnd() {
     const auto& occupancy = pipe.occupancy;
     char importMemo[96] = "";
     if (Graphics::DrawMemos()) std::snprintf(importMemo, sizeof(importMemo), "; import memo (APS5_DRAW_MEMOS): hits %llu, misses %llu", itemCounts[BImportMemoHits], itemCounts[BImportMemoMisses]);
-    std::fprintf(stderr, "[pipe] B (10 s): items %llu (draws %llu: recipe %llu, restart %llu, full %llu, built %llu, stale %llu; dispatches %llu; labels %llu), us per item: %s (busy minus the rows); hold breaks %llu (%.1f ms, relock wait %.1f ms); idle ms %.1f in %llu waits (%llu slept); wake latency us mean %.1f max %.1f (%llu); heap per item: %.2f allocations, %.2f frees; cpu ms %.1f (busy ms %.1f); ring at hand-over: 1 %llu, 2-4 %llu, 5-16 %llu, 17-31 %llu, full %llu; collect epochs %llu%s\n", itemCounts[BItems], itemCounts[BItems] > itemCounts[BDispatchItems] + itemCounts[BLabelItems] ? itemCounts[BItems] - itemCounts[BDispatchItems] - itemCounts[BLabelItems] : 0ull, itemCounts[BRecipeItems], itemCounts[BRestartItems], itemCounts[BFullItems], itemCounts[BBuiltItems], itemCounts[BStaleItems], itemCounts[BDispatchItems], itemCounts[BLabelItems], rows, itemCounts[BHoldBreaks], holdBreakMs, holdBreakLockMs, idleMs, itemCounts[BIdleWaits], itemCounts[BIdleSlept], itemCounts[BWakes] == 0 ? 0.0 : wakeMs * 1e3 / static_cast<double>(itemCounts[BWakes]), wakeMaxNs / 1e3, itemCounts[BWakes], allocations / bItems, frees / bItems, cpuMs, busyMs, static_cast<unsigned long long>(occupancy[0]), static_cast<unsigned long long>(occupancy[1]), static_cast<unsigned long long>(occupancy[2]), static_cast<unsigned long long>(occupancy[3]), static_cast<unsigned long long>(occupancy[4]), itemCounts[BEpochs], importMemo);
+    // APS5_HANDOFF_FAST: its parts, and the items B prefetched ahead with their lines.
+    char handoff[160] = "";
+    if (const auto parts = RecordPipeHandoff(); parts != 0) std::snprintf(handoff, sizeof(handoff), "; handoff (APS5_HANDOFF_FAST):%s%s, prefetched items %llu (%.1f lines each)", (parts & HandoffRelease) != 0 ? " release on A" : "", (parts & HandoffPrefetch) != 0 ? " prefetch" : "", itemCounts[BPrefetchItems], itemCounts[BPrefetchItems] == 0 ? 0.0 : static_cast<double>(itemCounts[BPrefetchLines]) / static_cast<double>(itemCounts[BPrefetchItems]));
+    std::fprintf(stderr, "[pipe] B (10 s): items %llu (draws %llu: recipe %llu, restart %llu, full %llu, built %llu, stale %llu; dispatches %llu; labels %llu), us per item: %s (busy minus the rows); hold breaks %llu (%.1f ms, relock wait %.1f ms); idle ms %.1f in %llu waits (%llu slept); wake latency us mean %.1f max %.1f (%llu); heap per item: %.2f allocations, %.2f frees; cpu ms %.1f (busy ms %.1f); ring at hand-over: 1 %llu, 2-4 %llu, 5-16 %llu, 17-31 %llu, full %llu; collect epochs %llu%s%s\n", itemCounts[BItems], itemCounts[BItems] > itemCounts[BDispatchItems] + itemCounts[BLabelItems] ? itemCounts[BItems] - itemCounts[BDispatchItems] - itemCounts[BLabelItems] : 0ull, itemCounts[BRecipeItems], itemCounts[BRestartItems], itemCounts[BFullItems], itemCounts[BBuiltItems], itemCounts[BStaleItems], itemCounts[BDispatchItems], itemCounts[BLabelItems], rows, itemCounts[BHoldBreaks], holdBreakMs, holdBreakLockMs, idleMs, itemCounts[BIdleWaits], itemCounts[BIdleSlept], itemCounts[BWakes] == 0 ? 0.0 : wakeMs * 1e3 / static_cast<double>(itemCounts[BWakes]), wakeMaxNs / 1e3, itemCounts[BWakes], allocations / bItems, frees / bItems, cpuMs, busyMs, static_cast<unsigned long long>(occupancy[0]), static_cast<unsigned long long>(occupancy[1]), static_cast<unsigned long long>(occupancy[2]), static_cast<unsigned long long>(occupancy[3]), static_cast<unsigned long long>(occupancy[4]), itemCounts[BEpochs], importMemo, handoff);
     // P-LABEL: the label drains that waited (ms/drains) by kind, by what A did next (handed: riding
     // the ring the label would have joined two runs) and by their readers (APS5_LABEL_CENSUS); the
     // labels handed over (APS5_LAZY_LABELS); the queue-0 worker's wait for a submission.
@@ -882,6 +1003,30 @@ void Driver::recordPipeSubmissionEnd() {
             census.labelWaitMs = census.otherWaitMs = {};
         }
         std::fprintf(stderr, "[label-census] (10 s): queue-0 label packets %llu (%zu addresses known); waits on them by queue (n/ms):%s; waits on other addresses by queue:%s\n", static_cast<unsigned long long>(labels), known, onLabels.empty() ? " none" : onLabels.c_str(), elsewhere.empty() ? " none" : elsewhere.c_str());
+    }
+    // Multi-recorder S0 (APS5_RECORD_CENSUS, APS5_RENDER_PASS_SPLIT): B's draws by template, the share
+    // of them that mutated each shared structure, its runs by length, the chunk census and the passes
+    // the split ended.
+    if (Graphics::RecordCensus::Enabled() || Graphics::Recorder::RenderPassSplit() != 0) {
+        auto& census = pipe.census;
+        const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+        const auto draws = take(census.draws), templated = take(census.templated), same = take(census.sameTemplate), runs = take(census.runs), runDraws = take(census.runDraws);
+        const auto share = [&](unsigned long long part) { return draws == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(draws); };
+        std::string structures, lengths, chunks;
+        for (std::size_t structure = 0; structure < Graphics::RecordCensus::StructureCount; ++structure) {
+            std::snprintf(item, sizeof(item), "%s %s %.1f%%", structure == 0 ? "" : ",", Graphics::RecordCensus::StructureNames[structure], share(take(census.touched[structure])));
+            structures += item;
+        }
+        for (std::size_t bucket = 0; bucket < RecordPipeRunBuckets; ++bucket) {
+            std::snprintf(item, sizeof(item), "%s%llu", bucket == 0 ? "" : " / ", take(census.runLengths[bucket]));
+            lengths += item;
+        }
+        for (std::size_t size = 0; size < CensusChunkSizes.size(); ++size) {
+            const auto made = take(census.chunks[size][0]), pairs = take(census.chunks[size][1]), shared = take(census.chunks[size][2]);
+            std::snprintf(item, sizeof(item), "%s K=%zu %llu/%llu/%llu (%.1f%%)", size == 0 ? "" : ",", CensusChunkSizes[size], made, pairs, shared, pairs == 0 ? 0.0 : 100.0 * static_cast<double>(shared) / static_cast<double>(pairs));
+            chunks += item;
+        }
+        std::fprintf(stderr, "[pipe] census (APS5_RECORD_CENSUS, 10 s): B draws %llu, with a template %llu, same template as the draw before %.1f%%; mutated by share of draws:%s; runs ended %llu (draws per run mean %.1f; 1 / 2-7 / 8-31 / 32-127 / 128-511 / 512+: %s); chunks/neighbour pairs/pairs sharing a template:%s; render pass split (APS5_RENDER_PASS_SPLIT=%u): passes ended %llu\n", draws, templated, share(same), structures.c_str(), runs, runs == 0 ? 0.0 : static_cast<double>(runDraws) / static_cast<double>(runs), lengths.c_str(), chunks.c_str(), Graphics::Recorder::RenderPassSplit(), static_cast<unsigned long long>(Graphics::Recorder::TakeForcedPassSplits()));
     }
     pipe.occupancy = {};
     pipe.items = pipe.runs = pipe.staleRedos = pipe.overlayDraws = pipe.overlayLoads = pipe.overlayDispatches = pipe.submitsLeft = pipe.dispatchItems = 0;
@@ -944,6 +1089,11 @@ void Driver::runRecordPipe() noexcept {
     auto& pipe = recordPipe();
     static const auto hold = pipeMicros("APS5_RECORD_PIPE_HOLD_US", 200);
     const bool profile = recordPipeProfile(), verify = recordPipeVerify(), bSubmit = recordPipeBSubmit(), epochs = RecordPipeEpochActive();
+    // APS5_RECORD_CENSUS: B's census state between items.
+    const bool census = Graphics::RecordCensus::Enabled();
+    PipeCensusB censusB;
+    // APS5_HANDOFF_FAST: B leaves an item's references to A, and prefetches the next item.
+    const bool releaseOnA = (RecordPipeHandoff() & HandoffRelease) != 0, prefetchNext = (RecordPipeHandoff() & HandoffPrefetch) != 0;
     // APS5_RECORD_PIPE_EPOCH: the hand-over epoch of the last item B recorded (0: none yet).
     std::uint64_t epochStamp = 0;
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
@@ -1114,6 +1264,14 @@ void Driver::runRecordPipe() noexcept {
                 std::fprintf(stderr, "[pipe] device replaced before recording (%llu)\n", static_cast<unsigned long long>(++replaced));
                 itemDevice = std::move(current);
             }
+            // APS5_HANDOFF_FAST: the next item's lines, if A published it, come over while this one records.
+            if (prefetchNext && !dispatchItem && pipe.ring.handed.load(std::memory_order_acquire) > serial) {
+                const auto lines = prefetchPipeItem(pipe.slots[RecordPipeRing::Slot(serial + 1)]);
+                if (profile && lines != 0) {
+                    count(BPrefetchItems);
+                    pipe.bCounts[BPrefetchLines].fetch_add(lines, std::memory_order_relaxed);
+                }
+            }
             bool stale = false;
             if (dispatchItem) {
                 lap.Mark();
@@ -1121,7 +1279,9 @@ void Driver::runRecordPipe() noexcept {
                 lap.Lap(pipe.bPhaseNs, BDispatch);
                 count(BDispatchItems);
             } else {
+                if (census) Graphics::RecordCensus::Thread() = {};
                 stale = recordPipeItem(slot.scratch, slot.draw);
+                if (census) notePipeCensus(pipe.census, censusB, slot.runStart);
             }
             GuestMemory::recordedWrites = nullptr;
             submitDue();
@@ -1139,21 +1299,24 @@ void Driver::runRecordPipe() noexcept {
                 verifyPipeEstimate(pipe, serial, opcode, key, slot.estimate);
                 lap.Lap(pipe.bPhaseNs, BVerify);
             }
-            // The device call published the item's pending writes: release what it held, then the slot.
+            // The device call published the item's pending writes: release what it held, then the slot
+            // (APS5_HANDOFF_FAST: A releases it when it fills the slot again, releasePipeSlot).
             lap.Mark();
-            if (dispatchItem) slot.dispatch = {};
-            auto& scratch = slot.scratch;
-            scratch.results.clear();
-            scratch.hits.results.clear();
-            scratch.matched.clear();
-            scratch.fresh.clear();
-            scratch.recipeStages.clear();
-            scratch.stageCaptures.clear();
-            scratch.shaderMemory.reset();
-            slot.draw.decode.reset();
-            slot.draw.entry.reset();
-            slot.draw.device.reset();
-            slot.draw.recipe.reset();
+            if (!releaseOnA) {
+                if (dispatchItem) slot.dispatch = {};
+                auto& scratch = slot.scratch;
+                scratch.results.clear();
+                scratch.hits.results.clear();
+                scratch.matched.clear();
+                scratch.fresh.clear();
+                scratch.recipeStages.clear();
+                scratch.stageCaptures.clear();
+                scratch.shaderMemory.reset();
+                slot.draw.decode.reset();
+                slot.draw.entry.reset();
+                slot.draw.device.reset();
+                slot.draw.recipe.reset();
+            }
             // B counts the item once it is in the open batch (A skips handed draws at the packet's
             // end): a submit between A's count and B's recording cleared it, and the EOP's and the
             // submission end's submit-if-open then left the recorded draw in an unsubmitted batch.
@@ -1177,6 +1340,10 @@ void Driver::stopRecordPipe() {
     pipe.stopping.store(true, std::memory_order_release);
     PollWake(pipe.bWake.load(std::memory_order_acquire));
     pipe.thread.join();
+    // APS5_HANDOFF_FAST: the references B left in the slots (the device's among them) go before the device.
+    if ((RecordPipeHandoff() & HandoffRelease) != 0) {
+        for (auto& slot : pipe.slots) releasePipeSlot(slot, false);
+    }
 }
 
 }

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -215,6 +216,21 @@ void Driver::reportDispatchCache(EntryCounters& counters) {
             top += "; sample" + p.sample + ")";
         }
         std::fprintf(stderr, "[dispatch-keys] top programs by no entry%s\n", top.c_str());
+        // Debug aid APS5_DISPATCH_PROGRAMS=1 (s62 WATER): every program's lookups per queue, to tell which
+        // dispatches a game switch (r_waterEnableSim=false) removes by an A/B of two runs.
+        static const bool listPrograms = std::getenv("APS5_DISPATCH_PROGRAMS") != nullptr;
+        if (listPrograms) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> all;
+            for (const auto& [id, p] : counters.programKeys) all.emplace_back(id, p.lookups);
+            std::sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return (a.first >> 48u) != (b.first >> 48u) ? (a.first >> 48u) < (b.first >> 48u) : a.second > b.second; });
+            std::string list;
+            for (const auto& [id, lookups] : all) {
+                char item[64];
+                std::snprintf(item, sizeof(item), " q0x%llx:0x%llx x%llu", static_cast<unsigned long long>(id >> 48u), static_cast<unsigned long long>(id & 0xffffffffffffull), count(lookups));
+                list += item;
+            }
+            std::fprintf(stderr, "[dispatch-keys] programs (10 s, %zu):%s\n", all.size(), list.c_str());
+        }
     }
     counters = EntryCounters{};
 }

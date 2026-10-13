@@ -66,7 +66,7 @@ namespace ShaderRecompiler::ShaderDiskCache {
 static_assert(sizeof(RecompileResult) == 176, "RecompileResult changed: update EncodeResult and DecodeResult");
 // deferredWords is not encoded: like guestDescriptor's words, materializeResult re-populates it from
 // each capture's snapshot (DescriptorBindingBuilder::Populate).
-static_assert(sizeof(DescriptorBinding) == 288, "DescriptorBinding changed: update the binding encoder");
+static_assert(sizeof(DescriptorBinding) == 312, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 28, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(FragmentParameter) == 12, "FragmentParameter changed: update the parameter encoder");
 static_assert(sizeof(CompiledShaderInfo) == 304, "CompiledShaderInfo changed: update the info encoder");
@@ -250,6 +250,7 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Flags(binding.samplerDepthCompare);
     writer.Flags(binding.imageWritten);
     writer.Flags(binding.imageDepthCompare);
+    writer.Values(std::span<const std::uint32_t>(binding.imageMipOffset));
     writer.Flags(binding.bufferAtomic);
     writer.Flags(binding.bufferWritten);
 }
@@ -268,6 +269,7 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     reader.Flags(binding.samplerDepthCompare);
     reader.Flags(binding.imageWritten);
     reader.Flags(binding.imageDepthCompare);
+    reader.Values(binding.imageMipOffset);
     reader.Flags(binding.bufferAtomic);
     reader.Flags(binding.bufferWritten);
 }

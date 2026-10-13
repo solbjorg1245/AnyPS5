@@ -2848,6 +2848,24 @@ bool TraceDispatchIo() {
     return traceIo;
 }
 
+// Debug aid: APS5_TRACE_DISPATCH_IO_PROGRAMS=<hex>[,<hex>...] (s62 WATER) prints those programs' [dispatch-io] lines
+// only, with the program named, so one system's dispatches (the water sim's) can be followed in a normal run.
+bool TraceDispatchIoFor(std::uint64_t programAddress) {
+    static const std::vector<std::uint64_t> programs = [] {
+        std::vector<std::uint64_t> parsed;
+        const char* text = std::getenv("APS5_TRACE_DISPATCH_IO_PROGRAMS");
+        while (text != nullptr && *text != '\0') {
+            char* end = nullptr;
+            parsed.push_back(std::strtoull(text, &end, 16));
+            if (end == text) break;
+            text = *end == ',' ? end + 1 : end;
+        }
+        return parsed;
+    }();
+    if (programs.empty()) return TraceDispatchIo();
+    return std::find(programs.begin(), programs.end(), programAddress) != programs.end();
+}
+
 void WatchMemory(std::uint64_t programAddress) {
     struct Range {
         std::uint64_t address = 0;
@@ -4178,7 +4196,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         // finishes the recorder up to that batch's serial. Prints the [address-sync] leases line.
         Graphics::CountLeaseOutcome(false, recorder.Submissions() + 1);
     }
-    if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s%s\n", groupsText, resources->Describe().c_str(), record.forked ? resources->DescribeForkedWords(*record.shader).c_str() : "");
+    if (TraceDispatchIoFor(programAddress)) std::fprintf(stderr, "[dispatch-io] %s:%s%s (program 0x%llx)\n", groupsText, resources->Describe().c_str(), record.forked ? resources->DescribeForkedWords(*record.shader).c_str() : "", static_cast<unsigned long long>(programAddress));
     WatchMemory(programAddress);
     // The recipe for the caller's dispatch-cache variant (design_cpu_final M4, rule R3): only an
     // object the resource cache serves under this content key (reusable: no lease, no copied
@@ -4316,7 +4334,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
         state->recorder->Sync();
         timer.phase(PhaseSync);
     }
-    if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s%s\n", groupsText, hit->resources->Describe().c_str(), record.forked ? hit->resources->DescribeForkedWords(*record.shader).c_str() : "");
+    if (TraceDispatchIoFor(programAddress)) std::fprintf(stderr, "[dispatch-io] %s:%s%s (program 0x%llx, recipe)\n", groupsText, hit->resources->Describe().c_str(), record.forked ? hit->resources->DescribeForkedWords(*record.shader).c_str() : "", static_cast<unsigned long long>(programAddress));
     WatchMemory(programAddress);
     timer.finish(lookupsBefore, groupsText, indirect);
     if (profile) reportRecipes();

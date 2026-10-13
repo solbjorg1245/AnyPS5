@@ -187,6 +187,11 @@ their whole index ranges, which a PC GPU draws faster than it runs the cull pass
 picture). `APS5_ENGINE_SWITCHES=doIndexBufferCulling=true` turns it back on; `APS5_ENGINE_SWITCHES=0` keeps all of
 the game's own render settings.
 
+Water (the moat and pools, the tutorial's flooded tunnel): the game's water simulation stores its surface
+through two identical image descriptors, and the driver used to take the second for the next mip level,
+which left the water's height, motion and reflections wrong. Each storage image now writes the level the
+shader names. `APS5_STORAGE_MIP_EXACT=0` restores the old guess (for comparison only).
+
 ## Controls
 
 Controllers work through SDL: Xbox layout A/B/X/Y = Cross/Circle/Square/Triangle, LB/RB = L1/R1,

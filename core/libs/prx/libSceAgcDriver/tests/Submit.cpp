@@ -24,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <initializer_list>
@@ -338,6 +339,34 @@ void testLabelHeldAtSubmission() {
     gate = 1;
     check(waitFor(&reset, 1, "consumer never passed its wait") >= std::chrono::milliseconds(900), "a label its own queue stored first counted as held at the submission");
     AgcDriverWaitIdle_nid_postfix();
+}
+
+void setWaitPatient(const char* value) {
+#ifdef _WIN32
+    _putenv_s("APS5_WAIT_PATIENT", value);
+#else
+    setenv("APS5_WAIT_PATIENT", value, 1);
+#endif
+}
+
+// APS5_WAIT_PATIENT (s62 WATER): a compute queue's wait that reaches the 1000 ms timeout waits on for the label
+// the graphics queue writes later, as across a scene load, instead of running on without it; past the patience
+// limit it gives up and runs on as before. Read at each timeout, so setting it here leaves the tests above alone.
+void testPatientWait() {
+    alignas(64) static volatile std::uint32_t label = 0, done = 0, never = 0, late = 0;
+    setWaitPatient("5000");
+    submit(0x20, commands(waitEqual(&label, 1), writeData(&done, 1)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1600));
+    check(done == 0, "patient wait: the wait ran on at the timeout");
+    submit(0, commands(writeData(&label, 1)));
+    check(waitFor(&done, 1, "patient wait: the label written after the timeout never satisfied the wait") < std::chrono::milliseconds(500), "patient wait: the wait passed late after its label landed");
+    AgcDriverWaitIdle_nid_postfix();
+    setWaitPatient("500");
+    submit(0x20, commands(waitEqual(&never, 1), writeData(&late, 1)));
+    const auto waited = waitFor(&late, 1, "patient wait: the wait never gave up");
+    check(waited >= std::chrono::milliseconds(1400) && waited < std::chrono::milliseconds(5000), "patient wait: the wait gave up outside the timeout plus the patience limit");
+    AgcDriverWaitIdle_nid_postfix();
+    setWaitPatient("0");
 }
 
 // A dispatch the driver cannot run (here: no compute program registers) is reported and skipped,
@@ -736,6 +765,42 @@ void testRecordPipe() {
     imageOk = imageOk && ranges.empty();
     RecordPipeImageRanges({}, ranges);
     check(imageOk && ranges == Ranges{{0, ~0ull}}, "record pipe: a storage image's estimate is its surface + 64 KiB, a null T# none, an unknown one everything");
+
+    // APS5_HANDOFF_FAST: the parts (unset or "1" both, else a mask), and the prefetch budget's lines.
+    check(RecordPipeHandoffParts(nullptr) == (HandoffRelease | HandoffPrefetch) && RecordPipeHandoffParts("") == (HandoffRelease | HandoffPrefetch) && RecordPipeHandoffParts("0") == 0 && RecordPipeHandoffParts("1") == (HandoffRelease | HandoffPrefetch) && RecordPipeHandoffParts("2") == HandoffRelease && RecordPipeHandoffParts("4") == HandoffPrefetch && RecordPipeHandoffParts("6") == (HandoffRelease | HandoffPrefetch) && RecordPipeHandoffParts("3") == HandoffRelease && RecordPipeHandoffParts("x") == 0 && RecordPipeHandoffParts("99999999999") == 0, "record pipe handoff: unset and 1 take both parts, other numbers are a mask, 0 and junk are off");
+    alignas(64) static std::array<std::byte, 512> lines{};
+    std::vector<const void*> touched;
+    const auto touch = [&](const void* line) { touched.push_back(line); };
+    RecordPipePrefetchBudget budget{4 * RecordPipePrefetchBudget::Line};
+    budget.Lines(lines.data() + 10, 100, touch);
+    bool budgetOk = touched == std::vector<const void*>{lines.data(), lines.data() + 64} && budget.left == 2 * RecordPipePrefetchBudget::Line;
+    budget.Lines(nullptr, 64, touch);
+    budget.Lines(lines.data(), 0, touch);
+    budget.Lines(lines.data() + 128, 512 - 128, touch);
+    budgetOk = budgetOk && touched.size() == 4 && touched[2] == lines.data() + 128 && touched[3] == lines.data() + 192 && budget.left == 0;
+    budget.Lines(lines.data(), 64, touch);
+    check(budgetOk && touched.size() == 4, "record pipe handoff: the prefetch takes whole lines from the first byte's to the last byte's, within its budget");
+
+    // APS5_RECORD_CENSUS: chunks of K=2. Run 1 (a a b c a): [a a] [b c] [a], two pairs, none shared.
+    // Run 2 (a a b a): [a a] [b a], one pair sharing a, none across the runs. Run 3 (nulls): no share.
+    int a = 0, b = 0, c = 0;
+    RecordPipeChunkCensus chunks;
+    chunks.k = 2;
+    for (const void* id : {static_cast<const void*>(&a), static_cast<const void*>(&a), static_cast<const void*>(&b), static_cast<const void*>(&c), static_cast<const void*>(&a)}) chunks.Note(id);
+    chunks.NewRun();
+    bool chunkOk = chunks.chunks == 3 && chunks.pairs == 2 && chunks.sharedPairs == 0;
+    chunks.Note(&a);
+    chunks.Note(&a);
+    chunks.Note(&b);
+    chunks.Note(&a);
+    chunks.NewRun();
+    chunkOk = chunkOk && chunks.chunks == 5 && chunks.pairs == 3 && chunks.sharedPairs == 1;
+    chunks.Note(nullptr);
+    chunks.Note(nullptr);
+    chunks.Note(nullptr);
+    chunks.Close();
+    chunkOk = chunkOk && chunks.chunks == 7 && chunks.pairs == 4 && chunks.sharedPairs == 1;
+    check(chunkOk && RecordPipeRunBucket(0) == 0 && RecordPipeRunBucket(1) == 0 && RecordPipeRunBucket(2) == 1 && RecordPipeRunBucket(7) == 1 && RecordPipeRunBucket(8) == 2 && RecordPipeRunBucket(127) == 3 && RecordPipeRunBucket(128) == 4 && RecordPipeRunBucket(512) == 5, "record census: chunks of K per run, neighbour pairs within a run, shared templates, run buckets");
 }
 
 // The fast dispatch (F5): the compare its verify mode makes between the old path's capture and the
@@ -1299,6 +1364,7 @@ int main() {
         testEndOfPipeLabelsWithoutWork();
         testLabelHeldAtSubmission();
         testWideLabelStoredSinceSubmission();
+        testPatientWait();
         testSkippedDispatch();
         testNewDrawKeyTally();
         testFastCensus();
