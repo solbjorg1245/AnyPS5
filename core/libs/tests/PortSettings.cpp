@@ -1,6 +1,10 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/AddonContent.hpp"
 #include "prx/libc/include/PortSettings.hpp"
+#include "prx/libSceVideoOut/include/TitleJobBudget.hpp"
+#include "prx/libSceVideoOut/include/TitleRefreshField.hpp"
+#include "prx/libSceVideoOut/include/TitleRefreshTable.hpp"
+#include "prx/libSceVideoOut/include/TitleStepWindow.hpp"
 #include "SceTypes.hpp"
 #include "prx/libkernel/File/include/FileFlags.hpp"
 
@@ -8,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -155,6 +160,171 @@ static void TestPacer() {
         step = 1.0 / timed.Flip(now);
     }
     Require(Near(gameSeconds / (static_cast<double>(now - 5000 * ms) / 1e9), 1.0, 0.01), "variable steps keep the game speed");
+}
+
+// APS5_FRAME_PROBE's window (libSceVideoOut TimestepPatch): the title's own float step, read once per flip.
+static void TestTitleStep() {
+    const TitleStepWindow empty{};
+    Require(empty.Steps() == 0 && empty.Unreadable() == 0 && empty.Speed(10.0) == 0.0 && empty.MinHz() == 0.0 && empty.MaxHz() == 0.0, "empty window");
+    // Ten seconds of flips at flipHz, each reading a step of 1/stepHz.
+    const auto speed = [](double stepHz, double flipHz) {
+        TitleStepWindow window;
+        const long flips = std::lround(flipHz * 10.0);
+        for (long flip = 0; flip < flips; ++flip) window.Add(static_cast<float>(1.0 / stepHz));
+        return window.Speed(static_cast<double>(flips) / flipHz);
+    };
+    Require(Near(speed(PortSettings::GameRefresh60, PortSettings::GameRefresh60), 1.0, 0.001), "60 FPS mode at the 59.94 Hz vblank: real time");
+    Require(Near(speed(120.0, 120.0), 1.0, 0.001), "1/120 s steps at 120 flips/s: real time");
+    Require(Near(speed(PortSettings::GameRefresh60, 120.0), 120.0 / PortSettings::GameRefresh60, 0.001), "1/59.94 s steps at 120 flips/s (APS5_VBLANK_HZ alone): 2x");
+    TitleStepWindow mixed;
+    for (const double value : {0.0, -1.0 / 60.0, 0.0005, 1.5, std::nan(""), HUGE_VAL}) mixed.Add(value);
+    Require(mixed.Steps() == 0 && mixed.Unreadable() == 6 && mixed.Speed(1.0) == 0.0 && mixed.MaxHz() == 0.0, "implausible values ignored");
+    for (const double hz : {120.0, 29.97, PortSettings::GameRefresh60}) mixed.Add(1.0 / hz);
+    Require(mixed.Steps() == 3 && Near(mixed.MinHz(), 29.97, 1e-9) && Near(mixed.MaxHz(), 120.0, 1e-9), "step range");
+    Require(Near(mixed.Speed(2.0), (1.0 / 120.0 + 1.0 / 29.97 + 1.0 / PortSettings::GameRefresh60) / 2.0, 1e-12), "speed sums the plausible steps only");
+}
+
+// APS5_TIMESTEP_FIELD's decision (libSceVideoOut TimestepPatch): the title's refresh field once per flip, with
+// the table's 60 FPS entry at 41 Hz and its 30 FPS entry at 25 Hz.
+static void TestRefreshField() {
+    using Action = TitleRefreshField::Action;
+    const auto decide = [](std::int32_t mode, float current, std::optional<float> known) { return TitleRefreshField::Decide(mode, current, known, 41.0f, 25.0f); };
+    const auto first = decide(1, 59.94f, std::nullopt);
+    Require(first.action == Action::Write && first.value == 41.0f && !first.titleRewrote, "60 FPS mode, first sight of 59.94: the 60 FPS entry");
+    Require(decide(2, 29.97f, std::nullopt).action == Action::Write && decide(2, 29.97f, std::nullopt).value == 25.0f, "30 FPS mode: the 30 FPS entry");
+    Require(decide(0, 59.94f, std::nullopt).action == Action::Write && decide(0, 59.94f, std::nullopt).value == 41.0f, "Unlocked (the 59.94 constant): the 60 FPS entry");
+    Require(decide(3, 19.98f, std::nullopt).action == Action::OtherMode && decide(3, 19.98f, 41.0f).action == Action::OtherMode, "20 FPS mode: left alone");
+    Require(decide(7, 41.0f, 41.0f).action == Action::OtherMode, "another enum once known: left alone");
+    for (const float value : {1234.5f, std::nanf(""), 0.0f, 41.0f, 59.96f}) Require(decide(1, value, std::nullopt).action == Action::Refuse, "not a title refresh before the first write: refused");
+    Require(decide(4, 59.94f, std::nullopt).action == Action::Refuse && decide(-1, 19.98f, std::nullopt).action == Action::Refuse, "enum outside 0-3 before the first write: refused");
+    Require(decide(1, 29.975f, std::nullopt).action == Action::Write, "a title refresh within 0.01");
+    const auto rewrite = decide(2, 29.97f, 41.0f);
+    Require(rewrite.action == Action::Write && rewrite.value == 25.0f && rewrite.titleRewrote, "the title's rewrite at a mode change: written and counted");
+    const auto copied = decide(1, 37.5f, 41.0f);
+    Require(copied.action == Action::Write && copied.value == 41.0f && copied.titleRewrote, "the title's copy of an older entry: written and counted");
+    const auto same = decide(1, 41.0f, 41.0f);
+    Require(same.action == Action::AlreadySet && !same.titleRewrote, "equal value: no store");
+    Require(TitleRefreshField::Decide(1, 59.94f, std::nullopt, 59.94f, 29.97f).action == Action::AlreadySet, "first sight already holding the entry: no store");
+    Require(decide(1, std::nanf(""), 41.0f).action == Action::Write, "any value once known: written");
+}
+
+static void TestJobBudget() {
+    using Action = TitleJobBudget::Action;
+    const auto decide = [](double limit, float unlocked, float mode60) { return TitleJobBudget::Decide(limit, unlocked, mode60); };
+    Require(TitleJobBudget::Bits(60.0f) == TitleJobBudget::UnlockedBits && TitleJobBudget::Bits(59.94f) == TitleJobBudget::Mode60Bits && TitleJobBudget::Bits(119.88f) == TitleJobBudget::PatchedMode60Bits,
+        "the image's bits: 60.0, 59.94 and patch_game.py's 119.88");
+    const auto at120 = decide(120.0, 60.0f, 59.94f);
+    Require(at120.action == Action::Write && at120.value == 120.0f, "120 over the title's 60 / 59.94: 120 into both");
+    Require(decide(144.0, 60.0f, 59.94f).action == Action::Write && decide(144.0, 60.0f, 59.94f).value == 144.0f, "144: 144");
+    for (const double limit : {PortSettings::GameRefresh60, 60.0, 60.005, 30.0, 0.0, std::nan("")}) Require(decide(limit, 60.0f, 59.94f).action == Action::NotAbove, "at or below the title's 60: left alone");
+    Require(decide(60.5, 60.0f, 59.94f).action == Action::Write, "just above 60: written");
+    Require(decide(120.0, 60.0f, 119.88f).action == Action::Write && decide(120.0, 60.0f, 119.88f).value == 120.0f, "patch_game.py --fps120's 119.88: replaced by the limit");
+    const auto already = decide(120.0, 120.0f, 120.0f);
+    Require(already.action == Action::AlreadySet && already.value == 120.0f, "both holding the limit: already set");
+    for (const auto& pair : {std::pair{59.94f, 59.94f}, std::pair{60.0f, 60.0f}, std::pair{60.0f, 59.95f}, std::pair{0.0f, 0.0f}, std::pair{120.0f, 59.94f}, std::pair{60.0f, 120.0f}, std::pair{std::nanf(""), 59.94f}})
+        Require(decide(120.0, pair.first, pair.second).action == Action::Refuse, "anything else: refused");
+}
+
+// APS5_TABLE_COMPAT (libSceVideoOut TimestepPatch): the refresh table's two forms, the refresh field's guard on a
+// patch_game.py --fps120 table and the game speed the fixed step gives such a table.
+static void TestTableCompat() {
+    using Form = TitleRefreshTable::Form;
+    const float original[4] = {59.94f, 59.94f, 29.97f, 19.98f};
+    const float patched[4] = {59.94f, 119.88f, 29.97f, 19.98f};
+    Require(std::memcmp(original, TitleRefreshTable::Original.data(), sizeof(original)) == 0 && std::memcmp(patched, TitleRefreshTable::Fps120.data(), sizeof(patched)) == 0,
+        "the signatures are the floats' bits");
+    Require(TitleJobBudget::Bits(TitleRefreshTable::PatchedRefresh) == TitleJobBudget::PatchedMode60Bits, "patch_game.py's 119.88: 0x42efc28f");
+    Require(TitleRefreshTable::Classify(TitleRefreshTable::Original.data()) == Form::Original, "the image's table: original");
+    Require(TitleRefreshTable::Classify(TitleRefreshTable::Fps120.data()) == Form::Fps120, "patch_game.py --fps120's table: fps120");
+    for (std::size_t bit = 0; bit < 128; ++bit) {
+        auto bytes = TitleRefreshTable::Fps120;
+        bytes[bit / 8] ^= static_cast<unsigned char>(1u << (bit % 8));
+        // Bit 55 is entry 1's lowest exponent bit: 119.88 back to 59.94.
+        Require(TitleRefreshTable::Classify(bytes.data()) == (bit == 55 ? Form::Original : Form::None), "one bit off the fps120 form: none");
+    }
+    using Action = TitleRefreshField::Action;
+    Require(TitleRefreshField::Decide(1, 119.88f, std::nullopt, 41.0f, 25.0f).action == Action::Refuse, "119.88 on an original table: refused");
+    const auto patchedField = TitleRefreshField::Decide(1, 119.88f, std::nullopt, 41.0f, 25.0f, true);
+    Require(patchedField.action == Action::Write && patchedField.value == 41.0f, "119.88 on a patched table: a title refresh, the 60 FPS entry");
+    Require(TitleRefreshField::Decide(1, 119.885f, std::nullopt, 41.0f, 25.0f, true).action == Action::Write, "within 0.01 of 119.88");
+    Require(TitleRefreshField::Decide(1, 119.9f, std::nullopt, 41.0f, 25.0f, true).action == Action::Refuse, "0.02 off 119.88: refused");
+    Require(TitleRefreshField::Decide(2, 29.97f, std::nullopt, 41.0f, 25.0f, true).action == Action::Write, "the other refreshes still on a patched table");
+    char text[16];
+    const double slow = TitleRefreshTable::Speed(TitleRefreshTable::PatchedRefresh, PortSettings::GameRefresh60);
+    std::snprintf(text, sizeof(text), "%.2f", slow);
+    Require(std::string(text) == "0.50" && !TitleRefreshTable::RightSpeed(slow), "the 59.94 Hz vblank: 0.50x");
+    const double right = TitleRefreshTable::Speed(TitleRefreshTable::PatchedRefresh, 120000.0 / 1001.0);
+    std::snprintf(text, sizeof(text), "%.2f", right);
+    Require(std::string(text) == "1.00" && TitleRefreshTable::RightSpeed(right), "the 119.88 Hz vblank: 1.00x");
+    Require(TitleRefreshTable::Speed(0.0, 59.94) == 0.0, "no title refresh: 0");
+}
+
+static void TestPresentMode() {
+    using PortSettings::PresentMode;
+    Require(FromText("").presentMode == PresentMode::Auto, "PresentMode: auto by default");
+    Require(FromText("PresentMode = fifo").presentMode == PresentMode::Fifo && FromText("PresentMode = Mailbox").presentMode == PresentMode::Mailbox, "PresentMode: fifo, mailbox (any case)");
+    Require(FromText("presentmode = IMMEDIATE").presentMode == PresentMode::Immediate && FromText("PresentMode = fifo\nPresentMode = AUTO").presentMode == PresentMode::Auto, "PresentMode: immediate, auto");
+    const auto bad = FromText("PresentMode = fifo\nPresentMode = vsync");
+    Require(bad.presentMode == PresentMode::Fifo && bad.warnings.size() == 1 && bad.warnings[0].find("refused") != std::string::npos, "PresentMode: a refused value warns and keeps the previous one");
+    const auto badOnly = FromText("PresentMode = vsync");
+    Require(badOnly.presentMode == PresentMode::Auto && badOnly.warnings.size() == 1, "PresentMode: a refused value keeps auto");
+    Require(!FromText("PresentMode = mailbox").Any(), "PresentMode alone is not Any()");
+    Require(PortSettings::Describe(FromText("Resolution = 1920x1080\nFpsLimit = 120\nTimestep = variable\nPresentMode = mailbox")) == PortSettings::Describe(FromText("Resolution = 1920x1080\nFpsLimit = 120\nTimestep = variable")), "PresentMode leaves Describe byte-identical");
+
+    auto settings = PortSettings::Parse("PresentMode = fifo\n", "test.ini");
+    const std::map<std::string, std::string> environment{{"APS5_PRESENT_MODE", "mailbox"}};
+    PortSettings::ApplyEnvironment(settings, [&](const char* name) -> const char* {
+        const auto found = environment.find(name);
+        return found == environment.end() ? nullptr : found->second.c_str();
+    });
+    Require(settings.presentMode == PresentMode::Mailbox && settings.warnings.empty(), "APS5_PRESENT_MODE overrides the file");
+    auto refused = PortSettings::Parse("PresentMode = fifo\n", "test.ini");
+    PortSettings::ApplyEnvironment(refused, [](const char* name) -> const char* { return std::string(name) == "APS5_PRESENT_MODE" ? "tearing" : nullptr; });
+    Require(refused.presentMode == PresentMode::Fifo && refused.warnings.size() == 1 && refused.warnings[0].find("APS5_PRESENT_MODE") != std::string::npos, "an invalid APS5_PRESENT_MODE warns and keeps the file's");
+
+    const auto choose = [](PresentMode wanted, double vblank, double display, bool mailbox, bool immediate, PresentMode expected) {
+        const auto choice = PortSettings::ChoosePresentMode(wanted, vblank, display, mailbox, immediate);
+        return choice.mode == expected && !choice.reason.empty();
+    };
+    Require(choose(PresentMode::Auto, 120.0, 60.0, true, true, PresentMode::Mailbox), "auto: vblank 120 on a 60 Hz display, mailbox offered");
+    Require(PortSettings::ChoosePresentMode(PresentMode::Auto, 120.0, 60.0, true, false).reason == "auto: vblank 120.00 Hz above the display's 60 Hz", "auto: the reason");
+    Require(choose(PresentMode::Auto, 120.0, 60.0, false, true, PresentMode::Fifo), "auto: mailbox not offered, fifo");
+    Require(PortSettings::ChoosePresentMode(PresentMode::Auto, 120.0, 60.0, false, true).reason.find("mailbox is not offered") != std::string::npos, "auto: why not mailbox");
+    Require(choose(PresentMode::Auto, 0.0, 60.0, true, true, PresentMode::Fifo), "auto: the default 59.94 on a 60 Hz display, fifo");
+    Require(PortSettings::ChoosePresentMode(PresentMode::Auto, 0.0, 60.0, true, true).reason == "auto: vblank 59.94 Hz within the display's 60 Hz", "auto: the default vblank's reason");
+    Require(choose(PresentMode::Auto, 60.0, 59.0, true, true, PresentMode::Fifo), "auto: within 1 Hz, fifo");
+    Require(choose(PresentMode::Auto, 120.0, 0.0, true, true, PresentMode::Fifo), "auto: display refresh unknown, fifo");
+    Require(choose(PresentMode::Auto, 120.0, 144.0, true, true, PresentMode::Fifo), "auto: vblank 120 on a 144 Hz display, fifo");
+    for (const double vblank : {0.0, 20.0, 30.0, 60.0, 120.0, 240.0}) {
+        for (const double display : {0.0, 30.0, 60.0, 144.0}) {
+            for (const bool mailbox : {false, true}) Require(PortSettings::ChoosePresentMode(PresentMode::Auto, vblank, display, mailbox, true).mode != PresentMode::Immediate, "auto never tears");
+        }
+    }
+    Require(choose(PresentMode::Immediate, 0.0, 60.0, true, true, PresentMode::Immediate), "immediate offered: immediate");
+    Require(choose(PresentMode::Immediate, 0.0, 60.0, true, false, PresentMode::Fifo), "immediate not offered: fifo");
+    Require(choose(PresentMode::Mailbox, 0.0, 60.0, true, false, PresentMode::Mailbox) && choose(PresentMode::Mailbox, 120.0, 60.0, false, true, PresentMode::Fifo), "mailbox: as asked when offered, else fifo");
+    Require(PortSettings::ChoosePresentMode(PresentMode::Mailbox, 0.0, 60.0, false, true).reason == "PresentMode mailbox is not offered by the surface; using fifo", "mailbox not offered: the reason");
+    Require(choose(PresentMode::Fifo, 120.0, 60.0, true, true, PresentMode::Fifo), "fifo: fifo even above the display refresh");
+}
+
+// The launcher's "Display (N Hz)" preset and its PresentMode line (frame rate S3, APS5_PRESENT_AUTO=1).
+static void TestDisplayFpsLimit() {
+    Require(PortSettings::DisplayFpsLimit(0) == 0.0 && PortSettings::DisplayFpsLimit(-1) == 0.0, "display limit: unknown refresh");
+    Require(PortSettings::DisplayFpsLimit(59) == 60.0 && PortSettings::DisplayFpsLimit(60) == 60.0 && PortSettings::DisplayFpsLimit(61) == 60.0, "display limit: 59-61 is 60");
+    Require(PortSettings::DisplayFpsLimit(29) == 30.0 && PortSettings::DisplayFpsLimit(30) == 30.0 && PortSettings::DisplayFpsLimit(31) == 30.0, "display limit: 29-31 is 30");
+    Require(PortSettings::DisplayFpsLimit(119) == 120.0 && PortSettings::DisplayFpsLimit(120) == 120.0 && PortSettings::DisplayFpsLimit(121) == 120.0, "display limit: 119-121 is 120");
+    Require(PortSettings::DisplayFpsLimit(144) == 144.0 && PortSettings::DisplayFpsLimit(165) == 165.0 && PortSettings::DisplayFpsLimit(75) == 75.0, "display limit: other refreshes as they are");
+    Require(PortSettings::DisplayFpsLimit(10) == 0.0 && PortSettings::DisplayFpsLimit(360) == 0.0, "display limit: outside 20-240");
+
+    PortSettings::Settings chosen;
+    chosen.fpsLimit = 120.0;
+    chosen.presentMode = PortSettings::PresentMode::Mailbox;
+    PortSettings::ApplyLauncherRules(chosen);
+    auto values = PortSettings::LauncherValues(chosen);
+    values.emplace_back("PresentMode", PortSettings::PresentModeName(chosen.presentMode));
+    const auto reread = FromText(PortSettings::SetIniValues("", values).c_str());
+    Require(reread.warnings.empty() && reread.presentMode == PortSettings::PresentMode::Mailbox && reread.fpsLimit == 120.0 && reread.variableTimestep,
+            "round trip: 120 with the variable timestep and PresentMode mailbox");
 }
 
 static std::string ReadGuest(const char* path) {
@@ -890,6 +1060,12 @@ int main() {
     TestRenderTier();
     TestFrameRate();
     TestPacer();
+    TestTitleStep();
+    TestRefreshField();
+    TestJobBudget();
+    TestTableCompat();
+    TestPresentMode();
+    TestDisplayFpsLimit();
     TestWindowSize();
     TestOverlay();
     std::printf("port_settings_tests: ok\n");

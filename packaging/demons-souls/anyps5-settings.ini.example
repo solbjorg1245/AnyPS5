@@ -28,6 +28,11 @@
 # Timestep = fixed
 # TimestepMinHz = 19.98
 
+# Present mode, experimental: read only with the environment switch APS5_PRESENT_AUTO=1 for now.
+# auto: mailbox when the frame rate limit is above the display's refresh, else fifo. fifo waits for the
+# display; mailbox shows the newest frame at each refresh (drops frames, never tears); immediate tears.
+# PresentMode = auto
+
 # windowed or fullscreen (fullscreen uses the desktop resolution; F11 toggles it).
 # WindowMode = windowed
 
