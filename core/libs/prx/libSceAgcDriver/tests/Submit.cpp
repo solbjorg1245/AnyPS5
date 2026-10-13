@@ -24,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <initializer_list>
@@ -338,6 +339,34 @@ void testLabelHeldAtSubmission() {
     gate = 1;
     check(waitFor(&reset, 1, "consumer never passed its wait") >= std::chrono::milliseconds(900), "a label its own queue stored first counted as held at the submission");
     AgcDriverWaitIdle_nid_postfix();
+}
+
+void setWaitPatient(const char* value) {
+#ifdef _WIN32
+    _putenv_s("APS5_WAIT_PATIENT", value);
+#else
+    setenv("APS5_WAIT_PATIENT", value, 1);
+#endif
+}
+
+// APS5_WAIT_PATIENT (s62 WATER): a compute queue's wait that reaches the 1000 ms timeout waits on for the label
+// the graphics queue writes later, as across a scene load, instead of running on without it; past the patience
+// limit it gives up and runs on as before. Read at each timeout, so setting it here leaves the tests above alone.
+void testPatientWait() {
+    alignas(64) static volatile std::uint32_t label = 0, done = 0, never = 0, late = 0;
+    setWaitPatient("5000");
+    submit(0x20, commands(waitEqual(&label, 1), writeData(&done, 1)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1600));
+    check(done == 0, "patient wait: the wait ran on at the timeout");
+    submit(0, commands(writeData(&label, 1)));
+    check(waitFor(&done, 1, "patient wait: the label written after the timeout never satisfied the wait") < std::chrono::milliseconds(500), "patient wait: the wait passed late after its label landed");
+    AgcDriverWaitIdle_nid_postfix();
+    setWaitPatient("500");
+    submit(0x20, commands(waitEqual(&never, 1), writeData(&late, 1)));
+    const auto waited = waitFor(&late, 1, "patient wait: the wait never gave up");
+    check(waited >= std::chrono::milliseconds(1400) && waited < std::chrono::milliseconds(5000), "patient wait: the wait gave up outside the timeout plus the patience limit");
+    AgcDriverWaitIdle_nid_postfix();
+    setWaitPatient("0");
 }
 
 // A dispatch the driver cannot run (here: no compute program registers) is reported and skipped,
@@ -1335,6 +1364,7 @@ int main() {
         testEndOfPipeLabelsWithoutWork();
         testLabelHeldAtSubmission();
         testWideLabelStoredSinceSubmission();
+        testPatientWait();
         testSkippedDispatch();
         testNewDrawKeyTally();
         testFastCensus();

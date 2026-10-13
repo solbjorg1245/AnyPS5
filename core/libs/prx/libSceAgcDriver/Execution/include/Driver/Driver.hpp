@@ -329,6 +329,7 @@ private:
     void waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit);
     static PollStats& pollStats();
     static WaitOutcomes& waitOutcomes();
+    static int waitPatientMs();
     static Graphics::Recorder::LateStatistics& lateCountsSeen();
     static EpochBumps& epochBumps();
     static void bumpEpoch(std::uint64_t EpochBumps::*counter);
