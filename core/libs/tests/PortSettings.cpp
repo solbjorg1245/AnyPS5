@@ -3,6 +3,7 @@
 #include "prx/libc/include/PortSettings.hpp"
 #include "prx/libSceVideoOut/include/TitleJobBudget.hpp"
 #include "prx/libSceVideoOut/include/TitleRefreshField.hpp"
+#include "prx/libSceVideoOut/include/TitleRefreshTable.hpp"
 #include "prx/libSceVideoOut/include/TitleStepWindow.hpp"
 #include "SceTypes.hpp"
 #include "prx/libkernel/File/include/FileFlags.hpp"
@@ -11,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -221,6 +223,40 @@ static void TestJobBudget() {
     Require(already.action == Action::AlreadySet && already.value == 120.0f, "both holding the limit: already set");
     for (const auto& pair : {std::pair{59.94f, 59.94f}, std::pair{60.0f, 60.0f}, std::pair{60.0f, 59.95f}, std::pair{0.0f, 0.0f}, std::pair{120.0f, 59.94f}, std::pair{60.0f, 120.0f}, std::pair{std::nanf(""), 59.94f}})
         Require(decide(120.0, pair.first, pair.second).action == Action::Refuse, "anything else: refused");
+}
+
+// APS5_TABLE_COMPAT (libSceVideoOut TimestepPatch): the refresh table's two forms, the refresh field's guard on a
+// patch_game.py --fps120 table and the game speed the fixed step gives such a table.
+static void TestTableCompat() {
+    using Form = TitleRefreshTable::Form;
+    const float original[4] = {59.94f, 59.94f, 29.97f, 19.98f};
+    const float patched[4] = {59.94f, 119.88f, 29.97f, 19.98f};
+    Require(std::memcmp(original, TitleRefreshTable::Original.data(), sizeof(original)) == 0 && std::memcmp(patched, TitleRefreshTable::Fps120.data(), sizeof(patched)) == 0,
+        "the signatures are the floats' bits");
+    Require(TitleJobBudget::Bits(TitleRefreshTable::PatchedRefresh) == TitleJobBudget::PatchedMode60Bits, "patch_game.py's 119.88: 0x42efc28f");
+    Require(TitleRefreshTable::Classify(TitleRefreshTable::Original.data()) == Form::Original, "the image's table: original");
+    Require(TitleRefreshTable::Classify(TitleRefreshTable::Fps120.data()) == Form::Fps120, "patch_game.py --fps120's table: fps120");
+    for (std::size_t bit = 0; bit < 128; ++bit) {
+        auto bytes = TitleRefreshTable::Fps120;
+        bytes[bit / 8] ^= static_cast<unsigned char>(1u << (bit % 8));
+        // Bit 55 is entry 1's lowest exponent bit: 119.88 back to 59.94.
+        Require(TitleRefreshTable::Classify(bytes.data()) == (bit == 55 ? Form::Original : Form::None), "one bit off the fps120 form: none");
+    }
+    using Action = TitleRefreshField::Action;
+    Require(TitleRefreshField::Decide(1, 119.88f, std::nullopt, 41.0f, 25.0f).action == Action::Refuse, "119.88 on an original table: refused");
+    const auto patchedField = TitleRefreshField::Decide(1, 119.88f, std::nullopt, 41.0f, 25.0f, true);
+    Require(patchedField.action == Action::Write && patchedField.value == 41.0f, "119.88 on a patched table: a title refresh, the 60 FPS entry");
+    Require(TitleRefreshField::Decide(1, 119.885f, std::nullopt, 41.0f, 25.0f, true).action == Action::Write, "within 0.01 of 119.88");
+    Require(TitleRefreshField::Decide(1, 119.9f, std::nullopt, 41.0f, 25.0f, true).action == Action::Refuse, "0.02 off 119.88: refused");
+    Require(TitleRefreshField::Decide(2, 29.97f, std::nullopt, 41.0f, 25.0f, true).action == Action::Write, "the other refreshes still on a patched table");
+    char text[16];
+    const double slow = TitleRefreshTable::Speed(TitleRefreshTable::PatchedRefresh, PortSettings::GameRefresh60);
+    std::snprintf(text, sizeof(text), "%.2f", slow);
+    Require(std::string(text) == "0.50" && !TitleRefreshTable::RightSpeed(slow), "the 59.94 Hz vblank: 0.50x");
+    const double right = TitleRefreshTable::Speed(TitleRefreshTable::PatchedRefresh, 120000.0 / 1001.0);
+    std::snprintf(text, sizeof(text), "%.2f", right);
+    Require(std::string(text) == "1.00" && TitleRefreshTable::RightSpeed(right), "the 119.88 Hz vblank: 1.00x");
+    Require(TitleRefreshTable::Speed(0.0, 59.94) == 0.0, "no title refresh: 0");
 }
 
 static void TestPresentMode() {
@@ -943,6 +979,7 @@ int main() {
     TestTitleStep();
     TestRefreshField();
     TestJobBudget();
+    TestTableCompat();
     TestPresentMode();
     TestDisplayFpsLimit();
     TestWindowSize();

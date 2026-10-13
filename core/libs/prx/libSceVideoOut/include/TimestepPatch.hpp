@@ -9,6 +9,7 @@
 #include "prx/libc/include/PortSettings.hpp"
 #include "prx/libSceVideoOut/include/TitleJobBudget.hpp"
 #include "prx/libSceVideoOut/include/TitleRefreshField.hpp"
+#include "prx/libSceVideoOut/include/TitleRefreshTable.hpp"
 #include "prx/libSceVideoOut/include/TitleStepWindow.hpp"
 
 // Variable timestep for Demon's Souls (PPSA01341). The title steps physics (and the logic delta floor)
@@ -34,6 +35,9 @@
 // mode changes, so each flip also writes there the entry of the mode in effect (TitleRefreshField.hpp).
 // APS5_JOB_BUDGET=1 (with the variable step and a vblank above 60 Hz) writes the vblank once into the title's
 // main-thread job budget (TitleJobBudget.hpp), so queued jobs no longer hold every frame to about 1/60 s.
+// APS5_TABLE_COMPAT=1 also accepts a table patched by tools/patch_game.py --fps120 (entry 1 = 119.88,
+// TitleRefreshTable.hpp): the variable step runs on such an executable as on the original; with the fixed step it
+// looks for the table too (read only) and one line gives the speed the patched step runs at (vblank / 119.88).
 class TimestepPatch {
 public:
     static TimestepPatch& Get();
@@ -89,6 +93,9 @@ private:
     bool jobBudget = false;
     float* jobBudgetAt = nullptr;
     float jobBudgetHz = 0.0f;
+    // APS5_TABLE_COMPAT: on, and the table found is patch_game.py --fps120's.
+    bool tableCompat = false;
+    bool tablePatched = false;
 };
 
 #endif

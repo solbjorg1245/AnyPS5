@@ -29,8 +29,8 @@
 namespace {
 
 // 59.94f, 59.94f, 29.97f, 19.98f: the refresh table (PE VA 0x142507b90 in 2025-10-15.877562); the four
-// floats occur once in the image.
-constexpr std::array<unsigned char, 16> RefreshTableSignature{0x8f, 0xc2, 0x6f, 0x42, 0x8f, 0xc2, 0x6f, 0x42, 0x8f, 0xc2, 0xef, 0x41, 0x0a, 0xd7, 0x9f, 0x41};
+// floats occur once in the image (APS5_TABLE_COMPAT: either form of TitleRefreshTable does).
+constexpr auto& RefreshTableSignature = TitleRefreshTable::Original;
 constexpr std::size_t Entry60 = 1;
 constexpr std::size_t Entry30 = 2;
 // FUN_140b380e0 stores the title's nominal frame step (1/refresh, seconds) every frame in a variable at PE VA
@@ -55,10 +55,17 @@ struct Search {
     unsigned char* regionBegin = nullptr;
     unsigned char* regionEnd = nullptr;
     std::size_t hits = 0;
+    // APS5_TABLE_COMPAT: patch_game.py --fps120's form counts as a hit too.
+    bool compat = false;
 
     void scan(unsigned char* begin, std::size_t size) {
+        scanFor(RefreshTableSignature, begin, size);
+        if (compat) scanFor(TitleRefreshTable::Fps120, begin, size);
+    }
+
+    void scanFor(const std::array<unsigned char, 16>& signature, unsigned char* begin, std::size_t size) {
         auto* end = begin + size;
-        for (auto* at = begin; (at = std::search(at, end, RefreshTableSignature.begin(), RefreshTableSignature.end())) != end; ++at) {
+        for (auto* at = begin; (at = std::search(at, end, signature.begin(), signature.end())) != end; ++at) {
             hit = at;
             regionBegin = begin;
             regionEnd = end;
@@ -72,6 +79,7 @@ struct Located {
     void* pageBase = nullptr;
     std::size_t pageBytes = 0;
     std::uint64_t neighbourhood = 0;
+    TitleRefreshTable::Form form = TitleRefreshTable::Form::None;
 };
 
 // FNV-1a of the matched bytes and up to 32 bytes either side (inside the section); logged so a build
@@ -96,10 +104,11 @@ std::string guestBuildVersion() {
     }
 }
 
-// The table in the main image's read-only data; nullptr unless it occurs exactly once and is 4-aligned.
-// The page stays read-only here (store() opens it for each write).
-Located locateRefreshTable() {
+// The table in the main image's read-only data; nullptr unless it occurs exactly once and is 4-aligned (with
+// `compat` in either form, once in all). The page stays read-only here (store() opens it for each write).
+Located locateRefreshTable(bool compat) {
     Search search;
+    search.compat = compat;
 #ifdef _WIN32
     auto* image = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
     if (image == nullptr) return {};
@@ -147,6 +156,7 @@ Located locateRefreshTable() {
     located.pageBase = reinterpret_cast<void*>(first);
     located.pageBytes = static_cast<std::size_t>(last - first);
     located.neighbourhood = hashNeighbourhood(search);
+    located.form = TitleRefreshTable::Classify(search.hit);
     return located;
 }
 
@@ -332,22 +342,25 @@ TimestepPatch::TimestepPatch() {
         std::fflush(stderr);
         jobBudget = false;
     }
+    // APS5_TABLE_COMPAT also accepts patch_game.py --fps120's table; with the fixed step it is looked for (read only) to warn.
+    tableCompat = std::getenv("APS5_TABLE_COMPAT") != nullptr;
     // Without FpsLimit the render config picks the mode; the digest then assumes the 60 FPS one.
     mode30 = PortSettings::GameFramesPerSecond(settings) == 30;
 }
 
 void TimestepPatch::Flip(double vblankHz, std::uint64_t vblankCount) {
-    if (!enabled && !profile && !probe) return;
+    if (!enabled && !profile && !probe && !tableCompat) return;
     std::lock_guard lock(mutex);
     const auto now = nowNanos();
     // The 60 FPS mode flips once per vblank, the 30 FPS mode every second one.
     const double cap = vblankHz != 0.0 ? vblankHz : PortSettings::GameRefresh60;
     double step = 1.0 / (mode30 ? cap / 2.0 : cap);
-    if ((enabled || probe) && !searched) {
+    if ((enabled || probe || tableCompat) && !searched) {
         searched = true;
         const auto version = guestBuildVersion();
         const bool supported = PortSettings::BuildVersionSupported(version);
-        const auto located = supported ? locateRefreshTable() : Located{};
+        const auto located = supported ? locateRefreshTable(tableCompat) : Located{};
+        tablePatched = located.form == TitleRefreshTable::Form::Fps120;
         if (enabled) {
             table = located.table;
             pageBase = located.pageBase;
@@ -358,12 +371,23 @@ void TimestepPatch::Flip(double vblankHz, std::uint64_t vblankCount) {
             else if (table == nullptr) std::fprintf(stderr, "[timestep] refresh table not found in the executable: the frame step stays fixed\n");
             else std::fprintf(stderr, "[timestep] variable frame step %.2f to %.2f Hz (build %s, refresh table at %p, neighbourhood hash %016llx)\n", floorHz, cap, PortSettings::SupportedBuildVersion, static_cast<void*>(table), static_cast<unsigned long long>(located.neighbourhood));
         }
+        // APS5_TABLE_COMPAT on a patch_game.py --fps120 table: the variable step overwrites its 119.88 each flip; the fixed
+        // step writes nothing and runs the 60 FPS mode at vblank / 119.88. Enum 0's own 59.94 (0x14238ef8c) is not
+        // written either way (frame-rate.md S5: only once the frame probe finds the title selecting enum 0).
+        if (tablePatched && enabled) std::fprintf(stderr, "[timestep] refresh table in the patch_game.py --fps120 form (entry 1 119.88): the variable step replaces it (APS5_TABLE_COMPAT=1)\n");
+        if (tablePatched && !enabled) {
+            const double speed = TitleRefreshTable::Speed(TitleRefreshTable::PatchedRefresh, cap);
+            if (TitleRefreshTable::RightSpeed(speed)) std::fprintf(stderr, "[timestep] this executable was patched for 120 FPS: vblank %.2f Hz, game speed %.2fx (APS5_TABLE_COMPAT=1)\n", cap, speed);
+            else std::fprintf(stderr, "[timestep] this executable was patched for 120 FPS (patch_game.py --fps120): at the %.2f Hz vblank the game runs at %.2fx; set APS5_VBLANK_HZ=119.88 or Timestep = variable (APS5_TABLE_COMPAT=1)\n", cap, speed);
+        }
         // The probe only reads, so it also runs with the fixed step.
         if (probe) titleStep = locateTitleStep(located.table, supported);
         if (refreshField) displaySlot = locateDisplaySlot(table, supported);
         if (jobBudget) applyJobBudget(cap, supported);
         std::fflush(stderr);
     }
+    // APS5_TABLE_COMPAT, fixed step on a patched table: the digest's model takes the 60 FPS mode's 1/119.88 s step.
+    if (tablePatched && !enabled && !mode30) step = 1.0 / TitleRefreshTable::PatchedRefresh;
     if (table != nullptr) {
         const double hz = pacer->Flip(now);
         const auto rate60 = static_cast<float>(std::min(hz, cap));
@@ -433,7 +457,7 @@ void TimestepPatch::followRefreshField() {
     auto* refresh = reinterpret_cast<float*>(object + DisplayRefreshOffset);
     const auto mode = std::atomic_ref<std::int32_t>(*reinterpret_cast<std::int32_t*>(object + DisplayFramesPerSecondOffset)).load(std::memory_order_relaxed);
     const auto current = static_cast<float>(loadStep(refresh));
-    const auto step = TitleRefreshField::Decide(mode, current, fieldKnown, stored60, stored30);
+    const auto step = TitleRefreshField::Decide(mode, current, fieldKnown, stored60, stored30, tablePatched);
     if (step.action == TitleRefreshField::Action::Refuse) {
         fieldRefused = true;
         std::fprintf(stderr, "[timestep] refresh field: display+0x28 holds %g in mode %d (not a title refresh): left alone\n", current, mode);
