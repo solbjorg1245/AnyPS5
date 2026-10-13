@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordCensus.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
@@ -1220,6 +1221,7 @@ private:
 // dereferenced under the GpuMutex (it is destroyed with its device under that lock).
 void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     hookCalls.fetch_add(1, std::memory_order_relaxed);
+    RecordCensus::Touch(RecordCensus::FlushHook);
     // A label this worker queued but has not recorded writes the range: in queue order the label
     // precedes this access, so the group is recorded first (it then notes the range as a pending
     // write of the open batch, and the check below syncs on it like any recorded store). Not from
@@ -1553,6 +1555,7 @@ Recorder* Recorder::Active() {
 
 void Recorder::Activate() {
     activeRecorder = this;
+    RecordCensus::Touch(RecordCensus::ActiveRecorder);
     // Marks of earlier recorders (lower offsets) read completed from here on; a recorder activated
     // again restores its own completed serial, below a later recorder's marks (they read pending).
     if (PendingBlocksTracked()) completedBlockSerial.store(blockSerialBase + blocksFinished, std::memory_order_release);
@@ -1923,6 +1926,7 @@ void dropOverwritten(std::vector<Recorder::DeferredCopy>& copies, std::uint64_t 
 void Recorder::DeferCopies(std::vector<DeferredCopy> copies) {
     if (copies.empty()) return;
     ensureOpen();
+    RecordCensus::Touch(RecordCensus::RecorderLists);
     const auto freeClock = GuestMemory::FreeClock();
     const auto generation = GuestMemory::LateLandChecked(GuestMemory::LateLandKind::CopyBack) ? GuestMemory::TrackerGeneration() : 0;
     for (auto& copy : copies) {
@@ -2751,8 +2755,32 @@ Recorder::DispatchTrailStatistics Recorder::DispatchTrailCounts() {
     return counts;
 }
 
+namespace {
+
+std::atomic<std::uint64_t> forcedPassSplits{0};
+
+}
+
+std::uint32_t Recorder::RenderPassSplit() {
+    static const std::uint32_t split = [] {
+        const char* text = std::getenv("APS5_RENDER_PASS_SPLIT");
+        return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
+    }();
+    return split;
+}
+
+std::uint64_t Recorder::TakeForcedPassSplits() {
+    return forcedPassSplits.exchange(0, std::memory_order_relaxed);
+}
+
 bool Recorder::ContinuesRenderPass(std::uint64_t key) const {
-    return open != nullptr && open->renderPass.open && open->renderPass.continuable && open->renderPass.key == key;
+    if (open == nullptr || !open->renderPass.open || !open->renderPass.continuable || open->renderPass.key != key) return false;
+    // APS5_RENDER_PASS_SPLIT: a pass holding K draws ends here (a re-check of the same draw counts again).
+    if (const auto split = RenderPassSplit(); split != 0 && open->renderPass.draws >= split) {
+        forcedPassSplits.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    return true;
 }
 
 VkCommandBuffer Recorder::CommandsInRenderPass() {
@@ -2770,10 +2798,13 @@ VkCommandBuffer Recorder::CommandsInRenderPass() {
 void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool continuable) {
     Require(open != nullptr, "no batch is open for the render pass");
     auto& pass = open->renderPass;
+    RecordCensus::Touch(RecordCensus::RenderPass);
     if (!pass.open) {
         pass.timing = timing;
         pass.serial = ++passSerials;
+        pass.draws = 0;
     }
+    ++pass.draws;
     pass.open = true;
     pass.key = key;
     pass.continuable = continuable;
@@ -2787,6 +2818,7 @@ std::uint64_t Recorder::ActiveOpenRenderPassSerial() {
 
 void Recorder::endOpenRenderPass() {
     auto& pass = open->renderPass;
+    RecordCensus::Touch(RecordCensus::RenderPass);
     context.Resolved(&DeviceFunctions::cmdEndRenderPass, "vkCmdEndRenderPass")(open->commands);
     // The pass's attachment and shader writes are visible to everything recorded after it (the
     // host sees them at the batch's fence).
@@ -2913,6 +2945,7 @@ void Recorder::ensureOpen() {
                 allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
                 allocation.commandBufferCount = 1;
                 Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &batch->commands), "vkAllocateCommandBuffers recorder");
+                RecordCensus::Touch(RecordCensus::CommandPool);
                 VkFenceCreateInfo info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
                 Check(context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &info, nullptr, &batch->fence), "vkCreateFence recorder");
             }
@@ -2935,6 +2968,7 @@ void Recorder::ensureOpen() {
         }
         if (countingSamples) beginSamples(*batch);
         open = std::move(batch);
+        RecordCensus::Touch(RecordCensus::OpenBatch);
         // The whole-batch range: its start stamp waits for the previous batches like any
         // bottom-of-pipe stamp, so it marks when this batch's execution began.
         if (BatchStampsEnabled()) open->batchTiming = beginTiming(BatchTimingKey, TimingKind::Batch);
@@ -3943,6 +3977,7 @@ std::size_t Recorder::UnsignaledBatches() const {
 
 void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
     ensureOpen();
+    RecordCensus::Touch(RecordCensus::RecorderLists);
     open->kept.push_back(std::move(object));
     open->keptBytes += bytes;
 }
@@ -4030,6 +4065,7 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     }
     while (!pool.recency.empty() && (pool.bytes + bytes > budget || pool.recency.size() >= maxEntries)) eraseDrawSnapshot(drawSnapshots.find(pool.recency.front()));
     const DrawSnapshotKey key{address, use, bytes};
+    RecordCensus::Touch(RecordCensus::RecorderLists);
     pool.recency.push_back(key);
     try {
         drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived});
@@ -4066,6 +4102,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     // APS5_LATE_LAND_CHECK=2: a shader's in-place write range, checked from now on (LateLandKind::GpuWrite).
     if (!ownLabel && (kind == WriteKind::ShaderWrite || kind == WriteKind::Unknown) && GuestMemory::LateLandChecked(GuestMemory::LateLandKind::GpuWrite)) open->lateLands.push_back(GuestMemory::MakeLateLand(GuestMemory::LateLandKind::GpuWrite, address, end, GuestMemory::TrackerGeneration(), WriteKindName(kind)));
     open->writes.emplace_back(address, end);
+    RecordCensus::Touch(RecordCensus::PendingWrites);
     if (!ownLabel) GuestMemory::NoteGpuWriteForCrash(address, end, WriteKindName(kind), submissions + 1);
     open->writeNotes.push_back(++writeNoteCount);
     markPendingBlocks(address, end, submissions + 1);
@@ -4115,6 +4152,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
 void Recorder::markOverwritten(std::uint64_t address, std::uint64_t end) {
     if (recordedLabels.load(std::memory_order_relaxed) == 0) return;
     std::lock_guard tableLock(labelTableMutex);
+    RecordCensus::Touch(RecordCensus::LabelTable);
     // A dword overlaps the range when it starts before the end and ends after the start.
     for (auto it = labels.lower_bound(address >= 3 ? address - 3 : 0); it != labels.end() && it->first < end; ++it) it->second.overwritten = true;
 }
@@ -4156,6 +4194,7 @@ void Recorder::publishPendingWrites() const {
         else (*merged)[out++] = {begin, end};
     }
     merged->resize(out);
+    RecordCensus::Touch(RecordCensus::PendingPublish);
     pendingWrites.store(std::move(merged), std::memory_order_release);
     publishGeneration.fetch_add(1, std::memory_order_release);
     ++snapshotRebuilds;

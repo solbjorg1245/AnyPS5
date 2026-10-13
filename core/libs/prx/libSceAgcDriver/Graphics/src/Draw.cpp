@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawSkipReasons.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastDraw.hpp"
@@ -1818,6 +1819,7 @@ VkCommandBuffer drawCommands(Recorder& recorder, bool& continued, bool known, co
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
+    RecordCensus::NoteTemplate(&resources);
     const auto* args = record.indirect != nullptr ? record.indirect->args : nullptr;
     const bool gpuIndirect = args != nullptr && record.indirect->path == IndirectDrawPath::Gpu;
     using CommandClass = Recorder::CommandClass;

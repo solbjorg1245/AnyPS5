@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -5604,6 +5605,7 @@ std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> Gues
 
 void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     if (!uploaded || committed) return;
+    RecordCensus::Touch(RecordCensus::TemplateShadows);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::vector<Region*> copies;
     for (auto& region : regions) {

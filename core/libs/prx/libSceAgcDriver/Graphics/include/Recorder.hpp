@@ -146,6 +146,12 @@ public:
     // `timing`): Commands(), RecordStore and Submit end it; CommandsInRenderPass hands a
     // continuing draw the command buffer without ending it.
     bool ContinuesRenderPass(std::uint64_t key) const;
+    // APS5_RENDER_PASS_SPLIT=K (P-HANDOFF part 2, multi-recorder S0; default 0, off): a pass that holds
+    // K draws is not continued, so the next draw ends it and begins another (LOAD/STORE), as a
+    // dispatcher handing chunks of K draws to two recorders would split it: the GPU cost of that split.
+    // The passes ended so, since the last call (the [pipe] census line).
+    static std::uint32_t RenderPassSplit();
+    static std::uint64_t TakeForcedPassSplits();
     // The serial of the render pass currently left open (0: none). While it stays the same, only
     // draws of that pass were recorded (anything else ends it): StorageTexture::Refresh's memo.
     std::uint64_t OpenRenderPassSerial() const { return open != nullptr && open->renderPass.open ? open->renderPass.serial : 0; }
@@ -1138,6 +1144,8 @@ private:
             std::uint32_t timing = NoTiming;
             // Counts the passes this recorder left open (OpenRenderPassSerial).
             std::uint64_t serial = 0;
+            // The draws recorded in it (APS5_RENDER_PASS_SPLIT).
+            std::uint32_t draws = 0;
         } renderPass;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
         bool hostReadOwed = false;

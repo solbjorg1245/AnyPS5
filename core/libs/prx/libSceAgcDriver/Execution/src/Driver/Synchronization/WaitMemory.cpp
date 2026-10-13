@@ -5,7 +5,10 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include <algorithm>
+#include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <set>
 #ifdef _WIN32
@@ -85,6 +88,20 @@ int Driver::waitTimeoutMs() {
     return value;
 }
 
+// APS5_WAIT_PATIENT=1 (or =<ms>; s62 WATER): a compute queue's WAIT_REG_MEM that reaches the timeout above keeps
+// waiting, for up to 30 s (or <ms>) more, instead of running on without its input. The timeout counts time in
+// which no packet finished on any queue, which is also what a scene load looks like: the game stops submitting
+// while the compute queues wait for labels the graphics queue writes only once the next frame is submitted.
+// The PS5 waits there; running on lets the compute queue's later waits pass on the previous frame's values
+// (one frame ahead of the graphics queue for good). Queue 0 keeps the timeout. 0 / unset = the old rule.
+// Read at each timeout, not cached: timeouts are rare, and the unit test sets it after the other wait tests ran.
+int Driver::waitPatientMs() {
+    const char* text = std::getenv("APS5_WAIT_PATIENT");
+    if (text == nullptr || text[0] == '\0' || std::strcmp(text, "0") == 0) return 0;
+    const int ms = std::atoi(text);
+    return ms > 1 ? ms : 30000;
+}
+
 bool Driver::pollReapAll() {
     static const bool all = std::getenv("APS5_POLL_REAP") != nullptr;
     return all;
@@ -121,6 +138,25 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
     } waitTrace{traceGpu, queue, packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), std::chrono::steady_clock::now()};
     bool warned = false;
+    // APS5_WAIT_PATIENT: set once this wait passed the timeout and waits on; the end counts and reports it.
+    struct PatientWait {
+        WaitOutcomes& outcomes;
+        std::uint32_t queue;
+        std::uint64_t address;
+        std::chrono::steady_clock::time_point since{};
+        bool gaveUp = false;
+        ~PatientWait() {
+            if (since == std::chrono::steady_clock::time_point{} || gaveUp) return;
+            const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - since).count();
+            ++outcomes.patientSatisfied;
+            outcomes.patientLongestMs = std::max(outcomes.patientLongestMs, ms);
+            static std::atomic<int> shown{0};
+            if (shown.fetch_add(1) < 64) std::fprintf(stderr, "[gpu] queue 0x%x WAIT_REG_MEM at 0x%llx satisfied %.0f ms after the timeout (APS5_WAIT_PATIENT)\n", queue, static_cast<unsigned long long>(address), ms);
+        }
+    };
+    bool patient = false;
+    int patientMs = 0;
+    PatientWait patience{waitOutcomes(), queue, packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u)};
 
     struct EpochPoint {
         bool bump = true;
@@ -345,39 +381,60 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (!warned && std::chrono::steady_clock::now() - start > std::chrono::milliseconds(waitTimeoutMs())) {
             warned = true;
             ++outcomes.timedOut;
+            patientMs = queue != 0 ? waitPatientMs() : 0;
+            patient = patientMs > 0;
+            if (patient) {
+                ++outcomes.patientWaits;
+                patience.since = std::chrono::steady_clock::now();
+            }
+            bool firstReport = true;
             {
                 static std::mutex reportedMutex;
                 static std::set<std::uint64_t> reported;
                 static std::uint64_t timeouts = 0;
                 const std::lock_guard lock(reportedMutex);
                 if (++timeouts % 20 == 0) std::fprintf(stderr, "[gpu] %llu GPU waits have timed out\n", static_cast<unsigned long long>(timeouts));
-                if (!reported.insert(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u)).second) return;
+                if (!reported.insert(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u)).second) {
+                    if (!patient) return;
+                    firstReport = false;
+                }
             }
-            const bool wide = ((packet[0] >> 8u) & 0xffu) == 0x93u;
-            const std::uint64_t reference = wide ? packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u) : packet[4];
-            const std::uint64_t mask = wide ? packet[6] | (static_cast<std::uint64_t>(packet[7]) << 32u) : packet[5];
-            const std::uint64_t current = wide ? *reinterpret_cast<const volatile std::uint64_t*>(awaited) : *reinterpret_cast<const volatile std::uint32_t*>(awaited);
-            std::fprintf(stderr, "[gpu] queue 0x%x WAIT_REG_MEM%s at 0x%llx timed out after %dms (function %u ref 0x%llx mask 0x%llx value 0x%llx)\n", queue, wide ? "_64" : "",
-                         static_cast<unsigned long long>(awaited), waitTimeoutMs(), packet[1] & 7u, static_cast<unsigned long long>(reference), static_cast<unsigned long long>(mask), static_cast<unsigned long long>(current));
-            const auto address = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
-            for (const auto& record : writeHistory()) {
-                if (record.length != 0 && record.target <= address && address < record.target + std::max<std::uint64_t>(record.length, 4))
-                    std::fprintf(stderr, "[gpu]   earlier write by queue 0x%x opcode 0x%x at 0x%llx+0x%llx\n", record.queue, record.opcode, static_cast<unsigned long long>(record.target), static_cast<unsigned long long>(record.length));
-            }
+            if (firstReport) {
+                const bool wide = ((packet[0] >> 8u) & 0xffu) == 0x93u;
+                const std::uint64_t reference = wide ? packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u) : packet[4];
+                const std::uint64_t mask = wide ? packet[6] | (static_cast<std::uint64_t>(packet[7]) << 32u) : packet[5];
+                const std::uint64_t current = wide ? *reinterpret_cast<const volatile std::uint64_t*>(awaited) : *reinterpret_cast<const volatile std::uint32_t*>(awaited);
+                std::fprintf(stderr, "[gpu] queue 0x%x WAIT_REG_MEM%s at 0x%llx timed out after %dms (function %u ref 0x%llx mask 0x%llx value 0x%llx)\n", queue, wide ? "_64" : "",
+                             static_cast<unsigned long long>(awaited), waitTimeoutMs(), packet[1] & 7u, static_cast<unsigned long long>(reference), static_cast<unsigned long long>(mask), static_cast<unsigned long long>(current));
+                const auto address = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+                for (const auto& record : writeHistory()) {
+                    if (record.length != 0 && record.target <= address && address < record.target + std::max<std::uint64_t>(record.length, 4))
+                        std::fprintf(stderr, "[gpu]   earlier write by queue 0x%x opcode 0x%x at 0x%llx+0x%llx\n", record.queue, record.opcode, static_cast<unsigned long long>(record.target), static_cast<unsigned long long>(record.length));
+                }
 
-            if (const auto reportDevice = device.Load(); reportDevice != nullptr) {
-                Graphics::Recorder::LabelRefusal refusal{};
-                const auto hit = reportDevice->PendingLabel(awaited, awaitedBytes, received, &refusal);
-                const auto since = Graphics::Recorder::PendingLabelSince();
-                const auto age = since.has_value() ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - *since).count() : -1.0;
-                std::fprintf(stderr, "[gpu]   recorder: table %s (refusal %u), open batch writes it %d, snapshot write overlaps %d, pending completion labels %llu, write-back completions %llu, pending label age %.1f ms, write generation %llu seen %llu, queue 0 dormant %d, completions pending %d, label due %d\n",
-                             hit.has_value() ? "hit" : "miss", static_cast<unsigned>(refusal), reportDevice->OpenWriteOverlaps(awaited, awaitedBytes) ? 1 : 0, Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes) ? 1 : 0,
-                             static_cast<unsigned long long>(Graphics::Recorder::PendingCompletionLabels()), static_cast<unsigned long long>(Graphics::Recorder::PendingWriteBackCompletions()), age,
-                             static_cast<unsigned long long>(Graphics::Recorder::WriteGeneration()), static_cast<unsigned long long>(seenGeneration), queue0Dormant.load(std::memory_order_relaxed) ? 1 : 0, completionsPending() ? 1 : 0, labelFlushDue() ? 1 : 0);
+                if (const auto reportDevice = device.Load(); reportDevice != nullptr) {
+                    Graphics::Recorder::LabelRefusal refusal{};
+                    const auto hit = reportDevice->PendingLabel(awaited, awaitedBytes, received, &refusal);
+                    const auto since = Graphics::Recorder::PendingLabelSince();
+                    const auto age = since.has_value() ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - *since).count() : -1.0;
+                    std::fprintf(stderr, "[gpu]   recorder: table %s (refusal %u), open batch writes it %d, snapshot write overlaps %d, pending completion labels %llu, write-back completions %llu, pending label age %.1f ms, write generation %llu seen %llu, queue 0 dormant %d, completions pending %d, label due %d\n",
+                                 hit.has_value() ? "hit" : "miss", static_cast<unsigned>(refusal), reportDevice->OpenWriteOverlaps(awaited, awaitedBytes) ? 1 : 0, Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes) ? 1 : 0,
+                                 static_cast<unsigned long long>(Graphics::Recorder::PendingCompletionLabels()), static_cast<unsigned long long>(Graphics::Recorder::PendingWriteBackCompletions()), age,
+                                 static_cast<unsigned long long>(Graphics::Recorder::WriteGeneration()), static_cast<unsigned long long>(seenGeneration), queue0Dormant.load(std::memory_order_relaxed) ? 1 : 0, completionsPending() ? 1 : 0, labelFlushDue() ? 1 : 0);
+                }
+                context.Print(stderr, "[gpu]   preceding packet %s\n");
+                if (patient) std::fprintf(stderr, "[gpu]   waiting on for up to %d ms (APS5_WAIT_PATIENT)\n", patientMs);
             }
-            context.Print(stderr, "[gpu]   preceding packet %s\n");
         }
-        if (warned) return;
+        if (warned) {
+            if (!patient) return;
+            if (std::chrono::steady_clock::now() - patience.since > std::chrono::milliseconds(patientMs)) {
+                patience.gaveUp = true;
+                ++outcomes.patientGaveUp;
+                std::fprintf(stderr, "[gpu] queue 0x%x WAIT_REG_MEM at 0x%llx gave up %d ms after the timeout (APS5_WAIT_PATIENT)\n", queue, static_cast<unsigned long long>(awaited), patientMs);
+                return;
+            }
+        }
     }
     ++outcomes.polled;
 }

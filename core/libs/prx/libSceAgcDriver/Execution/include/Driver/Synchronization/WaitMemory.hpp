@@ -39,6 +39,10 @@ struct PollStats {
 struct WaitOutcomes {
     std::uint64_t atEntry = 0, fromRecorder = 0, fromRecorderSameQueue = 0, fromRecorderPolling = 0, polled = 0, timedOut = 0, pollSubmits = 0, pollReaps = 0;
     std::uint64_t fromRecorderUnlocked = 0, entriesUnlocked = 0, entryTriesFailed = 0, fromRecorderLate = 0, lateRefusedCpuStore = 0;
+    // APS5_WAIT_PATIENT (Driver::waitPatientMs): compute-queue waits that passed the timeout and waited on,
+    // how many of them were then satisfied, how many gave up at the patience limit, the longest extra wait.
+    std::uint64_t patientWaits = 0, patientSatisfied = 0, patientGaveUp = 0;
+    double patientLongestMs = 0;
 };
 
 struct EpochBumps {

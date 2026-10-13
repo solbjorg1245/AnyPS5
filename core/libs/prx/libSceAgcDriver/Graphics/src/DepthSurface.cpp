@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libc/include/PortSettings.hpp"
@@ -1194,6 +1195,7 @@ void NoteDisplayBufferPresent(std::uint64_t address) {
 
 void NoteDisplayBufferDraw(const State& state, std::span<const CompiledShader> shaders) {
     if (!watchOn()) return;
+    RecordCensus::Touch(RecordCensus::UiProbe);
     const ShaderRecompiler::RecompileResult* fragment = nullptr;
     for (const auto& shader : shaders) {
         if (shader.stage == ShaderRecompiler::ShaderStage::Fragment && shader.program != nullptr) fragment = shader.program;
