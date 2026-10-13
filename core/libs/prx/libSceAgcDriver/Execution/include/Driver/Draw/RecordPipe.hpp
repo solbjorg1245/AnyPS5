@@ -76,7 +76,8 @@ struct RecordPipeRing {
     void Consume(std::uint64_t serial) { consumed.store(serial, std::memory_order_release); }
 };
 
-// APS5_HANDOFF_FAST (P-HANDOFF; read once, only with the pipe on; default off): B's hand-off penalty.
+// APS5_HANDOFF_FAST (P-HANDOFF; read once, only with the pipe on; default on, =0 the old path): B's
+// hand-off penalty.
 // A draw recorded on B took 12.09 us against 10.24 us inline (t911/t912, APS5_RECORD_PROFILE), the
 // gap in the spans that first read what A wrote for the item (inputs +0.71, revalidate +0.39), and B
 // dropped the item's references after recording it (cleanup 0.64 us per item: shared counts A had
@@ -84,10 +85,11 @@ struct RecordPipeRing {
 // and A drops them when it fills the slot again, on the thread that took them; Prefetch, before
 // recording item k B prefetches item k+1's slot when A has published it (its draw, stage and snapshot
 // lists, its decode and the captured bytes, up to APS5_HANDOFF_PREFETCH_KB, 16), so those lines come
-// over while k records. "1" takes both; another number is a mask of the parts (2 Release, 4 Prefetch).
+// over while k records. Unset or "1" takes both; another number is a mask of the parts (2 Release,
+// 4 Prefetch), and 0 or junk the old path. On: 63.6 presents/10 s against 60.2 (t914-t919, 3+3).
 enum RecordPipeHandoffPart : unsigned { HandoffRelease = 2, HandoffPrefetch = 4 };
 constexpr unsigned RecordPipeHandoffParts(const char* value) {
-    if (value == nullptr || value[0] == '\0') return 0;
+    if (value == nullptr || value[0] == '\0') return HandoffRelease | HandoffPrefetch;
     unsigned parsed = 0;
     for (const char* digit = value; *digit != '\0'; ++digit) {
         if (*digit < '0' || *digit > '9' || parsed > 1000) return 0;

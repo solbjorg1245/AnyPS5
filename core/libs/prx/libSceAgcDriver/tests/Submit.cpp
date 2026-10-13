@@ -737,8 +737,8 @@ void testRecordPipe() {
     RecordPipeImageRanges({}, ranges);
     check(imageOk && ranges == Ranges{{0, ~0ull}}, "record pipe: a storage image's estimate is its surface + 64 KiB, a null T# none, an unknown one everything");
 
-    // APS5_HANDOFF_FAST: the parts ("1" both, else a mask), and the prefetch budget's lines.
-    check(RecordPipeHandoffParts(nullptr) == 0 && RecordPipeHandoffParts("") == 0 && RecordPipeHandoffParts("0") == 0 && RecordPipeHandoffParts("1") == (HandoffRelease | HandoffPrefetch) && RecordPipeHandoffParts("2") == HandoffRelease && RecordPipeHandoffParts("4") == HandoffPrefetch && RecordPipeHandoffParts("6") == (HandoffRelease | HandoffPrefetch) && RecordPipeHandoffParts("3") == HandoffRelease && RecordPipeHandoffParts("x") == 0 && RecordPipeHandoffParts("99999999999") == 0, "record pipe handoff: 1 takes both parts, other numbers are a mask, junk is off");
+    // APS5_HANDOFF_FAST: the parts (unset or "1" both, else a mask), and the prefetch budget's lines.
+    check(RecordPipeHandoffParts(nullptr) == (HandoffRelease | HandoffPrefetch) && RecordPipeHandoffParts("") == (HandoffRelease | HandoffPrefetch) && RecordPipeHandoffParts("0") == 0 && RecordPipeHandoffParts("1") == (HandoffRelease | HandoffPrefetch) && RecordPipeHandoffParts("2") == HandoffRelease && RecordPipeHandoffParts("4") == HandoffPrefetch && RecordPipeHandoffParts("6") == (HandoffRelease | HandoffPrefetch) && RecordPipeHandoffParts("3") == HandoffRelease && RecordPipeHandoffParts("x") == 0 && RecordPipeHandoffParts("99999999999") == 0, "record pipe handoff: unset and 1 take both parts, other numbers are a mask, 0 and junk are off");
     alignas(64) static std::array<std::byte, 512> lines{};
     std::vector<const void*> touched;
     const auto touch = [&](const void* line) { touched.push_back(line); };
