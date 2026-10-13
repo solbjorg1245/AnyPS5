@@ -306,6 +306,11 @@ struct DescriptorBinding {
     // Guest image elements the shader stores to (or updates atomically); the others are only read.
     std::vector<bool> imageWritten;
     std::vector<bool> imageDepthCompare;
+    // Each guest image element's mip within its image's run: the layout repeats a dynamic-mip
+    // storage image once per mip (BindingAllocator), so its elements count 0, 1, 2...; every other
+    // element is 0, even one whose T# equals the previous element's. One entry per element of a
+    // GuestImages binding (empty from a producer that does not fill it, or another role).
+    std::vector<std::uint32_t> imageMipOffset;
     // Guest buffer elements the shader updates atomically (one entry per element of a GuestBuffers
     // binding, empty otherwise). An atomic on a host-imported range is a serialized PCIe round trip
     // (~0.4-0.5 us each on NVIDIA), so a driver may keep these elements in device-local memory.

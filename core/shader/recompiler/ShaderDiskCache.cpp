@@ -250,6 +250,7 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Flags(binding.samplerDepthCompare);
     writer.Flags(binding.imageWritten);
     writer.Flags(binding.imageDepthCompare);
+    writer.Values(std::span<const std::uint32_t>(binding.imageMipOffset));
     writer.Flags(binding.bufferAtomic);
     writer.Flags(binding.bufferWritten);
 }
@@ -268,6 +269,7 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     reader.Flags(binding.samplerDepthCompare);
     reader.Flags(binding.imageWritten);
     reader.Flags(binding.imageDepthCompare);
+    reader.Values(binding.imageMipOffset);
     reader.Flags(binding.bufferAtomic);
     reader.Flags(binding.bufferWritten);
 }

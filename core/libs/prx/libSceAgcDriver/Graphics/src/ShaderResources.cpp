@@ -244,6 +244,24 @@ TextureCounters& TextureCounts() {
 // Sampled elements the driver could not decode and bound as null (see decodeBoundSampled).
 std::atomic<std::uint64_t> sampledNullBound{0};
 
+// The storage mip runs come from the recompiler (DescriptorBinding::imageMipOffset) instead of a
+// guess from equal T#s (s62 WATER): two separate storage images with the same T# (the water sim
+// stores its normal map through two equal descriptors, the second for the red channel) both address
+// their own level, where the guess sent the second one's stores a mip down and the water's height,
+// motion and reflections went wrong. A binding without the offsets keeps the guess.
+// APS5_STORAGE_MIP_EXACT=0 restores the guess for every binding.
+bool StorageMipExact() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_STORAGE_MIP_EXACT");
+        return text == nullptr || std::strcmp(text, "0") != 0;
+    }();
+    return enabled;
+}
+
+// Storage element lookups under APS5_STORAGE_MIP_EXACT whose T# equals the previous element's but
+// that keep their own mip (the guess took them for the next one); on the [textures] line.
+std::atomic<std::uint64_t> storageEqualKept{0};
+
 void reportTextureCounters() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
@@ -252,7 +270,9 @@ void reportTextureCounters() {
     auto last = counters.lastReport.load();
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-    std::fprintf(stderr, "[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; cache %llu MiB, %llu budget evictions (%llu MiB, %llu of 64 MiB or more), %llu replaced, %llu made beside another key of the surface, %llu views of a shared image\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.cachedBytes) >> 20u, count(counters.budgetEvictions), count(counters.evictedBytes) >> 20u, count(counters.largeEvictions), count(counters.replaced), count(counters.sameSurface), count(counters.sharedImages));
+    char exactMips[112] = "";
+    if (StorageMipExact()) std::snprintf(exactMips, sizeof(exactMips), "; %llu storage lookups with an equal T# kept at their own mip (APS5_STORAGE_MIP_EXACT)", static_cast<unsigned long long>(storageEqualKept.exchange(0, std::memory_order_relaxed)));
+    std::fprintf(stderr, "[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; cache %llu MiB, %llu budget evictions (%llu MiB, %llu of 64 MiB or more), %llu replaced, %llu made beside another key of the surface, %llu views of a shared image%s\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.cachedBytes) >> 20u, count(counters.budgetEvictions), count(counters.evictedBytes) >> 20u, count(counters.largeEvictions), count(counters.replaced), count(counters.sameSurface), count(counters.sharedImages), exactMips);
     // The image elements bound as null over these 10 s instead of dropping their draws (see
     // ShaderRecompiler::NullBoundImage and decodeBoundSampled); each was a thrown draw before.
     using ShaderRecompiler::NullBoundImage;
@@ -1037,11 +1057,18 @@ bool StorageDedupeEnabled() {
     return !disabled;
 }
 
-// Whether storage element `element` of `binding` repeats the previous element's eight words.
+// Whether storage element `element` of `binding` is the next mip of the previous element's image
+// (it repeats the previous element's eight words; see StorageMipExact).
 bool SameAsPreviousStorageElement(const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t element) {
     if (element == 0) return false;
     const auto words = binding.guestDescriptor.begin() + static_cast<std::size_t>(element) * 8u;
-    return std::equal(words, words + 8, words - 8);
+    const bool equal = std::equal(words, words + 8, words - 8);
+    if (StorageMipExact() && element < binding.imageMipOffset.size()) {
+        const bool run = binding.imageMipOffset[element] != 0;
+        if (equal && !run) storageEqualKept.fetch_add(1, std::memory_order_relaxed);
+        return run;
+    }
+    return equal;
 }
 
 }
