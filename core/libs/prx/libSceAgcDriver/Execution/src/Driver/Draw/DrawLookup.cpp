@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepareProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include <algorithm>
@@ -262,8 +263,10 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         auto* live = dataAllowed ? &liveData[i] : nullptr;
                         const auto compareStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                         const auto waitedAtCompare = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
+                        PrepareProfile::Scope compareSpan(PrepareProfile::DCompare, submission.queue == 0);
                         auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
                         if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
+                        compareSpan.Stop();
                         // APS5_DRAW_ENTRY_RUNS_CHECK: a variant captured with flat words left to the GPU
                         // relies on runs without them; once no pending GPU write overlaps one of
                         // them, a capture of this draw reads it into one more run, so the variant
@@ -325,6 +328,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             hits.partial = !drawHit && stagesKept != 0 && partialDrawHits() && !verifyDrawEntries() && !verifyDataHits();
             // The kept stages' results; a data hit's stages carry the live words and a patched copy.
             std::uint64_t dataStages = 0, dataWords = 0, baseStages = 0;
+            PrepareProfile::Scope patchSpan(PrepareProfile::DPatch, submission.queue == 0);
             if (drawHit || hits.partial) {
                 const auto patchStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 hits.liveWords.assign(programs.size(), {});
@@ -384,6 +388,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 }
                 if (profile) patchUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - patchStart).count();
             }
+            patchSpan.Stop();
             std::lock_guard cacheLock(drawCacheMutex);
             auto& counters = drawEntryCounters;
             counters.stageValidations += stageValidations;

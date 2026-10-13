@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastDraw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepareProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/FrameTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/PassDump.hpp"
@@ -803,7 +804,9 @@ void Driver::drainRecordPipe(PipeCensusDrain why) {
     // Only a drain that finds unrecorded items waits; it is timed by reason.
     const bool timed = recordPipeProfile() && !empty();
     const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    PrepareProfile::Scope drainSpan(PrepareProfile::ADrainWait, timed);
     pipeWait(pipe.aSleeping, pipe.aWake, empty, [&] { recordPipeWaitRound(); });
+    drainSpan.Stop();
     if (timed) {
         const auto ms = sinceMs(start);
         pipe.drainWaitMs += ms;
@@ -863,7 +866,9 @@ void Driver::recordPipeBoundary(std::span<const std::uint32_t> packet, std::uint
         const auto handed = pipe.ring.handed.load(std::memory_order_relaxed);
         if (!RecordPipeRing::Full(handed, pipe.ring.consumed.load(std::memory_order_acquire))) return;
         const auto start = recordPipeProfile() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        PrepareProfile::Scope ringSpan(PrepareProfile::ARingFull, true);
         pipeWait(pipe.aSleeping, pipe.aWake, [&] { return !RecordPipeRing::Full(handed, pipe.ring.consumed.load(std::memory_order_acquire)); }, [&] { recordPipeWaitRound(); });
+        ringSpan.Stop();
         if (recordPipeProfile()) pipe.ringWaitMs += sinceMs(start);
         return;
     }
@@ -902,6 +907,7 @@ void Driver::recordPipeSubmissionEnd() {
     drainRecordPipe(PipeCensusDrain::SubmissionEnd);
     auto& pipe = recordPipe();
     if (!recordPipeProfile() || std::chrono::steady_clock::now() - pipe.lastReport < std::chrono::seconds(10)) return;
+    PrepareProfile::Report();
     std::string drains, waits;
     char item[64];
     for (std::size_t why = 0; why < PipeCensusDrains; ++why) {

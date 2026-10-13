@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepareProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/ExposureWatch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/FrameTrace.hpp"
@@ -185,6 +186,9 @@ void Driver::execute(const Submission& submission) {
         }
     }
     PacketHistory recent{submission.commands};
+    // APS5_PREPARE_PROFILE: queue 0's submission, packet loop and end (PrepareProfile.hpp).
+    const bool prepareProfile = submission.queue == 0 && PrepareProfile::Enabled();
+    PrepareProfile::Scope submissionSpan(PrepareProfile::ASubmission, prepareProfile);
 
     static const bool profilePackets = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     // APS5_FAST_CENSUS (with APS5_PROFILE_DRAW): each packet's effect on a run of fast-eligible draws (F0).
@@ -217,9 +221,15 @@ void Driver::execute(const Submission& submission) {
         if (guestOrder) Graphics::Recorder::NoteGuestPacket(opcode, header == FlipPacketHeader || header == RenderingWaitPacketHeader);
         CaptureTrace::Log("packet submission=%llu queue=%x offset=%zu header=%08x words=%zu", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, header, packet.size());
 
-        if (recordPipe && submission.queue == 0) recordPipeBoundary(packet, header);
+        if (recordPipe && submission.queue == 0) {
+            PrepareProfile::Scope boundarySpan(PrepareProfile::ABoundary, prepareProfile);
+            recordPipeBoundary(packet, header);
+        }
         const auto flushStart = profilePackets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        flushBetweenPackets(submission.queue, header, opcode == 0x49 || opcode == 0x37);
+        {
+            PrepareProfile::Scope flushSpan(PrepareProfile::AFlush, prepareProfile);
+            flushBetweenPackets(submission.queue, header, opcode == 0x49 || opcode == 0x37);
+        }
         PacketTimer packetTimer{profilePackets, header == FlipPacketHeader ? 0xffffu : opcode, submission.queue, packetProfile, std::chrono::steady_clock::now()};
 
         if (profilePackets) {
@@ -256,8 +266,10 @@ void Driver::execute(const Submission& submission) {
         if (profilePackets) packetProfile.flushMs += std::chrono::duration<double, std::milli>(packetTimer.start - flushStart).count();
 
         bool wroteOnGpu = false, endOfPipeInterrupt = false, interruptDeferred = false, drawPacket = false, sampleDump = false;
+        PrepareProfile::Scope memorySpan(PrepareProfile::AMemory, prepareProfile);
         const bool drains = preparePacketMemory(submission, queue, packet, header, opcode, wroteOnGpu, endOfPipeInterrupt, interruptDeferred, drawPacket, sampleDump);
         traceLabel(packet, submission.queue);
+        memorySpan.Stop();
 
         const bool waitPacket = opcode == 0x3c || opcode == 0x93 || header == RenderingWaitPacketHeader;
         struct Progress {
@@ -271,6 +283,9 @@ void Driver::execute(const Submission& submission) {
         } progress{*this, !waitPacket};
         if (!waitPacket) ++packetsInFlight;
         recent.Record(cursor);
+        // The packet by kind, to the end of this iteration.
+        const auto packetSpanKind = header == RenderingWaitPacketHeader || opcode == 0x3c || opcode == 0x93 ? PrepareProfile::AWait : header == FlipPacketHeader ? PrepareProfile::AOther : opcode == 0x15 || opcode == 0x16 ? PrepareProfile::ADispatch : drawPacket ? PrepareProfile::ADraw : opcode == 0x49 || opcode == 0x37 ? PrepareProfile::ALabel : PrepareProfile::AOther;
+        PrepareProfile::Scope packetSpan(packetSpanKind, prepareProfile);
         // DMA_DATA and WRITE_DATA store to memory outside draws and dispatches (depth/HTILE clears).
         if (FrameTrace::Active() && (opcode == 0x50 || opcode == 0x37)) {
             char text[160];
@@ -438,6 +453,7 @@ void Driver::execute(const Submission& submission) {
         if (pipeCensus && submission.queue == 0) NotePipeCensusPacket(header, drawPacket, header == FlipPacketHeader, header == RenderingWaitPacketHeader, wroteOnGpu, pendingDispatchPhases().outcome);
         cursor += count;
     }
+    PrepareProfile::Scope endSpan(PrepareProfile::AEnd, prepareProfile);
     if (recordPipe && submission.queue == 0) recordPipeSubmissionEnd();
     if (fastCensus) NoteFastCensusSubmissionEnd(submission.queue);
     if (pipeCensus && submission.queue == 0) NotePipeCensusSubmissionEnd(workerQueued() != nullptr && workerQueued()->load(std::memory_order_relaxed) != 0);

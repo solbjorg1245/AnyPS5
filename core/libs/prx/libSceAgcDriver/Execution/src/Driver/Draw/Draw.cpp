@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastWalk.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepareProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/PassDump.hpp"
@@ -118,9 +119,13 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         pending.tailAt = phaseLap;
         return DrawVerdict::Drawn;
     };
+    // APS5_PREPARE_PROFILE: queue 0's draw by span (PrepareProfile.hpp).
+    const bool prepareProfile = submission.queue == 0 && PrepareProfile::Enabled();
+    PrepareProfile::Scope precheckSpan(PrepareProfile::DPrecheck, prepareProfile);
     auto drawParameters = Pm4::ResolveDraw(packet, queue);
     bool traceIndirect = false;
     if (const auto verdict = precheckDraw(queue, submission, packet, drawParameters, rejected, traceIndirect)) return *verdict;
+    precheckSpan.Stop();
     phaseTiming.Phase(DrawRowPrecheck);
     using Stage = ShaderRecompiler::ShaderStage;
     using Role = ShaderRecompiler::ProgramRole;
@@ -170,7 +175,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     relocation.Reset();
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        PrepareProfile::Scope keySpan(PrepareProfile::DKey, prepareProfile);
         drawKey = fastState() ? fastDrawKey(queue, submission, localDevice->Serial()) : drawRegisterKey(queue, *submission.shaders, localDevice->Serial());
+        keySpan.Stop();
+        PrepareProfile::Scope findSpan(PrepareProfile::DFind, prepareProfile);
         std::lock_guard cacheLock(drawCacheMutex);
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
@@ -214,6 +222,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     // APS5_FAST_STATE: a key without an entry takes its draw state's decode with the live user words.
+    PrepareProfile::Scope decodeSpan(PrepareProfile::DDecode, prepareProfile);
     if (registerKey && decode == nullptr && fastState() && !verifyDrawRecipe()) decode = fastDrawDecode(queue, submission);
     resolveDrawDecode(queue, submission, decode, registerKey, drawKey.key, profile);
     const auto& graphics = decode->state;
@@ -230,7 +239,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (!drawParameters.indirect) setMeshIndexBuffer(drawParameters);
     else if (graphics.stages.mesh) setMeshIndexBuffer(Pm4::DrawParameters{drawParameters.indexAddress, std::max(drawParameters.indexCount, 1u), drawParameters.indexSize, 1, 0, drawParameters.indexed});
     const std::vector<Role>& roles = decode->roles;
+    decodeSpan.Stop();
     phaseTiming.Phase(DrawRowDecode);
+    PrepareProfile::Scope prepareSpan(PrepareProfile::DPrepare, prepareProfile);
 
     const auto locate = [&](std::uint32_t location) -> std::optional<std::pair<std::size_t, std::size_t>> {
         if (location == 0x280u) return std::nullopt;
@@ -265,6 +276,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     timing.Mark("prepare");
     phaseTiming.Phase(DrawRowProgramPrepare);
+    prepareSpan.Stop();
+    PrepareProfile::Scope setupSpan(PrepareProfile::DSetup, prepareProfile);
 
     auto& vertexInfos = scratch->vertexInfos;
     vertexInfos.assign(programs.size(), std::nullopt);
@@ -320,8 +333,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     bool drawHit = false;
     bool verifyHit = false;
     if (Graphics::CheckpointsRequested() && !programs.empty()) Graphics::SetCheckpointWork(programs.front().binary.codeAddress, programs.back().binary.codeAddress);
+    setupSpan.Stop();
+    PrepareProfile::Scope lookupSpan(PrepareProfile::DLookup, prepareProfile);
     lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey.key, entry, matched, matchedRegions, hits, drawHit, verifyHit, phaseTiming, phaseMs, relocating);
 
+    lookupSpan.Stop();
+    PrepareProfile::Scope vertexSpan(PrepareProfile::DVertex, prepareProfile);
     if (registerKey) {
 
         for (std::size_t i = 0; i < programs.size(); ++i) {
@@ -352,6 +369,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (main.instanceOffsetSgpr >= 0) parameters.firstInstance = drawUserWord(programs.front(), main.instanceOffsetSgpr);
     };
 
+    vertexSpan.Stop();
+    PrepareProfile::Scope stagesSpan(PrepareProfile::DStages, prepareProfile);
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
     auto& pushOffsets = scratch->pushOffsets;
     pushOffsets.assign(programs.size(), 0);
@@ -390,10 +409,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     // APS5_FAST_DRAW_VERIFY: the results bound above against the fast path's for this draw.
     if (FastDrawVerifyPending()) VerifyFastDrawStages(programResults, (drawHit || hits.partial) && (hits.data || hits.partial || relocating != nullptr), memory);
 
+    stagesSpan.Stop();
+    PrepareProfile::Scope cacheSpan(PrepareProfile::DCache, prepareProfile);
     cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, hits, fresh, drawKey, registerKey, decode, phaseTiming, relocating);
     // APS5_FAST_CENSUS: what the fast path would decline on, committed when the packet ends (F0).
     if (FastCensusActive()) NoteFastCensusDraw(queue, graphics, roles, programs, programResults, recompiled, stageCaptures, matchedRegions, decodeReads, drawParameters.indirect.has_value(), indirectCpu, ShaderRecompiler::DebugProbeActive() || dumpTarget != 0 || dumpSlot1 != 0);
     timing.Mark("shader_compile_and_link");
+    cacheSpan.Stop();
+    PrepareProfile::Scope tailSpan(PrepareProfile::DTail, prepareProfile);
 
     for (const auto& reads : decodeReads) {
         for (const auto& read : reads) memory.push_back({read.address, std::as_bytes(std::span(read.bytes))});
@@ -466,6 +489,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (const auto& region : memory) snapshots.push_back({region.guestAddress, region.bytes});
     };
     snapshot();
+    tailSpan.Stop();
     timing.Mark("post_compile_prepare");
     const auto lockForDraw = [&] {
         if (gpuLock.owns_lock()) return;
@@ -565,6 +589,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return drawn();
     }
 
+    PrepareProfile::Scope recipeSpan(PrepareProfile::DRecipe, prepareProfile);
     auto& recipeStages = scratch->recipeStages;
     recipeStages.clear();
     // A recipe replays the resources recorded with its variants' words: not for refreshed data.
@@ -592,6 +617,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     // APS5_RECORD_PIPE: the locked half goes to the recording thread with everything it reads
     // (the slot's scratch and RecordPipeDraw); any other draw drains first and records here.
+    recipeSpan.Stop();
+    PrepareProfile::Scope handOverSpan(PrepareProfile::DHandOver, prepareProfile);
     if (recordPipe && !gpuLock.owns_lock()) {
         const auto verdict = RecordPipeDrawVerdict(retry.level != 0 ? PipeCensusLock::Stale : lockedPrepare ? PipeCensusLock::Other : PipeCensusLock::Direct, !deferredLabels().labels.empty());
         if (verdict.eligible && scratch.Slot() && localDevice->Window() != nullptr) {
@@ -602,6 +629,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         drainRecordPipe(verdict.drain.value_or(PipeCensusDrain::Other));
         verifyRecordPipeDrained(memory, pipeConsumed, (packet[0] >> 8u) & 0xffu, drawKey.key);
     }
+    handOverSpan.Stop();
+    PrepareProfile::Scope lockedSpan(PrepareProfile::DLocked, prepareProfile);
     lockForDraw();
     noteDrawWriters(stages, submission.queue);
     phaseTiming.Phase(DrawRowVectors);
