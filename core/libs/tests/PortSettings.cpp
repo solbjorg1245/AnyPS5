@@ -1,6 +1,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/AddonContent.hpp"
 #include "prx/libc/include/PortSettings.hpp"
+#include "prx/libSceVideoOut/include/TitleJobBudget.hpp"
 #include "prx/libSceVideoOut/include/TitleRefreshField.hpp"
 #include "prx/libSceVideoOut/include/TitleStepWindow.hpp"
 #include "SceTypes.hpp"
@@ -203,6 +204,23 @@ static void TestRefreshField() {
     Require(same.action == Action::AlreadySet && !same.titleRewrote, "equal value: no store");
     Require(TitleRefreshField::Decide(1, 59.94f, std::nullopt, 59.94f, 29.97f).action == Action::AlreadySet, "first sight already holding the entry: no store");
     Require(decide(1, std::nanf(""), 41.0f).action == Action::Write, "any value once known: written");
+}
+
+static void TestJobBudget() {
+    using Action = TitleJobBudget::Action;
+    const auto decide = [](double limit, float unlocked, float mode60) { return TitleJobBudget::Decide(limit, unlocked, mode60); };
+    Require(TitleJobBudget::Bits(60.0f) == TitleJobBudget::UnlockedBits && TitleJobBudget::Bits(59.94f) == TitleJobBudget::Mode60Bits && TitleJobBudget::Bits(119.88f) == TitleJobBudget::PatchedMode60Bits,
+        "the image's bits: 60.0, 59.94 and patch_game.py's 119.88");
+    const auto at120 = decide(120.0, 60.0f, 59.94f);
+    Require(at120.action == Action::Write && at120.value == 120.0f, "120 over the title's 60 / 59.94: 120 into both");
+    Require(decide(144.0, 60.0f, 59.94f).action == Action::Write && decide(144.0, 60.0f, 59.94f).value == 144.0f, "144: 144");
+    for (const double limit : {PortSettings::GameRefresh60, 60.0, 60.005, 30.0, 0.0, std::nan("")}) Require(decide(limit, 60.0f, 59.94f).action == Action::NotAbove, "at or below the title's 60: left alone");
+    Require(decide(60.5, 60.0f, 59.94f).action == Action::Write, "just above 60: written");
+    Require(decide(120.0, 60.0f, 119.88f).action == Action::Write && decide(120.0, 60.0f, 119.88f).value == 120.0f, "patch_game.py --fps120's 119.88: replaced by the limit");
+    const auto already = decide(120.0, 120.0f, 120.0f);
+    Require(already.action == Action::AlreadySet && already.value == 120.0f, "both holding the limit: already set");
+    for (const auto& pair : {std::pair{59.94f, 59.94f}, std::pair{60.0f, 60.0f}, std::pair{60.0f, 59.95f}, std::pair{0.0f, 0.0f}, std::pair{120.0f, 59.94f}, std::pair{60.0f, 120.0f}, std::pair{std::nanf(""), 59.94f}})
+        Require(decide(120.0, pair.first, pair.second).action == Action::Refuse, "anything else: refused");
 }
 
 static void TestPresentMode() {
@@ -924,6 +942,7 @@ int main() {
     TestPacer();
     TestTitleStep();
     TestRefreshField();
+    TestJobBudget();
     TestPresentMode();
     TestDisplayFpsLimit();
     TestWindowSize();

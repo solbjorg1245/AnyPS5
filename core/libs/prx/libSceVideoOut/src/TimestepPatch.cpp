@@ -42,6 +42,9 @@ constexpr std::ptrdiff_t TitleStepFromRefreshTable = 0x142f8b4a0 - 0x142507b90;
 constexpr std::ptrdiff_t DisplaySlotFromRefreshTable = 0x142f1a988 - 0x142507b90;
 constexpr std::size_t DisplayRefreshOffset = 0x28;
 constexpr std::size_t DisplayFramesPerSecondOffset = 0x30;
+// APS5_JOB_BUDGET: FUN_141481b10's float pair (Unlocked 60.0, the 60 FPS mode 59.94; DAT_142509a28) this far from
+// the table, in the same read-only data.
+constexpr std::ptrdiff_t JobBudgetFromRefreshTable = 0x142509a28 - 0x142507b90;
 
 std::uint64_t nowNanos() {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -201,8 +204,9 @@ std::string titleStepDigest(const TitleStepWindow& steps, double seconds, std::u
     return digest;
 }
 
-// The main image's writable data holds [address, address + bytes) (NativeAspectPatch's check of the same slot).
-bool inWritableData(std::uintptr_t address, std::size_t bytes) {
+// The main image's writable data (writable) or read-only data (neither writable nor executable) holds
+// [address, address + bytes) (NativeAspectPatch's check of the display slot).
+bool inImageData(std::uintptr_t address, std::size_t bytes, bool writable) {
 #ifdef _WIN32
     auto* image = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
     if (image == nullptr) return false;
@@ -213,7 +217,9 @@ bool inWritableData(std::uintptr_t address, std::size_t bytes) {
     const auto* sections = IMAGE_FIRST_SECTION(nt);
     for (unsigned index = 0; index < nt->FileHeader.NumberOfSections; ++index) {
         const auto& section = sections[index];
-        if ((section.Characteristics & IMAGE_SCN_MEM_READ) == 0 || (section.Characteristics & IMAGE_SCN_MEM_WRITE) == 0 || section.VirtualAddress > nt->OptionalHeader.SizeOfImage) continue;
+        const auto flags = section.Characteristics;
+        const bool kind = writable ? (flags & IMAGE_SCN_MEM_WRITE) != 0 : (flags & (IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE)) == 0;
+        if ((flags & IMAGE_SCN_MEM_READ) == 0 || !kind || section.VirtualAddress > nt->OptionalHeader.SizeOfImage) continue;
         const auto begin = reinterpret_cast<std::uintptr_t>(image + section.VirtualAddress);
         if (address >= begin && address + bytes <= begin + std::min<std::size_t>(section.Misc.VirtualSize, nt->OptionalHeader.SizeOfImage - section.VirtualAddress)) return true;
     }
@@ -222,15 +228,17 @@ bool inWritableData(std::uintptr_t address, std::size_t bytes) {
     struct Query {
         std::uintptr_t begin;
         std::uintptr_t end;
+        bool writable;
         bool inside;
-    } query{address, address + bytes, false};
+    } query{address, address + bytes, writable, false};
     dl_iterate_phdr([](dl_phdr_info* image, std::size_t, void* data) {
         auto& result = *static_cast<Query*>(data);
         if (image->dlpi_name != nullptr && image->dlpi_name[0] != '\0') return 0;
         for (std::uint16_t index = 0; index < image->dlpi_phnum; ++index) {
             const auto& header = image->dlpi_phdr[index];
             const auto begin = static_cast<std::uintptr_t>(image->dlpi_addr + header.p_vaddr);
-            if (header.p_type == PT_LOAD && (header.p_flags & PF_W) != 0 && result.begin >= begin && result.end <= begin + header.p_memsz) result.inside = true;
+            const bool kind = result.writable ? (header.p_flags & PF_W) != 0 : (header.p_flags & (PF_W | PF_X)) == 0;
+            if (header.p_type == PT_LOAD && kind && result.begin >= begin && result.end <= begin + header.p_memsz) result.inside = true;
         }
         return 1;
     }, &query);
@@ -238,6 +246,7 @@ bool inWritableData(std::uintptr_t address, std::size_t bytes) {
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);
+    static_cast<void>(writable);
     return false;
 #endif
 }
@@ -253,10 +262,48 @@ bool displayFieldsWritable(std::uintptr_t object) {
 std::uint64_t* locateDisplaySlot(float* refreshTable, bool supported) {
     const auto slot = static_cast<std::uintptr_t>(static_cast<std::intptr_t>(reinterpret_cast<std::uintptr_t>(refreshTable)) + DisplaySlotFromRefreshTable);
     const char* reason = !supported ? "unsupported game build" : refreshTable == nullptr ? "refresh table not found"
-        : (slot % alignof(std::uint64_t) != 0 || !inWritableData(slot, sizeof(std::uint64_t))) ? "the display pointer slot is not in the executable's writable data" : nullptr;
+        : (slot % alignof(std::uint64_t) != 0 || !inImageData(slot, sizeof(std::uint64_t), true)) ? "the display pointer slot is not in the executable's writable data" : nullptr;
     if (reason == nullptr) return reinterpret_cast<std::uint64_t*>(slot);
     std::fprintf(stderr, "[timestep] refresh field: off, %s (APS5_TIMESTEP_FIELD=1)\n", reason);
     return nullptr;
+}
+
+// APS5_JOB_BUDGET: the job runner's float pair by its distance from the refresh table, 4-aligned and committed in
+// the image's read-only data like the table; nullptr when it is not there.
+float* locateJobBudget(float* refreshTable) {
+    const auto at = static_cast<std::uintptr_t>(static_cast<std::intptr_t>(reinterpret_cast<std::uintptr_t>(refreshTable)) + JobBudgetFromRefreshTable);
+    constexpr std::size_t bytes = 2 * sizeof(float);
+    if (at % alignof(std::uint32_t) != 0 || !inImageData(at, bytes, false)) return nullptr;
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) != sizeof(info) || info.State != MEM_COMMIT || (info.Protect & PAGE_GUARD) != 0
+        || at + bytes > reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize) return nullptr;
+#endif
+    return reinterpret_cast<float*>(at);
+}
+
+// Both floats of the pair, one aligned 32-bit store each, the page open for writing only meanwhile (store()'s idiom).
+bool storeJobBudget(float* at, float value) {
+#ifdef _WIN32
+    DWORD previous = 0;
+    if (VirtualProtect(at, 2 * sizeof(float), PAGE_READWRITE, &previous) == FALSE) return false;
+#elif defined(__linux__)
+    const auto page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
+    auto* base = reinterpret_cast<void*>(reinterpret_cast<std::uintptr_t>(at) & ~(page - 1));
+    const auto bytes = static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(at + 2) - reinterpret_cast<std::uintptr_t>(base));
+    if (mprotect(base, bytes, PROT_READ | PROT_WRITE) != 0) return false;
+#else
+    return false;
+#endif
+    storeFloat(at, value);
+    storeFloat(at + 1, value);
+#ifdef _WIN32
+    DWORD ignored = 0;
+    VirtualProtect(at, 2 * sizeof(float), previous, &ignored);
+#elif defined(__linux__)
+    mprotect(base, bytes, PROT_READ);
+#endif
+    return true;
 }
 
 }
@@ -277,6 +324,13 @@ TimestepPatch::TimestepPatch() {
         std::fprintf(stderr, "[timestep] refresh field: off, Timestep is fixed (APS5_TIMESTEP_FIELD=1)\n");
         std::fflush(stderr);
         refreshField = false;
+    }
+    // APS5_JOB_BUDGET follows the vblank the variable step is capped at: only with that step.
+    jobBudget = std::getenv("APS5_JOB_BUDGET") != nullptr;
+    if (jobBudget && !enabled) {
+        std::fprintf(stderr, "[timestep] job budget: left alone (Timestep is fixed) (APS5_JOB_BUDGET=1)\n");
+        std::fflush(stderr);
+        jobBudget = false;
     }
     // Without FpsLimit the render config picks the mode; the digest then assumes the 60 FPS one.
     mode30 = PortSettings::GameFramesPerSecond(settings) == 30;
@@ -307,6 +361,7 @@ void TimestepPatch::Flip(double vblankHz, std::uint64_t vblankCount) {
         // The probe only reads, so it also runs with the fixed step.
         if (probe) titleStep = locateTitleStep(located.table, supported);
         if (refreshField) displaySlot = locateDisplaySlot(table, supported);
+        if (jobBudget) applyJobBudget(cap, supported);
         std::fflush(stderr);
     }
     if (table != nullptr) {
@@ -399,6 +454,33 @@ void TimestepPatch::followRefreshField() {
     std::fflush(stderr);
 }
 
+// APS5_JOB_BUDGET, once when the table is looked for: the vblank (the variable step's cap) into the job runner's
+// budget for Unlocked and the 60 FPS mode (TitleJobBudget); one line either way. The 20 and 30 FPS modes' budgets
+// are immediates and stay.
+void TimestepPatch::applyJobBudget(double cap, bool supported) {
+    char reason[96] = "";
+    auto* at = supported && table != nullptr && TitleJobBudget::Above(cap) ? locateJobBudget(table) : nullptr;
+    if (!supported) std::snprintf(reason, sizeof(reason), "unsupported game build");
+    else if (table == nullptr) std::snprintf(reason, sizeof(reason), "refresh table not found");
+    else if (!TitleJobBudget::Above(cap)) std::snprintf(reason, sizeof(reason), "vblank %.2f Hz is not above the title's %.2f Hz", cap, TitleJobBudget::TitleHz);
+    else if (at == nullptr) std::snprintf(reason, sizeof(reason), "its address is not in the executable's read-only data");
+    if (at != nullptr) {
+        const auto unlocked = static_cast<float>(loadStep(at));
+        const auto mode60 = static_cast<float>(loadStep(at + 1));
+        const auto budget = TitleJobBudget::Decide(cap, unlocked, mode60);
+        if (budget.action == TitleJobBudget::Action::Refuse) std::snprintf(reason, sizeof(reason), "it holds %g / %g, not the title's 60 / 59.94", unlocked, mode60);
+        else if (budget.action == TitleJobBudget::Action::Write && !storeJobBudget(at, budget.value)) std::snprintf(reason, sizeof(reason), "cannot make its page writable");
+        else {
+            jobBudgetAt = at;
+            jobBudgetHz = budget.value;
+            std::fprintf(stderr, "[timestep] job budget %.2f Hz (title %.2f / %.2f%s) (APS5_JOB_BUDGET=1)\n", budget.value, unlocked, mode60,
+                budget.action == TitleJobBudget::Action::AlreadySet ? ", already set" : "");
+            return;
+        }
+    }
+    std::fprintf(stderr, "[timestep] job budget: left alone (%s) (APS5_JOB_BUDGET=1)\n", reason);
+}
+
 void TimestepPatch::report(std::uint64_t now, std::uint64_t vblankCount) {
     const double seconds = static_cast<double>(now - windowStart) / 1e9;
     const auto title = titleStep != nullptr ? titleStepDigest(titleSteps, seconds, vblankCount - std::min(windowVblank, vblankCount)) : std::string();
@@ -406,14 +488,20 @@ void TimestepPatch::report(std::uint64_t now, std::uint64_t vblankCount) {
     if (displaySlot != nullptr && fieldRefused) std::snprintf(field, sizeof(field), ", refresh field refused");
     else if (displaySlot != nullptr) std::snprintf(field, sizeof(field), ", refresh field writes %llu (mode changes %llu, left alone %llu)", static_cast<unsigned long long>(windowFieldWrites),
         static_cast<unsigned long long>(windowModeChanges), static_cast<unsigned long long>(windowFieldLeft));
+    // APS5_JOB_BUDGET: the floats should keep the budget (the title only reads them); shown only when they do not.
+    char budget[48] = "";
+    if (jobBudgetAt != nullptr) {
+        const int rewritten = (static_cast<float>(loadStep(jobBudgetAt)) != jobBudgetHz ? 1 : 0) + (static_cast<float>(loadStep(jobBudgetAt + 1)) != jobBudgetHz ? 1 : 0);
+        if (rewritten > 0) std::snprintf(budget, sizeof(budget), ", job budget rewritten %d", rewritten);
+    }
     if (table != nullptr) {
-        std::fprintf(stderr, "[timestep] 10 s: %llu flips (%.2f FPS), game speed %.3fx, variable step %.2f-%.2f Hz (%d FPS mode entry), %llu flips slower than the %.2f Hz floor%s%s%s\n",
+        std::fprintf(stderr, "[timestep] 10 s: %llu flips (%.2f FPS), game speed %.3fx, variable step %.2f-%.2f Hz (%d FPS mode entry), %llu flips slower than the %.2f Hz floor%s%s%s%s\n",
             static_cast<unsigned long long>(windowFlips), windowFlips / seconds, windowGameSeconds / seconds, windowMinHz, windowMaxHz, mode30 ? 30 : 60,
-            static_cast<unsigned long long>(windowFloored), floorHz, field, title.c_str(), NativeAspectPatch::Get().Digest().c_str());
+            static_cast<unsigned long long>(windowFloored), floorHz, field, budget, title.c_str(), NativeAspectPatch::Get().Digest().c_str());
     } else {
-        std::fprintf(stderr, "[timestep] 10 s: %llu flips (%.2f FPS), game speed %.3fx, fixed step (%d FPS mode)%s%s%s%s\n",
+        std::fprintf(stderr, "[timestep] 10 s: %llu flips (%.2f FPS), game speed %.3fx, fixed step (%d FPS mode)%s%s%s%s%s\n",
             static_cast<unsigned long long>(windowFlips), windowFlips / seconds, windowGameSeconds / seconds, mode30 ? 30 : 60,
-            enabled ? ", refresh table not found" : "", field, title.c_str(), NativeAspectPatch::Get().Digest().c_str());
+            enabled ? ", refresh table not found" : "", field, budget, title.c_str(), NativeAspectPatch::Get().Digest().c_str());
     }
     std::fflush(stderr);
     windowStart = now;

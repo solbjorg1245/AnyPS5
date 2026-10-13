@@ -7,6 +7,7 @@
 #include <mutex>
 #include <optional>
 #include "prx/libc/include/PortSettings.hpp"
+#include "prx/libSceVideoOut/include/TitleJobBudget.hpp"
 #include "prx/libSceVideoOut/include/TitleRefreshField.hpp"
 #include "prx/libSceVideoOut/include/TitleStepWindow.hpp"
 
@@ -31,6 +32,8 @@
 // APS5_TIMESTEP_FIELD=1 (with the variable step) makes the entries reach the title: FUN_14091b3a0 copies one
 // into the display object's refresh field (CRenderDisplay+0x28, which FUN_140b380e0 divides by) only when the
 // mode changes, so each flip also writes there the entry of the mode in effect (TitleRefreshField.hpp).
+// APS5_JOB_BUDGET=1 (with the variable step and a vblank above 60 Hz) writes the vblank once into the title's
+// main-thread job budget (TitleJobBudget.hpp), so queued jobs no longer hold every frame to about 1/60 s.
 class TimestepPatch {
 public:
     static TimestepPatch& Get();
@@ -81,6 +84,11 @@ private:
     std::uint64_t windowFieldWrites = 0;
     std::uint64_t windowModeChanges = 0;
     std::uint64_t windowFieldLeft = 0;
+    // APS5_JOB_BUDGET: the job runner's float pair (nullptr: off or left alone) and the budget stored there.
+    void applyJobBudget(double cap, bool supported);
+    bool jobBudget = false;
+    float* jobBudgetAt = nullptr;
+    float jobBudgetHz = 0.0f;
 };
 
 #endif
