@@ -391,7 +391,7 @@ inline void SetKey(Settings& settings, std::string_view key, std::string_view va
         else if (settings.upscalerSettings && (text == "port" || text == "fsr" || text == "dlss")) {
             settings.upscaler = Upscaler::Port;
             settings.upscalerBackend = text == "fsr" ? Upscaler::Fsr : text == "dlss" ? Upscaler::Dlss : Upscaler::Port;
-            if (text != "port") settings.warnings.push_back(origin + ": Upscaler = " + text + " is not available yet; using port (the port upscaler)");
+            if (text != "port") settings.warnings.push_back(origin + ": Upscaler = " + text + " is not available yet; using port (the port upscaler) unless APS5_UPSCALER_PLUGIN=1 loads a plugin");
         } else if (text == "fsr" || text == "dlss") settings.warnings.push_back(origin + ": Upscaler = " + text + " is not implemented yet; using off");
         else refuse(settings.upscalerSettings ? "off, port, fsr or dlss" : "off, fsr or dlss");
     } else if (name == "upscalerquality") {
@@ -964,7 +964,9 @@ inline std::vector<std::pair<std::string, std::string>> LauncherValues(const Set
         {"ButtonIcons", settings.buttonIcons == ButtonIcons::SteamDeck ? "steamdeck" : "playstation"},
         {"DeluxeEdition", settings.deluxeEdition == DeluxeEdition::Off ? "off" : "auto"}};
     if (settings.upscalerSettings) {
-        values.emplace_back("Upscaler", settings.upscaler == Upscaler::Off ? "off" : "port");
+        // fsr and dlss stay as written (S4: an APS5_UPSCALER_PLUGIN plugin takes them; the port pass until then).
+        const auto backend = settings.upscalerBackend == Upscaler::Fsr ? "fsr" : settings.upscalerBackend == Upscaler::Dlss ? "dlss" : "port";
+        values.emplace_back("Upscaler", settings.upscaler == Upscaler::Off ? "off" : backend);
         values.emplace_back("UpscalerQuality", PresetOf(settings.upscalerQuality).name);
     }
     return values;

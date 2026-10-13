@@ -678,6 +678,8 @@ static void TestUpscalerSettings() {
     const auto saved = PortSettings::SetIniValues("", PortSettings::LauncherValues(performance));
     const auto reread = parsed(saved, true);
     Require(saved.find("Upscaler = port\n") != std::string::npos && reread.upscaler == Upscaler::Port && reread.upscalerQuality == UpscalerQuality::Performance, "launcher round trip");
+    const auto dlssSaved = PortSettings::SetIniValues("", PortSettings::LauncherValues(parsed("Upscaler = dlss\n", true)));
+    Require(dlssSaved.find("Upscaler = dlss\n") != std::string::npos && parsed(dlssSaved, true).upscalerBackend == Upscaler::Dlss, "launcher: dlss (a plugin backend) survives a save");
     auto chosen = performance;
     chosen.nativeAspect = true;
     PortSettings::ApplyLauncherRules(chosen);

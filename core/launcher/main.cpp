@@ -568,6 +568,7 @@ void DrawUpscaler(Model& model, bool nativeAspect) {
         for (int index = 0; index < IM_ARRAYSIZE(names); ++index) {
             if (ImGui::Selectable(names[index], index == current, index >= 2 ? ImGuiSelectableFlags_Disabled : 0)) {
                 model.settings.upscaler = index == 1 ? PortSettings::Upscaler::Port : PortSettings::Upscaler::Off;
+                model.settings.upscalerBackend = model.settings.upscaler;
             }
         }
         ImGui::EndCombo();
