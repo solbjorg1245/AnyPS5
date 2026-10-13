@@ -236,6 +236,8 @@ bool requiresPointSampler(const ResourceSpecialization::Image& image) {
 }
 
 constexpr std::uint32_t TableEntryBytes = 32;
+// The entries past a runtime-key table's span read for valid T#s (APS5_LOOP_TABLE_RUN).
+constexpr std::uint32_t RuntimeKeyPeekEntries = 16;
 
 // Bindless image tables: the most material records mode M reads to enumerate a table's keys
 // (APS5_BINDLESS_MATERIAL_SCAN, default 256); beyond it the whole table is bound instead.
@@ -279,6 +281,17 @@ struct BindlessCounters {
     // APS5_LOOP_TABLE_FIT: loop-counter tables cut to fit the image slots, and the entries cut.
     std::atomic<std::uint64_t> loopFitted{0};
     std::atomic<std::uint64_t> loopEntriesCut{0};
+    // APS5_LOOP_TABLE_RUN: runtime-key (waterfall) tables resolved through their records, and the
+    // distinct keys mapped; the others spanned, and the valid T#s just past their span
+    // (RuntimeKeyPeekEntries read). The totals are for TakeRuntimeKeyTables.
+    std::atomic<std::uint64_t> runtimeProbed{0};
+    std::atomic<std::uint64_t> runtimeKeys{0};
+    std::atomic<std::uint64_t> runtimeSpanned{0};
+    std::atomic<std::uint64_t> runtimePastSpan{0};
+    std::atomic<std::uint64_t> runtimeProbedTotal{0};
+    std::atomic<std::uint64_t> runtimeKeysTotal{0};
+    std::atomic<std::uint64_t> runtimeSpannedTotal{0};
+    std::atomic<std::uint64_t> runtimePastSpanTotal{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(BindlessRejection::Count)> rejected{};
     std::atomic<long long> lastReport{0};
 };
@@ -316,9 +329,20 @@ void reportBindless() {
     const auto tables = material + whole;
     // APS5_LOOP_TABLE_FIT: the loop tables cut to fit the image slots (served instead of thrown as
     // "need N image slots"); keys at or past the cut sample zeros.
-    char fitted[128] = "";
+    char fitted[256] = "";
     if (ResourceMaterializer::LoopTableFit()) {
         std::snprintf(fitted, sizeof(fitted), "; loop tables fitted to the image slots %llu (entries cut %llu)", static_cast<unsigned long long>(counters.loopFitted.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.loopEntriesCut.exchange(0, std::memory_order_relaxed)));
+    }
+    // APS5_LOOP_TABLE_RUN: the waterfall-key tables bound (they were dispatches skipped as
+    // "GetImageResource dword 0"): through their records (exact), or spanning the slots with the
+    // valid T#s past the span (keys no slot maps; 0 = exact).
+    if (ResourceMaterializer::RuntimeKeyTables()) {
+        const auto probed = counters.runtimeProbed.exchange(0, std::memory_order_relaxed);
+        const auto runtimeKeys = counters.runtimeKeys.exchange(0, std::memory_order_relaxed);
+        const auto spanned = counters.runtimeSpanned.exchange(0, std::memory_order_relaxed);
+        const auto pastSpan = counters.runtimePastSpan.exchange(0, std::memory_order_relaxed);
+        const auto used = std::strlen(fitted);
+        std::snprintf(fitted + used, sizeof(fitted) - used, "; runtime-key tables: by record %llu (keys avg %.1f), spanned %llu (valid T#s past the span %llu)", static_cast<unsigned long long>(probed), probed != 0u ? static_cast<double>(runtimeKeys) / static_cast<double>(probed) : 0.0, static_cast<unsigned long long>(spanned), static_cast<unsigned long long>(pastSpan));
     }
     std::fprintf(stderr, "[bindless] (10 s): tables bound %llu (mode M %llu, mode T %llu; loop-counter %llu), slots %u, keys avg %.1f, entries unmapped (sample zeros): null/invalid %llu, shape %llu, conversion %llu, out of range %llu; rejected: capacity %llu, material scan %llu, no entry %llu, storage %llu, non-uniform %llu, image slots %llu, loop entry %llu, table entry %llu%s%s%s\n",
         static_cast<unsigned long long>(tables), static_cast<unsigned long long>(material), static_cast<unsigned long long>(whole), static_cast<unsigned long long>(counters.tablesLoop.exchange(0, std::memory_order_relaxed)), ResourceMaterializer::BindlessSlots(), tables != 0 ? static_cast<double>(keys) / static_cast<double>(tables) : 0.0,
@@ -389,10 +413,13 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     if (table.hasMaterial && table.selectorStride != 0u) {
         DescriptorValue materialValue;
         walker.EvaluateDescriptorSource(plan, table.materialSource, runtime, materialValue);
-        const ShaderBufferResource material = decodeBufferDescriptor(materialValue);
-        materialBase = material.Base48();
-        const std::uint64_t materialSize = material.GetSize();
-        materialEntries = static_cast<std::uint32_t>(std::min<std::uint64_t>(materialSize / table.selectorStride, std::numeric_limits<std::uint32_t>::max()));
+        // Records behind a raw address (a waterfall key's) have no V# to size them: their count
+        // is the record index's range, and a null address (no records bound) reads none.
+        const bool recordAddress = table.materialRecords != 0u;
+        const ShaderBufferResource material = recordAddress ? ShaderBufferResource{} : decodeBufferDescriptor(materialValue);
+        materialBase = recordAddress ? ((static_cast<std::uint64_t>(materialValue.dwords[1]) << 32u) | materialValue.dwords[0]) & 0xffffffffffffull : material.Base48();
+        const std::uint64_t materialSize = recordAddress ? (materialBase != 0u ? table.selectorOffset + static_cast<std::uint64_t>(table.materialRecords) * table.selectorStride + sizeof(std::uint32_t) : 0u) : material.GetSize();
+        materialEntries = recordAddress ? (materialBase != 0u ? table.materialRecords : 0u) : static_cast<std::uint32_t>(std::min<std::uint64_t>(materialSize / table.selectorStride, std::numeric_limits<std::uint32_t>::max()));
         if (materialEntries <= MaterialScanLimit()) {
             materialMode = true;
             for (std::uint32_t record = 0; record < materialEntries; record++) {
@@ -400,6 +427,11 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
                 if (offset + sizeof(std::uint32_t) > materialSize) break;
                 std::uint32_t key = 0;
                 readWord(materialBase + offset, key);
+                // A negative record key is a record without a texture: the waterfall passes skip it
+                // (v_cmpx_le_i32 0, key before the loop), so no lane selects it.
+                if (recordAddress && static_cast<std::int32_t>(key) < 0) {
+                    continue;
+                }
                 if (key >= entries) {
                     outOfRange++;
                     continue;
@@ -421,6 +453,34 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         for (std::uint32_t key = 0; key < entries; key++) keys[key] = key;
     }
     counters.outOfRange.fetch_add(outOfRange, std::memory_order_relaxed);
+    // A waterfall key (runtimeKey) has no bound of its own: the table spans the bindless slots, and
+    // the entries just past them are read as well. A valid T# there is a texture the table holds
+    // that no slot maps (its key would sample zeros where the PS5 samples it), counted on the
+    // [bindless] line; the scan stops at unreadable memory.
+    // One keyed through its records maps every key they hold.
+    if (table.runtimeKey && materialMode) {
+        counters.runtimeProbed.fetch_add(1, std::memory_order_relaxed);
+        counters.runtimeProbedTotal.fetch_add(1, std::memory_order_relaxed);
+        counters.runtimeKeys.fetch_add(keys.size(), std::memory_order_relaxed);
+        counters.runtimeKeysTotal.fetch_add(keys.size(), std::memory_order_relaxed);
+    } else if (table.runtimeKey) {
+        counters.runtimeSpanned.fetch_add(1, std::memory_order_relaxed);
+        counters.runtimeSpannedTotal.fetch_add(1, std::memory_order_relaxed);
+        std::uint64_t past = 0;
+        for (std::uint32_t key = entries; addressBase != 0u && key < entries + RuntimeKeyPeekEntries; key++) {
+            DescriptorValue entry;
+            entry.dwordCount = 8u;
+            const std::uint64_t address = addressBase + table.entryOffset + static_cast<std::uint64_t>(key) * TableEntryBytes;
+            bool readable = true;
+            for (std::uint32_t dword = 0; dword < (image.r128 ? 4u : 8u) && readable; dword++) {
+                readable = runtime.readMemory(runtime.userContext, address + dword * sizeof(std::uint32_t), &entry.dwords[dword]);
+            }
+            if (!readable) break;
+            if (!nullImageDescriptor(entry) && validImageDescriptor(entry, image.r128) && imageAddressBelowUserLimit(entry)) past++;
+        }
+        counters.runtimePastSpan.fetch_add(past, std::memory_order_relaxed);
+        counters.runtimePastSpanTotal.fetch_add(past, std::memory_order_relaxed);
+    }
     // A table that selects nothing (or nothing usable) binds null images and an empty mapping:
     // every key then misses the mapping and samples zeros, as an unbound descriptor does on the
     // GPU. Demon's Souls dispatches such tables for materials that have no textures yet.
@@ -450,10 +510,10 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         candidate.dwordCount = 8u;
         const std::uint64_t address = heapBase + table.entryOffset + static_cast<std::uint64_t>(keys[i]) * TableEntryBytes;
         // An entry in unreadable memory (a table bounded past its end) is a null entry rather than
-        // the end of the draw.
+        // the end of the draw. A runtime-key table's span is no bound the game set: always so.
         bool readable = true;
         for (std::uint32_t dword = 0; dword < (image.r128 ? 4u : 8u) && readable; dword++) {
-            if (!ResourceMaterializer::NullUndecodable()) {
+            if (!ResourceMaterializer::NullUndecodable() && !table.runtimeKey) {
                 readWord(address + dword * sizeof(std::uint32_t), candidate.dwords[dword]);
             } else {
                 readable = runtime.readMemory(runtime.userContext, address + dword * sizeof(std::uint32_t), &candidate.dwords[dword]);
@@ -1184,6 +1244,25 @@ bool ResourceMaterializer::LoopTableFit() {
         return off == nullptr || *off == '\0' || std::strcmp(off, "0") == 0;
     }();
     return enabled;
+}
+
+// Default on (s62, R-LOOPTABLE): APS5_LOOP_TABLE_RUN=0 fails the waterfall-key dispatches as before.
+bool ResourceMaterializer::RuntimeKeyTables() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_LOOP_TABLE_RUN");
+        return value == nullptr || *value == '\0' || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+ResourceMaterializer::RuntimeKeyCounts ResourceMaterializer::TakeRuntimeKeyTables() {
+    auto& counters = bindlessCounters();
+    RuntimeKeyCounts taken;
+    taken.probed = counters.runtimeProbedTotal.exchange(0, std::memory_order_relaxed);
+    taken.keys = counters.runtimeKeysTotal.exchange(0, std::memory_order_relaxed);
+    taken.spanned = counters.runtimeSpannedTotal.exchange(0, std::memory_order_relaxed);
+    taken.pastSpan = counters.runtimePastSpanTotal.exchange(0, std::memory_order_relaxed);
+    return taken;
 }
 
 std::uint32_t ResourceMaterializer::LoopTableSpan(std::uint32_t fixedSlots, const std::vector<std::uint32_t>& loopSlots, std::uint32_t limit) {
