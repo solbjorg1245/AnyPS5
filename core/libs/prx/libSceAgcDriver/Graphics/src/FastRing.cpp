@@ -65,10 +65,19 @@ FastRing::FastRing(const Context& context, VkDeviceSize bytes) : context(context
         Check(context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &buffer), "vkCreateBuffer fast ring");
         VkMemoryRequirements requirements{};
         context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, buffer, &requirements);
-        // The CPU only writes the ring and the GPU reads it once: uncached host memory is right.
+        // The CPU only writes the ring and the GPU reads it once: uncached host memory is right
+        // (host-visible video memory under APS5_VRAM_FLOOR when the device has it).
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (VramFloor(VramFloorBar)) {
+            try {
+                allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, GpuReadHostProperties());
+                NoteVramFloorBuffer(requirements.size, true);
+            } catch (const std::runtime_error&) {
+                NoteVramFloorBuffer(requirements.size, false);
+            }
+        }
         Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory fast ring");
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory fast ring");
         void* data = nullptr;

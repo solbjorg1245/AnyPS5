@@ -4334,7 +4334,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
                 if (!staged) {
                     if (!gpuCopyEligible(region)) continue;
                     const auto allocateStart = std::chrono::steady_clock::now();
-                    region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable), copyBufferProperties(false));
+                    region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable), region.writable ? copyBufferProperties(false) : GpuReadHostProperties());
                     if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
                 }
                 region.deviceLocal = staged;
@@ -4638,7 +4638,8 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     }
     const auto allocateStart = std::chrono::steady_clock::now();
     // A buffer made by UploadPrepare for a GPU copy that fell back here (its import went) is kept.
-    if (region.buffer == nullptr) region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), usage);
+    // A written region's copy is read back by the CPU: it stays in cached host memory.
+    if (region.buffer == nullptr) region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), usage, region.writable ? copyBufferProperties(false) : GpuReadHostProperties());
     const auto readStart = std::chrono::steady_clock::now();
     if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
     // Named for the [hooksync] attribution: the reads below go through the flush hook.
@@ -4695,7 +4696,7 @@ void GuestBufferMemory::allocateRegionBuffer(Region& region, bool addressable) {
         region.deviceLocal = false;
         region.unstaged = true;
         region.baselineDelta = 0;
-        region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable), copyBufferProperties(false));
+        region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable), region.writable ? copyBufferProperties(false) : GpuReadHostProperties());
     }
     if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
 }
@@ -5848,8 +5849,9 @@ void GuestBufferMemory::recordResidentReads(Recorder& recorder, std::span<Region
             case Unwatched: ++cache.counts.refreshUnwatched; break;
             default: ++cache.counts.refreshWriter; break;
         }
-        // Refreshed at most uses (a block rewritten every frame): new builds bind it in place.
-        if (copy.refreshes >= 8 && copy.refreshes * 4 > copy.uses * 3) {
+        // Refreshed at most uses (a block rewritten every frame): new builds bind it in place
+        // (never under APS5_VRAM_FLOOR: ResidentReadSettings::demote).
+        if (settings.demote && copy.refreshes >= 8 && copy.refreshes * 4 > copy.uses * 3) {
             const std::pair<std::uint64_t, std::uint64_t> key{copy.begin, copy.end};
             if (const auto found = cache.entries.find(key); found != cache.entries.end() && found->second.get() == &copy) {
                 dropResidentEntry(cache, found, released);

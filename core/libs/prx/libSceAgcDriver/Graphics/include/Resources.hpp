@@ -179,6 +179,30 @@ void NoteImagePoison(std::uint64_t bytes, bool pooled);
 // The [pool-poison] line (BufferPool's 10 s report); nothing while the switch is off.
 void ReportPoolPoison();
 
+// Experiment APS5_VRAM_FLOOR=1 (default off; s62 P-VRAM, docs/design/resident-memory-3.md): the
+// floor of host-memory latency in the GPU time. What the GPU reads from host memory moves to video
+// memory, whatever that costs on the CPU, so a profile against the same binary without the switch
+// shows how much of the GPU time is reads over the bus. APS5_VRAM_FLOOR_PARTS (a mask, default all)
+// picks the parts: 1 (VramFloorBar) buffers the CPU fills and the GPU only reads (BDA tables, the
+// fast ring, draw input and binding snapshots, data buffers, read-only copied regions) in
+// host-visible video memory (ReBAR); 2 dispatch read-only regions as resident copies of any size,
+// never demoted (APS5_RESIDENT_READS, 2048 MiB unless APS5_RESIDENT_READS_MIB is set); 4 draw index
+// and vertex inputs as snapshots instead of the import; 8 a draw's moved descriptor elements as
+// snapshots instead of the import. What stays in host memory: a draw build's descriptor regions,
+// GPU-side indirect arguments, BDA (address-based) reads, written regions, transfers. The [vram]
+// line counts the video-memory host buffers made (APS5_PROFILE_DRAW).
+enum VramFloorPart : unsigned { VramFloorBar = 1, VramFloorDispatchReads = 2, VramFloorDrawInputs = 4, VramFloorDrawBindings = 8, VramFloorAll = 15 };
+// The parts from the two variables' values (either may be null): 0 while the first is unset or 0.
+unsigned VramFloorPartsFrom(const char* enabled, const char* parts);
+bool VramFloor(unsigned part);
+// HOST_VISIBLE | HOST_COHERENT, plus DEVICE_LOCAL under VramFloorBar: for a buffer the CPU writes
+// and only the GPU reads. Buffer falls back to host memory when no such type or memory is left.
+VkMemoryPropertyFlags GpuReadHostProperties();
+// A video-memory host buffer made (placed) or one that fell back to host memory (!placed).
+void NoteVramFloorBuffer(std::uint64_t bytes, bool placed) noexcept;
+// The floor's counts appended to the [vram] line, reset each call; empty while the switch is off.
+std::string VramFloorReport();
+
 // Records a whole-range buffer copy.
 void CopyBuffer(const Context& context, VkCommandBuffer commands, VkBuffer source, VkDeviceSize sourceOffset, VkBuffer destination, VkDeviceSize destinationOffset, VkDeviceSize bytes);
 
