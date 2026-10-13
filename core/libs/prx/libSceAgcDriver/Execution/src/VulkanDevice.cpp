@@ -354,6 +354,8 @@ struct VulkanDevice::State {
     std::unique_ptr<Graphics::GpuColorTransfer> colorTransfer;
     // APS5_MFSR_EXEC's pass (UpscaleBilinear), made on first use.
     std::unique_ptr<Graphics::BilinearUpscaler> upscaler;
+    // APS5_UPSCALER_PORT's pass and history images (UpscaleTemporal), made on first use.
+    std::unique_ptr<Graphics::TemporalUpscaler> temporalUpscaler;
     std::shared_ptr<Graphics::BufferPool> bufferPool;
     std::unique_ptr<Graphics::Buffer> emptyBuffer;
     std::unique_ptr<Graphics::TextureCache> textureCache;
@@ -661,6 +663,7 @@ struct VulkanDevice::State {
             Graphics::ClearStagedShadows(device);
             patternBuffers.clear();
             upscaler.reset();
+            temporalUpscaler.reset();
             fastRing.reset();
             fastLayouts.reset();
             descriptorCache.reset();
@@ -2591,6 +2594,12 @@ std::optional<Upscale::Skip> VulkanDevice::UpscaleBilinear(const Upscale::Plan& 
     const auto context = graphicsContext();
     if (state->upscaler == nullptr) state->upscaler = std::make_unique<Graphics::BilinearUpscaler>(context);
     return state->upscaler->Record(context, plan);
+}
+
+std::optional<Upscale::Skip> VulkanDevice::UpscaleTemporal(const Upscale::TemporalPlan& plan) {
+    const auto context = graphicsContext();
+    if (state->temporalUpscaler == nullptr) state->temporalUpscaler = std::make_unique<Graphics::TemporalUpscaler>(context);
+    return state->temporalUpscaler->Record(context, plan);
 }
 
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {

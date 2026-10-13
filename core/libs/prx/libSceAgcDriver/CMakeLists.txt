@@ -74,6 +74,20 @@ add_custom_command(
         VERBATIM
 )
 
+# APS5_UPSCALER_PORT's temporal upscale pass (Graphics/src/Upscale.cpp).
+set(agcUpscaleTemporalShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/UpscaleTemporal.comp)
+set(agcUpscaleTemporalShaderSpv ${agcTextureDetileGeneratedDir}/UpscaleTemporal.spv)
+set(agcUpscaleTemporalShaderHeader ${agcTextureDetileGeneratedDir}/UpscaleTemporal_spv.h)
+add_custom_command(
+        OUTPUT "${agcUpscaleTemporalShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcUpscaleTemporalShaderSpv}" "${agcUpscaleTemporalShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcUpscaleTemporalShaderSpv} -DOUTPUT=${agcUpscaleTemporalShaderHeader}
+        -DSYMBOL=UPSCALE_TEMPORAL_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcUpscaleTemporalShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
@@ -180,6 +194,7 @@ set(agcDriverSources
         ${agcTextureDetileShaderHeader}
         ${agcCopyBackDiffShaderHeader}
         ${agcUpscaleBilinearShaderHeader}
+        ${agcUpscaleTemporalShaderHeader}
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Event.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Query.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Resource/src/Lifecycle.cpp

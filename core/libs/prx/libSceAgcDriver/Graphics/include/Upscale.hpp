@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Upscale/Upscale.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include <memory>
 #include <optional>
 
 namespace AgcDriver::Graphics {
@@ -27,6 +28,31 @@ private:
     const FastLayout* layout = nullptr;
     VkSampler sampler = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    void release() noexcept;
+};
+
+// APS5_UPSCALER_PORT's pass (docs/design/dlss.md S2, shaders/UpscaleTemporal.comp): its pipeline and
+// samplers, made once per device (VulkanDevice keeps it), and two output-size RGBA16F history images,
+// made at the first pass and again when the output size changes, read and written in turn.
+class TemporalUpscaler {
+public:
+    explicit TemporalUpscaler(const Context& context);
+    ~TemporalUpscaler();
+    TemporalUpscaler(const TemporalUpscaler&) = delete;
+    TemporalUpscaler& operator=(const TemporalUpscaler&) = delete;
+    // As BilinearUpscaler::Record, reading MainColor, Motion, MainDepth and the last history, writing
+    // the next history and the output (a reset when the history images are new).
+    std::optional<Upscale::Skip> Record(const Context& context, const Upscale::TemporalPlan& plan);
+    struct HistoryImage;
+
+private:
+    Context context;
+    const FastLayout* layout = nullptr;
+    VkSampler linear = VK_NULL_HANDLE, nearest = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    std::array<std::shared_ptr<HistoryImage>, 2> history;
+    // The image the next pass reads.
+    std::size_t newest = 0;
     void release() noexcept;
 };
 

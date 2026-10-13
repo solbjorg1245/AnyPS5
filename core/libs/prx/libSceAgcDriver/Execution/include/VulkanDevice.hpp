@@ -345,6 +345,8 @@ public:
     // APS5_MFSR_EXEC's pass (Graphics::BilinearUpscaler, made on first use), under the mutex after
     // the packet's labels: nullopt once recorded, else why nothing was.
     std::optional<Upscale::Skip> UpscaleBilinear(const Upscale::Plan& plan);
+    // APS5_UPSCALER_PORT's pass (Graphics::TemporalUpscaler, made on first use), as UpscaleBilinear.
+    std::optional<Upscale::Skip> UpscaleTemporal(const Upscale::TemporalPlan& plan);
     // A draw-cache hit recorded from its recipe (Graphics::DrawWithRecipe), under the mutex after
     // the packet's labels; Rebuild when the recipe's device is not this one or DrawWithRecipe
     // missed (nothing recorded: the caller runs Draw with the hit's stages and re-attaches).

@@ -1361,6 +1361,64 @@ void testUpscalePlan() {
     check(!Upscale::Enabled(nullptr) && !Upscale::Enabled("") && !Upscale::Enabled("0") && Upscale::Enabled("1"), "upscale: off unless APS5_MFSR_EXEC is set and not 0");
 }
 
+// The temporal upscaler's plan (docs/design/dlss.md S2): its resets (the packet's bit, a first frame,
+// a size change), the skips for a missing Motion or MainDepth, the signs knob, the groups.
+void testUpscaleTemporalPlan() {
+    using namespace AgcDriver;
+    const auto image = [](std::uint32_t width, std::uint32_t height, std::uint32_t format) {
+        MfsrPacket::Descriptor words{};
+        words[1] = (format << 20u) | (((width - 1u) & 3u) << 30u);
+        words[2] = ((width - 1u) >> 2u) | ((height - 1u) << 14u);
+        return words;
+    };
+    MfsrPacket::Dispatch dispatch;
+    dispatch.present = 0x2f;
+    dispatch.images = {image(3840, 2160, 0x40), image(2688, 1512, 0x41), image(2688, 1512, 0x13), image(2688, 1512, 0x14), {}};
+    const auto set = [&](std::size_t offset, const auto& value) { std::memcpy(dispatch.block.data() + offset, &value, sizeof(value)); };
+    set(MfsrPacket::RenderSizeOffset, std::array<std::uint32_t, 2>{2688, 1512});
+    set(MfsrPacket::JitterOffset, std::array<float, 2>{0.25f, -0.125f});
+    set(MfsrPacket::MotionScaleOffset, std::array<float, 2>{-2688.0f, -1512.0f});
+    const auto defaults = Upscale::ParseSigns(nullptr);
+    const auto planOf = [&](const Upscale::History& previous, const Upscale::Signs& signs) {
+        const auto planned = Upscale::PlanTemporal(dispatch, previous, signs);
+        const auto* plan = std::get_if<Upscale::TemporalPlan>(&planned);
+        return plan != nullptr ? std::optional<Upscale::TemporalPlan>(*plan) : std::nullopt;
+    };
+    const auto skipOf = [&] {
+        const auto planned = Upscale::PlanTemporal(dispatch, {}, defaults);
+        const auto* skip = std::get_if<Upscale::Skip>(&planned);
+        return skip != nullptr ? std::optional<Upscale::Skip>(*skip) : std::nullopt;
+    };
+    const auto first = planOf({}, defaults);
+    check(first && first->reset && first->base.groups == std::array<std::uint32_t, 2>{480, 270} && first->motionWords == dispatch.images[2] && first->depthWords == dispatch.images[3], "upscale port: a first frame resets, 8x8 groups cover the output, Motion and MainDepth are carried");
+    check(first->next.output == std::array<std::uint32_t, 2>{3840, 2160} && first->next.render == std::array<std::uint32_t, 2>{2688, 1512}, "upscale port: the history the pass leaves has the output and render sizes");
+    check(first->jitter == std::array<float, 2>{0.25f, -0.125f} && first->motionScale == std::array<float, 2>{-2688.0f, -1512.0f} && !first->smallestNearest && defaults.letters[0] == '\0', "upscale port: by default the jitter as stored, the MV scale as given, reversed Z");
+    check(!planOf(first->next, defaults)->reset, "upscale port: the same sizes keep the history");
+    set(MfsrPacket::ResetOffset, std::uint8_t{1});
+    check(planOf(first->next, defaults)->reset, "upscale port: the packet's reset bit resets");
+    set(MfsrPacket::ResetOffset, std::uint8_t{0});
+    set(MfsrPacket::RenderSizeOffset, std::array<std::uint32_t, 2>{1920, 1080});
+    check(planOf(first->next, defaults)->reset, "upscale port: a render size change resets");
+    set(MfsrPacket::RenderSizeOffset, std::array<std::uint32_t, 2>{2688, 1512});
+    dispatch.images[0] = image(2560, 1440, 0x40);
+    const auto smaller = planOf(first->next, defaults);
+    check(smaller->reset && smaller->base.groups == std::array<std::uint32_t, 2>{320, 180}, "upscale port: an output size change resets");
+    dispatch.images[0] = image(3840, 2160, 0x40);
+    const auto flipped = planOf(first->next, Upscale::ParseSigns("yjz"));
+    check(flipped->jitter == std::array<float, 2>{-0.25f, -0.125f} && flipped->motionScale == std::array<float, 2>{-2688.0f, 1512.0f} && flipped->smallestNearest, "upscale port: y flips the MV scale's y, j the jitter's x, z the depth order");
+    const auto every = Upscale::ParseSigns("kxjyq");
+    check(every.motion == std::array<float, 2>{-1.0f, -1.0f} && every.jitter == std::array<float, 2>{-1.0f, -1.0f} && !every.smallestNearest && std::string(every.letters.data()) == "xyjk", "upscale port: the knob's letters in any order, others ignored, logged in xyjkz order");
+    dispatch.present = 0x2b;
+    check(skipOf() == Upscale::Skip::NoMotion, "upscale port: no Motion T#, bilinear instead");
+    dispatch.present = 0x27;
+    check(skipOf() == Upscale::Skip::NoDepth, "upscale port: no MainDepth T#, bilinear instead");
+    dispatch.present = 0x2e;
+    check(skipOf() == Upscale::Skip::NoOutput, "upscale port: the bilinear plan's skips come first");
+    dispatch.present = 0x2f;
+    set(MfsrPacket::JitterOffset, std::array<float, 2>{std::numeric_limits<float>::quiet_NaN(), 0.0f});
+    check(skipOf() == Upscale::Skip::Parameters, "upscale port: a jitter that is not finite, bilinear instead");
+}
+
 // Native aspect's UI rect (AspectFit): the part of the 16:9 display buffer that is shown undistorted
 // at the window's aspect, and a viewport or scissor carried into it.
 void testUndistortedRect() {
@@ -1431,6 +1489,7 @@ int main() {
         testUndistortedRect();
         testMfsrPacket();
         testUpscalePlan();
+        testUpscaleTemporalPlan();
         LibcRunShutdown_nid_postfix();
         std::puts("AGC driver submit tests passed");
         return 0;
