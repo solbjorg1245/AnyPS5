@@ -1539,6 +1539,56 @@ void verifyComputedTexelOffsets() {
     }
 }
 
+// Device storage buffer bounds (SpirvTarget::deviceStorageBufferBounds, APS5_ROBUST_BUFFERS): a
+// plain buffer load and store lose their index < length check, an atomic keeps it, and the flag
+// survives serialization.
+void verifyDeviceStorageBufferBounds() {
+    using namespace ShaderRecompiler;
+    static std::array<std::uint32_t, 64> output{};
+    const auto outputBase = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
+    const std::array<std::uint32_t, 16> userData{0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u,
+        static_cast<std::uint32_t>(outputBase), static_cast<std::uint32_t>((outputBase >> 32u) & 0xffffu), 256u, 0xfacu};
+    // buffer_load_dword v1, s[12:15] offset 0; buffer_store_dword v1, s[12:15] offset 4; s_endpgm.
+    const std::vector<std::uint32_t> loadStore{0xe0300000u, 0x80030100u, 0xe0700004u, 0x80030100u, 0xbf810000u};
+    // v_mov_b32 v1, 1; buffer_atomic_add v1, s[12:15] offset 8; s_endpgm.
+    const std::vector<std::uint32_t> atomic{0x7e020281u, 0xe0c80008u, 0x80030100u, 0xbf810000u};
+    const auto recompile = [&](const std::vector<std::uint32_t>& code, bool device) {
+        RecompileRequest request{};
+        request.shader = {ShaderStage::Compute, 0x30000u, code, 0, {}};
+        request.context.waveSize = 32;
+        request.context.userDataBaseRegister = 0;
+        request.context.userData = userData;
+        request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = 32;
+        request.target.fragmentShaderBarycentricEnabled = false;
+        request.target.deviceStorageBufferBounds = device;
+        request.layout.pushConstantSizeBytes = 128;
+        request.useCache = false;
+        AgcDriver::ShaderMemory memory({});
+        static_cast<void>(memory.Capture(request));
+        request.context.memory = memory.Regions();
+        if (device) require(RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(request)).request.target.deviceStorageBufferBounds, "device bounds: the flag was lost in serialization");
+        return Recompile(request).spirv;
+    };
+    const auto lessThans = [](const std::vector<std::uint32_t>& words) {
+        std::size_t found = 0;
+        for (std::size_t cursor = 5; cursor < words.size();) {
+            const auto count = words[cursor] >> 16u;
+            require(count != 0 && count <= words.size() - cursor, "device bounds: truncated SPIR-V instruction");
+            if ((words[cursor] & 0xffffu) == spv::OpULessThan) found++;
+            cursor += count;
+        }
+        return found;
+    };
+    const auto shaderChecked = lessThans(recompile(loadStore, false));
+    const auto deviceChecked = lessThans(recompile(loadStore, true));
+    require(shaderChecked >= 2u && shaderChecked - deviceChecked == 2u, "device bounds: a buffer load and store did not lose exactly their two bounds checks");
+    const auto atomicShader = lessThans(recompile(atomic, false));
+    require(atomicShader >= 1u && lessThans(recompile(atomic, true)) == atomicShader, "device bounds: a buffer atomic lost its bounds check");
+}
+
 void verifyWaveUniformValues() {
     using namespace ShaderRecompiler;
     IrProgram program;
@@ -1698,6 +1748,7 @@ int main() {
         verifyPixelInputs();
         verifyPixelParameterSlots();
         verifyComputedTexelOffsets();
+        verifyDeviceStorageBufferBounds();
         verifyWaveUniformValues();
         verifyTwoLaneUniformValues();
         verifyFlatTsharpFeedbackCopy();

@@ -1,7 +1,9 @@
 #include "SpirvBackend/SpirvMemory/SpirvBufferAccess.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvDescriptors.hpp"
+#include "Recompiler.hpp"
 #include <spirv/unified1/spirv.hpp>
+#include <atomic>
 #include <stdexcept>
 #include <string>
 #include <SpirvBackend/SpirvEmitterInstructions.hpp>
@@ -12,6 +14,8 @@ namespace ShaderRecompiler
 namespace {
 
     constexpr std::uint32_t FunctionLdsDwords = 8192u;
+
+    std::atomic<std::uint64_t> storageBufferChecks[2]{};
 
     [[noreturn]] void FailEmit(const std::string& reason) {
         throw std::runtime_error("SPIR-V module emission failed: " + reason);
@@ -115,6 +119,8 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(SpirvEmitterState& state
     if (mem.resource < state.program.Info().buffers.size() && state.program.Info().buffers[mem.resource].empty) {
         access.length = ConstantU32(state, 0u);
     }
+    // An empty buffer keeps the shader's zero length: its binding is a stand-in, not the guest's range.
+    access.deviceBounds = state.deviceStorageBufferBounds && (mem.kind == ResourceKind::Buffer || mem.kind == ResourceKind::ScalarBuffer) && !(mem.resource < state.program.Info().buffers.size() && state.program.Info().buffers[mem.resource].empty);
     return access;
 }
 
@@ -167,6 +173,14 @@ std::uint32_t EmitMemoryElementInBounds(SpirvEmitterState& state, const MemoryRe
     const auto inBounds = state.module.AllocateId();
     state.module.AddFunction(spv::OpULessThan, TypeBool(state), inBounds, index, access.length);
     return inBounds;
+}
+
+void CountStorageBufferCheck(bool device) {
+    storageBufferChecks[device ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t StorageBufferChecks(bool device) {
+    return storageBufferChecks[device ? 1 : 0].load(std::memory_order_relaxed);
 }
 
 std::uint32_t EmitMemoryElementPointer(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t index) {

@@ -305,6 +305,9 @@ struct VulkanDevice::State {
     bool depthClipControl = false;
     bool imageViewMinLod = false;
     bool maintenance8 = false;
+    // VK_EXT_robustness2's robustBufferAccess2 with byte-exact storage buffer ranges: the recompiler
+    // leaves plain buffer loads and stores to the device's bounds (SpirvTarget::deviceStorageBufferBounds).
+    bool deviceStorageBufferBounds = false;
     bool depthClamp = false;
     bool occlusionQueryPrecise = false;
     VkDeviceSize hostImportAlignment = 0;
@@ -964,6 +967,28 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     }
     maintenance8Features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
     maintenance8Features.maintenance8 = VK_TRUE;
+    // Storage buffer bounds on the device (from KytyPS5 357b3ac4): where robustBufferAccess2 checks the
+    // bound range byte-exactly (robustStorageBufferAccessSizeAlignment 1, NVIDIA), an out-of-range load
+    // reads zero and a store is dropped, as the shaders' index < OpArrayLength check does over the same
+    // descriptor range, so the shaders leave that check out. APS5_ROBUST_BUFFERS=0 keeps the checks and
+    // the device as before.
+    VkPhysicalDeviceRobustness2FeaturesEXT robustness2Features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+    const char* robustBuffers = std::getenv("APS5_ROBUST_BUFFERS");
+    std::uint32_t robustAlignment = 0;
+    if ((robustBuffers == nullptr || std::strcmp(robustBuffers, "0") != 0) && hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &robustness2Features};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+        VkPhysicalDeviceRobustness2PropertiesEXT robustness2Properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &robustness2Properties};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &properties);
+        robustAlignment = static_cast<std::uint32_t>(robustness2Properties.robustStorageBufferAccessSizeAlignment);
+        // robustBufferAccess2 requires robustBufferAccess, which the device enables when available.
+        state->deviceStorageBufferBounds = robustness2Features.robustBufferAccess2 == VK_TRUE && features.features.robustBufferAccess == VK_TRUE && robustAlignment == 1u;
+        if (state->deviceStorageBufferBounds) deviceExtensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+    }
+    robustness2Features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+    robustness2Features.robustBufferAccess2 = VK_TRUE;
+    std::fprintf(stderr, "[gpu] storage buffer bounds: %s (robustBufferAccess2 size alignment %u; APS5_ROBUST_BUFFERS=%s)\n", state->deviceStorageBufferBounds ? "device" : "shader", robustAlignment, robustBuffers != nullptr ? robustBuffers : "default");
     // VK_EXT_device_fault: a lost device reports what faulted (DeviceLostHook prints it).
     VkPhysicalDeviceFaultFeaturesEXT faultFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     bool deviceFault = false;
@@ -1094,6 +1119,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     if (state->maintenance8) {
         maintenance8Features.pNext = const_cast<void*>(deviceInfo.pNext);
         deviceInfo.pNext = &maintenance8Features;
+    }
+    if (state->deviceStorageBufferBounds) {
+        robustness2Features.pNext = const_cast<void*>(deviceInfo.pNext);
+        deviceInfo.pNext = &robustness2Features;
     }
     if (deviceFault) {
         faultFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
@@ -2501,6 +2530,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     ShaderRecompiler::SpirvTarget target{VK_API_VERSION_1_1, state->meshShader ? 0x00010400u : 0x00010300u, state->subgroup.subgroupSize, ShaderRecompiler::BdaAbi::Version, state->capabilities, state->spirvExtensions, false, {limits.maxComputeWorkGroupSize[0], limits.maxComputeWorkGroupSize[1], limits.maxComputeWorkGroupSize[2]}, limits.maxComputeWorkGroupInvocations, limits.maxComputeSharedMemorySize, {}, {}};
     target.fragmentShaderBarycentricEnabled = state->fragmentShaderBarycentric;
     target.nonConstantImageOffsets = state->maintenance8;
+    target.deviceStorageBufferBounds = state->deviceStorageBufferBounds;
     if (state->meshShader) {
         const auto& mesh = state->meshLimits;
         target.mesh = ShaderRecompiler::MeshTargetLimits{{mesh.maxMeshWorkGroupSize[0], mesh.maxMeshWorkGroupSize[1], mesh.maxMeshWorkGroupSize[2]}, mesh.maxMeshWorkGroupInvocations, std::min(mesh.maxMeshSharedMemorySize, mesh.maxMeshPayloadAndSharedMemorySize), mesh.maxMeshOutputVertices, mesh.maxMeshOutputPrimitives, mesh.maxMeshOutputComponents, std::min(mesh.maxMeshOutputMemorySize, mesh.maxMeshPayloadAndOutputMemorySize), mesh.meshOutputPerVertexGranularity, mesh.meshOutputPerPrimitiveGranularity};

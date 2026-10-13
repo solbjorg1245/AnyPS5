@@ -68,6 +68,8 @@ struct MemoryResourceAccess {
     std::uint32_t byteOffset = 0;
     bool addIndexOffset = false;
     std::uint32_t memoryAccess = 0;
+    // The device bounds this storage buffer access exactly (SpirvTarget::deviceStorageBufferBounds).
+    bool deviceBounds = false;
 };
 
 struct SpirvEmitterState {
@@ -90,6 +92,7 @@ struct SpirvEmitterState {
     std::span<const std::uint32_t> supportedCapabilities;
     std::span<const std::string_view> supportedExtensions;
     bool nonConstantImageOffsets = false;
+    bool deviceStorageBufferBounds = false;
     // A bindless table's runtime slot is wave-uniform; it is uniform over the invocation group
     // only for a single-wave compute workgroup, elsewhere it needs the NonUniform decoration.
     bool tableIndexNonUniform = true;

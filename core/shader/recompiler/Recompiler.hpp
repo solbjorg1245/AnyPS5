@@ -190,6 +190,10 @@ struct SpirvTarget {
     std::optional<MeshTargetLimits> mesh;
     std::optional<TessellationTargetLimits> tessellation;
     bool nonConstantImageOffsets = false;
+    // The device bounds storage buffer accesses byte-exactly (robustBufferAccess2 with
+    // robustStorageBufferAccessSizeAlignment 1): out-of-range loads read zero and stores are dropped,
+    // so plain buffer loads and stores leave out the shader's index < length check.
+    bool deviceStorageBufferBounds = false;
 };
 
 struct BindingLayout {
@@ -446,6 +450,10 @@ enum class LegacyFloatSite : std::uint32_t { MadLegacy, Mullit, ClampNan, Count 
 // The instructions translated under each rule since start (the [recompile] digest, APS5_PROFILE_DRAW).
 void CountLegacyFloatSite(LegacyFloatSite site);
 [[nodiscard]] std::uint64_t LegacyFloatSites(LegacyFloatSite site);
+// Storage buffer loads and stores translated since start (the [recompile] digest): with the shader's
+// bounds check, or left to the device (SpirvTarget::deviceStorageBufferBounds).
+void CountStorageBufferCheck(bool device);
+[[nodiscard]] std::uint64_t StorageBufferChecks(bool device);
 
 struct RectListShaders {
     RecompileResult control;

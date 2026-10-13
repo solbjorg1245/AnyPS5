@@ -1,6 +1,7 @@
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
+#include "Recompiler.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
@@ -106,6 +107,27 @@ std::uint32_t ActiveArgument(SpirvValueEmitContext& ctx, const IrValue& inst) {
     return ctx.Arg(inst, inst.ArgumentCount() - 1u);
 }
 
+// A storage buffer element the device bounds exactly (MemoryResourceAccess::deviceBounds) needs no
+// index < length check: robustBufferAccess2 reads zero and drops the store out of range, as the
+// check did (KytyPS5 357b3ac4). Atomics, subword stores (a compare-exchange loop) and formatted
+// vectors (all components or none) keep their checks.
+template<typename TLoad>
+std::uint32_t LoadIfInBounds(SpirvEmitterState& state, const MemoryResourceAccess& resource, std::uint32_t index, TLoad&& load) {
+    if (resource.kind == ResourceKind::Buffer || resource.kind == ResourceKind::ScalarBuffer) CountStorageBufferCheck(resource.deviceBounds);
+    if (resource.deviceBounds) return load();
+    return EmitValueOrZeroIfCondition(state, EmitMemoryElementInBounds(state, resource, index), std::forward<TLoad>(load));
+}
+
+template<typename TStore>
+void StoreIfInBounds(SpirvEmitterState& state, const MemoryResourceAccess& resource, std::uint32_t index, TStore&& store) {
+    if (resource.kind == ResourceKind::Buffer || resource.kind == ResourceKind::ScalarBuffer) CountStorageBufferCheck(resource.deviceBounds);
+    if (resource.deviceBounds) {
+        store();
+        return;
+    }
+    EmitIfCondition(state, EmitMemoryElementInBounds(state, resource, index), std::forward<TStore>(store));
+}
+
 std::uint32_t LoadWordInBounds(SpirvValueEmitContext& ctx, const MemoryResourceAccess& resource, std::uint32_t index) {
     auto& state = ctx.state;
     const auto pointer = EmitMemoryElementPointer(state, resource, index);
@@ -134,7 +156,7 @@ std::uint32_t LoadSubwordInBounds(SpirvValueEmitContext& ctx, const MemoryResour
 std::uint32_t LoadWordPrepared(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, const MemoryResourceAccess& resource) {
     auto& state = ctx.state;
     const auto index = EmitMemoryElementIndex(state, resource, DwordIndex(ctx, inst, mem));
-    return EmitValueOrZeroIfCondition(state, EmitMemoryElementInBounds(state, resource, index), [&]() {
+    return LoadIfInBounds(state, resource, index, [&]() {
         return LoadWordInBounds(ctx, resource, index);
     });
 }
@@ -151,7 +173,7 @@ std::uint32_t LoadSubwordPrepared(SpirvValueEmitContext& ctx, const IrValue& ins
     const auto address = ByteAddress(ctx, inst, mem);
     const auto rawIndex = Binary(state, spv::OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2u));
     const auto index = EmitMemoryElementIndex(state, resource, rawIndex);
-    return EmitValueOrZeroIfCondition(state, EmitMemoryElementInBounds(state, resource, index), [&]() {
+    return LoadIfInBounds(state, resource, index, [&]() {
         return LoadSubwordInBounds(ctx, resource, address, index, bits, signExtend);
     });
 }
@@ -419,7 +441,7 @@ void StoreSubword(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryI
 void StoreWordPrepared(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, const MemoryResourceAccess& resource, std::uint32_t data) {
     auto& state = ctx.state;
     const auto index = EmitMemoryElementIndex(state, resource, DwordIndex(ctx, inst, mem));
-    EmitIfCondition(state, EmitMemoryElementInBounds(state, resource, index), [&]() {
+    StoreIfInBounds(state, resource, index, [&]() {
         StoreWordInBounds(ctx, resource, index, data);
     });
 }
@@ -1088,8 +1110,7 @@ void EmitReadConstBuffer(SpirvValueEmitContext& ctx, const IrValue& inst) {
     const auto rawIndex = Binary(state, spv::OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2u));
     const auto access = PrepareMemoryResourceAccess(state, mem);
     const auto element = EmitMemoryElementIndex(state, access, rawIndex);
-    const auto inBounds = EmitMemoryElementInBounds(state, access, element);
-    ctx.Define(inst, EmitValueOrZeroIfCondition(state, inBounds, [&]() {
+    ctx.Define(inst, LoadIfInBounds(state, access, element, [&]() {
         const auto value = state.module.AllocateId();
         state.module.AddFunction(spv::OpLoad, TypeU32(state), value, EmitMemoryElementPointer(state, access, element));
         return value;
