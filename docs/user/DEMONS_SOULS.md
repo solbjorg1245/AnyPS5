@@ -100,7 +100,8 @@ Edition content (see [Deluxe Edition content](#deluxe-edition-content)). Use the
 the keyboard (arrow keys, Enter) or a controller (D-pad, A; Start plays). **Play** saves
 `anyps5-settings.ini`, runs the setup when it is due and starts the game; **Quit** or closing the window
 exits. Your comments and other keys in the file are kept. Upscaler and frame generation are shown greyed
-out: they come later.
+out: they come later. With `APS5_PRESENT_AUTO=1` (experimental) the FPS limit also offers 120 and your
+display's refresh ("Display (N Hz)", e.g. 144), and a Present row sets `PresentMode`.
 
 Starting `DemonsSouls.exe` itself (or `DemonsSouls.bat` / `.sh` after the setup) opens the same window
 first; there the game folder is shown but not changed. Add `--launch` to start straight away with the
@@ -123,7 +124,7 @@ by these keys:
 | `Resolution` | `APS5_RESOLUTION` | `auto` or `WIDTHxHEIGHT`, e.g. `1280x800` (Steam Deck), `1920x1080`, `2560x1440`; sets the window size and the game's render resolution |
 | `FpsLimit` | `APS5_FPS_LIMIT` | `auto`, `30`, `60`; other values (20 to 240) need `Timestep = variable` |
 | `Timestep` | `APS5_TIMESTEP` | `fixed` (the game's own: slow motion below the limit) or `variable` (experimental: the game keeps its speed at any frame rate) |
-| `PresentMode` | `APS5_PRESENT_MODE` | experimental, read only with `APS5_PRESENT_AUTO=1` until the settings window has a row for it: `auto` (`mailbox` when the frame rate limit is above the display's refresh, else `fifo`), `fifo` (waits for the display), `mailbox` (the newest frame at each refresh: drops frames, never tears) or `immediate` (tears). Without the switch `APS5_PRESENT_MODE` alone picks `fifo`, `mailbox` or `immediate` (`fifo` by default) |
+| `PresentMode` | `APS5_PRESENT_MODE` | experimental, read only with `APS5_PRESENT_AUTO=1` (the settings window shows its row with the same switch): `auto` (`mailbox` when the frame rate limit is above the display's refresh, else `fifo`), `fifo` (waits for the display), `mailbox` (the newest frame at each refresh: drops frames, never tears) or `immediate` (tears). Without the switch `APS5_PRESENT_MODE` alone picks `fifo`, `mailbox` or `immediate` (`fifo` by default) |
 | `WindowMode` | `APS5_WINDOW_MODE` | `windowed` or `fullscreen` |
 | `ButtonIcons` | `APS5_BUTTON_ICONS` | `playstation` or `steamdeck` (the prompts show A, B, X, Y, Menu and View; View works as the touchpad) |
 | `NativeAspect` | `APS5_NATIVE_ASPECT` | `off` or `on` (experimental: renders at `Resolution`'s own aspect, e.g. 21:9, instead of letterboxed 16:9) |

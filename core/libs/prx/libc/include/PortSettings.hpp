@@ -811,6 +811,18 @@ inline void ApplyLauncherRules(Settings& settings) {
     if (settings.width == 0) settings.nativeAspect = false;
 }
 
+// The FpsLimit of the launcher's "Display (N Hz)" preset (APS5_PRESENT_AUTO=1) for a desktop refresh in whole
+// hertz, as SDL reports it: 0 when the refresh is unknown or the limit would fall outside 20-240. A 59 or 61 Hz
+// report is a 59.94 or 60 Hz display, so 59-61 gives 60, which keeps the title's own 60 FPS mode and its fixed
+// step; 29-31 gives 30 and 119-121 gives 120 the same way.
+inline double DisplayFpsLimit(int refreshHz) {
+    if (refreshHz <= 0) return 0.0;
+    for (const int rate : {30, 60, 120}) {
+        if (refreshHz >= rate - 1 && refreshHz <= rate + 1) return rate;
+    }
+    return refreshHz >= 20 && refreshHz <= 240 ? refreshHz : 0.0;
+}
+
 // Shortest text that parses back to the same number (locale independent, like ParseNumber).
 inline std::string FormatNumber(double value) {
     char text[32];

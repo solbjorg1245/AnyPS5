@@ -253,6 +253,26 @@ static void TestPresentMode() {
     Require(choose(PresentMode::Fifo, 120.0, 60.0, true, true, PresentMode::Fifo), "fifo: fifo even above the display refresh");
 }
 
+// The launcher's "Display (N Hz)" preset and its PresentMode line (frame rate S3, APS5_PRESENT_AUTO=1).
+static void TestDisplayFpsLimit() {
+    Require(PortSettings::DisplayFpsLimit(0) == 0.0 && PortSettings::DisplayFpsLimit(-1) == 0.0, "display limit: unknown refresh");
+    Require(PortSettings::DisplayFpsLimit(59) == 60.0 && PortSettings::DisplayFpsLimit(60) == 60.0 && PortSettings::DisplayFpsLimit(61) == 60.0, "display limit: 59-61 is 60");
+    Require(PortSettings::DisplayFpsLimit(29) == 30.0 && PortSettings::DisplayFpsLimit(30) == 30.0 && PortSettings::DisplayFpsLimit(31) == 30.0, "display limit: 29-31 is 30");
+    Require(PortSettings::DisplayFpsLimit(119) == 120.0 && PortSettings::DisplayFpsLimit(120) == 120.0 && PortSettings::DisplayFpsLimit(121) == 120.0, "display limit: 119-121 is 120");
+    Require(PortSettings::DisplayFpsLimit(144) == 144.0 && PortSettings::DisplayFpsLimit(165) == 165.0 && PortSettings::DisplayFpsLimit(75) == 75.0, "display limit: other refreshes as they are");
+    Require(PortSettings::DisplayFpsLimit(10) == 0.0 && PortSettings::DisplayFpsLimit(360) == 0.0, "display limit: outside 20-240");
+
+    PortSettings::Settings chosen;
+    chosen.fpsLimit = 120.0;
+    chosen.presentMode = PortSettings::PresentMode::Mailbox;
+    PortSettings::ApplyLauncherRules(chosen);
+    auto values = PortSettings::LauncherValues(chosen);
+    values.emplace_back("PresentMode", PortSettings::PresentModeName(chosen.presentMode));
+    const auto reread = FromText(PortSettings::SetIniValues("", values).c_str());
+    Require(reread.warnings.empty() && reread.presentMode == PortSettings::PresentMode::Mailbox && reread.fpsLimit == 120.0 && reread.variableTimestep,
+            "round trip: 120 with the variable timestep and PresentMode mailbox");
+}
+
 static std::string ReadGuest(const char* path) {
     const int fd = sceKernelOpen(path, SCE_KERNEL_O_RDONLY, 0);
     Require(fd >= 0, "open guest file");
@@ -905,6 +925,7 @@ int main() {
     TestTitleStep();
     TestRefreshField();
     TestPresentMode();
+    TestDisplayFpsLimit();
     TestWindowSize();
     TestOverlay();
     std::printf("port_settings_tests: ok\n");
