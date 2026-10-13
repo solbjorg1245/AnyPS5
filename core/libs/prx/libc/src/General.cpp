@@ -13,6 +13,7 @@
 #include "prx/libc/include/GraphicsModePin.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
 #include "prx/libc/include/PortSettings.hpp"
+#include "prx/libc/include/ProLitePatch.hpp"
 #include "prx/libc/include/UiOverlay.hpp"
 
 namespace {
@@ -172,6 +173,7 @@ extern "C" void RemovePathAlias_nid_no_patch(const char* guestPrefix) {
 extern "C" std::filesystem::path ResolvePath_nid_no_patch(const char* path) {
     if (!path) { APS5_INVALID_ARG_EX; }
     auto& state = Directories();
+    // Pro-lite (APS5_MFSR_PROBE=1, ProLitePatch.hpp) patches the renderer before it starts.
     // The player settings' title arguments alias the command-line and render-config files to merged
     // copies before the first guest path resolves (PortSettings.cpp); without settings nothing changes.
     // The UI overlays (button icons, the Visual Mode row) alias their generated files (UiOverlay.hpp).
@@ -182,6 +184,7 @@ extern "C" std::filesystem::path ResolvePath_nid_no_patch(const char* path) {
             std::lock_guard lock(state.mutex);
             return Resolve(state, guest);
         };
+        InstallProLitePatch(resolve);
         InstallPortSettingsOverlay(resolve);
         InstallGraphicsModePin(resolve);
         InstallUiOverlay(resolve);

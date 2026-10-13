@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
+#include "prx/libSceAgcDriver/Execution/include/MfsrPacket.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/NewDrawKeyTally.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
@@ -13,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "prx/libc/include/ProLitePatch.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
@@ -1245,6 +1248,66 @@ void testDrawPipelineKey() {
     check(memo.Find(fresh, KeyHash(fresh), 3, pool.get()) == nullptr, "draw pipeline memo: an entry answered after the store removed one");
 }
 
+// The upscaler probe (docs/design/dlss.md S0): the Psml packet round-trips through MfsrPacket.hpp, is
+// exactly Words dwords, and today's PM4 parser validates and skips it; Pro-lite's site check.
+void testMfsrPacket() {
+    using namespace AgcDriver;
+    std::array<unsigned char, MfsrPacket::BlockBytes> block{};
+    std::array<MfsrPacket::Descriptor, 6> targets{};
+    for (std::size_t index = 0; index < targets.size(); ++index) {
+        for (std::size_t word = 0; word < 8; ++word) targets[index][word] = static_cast<std::uint32_t>(index * 0x100 + word);
+    }
+    // The output T#: 3840x2160, format 0x40 (width - 1 split over words 1 and 2, height - 1 in word 2).
+    targets[0][1] = (0x40u << 20u) | (3u << 30u);
+    targets[0][2] = (3839u >> 2u) | (2159u << 14u);
+    const auto setPointer = [&](std::size_t offset, const void* pointer) {
+        const auto value = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(pointer));
+        std::memcpy(block.data() + offset, &value, sizeof(value));
+    };
+    setPointer(0x00, &targets[0]);
+    setPointer(0x08, &targets[1]);
+    setPointer(0x10, &targets[2]);
+    setPointer(0x20, &targets[3]);
+    setPointer(0x28, &targets[5]);
+    const std::array<std::uint32_t, 2> render{2688, 1512};
+    const std::array<float, 2> jitter{0.25f, -0.75f};
+    std::memcpy(block.data() + MfsrPacket::RenderSizeOffset, render.data(), sizeof(render));
+    std::memcpy(block.data() + MfsrPacket::JitterOffset, jitter.data(), sizeof(jitter));
+    block[MfsrPacket::ResetOffset] = 1;
+    const auto dispatch = MfsrPacket::Capture(block.data());
+    check(dispatch.present == 0x2fu, "mfsr: four images and the descriptor captured, the null +0x30 left clear");
+    check(dispatch.images[1] == targets[1] && dispatch.images[4] == MfsrPacket::Descriptor{} && dispatch.descriptor == targets[5], "mfsr: the copies are the pointed-to words");
+    std::vector<std::uint32_t> words(MfsrPacket::Words + 1, 0xdeadbeefu);
+    MfsrPacket::Encode(dispatch, std::span<std::uint32_t, MfsrPacket::Words>(words.data(), MfsrPacket::Words));
+    check(words.back() == 0xdeadbeefu, "mfsr: the packet writes exactly Words dwords");
+    words.pop_back();
+    check(MfsrPacket::Words == 139 && AgcDriver::Pm4::PacketWords(words[0]) == MfsrPacket::Words, "mfsr: the header's count is the packet's dword count");
+    check(((words[0] >> 8u) & 0xffu) == 0x10u && ((words[0] >> 2u) & 0x3fu) == 0 && (words[0] & 3u) == 0 && (words[1] >> 16u) != 0x6875u, "mfsr: a NOP, sub-op 0, flags 0, not a typed user-data marker");
+    QueueState state;
+    AgcDriver::Pm4::Validate(words, 0);
+    AgcDriver::Pm4::Execute(words, state);
+    const auto decoded = MfsrPacket::Decode(words);
+    check(decoded.has_value() && decoded->block == dispatch.block && decoded->images == dispatch.images && decoded->descriptor == dispatch.descriptor && decoded->present == dispatch.present, "mfsr: decode returns what was encoded");
+    check(decoded->Field<std::array<std::uint32_t, 2>>(MfsrPacket::RenderSizeOffset) == render && decoded->Field<std::array<float, 2>>(MfsrPacket::JitterOffset) == jitter && decoded->Field<std::uint8_t>(MfsrPacket::ResetOffset) == 1, "mfsr: block fields survive");
+    const auto output = MfsrPacket::DecodeImageSize(decoded->images[0]);
+    check(output.width == 3840 && output.height == 2160 && output.format == 0x40, "mfsr: the output T# decodes to 3840x2160 format 0x40");
+    words[1] ^= 1u;
+    check(!MfsrPacket::Decode(words).has_value(), "mfsr: another magic is not ours");
+    words[1] ^= 1u;
+    check(!MfsrPacket::Decode(std::span<const std::uint32_t>(words).first(MfsrPacket::Words - 1)).has_value(), "mfsr: a short packet is not ours");
+
+    std::array<unsigned char, 8> site{0xe8, 0xf8, 0x1d, 0xe6, 0xff, 0x84, 0xc0, 0x74};
+    check(ProLitePatch::Classify(site.data()) == ProLitePatch::Site::Original, "pro-lite: the IsPro call matches");
+    std::memcpy(site.data(), ProLitePatch::Patched.data(), ProLitePatch::Patched.size());
+    check(ProLitePatch::Classify(site.data()) == ProLitePatch::Site::Patched, "pro-lite: an already patched site is recognised");
+    site[1] = 0x00;
+    check(ProLitePatch::Classify(site.data()) == ProLitePatch::Site::Unknown, "pro-lite: other bytes are refused");
+    std::vector<std::string> args{"+r_Wants4K=WantsHigh", "+TargetFramesPerSecond=60"};
+    ProLitePatch::ForceTrinityTier(args);
+    check(args == std::vector<std::string>{"+TargetFramesPerSecond=60", "+r_Wants4K=WantsTrinity"}, "pro-lite: the tier argument is replaced by WantsTrinity");
+    check(!ProLitePatch::Enabled(nullptr) && !ProLitePatch::Enabled("0") && ProLitePatch::Enabled("1"), "pro-lite: off unless APS5_MFSR_PROBE is set and not 0");
+}
+
 // Native aspect's UI rect (AspectFit): the part of the 16:9 display buffer that is shown undistorted
 // at the window's aspect, and a viewport or scissor carried into it.
 void testUndistortedRect() {
@@ -1313,6 +1376,7 @@ int main() {
         testFastPipelineMemo();
         testDrawPipelineKey();
         testUndistortedRect();
+        testMfsrPacket();
         LibcRunShutdown_nid_postfix();
         std::puts("AGC driver submit tests passed");
         return 0;

@@ -1,6 +1,7 @@
 #include "prx/libc/include/PortSettings.hpp"
 #include "prx/libc/include/EngineSwitches.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/ProLitePatch.hpp"
 
 #include <cerrno>
 #include <chrono>
@@ -268,6 +269,8 @@ void InstallPortSettingsOverlay(const std::function<std::filesystem::path(const 
     std::fprintf(stderr, "%s\n", engine.line.c_str());
     std::fflush(stderr);
     args.insert(args.end(), engine.args.begin(), engine.args.end());
+    // Pro-lite (APS5_MFSR_PROBE=1) takes the PS5 Pro tier, whose gate hands the frame to the upscaler.
+    if (MfsrProbeActive_nid_no_patch()) ProLitePatch::ForceTrinityTier(args);
     if (args.empty()) return;
     std::string joined;
     for (const auto& arg : args) joined += (joined.empty() ? "" : " ") + arg;

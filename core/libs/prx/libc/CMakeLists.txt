@@ -3,6 +3,7 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/General.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/GraphicsModePin.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/PortSettings.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/ProLitePatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/gcc/StackGuard.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/windows/CrashReport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/linux/DlIteratePhdr.cpp
