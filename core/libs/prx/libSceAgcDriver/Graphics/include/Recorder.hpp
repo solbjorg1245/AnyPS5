@@ -283,9 +283,11 @@ public:
     // copies, default 1024), APS5_RESIDENT_READS_MIN_KIB / APS5_RESIDENT_READS_MAX_KIB (the region
     // sizes taken, default 4 / 16384) and APS5_RESIDENT_READS_VERIFY=N (every Nth use served
     // without a refresh, 1: each one, also copies the import and the copy to the host; they are
-    // compared when the batch completed).
+    // compared when the batch completed). APS5_VRAM_FLOOR (part 2, Resources.hpp) turns them on
+    // for regions of any size, never demoted (demote), 2048 MiB unless APS5_RESIDENT_READS_MIB.
     struct ResidentReadSettings {
         bool enabled = false;
+        bool demote = true;
         std::uint32_t verifyEvery = 0;
         std::uint64_t limitBytes = 0;
         std::uint64_t minBytes = 0;

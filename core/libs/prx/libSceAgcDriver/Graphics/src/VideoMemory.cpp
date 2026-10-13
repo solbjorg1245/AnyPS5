@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include <algorithm>
 #include <atomic>
@@ -365,7 +366,7 @@ std::string Report() {
     char text[1280];
     std::snprintf(text, sizeof(text), "[vram] (10 s) device-local heap: usage %.0f MiB of budget %.0f MiB (peak %.0f, margin %.0f), host heap %.0f of %.0f MiB%s; guard %s, pressure %s: episodes %llu (%.1f s; %llu over the budget or refused, %llu ended with nothing left to free), refused allocations %llu; trimmed: pool %.0f MiB, resident copies %.0f MiB (%llu) and %.0f MiB held by builds (%llu, rebuilt); resident copies refused for the budget %llu; recycles %llu (pool %.0f MiB); device allocations made under pressure %llu (%.0f MiB); epoch %llu", mib(c.last.usage), mib(c.last.budget), mib(c.peakUsage), mib(c.last.valid ? marginFor(s, c.last.budget) : marginBytes(s)), mib(c.last.hostUsage), mib(c.last.hostBudget), c.last.valid ? "" : " (no VK_EXT_memory_budget sample)", GuardEnabled() ? "on" : "off (observed only)", pressure.load(std::memory_order_relaxed) ? "now" : "no", d(c.episodes, r.episodes), c.pressureSeconds - r.pressureSeconds, d(c.hardEpisodes, r.hardEpisodes), d(c.exhaustedEnds, r.exhaustedEnds), d(c.outOfMemory, r.outOfMemory), mib(c.poolTrimmedBytes - r.poolTrimmedBytes), mib(c.residentTrimmedBytes - r.residentTrimmedBytes), d(c.residentTrimmedCopies, r.residentTrimmedCopies), mib(c.residentHeldBytes - r.residentHeldBytes), d(c.residentHeldCopies, r.residentHeldCopies), d(c.residentRefused, r.residentRefused), d(c.recycles, r.recycles), mib(c.recycledPoolBytes - r.recycledPoolBytes), d(c.pressuredAllocations, r.pressuredAllocations), mib(c.pressuredBytes - r.pressuredBytes), static_cast<unsigned long long>(epoch.load(std::memory_order_relaxed)));
     s.reported = c;
-    return text;
+    return text + VramFloorReport();
 }
 
 void ConfigureForTests(int guard, Sampler sampler, std::uint32_t pollMs, std::uint64_t marginBytes, std::uint64_t poolFloorBytes, std::uint32_t idleMs) {

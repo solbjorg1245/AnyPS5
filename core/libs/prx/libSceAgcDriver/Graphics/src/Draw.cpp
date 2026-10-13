@@ -898,7 +898,7 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
 }
 
 bool InPlaceInputs() {
-    static const bool inPlace = std::getenv("APS5_NO_INPLACE_INPUTS") == nullptr;
+    static const bool inPlace = std::getenv("APS5_NO_INPLACE_INPUTS") == nullptr && !VramFloor(VramFloorDrawInputs);
     return inPlace;
 }
 
@@ -928,7 +928,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
             return copy;
         }
     }
-    copy.buffer = std::make_shared<Buffer>(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    copy.buffer = std::make_shared<Buffer>(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT, GpuReadHostProperties());
     GuestMemory::Read(address, copy.buffer->Bytes(), alignment);
     return copy;
 }
@@ -1065,7 +1065,9 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             highest = UnscannedIndices;
             if (scan) {
                 highest = 0;
-                const auto bytes = copy.buffer->Bytes();
+                // APS5_VRAM_FLOOR: the copy is write-combined video memory, slow to read back; the
+                // guest bytes are the same (just copied, or a reused copy's unchanged range).
+                const auto bytes = VramFloor(VramFloorBar) ? std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)) : std::span<const std::byte>(copy.buffer->Bytes());
                 if (draw.indexSize == 2) {
                     const auto* values = reinterpret_cast<const std::uint16_t*>(bytes.data());
                     for (std::size_t i = 0, count = static_cast<std::size_t>(indexBytes) / 2; i < count; ++i) highest = std::max<std::uint32_t>(highest, values[i]);

@@ -3434,7 +3434,7 @@ std::size_t ShaderResources::addDataBuffer(std::span<const std::uint32_t> words)
     const auto size = words.size() * sizeof(std::uint32_t);
     Require(size <= context.limits.maxStorageBufferRange, "shader data buffer exceeds descriptor range limit");
     const bool refreshable = TemplateDataRefresh() && size <= MaxRefreshBytes;
-    auto buffer = std::make_unique<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (refreshable ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u));
+    auto buffer = std::make_unique<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (refreshable ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u), GpuReadHostProperties());
     std::memcpy(buffer->Bytes().data(), words.data(), size);
     Allocation allocation{0, size, false, std::move(buffer)};
     if (refreshable) allocation.dataWords.assign(words.begin(), words.end());
@@ -4278,7 +4278,7 @@ bool ShaderResources::RebaseEligible(std::span<const CompiledShader> shaders, co
 }
 
 bool ShaderResources::InPlaceBindings() {
-    static const bool inPlace = std::getenv("APS5_NO_INPLACE_BINDINGS") == nullptr && std::getenv("APS5_CAPTURE_INPUTS") == nullptr;
+    static const bool inPlace = std::getenv("APS5_NO_INPLACE_BINDINGS") == nullptr && std::getenv("APS5_CAPTURE_INPUTS") == nullptr && !VramFloor(VramFloorDrawBindings);
     return inPlace;
 }
 
@@ -4327,7 +4327,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             const auto words = SourceWords(shaders, item.sourceShader, item.sourceBinding);
             Require(words.size() * sizeof(std::uint32_t) == item.size, "a rebased data buffer changed size");
             RecordProfile::Scope dataSpan(RecordProfile::SetDataCopy);
-            auto buffer = std::make_shared<Buffer>(context, item.size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            auto buffer = std::make_shared<Buffer>(context, item.size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, GpuReadHostProperties());
             auto* bytes = buffer->Bytes().data();
             std::memcpy(bytes, words.data(), item.size);
             patchDataWords(index, std::span<std::byte>(bytes, item.size));
@@ -4367,7 +4367,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         auto buffer = recorder.ReusableDrawSnapshot(begin, bytes);
         const bool reused = buffer != nullptr;
         if (buffer == nullptr) {
-            buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, GpuReadHostProperties());
             std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
             recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
         }
