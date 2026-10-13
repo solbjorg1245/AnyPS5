@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordCensus.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -688,6 +689,7 @@ DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t gues
             stable = !Recorder::SnapshotWriteOverlaps(resource.dccAddress, count);
         }
     }
+    RecordCensus::Touch(RecordCensus::DccProofs);
     proof = stable ? DccKeyProof{keys, collected} : DccKeyProof{};
     counters.scanned.fetch_add(1, std::memory_order_relaxed);
     if (!stable) counters.unstable.fetch_add(1, std::memory_order_relaxed);

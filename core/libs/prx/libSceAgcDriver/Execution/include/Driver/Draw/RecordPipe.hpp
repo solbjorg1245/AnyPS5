@@ -76,6 +76,84 @@ struct RecordPipeRing {
     void Consume(std::uint64_t serial) { consumed.store(serial, std::memory_order_release); }
 };
 
+// APS5_HANDOFF_FAST (P-HANDOFF; read once, only with the pipe on; default on, =0 the old path): B's
+// hand-off penalty.
+// A draw recorded on B took 12.09 us against 10.24 us inline (t911/t912, APS5_RECORD_PROFILE), the
+// gap in the spans that first read what A wrote for the item (inputs +0.71, revalidate +0.39), and B
+// dropped the item's references after recording it (cleanup 0.64 us per item: shared counts A had
+// raised, capture pages A had allocated). Parts: Release, B leaves the item's references in its slot
+// and A drops them when it fills the slot again, on the thread that took them; Prefetch, before
+// recording item k B prefetches item k+1's slot when A has published it (its draw, stage and snapshot
+// lists, its decode and the captured bytes, up to APS5_HANDOFF_PREFETCH_KB, 16), so those lines come
+// over while k records. Unset or "1" takes both; another number is a mask of the parts (2 Release,
+// 4 Prefetch), and 0 or junk the old path. On: 63.6 presents/10 s against 60.2 (t914-t919, 3+3).
+enum RecordPipeHandoffPart : unsigned { HandoffRelease = 2, HandoffPrefetch = 4 };
+constexpr unsigned RecordPipeHandoffParts(const char* value) {
+    if (value == nullptr || value[0] == '\0') return HandoffRelease | HandoffPrefetch;
+    unsigned parsed = 0;
+    for (const char* digit = value; *digit != '\0'; ++digit) {
+        if (*digit < '0' || *digit > '9' || parsed > 1000) return 0;
+        parsed = parsed * 10 + static_cast<unsigned>(*digit - '0');
+    }
+    return parsed == 1 ? HandoffRelease | HandoffPrefetch : parsed & (HandoffRelease | HandoffPrefetch);
+}
+unsigned RecordPipeHandoff();
+
+// The prefetch's byte budget for one item: Lines hands `touch` each 64-byte line of [data, data +
+// bytes) in order while the budget holds a whole line, and takes the lines from it.
+struct RecordPipePrefetchBudget {
+    static constexpr std::size_t Line = 64;
+    std::size_t left = 0;
+    template<typename TTouch>
+    void Lines(const void* data, std::size_t bytes, TTouch&& touch) {
+        if (data == nullptr || bytes == 0) return;
+        const auto end = reinterpret_cast<std::uintptr_t>(data) + bytes;
+        for (auto line = reinterpret_cast<std::uintptr_t>(data) & ~std::uintptr_t{Line - 1}; line < end && left >= Line; line += Line, left -= Line) touch(reinterpret_cast<const void*>(line));
+    }
+};
+
+// APS5_RECORD_CENSUS (multi-recorder S0): B's draws by run (a drain ends A's run), cut into chunks of
+// K draws as a dispatcher would hand them alternately to two recorders: the chunks, the neighbouring
+// chunk pairs of one run (recorded at the same time) and those sharing a template (a conflict the
+// per-template lock of S2 would serialise; null templates never conflict).
+struct RecordPipeChunkCensus {
+    std::size_t k = 16;
+    std::uint64_t chunks = 0, pairs = 0, sharedPairs = 0;
+    std::size_t position = 0;
+    std::vector<const void*> current, previous;
+
+    void NewRun() {
+        Close();
+        previous.clear();
+        position = 0;
+    }
+    void Note(const void* templateId) {
+        if (position != 0 && position % k == 0) Close();
+        current.push_back(templateId);
+        ++position;
+    }
+    void Close() {
+        if (current.empty()) return;
+        ++chunks;
+        if (!previous.empty()) {
+            ++pairs;
+            bool shared = false;
+            for (const auto* id : current) {
+                for (const auto* earlier : previous) shared = shared || (id != nullptr && id == earlier);
+            }
+            if (shared) ++sharedPairs;
+        }
+        previous.swap(current);
+        current.clear();
+    }
+};
+
+// The census's run-length buckets (draws per run): 1, 2-7, 8-31, 32-127, 128-511, 512+.
+inline constexpr std::size_t RecordPipeRunBuckets = 6;
+constexpr std::size_t RecordPipeRunBucket(std::uint64_t draws) {
+    return draws <= 1 ? 0 : draws < 8 ? 1 : draws < 32 ? 2 : draws < 128 ? 3 : draws < 512 ? 4 : 5;
+}
+
 // APS5_PROFILE_DRAW, the [pipe] B line: the items unrecorded once A published one (handed minus
 // consumed), bucketed 1, 2-4, 5-16, 17-31 and a full ring (0 counts as 1).
 inline constexpr std::size_t RecordPipeOccupancyBuckets = 5;
