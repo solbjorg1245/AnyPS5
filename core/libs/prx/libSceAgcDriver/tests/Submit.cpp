@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastRead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Upscale/Upscale.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastDispatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
@@ -1308,6 +1309,58 @@ void testMfsrPacket() {
     check(!ProLitePatch::Enabled(nullptr) && !ProLitePatch::Enabled("0") && ProLitePatch::Enabled("1"), "pro-lite: off unless APS5_MFSR_PROBE is set and not 0");
 }
 
+// The bilinear stand-in's plan (docs/design/dlss.md S1): sizes, 8x8 groups, MainColor's render
+// sub-rectangle mapped over the output, and every packet-side skip.
+void testUpscalePlan() {
+    using namespace AgcDriver;
+    const auto image = [](std::uint32_t width, std::uint32_t height, std::uint32_t format) {
+        MfsrPacket::Descriptor words{};
+        words[1] = (format << 20u) | (((width - 1u) & 3u) << 30u);
+        words[2] = ((width - 1u) >> 2u) | ((height - 1u) << 14u);
+        return words;
+    };
+    MfsrPacket::Dispatch dispatch;
+    dispatch.present = 0x2f;
+    dispatch.images[0] = image(3840, 2160, 0x40);
+    dispatch.images[1] = image(3840, 2160, 0x41);
+    const auto setRender = [&](std::uint32_t width, std::uint32_t height) {
+        const std::array<std::uint32_t, 2> render{width, height};
+        std::memcpy(dispatch.block.data() + MfsrPacket::RenderSizeOffset, render.data(), sizeof(render));
+    };
+    const auto skipOf = [&] {
+        const auto planned = Upscale::PlanBilinear(dispatch);
+        const auto* skip = std::get_if<Upscale::Skip>(&planned);
+        return skip != nullptr ? std::optional<Upscale::Skip>(*skip) : std::nullopt;
+    };
+    setRender(2688, 1512);
+    const auto planned = Upscale::PlanBilinear(dispatch);
+    const auto* plan = std::get_if<Upscale::Plan>(&planned);
+    check(plan != nullptr && plan->output.width == 3840 && plan->output.height == 2160 && plan->output.format == 0x40 && plan->color.format == 0x41 && plan->render == std::array<std::uint32_t, 2>{2688, 1512}, "upscale: the plan carries the output, MainColor and render sizes");
+    check(plan->groups == std::array<std::uint32_t, 2>{480, 270} && plan->outputWords == dispatch.images[0] && plan->colorWords == dispatch.images[1], "upscale: 8x8 groups cover the output, the T#s are carried");
+    // Where an output texel samples, in MainColor texels (the shader's clamp of (texel + 0.5) * scale).
+    const auto place = [&](std::size_t axis, float texel) {
+        const float position = (texel + 0.5f) * plan->scale[axis];
+        const float clamped = position < plan->low[axis] ? plan->low[axis] : position > plan->high[axis] ? plan->high[axis] : position;
+        return clamped * static_cast<float>(axis == 0 ? plan->color.width : plan->color.height);
+    };
+    const auto about = [](float value, float expected) { return value > expected - 0.01f && value < expected + 0.01f; };
+    check(about(place(0, 0), 0.5f) && about(place(0, 1920), 1344.35f) && about(place(0, 3839), 2687.5f) && about(place(1, 2159), 1511.5f), "upscale: the output spans the render rectangle, half a texel inside it, not the whole MainColor");
+    setRender(3840, 2161);
+    check(skipOf() == Upscale::Skip::RenderOutsideColor, "upscale: a render rectangle past MainColor is skipped");
+    setRender(0, 1512);
+    check(skipOf() == Upscale::Skip::RenderSize, "upscale: a zero render size is skipped");
+    setRender(0x80000000u, 1512);
+    check(skipOf() == Upscale::Skip::RenderSize, "upscale: a render size above 16384 is skipped");
+    setRender(3840, 2160);
+    check(!skipOf().has_value(), "upscale: a render rectangle of MainColor's size is planned");
+    dispatch.present = 0x2e;
+    check(skipOf() == Upscale::Skip::NoOutput, "upscale: no output T#, no pass");
+    dispatch.present = 0x2d;
+    check(skipOf() == Upscale::Skip::NoColor, "upscale: no MainColor T#, no pass");
+    for (std::size_t skip = 0; skip < static_cast<std::size_t>(Upscale::Skip::Count); ++skip) check(Upscale::SkipName(static_cast<Upscale::Skip>(skip)) != nullptr, "upscale: every skip has its log name");
+    check(!Upscale::Enabled(nullptr) && !Upscale::Enabled("") && !Upscale::Enabled("0") && Upscale::Enabled("1"), "upscale: off unless APS5_MFSR_EXEC is set and not 0");
+}
+
 // Native aspect's UI rect (AspectFit): the part of the 16:9 display buffer that is shown undistorted
 // at the window's aspect, and a viewport or scissor carried into it.
 void testUndistortedRect() {
@@ -1377,6 +1430,7 @@ int main() {
         testDrawPipelineKey();
         testUndistortedRect();
         testMfsrPacket();
+        testUpscalePlan();
         LibcRunShutdown_nid_postfix();
         std::puts("AGC driver submit tests passed");
         return 0;

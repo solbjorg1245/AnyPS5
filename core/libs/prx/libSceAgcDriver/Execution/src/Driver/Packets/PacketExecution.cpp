@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/PassDump.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Upscale/Upscale.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -194,6 +195,8 @@ void Driver::execute(const Submission& submission) {
     // APS5_RECORD_PIPE: queue-0 draws recorded on the recording thread; the packets that need its
     // items recorded first drain at their boundary, and the submission's end drains.
     static const bool recordPipe = RecordPipeActive();
+    // APS5_MFSR_EXEC (docs/design/dlss.md S1): the upscaler hand-over runs Upscale.cpp's pass.
+    static const bool upscaleExec = Upscale::Enabled();
 
     thread_local PacketProfile packetProfile;
     ++packetProfile.submissions;
@@ -424,6 +427,9 @@ void Driver::execute(const Submission& submission) {
             if (fastCensus && !drawn) NoteFastCensusDropped();
         } else if (sampleDump) {
             dumpSampleCounters(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u));
+        } else if (const auto mfsr = upscaleExec && opcode == 0x10 ? MfsrPacket::Decode(packet) : std::nullopt) {
+            // The PS5 Pro upscaler's hand-over (MfsrPacket): its bilinear stand-in instead of the NOP skip.
+            tolerate("upscale", [&] { upscale(*mfsr, submission); });
         } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
             if (!wroteOnGpu) {
                 Pm4::Execute(packet, queue);

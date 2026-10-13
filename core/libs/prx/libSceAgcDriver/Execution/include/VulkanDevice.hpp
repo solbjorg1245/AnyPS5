@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Upscale/Upscale.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastDraw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastDispatch.hpp"
@@ -341,6 +342,9 @@ public:
     // packet's labels; a decline records nothing and the caller runs Draw.
     Graphics::FastDrawOutcome FastDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders);
     void ColorMetadataPass(const Graphics::ColorMetadataPass& pass);
+    // APS5_MFSR_EXEC's pass (Graphics::BilinearUpscaler, made on first use), under the mutex after
+    // the packet's labels: nullopt once recorded, else why nothing was.
+    std::optional<Upscale::Skip> UpscaleBilinear(const Upscale::Plan& plan);
     // A draw-cache hit recorded from its recipe (Graphics::DrawWithRecipe), under the mutex after
     // the packet's labels; Rebuild when the recipe's device is not this one or DrawWithRecipe
     // missed (nothing recorded: the caller runs Draw with the hit's stages and re-attaches).

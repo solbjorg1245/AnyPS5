@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/MfsrPacket.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
@@ -138,6 +139,9 @@ private:
     static bool fastDispatchEnabled();
     static bool fastDispatchVerify();
     bool fastDispatch(const Submission& submission, const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<VulkanDevice>& localDevice, std::uint64_t address, const std::array<std::uint32_t, 3>& groups, std::uint64_t indirectArguments);
+    // APS5_MFSR_EXEC (Upscale.cpp, docs/design/dlss.md S1): the upscaler hand-over's bilinear pass;
+    // a failure skips it, reported on the [upscale] rows.
+    void upscale(const MfsrPacket::Dispatch& dispatch, const Submission& submission);
     void verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffset, std::uint64_t deviceSerial, ShaderRecompiler::RecompileRequest request, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint64_t address, const DispatchVariant& variant, std::span<const std::uint32_t> liveWords, const ShaderRecompiler::RecompileResult& patched);
     static bool drawEntries();
     static bool verifyDrawEntries();

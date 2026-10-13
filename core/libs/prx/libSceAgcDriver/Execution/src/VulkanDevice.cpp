@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Upscale.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
@@ -351,6 +352,8 @@ struct VulkanDevice::State {
     };
     std::map<std::uint64_t, FastComputePipeline> fastComputePipelines;
     std::unique_ptr<Graphics::GpuColorTransfer> colorTransfer;
+    // APS5_MFSR_EXEC's pass (UpscaleBilinear), made on first use.
+    std::unique_ptr<Graphics::BilinearUpscaler> upscaler;
     std::shared_ptr<Graphics::BufferPool> bufferPool;
     std::unique_ptr<Graphics::Buffer> emptyBuffer;
     std::unique_ptr<Graphics::TextureCache> textureCache;
@@ -657,6 +660,7 @@ struct VulkanDevice::State {
             // "shadows" reclaimer would otherwise free them on a destroyed device).
             Graphics::ClearStagedShadows(device);
             patternBuffers.clear();
+            upscaler.reset();
             fastRing.reset();
             fastLayouts.reset();
             descriptorCache.reset();
@@ -2581,6 +2585,12 @@ std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::Stat
 
 void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
     Graphics::RunColorMetadataPass(graphicsContext(), pass);
+}
+
+std::optional<Upscale::Skip> VulkanDevice::UpscaleBilinear(const Upscale::Plan& plan) {
+    const auto context = graphicsContext();
+    if (state->upscaler == nullptr) state->upscaler = std::make_unique<Graphics::BilinearUpscaler>(context);
+    return state->upscaler->Record(context, plan);
 }
 
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {

@@ -60,6 +60,20 @@ add_custom_command(
         VERBATIM
 )
 
+# APS5_MFSR_EXEC's bilinear upscale pass (Graphics/src/Upscale.cpp).
+set(agcUpscaleBilinearShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/UpscaleBilinear.comp)
+set(agcUpscaleBilinearShaderSpv ${agcTextureDetileGeneratedDir}/UpscaleBilinear.spv)
+set(agcUpscaleBilinearShaderHeader ${agcTextureDetileGeneratedDir}/UpscaleBilinear_spv.h)
+add_custom_command(
+        OUTPUT "${agcUpscaleBilinearShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcUpscaleBilinearShaderSpv}" "${agcUpscaleBilinearShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcUpscaleBilinearShaderSpv} -DOUTPUT=${agcUpscaleBilinearShaderHeader}
+        -DSYMBOL=UPSCALE_BILINEAR_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcUpscaleBilinearShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
@@ -122,6 +136,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/SynchronizationStatistics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitStatistics.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Upscale/Upscale.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/WorkerSampler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
@@ -160,9 +175,11 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureDetiler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Texture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Upscale.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
         ${agcCopyBackDiffShaderHeader}
+        ${agcUpscaleBilinearShaderHeader}
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Event.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Query.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Resource/src/Lifecycle.cpp
