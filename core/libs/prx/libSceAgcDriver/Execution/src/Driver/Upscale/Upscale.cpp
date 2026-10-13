@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libc/include/HostMutex.hpp"
+#include "prx/libc/include/PortSettings.hpp"
 #include <chrono>
 #include <cstdio>
 #include <mutex>
@@ -137,6 +138,20 @@ void Driver::upscale(const MfsrPacket::Dispatch& dispatch, const Submission& sub
         }
     }
     noteUpscale(dispatch, skip, detail, portNote);
+}
+
+}
+
+namespace AgcDriver::Upscale {
+
+bool Enabled() {
+    static const bool enabled = GetUpscalerChain_nid_no_patch().exec;
+    return enabled;
+}
+
+bool PortEnabled() {
+    static const bool enabled = GetUpscalerChain_nid_no_patch().port;
+    return enabled;
 }
 
 }

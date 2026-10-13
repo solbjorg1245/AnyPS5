@@ -327,7 +327,7 @@ void LoadModel(Model& model) {
         model.status = error;
         model.statusError = true;
     }
-    model.settings = PortSettings::Parse(model.text, PortSettings::PathText(model.options.settings.filename()));
+    model.settings = PortSettings::Parse(model.text, PortSettings::PathText(model.options.settings.filename()), PortSettings::SwitchOn(std::getenv(PortSettings::UpscalerSettingsSwitch)));
     const double fps = model.settings.fpsLimit;
     if (fps == 0.0) model.fpsChoice = 0;
     else if (std::abs(fps - 30.0) < 0.1) model.fpsChoice = 1;
@@ -509,6 +509,48 @@ void Colored(const ImVec4& color, const std::string& text) {
     ImGui::PushStyleColor(ImGuiCol_Text, color);
     ImGui::TextWrapped("%s", text.c_str());
     ImGui::PopStyleColor();
+}
+
+// The upscaler rows under APS5_UPSCALER_SETTINGS=1 (experimental, docs/design/dlss.md S3): off or the port's
+// temporal upscaler (FSR and DLSS listed, not available yet) and its render size; the output is 3840x2160,
+// scaled to the window as before. Not with native aspect (ApplyLauncherRules turns it off).
+void DrawUpscaler(Model& model, bool nativeAspect) {
+    // APS5_UPSCALER / APS5_UPSCALER_QUALITY win over the ini (the game reads them): the rows show what the game will do.
+    auto shown = model.settings;
+    const auto environment = [&shown](const char* variable, const char* key) {
+        const char* value = std::getenv(variable);
+        if (value == nullptr || value[0] == '\0') return std::string();
+        PortSettings::SetKey(shown, key, value, variable);
+        return std::string("(set by ") + variable + "=" + value + ")";
+    };
+    const auto upscalerSet = environment("APS5_UPSCALER", "Upscaler");
+    const auto qualitySet = environment("APS5_UPSCALER_QUALITY", "UpscalerQuality");
+    const int current = !nativeAspect && shown.upscaler != PortSettings::Upscaler::Off ? 1 : 0;
+    static const char* const names[] = {"Off", "Port upscaler (experimental)", "FSR (not available yet)", "DLSS (not available yet)"};
+    ImGui::BeginDisabled(!upscalerSet.empty() || nativeAspect);
+    if (ImGui::BeginCombo("##upscaler", names[current])) {
+        for (int index = 0; index < IM_ARRAYSIZE(names); ++index) {
+            if (ImGui::Selectable(names[index], index == current, index >= 2 ? ImGuiSelectableFlags_Disabled : 0)) {
+                model.settings.upscaler = index == 1 ? PortSettings::Upscaler::Port : PortSettings::Upscaler::Off;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::EndDisabled();
+    if (!upscalerSet.empty()) Note(upscalerSet.c_str());
+    if (nativeAspect) Note("Not with native aspect yet.");
+
+    Label("Upscaler quality");
+    ImGui::BeginDisabled(!qualitySet.empty() || current == 0);
+    if (ImGui::BeginCombo("##upscalerquality", PortSettings::PresetOf(shown.upscalerQuality).label)) {
+        for (const auto& preset : PortSettings::UpscalerPresets) {
+            if (ImGui::Selectable(preset.label, preset.quality == shown.upscalerQuality)) model.settings.upscalerQuality = preset.quality;
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::EndDisabled();
+    if (!qualitySet.empty()) Note(qualitySet.c_str());
+    else if (current == 1) Note("Rendered at this size and upscaled to 3840x2160 in the game's PS5 Pro path.");
 }
 
 // The Deluxe Edition add-on (s61 T-deluxe): it can be on only when the dump holds it (AddonContent.hpp,
@@ -699,11 +741,15 @@ Action Draw(Model& model) {
         if (chosen.width == 0) Note("Needs a resolution other than Auto.");
 
         Label("Upscaler");
-        ImGui::BeginDisabled();
-        int upscaler = 0;
-        static const char* const upscalerNames[] = {"Off (FSR / DLSS coming later)"};
-        ImGui::Combo("##upscaler", &upscaler, upscalerNames, IM_ARRAYSIZE(upscalerNames));
-        ImGui::EndDisabled();
+        if (model.settings.upscalerSettings) {
+            DrawUpscaler(model, chosen.nativeAspect);
+        } else {
+            ImGui::BeginDisabled();
+            int upscaler = 0;
+            static const char* const upscalerNames[] = {"Off (FSR / DLSS coming later)"};
+            ImGui::Combo("##upscaler", &upscaler, upscalerNames, IM_ARRAYSIZE(upscalerNames));
+            ImGui::EndDisabled();
+        }
 
         Label("Frame generation");
         ImGui::BeginDisabled();
@@ -726,7 +772,7 @@ Action Draw(Model& model) {
     }
 
     // What the game will make of it: the parser's own summary and warnings on the text that would be saved.
-    auto preview = PortSettings::Parse(NewText(model), PortSettings::PathText(model.options.settings.filename()));
+    auto preview = PortSettings::Parse(NewText(model), PortSettings::PathText(model.options.settings.filename()), model.settings.upscalerSettings);
     PortSettings::Normalize(preview);
     preview.source = PortSettings::PathText(model.options.settings);
     ImGui::Spacing();

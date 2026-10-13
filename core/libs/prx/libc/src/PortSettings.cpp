@@ -205,7 +205,7 @@ PortSettings::Settings Load() {
             bool found = false;
             const auto text = ReadFile(path, found);
             if (found) {
-                settings = PortSettings::Parse(text, PortSettings::PathText(path.filename()));
+                settings = PortSettings::Parse(text, PortSettings::PathText(path.filename()), PortSettings::SwitchOn(std::getenv(PortSettings::UpscalerSettingsSwitch)));
                 settings.source = display;
             } else if (explicitPath) {
                 settings.warnings.push_back("APS5_SETTINGS: cannot open '" + display + "'; using the defaults");
@@ -257,19 +257,29 @@ extern "C" const PortSettings::Settings& GetPortSettings_nid_no_patch() {
     return settings;
 }
 
+// First called by InstallProLitePatch, ahead of the settings overlay: Load resolves no guest path, so the
+// settings can load inside the path overlay's call_once.
+extern "C" PortSettings::UpscalerChain GetUpscalerChain_nid_no_patch() {
+    static const auto chain = PortSettings::PlanUpscalerChain(
+        PortSettings::SwitchOn(std::getenv(PortSettings::UpscalerSettingsSwitch)) && PortSettings::UpscalerActive(GetPortSettings_nid_no_patch()),
+        std::getenv(ProLitePatch::SwitchName), std::getenv("APS5_MFSR_EXEC"), std::getenv("APS5_UPSCALER_PORT"));
+    return chain;
+}
+
 std::vector<std::filesystem::path> PortOverrideDirectories() {
     return PortSettings::OverrideDirectories(ExecutableDirectory(), UserSettingsDirectory());
 }
 
 void InstallPortSettingsOverlay(const std::function<std::filesystem::path(const char*)>& resolve) {
-    auto args = PortSettings::GameArgs(GetPortSettings_nid_no_patch());
+    auto args = PortSettings::GameArgs(PortSettings::Running(GetPortSettings_nid_no_patch(), MfsrProbeActive_nid_no_patch()));
     // The engine switches (EngineSwitches.hpp, APS5_ENGINE_SWITCHES) follow the settings' own arguments.
     const auto engine = EngineSwitches::PlanSwitches(std::getenv(EngineSwitches::SwitchName));
     for (const auto& warning : engine.warnings) std::fprintf(stderr, "%s\n", warning.c_str());
     std::fprintf(stderr, "%s\n", engine.line.c_str());
     std::fflush(stderr);
     args.insert(args.end(), engine.args.begin(), engine.args.end());
-    // Pro-lite (APS5_MFSR_PROBE=1) takes the PS5 Pro tier, whose gate hands the frame to the upscaler.
+    // Pro-lite (APS5_MFSR_PROBE=1 or Upscaler = port) takes the PS5 Pro tier, whose gate hands the frame to
+    // the upscaler (the settings' own WantsTrinity is replaced, not doubled).
     if (MfsrProbeActive_nid_no_patch()) ProLitePatch::ForceTrinityTier(args);
     if (args.empty()) return;
     std::string joined;

@@ -43,7 +43,11 @@
 //                             a 1080p UI below 1440p (its HUD item cluster and menu slots drawn too large)
 //                             APS5_NO_RESOLUTION_4K_UI=1 (environment only): Resolution or RenderResolution
 //                             up to 1080p runs its tier's own 1080p-display slot again (same HUD fault)
-//   Upscaler = off            APS5_UPSCALER         reserved: fsr, dlss (UpscalerQuality and FrameGeneration: file only, reserved)
+//   Upscaler = off            APS5_UPSCALER         reserved: fsr, dlss (FrameGeneration: file only, reserved); with
+//                             APS5_UPSCALER_SETTINGS=1 (environment only, experimental) port: the port's temporal
+//                             upscaler in the PS5 Pro seam (fsr and dlss take it until they exist)
+//   UpscalerQuality = native  APS5_UPSCALER_QUALITY native 2688x1512, quality 2560x1440, balanced 2224x1252 or
+//                                                   performance 1920x1080 rendered, 3840x2160 out (PlanUpscaler)
 //   GameDir = "D:\PPSA01341-app0"                   the player's dump (app0), set by the launcher; the game ignores it
 //   DeluxeEdition = auto      APS5_DELUXE_EDITION   the Deluxe Edition add-on, owned when the dump holds it
 //                                                   (AddonContent.hpp); off answers 'not owned' even then
@@ -60,7 +64,8 @@ inline constexpr double GameRefresh30 = 30000.0 / 1001.0;
 inline constexpr double DefaultTimestepMinHz = 20000.0 / 1001.0;
 
 enum class WindowMode { Auto, Windowed, Fullscreen };
-enum class Upscaler { Off, Fsr, Dlss };
+enum class Upscaler { Off, Port, Fsr, Dlss };
+enum class UpscalerQuality { Native, Quality, Balanced, Performance };
 enum class ButtonIcons { PlayStation, SteamDeck };
 enum class DeluxeEdition { Auto, Off };
 
@@ -82,14 +87,18 @@ struct Settings {
     // A tier up to 1080p keeps the UI on a 3840x2160 display buffer (PlanResolution4kUi); APS5_NO_RESOLUTION_4K_UI.
     bool resolution4kUi = true;
     Upscaler upscaler = Upscaler::Off;
-    std::string upscalerQuality;
+    UpscalerQuality upscalerQuality = UpscalerQuality::Native;
+    // APS5_UPSCALER_SETTINGS (ApplyEnvironment, and Parse's argument for the file): Upscaler = port applies.
+    bool upscalerSettings = false;
     bool frameGeneration = false;
     std::string gameDir;  // UTF-8, without the quotes
     DeluxeEdition deluxeEdition = DeluxeEdition::Auto;
     std::string addonDir;  // UTF-8, without the quotes
     std::vector<std::string> warnings;
 
-    bool Any() const { return width != 0 || renderHeight != 0 || fpsLimit != 0.0 || variableTimestep || windowMode != WindowMode::Auto || nativeAspect; }
+    bool Any() const {
+        return width != 0 || renderHeight != 0 || fpsLimit != 0.0 || variableTimestep || windowMode != WindowMode::Auto || nativeAspect || (upscalerSettings && upscaler != Upscaler::Off);
+    }
 };
 
 // The title's render tiers (r_Wants4K): internal resolution; the title upscales to its 1080p or 2160p
@@ -112,6 +121,51 @@ inline constexpr std::array<ResolutionPreset, 10> ResolutionPresets{{
     {1280, 720, "1280x720"}, {1280, 800, "1280x800 (Steam Deck)"}, {1600, 900, "1600x900"}, {1920, 1080, "1920x1080"},
     {1920, 1200, "1920x1200"}, {2560, 1080, "2560x1080"}, {2560, 1440, "2560x1440"}, {2560, 1600, "2560x1600"},
     {3440, 1440, "3440x1440"}, {3840, 2160, "3840x2160"}}};
+
+// UpscalerQuality's render sizes inside mode 5's 2688x1512 shared targets (PlanUpscaler), output 3840x2160:
+// 16:9, width a multiple of 8, height of 4, never below 1080 (the title's upscaler gate FUN_140a63700 wants
+// a render height of at least 1080.0). Indexed by UpscalerQuality.
+struct UpscalerPreset {
+    UpscalerQuality quality;
+    const char* name;
+    std::uint32_t width;
+    std::uint32_t height;
+    const char* label;
+};
+inline constexpr std::array<UpscalerPreset, 4> UpscalerPresets{{{UpscalerQuality::Native, "native", 2688, 1512, "Native 2688x1512"},
+    {UpscalerQuality::Quality, "quality", 2560, 1440, "Quality 2560x1440 (1440p)"}, {UpscalerQuality::Balanced, "balanced", 2224, 1252, "Balanced 2224x1252"},
+    {UpscalerQuality::Performance, "performance", 1920, 1080, "Performance 1920x1080 (1080p)"}}};
+inline constexpr std::uint32_t UpscalerOutputWidth = 3840;
+inline constexpr std::uint32_t UpscalerOutputHeight = 2160;
+inline constexpr const char* UpscalerSettingsSwitch = "APS5_UPSCALER_SETTINGS";
+
+inline const UpscalerPreset& PresetOf(UpscalerQuality quality) { return UpscalerPresets[static_cast<std::size_t>(quality)]; }
+
+// An APS5_* on/off switch: on for any value but empty or "0".
+inline bool SwitchOn(const char* value) { return value != nullptr && value[0] != '\0' && std::string_view(value) != "0"; }
+
+// Upscaler = port under APS5_UPSCALER_SETTINGS (after Normalize: not with NativeAspect).
+inline bool UpscalerActive(const Settings& settings) { return settings.upscalerSettings && settings.upscaler != Upscaler::Off; }
+
+// Which upscaler stages run (libc ProLitePatch; the driver's Upscale::Enabled and PortEnabled): each with its
+// own switch (APS5_MFSR_PROBE, APS5_MFSR_EXEC, APS5_UPSCALER_PORT, the stages' tests) as before, and all three
+// under an active settings upscaler. `settingsActive` is UpscalerActive of the process's settings.
+struct UpscalerChain {
+    bool probe;
+    bool exec;
+    bool port;
+};
+inline UpscalerChain PlanUpscalerChain(bool settingsActive, const char* probe, const char* exec, const char* port) {
+    return {settingsActive || SwitchOn(probe), settingsActive || SwitchOn(exec), settingsActive || SwitchOn(port)};
+}
+
+// The settings as they run: the upscaler needs Pro-lite written (MfsrProbeActive_nid_no_patch); without it
+// (another build, other bytes) it is off, and the arguments and tier rewrite are Upscaler = off's.
+inline Settings Running(const Settings& settings, bool proLite) {
+    auto running = settings;
+    if (!proLite) running.upscaler = Upscaler::Off;
+    return running;
+}
 
 inline std::string Lower(std::string_view value) {
     std::string result(value);
@@ -311,11 +365,23 @@ inline void SetKey(Settings& settings, std::string_view key, std::string_view va
         else if (text == "on" || text == "1" || text == "true") settings.nativeAspect = true;
         else refuse("on or off");
     } else if (name == "upscaler") {
+        // Without APS5_UPSCALER_SETTINGS only off (port is refused, fsr and dlss warn); with it port, which fsr
+        // and dlss take until their backends exist.
         if (text == "off") settings.upscaler = Upscaler::Off;
-        else if (text == "fsr" || text == "dlss") settings.warnings.push_back(origin + ": Upscaler = " + text + " is not implemented yet; using off");
-        else refuse("off, fsr or dlss");
+        else if (settings.upscalerSettings && (text == "port" || text == "fsr" || text == "dlss")) {
+            settings.upscaler = Upscaler::Port;
+            if (text != "port") settings.warnings.push_back(origin + ": Upscaler = " + text + " is not available yet; using port (the port upscaler)");
+        } else if (text == "fsr" || text == "dlss") settings.warnings.push_back(origin + ": Upscaler = " + text + " is not implemented yet; using off");
+        else refuse(settings.upscalerSettings ? "off, port, fsr or dlss" : "off, fsr or dlss");
     } else if (name == "upscalerquality") {
-        settings.upscalerQuality = text;
+        // Read only under APS5_UPSCALER_SETTINGS, which also names an unknown value (native then).
+        const auto preset = std::find_if(UpscalerPresets.begin(), UpscalerPresets.end(), [&](const UpscalerPreset& candidate) { return text == candidate.name; });
+        if (preset != UpscalerPresets.end()) {
+            settings.upscalerQuality = preset->quality;
+        } else if (settings.upscalerSettings) {
+            settings.upscalerQuality = UpscalerQuality::Native;
+            settings.warnings.push_back(origin + ": UpscalerQuality = '" + std::string(Trim(value)) + "' unknown (native, quality, balanced or performance); using native");
+        }
     } else if (name == "framegeneration") {
         if (text == "off" || text == "0") settings.frameGeneration = false;
         else settings.warnings.push_back(origin + ": FrameGeneration is not implemented yet; using off");
@@ -332,8 +398,9 @@ inline void SetKey(Settings& settings, std::string_view key, std::string_view va
     }
 }
 
-inline Settings Parse(std::string_view text, const std::string& origin) {
+inline Settings Parse(std::string_view text, const std::string& origin, bool upscalerSettings = false) {
     Settings settings;
+    settings.upscalerSettings = upscalerSettings;
     if (text.starts_with("\xEF\xBB\xBF")) text.remove_prefix(3);
     std::size_t lineNumber = 0;
     while (!text.empty()) {
@@ -355,13 +422,15 @@ inline Settings Parse(std::string_view text, const std::string& origin) {
 }
 
 // The variable that overrides each key (the launcher names the ones set, which win over its choices).
-inline constexpr std::array<std::pair<const char*, const char*>, 10> EnvironmentKeys{{
+inline constexpr std::array<std::pair<const char*, const char*>, 11> EnvironmentKeys{{
     {"APS5_RESOLUTION", "Resolution"}, {"APS5_RENDER_RESOLUTION", "RenderResolution"}, {"APS5_FPS_LIMIT", "FpsLimit"},
     {"APS5_TIMESTEP", "Timestep"}, {"APS5_TIMESTEP_MIN_HZ", "TimestepMinHz"}, {"APS5_WINDOW_MODE", "WindowMode"},
-    {"APS5_NATIVE_ASPECT", "NativeAspect"}, {"APS5_UPSCALER", "Upscaler"}, {"APS5_BUTTON_ICONS", "ButtonIcons"},
-    {"APS5_DELUXE_EDITION", "DeluxeEdition"}}};
+    {"APS5_NATIVE_ASPECT", "NativeAspect"}, {"APS5_UPSCALER", "Upscaler"}, {"APS5_UPSCALER_QUALITY", "UpscalerQuality"},
+    {"APS5_BUTTON_ICONS", "ButtonIcons"}, {"APS5_DELUXE_EDITION", "DeluxeEdition"}}};
 
 inline void ApplyEnvironment(Settings& settings, const std::function<const char*(const char*)>& lookup) {
+    // First: the Upscaler keys below parse by it.
+    if (const char* value = lookup(UpscalerSettingsSwitch); value != nullptr && value[0] != '\0') settings.upscalerSettings = SwitchOn(value);
     for (const auto& [variable, key] : EnvironmentKeys) {
         const char* value = lookup(variable);
         if (value != nullptr && value[0] != '\0') SetKey(settings, key, value, variable);
@@ -395,6 +464,13 @@ inline void Normalize(Settings& settings) {
     if (settings.nativeAspect && settings.width == 0) {
         settings.warnings.push_back("NativeAspect = on needs Resolution = WIDTHxHEIGHT (the aspect to render at); using off");
         settings.nativeAspect = false;
+    }
+    // Native aspect wins over the upscaler (docs/design/dlss.md Open 5): it plans its own slot at the window's
+    // shape, while the upscaler's mode 5 renders 16:9 views in 16:9 targets, and the post passes broke at
+    // other shapes before (s59). The established setting keeps its picture; the experimental one waits.
+    if (UpscalerActive(settings) && settings.nativeAspect) {
+        settings.warnings.push_back("Upscaler = port does not combine with NativeAspect = on yet; using Upscaler = off");
+        settings.upscaler = Upscaler::Off;
     }
 }
 
@@ -562,11 +638,12 @@ inline NativeAspectPlan PlanNativeAspect(const Settings& settings) {
 // slot's render entries rewritten to the tier's size: the 3D renders as in the tier's own slot (1600x900
 // at 1280x720, 1920x1080 at 1920x1080), the UI is laid out on the 2160p display buffer and the presenter
 // scales it down to the window. The table rewrite is native aspect part 5's (NativeAspectPatch, t592);
-// the aspect field is not written. Inactive under NativeAspect (PlanNativeAspect plans the slot), above
-// 1080p, and with APS5_RESOLUTION_4K_UI=0 / APS5_NO_RESOLUTION_4K_UI=1 (the tier's own slot, as s58-s61).
+// the aspect field is not written. Inactive under NativeAspect (PlanNativeAspect plans the slot), with the
+// upscaler (mode 5 draws its UI on a 2160p display buffer already), above 1080p, and with
+// APS5_RESOLUTION_4K_UI=0 / APS5_NO_RESOLUTION_4K_UI=1 (the tier's own slot, as s58-s61).
 inline NativeAspectPlan PlanResolution4kUi(const Settings& settings) {
     NativeAspectPlan plan;
-    if (!settings.resolution4kUi || settings.nativeAspect) return plan;
+    if (!settings.resolution4kUi || settings.nativeAspect || UpscalerActive(settings)) return plan;
     const auto* tier = SelectRenderTier(settings);
     if (tier == nullptr) return plan;
     const auto own = std::find_if(NativeAspectSlots.begin(), NativeAspectSlots.end(), [&](const NativeAspectSlot& slot) { return std::string_view(slot.convar) == tier->convar; });
@@ -586,9 +663,32 @@ inline NativeAspectPlan PlanResolution4kUi(const Settings& settings) {
     return plan;
 }
 
-// The slot whose render entries NativeAspectPatch rewrites and the overlay forces: native aspect's plan,
-// else plain Resolution's 4K UI; inactive when the title keeps its tier's own slot.
+// The upscaler's slot: mode 5 (WantsTrinity, the PS5 Pro tier), whose gate hands the frame to the upscaler.
+// Not among NativeAspectSlots: native aspect never plans it.
+inline constexpr NativeAspectSlot TrinitySlot{2688, 1512, 3840, 2160, 5, "WantsTrinity"};
+
+// UpscalerQuality below native (docs/design/dlss.md "Sizes"): mode 5's render entries rewritten to the
+// preset's size, as PlanResolution4kUi does for WantsHigh. SetMode loads the shared targets' 2688x1512
+// apart from the table, so they keep it and the views render a top-left sub-rectangle, which the hand-over's
+// render size names; output and post stay 3840x2160. Native renders the slot's own size: no rewrite.
+inline NativeAspectPlan PlanUpscaler(const Settings& settings) {
+    NativeAspectPlan plan;
+    if (!UpscalerActive(settings) || settings.upscalerQuality == UpscalerQuality::Native) return plan;
+    const auto& preset = PresetOf(settings.upscalerQuality);
+    plan.slot = &TrinitySlot;
+    plan.renderWidth = preset.width;
+    plan.renderHeight = preset.height;
+    plan.aspectWidth = 16;
+    plan.aspectHeight = 9;
+    plan.uiOnly = true;
+    return plan;
+}
+
+// The slot whose render entries NativeAspectPatch rewrites and the overlay forces: the upscaler's plan (none
+// at native: mode 5 keeps its own size), else native aspect's, else plain Resolution's 4K UI; inactive when
+// the title keeps its tier's own slot.
 inline NativeAspectPlan PlanTierRewrite(const Settings& settings) {
+    if (UpscalerActive(settings)) return PlanUpscaler(settings);
     if (const auto plan = PlanNativeAspect(settings); plan.Active()) return plan;
     return PlanResolution4kUi(settings);
 }
@@ -678,7 +778,8 @@ inline bool DpiAwareWindow(const Settings& settings, const char* switchValue) {
 // The title's arguments the settings imply; empty when they imply none.
 inline std::vector<std::string> GameArgs(const Settings& settings) {
     std::vector<std::string> args;
-    if (const auto plan = PlanTierRewrite(settings); plan.Active()) args.push_back(std::string("+r_Wants4K=") + plan.slot->convar);
+    if (UpscalerActive(settings)) args.push_back(std::string("+r_Wants4K=") + TrinitySlot.convar);
+    else if (const auto plan = PlanTierRewrite(settings); plan.Active()) args.push_back(std::string("+r_Wants4K=") + plan.slot->convar);
     else if (const auto* tier = SelectRenderTier(settings)) args.push_back(std::string("+r_Wants4K=") + tier->convar);
     if (const auto fps = GameFramesPerSecond(settings)) args.push_back("+TargetFramesPerSecond=" + std::to_string(fps));
     return args;
@@ -705,7 +806,9 @@ inline std::string Describe(const Settings& settings) {
         std::snprintf(text, sizeof(text), "Resolution %ux%u, ", settings.width, settings.height);
         result += text;
     }
-    if (const auto plan = PlanNativeAspect(settings); plan.Active()) {
+    if (UpscalerActive(settings)) {
+        result += std::string("render r_Wants4K=") + TrinitySlot.convar + ", ";
+    } else if (const auto plan = PlanNativeAspect(settings); plan.Active()) {
         std::snprintf(text, sizeof(text), "native aspect %.4f: render %ux%u in the r_Wants4K=%s slot (shared targets %ux%u, display buffer %ux%u), ", plan.Aspect(),
             plan.renderWidth, plan.renderHeight, plan.slot->convar, plan.SharedNative() ? plan.sharedWidth : plan.slot->renderWidth,
             plan.SharedNative() ? plan.sharedHeight : plan.slot->renderHeight, plan.DisplayNative() ? plan.displayWidth : plan.slot->displayWidth,
@@ -731,7 +834,13 @@ inline std::string Describe(const Settings& settings) {
         result += text;
     }
     result += settings.windowMode == WindowMode::Fullscreen ? ", WindowMode fullscreen" : settings.windowMode == WindowMode::Windowed ? ", WindowMode windowed" : "";
-    result += ", Upscaler off";
+    if (UpscalerActive(settings)) {
+        const auto& preset = PresetOf(settings.upscalerQuality);
+        std::snprintf(text, sizeof(text), ", Upscaler port, %s (%ux%u -> %ux%u)", preset.name, preset.width, preset.height, UpscalerOutputWidth, UpscalerOutputHeight);
+        result += text;
+    } else {
+        result += ", Upscaler off";
+    }
     if (settings.buttonIcons == ButtonIcons::SteamDeck) result += ", ButtonIcons steamdeck";
     if (settings.deluxeEdition == DeluxeEdition::Off) result += ", Deluxe Edition content off";
     result += settings.source.empty() ? " (no settings file)" : " (" + settings.source + ")";
@@ -759,10 +868,12 @@ inline const char* LauncherSkipReason(const std::vector<std::string>& args, cons
 }
 
 // The launcher's choices made consistent the way Normalize would refuse them otherwise: an FpsLimit other
-// than the title's 30 or 60 turns the variable timestep on, native aspect needs an explicit Resolution.
+// than the title's 30 or 60 turns the variable timestep on, native aspect needs an explicit Resolution and
+// turns the upscaler off.
 inline void ApplyLauncherRules(Settings& settings) {
     if (settings.fpsLimit != 0.0 && !IsGameRate(settings.fpsLimit)) settings.variableTimestep = true;
     if (settings.width == 0) settings.nativeAspect = false;
+    if (settings.nativeAspect) settings.upscaler = Upscaler::Off;
 }
 
 // Shortest text that parses back to the same number (locale independent, like ParseNumber).
@@ -772,9 +883,10 @@ inline std::string FormatNumber(double value) {
     return result.ec == std::errc{} ? std::string(text, result.ptr) : std::string("0");
 }
 
-// The keys the launcher writes, as values Parse reads back to the same settings.
+// The keys the launcher writes, as values Parse reads back to the same settings; the Upscaler keys only under
+// APS5_UPSCALER_SETTINGS (without it the file is written as before).
 inline std::vector<std::pair<std::string, std::string>> LauncherValues(const Settings& settings) {
-    return {
+    std::vector<std::pair<std::string, std::string>> values{
         {"Resolution", settings.width == 0 ? std::string("auto") : std::to_string(settings.width) + "x" + std::to_string(settings.height)},
         {"WindowMode", settings.windowMode == WindowMode::Fullscreen ? "fullscreen" : "windowed"}, // auto is windowed (DisplayWindow)
         {"FpsLimit", settings.fpsLimit == 0.0 ? std::string("auto") : FormatNumber(settings.fpsLimit)},
@@ -782,6 +894,11 @@ inline std::vector<std::pair<std::string, std::string>> LauncherValues(const Set
         {"NativeAspect", settings.nativeAspect ? "on" : "off"},
         {"ButtonIcons", settings.buttonIcons == ButtonIcons::SteamDeck ? "steamdeck" : "playstation"},
         {"DeluxeEdition", settings.deluxeEdition == DeluxeEdition::Off ? "off" : "auto"}};
+    if (settings.upscalerSettings) {
+        values.emplace_back("Upscaler", settings.upscaler == Upscaler::Off ? "off" : "port");
+        values.emplace_back("UpscalerQuality", PresetOf(settings.upscalerQuality).name);
+    }
+    return values;
 }
 
 // LauncherValues plus the game folder, quoted (a path may hold '#' or ';'). An empty folder is written as
@@ -891,6 +1008,9 @@ private:
 
 // The process's settings: the file, then the APS5_* overrides, loaded and logged once ([settings] lines).
 extern "C" const PortSettings::Settings& GetPortSettings_nid_no_patch();
+// The process's upscaler stages (PlanUpscalerChain), decided once; the settings load only under
+// APS5_UPSCALER_SETTINGS.
+extern "C" PortSettings::UpscalerChain GetUpscalerChain_nid_no_patch();
 // Aliases the title's /app0/packagecmdlineargs.txt and /app0/misc/renderconfig_ps5_*.txt to copies with
 // the settings' arguments appended (anyps5-overrides next to the executable); `resolve` maps a guest path
 // to its host file. Nothing happens when the settings imply no arguments.

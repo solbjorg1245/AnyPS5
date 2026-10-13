@@ -63,12 +63,11 @@ inline std::variant<Plan, Skip> PlanBilinear(const MfsrPacket::Dispatch& dispatc
     return plan;
 }
 
-// APS5_MFSR_EXEC, read once: on for any value but empty or "0" (ProLitePatch::Enabled's parse).
+// APS5_MFSR_EXEC: on for any value but empty or "0" (ProLitePatch::Enabled's parse).
 inline bool Enabled(const char* value) { return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0; }
-inline bool Enabled() {
-    static const bool enabled = Enabled(std::getenv("APS5_MFSR_EXEC"));
-    return enabled;
-}
+// APS5_MFSR_EXEC, or Upscaler = port under APS5_UPSCALER_SETTINGS (libc PortSettings::PlanUpscalerChain),
+// read once (Upscale.cpp).
+bool Enabled();
 
 // APS5_UPSCALER_PORT=1 (docs/design/dlss.md S2, default off, with APS5_MFSR_EXEC): the port's temporal
 // upscaler (Graphics::TemporalUpscaler, UpscaleTemporal.comp) instead of the bilinear stand-in, which
@@ -140,10 +139,8 @@ inline std::variant<TemporalPlan, Skip> PlanTemporal(const MfsrPacket::Dispatch&
     return plan;
 }
 
-inline bool PortEnabled() {
-    static const bool enabled = Enabled(std::getenv("APS5_UPSCALER_PORT"));
-    return enabled;
-}
+// APS5_UPSCALER_PORT, or the settings' upscaler as for Enabled().
+bool PortEnabled();
 inline const Signs& PortSigns() {
     static const Signs signs = ParseSigns(std::getenv("APS5_UPSCALER_PORT_SIGNS"));
     return signs;

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/ProLitePatch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
 
 #ifdef _WIN32
@@ -277,7 +278,8 @@ NativeAspectPatch& NativeAspectPatch::Get() {
 }
 
 NativeAspectPatch::NativeAspectPatch() {
-    plan = PortSettings::PlanTierRewrite(GetPortSettings_nid_no_patch());
+    // The upscaler's slot-5 plan only with Pro-lite written (at the first guest path resolve, before video out).
+    plan = PortSettings::PlanTierRewrite(PortSettings::Running(GetPortSettings_nid_no_patch(), MfsrProbeActive_nid_no_patch()));
     if (plan.Active()) wideBits = PortSettings::AspectBits(plan.Aspect());
 }
 
@@ -429,9 +431,10 @@ std::string NativeAspectPatch::Digest() {
     std::lock_guard lock(mutex);
     char text[256];
     if (table == nullptr) {
-        std::snprintf(text, sizeof(text), ", %s not applied (%s)", plan.uiOnly ? "4K UI" : "native aspect", searched ? "see the [aspect] line" : "video out not opened");
+        std::snprintf(text, sizeof(text), ", %s not applied (%s)", plan.slot->mode == 5 ? "upscaler render size" : plan.uiOnly ? "4K UI" : "native aspect",
+            searched ? "see the [aspect] line" : "video out not opened");
     } else if (plan.uiOnly) {
-        std::snprintf(text, sizeof(text), ", 4K UI: %ux%u in %s, display buffer %ux%u", plan.renderWidth, plan.renderHeight, plan.slot->convar, plan.slot->displayWidth, plan.slot->displayHeight);
+        std::snprintf(text, sizeof(text), ", %s: %ux%u in %s, display buffer %ux%u", plan.slot->mode == 5 ? "upscaler render size" : "4K UI", plan.renderWidth, plan.renderHeight, plan.slot->convar, plan.slot->displayWidth, plan.slot->displayHeight);
     } else {
         std::snprintf(text, sizeof(text), ", native aspect %.4f (%ux%u in %s): display mode %d, %llu/%llu flips native, %llu field writes%s; shared targets %s, display buffer %s", plan.Aspect(),
             plan.renderWidth, plan.renderHeight, plan.slot->convar, mode, static_cast<unsigned long long>(windowWideFlips), static_cast<unsigned long long>(windowFlips),

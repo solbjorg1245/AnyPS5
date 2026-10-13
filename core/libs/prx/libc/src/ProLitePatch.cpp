@@ -77,7 +77,9 @@ std::string apply(const std::function<std::filesystem::path(const char*)>& resol
 }
 
 void InstallProLitePatch(const std::function<std::filesystem::path(const char*)>& resolve) {
-    if (!ProLitePatch::Enabled(std::getenv(ProLitePatch::SwitchName))) return;
+    if (!GetUpscalerChain_nid_no_patch().probe) return;
+    // On by its own switch, else by Upscaler = port (APS5_UPSCALER_SETTINGS=1).
+    const bool bySettings = !ProLitePatch::Enabled(std::getenv(ProLitePatch::SwitchName));
     std::string reason;
     try {
         reason = apply(resolve);
@@ -86,9 +88,11 @@ void InstallProLitePatch(const std::function<std::filesystem::path(const char*)>
     }
     if (reason.empty()) {
         active.store(true, std::memory_order_release);
-        std::fprintf(stderr, "[mfsr] pro-lite on (APS5_MFSR_PROBE=1): the IsPro call at 0x1409f4b33 answers true, Psml HLE on, %s\n", ProLitePatch::TrinityArg);
+        std::fprintf(stderr, "[mfsr] pro-lite on (%s): the IsPro call at 0x1409f4b33 answers true, Psml HLE on, %s\n", bySettings ? "Upscaler = port" : "APS5_MFSR_PROBE=1",
+            ProLitePatch::TrinityArg);
     } else {
-        std::fprintf(stderr, "[mfsr] pro-lite off: %s; nothing written, the Psml stubs stay unimplemented\n", reason.c_str());
+        std::fprintf(stderr, "[mfsr] pro-lite off: %s; nothing written, the Psml stubs stay unimplemented%s\n", reason.c_str(),
+            bySettings ? "; Upscaler = port runs as off" : "");
     }
     std::fflush(stderr);
 }

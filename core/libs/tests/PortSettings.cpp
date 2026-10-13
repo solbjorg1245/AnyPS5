@@ -423,6 +423,89 @@ static void TestResolution4kUi() {
     Require(std::string(PortSettings::PlanTierRewrite(nativeOff).slot->convar) == "WantsHigh", "native aspect's 4K UI is its own switch");
 }
 
+// APS5_UPSCALER_SETTINGS (docs/design/dlss.md S3): the Upscaler keys with the switch off (as before) and on,
+// the quality sizes, the slot-5 plan, the stage switches and the launcher's keys.
+static void TestUpscalerSettings() {
+    using PortSettings::Upscaler;
+    using PortSettings::UpscalerQuality;
+    const auto parsed = [](const std::string& text, bool on) {
+        auto settings = PortSettings::Parse(text, "test.ini", on);
+        PortSettings::Normalize(settings);
+        return settings;
+    };
+    for (const char* value : {"port", "fsr", "dlss", "bogus"}) {
+        const auto off = parsed(std::string("Upscaler = ") + value + "\nUpscalerQuality = ultra\n", false);
+        Require(off.upscaler == Upscaler::Off && off.warnings.size() == 1 && !PortSettings::UpscalerActive(off) && !off.Any() && PortSettings::GameArgs(off).empty(), "switch off: the upscaler stays off");
+    }
+    Require(parsed("Upscaler = port\n", false).warnings[0].find("refused (off, fsr or dlss)") != std::string::npos, "switch off: port refused as before");
+    Require(parsed("Upscaler = fsr\n", false).warnings[0] == "test.ini:1: Upscaler = fsr is not implemented yet; using off", "switch off: fsr warns as before");
+    Require(PortSettings::Describe(parsed("Resolution = 1920x1080\n", false)).find(", Upscaler off") != std::string::npos, "switch off: describe");
+
+    const auto port = parsed("Upscaler = port\n", true);
+    Require(port.upscaler == Upscaler::Port && port.warnings.empty() && PortSettings::UpscalerActive(port) && port.Any() && port.upscalerQuality == UpscalerQuality::Native, "port");
+    for (const char* value : {"fsr", "DLSS"}) {
+        const auto missing = parsed(std::string("Upscaler = ") + value + "\n", true);
+        Require(missing.upscaler == Upscaler::Port && missing.warnings.size() == 1 && missing.warnings[0].find("not available yet; using port") != std::string::npos, "fsr and dlss: port, one line");
+    }
+    Require(parsed("Upscaler = bogus\n", true).warnings[0].find("refused (off, port, fsr or dlss)") != std::string::npos, "unknown upscaler refused");
+    const auto ultra = parsed("Upscaler = port\nUpscalerQuality = ultra\n", true);
+    Require(ultra.upscalerQuality == UpscalerQuality::Native && ultra.warnings.size() == 1 && ultra.warnings[0].find("using native") != std::string::npos, "unknown quality: native");
+
+    const std::array<std::pair<std::uint32_t, std::uint32_t>, 4> sizes{{{2688, 1512}, {2560, 1440}, {2224, 1252}, {1920, 1080}}};
+    for (std::size_t index = 0; index < sizes.size(); ++index) {
+        const auto& preset = PortSettings::UpscalerPresets[index];
+        Require(static_cast<std::size_t>(preset.quality) == index && preset.width == sizes[index].first && preset.height == sizes[index].second, "quality sizes");
+        Require(preset.width % 8 == 0 && preset.height % 4 == 0 && preset.height >= 1080 && preset.width <= 2688 && preset.height <= 1512, "sizes fit mode 5's targets and the gate");
+        Require(parsed(std::string("Upscaler = port\nUpscalerQuality = ") + preset.name + "\n", true).upscalerQuality == preset.quality, "quality parse");
+    }
+
+    Require(!PortSettings::PlanUpscaler(port).Active() && !PortSettings::PlanTierRewrite(port).Active(), "native: no table write");
+    Require(PortSettings::GameArgs(port) == std::vector<std::string>{"+r_Wants4K=WantsTrinity"}, "native: WantsTrinity");
+    const auto performance = parsed("Resolution = 1280x720\nUpscaler = port\nUpscalerQuality = performance\n", true);
+    const auto plan = PortSettings::PlanTierRewrite(performance);
+    Require(plan.Active() && plan.uiOnly && plan.slot->mode == 5 && std::string(plan.slot->convar) == "WantsTrinity" && plan.renderWidth == 1920 && plan.renderHeight == 1080
+            && plan.Aspect() == 16.0f / 9.0f && !plan.SharedNative() && !plan.DisplayNative(), "performance: the slot-5 plan");
+    Require(!PortSettings::PlanResolution4kUi(performance).Active(), "no 4K UI rewrite with the upscaler");
+    Require(PortSettings::GameArgs(performance) == std::vector<std::string>{"+r_Wants4K=WantsTrinity"}, "performance: one r_Wants4K");
+    const auto writes = PortSettings::TierTableWrites(plan, true);
+    Require(writes.size() == 2 && writes[0].entry == 4 && writes[0].value == 1920 && writes[1].entry == 9 && writes[1].value == 1080, "entries 4 and 9");
+    Require(PortSettings::DisplayAspectBits(PortSettings::Aspect16x9Bits, 5, plan) == PortSettings::Aspect16x9Bits, "the aspect field stays 16:9");
+    const auto described = PortSettings::Describe(performance);
+    Require(described.find(", Upscaler port, performance (1920x1080 -> 3840x2160)") != std::string::npos && described.find("render r_Wants4K=WantsTrinity, ") != std::string::npos
+            && described.find("4K UI") == std::string::npos, "describe");
+    Require(!PortSettings::UpscalerActive(PortSettings::Running(performance, false)) && PortSettings::GameArgs(PortSettings::Running(performance, false))[0] == "+r_Wants4K=WantsHigh"
+            && PortSettings::UpscalerActive(PortSettings::Running(performance, true)), "without Pro-lite: Upscaler = off's arguments");
+
+    const auto wide = parsed("NativeAspect = on\nResolution = 2560x1080\nUpscaler = port\n", true);
+    Require(wide.upscaler == Upscaler::Off && wide.nativeAspect && wide.warnings.size() == 1 && std::string(PortSettings::PlanTierRewrite(wide).slot->convar) == "WantsHigh", "native aspect wins");
+
+    auto environment = PortSettings::Parse("Upscaler = port\n", "test.ini");
+    const std::map<std::string, std::string> variables{{"APS5_UPSCALER_SETTINGS", "1"}, {"APS5_UPSCALER", "port"}, {"APS5_UPSCALER_QUALITY", "Balanced"}};
+    PortSettings::ApplyEnvironment(environment, [&](const char* name) -> const char* {
+        const auto found = variables.find(name);
+        return found == variables.end() ? nullptr : found->second.c_str();
+    });
+    PortSettings::Normalize(environment);
+    Require(PortSettings::UpscalerActive(environment) && environment.upscalerQuality == UpscalerQuality::Balanced && PortSettings::PlanTierRewrite(environment).renderWidth == 2224, "environment");
+
+    const auto chain = [](bool active, const char* probe, const char* exec, const char* portSwitch) {
+        const auto planned = PortSettings::PlanUpscalerChain(active, probe, exec, portSwitch);
+        return (planned.probe ? 4 : 0) | (planned.exec ? 2 : 0) | (planned.port ? 1 : 0);
+    };
+    Require(chain(false, nullptr, nullptr, nullptr) == 0 && chain(false, "1", "", "0") == 4 && chain(false, nullptr, "1", nullptr) == 2 && chain(false, "0", "0", "yes") == 1, "chain: each switch alone");
+    Require(chain(true, nullptr, "0", nullptr) == 7 && chain(true, "1", "1", "1") == 7, "chain: the settings upscaler turns all three on");
+
+    Require(PortSettings::LauncherValues(PortSettings::Settings{}).size() == 7 && PortSettings::SetIniValues("", PortSettings::LauncherValues(port)).find("Upscaler") != std::string::npos
+            && PortSettings::SetIniValues("", PortSettings::LauncherValues(parsed("Upscaler = port\n", false))).find("Upscaler") == std::string::npos, "launcher: Upscaler keys only with the switch");
+    const auto saved = PortSettings::SetIniValues("", PortSettings::LauncherValues(performance));
+    const auto reread = parsed(saved, true);
+    Require(saved.find("Upscaler = port\n") != std::string::npos && reread.upscaler == Upscaler::Port && reread.upscalerQuality == UpscalerQuality::Performance, "launcher round trip");
+    auto chosen = performance;
+    chosen.nativeAspect = true;
+    PortSettings::ApplyLauncherRules(chosen);
+    Require(chosen.upscaler == Upscaler::Off, "launcher: native aspect turns the upscaler off");
+}
+
 // The settings launcher (s61): when it is skipped, and the ini read/modify/write round trip it saves with.
 static void TestLauncher() {
     const auto lookup = [](std::map<std::string, std::string> environment) {
@@ -794,6 +877,7 @@ static void TestAddonContent() {
 }
 
 int main() {
+    TestUpscalerSettings();
     TestAddonContent();
     TestLauncher();
     TestGameFolder();
