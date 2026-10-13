@@ -293,7 +293,7 @@ void FastBindings::KeepObjects(std::vector<std::shared_ptr<void>>& hold) const {
     // batch the hold belongs to (Draw.cpp notes those of the draw that began the pass).
     if (!ImageEdgesAsked()) return;
     auto* recorder = Recorder::Active();
-    if (recorder == nullptr || !recorder->NotesContinuedDraw()) return;
+    if (recorder == nullptr || !recorder->NotesContinuedDraw(true)) return;
     for (const auto* source : viewed) recorder->NoteImageEdge(Recorder::ImageKey(source->Image()), false, Recorder::ImageNote::FastDraw);
 }
 

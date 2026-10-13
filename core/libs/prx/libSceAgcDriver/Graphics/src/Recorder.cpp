@@ -226,7 +226,7 @@ struct AsyncComputeCounts {
 // fine edges need too, fine waits where the chain made none, the fine waits by source
 // (LaneEdges::FineSource order; a wait counts once per source that asked) and those only the
 // producer asked for; the images noted by noter (Recorder::ImageNote) and kind (read, written);
-// continued draws, and those of the fast path (whose sampled images are noted).
+// continued draws, and those of the fast and the slow path that noted their images.
 struct ImageEdgeCounts {
     std::uint64_t needed = 0;
     std::uint64_t edgeOnly = 0;
@@ -235,6 +235,7 @@ struct ImageEdgeCounts {
     std::array<std::array<std::uint64_t, 2>, static_cast<std::size_t>(Recorder::ImageNote::Count)> notes{};
     std::uint64_t continued = 0;
     std::uint64_t fastContinued = 0;
+    std::uint64_t slowContinued = 0;
 } imageEdgeCounts;
 // APS5_IMAGE_EDGES: the images the thread's next draw or dispatch accesses beyond its access note
 // (Recorder::PendImageEdge), as (image, written).
@@ -3363,9 +3364,9 @@ void Recorder::notePendingImages() {
     pendingImageEdges.clear();
 }
 
-bool Recorder::NotesContinuedDraw() {
+bool Recorder::NotesContinuedDraw(bool fast) {
     if (!imageEdges || !continuedDraw) return false;
-    ++imageEdgeCounts.fastContinued;
+    ++(fast ? imageEdgeCounts.fastContinued : imageEdgeCounts.slowContinued);
     return true;
 }
 
@@ -5335,7 +5336,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                                     return static_cast<unsigned long long>(total);
                                 };
                                 const auto note = [&](Recorder::ImageNote noter, std::size_t written) { return static_cast<unsigned long long>(notes[static_cast<std::size_t>(noter)][written]); };
-                                std::fprintf(stderr, "[recorder] image edges (10 s, APS5_IMAGE_EDGES=1): chain waits %llu; needed with image edges %llu (S4a coarse %llu), droppable %llu; fine waits by source: label %llu, RAW %llu, WAW %llu, WAR %llu, producer %llu, shadow %llu, image RAW %llu, image WAW %llu, image WAR %llu; asked for by producer alone %llu; images noted %llu (reads %llu, writes %llu, of which fast-draw reads %llu, depth writes %llu); image table %zu entries; fine waits where the chain made none %llu; depth reads %llu, template notes %llu; continued draws %llu (fast path %llu)\n", static_cast<unsigned long long>(counts.chainWaits), static_cast<unsigned long long>(image.needed), static_cast<unsigned long long>(edgeCounts.edgeNeeded), static_cast<unsigned long long>(counts.chainWaits - image.needed), static_cast<unsigned long long>(fine[0]), static_cast<unsigned long long>(fine[1]), static_cast<unsigned long long>(fine[2]), static_cast<unsigned long long>(fine[3]), static_cast<unsigned long long>(fine[4]), static_cast<unsigned long long>(fine[5]), static_cast<unsigned long long>(fine[6]), static_cast<unsigned long long>(fine[7]), static_cast<unsigned long long>(fine[8]), static_cast<unsigned long long>(image.producerOnly), kind(0) + kind(1), kind(0), kind(1), note(Recorder::ImageNote::FastDraw, 0), note(Recorder::ImageNote::Depth, 1), recorder.edges.Images(), static_cast<unsigned long long>(image.edgeOnly), note(Recorder::ImageNote::Depth, 0), note(Recorder::ImageNote::Template, 0) + note(Recorder::ImageNote::Template, 1), static_cast<unsigned long long>(image.continued), static_cast<unsigned long long>(image.fastContinued));
+                                std::fprintf(stderr, "[recorder] image edges (10 s, APS5_IMAGE_EDGES=1): chain waits %llu; needed with image edges %llu (S4a coarse %llu), droppable %llu; fine waits by source: label %llu, RAW %llu, WAW %llu, WAR %llu, producer %llu, shadow %llu, image RAW %llu, image WAW %llu, image WAR %llu; asked for by producer alone %llu; images noted %llu (reads %llu, writes %llu, of which fast-draw reads %llu, depth writes %llu); image table %zu entries; fine waits where the chain made none %llu; depth reads %llu, template notes %llu; continued draws %llu (fast path %llu, slow path %llu noting %llu images)\n", static_cast<unsigned long long>(counts.chainWaits), static_cast<unsigned long long>(image.needed), static_cast<unsigned long long>(edgeCounts.edgeNeeded), static_cast<unsigned long long>(counts.chainWaits - image.needed), static_cast<unsigned long long>(fine[0]), static_cast<unsigned long long>(fine[1]), static_cast<unsigned long long>(fine[2]), static_cast<unsigned long long>(fine[3]), static_cast<unsigned long long>(fine[4]), static_cast<unsigned long long>(fine[5]), static_cast<unsigned long long>(fine[6]), static_cast<unsigned long long>(fine[7]), static_cast<unsigned long long>(fine[8]), static_cast<unsigned long long>(image.producerOnly), kind(0) + kind(1), kind(0), kind(1), note(Recorder::ImageNote::FastDraw, 0), note(Recorder::ImageNote::Depth, 1), recorder.edges.Images(), static_cast<unsigned long long>(image.edgeOnly), note(Recorder::ImageNote::Depth, 0), note(Recorder::ImageNote::Template, 0) + note(Recorder::ImageNote::Template, 1), static_cast<unsigned long long>(image.continued), static_cast<unsigned long long>(image.fastContinued), static_cast<unsigned long long>(image.slowContinued), note(Recorder::ImageNote::SlowDraw, 0) + note(Recorder::ImageNote::SlowDraw, 1));
                                 image = {};
                             }
                             edgeCounts = {};

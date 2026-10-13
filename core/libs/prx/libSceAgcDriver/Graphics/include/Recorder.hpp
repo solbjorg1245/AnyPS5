@@ -945,7 +945,7 @@ public:
     // APS5_IMAGE_EDGES (with the two timelines): an image the open batch's last command reads or
     // writes that its access note leaves out (`image`: a VkImage's ImageKey, or a dispatch
     // template's address for its data buffers); the digest line counts the notes by noter.
-    enum class ImageNote : std::uint8_t { Command = 0, FastDraw, Depth, Template, Count };
+    enum class ImageNote : std::uint8_t { Command = 0, FastDraw, Depth, Template, SlowDraw, Count };
     static std::uint64_t ImageKey(VkImage image) { return reinterpret_cast<std::uint64_t>(image); }
     bool ImageEdges() const { return imageEdges; }
     void NoteImageEdge(std::uint64_t image, bool written, ImageNote note = ImageNote::Command);
@@ -955,9 +955,10 @@ public:
     static void PendImageEdge(std::uint64_t image, bool written) {
         if (ImageEdgesAsked()) pendImageEdge(image, written);
     }
-    // Whether the command buffer last handed out continued a draw's render pass: a fast draw notes
-    // its sampled images then (Draw.cpp notes the images of a pass's first draw only). Counted.
-    bool NotesContinuedDraw();
+    // Whether the command buffer last handed out continued a draw's render pass: the draw notes its
+    // images then (`fast`: its sampled images, FastDraw.cpp; else its storage images, Draw.cpp), as
+    // the pass's first draw noted its own and the attachments. Counted per path.
+    bool NotesContinuedDraw(bool fast);
     // A range timed outside the recorder's batches (the presenter's blit, stamped into its own
     // pool and read after its fence): enters the class totals like a recorded one.
     static void AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_t bytes);
