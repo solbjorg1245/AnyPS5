@@ -63,6 +63,21 @@ double vblankRate() {
     return hz;
 }
 
+// APS5_FRAME_PROBE=1: the refresh of the window's display next to the vblank clock, once the window exists
+// (presenter thread only).
+void logDisplayRefresh(SDL_Window* window) {
+    static const bool probe = std::getenv("APS5_FRAME_PROBE") != nullptr;
+    static bool logged = false;
+    if (!probe || logged || window == nullptr) return;
+    logged = true;
+    const double vblank = vblankRate() != 0.0 ? vblankRate() : PortSettings::GameRefresh60;
+    SDL_DisplayMode mode{};
+    const int display = SDL_GetWindowDisplayIndex(window);
+    if (display >= 0 && SDL_GetCurrentDisplayMode(display, &mode) == 0 && mode.refresh_rate > 0) std::fprintf(stderr, "[videoout] display %d Hz, vblank %.2f Hz\n", mode.refresh_rate, vblank);
+    else std::fprintf(stderr, "[videoout] display unknown, vblank %.2f Hz\n", vblank);
+    std::fflush(stderr);
+}
+
 void checkConfig(const VideoOutConfig& cfg) {
     cfg.Check();
 }
@@ -142,7 +157,8 @@ public:
         ++cfg->flipStatus.flipPendingNum;
         if (info.index >= 0) ++cfg->bufferPending[info.index];
         request->reserved = true;
-        TimestepPatch::Get().Flip(vblankRate());
+        // cfg->mutex is held here, and vblankEnd() advances the count under it.
+        TimestepPatch::Get().Flip(vblankRate(), cfg->vblankStatus.count);
         NativeAspectPatch::Get().Flip();
         return request;
     }
@@ -440,6 +456,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     }
     require(req.width != 0 && req.height != 0 && req.width <= static_cast<uint32_t>(std::numeric_limits<int>::max()) && req.height <= static_cast<uint32_t>(std::numeric_limits<int>::max()), "invalid window dimensions");
     window.Ensure(req.width, req.height);
+    logDisplayRefresh(window.Handle());
     unsigned extensionCount = 0;
     if (!SDL_Vulkan_GetInstanceExtensions(window.Handle(), &extensionCount, nullptr)) throw std::runtime_error(std::string("SDL_Vulkan_GetInstanceExtensions failed: ") + SDL_GetError());
     std::vector<const char*> extensions(extensionCount);

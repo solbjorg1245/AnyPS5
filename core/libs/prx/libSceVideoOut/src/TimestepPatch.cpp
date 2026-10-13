@@ -33,6 +33,9 @@ namespace {
 constexpr std::array<unsigned char, 16> RefreshTableSignature{0x8f, 0xc2, 0x6f, 0x42, 0x8f, 0xc2, 0x6f, 0x42, 0x8f, 0xc2, 0xef, 0x41, 0x0a, 0xd7, 0x9f, 0x41};
 constexpr std::size_t Entry60 = 1;
 constexpr std::size_t Entry30 = 2;
+// FUN_140b380e0 stores the title's nominal frame step (1/refresh, seconds) every frame in a variable at PE VA
+// 0x142f8b4a0, this far from the table (APS5_FRAME_PROBE reads it).
+constexpr std::ptrdiff_t TitleStepFromRefreshTable = 0x142f8b4a0 - 0x142507b90;
 
 std::uint64_t nowNanos() {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -145,6 +148,53 @@ void storeFloat(float* at, float value) {
     std::atomic_ref<std::uint32_t>(*reinterpret_cast<std::uint32_t*>(at)).store(bits, std::memory_order_release);
 }
 
+// The title's step is a 4-aligned variable: committed, writable memory (Windows; Linux trusts the distance).
+bool titleVariable(std::uintptr_t at) {
+    if (at % alignof(std::uint32_t) != 0) return false;
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) != sizeof(info)) return false;
+    constexpr DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    return info.State == MEM_COMMIT && (info.Protect & writable) != 0 && (info.Protect & PAGE_GUARD) == 0;
+#else
+    return true;
+#endif
+}
+
+// APS5_FRAME_PROBE: the title's step by its distance from the refresh table; one line either way, nullptr
+// when it cannot be read.
+float* locateTitleStep(float* refreshTable, bool supported) {
+    const auto at = static_cast<std::uintptr_t>(static_cast<std::intptr_t>(reinterpret_cast<std::uintptr_t>(refreshTable)) + TitleStepFromRefreshTable);
+    const char* reason = !supported ? "unsupported game build" : refreshTable == nullptr ? "refresh table not found" : !titleVariable(at) ? "no writable variable at its address" : nullptr;
+    if (reason != nullptr) {
+        std::fprintf(stderr, "[timestep] frame probe: title step not readable (%s)\n", reason);
+        return nullptr;
+    }
+    std::fprintf(stderr, "[timestep] frame probe: title step at %p (refresh table at %p)\n", reinterpret_cast<void*>(at), static_cast<void*>(refreshTable));
+    return reinterpret_cast<float*>(at);
+}
+
+// One aligned 32-bit load of the step the title's logic thread stores each frame (this frame's or the last).
+double loadStep(float* at) {
+    const auto bits = std::atomic_ref<std::uint32_t>(*reinterpret_cast<std::uint32_t*>(at)).load(std::memory_order_relaxed);
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+// APS5_FRAME_PROBE's part of the 10 s line: the title's step range, the game speed its steps add up to and
+// the window's vblank ticks.
+std::string titleStepDigest(const TitleStepWindow& steps, double seconds, std::uint64_t ticks) {
+    char text[160];
+    std::snprintf(text, sizeof(text), ", title step %.2f-%.2f Hz, title speed %.3fx, vblank %llu ticks", steps.MinHz(), steps.MaxHz(), steps.Speed(seconds), static_cast<unsigned long long>(ticks));
+    std::string digest = text;
+    if (steps.Unreadable() != 0) {
+        std::snprintf(text, sizeof(text), ", %llu flips without a plausible title step", static_cast<unsigned long long>(steps.Unreadable()));
+        digest += text;
+    }
+    return digest;
+}
+
 }
 
 TimestepPatch& TimestepPatch::Get() {
@@ -156,30 +206,35 @@ TimestepPatch::TimestepPatch() {
     const auto& settings = GetPortSettings_nid_no_patch();
     enabled = settings.variableTimestep;
     profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    probe = std::getenv("APS5_FRAME_PROBE") != nullptr;
     // Without FpsLimit the render config picks the mode; the digest then assumes the 60 FPS one.
     mode30 = PortSettings::GameFramesPerSecond(settings) == 30;
 }
 
-void TimestepPatch::Flip(double vblankHz) {
-    if (!enabled && !profile) return;
+void TimestepPatch::Flip(double vblankHz, std::uint64_t vblankCount) {
+    if (!enabled && !profile && !probe) return;
     std::lock_guard lock(mutex);
     const auto now = nowNanos();
     // The 60 FPS mode flips once per vblank, the 30 FPS mode every second one.
     const double cap = vblankHz != 0.0 ? vblankHz : PortSettings::GameRefresh60;
     double step = 1.0 / (mode30 ? cap / 2.0 : cap);
-    if (enabled && !searched) {
+    if ((enabled || probe) && !searched) {
         searched = true;
         const auto version = guestBuildVersion();
         const bool supported = PortSettings::BuildVersionSupported(version);
         const auto located = supported ? locateRefreshTable() : Located{};
-        table = located.table;
-        pageBase = located.pageBase;
-        pageBytes = located.pageBytes;
-        floorHz = std::min(GetPortSettings_nid_no_patch().timestepMinHz, cap);
-        pacer = std::make_unique<PortSettings::TimestepPacer>(floorHz, cap);
-        if (!supported) std::fprintf(stderr, "[timestep] game build is not %s (gameversion.txt %s): the frame step stays fixed\n", PortSettings::SupportedBuildVersion, version.empty() ? "unreadable" : "differs");
-        else if (table == nullptr) std::fprintf(stderr, "[timestep] refresh table not found in the executable: the frame step stays fixed\n");
-        else std::fprintf(stderr, "[timestep] variable frame step %.2f to %.2f Hz (build %s, refresh table at %p, neighbourhood hash %016llx)\n", floorHz, cap, PortSettings::SupportedBuildVersion, static_cast<void*>(table), static_cast<unsigned long long>(located.neighbourhood));
+        if (enabled) {
+            table = located.table;
+            pageBase = located.pageBase;
+            pageBytes = located.pageBytes;
+            floorHz = std::min(GetPortSettings_nid_no_patch().timestepMinHz, cap);
+            pacer = std::make_unique<PortSettings::TimestepPacer>(floorHz, cap);
+            if (!supported) std::fprintf(stderr, "[timestep] game build is not %s (gameversion.txt %s): the frame step stays fixed\n", PortSettings::SupportedBuildVersion, version.empty() ? "unreadable" : "differs");
+            else if (table == nullptr) std::fprintf(stderr, "[timestep] refresh table not found in the executable: the frame step stays fixed\n");
+            else std::fprintf(stderr, "[timestep] variable frame step %.2f to %.2f Hz (build %s, refresh table at %p, neighbourhood hash %016llx)\n", floorHz, cap, PortSettings::SupportedBuildVersion, static_cast<void*>(table), static_cast<unsigned long long>(located.neighbourhood));
+        }
+        // The probe only reads, so it also runs with the fixed step.
+        if (probe) titleStep = locateTitleStep(located.table, supported);
         std::fflush(stderr);
     }
     if (table != nullptr) {
@@ -198,10 +253,14 @@ void TimestepPatch::Flip(double vblankHz) {
         windowMinHz = windowFlips == 0 ? rate : std::min<double>(windowMinHz, rate);
         windowMaxHz = windowFlips == 0 ? rate : std::max<double>(windowMaxHz, rate);
     }
+    if (titleStep != nullptr) titleSteps.Add(loadStep(titleStep));
     ++windowFlips;
     windowGameSeconds += step;
-    if (windowStart == 0) windowStart = now;
-    if (profile && now - windowStart >= 10'000'000'000ULL) report(now);
+    if (windowStart == 0) {
+        windowStart = now;
+        windowVblank = vblankCount;
+    }
+    if (profile && now - windowStart >= 10'000'000'000ULL) report(now, vblankCount);
 }
 
 bool TimestepPatch::store(float rate60, float rate30) {
@@ -232,20 +291,23 @@ bool TimestepPatch::store(float rate60, float rate30) {
     return true;
 }
 
-void TimestepPatch::report(std::uint64_t now) {
+void TimestepPatch::report(std::uint64_t now, std::uint64_t vblankCount) {
     const double seconds = static_cast<double>(now - windowStart) / 1e9;
+    const auto title = titleStep != nullptr ? titleStepDigest(titleSteps, seconds, vblankCount - std::min(windowVblank, vblankCount)) : std::string();
     if (table != nullptr) {
-        std::fprintf(stderr, "[timestep] 10 s: %llu flips (%.2f FPS), game speed %.3fx, variable step %.2f-%.2f Hz (%d FPS mode entry), %llu flips slower than the %.2f Hz floor%s\n",
+        std::fprintf(stderr, "[timestep] 10 s: %llu flips (%.2f FPS), game speed %.3fx, variable step %.2f-%.2f Hz (%d FPS mode entry), %llu flips slower than the %.2f Hz floor%s%s\n",
             static_cast<unsigned long long>(windowFlips), windowFlips / seconds, windowGameSeconds / seconds, windowMinHz, windowMaxHz, mode30 ? 30 : 60,
-            static_cast<unsigned long long>(windowFloored), floorHz, NativeAspectPatch::Get().Digest().c_str());
+            static_cast<unsigned long long>(windowFloored), floorHz, title.c_str(), NativeAspectPatch::Get().Digest().c_str());
     } else {
-        std::fprintf(stderr, "[timestep] 10 s: %llu flips (%.2f FPS), game speed %.3fx, fixed step (%d FPS mode)%s%s\n",
+        std::fprintf(stderr, "[timestep] 10 s: %llu flips (%.2f FPS), game speed %.3fx, fixed step (%d FPS mode)%s%s%s\n",
             static_cast<unsigned long long>(windowFlips), windowFlips / seconds, windowGameSeconds / seconds, mode30 ? 30 : 60,
-            enabled ? ", refresh table not found" : "", NativeAspectPatch::Get().Digest().c_str());
+            enabled ? ", refresh table not found" : "", title.c_str(), NativeAspectPatch::Get().Digest().c_str());
     }
     std::fflush(stderr);
     windowStart = now;
+    windowVblank = vblankCount;
     windowFlips = 0;
     windowFloored = 0;
     windowGameSeconds = 0.0;
+    titleSteps = TitleStepWindow{};
 }

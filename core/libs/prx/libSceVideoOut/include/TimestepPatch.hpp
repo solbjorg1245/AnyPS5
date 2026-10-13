@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include "prx/libc/include/PortSettings.hpp"
+#include "prx/libSceVideoOut/include/TitleStepWindow.hpp"
 
 // Variable timestep for Demon's Souls (PPSA01341). The title steps physics (and the logic delta floor)
 // once per frame by 1/refresh, refresh coming from a table indexed by TargetFramesPerSecond: 59.94,
@@ -21,20 +22,26 @@
 // or the new value of each entry (a frame may mix the two entries' generations, and a value is up to
 // one flip old: the step it feeds is smoothed over several flips anyway).
 // APS5_PROFILE_DRAW=1 prints a [timestep] line every 10 s with the game speed either way.
+// APS5_FRAME_PROBE=1 (diagnostic, writes nothing) also looks for the table with the fixed step and reads,
+// each flip, the step the title derived from it (FUN_140b380e0's nominal at PE VA 0x142f8b4a0, found by its
+// distance from the table): the 10 s line then adds the title's own step range, the game speed those steps
+// add up to and the window's vblank ticks, so a run above 60 FPS shows its real speed, not the model's.
 class TimestepPatch {
 public:
     static TimestepPatch& Get();
 
-    // One flip of the title; vblankHz is the vblank clock (0: 59.94 Hz).
-    void Flip(double vblankHz);
+    // One flip of the title; vblankHz is the vblank clock (0: 59.94 Hz), vblankCount the flip's vblank
+    // counter (read under its config's mutex, which the vblank thread holds to advance it).
+    void Flip(double vblankHz, std::uint64_t vblankCount);
 
 private:
     TimestepPatch();
-    void report(std::uint64_t now);
+    void report(std::uint64_t now, std::uint64_t vblankCount);
 
     std::mutex mutex;
     bool enabled = false;
     bool profile = false;
+    bool probe = false;
     bool searched = false;
     // Stores the two entries (30 FPS mode first); false when the page cannot be made writable.
     bool store(float rate60, float rate30);
@@ -54,6 +61,10 @@ private:
     double windowGameSeconds = 0.0;
     double windowMinHz = 0.0;
     double windowMaxHz = 0.0;
+    // APS5_FRAME_PROBE: the title's step (nullptr: probe off or not readable) over the digest window.
+    float* titleStep = nullptr;
+    TitleStepWindow titleSteps;
+    std::uint64_t windowVblank = 0;
 };
 
 #endif

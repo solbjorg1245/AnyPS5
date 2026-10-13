@@ -1,6 +1,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/AddonContent.hpp"
 #include "prx/libc/include/PortSettings.hpp"
+#include "prx/libSceVideoOut/include/TitleStepWindow.hpp"
 #include "SceTypes.hpp"
 #include "prx/libkernel/File/include/FileFlags.hpp"
 
@@ -155,6 +156,28 @@ static void TestPacer() {
         step = 1.0 / timed.Flip(now);
     }
     Require(Near(gameSeconds / (static_cast<double>(now - 5000 * ms) / 1e9), 1.0, 0.01), "variable steps keep the game speed");
+}
+
+// APS5_FRAME_PROBE's window (libSceVideoOut TimestepPatch): the title's own float step, read once per flip.
+static void TestTitleStep() {
+    const TitleStepWindow empty{};
+    Require(empty.Steps() == 0 && empty.Unreadable() == 0 && empty.Speed(10.0) == 0.0 && empty.MinHz() == 0.0 && empty.MaxHz() == 0.0, "empty window");
+    // Ten seconds of flips at flipHz, each reading a step of 1/stepHz.
+    const auto speed = [](double stepHz, double flipHz) {
+        TitleStepWindow window;
+        const long flips = std::lround(flipHz * 10.0);
+        for (long flip = 0; flip < flips; ++flip) window.Add(static_cast<float>(1.0 / stepHz));
+        return window.Speed(static_cast<double>(flips) / flipHz);
+    };
+    Require(Near(speed(PortSettings::GameRefresh60, PortSettings::GameRefresh60), 1.0, 0.001), "60 FPS mode at the 59.94 Hz vblank: real time");
+    Require(Near(speed(120.0, 120.0), 1.0, 0.001), "1/120 s steps at 120 flips/s: real time");
+    Require(Near(speed(PortSettings::GameRefresh60, 120.0), 120.0 / PortSettings::GameRefresh60, 0.001), "1/59.94 s steps at 120 flips/s (APS5_VBLANK_HZ alone): 2x");
+    TitleStepWindow mixed;
+    for (const double value : {0.0, -1.0 / 60.0, 0.0005, 1.5, std::nan(""), HUGE_VAL}) mixed.Add(value);
+    Require(mixed.Steps() == 0 && mixed.Unreadable() == 6 && mixed.Speed(1.0) == 0.0 && mixed.MaxHz() == 0.0, "implausible values ignored");
+    for (const double hz : {120.0, 29.97, PortSettings::GameRefresh60}) mixed.Add(1.0 / hz);
+    Require(mixed.Steps() == 3 && Near(mixed.MinHz(), 29.97, 1e-9) && Near(mixed.MaxHz(), 120.0, 1e-9), "step range");
+    Require(Near(mixed.Speed(2.0), (1.0 / 120.0 + 1.0 / 29.97 + 1.0 / PortSettings::GameRefresh60) / 2.0, 1e-12), "speed sums the plausible steps only");
 }
 
 static std::string ReadGuest(const char* path) {
@@ -806,6 +829,7 @@ int main() {
     TestRenderTier();
     TestFrameRate();
     TestPacer();
+    TestTitleStep();
     TestWindowSize();
     TestOverlay();
     std::printf("port_settings_tests: ok\n");
