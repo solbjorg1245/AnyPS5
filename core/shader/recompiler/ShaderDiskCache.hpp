@@ -14,7 +14,8 @@ namespace ShaderRecompiler::ShaderDiskCache {
 
 // 5: the legacy float rules (Recompiler.hpp) changed translations, pinned source version or not.
 // 6: the clamp NaN rule went back to FClamp alone by default; a 5 cache holds its NaN -> 0 selects.
-inline constexpr std::uint32_t FormatVersion = 6;
+// 7: DescriptorBinding gained imageMipOffset (APS5_STORAGE_MIP_EXACT) in the middle of its record.
+inline constexpr std::uint32_t FormatVersion = 7;
 
 enum class LoadStatus {
     Loaded,

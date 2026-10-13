@@ -198,6 +198,7 @@ void resetBinding(DescriptorBinding& binding) {
     auto samplerDepthCompare = std::move(binding.samplerDepthCompare);
     auto imageWritten = std::move(binding.imageWritten);
     auto imageDepthCompare = std::move(binding.imageDepthCompare);
+    auto imageMipOffset = std::move(binding.imageMipOffset);
     auto bufferAtomic = std::move(binding.bufferAtomic);
     auto bufferWritten = std::move(binding.bufferWritten);
     auto deferredWords = std::move(binding.deferredWords);
@@ -206,6 +207,7 @@ void resetBinding(DescriptorBinding& binding) {
     samplerDepthCompare.clear();
     imageWritten.clear();
     imageDepthCompare.clear();
+    imageMipOffset.clear();
     bufferAtomic.clear();
     bufferWritten.clear();
     deferredWords.clear();
@@ -213,6 +215,7 @@ void resetBinding(DescriptorBinding& binding) {
     binding.samplerDepthCompare = std::move(samplerDepthCompare);
     binding.imageWritten = std::move(imageWritten);
     binding.imageDepthCompare = std::move(imageDepthCompare);
+    binding.imageMipOffset = std::move(imageMipOffset);
     binding.bufferAtomic = std::move(bufferAtomic);
     binding.bufferWritten = std::move(bufferWritten);
     binding.deferredWords = std::move(deferredWords);
@@ -256,10 +259,15 @@ void populateBindings(const IrBindingLayout& layout, const ShaderInfo& info, IrS
         case DescriptorRole::GuestImages:
             GuestImagesDescriptor(logical.resources, snapshot, physical.guestDescriptor);
             physical.imageShape = ImageShapeFor(info.images, logical.resources);
-            for (const std::uint32_t resource : logical.resources) {
+            for (std::size_t element = 0; element < logical.resources.size(); ++element) {
+                const std::uint32_t resource = logical.resources[element];
                 const auto& image = info.images.at(resource);
                 physical.imageWritten.push_back(image.written || image.atomic);
                 physical.imageDepthCompare.push_back(image.depthCompare);
+                // A dynamic-mip storage image is the only resource the layout places more than once,
+                // and its copies are consecutive (BindingAllocator).
+                const bool sameResource = element > 0 && logical.resources[element - 1] == resource;
+                physical.imageMipOffset.push_back(sameResource ? physical.imageMipOffset.back() + 1u : 0u);
             }
             break;
         case DescriptorRole::GuestSamplers:

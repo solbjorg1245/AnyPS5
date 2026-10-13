@@ -315,7 +315,7 @@ bool sameResult(const ShaderRecompiler::RecompileResult& left, const ShaderRecom
         const auto& a = left.bindings[i];
         const auto& b = right.bindings[i];
         if (a.kind != b.kind || a.role != b.role || a.descriptorSet != b.descriptorSet || a.binding != b.binding || a.count != b.count || a.guestDescriptor != b.guestDescriptor || a.readOnly != b.readOnly || a.imageShape != b.imageShape) return false;
-        if (a.samplerDepthCompare != b.samplerDepthCompare || a.imageWritten != b.imageWritten || a.imageDepthCompare != b.imageDepthCompare || a.bufferAtomic != b.bufferAtomic || a.bufferWritten != b.bufferWritten || a.deferredWords != b.deferredWords) return false;
+        if (a.samplerDepthCompare != b.samplerDepthCompare || a.imageWritten != b.imageWritten || a.imageDepthCompare != b.imageDepthCompare || a.imageMipOffset != b.imageMipOffset || a.bufferAtomic != b.bufferAtomic || a.bufferWritten != b.bufferWritten || a.deferredWords != b.deferredWords) return false;
     }
     for (std::size_t i = 0; i < left.vertexAttributes.size(); ++i) {
         const auto& a = left.vertexAttributes[i];
@@ -347,6 +347,7 @@ void dirtyResult(ShaderRecompiler::RecompileResult& result, std::size_t bindings
         binding.samplerDepthCompare.assign(3, true);
         binding.imageWritten.assign(2, true);
         binding.imageDepthCompare.assign(2, true);
+        binding.imageMipOffset.assign(4, 7u);
         binding.bufferAtomic.assign(5, true);
         binding.bufferWritten.assign(5, true);
         binding.deferredWords.assign(2, {1u, 0x20000u});
@@ -434,6 +435,35 @@ void verifyPopulateInto() {
     check(pushLayout, pushLayout.descriptors.size(), reused, "PopulateInto's push-data layout differs from Populate");
     require(!reused.pushConstants.empty(), "PopulateInto check: the push-data layout made no push constants");
     require(reused.bindings[0].deferredWords.empty() && reused.bindings[4].deferredWords == snapshot.deferredFlat, "PopulateInto check: deferred words outside the flattened SRT");
+}
+
+// DescriptorBinding::imageMipOffset (s62 WATER): a dynamic-mip storage image placed once per mip
+// counts its elements 0, 1, 2; the two separate images after it carry the same T# (the water sim's
+// normal map stored through two equal descriptors) and are each mip 0 of their own, which the
+// driver's equal-words guess (APS5_STORAGE_MIP_EXACT=0) took for a mip run.
+void verifyImageMipOffsets() {
+    using namespace ShaderRecompiler;
+    IrBindingLayout layout;
+    layout.descriptors = {{static_cast<DescriptorBindingKind>(FirstStorageImageBinding), {0, 0, 0, 1, 2}}};
+    ShaderInfo info;
+    info.images.resize(3);
+    for (auto& image : info.images) {
+        image.dimension = RdnaImageDimension::Dim2D;
+        image.written = true;
+    }
+    ResourceSnapshot snapshot;
+    snapshot.images.resize(3);
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        snapshot.images[i].dwordCount = 8;
+        for (std::uint32_t word = 0; word < 8; ++word) snapshot.images[i].dwords[word] = (i == 0 ? 0x100u : 0x200u) + word;
+    }
+    BindingAllocationResult result;
+    result.layout = layout;
+    DescriptorBindingBuilder{}.Populate(result, info, IrShaderStage::Compute, 0, snapshot, {});
+    require(result.bindings.size() == 1 && result.bindings[0].count == 5, "image mip offsets: the storage binding has the wrong element count");
+    const auto& binding = result.bindings[0];
+    require(binding.imageMipOffset == std::vector<std::uint32_t>{0u, 1u, 2u, 0u, 0u}, "image mip offsets: a dynamic-mip run or two equal separate images were counted wrong");
+    require(std::equal(binding.guestDescriptor.begin() + 24, binding.guestDescriptor.begin() + 32, binding.guestDescriptor.begin() + 32), "image mip offsets check: the two separate images do not carry equal T#s");
 }
 
 // PopulateVariant's per-thread memo and in-place result (s53-fast-cost-b, the fast paths' step 2b):
@@ -1672,6 +1702,7 @@ int main() {
         verifyTwoLaneUniformValues();
         verifyFlatTsharpFeedbackCopy();
         verifyPopulateInto();
+        verifyImageMipOffsets();
 #if ANYPS5_ENABLE_SPIRV_TOOLS
         const std::vector<std::uint32_t> minimalSpirv{
             0x07230203u, 0x00010000u, 0u, 5u, 0u,
