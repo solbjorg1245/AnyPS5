@@ -194,7 +194,8 @@ Loads and the intro: the compute queues wait for labels the graphics queue write
 such a wait after 1 s with no GPU progress and lets the compute work run without its input, printing
 "WAIT_REG_MEM ... timed out" lines. Since the recording thread took over the graphics queue's draws, its work
 (long pipeline builds at a load) was not counted as progress, so these waits gave up although the graphics
-queue was still on its way to the label. `APS5_WAIT_PIPE_PROGRESS=1` counts it; `=0` is the old rule.
+queue was still on its way to the label. The driver now counts it; `APS5_WAIT_PIPE_PROGRESS=0` restores
+the old rule (for comparison only).
 
 ## Controls
 

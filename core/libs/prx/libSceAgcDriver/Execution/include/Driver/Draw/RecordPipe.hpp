@@ -389,6 +389,10 @@ struct RecordPipeProgress {
     std::uint64_t handed = 0, consumed = 0;
 };
 RecordPipeProgress RecordPipeProgressNow();
+// The switch's value: on unless it is exactly "0" (default on since the s62 A/B).
+constexpr bool WaitPipeProgressSwitch(const char* text) {
+    return text == nullptr || !(text[0] == '0' && text[1] == '\0');
+}
 // Whether the pipe showed queue-0 work since a wait last saw `seenConsumed`: an item still unrecorded,
 // or one recorded since.
 constexpr bool RecordPipeProgressed(RecordPipeProgress now, std::uint64_t seenConsumed) {

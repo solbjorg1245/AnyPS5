@@ -103,16 +103,13 @@ int Driver::waitPatientMs() {
     return ms > 1 ? ms : 30000;
 }
 
-// APS5_WAIT_PIPE_PROGRESS=1 (s62 R-WAITS; default off while measured): the timeout above also restarts
+// APS5_WAIT_PIPE_PROGRESS (s62 R-WAITS; default on, =0 off): the timeout above also restarts
 // while the queue-0 recording pipe has a handed draw unrecorded or recorded one since the wait last looked
 // (RecordPipe.hpp). Before the pipe that draw was a packet in flight; with it A waits in a drain outside
 // any packet, and at loads B's pipeline builds ran past 1000 ms, so every compute queue waiting for a
-// queue-0 label timed out and ran on without its input. Unset / 0 = the old rule (packets only).
+// queue-0 label timed out and ran on without its input. =0 = the old rule (packets only).
 bool Driver::waitPipeProgress() {
-    static const bool on = [] {
-        const char* text = std::getenv("APS5_WAIT_PIPE_PROGRESS");
-        return text != nullptr && std::strcmp(text, "1") == 0;
-    }();
+    static const bool on = WaitPipeProgressSwitch(std::getenv("APS5_WAIT_PIPE_PROGRESS"));
     return on;
 }
 
