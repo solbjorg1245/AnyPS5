@@ -1,6 +1,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/AddonContent.hpp"
 #include "prx/libc/include/PortSettings.hpp"
+#include "prx/libSceVideoOut/include/TitleRefreshField.hpp"
 #include "prx/libSceVideoOut/include/TitleStepWindow.hpp"
 #include "SceTypes.hpp"
 #include "prx/libkernel/File/include/FileFlags.hpp"
@@ -178,6 +179,30 @@ static void TestTitleStep() {
     for (const double hz : {120.0, 29.97, PortSettings::GameRefresh60}) mixed.Add(1.0 / hz);
     Require(mixed.Steps() == 3 && Near(mixed.MinHz(), 29.97, 1e-9) && Near(mixed.MaxHz(), 120.0, 1e-9), "step range");
     Require(Near(mixed.Speed(2.0), (1.0 / 120.0 + 1.0 / 29.97 + 1.0 / PortSettings::GameRefresh60) / 2.0, 1e-12), "speed sums the plausible steps only");
+}
+
+// APS5_TIMESTEP_FIELD's decision (libSceVideoOut TimestepPatch): the title's refresh field once per flip, with
+// the table's 60 FPS entry at 41 Hz and its 30 FPS entry at 25 Hz.
+static void TestRefreshField() {
+    using Action = TitleRefreshField::Action;
+    const auto decide = [](std::int32_t mode, float current, std::optional<float> known) { return TitleRefreshField::Decide(mode, current, known, 41.0f, 25.0f); };
+    const auto first = decide(1, 59.94f, std::nullopt);
+    Require(first.action == Action::Write && first.value == 41.0f && !first.titleRewrote, "60 FPS mode, first sight of 59.94: the 60 FPS entry");
+    Require(decide(2, 29.97f, std::nullopt).action == Action::Write && decide(2, 29.97f, std::nullopt).value == 25.0f, "30 FPS mode: the 30 FPS entry");
+    Require(decide(0, 59.94f, std::nullopt).action == Action::Write && decide(0, 59.94f, std::nullopt).value == 41.0f, "Unlocked (the 59.94 constant): the 60 FPS entry");
+    Require(decide(3, 19.98f, std::nullopt).action == Action::OtherMode && decide(3, 19.98f, 41.0f).action == Action::OtherMode, "20 FPS mode: left alone");
+    Require(decide(7, 41.0f, 41.0f).action == Action::OtherMode, "another enum once known: left alone");
+    for (const float value : {1234.5f, std::nanf(""), 0.0f, 41.0f, 59.96f}) Require(decide(1, value, std::nullopt).action == Action::Refuse, "not a title refresh before the first write: refused");
+    Require(decide(4, 59.94f, std::nullopt).action == Action::Refuse && decide(-1, 19.98f, std::nullopt).action == Action::Refuse, "enum outside 0-3 before the first write: refused");
+    Require(decide(1, 29.975f, std::nullopt).action == Action::Write, "a title refresh within 0.01");
+    const auto rewrite = decide(2, 29.97f, 41.0f);
+    Require(rewrite.action == Action::Write && rewrite.value == 25.0f && rewrite.titleRewrote, "the title's rewrite at a mode change: written and counted");
+    const auto copied = decide(1, 37.5f, 41.0f);
+    Require(copied.action == Action::Write && copied.value == 41.0f && copied.titleRewrote, "the title's copy of an older entry: written and counted");
+    const auto same = decide(1, 41.0f, 41.0f);
+    Require(same.action == Action::AlreadySet && !same.titleRewrote, "equal value: no store");
+    Require(TitleRefreshField::Decide(1, 59.94f, std::nullopt, 59.94f, 29.97f).action == Action::AlreadySet, "first sight already holding the entry: no store");
+    Require(decide(1, std::nanf(""), 41.0f).action == Action::Write, "any value once known: written");
 }
 
 static std::string ReadGuest(const char* path) {
@@ -830,6 +855,7 @@ int main() {
     TestFrameRate();
     TestPacer();
     TestTitleStep();
+    TestRefreshField();
     TestWindowSize();
     TestOverlay();
     std::printf("port_settings_tests: ok\n");

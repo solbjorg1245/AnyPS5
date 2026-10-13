@@ -5,12 +5,14 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include "prx/libc/include/PortSettings.hpp"
+#include "prx/libSceVideoOut/include/TitleRefreshField.hpp"
 #include "prx/libSceVideoOut/include/TitleStepWindow.hpp"
 
 // Variable timestep for Demon's Souls (PPSA01341). The title steps physics (and the logic delta floor)
 // once per frame by 1/refresh, refresh coming from a table indexed by TargetFramesPerSecond: 59.94,
-// 59.94 (60 FPS mode), 29.97 (30 FPS mode), 19.98, read every frame by FUN_14091b3a0 (port notes,
+// 59.94 (60 FPS mode), 29.97 (30 FPS mode), 19.98, read by FUN_14091b3a0 at a mode change (port notes,
 // docs/research/frame-pacing.md). With Timestep = variable (APS5_TIMESTEP=1) every flip rewrites the 60
 // and 30 FPS entries with the measured frame rate (PortSettings::TimestepPacer), capped at the rate each
 // mode can flip at, so the step, the frame-locked game clock and the refresh readers follow the real
@@ -26,6 +28,9 @@
 // each flip, the step the title derived from it (FUN_140b380e0's nominal at PE VA 0x142f8b4a0, found by its
 // distance from the table): the 10 s line then adds the title's own step range, the game speed those steps
 // add up to and the window's vblank ticks, so a run above 60 FPS shows its real speed, not the model's.
+// APS5_TIMESTEP_FIELD=1 (with the variable step) makes the entries reach the title: FUN_14091b3a0 copies one
+// into the display object's refresh field (CRenderDisplay+0x28, which FUN_140b380e0 divides by) only when the
+// mode changes, so each flip also writes there the entry of the mode in effect (TitleRefreshField.hpp).
 class TimestepPatch {
 public:
     static TimestepPatch& Get();
@@ -65,6 +70,17 @@ private:
     float* titleStep = nullptr;
     TitleStepWindow titleSteps;
     std::uint64_t windowVblank = 0;
+    // APS5_TIMESTEP_FIELD: the display pointer slot (nullptr: off), the field's last known value (none before
+    // the first decision) and the digest window's stores, title rewrites (mode changes) and flips left alone.
+    void followRefreshField();
+    bool refreshField = false;
+    bool fieldStarted = false;
+    bool fieldRefused = false;
+    std::uint64_t* displaySlot = nullptr;
+    std::optional<float> fieldKnown;
+    std::uint64_t windowFieldWrites = 0;
+    std::uint64_t windowModeChanges = 0;
+    std::uint64_t windowFieldLeft = 0;
 };
 
 #endif

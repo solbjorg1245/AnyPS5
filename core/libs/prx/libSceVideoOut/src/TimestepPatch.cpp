@@ -36,6 +36,12 @@ constexpr std::size_t Entry30 = 2;
 // FUN_140b380e0 stores the title's nominal frame step (1/refresh, seconds) every frame in a variable at PE VA
 // 0x142f8b4a0, this far from the table (APS5_FRAME_PROBE reads it).
 constexpr std::ptrdiff_t TitleStepFromRefreshTable = 0x142f8b4a0 - 0x142507b90;
+// APS5_TIMESTEP_FIELD: the CRenderDisplay singleton pointer (DAT_142f1a988, NativeAspectPatch's display pointer
+// slot) this far from the table, and its object's refresh (float, FUN_140b380e0 divides by it) and
+// TargetFramesPerSecond enum (FUN_14091b3a0 copies an entry into the refresh only when the enum changes).
+constexpr std::ptrdiff_t DisplaySlotFromRefreshTable = 0x142f1a988 - 0x142507b90;
+constexpr std::size_t DisplayRefreshOffset = 0x28;
+constexpr std::size_t DisplayFramesPerSecondOffset = 0x30;
 
 std::uint64_t nowNanos() {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -195,6 +201,64 @@ std::string titleStepDigest(const TitleStepWindow& steps, double seconds, std::u
     return digest;
 }
 
+// The main image's writable data holds [address, address + bytes) (NativeAspectPatch's check of the same slot).
+bool inWritableData(std::uintptr_t address, std::size_t bytes) {
+#ifdef _WIN32
+    auto* image = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
+    if (image == nullptr) return false;
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0) return false;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(image + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
+    const auto* sections = IMAGE_FIRST_SECTION(nt);
+    for (unsigned index = 0; index < nt->FileHeader.NumberOfSections; ++index) {
+        const auto& section = sections[index];
+        if ((section.Characteristics & IMAGE_SCN_MEM_READ) == 0 || (section.Characteristics & IMAGE_SCN_MEM_WRITE) == 0 || section.VirtualAddress > nt->OptionalHeader.SizeOfImage) continue;
+        const auto begin = reinterpret_cast<std::uintptr_t>(image + section.VirtualAddress);
+        if (address >= begin && address + bytes <= begin + std::min<std::size_t>(section.Misc.VirtualSize, nt->OptionalHeader.SizeOfImage - section.VirtualAddress)) return true;
+    }
+    return false;
+#elif defined(__linux__)
+    struct Query {
+        std::uintptr_t begin;
+        std::uintptr_t end;
+        bool inside;
+    } query{address, address + bytes, false};
+    dl_iterate_phdr([](dl_phdr_info* image, std::size_t, void* data) {
+        auto& result = *static_cast<Query*>(data);
+        if (image->dlpi_name != nullptr && image->dlpi_name[0] != '\0') return 0;
+        for (std::uint16_t index = 0; index < image->dlpi_phnum; ++index) {
+            const auto& header = image->dlpi_phdr[index];
+            const auto begin = static_cast<std::uintptr_t>(image->dlpi_addr + header.p_vaddr);
+            if (header.p_type == PT_LOAD && (header.p_flags & PF_W) != 0 && result.begin >= begin && result.end <= begin + header.p_memsz) result.inside = true;
+        }
+        return 1;
+    }, &query);
+    return query.inside;
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    return false;
+#endif
+}
+
+// The display object is 8-aligned and its refresh and enum (display+0x28..+0x37) lie in committed, writable
+// memory (NativeAspectPatch's objectWritable; the first and the last word cover both pages they can span).
+bool displayFieldsWritable(std::uintptr_t object) {
+    return object != 0 && object % alignof(std::uint64_t) == 0 && titleVariable(object + DisplayRefreshOffset) && titleVariable(object + DisplayFramesPerSecondOffset + sizeof(std::int32_t));
+}
+
+// APS5_TIMESTEP_FIELD: the display pointer slot by its distance from the refresh table; nullptr and one line
+// when the field cannot be followed.
+std::uint64_t* locateDisplaySlot(float* refreshTable, bool supported) {
+    const auto slot = static_cast<std::uintptr_t>(static_cast<std::intptr_t>(reinterpret_cast<std::uintptr_t>(refreshTable)) + DisplaySlotFromRefreshTable);
+    const char* reason = !supported ? "unsupported game build" : refreshTable == nullptr ? "refresh table not found"
+        : (slot % alignof(std::uint64_t) != 0 || !inWritableData(slot, sizeof(std::uint64_t))) ? "the display pointer slot is not in the executable's writable data" : nullptr;
+    if (reason == nullptr) return reinterpret_cast<std::uint64_t*>(slot);
+    std::fprintf(stderr, "[timestep] refresh field: off, %s (APS5_TIMESTEP_FIELD=1)\n", reason);
+    return nullptr;
+}
+
 }
 
 TimestepPatch& TimestepPatch::Get() {
@@ -207,6 +271,13 @@ TimestepPatch::TimestepPatch() {
     enabled = settings.variableTimestep;
     profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     probe = std::getenv("APS5_FRAME_PROBE") != nullptr;
+    // APS5_TIMESTEP_FIELD writes the variable step's entries into the title's refresh field: only with that step.
+    refreshField = std::getenv("APS5_TIMESTEP_FIELD") != nullptr;
+    if (refreshField && !enabled) {
+        std::fprintf(stderr, "[timestep] refresh field: off, Timestep is fixed (APS5_TIMESTEP_FIELD=1)\n");
+        std::fflush(stderr);
+        refreshField = false;
+    }
     // Without FpsLimit the render config picks the mode; the digest then assumes the 60 FPS one.
     mode30 = PortSettings::GameFramesPerSecond(settings) == 30;
 }
@@ -235,6 +306,7 @@ void TimestepPatch::Flip(double vblankHz, std::uint64_t vblankCount) {
         }
         // The probe only reads, so it also runs with the fixed step.
         if (probe) titleStep = locateTitleStep(located.table, supported);
+        if (refreshField) displaySlot = locateDisplaySlot(table, supported);
         std::fflush(stderr);
     }
     if (table != nullptr) {
@@ -246,6 +318,7 @@ void TimestepPatch::Flip(double vblankHz, std::uint64_t vblankCount) {
             std::fflush(stderr);
             table = nullptr;
         }
+        if (displaySlot != nullptr && table != nullptr) followRefreshField();
         // The digest reports the entry the title reads: entry 2 in its 30 FPS mode, entry 1 in the 60 FPS one.
         const auto rate = mode30 ? rate30 : rate60;
         step = 1.0 / rate;
@@ -291,17 +364,56 @@ bool TimestepPatch::store(float rate60, float rate30) {
     return true;
 }
 
+// APS5_TIMESTEP_FIELD, each flip after the entries are stored: the display object's refresh field gets the
+// entry of the mode in effect (TitleRefreshField), since FUN_14091b3a0 copies one only when the mode changes.
+// The title's logic thread may change mode between our read of the enum and our store: the field then holds
+// the old mode's entry until the next flip (in mode 3, which is left alone, until the next mode change).
+void TimestepPatch::followRefreshField() {
+    if (fieldRefused) return;
+    const auto object = static_cast<std::uintptr_t>(std::atomic_ref<std::uint64_t>(*displaySlot).load(std::memory_order_acquire));
+    if (!displayFieldsWritable(object)) {
+        ++windowFieldLeft;
+        return;
+    }
+    auto* refresh = reinterpret_cast<float*>(object + DisplayRefreshOffset);
+    const auto mode = std::atomic_ref<std::int32_t>(*reinterpret_cast<std::int32_t*>(object + DisplayFramesPerSecondOffset)).load(std::memory_order_relaxed);
+    const auto current = static_cast<float>(loadStep(refresh));
+    const auto step = TitleRefreshField::Decide(mode, current, fieldKnown, stored60, stored30);
+    if (step.action == TitleRefreshField::Action::Refuse) {
+        fieldRefused = true;
+        std::fprintf(stderr, "[timestep] refresh field: display+0x28 holds %g in mode %d (not a title refresh): left alone\n", current, mode);
+        std::fflush(stderr);
+        return;
+    }
+    windowModeChanges += step.titleRewrote ? 1u : 0u;
+    windowFieldLeft += step.action == TitleRefreshField::Action::OtherMode ? 1u : 0u;
+    fieldKnown = current;
+    if (step.action != TitleRefreshField::Action::Write) return;
+    storeFloat(refresh, step.value);
+    fieldKnown = step.value;
+    ++windowFieldWrites;
+    if (fieldStarted) return;
+    fieldStarted = true;
+    std::fprintf(stderr, "[timestep] refresh field: the title's step follows the variable step (display object %p, field %p, mode %d) (APS5_TIMESTEP_FIELD=1)\n",
+        reinterpret_cast<void*>(object), static_cast<void*>(refresh), mode);
+    std::fflush(stderr);
+}
+
 void TimestepPatch::report(std::uint64_t now, std::uint64_t vblankCount) {
     const double seconds = static_cast<double>(now - windowStart) / 1e9;
     const auto title = titleStep != nullptr ? titleStepDigest(titleSteps, seconds, vblankCount - std::min(windowVblank, vblankCount)) : std::string();
+    char field[128] = "";
+    if (displaySlot != nullptr && fieldRefused) std::snprintf(field, sizeof(field), ", refresh field refused");
+    else if (displaySlot != nullptr) std::snprintf(field, sizeof(field), ", refresh field writes %llu (mode changes %llu, left alone %llu)", static_cast<unsigned long long>(windowFieldWrites),
+        static_cast<unsigned long long>(windowModeChanges), static_cast<unsigned long long>(windowFieldLeft));
     if (table != nullptr) {
-        std::fprintf(stderr, "[timestep] 10 s: %llu flips (%.2f FPS), game speed %.3fx, variable step %.2f-%.2f Hz (%d FPS mode entry), %llu flips slower than the %.2f Hz floor%s%s\n",
+        std::fprintf(stderr, "[timestep] 10 s: %llu flips (%.2f FPS), game speed %.3fx, variable step %.2f-%.2f Hz (%d FPS mode entry), %llu flips slower than the %.2f Hz floor%s%s%s\n",
             static_cast<unsigned long long>(windowFlips), windowFlips / seconds, windowGameSeconds / seconds, windowMinHz, windowMaxHz, mode30 ? 30 : 60,
-            static_cast<unsigned long long>(windowFloored), floorHz, title.c_str(), NativeAspectPatch::Get().Digest().c_str());
+            static_cast<unsigned long long>(windowFloored), floorHz, field, title.c_str(), NativeAspectPatch::Get().Digest().c_str());
     } else {
-        std::fprintf(stderr, "[timestep] 10 s: %llu flips (%.2f FPS), game speed %.3fx, fixed step (%d FPS mode)%s%s%s\n",
+        std::fprintf(stderr, "[timestep] 10 s: %llu flips (%.2f FPS), game speed %.3fx, fixed step (%d FPS mode)%s%s%s%s\n",
             static_cast<unsigned long long>(windowFlips), windowFlips / seconds, windowGameSeconds / seconds, mode30 ? 30 : 60,
-            enabled ? ", refresh table not found" : "", title.c_str(), NativeAspectPatch::Get().Digest().c_str());
+            enabled ? ", refresh table not found" : "", field, title.c_str(), NativeAspectPatch::Get().Digest().c_str());
     }
     std::fflush(stderr);
     windowStart = now;
@@ -310,4 +422,7 @@ void TimestepPatch::report(std::uint64_t now, std::uint64_t vblankCount) {
     windowFloored = 0;
     windowGameSeconds = 0.0;
     titleSteps = TitleStepWindow{};
+    windowFieldWrites = 0;
+    windowModeChanges = 0;
+    windowFieldLeft = 0;
 }
