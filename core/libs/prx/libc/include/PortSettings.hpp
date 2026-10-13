@@ -32,6 +32,10 @@
 //   FpsLimit = 60             APS5_FPS_LIMIT        30 and 60 are the title's own modes; 20-240 otherwise
 //   Timestep = fixed          APS5_TIMESTEP         variable (1): the frame step follows the frame time
 //   TimestepMinHz = 19.98     APS5_TIMESTEP_MIN_HZ  slowest step rate; slower frames slow the game down
+//   PresentMode = auto        APS5_PRESENT_MODE     fifo, mailbox, immediate (tears) or auto: mailbox when the
+//                                                   vblank runs above the display refresh, else fifo (ChoosePresentMode);
+//                                                   read only with APS5_PRESENT_AUTO=1 for now (without it APS5_PRESENT_MODE
+//                                                   alone picks fifo, mailbox or immediate, fifo by default)
 //   WindowMode = windowed     APS5_WINDOW_MODE      or fullscreen (desktop size, the frame scaled into it)
 //   ButtonIcons = playstation APS5_BUTTON_ICONS     steamdeck: the prompts show Steam Deck buttons (UiOverlay.hpp)
 //   NativeAspect = off        APS5_NATIVE_ASPECT    on (1): render at Resolution's aspect, wider view (Hor+)
@@ -63,6 +67,7 @@ enum class WindowMode { Auto, Windowed, Fullscreen };
 enum class Upscaler { Off, Fsr, Dlss };
 enum class ButtonIcons { PlayStation, SteamDeck };
 enum class DeluxeEdition { Auto, Off };
+enum class PresentMode { Auto, Fifo, Mailbox, Immediate };
 
 struct Settings {
     std::string source;
@@ -72,6 +77,8 @@ struct Settings {
     double fpsLimit = 0.0;
     bool variableTimestep = false;
     double timestepMinHz = DefaultTimestepMinHz;
+    // The swapchain's present mode (ChoosePresentMode), read with APS5_PRESENT_AUTO=1; not part of Any().
+    PresentMode presentMode = PresentMode::Auto;
     WindowMode windowMode = WindowMode::Auto;
     ButtonIcons buttonIcons = ButtonIcons::PlayStation;
     bool nativeAspect = false;
@@ -297,6 +304,12 @@ inline void SetKey(Settings& settings, std::string_view key, std::string_view va
     } else if (name == "timestepminhz") {
         if (ParseNumber(text, number) && number >= 10.0 && number <= 240.0) settings.timestepMinHz = number;
         else refuse("10 to 240");
+    } else if (name == "presentmode") {
+        if (text == "auto") settings.presentMode = PresentMode::Auto;
+        else if (text == "fifo") settings.presentMode = PresentMode::Fifo;
+        else if (text == "mailbox") settings.presentMode = PresentMode::Mailbox;
+        else if (text == "immediate") settings.presentMode = PresentMode::Immediate;
+        else refuse("auto, fifo, mailbox or immediate");
     } else if (name == "windowmode") {
         if (text == "auto") settings.windowMode = WindowMode::Auto;
         else if (text == "windowed") settings.windowMode = WindowMode::Windowed;
@@ -355,11 +368,11 @@ inline Settings Parse(std::string_view text, const std::string& origin) {
 }
 
 // The variable that overrides each key (the launcher names the ones set, which win over its choices).
-inline constexpr std::array<std::pair<const char*, const char*>, 10> EnvironmentKeys{{
+inline constexpr std::array<std::pair<const char*, const char*>, 11> EnvironmentKeys{{
     {"APS5_RESOLUTION", "Resolution"}, {"APS5_RENDER_RESOLUTION", "RenderResolution"}, {"APS5_FPS_LIMIT", "FpsLimit"},
     {"APS5_TIMESTEP", "Timestep"}, {"APS5_TIMESTEP_MIN_HZ", "TimestepMinHz"}, {"APS5_WINDOW_MODE", "WindowMode"},
     {"APS5_NATIVE_ASPECT", "NativeAspect"}, {"APS5_UPSCALER", "Upscaler"}, {"APS5_BUTTON_ICONS", "ButtonIcons"},
-    {"APS5_DELUXE_EDITION", "DeluxeEdition"}}};
+    {"APS5_DELUXE_EDITION", "DeluxeEdition"}, {"APS5_PRESENT_MODE", "PresentMode"}}};
 
 inline void ApplyEnvironment(Settings& settings, const std::function<const char*(const char*)>& lookup) {
     for (const auto& [variable, key] : EnvironmentKeys) {
@@ -409,6 +422,39 @@ inline int GameFramesPerSecond(const Settings& settings) {
 inline double VblankHz(const Settings& settings) {
     if (settings.fpsLimit == 0.0 || IsGameRate(settings.fpsLimit)) return 0.0;
     return settings.fpsLimit;
+}
+
+inline const char* PresentModeName(PresentMode mode) {
+    return mode == PresentMode::Fifo ? "fifo" : mode == PresentMode::Mailbox ? "mailbox" : mode == PresentMode::Immediate ? "immediate" : "auto";
+}
+
+// The swapchain's present mode and why (APS5_PRESENT_AUTO=1, VulkanDevice). FIFO holds each present to the
+// display refresh, so a vblank above it (FpsLimit 120 on a 60 Hz display) shows only the refresh rate;
+// mailbox shows the newest frame at each refresh (frames are dropped, never torn); immediate tears and is
+// only taken when asked for. vblankHz 0 is the default 59.94 Hz, displayHz 0 an unknown refresh. Auto takes
+// mailbox when the vblank exceeds the display refresh by more than 1 Hz and the surface offers it, else
+// FIFO. A mode the surface lacks falls back to FIFO (every surface offers it).
+struct PresentChoice {
+    PresentMode mode;
+    std::string reason;
+};
+
+inline PresentChoice ChoosePresentMode(PresentMode wanted, double vblankHz, double displayHz, bool mailboxOffered, bool immediateOffered) {
+    if (wanted == PresentMode::Fifo) return {PresentMode::Fifo, "PresentMode fifo"};
+    if (wanted == PresentMode::Mailbox || wanted == PresentMode::Immediate) {
+        if (wanted == PresentMode::Mailbox ? mailboxOffered : immediateOffered) return {wanted, std::string("PresentMode ") + PresentModeName(wanted)};
+        return {PresentMode::Fifo, std::string("PresentMode ") + PresentModeName(wanted) + " is not offered by the surface; using fifo"};
+    }
+    if (!(displayHz > 0.0)) return {PresentMode::Fifo, "auto: display refresh unknown"};
+    const double vblank = vblankHz != 0.0 ? vblankHz : GameRefresh60;
+    char text[160];
+    if (vblank > displayHz + 1.0 && mailboxOffered) {
+        std::snprintf(text, sizeof(text), "auto: vblank %.2f Hz above the display's %g Hz", vblank, displayHz);
+        return {PresentMode::Mailbox, text};
+    }
+    if (vblank > displayHz + 1.0) std::snprintf(text, sizeof(text), "auto: vblank %.2f Hz above the display's %g Hz but mailbox is not offered; the display caps presents", vblank, displayHz);
+    else std::snprintf(text, sizeof(text), "auto: vblank %.2f Hz %s the display's %g Hz", vblank, vblank >= displayHz - 1.0 ? "within" : "below", displayHz);
+    return {PresentMode::Fifo, text};
 }
 
 // The render tier for the output size: the smallest tier at least as tall as the 16:9 image letterboxed

@@ -24,6 +24,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/FastRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/PortSettings.hpp"
 #ifdef _WIN32
 #include "prx/libc/include/HostThread.hpp"
 #include <windows.h>
@@ -208,10 +209,33 @@ private:
 // The [present] line's counters (see the header); mutated under State::presentMutex.
 VulkanDevice::PresentStatistics presentCounters{};
 
+// The present modes the surface offers (none when the query fails).
+std::vector<VkPresentModeKHR> offeredPresentModes(PFN_vkGetPhysicalDeviceSurfacePresentModesKHR getModes, VkPhysicalDevice physical, VkSurfaceKHR surface) {
+    std::uint32_t count = 0;
+    std::vector<VkPresentModeKHR> modes;
+    if (getModes(physical, surface, &count, nullptr) == VK_SUCCESS) {
+        modes.resize(count);
+        if (getModes(physical, surface, &count, modes.data()) != VK_SUCCESS) count = 0;
+        modes.resize(count);
+    }
+    return modes;
+}
+
 // The swapchain's present mode: FIFO unless APS5_PRESENT_MODE=mailbox|immediate asks otherwise and the
 // surface offers it. The title is paced by the VideoOut vblank either way; FIFO also holds each present
 // to the display refresh, so a 120 FPS run (APS5_VBLANK_HZ=119.88) on a 60 Hz display needs mailbox.
-VkPresentModeKHR choosePresentMode(PFN_vkGetPhysicalDeviceSurfacePresentModesKHR getModes, VkPhysicalDevice physical, VkSurfaceKHR surface) {
+// APS5_PRESENT_AUTO=1 (frame rate S2): the player's PresentMode (APS5_PRESENT_MODE through the settings,
+// auto by default) with the window's vblank rate and display refresh decides (PortSettings::ChoosePresentMode):
+// auto takes mailbox when the vblank runs above the display refresh, else FIFO, and never immediate.
+VkPresentModeKHR choosePresentMode(PFN_vkGetPhysicalDeviceSurfacePresentModesKHR getModes, VkPhysicalDevice physical, VkSurfaceKHR surface, double vblankHz, double displayHz) {
+    static const bool presentAuto = std::getenv("APS5_PRESENT_AUTO") != nullptr;
+    if (presentAuto) {
+        const auto modes = offeredPresentModes(getModes, physical, surface);
+        const auto offered = [&](VkPresentModeKHR mode) { return std::find(modes.begin(), modes.end(), mode) != modes.end(); };
+        const auto choice = PortSettings::ChoosePresentMode(GetPortSettings_nid_no_patch().presentMode, vblankHz, displayHz, offered(VK_PRESENT_MODE_MAILBOX_KHR), offered(VK_PRESENT_MODE_IMMEDIATE_KHR));
+        std::fprintf(stderr, "[present] present mode %s (%s) (APS5_PRESENT_AUTO=1)\n", PortSettings::PresentModeName(choice.mode), choice.reason.c_str());
+        return choice.mode == PortSettings::PresentMode::Mailbox ? VK_PRESENT_MODE_MAILBOX_KHR : choice.mode == PortSettings::PresentMode::Immediate ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
+    }
     const char* value = std::getenv("APS5_PRESENT_MODE");
     if (value == nullptr || std::strcmp(value, "fifo") == 0) return VK_PRESENT_MODE_FIFO_KHR;
     VkPresentModeKHR wanted = VK_PRESENT_MODE_FIFO_KHR;
@@ -221,13 +245,7 @@ VkPresentModeKHR choosePresentMode(PFN_vkGetPhysicalDeviceSurfacePresentModesKHR
         std::fprintf(stderr, "[present] APS5_PRESENT_MODE=%s refused (fifo, mailbox or immediate); using fifo\n", value);
         return VK_PRESENT_MODE_FIFO_KHR;
     }
-    std::uint32_t count = 0;
-    std::vector<VkPresentModeKHR> modes;
-    if (getModes(physical, surface, &count, nullptr) == VK_SUCCESS) {
-        modes.resize(count);
-        if (getModes(physical, surface, &count, modes.data()) != VK_SUCCESS) count = 0;
-        modes.resize(count);
-    }
+    const auto modes = offeredPresentModes(getModes, physical, surface);
     if (std::find(modes.begin(), modes.end(), wanted) == modes.end()) {
         std::fprintf(stderr, "[present] APS5_PRESENT_MODE=%s is not offered by the surface; using fifo\n", value);
         return VK_PRESENT_MODE_FIFO_KHR;
@@ -1231,7 +1249,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         std::vector<VkSurfaceFormatKHR> formats(formatCount);
         check(getFormats(selected, state->surface, &formatCount, formats.data()), "vkGetPhysicalDeviceSurfaceFormatsKHR");
         require(std::any_of(formats.begin(), formats.end(), [](const auto& format) { return format.format == VK_FORMAT_B8G8R8A8_UNORM && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR; }), "BGRA8 sRGB-nonlinear surface format is unavailable");
-        state->presentMode = choosePresentMode(state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>("vkGetPhysicalDeviceSurfacePresentModesKHR"), selected, state->surface);
+        state->presentMode = choosePresentMode(state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>("vkGetPhysicalDeviceSurfacePresentModesKHR"), selected, state->surface, window->vblankHz, window->displayHz);
         VkSwapchainCreateInfoKHR swapchain{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
         swapchain.surface = state->surface;
         swapchain.minImageCount = swapchainImageCount(surface, state->presentMode);

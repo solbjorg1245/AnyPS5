@@ -78,6 +78,17 @@ void logDisplayRefresh(SDL_Window* window) {
     std::fflush(stderr);
 }
 
+// APS5_PRESENT_AUTO=1: the refresh of the window's display for the swapchain's present mode, 0 while
+// unknown (presenter thread only). The device takes it once, when it is created, so a known value is kept.
+double displayRefresh(SDL_Window* window) {
+    static double known = 0.0;
+    if (known != 0.0 || window == nullptr) return known;
+    SDL_DisplayMode mode{};
+    const int display = SDL_GetWindowDisplayIndex(window);
+    if (display >= 0 && SDL_GetCurrentDisplayMode(display, &mode) == 0 && mode.refresh_rate > 0) known = mode.refresh_rate;
+    return known;
+}
+
 void checkConfig(const VideoOutConfig& cfg) {
     cfg.Check();
 }
@@ -462,6 +473,9 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     std::vector<const char*> extensions(extensionCount);
     if (!SDL_Vulkan_GetInstanceExtensions(window.Handle(), &extensionCount, extensions.data())) throw std::runtime_error(std::string("SDL_Vulkan_GetInstanceExtensions failed: ") + SDL_GetError());
     extensions.resize(extensionCount);
+    static const bool presentAuto = std::getenv("APS5_PRESENT_AUTO") != nullptr;
+    const double presentVblankHz = presentAuto ? vblankRate() : 0.0;
+    const double presentDisplayHz = presentAuto ? displayRefresh(window.Handle()) : 0.0;
     const AgcDriver::PresentationWindow target{window.Handle(), extensions, [](void* context, VkInstance instance) {
         VkSurfaceKHR surface = VK_NULL_HANDLE;
         if (!SDL_Vulkan_CreateSurface(static_cast<SDL_Window*>(context), instance, &surface)) throw std::runtime_error(std::string("SDL_Vulkan_CreateSurface failed: ") + SDL_GetError());
@@ -477,7 +491,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         SDL_Vulkan_GetDrawableSize(static_cast<SDL_Window*>(context), &drawableWidth, &drawableHeight);
         *width = drawableWidth > 0 ? static_cast<std::uint32_t>(drawableWidth) : 0;
         *height = drawableHeight > 0 ? static_cast<std::uint32_t>(drawableHeight) : 0;
-    }, req.width, req.height, req.timing};
+    }, req.width, req.height, req.timing, presentVblankHz, presentDisplayHz};
     timing.Mark("window_prepare");
     const auto gpuReady = [](void* context) {
         auto& request = *static_cast<FlipRequest*>(context);

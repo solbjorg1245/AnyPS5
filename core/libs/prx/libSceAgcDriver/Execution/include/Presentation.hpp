@@ -21,6 +21,9 @@ struct PresentationWindow {
     std::uint32_t width;
     std::uint32_t height;
     std::shared_ptr<FrameTiming> timing;
+    // APS5_PRESENT_AUTO=1: the vblank rate (0 = the default 59.94 Hz) and the window display's refresh (0 = unknown).
+    double vblankHz = 0.0;
+    double displayHz = 0.0;
 };
 
 }

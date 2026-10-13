@@ -123,6 +123,7 @@ by these keys:
 | `Resolution` | `APS5_RESOLUTION` | `auto` or `WIDTHxHEIGHT`, e.g. `1280x800` (Steam Deck), `1920x1080`, `2560x1440`; sets the window size and the game's render resolution |
 | `FpsLimit` | `APS5_FPS_LIMIT` | `auto`, `30`, `60`; other values (20 to 240) need `Timestep = variable` |
 | `Timestep` | `APS5_TIMESTEP` | `fixed` (the game's own: slow motion below the limit) or `variable` (experimental: the game keeps its speed at any frame rate) |
+| `PresentMode` | `APS5_PRESENT_MODE` | experimental, read only with `APS5_PRESENT_AUTO=1` until the settings window has a row for it: `auto` (`mailbox` when the frame rate limit is above the display's refresh, else `fifo`), `fifo` (waits for the display), `mailbox` (the newest frame at each refresh: drops frames, never tears) or `immediate` (tears). Without the switch `APS5_PRESENT_MODE` alone picks `fifo`, `mailbox` or `immediate` (`fifo` by default) |
 | `WindowMode` | `APS5_WINDOW_MODE` | `windowed` or `fullscreen` |
 | `ButtonIcons` | `APS5_BUTTON_ICONS` | `playstation` or `steamdeck` (the prompts show A, B, X, Y, Menu and View; View works as the touchpad) |
 | `NativeAspect` | `APS5_NATIVE_ASPECT` | `off` or `on` (experimental: renders at `Resolution`'s own aspect, e.g. 21:9, instead of letterboxed 16:9) |

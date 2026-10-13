@@ -205,6 +205,54 @@ static void TestRefreshField() {
     Require(decide(1, std::nanf(""), 41.0f).action == Action::Write, "any value once known: written");
 }
 
+static void TestPresentMode() {
+    using PortSettings::PresentMode;
+    Require(FromText("").presentMode == PresentMode::Auto, "PresentMode: auto by default");
+    Require(FromText("PresentMode = fifo").presentMode == PresentMode::Fifo && FromText("PresentMode = Mailbox").presentMode == PresentMode::Mailbox, "PresentMode: fifo, mailbox (any case)");
+    Require(FromText("presentmode = IMMEDIATE").presentMode == PresentMode::Immediate && FromText("PresentMode = fifo\nPresentMode = AUTO").presentMode == PresentMode::Auto, "PresentMode: immediate, auto");
+    const auto bad = FromText("PresentMode = fifo\nPresentMode = vsync");
+    Require(bad.presentMode == PresentMode::Fifo && bad.warnings.size() == 1 && bad.warnings[0].find("refused") != std::string::npos, "PresentMode: a refused value warns and keeps the previous one");
+    const auto badOnly = FromText("PresentMode = vsync");
+    Require(badOnly.presentMode == PresentMode::Auto && badOnly.warnings.size() == 1, "PresentMode: a refused value keeps auto");
+    Require(!FromText("PresentMode = mailbox").Any(), "PresentMode alone is not Any()");
+    Require(PortSettings::Describe(FromText("Resolution = 1920x1080\nFpsLimit = 120\nTimestep = variable\nPresentMode = mailbox")) == PortSettings::Describe(FromText("Resolution = 1920x1080\nFpsLimit = 120\nTimestep = variable")), "PresentMode leaves Describe byte-identical");
+
+    auto settings = PortSettings::Parse("PresentMode = fifo\n", "test.ini");
+    const std::map<std::string, std::string> environment{{"APS5_PRESENT_MODE", "mailbox"}};
+    PortSettings::ApplyEnvironment(settings, [&](const char* name) -> const char* {
+        const auto found = environment.find(name);
+        return found == environment.end() ? nullptr : found->second.c_str();
+    });
+    Require(settings.presentMode == PresentMode::Mailbox && settings.warnings.empty(), "APS5_PRESENT_MODE overrides the file");
+    auto refused = PortSettings::Parse("PresentMode = fifo\n", "test.ini");
+    PortSettings::ApplyEnvironment(refused, [](const char* name) -> const char* { return std::string(name) == "APS5_PRESENT_MODE" ? "tearing" : nullptr; });
+    Require(refused.presentMode == PresentMode::Fifo && refused.warnings.size() == 1 && refused.warnings[0].find("APS5_PRESENT_MODE") != std::string::npos, "an invalid APS5_PRESENT_MODE warns and keeps the file's");
+
+    const auto choose = [](PresentMode wanted, double vblank, double display, bool mailbox, bool immediate, PresentMode expected) {
+        const auto choice = PortSettings::ChoosePresentMode(wanted, vblank, display, mailbox, immediate);
+        return choice.mode == expected && !choice.reason.empty();
+    };
+    Require(choose(PresentMode::Auto, 120.0, 60.0, true, true, PresentMode::Mailbox), "auto: vblank 120 on a 60 Hz display, mailbox offered");
+    Require(PortSettings::ChoosePresentMode(PresentMode::Auto, 120.0, 60.0, true, false).reason == "auto: vblank 120.00 Hz above the display's 60 Hz", "auto: the reason");
+    Require(choose(PresentMode::Auto, 120.0, 60.0, false, true, PresentMode::Fifo), "auto: mailbox not offered, fifo");
+    Require(PortSettings::ChoosePresentMode(PresentMode::Auto, 120.0, 60.0, false, true).reason.find("mailbox is not offered") != std::string::npos, "auto: why not mailbox");
+    Require(choose(PresentMode::Auto, 0.0, 60.0, true, true, PresentMode::Fifo), "auto: the default 59.94 on a 60 Hz display, fifo");
+    Require(PortSettings::ChoosePresentMode(PresentMode::Auto, 0.0, 60.0, true, true).reason == "auto: vblank 59.94 Hz within the display's 60 Hz", "auto: the default vblank's reason");
+    Require(choose(PresentMode::Auto, 60.0, 59.0, true, true, PresentMode::Fifo), "auto: within 1 Hz, fifo");
+    Require(choose(PresentMode::Auto, 120.0, 0.0, true, true, PresentMode::Fifo), "auto: display refresh unknown, fifo");
+    Require(choose(PresentMode::Auto, 120.0, 144.0, true, true, PresentMode::Fifo), "auto: vblank 120 on a 144 Hz display, fifo");
+    for (const double vblank : {0.0, 20.0, 30.0, 60.0, 120.0, 240.0}) {
+        for (const double display : {0.0, 30.0, 60.0, 144.0}) {
+            for (const bool mailbox : {false, true}) Require(PortSettings::ChoosePresentMode(PresentMode::Auto, vblank, display, mailbox, true).mode != PresentMode::Immediate, "auto never tears");
+        }
+    }
+    Require(choose(PresentMode::Immediate, 0.0, 60.0, true, true, PresentMode::Immediate), "immediate offered: immediate");
+    Require(choose(PresentMode::Immediate, 0.0, 60.0, true, false, PresentMode::Fifo), "immediate not offered: fifo");
+    Require(choose(PresentMode::Mailbox, 0.0, 60.0, true, false, PresentMode::Mailbox) && choose(PresentMode::Mailbox, 120.0, 60.0, false, true, PresentMode::Fifo), "mailbox: as asked when offered, else fifo");
+    Require(PortSettings::ChoosePresentMode(PresentMode::Mailbox, 0.0, 60.0, false, true).reason == "PresentMode mailbox is not offered by the surface; using fifo", "mailbox not offered: the reason");
+    Require(choose(PresentMode::Fifo, 120.0, 60.0, true, true, PresentMode::Fifo), "fifo: fifo even above the display refresh");
+}
+
 static std::string ReadGuest(const char* path) {
     const int fd = sceKernelOpen(path, SCE_KERNEL_O_RDONLY, 0);
     Require(fd >= 0, "open guest file");
@@ -856,6 +904,7 @@ int main() {
     TestPacer();
     TestTitleStep();
     TestRefreshField();
+    TestPresentMode();
     TestWindowSize();
     TestOverlay();
     std::printf("port_settings_tests: ok\n");
