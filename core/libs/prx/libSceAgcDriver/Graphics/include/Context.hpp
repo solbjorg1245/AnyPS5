@@ -133,6 +133,16 @@ inline std::uint64_t& DeviceProcLookups() {
 
 inline constexpr std::size_t EmptyBufferBytes = 16;
 
+struct HostPlacementCounts {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::uint64_t> bytes{0};
+};
+
+inline HostPlacementCounts& HostPlacements() {
+    static HostPlacementCounts counts;
+    return counts;
+}
+
 struct Context {
     VkDevice device;
     VkPhysicalDevice physical;
@@ -317,9 +327,8 @@ struct Context {
             return type;
         }
         const auto hostHeap = memory.memoryTypes[*host].heapIndex;
-        static std::atomic<std::uint64_t> placements{0}, placedBytes{0};
-        const auto count = placements.fetch_add(1) + 1;
-        const auto total = placedBytes.fetch_add(bytes) + bytes;
+        const auto count = HostPlacements().count.fetch_add(1) + 1;
+        const auto total = HostPlacements().bytes.fetch_add(bytes) + bytes;
         if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] %s: device-local heap %u uses %llu of its %llu MiB budget, %llu bytes placed in host memory type %u; %llu such allocations, %llu MiB; host heap %u uses %llu of its %llu MiB budget\n", what, heap, static_cast<unsigned long long>(usage >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(bytes), *host, static_cast<unsigned long long>(count), static_cast<unsigned long long>(total >> 20u), hostHeap, static_cast<unsigned long long>(reported.heapUsage[hostHeap] >> 20u), static_cast<unsigned long long>(reported.heapBudget[hostHeap] >> 20u));
         return *host;
     }
