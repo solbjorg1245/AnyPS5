@@ -220,6 +220,10 @@ std::size_t GuestArenaTrackEdgeWriteParts_nid_postfix(std::uintptr_t begin, std:
     return WindowsMappings::Get().TrackEdgeParts(begin, end);
 }
 
+bool GuestArenaCoarseWriteView_nid_postfix(std::uintptr_t address) {
+    return WindowsMappings::Get().CoarseView(address);
+}
+
 std::uint64_t GuestArenaMappingSerial_nid_postfix() {
     return WindowsMappings::Get().MappingSerial();
 }

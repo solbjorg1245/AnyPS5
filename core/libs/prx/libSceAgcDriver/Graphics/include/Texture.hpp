@@ -462,9 +462,12 @@ private:
     SurfaceGeometry geometry;
     std::vector<std::byte> original;
     // APS5_FIX_CORNER: the surface's bytes in the 16 KiB view pages it shares with other data at its
-    // start [0] and end [1], read before a whole upload's collect set every layer's generation (so
-    // older than it); edgeSnapshotAt 0 = nothing read. Bytes still equal to them were not written since.
+    // start [0] and end [1] while those were still tracked per 16 KiB (CoarseViewPage), read before
+    // a whole upload's collect set every layer's generation to edgeSnapshotGeneration; edgeSnapshotAt
+    // 0 = nothing read. Bytes still equal to them were not written since; they vouch only while the
+    // layer keeps that generation (any other upload, borrow or store sets another).
     std::uint64_t edgeSnapshotAt[2] = {0, 0};
+    std::uint64_t edgeSnapshotGeneration = 0;
     std::vector<std::byte> edgeSnapshot[2];
     // DCC keys the image content was uploaded under: a fast-cleared surface starts as its clear value.
     DccKeys uploadedKeys = DccKeys::Uncompressed;

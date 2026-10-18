@@ -107,9 +107,10 @@ std::size_t traceEdgeFine(const char* when, const GuestTextureResource& descript
 }
 std::array<std::atomic<std::uint64_t>, 5> edgeCauses{};
 // APS5_FIX_CORNER (default on; =0 = the old merge): an edge block's surface pages the CPU stamped
-// take the results when their bytes still equal the ones read before the layer's generation: the
-// stamp was the 16 KiB view page's, from a CPU store into the data next door before TrackEdgeParts
-// made the page fine (a Bink plane's first merge: the intro movie's bottom-right rectangle).
+// take the results when their view page was still tracked per 16 KiB at the layer's upload and
+// their bytes still equal the ones read then: the stamp was the view page's, from a CPU store into
+// the data next door before TrackEdgeParts made it fine (a Bink plane's first merge: the intro
+// movie's bottom-right rectangle). A CPU store of the very same bytes is taken for no store.
 bool fixCorner() {
     static const bool on = [] {
         const char* value = std::getenv("APS5_FIX_CORNER");
@@ -1824,6 +1825,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         edgeSnapshotAt[0] = edgeSnapshotAt[1] = 0;
     }
     const auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    edgeSnapshotGeneration = now;
     const auto stampLayers = [&](bool selectedOnly) {
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (!selectedOnly || layers == nullptr || (*layers)[layer]) layerGeneration[layer] = now;
@@ -1844,6 +1846,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         originalValid = false;
         forgetBorrowed(0, trackedLayers);
         stampLayers(false);
+        edgeSnapshotAt[0] = edgeSnapshotAt[1] = 0;
         static const bool recordClear = std::getenv("APS5_NO_RECORDED_CLEAR") == nullptr;
         auto* recorder = recordClear ? Recorder::Active() : nullptr;
         std::unique_ptr<CommandBatch> batch;
@@ -4049,15 +4052,17 @@ void StorageTexture::snapshotEdges() {
     for (int side = 0; side < 2; ++side) {
         edgeSnapshotAt[side] = 0;
         // A side on a view page boundary shares no page; a surface inside one view page has one side.
-        if ((side == 0 ? begin : end) % viewPage == 0 || from[side] >= to[side] || (side == 1 && edgeSnapshotAt[0] != 0 && from[1] < to[0])) {
-            edgeSnapshot[side].clear();
+        // Only a view page still tracked per 16 KiB stamps the surface for its neighbours' stores (a
+        // fine one, plain memory and fine tracking off read nothing: most uploads stop here).
+        if ((side == 0 ? begin : end) % viewPage == 0 || from[side] >= to[side] || (side == 1 && edgeSnapshotAt[0] != 0 && from[1] < to[0]) || !GuestMemory::CoarseViewPage(from[side])) {
+            std::vector<std::byte>().swap(edgeSnapshot[side]);
             continue;
         }
         // Read in place, no flush (the refresh flushed the surface; GPU stores landing later differ),
         // and only where every byte is readable (else nothing is vouched for).
         const auto bytes = static_cast<std::size_t>(to[side] - from[side]);
         if (!GuestMemory::Accessible(reinterpret_cast<const void*>(from[side]), bytes)) {
-            edgeSnapshot[side].clear();
+            std::vector<std::byte>().swap(edgeSnapshot[side]);
             continue;
         }
         edgeSnapshot[side].resize(bytes);
@@ -4212,10 +4217,11 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                         }
                     }
                 }
-                // APS5_FIX_CORNER: at the merge that made their view page fine (its CPU stamps were the
-                // whole page's until now), CPU-stamped surface pages no driver store reached whose bytes
-                // still equal the upload's take the results (see fixCorner). Later merges' stamps are exact.
-                if (fixCorner() && madeFine != 0 && cause == GuestMemory::PageStoreCause::CpuPages) {
+                // APS5_FIX_CORNER: while the layer keeps the generation of the upload that read its edge
+                // bytes with their view page still per 16 KiB (whichever surface's merge made it fine
+                // since), CPU-stamped surface pages no driver store reached whose bytes still equal them
+                // take the results (see fixCorner). A later upload reads a fine page: nothing to vouch.
+                if (fixCorner() && edgeSnapshotGeneration != 0 && layerGeneration[layer] == edgeSnapshotGeneration && cause == GuestMemory::PageStoreCause::CpuPages) {
                     const auto vouched = unchangedEdgePages(at, cpuPages & surfacePages & ~driverPages & ~gpuPages);
                     gpuPages |= vouched;
                     edgeUnchangedPages.fetch_add(static_cast<std::uint64_t>(std::popcount(vouched)), std::memory_order_relaxed);

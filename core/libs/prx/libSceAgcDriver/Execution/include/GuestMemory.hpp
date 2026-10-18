@@ -117,6 +117,9 @@ void ArmEdgeWatch(std::uint64_t address, std::size_t bytes);
 // coarse 16 KiB stamp covered (the Bink planes' table neighbours). APS5_NO_FINE_EDGE_TRACKING=1 =
 // off. Returns the view pages made fine (0 off, or when they already were).
 std::size_t TrackEdgeParts(std::uint64_t address, std::size_t bytes);
+// Whether TrackEdgeParts would still make the view page holding `address` fine: a shared view page
+// whose CPU stamps cover all 16 KiB (false when fine tracking is off, as TrackEdgeParts is).
+bool CoarseViewPage(std::uint64_t address);
 // The same, ahead of any merge, for the view pages a GPU-written surface [address, address + bytes)
 // covers only in part (its first and last, when it starts or ends inside one): called when the
 // surface's image is made, so the first frame's CPU stores next door stamp only their own pages.

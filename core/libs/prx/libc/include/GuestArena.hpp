@@ -38,6 +38,8 @@ std::uint64_t GuestArenaMappingSerial_nid_postfix();
 std::size_t GuestArenaTrackWriteParts_nid_postfix(std::uintptr_t address, std::size_t bytes);
 // The same for the view pages [begin, end) covers only in part (WindowsMappings::TrackEdgeParts).
 std::size_t GuestArenaTrackEdgeWriteParts_nid_postfix(std::uintptr_t begin, std::uintptr_t end);
+// Whether the address is in a shared view page still tracked per 16 KiB (WindowsMappings::CoarseView).
+bool GuestArenaCoarseWriteView_nid_postfix(std::uintptr_t address);
 bool GuestArenaHostRegionOverlaps_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_t protection, std::size_t granule);
 void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes);
