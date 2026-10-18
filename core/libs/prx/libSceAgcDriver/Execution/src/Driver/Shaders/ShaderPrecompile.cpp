@@ -19,6 +19,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_set>
 #include <vector>
@@ -114,7 +115,16 @@ void collectFiles(const std::filesystem::path& root, std::string_view pattern, s
 }
 
 void RunShaderPrecompile(const ShaderRecompiler::SpirvTarget& target) {
-    static std::atomic<bool> ran{false};
+    static std::atomic<bool> ran{false}, delayed{false};
+    // APS5_PRECOMPILE_DELAY_MS=<ms> (diagnostic): the first device creation waits that long, with or without
+    // a precompile, so a run can separate the precompile's start-up delay from its other effects.
+    if (const char* delay = std::getenv("APS5_PRECOMPILE_DELAY_MS"); delay != nullptr && *delay != '\0' && !delayed.exchange(true)) {
+        const auto ms = std::strtoul(delay, nullptr, 10);
+        if (ms > 0 && ms <= 600000) {
+            std::fprintf(stderr, "[precompile] waiting %lu ms at the first device creation (APS5_PRECOMPILE_DELAY_MS)\n", ms);
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        }
+    }
     const char* listPath = std::getenv("APS5_PRECOMPILE");
     if (listPath == nullptr || *listPath == '\0' || ran.exchange(true)) return;
     const auto started = std::chrono::steady_clock::now();
