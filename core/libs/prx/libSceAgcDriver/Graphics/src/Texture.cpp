@@ -368,7 +368,10 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
-    std::fprintf(stderr, "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu, edge blocks to the CPU %llu (cpu pages %llu, driver pages %llu, driver whole %llu, unknown %llu), edge blocks merged per page %llu (GPU pages %llu, view pages made fine %llu, at creation %llu, unchanged CPU-stamped pages %llu, edge snapshots %llu)%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), take(edgeBlocksToCpu), take(edgeCauses[1]), take(edgeCauses[2]), take(edgeCauses[3]), take(edgeCauses[4]), take(edgeBlocksMerged), take(edgeGpuPages), take(edgeFinePages), take(edgeFineAtCreation), take(edgeUnchangedPages), take(edgeSnapshotsRead), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
+    // APS5_FIX_CORNER's fields: with the switch off the line keeps its old shape.
+    char corner[96] = "";
+    if (fixCorner()) std::snprintf(corner, sizeof(corner), ", unchanged CPU-stamped pages %llu, edge snapshots %llu", take(edgeUnchangedPages), take(edgeSnapshotsRead));
+    std::fprintf(stderr, "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu, edge blocks to the CPU %llu (cpu pages %llu, driver pages %llu, driver whole %llu, unknown %llu), edge blocks merged per page %llu (GPU pages %llu, view pages made fine %llu, at creation %llu%s)%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), take(edgeBlocksToCpu), take(edgeCauses[1]), take(edgeCauses[2]), take(edgeCauses[3]), take(edgeCauses[4]), take(edgeBlocksMerged), take(edgeGpuPages), take(edgeFinePages), take(edgeFineAtCreation), corner, ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
@@ -1664,7 +1667,9 @@ bool StorageTexture::Refresh() {
     }
     if (unchanged) {
         ++Profile().storageReused;
-        for (const int side : {0, 1}) carryEdgeSnapshot(edgeLayer(side), layerGeneration[edgeLayer(side)], current);
+        if ((edgeSnapshotAt[0] | edgeSnapshotAt[1]) != 0) {
+            for (const int side : {0, 1}) carryEdgeSnapshot(edgeLayer(side), layerGeneration[edgeLayer(side)], current);
+        }
         layerGeneration.assign(trackedLayers, current);
         refreshGeneration();
         RecordCensus::Touch(RecordCensus::RefreshMemo);
@@ -4061,17 +4066,32 @@ void StorageTexture::carryEdgeSnapshot(std::uint32_t layer, std::uint64_t from, 
     }
 }
 
-std::uint32_t StorageTexture::snapshotEdges(const std::vector<bool>* layers) {
+std::uint32_t StorageTexture::snapshotEdges(const std::vector<bool>* layers, bool read) {
     constexpr std::uint64_t viewPage = 0x4000;
     const auto begin = descriptor.baseAddress;
     const auto end = begin + guestBytes;
     const std::uint64_t from[2] = {begin, std::max(end & ~(viewPage - 1), begin)};
     const std::uint64_t to[2] = {std::min((begin + viewPage - 1) & ~(viewPage - 1), end), end};
+    // The tracked layers a side's bytes lie in that `layers` selects, of how many (a side spans
+    // several when a layer is smaller than its 16 KiB).
+    const auto selection = [&](int side) {
+        if (from[side] >= to[side] || trackedLayerBytes == 0) return std::pair<std::uint64_t, std::uint64_t>{(*layers)[edgeLayer(side)] ? 1u : 0u, 1u};
+        const auto first = std::min<std::uint64_t>(trackedLayers - 1, (from[side] - begin) / trackedLayerBytes);
+        const auto last = std::min<std::uint64_t>(trackedLayers - 1, (to[side] - 1 - begin) / trackedLayerBytes);
+        std::uint64_t selected = 0;
+        for (auto layer = first; layer <= last; ++layer) selected += (*layers)[static_cast<std::size_t>(layer)] ? 1u : 0u;
+        return std::pair<std::uint64_t, std::uint64_t>{selected, last - first + 1};
+    };
     std::uint32_t snapped = 0;
     for (int side = 0; side < 2; ++side) {
-        if (layers != nullptr && !(*layers)[edgeLayer(side)]) continue;
+        const auto [selected, spanned] = layers != nullptr ? selection(side) : std::pair<std::uint64_t, std::uint64_t>{1, 1};
+        if (selected == 0) continue;
         edgeSnapshotAt[side] = 0;
         edgeSnapshotGeneration[side] = 0;
+        if (!read || selected != spanned) {
+            std::vector<std::byte>().swap(edgeSnapshot[side]);
+            continue;
+        }
         // A side on a view page boundary shares no page; a surface inside one view page has one side.
         // Only a view page still tracked per 16 KiB stamps the surface for its neighbours' stores (a
         // fine one, plain memory and fine tracking off read nothing: most uploads stop here).
@@ -4311,7 +4331,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     std::vector<ShadowedRange> shadowed;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> imported;
     const HostImport* shadowImport = nullptr;
-    const auto settle = [&](bool memoizedCollect) {
+    const auto settle = [&](bool memoizedCollect, bool landed = true) {
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (layers[layer]) layerPending[layer] = false;
         }
@@ -4319,12 +4339,14 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         if (allKept || !adjacent.empty()) {
             // APS5_FIX_CORNER: the re-stamped layers' edge bytes (what was just stored) are read again
             // before the collect, as an upload reads them (a Bink plane stored whole before the first
-            // frame whose table store stamps its edge pages through the shared view page).
+            // frame whose table store stamps its edge pages through the shared view page). A store
+            // into a host import lands when its batch runs: read now, the bytes would be the old ones
+            // (t1193's luma head), so those sides are dropped and vouch for nothing until an upload.
             std::uint32_t snapped = 0;
             if (fixCorner()) {
                 std::vector<bool> restamped(trackedLayers, false);
                 for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) restamped[layer] = layers[layer] && !skippedLayer[layer];
-                snapped = snapshotEdges(&restamped);
+                snapped = snapshotEdges(&restamped, landed);
             }
             const auto now = memoizedCollect ? GuestMemory::CollectWrites(firstStored, static_cast<std::size_t>(lastStored - firstStored)) : GuestMemory::CollectWritesUncached(firstStored, static_cast<std::size_t>(lastStored - firstStored));
             for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
@@ -4374,7 +4396,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             storeKeys("block write-back", layers);
             uploadedKeys = DccKeys::Uncompressed;
             for (const auto& [from, to] : keep) GuestMemory::MarkWritten(from, static_cast<std::size_t>(to - from));
-            settle(true);
+            settle(true, Recorder::Active() == nullptr);
             ++Profile().storageDirectWriteBacks;
             return;
         }
@@ -4517,7 +4539,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         // The walk covers this surface's pages only: an adjacent image's later CPU write is stamped
         // newer than this value when its own range is collected. No CPU wrote the pages here
         // (MarkWritten made the only stamps), so the memoized collect is exact.
-        settle(true);
+        settle(true, batch != nullptr);
         ++Profile().storageDirectWriteBacks;
         return;
     }

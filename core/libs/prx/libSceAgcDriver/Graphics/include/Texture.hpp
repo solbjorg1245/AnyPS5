@@ -447,11 +447,12 @@ private:
     bool pendingUnitInside(std::uint64_t address, std::size_t bytes) const;
     VkImageView createView(std::uint32_t mip, bool firstLayer = false) const;
     void release() noexcept;
-    // APS5_FIX_CORNER: reads edgeSnapshot below for the sides whose tracked layer `layers` selects
-    // (all for none) and returns them as bits; of `pages` (bits of the 64 KiB block at `block`), the
+    // APS5_FIX_CORNER: reads edgeSnapshot below for the sides whose tracked layers `layers` all
+    // selects (all for none; a side partly selected is dropped), or with `read` false drops them,
+    // and returns the sides read as bits; of `pages` (bits of the 64 KiB block at `block`), the
     // ones whose surface bytes still equal a snapshot taken at `generation`; a side's snapshot
     // follows its layer from `from` to `to` (Refresh found it unchanged).
-    std::uint32_t snapshotEdges(const std::vector<bool>* layers);
+    std::uint32_t snapshotEdges(const std::vector<bool>* layers, bool read = true);
     std::uint32_t unchangedEdgePages(std::uint64_t block, std::uint32_t pages, std::uint64_t generation) const;
     std::uint32_t edgeLayer(int side) const;
     void carryEdgeSnapshot(std::uint32_t layer, std::uint64_t from, std::uint64_t to);
@@ -471,7 +472,8 @@ private:
     // edgeSnapshotAt 0 = nothing read. Bytes still equal to them were not written since; they vouch
     // only while the layer keeps that generation (a borrow, clear or copy sets another; an upload
     // and a write-back's re-stamp read them again first; Refresh's unchanged re-stamp carries it,
-    // carryEdgeSnapshot).
+    // carryEdgeSnapshot, as advanceAdjacent's advance does: inside the shared block only the byte
+    // compare tells a CPU store apart). A CPU store of the very bytes read is taken for no store.
     std::uint64_t edgeSnapshotAt[2] = {0, 0};
     std::uint64_t edgeSnapshotGeneration[2] = {0, 0};
     std::vector<std::byte> edgeSnapshot[2];
