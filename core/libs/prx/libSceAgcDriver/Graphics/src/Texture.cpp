@@ -4342,6 +4342,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             // frame whose table store stamps its edge pages through the shared view page). A store
             // into a host import lands when its batch runs: read now, the bytes would be the old ones
             // (t1193's luma head), so those sides are dropped and vouch for nothing until an upload.
+            // A skipped layer keeps its old generation and snapshot: its edge block is BlockWritten, so the
+            // next Refresh sees the same 64 KiB stamp and re-uploads it (new generation, new snapshot)
+            // before any later merge can vouch with it.
             std::uint32_t snapped = 0;
             if (fixCorner()) {
                 std::vector<bool> restamped(trackedLayers, false);
