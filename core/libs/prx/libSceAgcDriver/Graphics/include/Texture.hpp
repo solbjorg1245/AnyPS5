@@ -447,6 +447,10 @@ private:
     bool pendingUnitInside(std::uint64_t address, std::size_t bytes) const;
     VkImageView createView(std::uint32_t mip, bool firstLayer = false) const;
     void release() noexcept;
+    // APS5_FIX_CORNER: reads edgeSnapshot below; of `pages` (bits of the 64 KiB block at `block`),
+    // the ones whose surface bytes still equal it.
+    void snapshotEdges();
+    std::uint32_t unchangedEdgePages(std::uint64_t block, std::uint32_t pages) const;
 
     Context context;
     TextureDetiler& detiler;
@@ -457,6 +461,11 @@ private:
     std::uint64_t sliceLinearBytes = 0;
     SurfaceGeometry geometry;
     std::vector<std::byte> original;
+    // APS5_FIX_CORNER: the surface's bytes in the 16 KiB view pages it shares with other data at its
+    // start [0] and end [1], read before a whole upload's collect set every layer's generation (so
+    // older than it); edgeSnapshotAt 0 = nothing read. Bytes still equal to them were not written since.
+    std::uint64_t edgeSnapshotAt[2] = {0, 0};
+    std::vector<std::byte> edgeSnapshot[2];
     // DCC keys the image content was uploaded under: a fast-cleared surface starts as its clear value.
     DccKeys uploadedKeys = DccKeys::Uncompressed;
     DccKeys filledKeys = DccKeys::Uncompressed;
