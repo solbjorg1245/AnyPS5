@@ -11,6 +11,7 @@
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "Optimization/SrtWalker/WalkProgram.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
+#include "SpirvBackend/SpirvBda.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
@@ -1148,6 +1149,260 @@ void verifyLoopCounterTable() {
     table[1][5] = 0u;
 }
 
+// A T# table behind an SRT pointer keyed by v_readfirstlane of a per-lane value: the waterfall
+// loops of Demon's Souls' particle passes (0x24b201a00 at pc 0x1a00: key = the force volume's
+// texture index, T# at block + 0x20e0 + key * 32). Before APS5_LOOP_TABLE_RUN the plan failed
+// ("GetImageResource dword 0 is not a valid runtime value") and the dispatch was skipped.
+void verifyRuntimeKeyTable() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t Format8888UNorm = 56;
+    constexpr std::uint32_t Type2D = 9;
+    const std::uint32_t slots = ResourceMaterializer::BindlessSlots();
+    if (slots < 2u || !ResourceMaterializer::RuntimeKeyTables()) return;
+
+    struct alignas(256) Texture { std::array<std::uint8_t, 256> bytes{}; };
+    static Texture textures[2];
+    // The span's entries and the ones read past it; zeros (null T#s) elsewhere.
+    std::vector<std::array<std::uint32_t, 8>> table(64u + slots);
+    const auto makeTexture = [&](std::uint32_t entry, const Texture& texture) {
+        const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texture.bytes.data()));
+        table[entry] = {static_cast<std::uint32_t>(base >> 8u), static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (Format8888UNorm << 20u) | (3u << 30u), 3u << 14u, 0xfacu | (Type2D << 28u), 0u, 0u, 0u, 0u};
+    };
+    makeTexture(0u, textures[0]);
+    makeTexture(1u, textures[1]);
+    std::array<std::uint32_t, 4> output{};
+    const auto tableAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(table.data()));
+    const auto outputAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
+    std::array<std::uint32_t, 12> srt{static_cast<std::uint32_t>(tableAddress), static_cast<std::uint32_t>(tableAddress >> 32u), 0u, 0u, 0u, 0u, 0u, 0u, static_cast<std::uint32_t>(outputAddress), static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu), 16u, 0xfacu};
+    const auto srtAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(srt.data()));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(srtAddress), static_cast<std::uint32_t>(srtAddress >> 32u)};
+    // The table and record reads through raw addresses compile to buffer-device-address loads.
+    const std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+
+    // s_load_dwordx2 s[2:3], s[0:1], 0; s_load_dwordx4 s[8:11], s[0:1], 0x10 (S#);
+    // s_load_dwordx4 s[28:31], s[0:1], 0x20 (output V#); s_waitcnt lgkmcnt(0);
+    // v_and_b32 v8, 1, v0; v_readfirstlane_b32 s16, v8; s_lshl_b32 s17, s16, 5;
+    // s_load_dwordx8 s[20:27], s[2:3], s17; s_waitcnt lgkmcnt(0);
+    // image_sample_lz v[4:7], v[0:1], s[20:27], s[8:11]; s_waitcnt vmcnt(0);
+    // buffer_store_dword v4, off, s[28:31], 0; s_endpgm.
+    const std::vector<std::uint32_t> code{0xf4040080u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000020u, 0xbf8cc07fu, 0x36100081u, 0x7e200508u, 0x8f118510u, 0xf40c0501u, 0x22000000u, 0xbf8cc07fu, 0xf09c0f08u, 0x00450400u, 0xbf8c3f70u, 0xe0700000u, 0x80070400u, 0xbf810000u};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Compute, 0x20000u, code, 0, {}};
+    request.context.waveSize = 64;
+    request.context.userDataBaseRegister = 0;
+    request.context.userData = userData;
+    request.context.compute = ShaderComputeStageInfo{{64u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 32;
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
+    request.target.bdaAbiVersion = BdaAbi::Version;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+
+    // The span is opt-in (APS5_LOOP_TABLE_RUN=2): by default a waterfall key that is no record
+    // read fails the plan as before.
+    if (!ResourceMaterializer::RuntimeKeySpan()) {
+        bool failed = false;
+        try {
+            static_cast<void>(GetResourcePlan(request));
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        require(failed, "runtime-key table: the span fallback ran without APS5_LOOP_TABLE_RUN=2");
+        return;
+    }
+    const auto plan = GetResourcePlan(request);
+    std::size_t tables = 0;
+    for (const auto& source : plan->descriptorSources) {
+        if (!source.indirectImage.has_value()) continue;
+        ++tables;
+        const auto& indirect = *source.indirectImage;
+        require(indirect.heapAddress && indirect.runtimeKey && !indirect.loopKey && !indirect.hasMaterial && indirect.entryOffset == 0u, "runtime-key table: the waterfall table was not planned");
+        require(indirect.entryLimit == slots, "runtime-key table: the table does not span the bindless slots");
+    }
+    require(tables == 1, "runtime-key table: the table source was not planned");
+    const auto mappingOf = [&](const ResourceSnapshot& snapshot) {
+        require(snapshot.flattenedSrt.size() >= 1u + 2u * slots, "runtime-key table: the mapping block is missing from the flattened SRT");
+        return std::vector<std::uint32_t>(snapshot.flattenedSrt.end() - static_cast<std::ptrdiff_t>(1u + 2u * slots), snapshot.flattenedSrt.end());
+    };
+
+    // The two textures map to their keys; the null entries up to the span stay unmapped (sample
+    // zeros, as a null T# does), and nothing valid lies past the span.
+    static_cast<void>(ResourceMaterializer::TakeRuntimeKeyTables());
+    AgcDriver::ShaderMemory memory({});
+    const auto capture = memory.Capture(request);
+    const auto direct = static_cast<std::uint32_t>(plan->info.images.size());
+    require(capture->snapshot.images.size() == direct + slots - 1u, "runtime-key table: the table does not bind the bindless slots");
+    const auto mapping = mappingOf(capture->snapshot);
+    require(std::vector<std::uint32_t>(mapping.begin(), mapping.begin() + 5) == std::vector<std::uint32_t>{2u, 0u, 0u, 1u, 1u}, "runtime-key table: the textures are not mapped to their keys");
+    const auto counted = ResourceMaterializer::TakeRuntimeKeyTables();
+    require(counted.spanned == 1u && counted.pastSpan == 0u && counted.probed == 0u, "runtime-key table: the table or a valid T# past its span was miscounted");
+    const auto regions = memory.Regions();
+    request.context.memory = regions;
+    require(!Recompile(request, *capture)->spirv.empty(), "runtime-key table: the waterfall table did not compile");
+    request.context.memory = {};
+
+    // A texture past the span is a key no slot maps: counted, the keys inside still mapped.
+    makeTexture(slots + 3u, textures[1]);
+    AgcDriver::ShaderMemory pastMemory({});
+    const auto pastMapping = mappingOf(pastMemory.Capture(request)->snapshot);
+    require(std::vector<std::uint32_t>(pastMapping.begin(), pastMapping.begin() + 5) == std::vector<std::uint32_t>{2u, 0u, 0u, 1u, 1u}, "runtime-key table: a texture past the span changed the mapping");
+    const auto pastCounted = ResourceMaterializer::TakeRuntimeKeyTables();
+    require(pastCounted.spanned == 1u && pastCounted.pastSpan == 1u, "runtime-key table: the texture past the span was not counted");
+    table[slots + 3u] = {};
+}
+
+// The waterfall key read from records (Demon's Souls' particle passes: key = the force volume's
+// texture index at block + 0xc00 + i * 0x90, i < 32, the T# at block + 0x20e0 + key * 32): the
+// records are probed and exactly the keys they hold are mapped, whatever the span.
+void verifyRecordKeyTable() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t Format8888UNorm = 56;
+    constexpr std::uint32_t Type2D = 9;
+    const std::uint32_t slots = ResourceMaterializer::BindlessSlots();
+    if (slots < 3u || !ResourceMaterializer::RuntimeKeyTables()) return;
+
+    struct alignas(256) Texture { std::array<std::uint8_t, 256> bytes{}; };
+    static Texture textures[3];
+    // Entries 0-31 are the T# table, entries 32-33 hold the four records (16 bytes apart, from
+    // byte 0x408).
+    std::vector<std::array<std::uint32_t, 8>> table(64u + slots);
+    const auto makeTexture = [&](std::uint32_t entry, const Texture& texture) {
+        const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texture.bytes.data()));
+        table[entry] = {static_cast<std::uint32_t>(base >> 8u), static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (Format8888UNorm << 20u) | (3u << 30u), 3u << 14u, 0xfacu | (Type2D << 28u), 0u, 0u, 0u, 0u};
+    };
+    makeTexture(2u, textures[0]);
+    makeTexture(5u, textures[1]);
+    makeTexture(9u, textures[2]);
+    const auto setRecords = [&](std::uint32_t r0, std::uint32_t r1, std::uint32_t r2, std::uint32_t r3) {
+        table[32][2] = r0;
+        table[32][6] = r1;
+        table[33][2] = r2;
+        table[33][6] = r3;
+    };
+    setRecords(5u, 2u, 5u, 0xffffffffu);
+    std::array<std::uint32_t, 4> output{};
+    const auto tableAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(table.data()));
+    const auto outputAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
+    std::array<std::uint32_t, 12> srt{static_cast<std::uint32_t>(tableAddress), static_cast<std::uint32_t>(tableAddress >> 32u), 0u, 0u, 0u, 0u, 0u, 0u, static_cast<std::uint32_t>(outputAddress), static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu), 16u, 0xfacu};
+    const auto srtAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(srt.data()));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(srtAddress), static_cast<std::uint32_t>(srtAddress >> 32u)};
+    // The table and record reads through raw addresses compile to buffer-device-address loads.
+    const std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+
+    // s_load_dwordx2 s[2:3], s[0:1], 0; s_load_dwordx4 s[8:11], s[0:1], 0x10 (S#);
+    // s_load_dwordx4 s[28:31], s[0:1], 0x20 (output V#); s_waitcnt lgkmcnt(0);
+    // v_and_b32 v8, 3, v0; v_lshlrev_b32 v9, 4, v8; v_add_nc_u32 v9, 0x400, v9;
+    // global_load_dword v10, v9, s[2:3] offset:0x8; s_waitcnt vmcnt(0);
+    // v_readfirstlane_b32 s16, v10; s_lshl_b32 s17, s16, 5; s_load_dwordx8 s[20:27], s[2:3], s17;
+    // s_waitcnt lgkmcnt(0); image_sample_lz v[4:7], v[0:1], s[20:27], s[8:11]; s_waitcnt vmcnt(0);
+    // buffer_store_dword v4, off, s[28:31], 0; s_endpgm.
+    const std::vector<std::uint32_t> code{0xf4040080u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000020u, 0xbf8cc07fu, 0x36100083u, 0x34121084u, 0x4a1212ffu, 0x00000400u, 0xdc308008u, 0x0a020009u, 0xbf8c3f70u, 0x7e20050au, 0x8f118510u, 0xf40c0501u, 0x22000000u, 0xbf8cc07fu, 0xf09c0f08u, 0x00450400u, 0xbf8c3f70u, 0xe0700000u, 0x80070400u, 0xbf810000u};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Compute, 0x20000u, code, 0, {}};
+    request.context.waveSize = 64;
+    request.context.userDataBaseRegister = 0;
+    request.context.userData = userData;
+    request.context.compute = ShaderComputeStageInfo{{64u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 32;
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
+    request.target.bdaAbiVersion = BdaAbi::Version;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+
+    const auto plan = GetResourcePlan(request);
+    std::size_t tables = 0;
+    for (const auto& source : plan->descriptorSources) {
+        if (!source.indirectImage.has_value()) continue;
+        ++tables;
+        const auto& indirect = *source.indirectImage;
+        require(indirect.heapAddress && indirect.runtimeKey && indirect.hasMaterial && !indirect.loopKey && indirect.entryOffset == 0u, "record-key table: the waterfall table was not planned through its records");
+        require(indirect.materialRecords == 4u && indirect.selectorStride == 16u && indirect.selectorOffset == 0x408u, "record-key table: the records were not matched (4 records, stride 16, from 0x408)");
+    }
+    require(tables == 1, "record-key table: the table source was not planned");
+    const auto mappingOf = [&](const ResourceSnapshot& snapshot) {
+        require(snapshot.flattenedSrt.size() >= 1u + 2u * slots, "record-key table: the mapping block is missing from the flattened SRT");
+        return std::vector<std::uint32_t>(snapshot.flattenedSrt.end() - static_cast<std::ptrdiff_t>(1u + 2u * slots), snapshot.flattenedSrt.end());
+    };
+
+    // Keys 2 and 5 are the records'; the negative record holds no key, and the texture at 9 is
+    // one no record selects.
+    static_cast<void>(ResourceMaterializer::TakeRuntimeKeyTables());
+    AgcDriver::ShaderMemory memory({});
+    const auto capture = memory.Capture(request);
+    const auto mapping = mappingOf(capture->snapshot);
+    require(std::vector<std::uint32_t>(mapping.begin(), mapping.begin() + 5) == std::vector<std::uint32_t>{2u, 2u, 0u, 5u, 1u}, "record-key table: the records' keys are not mapped");
+    ResourceMaterializer::RuntimeKeyCounts expected;
+    expected.probed = 1u;
+    expected.keys = 2u;
+    require(ResourceMaterializer::TakeRuntimeKeyTables() == expected, "record-key table: the table was not counted as keyed by its records");
+    const auto regions = memory.Regions();
+    request.context.memory = regions;
+    require(!Recompile(request, *capture)->spirv.empty(), "record-key table: the waterfall table did not compile");
+    request.context.memory = {};
+
+    // A record that now holds 9 maps it as well.
+    setRecords(5u, 2u, 9u, 0xffffffffu);
+    AgcDriver::ShaderMemory nextMemory({});
+    const auto nextMapping = mappingOf(nextMemory.Capture(request)->snapshot);
+    require(std::vector<std::uint32_t>(nextMapping.begin(), nextMapping.begin() + 7) == std::vector<std::uint32_t>{3u, 2u, 0u, 5u, 1u, 9u, 2u}, "record-key table: a changed record was not mapped");
+    static_cast<void>(ResourceMaterializer::TakeRuntimeKeyTables());
+}
+
+// A record offset built as a DAG with shared operands (`v9 = v9 + v9`, k times) costs 2^k values
+// to evaluate as a tree: the probe stops at its budget (256 values) and the plan fails as before
+// (or spans, with APS5_LOOP_TABLE_RUN=2) instead of hanging translation.
+void verifyRecordOffsetBudget() {
+    using namespace ShaderRecompiler;
+    if (!ResourceMaterializer::RuntimeKeyTables()) return;
+    std::array<std::uint32_t, 4> srt{};
+    const auto srtAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(srt.data()));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(srtAddress), static_cast<std::uint32_t>(srtAddress >> 32u)};
+    const std::array<std::uint32_t, 1> capabilities{29u};
+    const auto planFor = [&](std::uint32_t doublings, bool& failed) {
+        // As verifyRecordKeyTable's shader, with `v_add_nc_u32 v9, v9, v9` x doublings after the
+        // record index's shift.
+        std::vector<std::uint32_t> code{0xf4040080u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000020u, 0xbf8cc07fu, 0x36100083u, 0x34121084u};
+        code.insert(code.end(), doublings, 0x4a121309u);
+        code.insert(code.end(), {0x4a1212ffu, 0x00000400u, 0xdc308008u, 0x0a020009u, 0xbf8c3f70u, 0x7e20050au, 0x8f118510u, 0xf40c0501u, 0x22000000u, 0xbf8cc07fu, 0xf09c0f08u, 0x00450400u, 0xbf8c3f70u, 0xe0700000u, 0x80070400u, 0xbf810000u});
+        RecompileRequest request{};
+        request.shader = {ShaderStage::Compute, 0x20000u, code, 0, {}};
+        request.context.waveSize = 64;
+        request.context.userDataBaseRegister = 0;
+        request.context.userData = userData;
+        request.context.compute = ShaderComputeStageInfo{{64u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = 32;
+        request.target.supportedCapabilities = capabilities;
+        request.target.fragmentShaderBarycentricEnabled = false;
+        request.layout.pushConstantSizeBytes = 128;
+        std::optional<DescriptorSource::IndirectImage> table;
+        failed = false;
+        try {
+            const auto plan = GetResourcePlan(request);
+            for (const auto& source : plan->descriptorSources) {
+                if (source.indirectImage.has_value()) table = source.indirectImage;
+            }
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        return table;
+    };
+    bool failed = false;
+    const auto cheap = planFor(5u, failed);
+    require(!failed && cheap.has_value() && cheap->materialRecords == 4u && cheap->selectorStride == (16u << 5u), "record offset budget: a 129-value offset was not probed");
+    const auto costly = planFor(12u, failed);
+    require(ResourceMaterializer::RuntimeKeySpan() ? (!failed && costly.has_value() && costly->materialRecords == 0u) : failed, "record offset budget: a 4096-value offset was probed past the budget");
+}
+
 void verifyDescriptorPhis() {
     using namespace ShaderRecompiler;
     constexpr std::uint32_t Format8888UNorm = 56;
@@ -1691,6 +1946,9 @@ int main() {
         verifyLoopCounterRange();
         verifyBindlessTable();
         verifyLoopCounterTable();
+        verifyRuntimeKeyTable();
+        verifyRecordKeyTable();
+        verifyRecordOffsetBudget();
         verifyLoopTableSpan();
         verifyDescriptorPhis();
         verifyProgramCounterRelativeData();

@@ -190,6 +190,19 @@ through two identical image descriptors, and the driver used to take the second 
 which left the water's height, motion and reflections wrong. Each storage image now writes the level the
 shader names. `APS5_STORAGE_MIP_EXACT=0` restores the old guess (for comparison only).
 
+Loads and the intro: the compute queues wait for labels the graphics queue writes. The driver gives up on
+such a wait after 1 s with no GPU progress and lets the compute work run without its input, printing
+"WAIT_REG_MEM ... timed out" lines. Since the recording thread took over the graphics queue's draws, its work
+(long pipeline builds at a load) was not counted as progress, so these waits gave up although the graphics
+queue was still on its way to the label. The driver now counts it; `APS5_WAIT_PIPE_PROGRESS=0` restores
+the old rule (for comparison only).
+
+Particles in wind and force volumes: some of the game's particle passes pick a 3D texture per force
+volume from a table, one volume at a time (a "waterfall" loop). The driver could not tell which table
+entries they use and skipped those passes; the log said "GetImageResource dword 0 is not a valid runtime
+value". It now reads the volumes' records and binds exactly the textures they name.
+`APS5_LOOP_TABLE_RUN=0` skips the passes as before (for comparison only).
+
 ## Controls
 
 Controllers work through SDL: Xbox layout A/B/X/Y = Cross/Circle/Square/Triangle, LB/RB = L1/R1,
