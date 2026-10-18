@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <span>
 #include <string>
@@ -20,9 +21,19 @@
 // byte offset) or by scanning files for the code's anchor hash.
 namespace ShaderRecompiler::ShaderKeyList {
 
-inline constexpr std::uint32_t FormatVersion = 1;
+// Format 2 ("k2" lines) ends each line in a checksum, so a cut line never decodes; "k1" lines (format
+// 1, no checksum) still decode, and a list rewrite turns them into k2.
+inline constexpr std::uint32_t FormatVersion = 2;
 // Dwords the anchor hash covers: the first AnchorDwords of the code.
 inline constexpr std::size_t AnchorDwords = 8;
+// Bounds a decoded record must keep: a code's dwords, and the user data, flat SRT and other counts.
+inline constexpr std::uint32_t MaxCodeDwords = 1u << 20u;
+inline constexpr std::size_t MaxCount = 1u << 16u;
+// A key list larger than this is not read.
+inline constexpr std::uintmax_t MaxListBytes = 64ull << 20u;
+// The locator path of the running program's own file (a port that links the game's executable into
+// its own carries that code there instead of in app0/eboot.bin).
+inline constexpr std::string_view ExecutableLocator = "@exe";
 
 struct CodeIdentity {
     std::uint32_t dwords = 0;
@@ -50,6 +61,7 @@ struct Record {
     std::string entry;
     std::uint64_t spirvHash = 0;
     ShaderStage stage = ShaderStage::Compute;
+    // Not part of any key (it names the program in diagnostics only): Describe leaves it 0.
     std::uint64_t codeAddress = 0;
     CodeIdentity code;
     std::uint32_t waveSize = 0;
@@ -62,7 +74,8 @@ struct Record {
     BindingLayout layout{};
     ResourceSpecialization specialization;
     SnapshotShape shape;
-    // Where the code lies in the game files: a path below app0 ('/' separated) and a byte offset.
+    // Where the code lies in the game files: a path below app0 ('/' separated, ValidLocatorPath) or
+    // ExecutableLocator, and a byte offset.
     std::string locatorPath;
     std::uint64_t locatorOffset = 0;
 };
@@ -74,6 +87,31 @@ struct Record {
 [[nodiscard]] Record Describe(const RecompileRequest& request, const ResourceSnapshot& snapshot, const ResourceSpecialization& specialization);
 [[nodiscard]] std::string Encode(const Record& record);
 [[nodiscard]] bool Decode(std::string_view line, Record& record);
+// A relative path below app0 without "." or ".." parts, drive or backslash, or ExecutableLocator.
+[[nodiscard]] bool ValidLocatorPath(std::string_view path);
+// The code of `identity` at byte `offset` of `bytes`, into `words`; false (words untouched) when the
+// bytes there are not that code.
+[[nodiscard]] bool TakeCode(std::span<const std::byte> bytes, std::uint64_t offset, const CodeIdentity& identity, std::vector<std::uint32_t>& words);
+
+// A key list file: its lines in order and the records decoded from them. A line that is no record
+// of this format (a comment, another format, a damaged line, a repeated entry) is kept verbatim, so
+// a rewrite changes the records' locators and format and nothing else.
+struct ListFile {
+    struct Line {
+        std::string text;
+        // The record of the line, or -1 for a verbatim line.
+        std::ptrdiff_t record = -1;
+    };
+    std::vector<Line> lines;
+    std::vector<Record> records;
+    std::size_t unreadable = 0;
+    std::size_t duplicates = 0;
+    // Records read from format 1 lines.
+    std::size_t legacy = 0;
+};
+[[nodiscard]] bool ReadList(const std::filesystem::path& path, ListFile& list);
+// Writes the list to a temporary file renamed over `path`.
+[[nodiscard]] bool WriteList(const std::filesystem::path& path, const ListFile& list);
 
 // A request (and snapshot) rebuilt from a record over the code and the device's target: its disk
 // cache key is the recording's when the code, the target and the switches are the same. The
@@ -117,7 +155,13 @@ void Note(const RecompileRequest& request, const ResourceSnapshot& snapshot, con
 [[nodiscard]] std::uint64_t Recorded();
 
 enum class PrecompileStatus {
+    // Stored under the recording's entry name, with the recording's SPIR-V.
     Stored,
+    // Stored under another entry name than the recording's (another device, sources or switch set),
+    // so nothing could compare it: only with storeUnverified.
+    StoredUnverified,
+    // Not compiled: another entry name than the recording's, without storeUnverified.
+    Unverified,
     Present,
     Diverged,
     Disabled,
@@ -131,8 +175,9 @@ struct PrecompileOutcome {
 
 // Compiles the variant of a rebuilt request into the disk cache unless its entry is there
 // (Recompiler.cpp: the compile the recompiler itself runs on a miss). A variant whose entry
-// name is the recording's but whose SPIR-V is not is reported Diverged and not stored.
-[[nodiscard]] PrecompileOutcome Precompile(const Record& record, const RebuiltRequest& rebuilt);
+// name is the recording's but whose SPIR-V is not is reported Diverged and not stored; one whose
+// entry name differs from the recording's is compiled and stored only with storeUnverified.
+[[nodiscard]] PrecompileOutcome Precompile(const Record& record, const RebuiltRequest& rebuilt, bool storeUnverified);
 
 }
 

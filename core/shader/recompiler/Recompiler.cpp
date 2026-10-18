@@ -888,7 +888,11 @@ std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request
 namespace ShaderKeyList {
 
 // The miss path of findOrCompileVariant over a rebuilt request: the same key, the same compile.
-PrecompileOutcome Precompile(const Record& record, const RebuiltRequest& rebuilt) {
+// The compile reads the code, the stage, the context's stage info, wave size and user data count,
+// the target, the layout, graphics->mesh and the specialization: all of them in the disk key, all
+// of them in the record. It also reads the snapshot, but only into the descriptor values the SPIR-V
+// emitter never reads (it checks their counts), and the code address, only into diagnostics.
+PrecompileOutcome Precompile(const Record& record, const RebuiltRequest& rebuilt, bool storeUnverified) {
     PrecompileOutcome outcome;
     if (!ShaderDiskCache::Enabled() || DebugProbeActive()) return outcome;
     const auto& request = rebuilt.request;
@@ -899,15 +903,21 @@ PrecompileOutcome Precompile(const Record& record, const RebuiltRequest& rebuilt
         outcome.status = PrecompileStatus::Present;
         return outcome;
     }
+    // Another entry name than the recording's: nothing to compare the SPIR-V with.
+    const bool verifiable = outcome.entry == record.entry;
+    if (!verifiable && !storeUnverified) {
+        outcome.status = PrecompileStatus::Unverified;
+        return outcome;
+    }
     auto program = PrepareResourceProgram(request);
     auto variant = std::make_shared<const CompiledVariant>(compileVariant(request, std::move(program), rebuilt.snapshot, record.specialization));
     outcome.spirvHash = HashBytes(std::as_bytes(std::span(variant->result.spirv.Words())));
-    if (outcome.entry == record.entry && outcome.spirvHash != record.spirvHash) {
+    if (verifiable && outcome.spirvHash != record.spirvHash) {
         outcome.status = PrecompileStatus::Diverged;
         return outcome;
     }
     ShaderDiskCache::Store(std::move(key), std::move(variant));
-    outcome.status = PrecompileStatus::Stored;
+    outcome.status = verifiable ? PrecompileStatus::Stored : PrecompileStatus::StoredUnverified;
     return outcome;
 }
 

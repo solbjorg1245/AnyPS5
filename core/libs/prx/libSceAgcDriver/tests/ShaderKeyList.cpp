@@ -161,14 +161,30 @@ void verifyRoundTrip() {
     }
 }
 
+// The format 1 form of a line: the k1 tag and no checksum.
+std::string legacyLine(const std::string& line) {
+    return "k1" + line.substr(2, line.rfind(" ~") - 2);
+}
+
 void verifyRejects() {
     Sample sample(ShaderStage::Compute);
     auto record = KeyList::Describe(sample.request, sample.snapshot, sample.specialization);
     record.entry = "0123456789abcdef0123456789abcdef.bin";
-    const auto line = KeyList::Encode(record);
+    const auto sealed = KeyList::Encode(record);
     KeyList::Record decoded;
+    require(sealed.compare(0, 3, "k2 ") == 0 && KeyList::Decode(sealed, decoded), "a format 2 line does not decode");
+    require(record.codeAddress == 0 && decoded.codeAddress == 0, "the record carries the code address");
+    // A cut line never decodes: the checksum, or a value before it.
+    require(!KeyList::Decode(sealed.substr(0, sealed.size() - 1), decoded), "a line missing its checksum's last digit decodes");
+    require(!KeyList::Decode(sealed.substr(0, sealed.rfind(" ~")), decoded), "a format 2 line without its checksum decodes");
+    auto cut = sealed;
+    cut.erase(cut.rfind(" ~") - 1, 1);
+    require(!KeyList::Decode(cut, decoded), "a line whose last value lost a digit decodes");
+    // The structure checks, over format 1 lines (no checksum to fail first).
+    const auto line = legacyLine(sealed);
+    require(KeyList::Decode(line, decoded) && KeyList::Encode(decoded) == sealed, "a format 1 line does not decode to the same record");
     require(!KeyList::Decode("", decoded), "an empty line decodes");
-    require(!KeyList::Decode("k2" + line.substr(2), decoded), "another format tag decodes");
+    require(!KeyList::Decode("k3" + line.substr(2), decoded), "another format tag decodes");
     require(!KeyList::Decode("k1 0123.bin" + line.substr(line.find(".bin") + 4), decoded), "a short entry name decodes");
     require(!KeyList::Decode(line.substr(0, line.rfind(' ')), decoded), "a record missing its last value decodes");
     require(!KeyList::Decode(line + " 0", decoded), "a record with an extra value decodes");
@@ -182,6 +198,79 @@ void verifyRejects() {
     require(KeyList::Decode(tokens, decoded), "the record itself does not decode");
     tokens.replace(stageStart, stageEnd - stageStart, "100000000");
     require(!KeyList::Decode(tokens, decoded), "a stage beyond 32 bits decodes");
+
+    // Counts a rebuild allocates by stay bounded.
+    const auto rejects = [&](auto change, const char* what) {
+        auto changed = record;
+        change(changed);
+        KeyList::Record out;
+        require(!KeyList::Decode(KeyList::Encode(changed), out), std::string("a record with ") + what + " decodes");
+    };
+    rejects([](KeyList::Record& r) { r.userDataCount = static_cast<std::uint32_t>(KeyList::MaxCount + 1); }, "a huge user data count");
+    rejects([](KeyList::Record& r) { r.shape.flattenedSrt = 0xffffffffu; }, "a huge flat SRT");
+    rejects([](KeyList::Record& r) { r.shape.userData = static_cast<std::uint32_t>(KeyList::MaxCount + 1); }, "a huge snapshot user data count");
+    rejects([](KeyList::Record& r) { r.code.dwords = 0; }, "an empty code");
+    rejects([](KeyList::Record& r) { r.code.dwords = KeyList::MaxCodeDwords + 1; }, "a huge code");
+    // Locators stay below app0 (or name the program).
+    for (const char* path : {"/etc/passwd", "C:/Windows/win.ini", "a/../../b", "..", "./a", "a//b", "a/", "a\\b", "x\ty"}) {
+        rejects([&](KeyList::Record& r) { r.locatorPath = path; r.locatorOffset = 4; }, (std::string("the locator ") + path).c_str());
+        require(!KeyList::ValidLocatorPath(path), std::string("the locator path is valid: ") + path);
+    }
+    for (const char* path : {"eboot.bin", "materials/!cookedshaders/a b.csdr", "@exe"}) {
+        auto located = record;
+        located.locatorPath = path;
+        located.locatorOffset = 0x40;
+        require(KeyList::Decode(KeyList::Encode(located), decoded) && decoded.locatorPath == path, std::string("the locator does not decode: ") + path);
+    }
+}
+
+void verifyTakeCode() {
+    std::vector<std::uint32_t> words(64);
+    for (std::uint32_t i = 0; i < words.size(); ++i) words[i] = 0x01000193u * (i + 7u);
+    const std::vector<std::uint32_t> code(words.begin() + 10, words.begin() + 30);
+    const auto identity = KeyList::IdentifyCode(code);
+    const auto bytes = std::as_bytes(std::span(words));
+    std::vector<std::uint32_t> out{1u};
+    require(KeyList::TakeCode(bytes, 40, identity, out) && out == code, "the code at its offset is not taken");
+    out = {1u};
+    require(!KeyList::TakeCode(bytes, 44, identity, out) && out == std::vector<std::uint32_t>{1u}, "the code at a wrong offset is taken");
+    require(!KeyList::TakeCode(bytes, bytes.size() - 8, identity, out), "a code running past the end is taken");
+    require(!KeyList::TakeCode(bytes, bytes.size() + 4, identity, out), "an offset beyond the file is taken");
+    require(!KeyList::TakeCode(bytes, ~std::uint64_t{0}, identity, out), "the largest offset is taken");
+    auto stale = words;
+    stale[20] ^= 0x100u;
+    require(!KeyList::TakeCode(std::as_bytes(std::span(stale)), 40, identity, out), "a changed code (a stale locator) is taken");
+}
+
+// A list rewrite keeps every line that is no record verbatim and upgrades format 1 records.
+void verifyListFile(const std::filesystem::path& directory) {
+    Sample sample(ShaderStage::Compute);
+    auto first = KeyList::Describe(sample.request, sample.snapshot, sample.specialization);
+    first.entry = "0123456789abcdef0123456789abcdef.bin";
+    auto second = first;
+    second.entry = "00000000000000000000000000000002.bin";
+    const auto foreign = "k9 a line of a later format";
+    const auto damaged = KeyList::Encode(second).substr(0, 60);
+    const auto path = directory / "list.txt";
+    {
+        std::ofstream file(path, std::ios::binary);
+        file << "# a comment\r\n" << legacyLine(KeyList::Encode(first)) << "\r\n" << foreign << "\n" << KeyList::Encode(second) << "\n" << KeyList::Encode(first) << "\n" << damaged;
+    }
+    KeyList::ListFile list;
+    require(KeyList::ReadList(path, list), "the list does not read");
+    require(list.records.size() == 2 && list.lines.size() == 6, "the list read " + std::to_string(list.records.size()) + " records in " + std::to_string(list.lines.size()) + " lines, not 2 in 6");
+    require(list.unreadable == 2 && list.duplicates == 1 && list.legacy == 1, "the list counts are wrong");
+    require(list.lines[1].record == 0 && list.lines[3].record == 1 && list.lines[4].record < 0, "the lines do not map to their records");
+    list.records[1].locatorPath = "materials/x.csdr";
+    list.records[1].locatorOffset = 0x100;
+    require(KeyList::WriteList(path, list), "the list does not write");
+    KeyList::ListFile again;
+    require(KeyList::ReadList(path, again), "the rewritten list does not read");
+    require(again.lines.size() == 6 && again.lines[0].text == "# a comment" && again.lines[2].text == foreign && again.lines[5].text == damaged, "the rewrite changed a line that is no record");
+    require(again.lines[4].text == KeyList::Encode(first), "the rewrite changed a repeated record's line");
+    require(again.records.size() == 2 && again.legacy == 0 && again.unreadable == 2 && again.duplicates == 1, "the rewritten list counts are wrong");
+    require(again.records[1].locatorPath == "materials/x.csdr" && again.records[1].locatorOffset == 0x100, "the rewrite lost the locator");
+    require(!KeyList::ReadList(directory / "no such list.txt", again), "a missing list reads");
 }
 
 void verifyScanner() {
@@ -239,34 +328,48 @@ struct ComputeRequest {
 // A real recompile records its key; the record, rebuilt over the same code and target, finds the
 // entry present, and once the entry is gone compiles it again to the recorded SPIR-V.
 void verifyRecordAndPrecompile(const std::filesystem::path& keys) {
+    // The list ends in a cut line (a recorder killed mid-write): the first record starts a line of its own.
+    {
+        std::ofstream file(keys, std::ios::binary);
+        file << "# seeded\nk2 0123456789abcdef";
+    }
     ComputeRequest compute;
     const auto compiled = Recompile(compute.request);
     ShaderDiskCache::Flush();
     require(!compiled.spirv.empty(), "the compile produced no SPIR-V");
     require(KeyList::Recorded() == 1, "the compile recorded " + std::to_string(KeyList::Recorded()) + " keys, not 1");
-    std::ifstream file(keys, std::ios::binary);
-    std::string line;
-    std::vector<KeyList::Record> records;
-    while (std::getline(file, line)) {
-        KeyList::Record record;
-        if (!line.empty() && line[0] != '#') {
-            require(KeyList::Decode(line, record), "a recorded line does not decode");
-            records.push_back(record);
-        }
-    }
-    require(records.size() == 1, "the key list holds " + std::to_string(records.size()) + " records, not 1");
-    const auto& record = records[0];
+    KeyList::ListFile list;
+    require(KeyList::ReadList(keys, list), "the key list does not read");
+    require(list.records.size() == 1 && list.unreadable == 1 && list.lines.size() == 3, "the key list holds " + std::to_string(list.records.size()) + " records and " + std::to_string(list.unreadable) + " unreadable lines, not 1 and 1");
+    const auto& record = list.records[0];
     require(record.code == KeyList::IdentifyCode(compute.code) && record.locatorPath.empty(), "the recorded code identity is wrong");
     KeyList::RebuiltRequest rebuilt;
     KeyList::Rebuild(record, compute.code, compute.request.target, rebuilt);
-    auto outcome = KeyList::Precompile(record, rebuilt);
+    auto outcome = KeyList::Precompile(record, rebuilt, false);
     require(outcome.status == KeyList::PrecompileStatus::Present && outcome.entry == record.entry, "the precompile does not find the recorded entry present");
-    std::filesystem::remove(ShaderDiskCache::EntryDirectory() / record.entry);
-    outcome = KeyList::Precompile(record, rebuilt);
+    const auto entryFile = ShaderDiskCache::EntryDirectory() / record.entry;
+    std::filesystem::remove(entryFile);
+    // Other SPIR-V under the recording's entry name is never stored.
+    auto changed = record;
+    changed.spirvHash ^= 1u;
+    outcome = KeyList::Precompile(changed, rebuilt, true);
+    ShaderDiskCache::Flush();
+    require(outcome.status == KeyList::PrecompileStatus::Diverged && !std::filesystem::exists(entryFile), "a diverged variant was stored");
+    // Another entry name than the recording's cannot be compared: skipped, or stored when asked to.
+    changed = record;
+    changed.entry = "ffffffffffffffffffffffffffffffff.bin";
+    outcome = KeyList::Precompile(changed, rebuilt, false);
+    ShaderDiskCache::Flush();
+    require(outcome.status == KeyList::PrecompileStatus::Unverified && outcome.entry == record.entry && !std::filesystem::exists(entryFile), "an unverifiable variant was stored");
+    outcome = KeyList::Precompile(changed, rebuilt, true);
+    ShaderDiskCache::Flush();
+    require(outcome.status == KeyList::PrecompileStatus::StoredUnverified && std::filesystem::is_regular_file(entryFile), "an unverifiable variant was not stored when asked to");
+    std::filesystem::remove(entryFile);
+    outcome = KeyList::Precompile(record, rebuilt, false);
     require(outcome.status == KeyList::PrecompileStatus::Stored, "the precompile did not store the missing entry");
     require(outcome.entry == record.entry && outcome.spirvHash == record.spirvHash, "the precompile compiled other SPIR-V than the recording");
     ShaderDiskCache::Flush();
-    require(std::filesystem::is_regular_file(ShaderDiskCache::EntryDirectory() / record.entry), "the precompiled entry was not written");
+    require(std::filesystem::is_regular_file(entryFile), "the precompiled entry was not written");
     // A second recompile of the same key in this process records nothing new.
     static_cast<void>(Recompile(compute.request));
     require(KeyList::Recorded() == 1, "a repeated key was recorded again");
@@ -285,6 +388,8 @@ int main() {
         setEnvironment("APS5_SHADER_KEYS", keys.string());
         verifyRoundTrip();
         verifyRejects();
+        verifyTakeCode();
+        verifyListFile(directory);
         verifyScanner();
         verifyRecordAndPrecompile(keys);
         std::error_code error;
