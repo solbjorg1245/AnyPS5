@@ -63,10 +63,37 @@ bool endsWithNoCase(std::string_view text, std::string_view suffix) {
     return std::equal(tail.begin(), tail.end(), suffix.begin(), [](char a, char b) { return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b)); });
 }
 
-// One APS5_PRECOMPILE_SCAN pattern: a file below app0 ("eboot.bin"), or the files below a folder
-// whose names end in a suffix ("materials/*.csdr", or "*.csdr" for all of app0).
+// The locator name of the running program's own file: a port that links the game's executable into
+// its own carries the shader code there instead of in app0/eboot.bin.
+constexpr std::string_view ExecutableLocator = "@exe";
+
+std::filesystem::path executablePath() {
+#ifdef _WIN32
+    std::wstring path(32768, L'\0');
+    const auto size = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+    if (size == 0 || size >= path.size()) return {};
+    path.resize(size);
+    return std::filesystem::path(path);
+#else
+    std::error_code error;
+    const auto self = std::filesystem::read_symlink("/proc/self/exe", error);
+    return error ? std::filesystem::path() : self;
+#endif
+}
+
+std::filesystem::path locatorFile(const std::filesystem::path& app0, std::string_view locator) {
+    return locator == ExecutableLocator ? executablePath() : app0 / std::filesystem::path(std::string(locator));
+}
+
+// One APS5_PRECOMPILE_SCAN pattern: a file below app0 ("eboot.bin"), the files below a folder whose
+// names end in a suffix ("materials/*.csdr", or "*.csdr" for all of app0), or "@exe" for the program.
 void collectFiles(const std::filesystem::path& root, std::string_view pattern, std::set<std::filesystem::path>& files) {
     std::error_code error;
+    if (pattern == ExecutableLocator) {
+        const auto path = executablePath();
+        if (!path.empty() && std::filesystem::is_regular_file(path, error)) files.insert(path);
+        return;
+    }
     const auto star = pattern.find('*');
     if (star == std::string_view::npos) {
         const auto path = root / std::filesystem::path(std::string(pattern));
@@ -153,7 +180,7 @@ void RunShaderPrecompile(const ShaderRecompiler::SpirvTarget& target) {
         }
         std::vector<std::byte> bytes;
         for (const auto& [path, members] : byPath) {
-            const bool read = ShaderRecompiler::ReadWholeFile(app0 / std::filesystem::path(path), bytes);
+            const bool read = ShaderRecompiler::ReadWholeFile(locatorFile(app0, path), bytes);
             for (const auto i : members) {
                 if (read && take(codes[i], bytes, codes[i].offset)) ++byLocator;
                 else {
@@ -185,6 +212,7 @@ void RunShaderPrecompile(const ShaderRecompiler::SpirvTarget& target) {
         std::vector<KeyList::CodeIdentity> identities;
         for (const auto i : missing) identities.push_back(codes[i].identity);
         const KeyList::Scanner scanner(identities);
+        const auto executable = executablePath();
         std::vector<std::byte> bytes;
         for (const auto& path : files) {
             std::error_code error;
@@ -195,7 +223,7 @@ void RunShaderPrecompile(const ShaderRecompiler::SpirvTarget& target) {
             for (const auto& hit : scanner.Find(bytes)) {
                 auto& code = codes[missing[hit.index]];
                 if (code.located || !take(code, bytes, hit.offset)) continue;
-                code.path = path.lexically_relative(app0).generic_string();
+                code.path = !executable.empty() && path == executable ? std::string(ExecutableLocator) : path.lexically_relative(app0).generic_string();
                 code.scanned = true;
                 ++byScan;
             }
