@@ -469,8 +469,9 @@ private:
     // start [0] and end [1] while those were still tracked per 16 KiB (CoarseViewPage), read before
     // the collect of the upload that set their tracked layer's generation to edgeSnapshotGeneration;
     // edgeSnapshotAt 0 = nothing read. Bytes still equal to them were not written since; they vouch
-    // only while the layer keeps that generation (another upload, borrow or store sets another;
-    // Refresh's unchanged re-stamp carries it, carryEdgeSnapshot).
+    // only while the layer keeps that generation (a borrow, clear or copy sets another; an upload
+    // and a write-back's re-stamp read them again first; Refresh's unchanged re-stamp carries it,
+    // carryEdgeSnapshot).
     std::uint64_t edgeSnapshotAt[2] = {0, 0};
     std::uint64_t edgeSnapshotGeneration[2] = {0, 0};
     std::vector<std::byte> edgeSnapshot[2];

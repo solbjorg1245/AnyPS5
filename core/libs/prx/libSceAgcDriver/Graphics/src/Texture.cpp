@@ -119,6 +119,7 @@ bool fixCorner() {
     return on;
 }
 std::atomic<std::uint64_t> edgeUnchangedPages{0};
+std::atomic<std::uint64_t> edgeSnapshotsRead{0};
 // Images stored by a FlushPending after a hook skip of theirs (AccessKeptByCpu), of which by the
 // hook for the read site of the last skip; images evictStale dropped (the [hooksync] and [storage] lines).
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
@@ -367,7 +368,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
-    std::fprintf(stderr, "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu, edge blocks to the CPU %llu (cpu pages %llu, driver pages %llu, driver whole %llu, unknown %llu), edge blocks merged per page %llu (GPU pages %llu, view pages made fine %llu, at creation %llu, unchanged CPU-stamped pages %llu)%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), take(edgeBlocksToCpu), take(edgeCauses[1]), take(edgeCauses[2]), take(edgeCauses[3]), take(edgeCauses[4]), take(edgeBlocksMerged), take(edgeGpuPages), take(edgeFinePages), take(edgeFineAtCreation), take(edgeUnchangedPages), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
+    std::fprintf(stderr, "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu, edge blocks to the CPU %llu (cpu pages %llu, driver pages %llu, driver whole %llu, unknown %llu), edge blocks merged per page %llu (GPU pages %llu, view pages made fine %llu, at creation %llu, unchanged CPU-stamped pages %llu, edge snapshots %llu)%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), take(edgeBlocksToCpu), take(edgeCauses[1]), take(edgeCauses[2]), take(edgeCauses[3]), take(edgeCauses[4]), take(edgeBlocksMerged), take(edgeGpuPages), take(edgeFinePages), take(edgeFineAtCreation), take(edgeUnchangedPages), take(edgeSnapshotsRead), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
@@ -4085,6 +4086,7 @@ std::uint32_t StorageTexture::snapshotEdges(const std::vector<bool>* layers) {
         std::memcpy(edgeSnapshot[side].data(), reinterpret_cast<const void*>(from[side]), bytes);
         edgeSnapshotAt[side] = from[side];
         snapped |= 1u << side;
+        edgeSnapshotsRead.fetch_add(1, std::memory_order_relaxed);
     }
     return snapped;
 }
@@ -4311,9 +4313,21 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         }
         const bool allKept = std::none_of(skippedLayer.begin(), skippedLayer.end(), [](bool kept) { return kept; });
         if (allKept || !adjacent.empty()) {
+            // APS5_FIX_CORNER: the re-stamped layers' edge bytes (what was just stored) are read again
+            // before the collect, as an upload reads them (a Bink plane stored whole before the first
+            // frame whose table store stamps its edge pages through the shared view page).
+            std::uint32_t snapped = 0;
+            if (fixCorner()) {
+                std::vector<bool> restamped(trackedLayers, false);
+                for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) restamped[layer] = layers[layer] && !skippedLayer[layer];
+                snapped = snapshotEdges(&restamped);
+            }
             const auto now = memoizedCollect ? GuestMemory::CollectWrites(firstStored, static_cast<std::size_t>(lastStored - firstStored)) : GuestMemory::CollectWritesUncached(firstStored, static_cast<std::size_t>(lastStored - firstStored));
             for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
                 if (layers[layer] && !skippedLayer[layer]) layerGeneration[layer] = now;
+            }
+            for (const int side : {0, 1}) {
+                if ((snapped >> side & 1u) != 0) edgeSnapshotGeneration[side] = now;
             }
             refreshGeneration();
             advanceAdjacent(adjacent, now, firstBlock, lastBlock);
