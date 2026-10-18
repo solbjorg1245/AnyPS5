@@ -3862,6 +3862,10 @@ void StorageTexture::advanceAdjacent(const std::vector<Adjacent>& adjacent, std:
         if (begin < beforeEnd && !GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(beforeEnd - begin), seen)) continue;
         if (afterBegin < end && !GuestMemory::UnchangedSince(afterBegin, static_cast<std::size_t>(end - afterBegin), seen)) continue;
         if (trace) std::fprintf(stderr, "[flush] adjacent pending image 0x%llx+0x%llx layer %u advanced past a write-back's stamps (generation %llu -> %llu)\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), layer, static_cast<unsigned long long>(seen), static_cast<unsigned long long>(now));
+        // APS5_FIX_CORNER: unchanged outside the shared block since `seen`, so the edge bytes read at
+        // `seen` still vouch (the byte compare catches a write inside it; the Bink luma plane's store
+        // advancing the chroma plane after it).
+        texture->carryEdgeSnapshot(layer, seen, now);
         texture->layerGeneration[layer] = now;
         texture->refreshGeneration();
     }
