@@ -1,0 +1,139 @@
+#ifndef CORE_SHADER_RECOMPILER_SHADERKEYLIST_HPP
+#define CORE_SHADER_RECOMPILER_SHADERKEYLIST_HPP
+
+#include "CompiledVariant.hpp"
+#include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+// The shader key list (P-PRECOMPILE): one line per recompile key a run meets, so a later launch can
+// fill the shader disk cache before play. A line names the code by its size and hash and carries
+// every other input of the disk cache key (stage info, binding layout, specialization) plus the
+// shape of the descriptor snapshot the compile populates. It holds no code bytes: the precompile
+// finds the code in the player's own game files, by an optional locator (a path below app0 and a
+// byte offset) or by scanning files for the code's anchor hash.
+namespace ShaderRecompiler::ShaderKeyList {
+
+inline constexpr std::uint32_t FormatVersion = 1;
+// Dwords the anchor hash covers: the first AnchorDwords of the code.
+inline constexpr std::size_t AnchorDwords = 8;
+
+struct CodeIdentity {
+    std::uint32_t dwords = 0;
+    std::array<std::uint64_t, 2> hash{};
+    std::uint64_t anchor = 0;
+
+    bool operator==(const CodeIdentity& other) const = default;
+};
+
+// The descriptor snapshot's shape (counts and widths, no values): Populate checks it while the
+// compile allocates bindings; the values never reach the SPIR-V.
+struct SnapshotShape {
+    std::vector<std::uint32_t> buffers;
+    std::vector<std::uint32_t> images;
+    std::vector<std::uint32_t> samplers;
+    std::uint32_t flattenedSrt = 0;
+    // The flat offsets of the deferred slots (their guest addresses are left out).
+    std::vector<std::uint32_t> deferredFlat;
+    std::uint32_t userData = 0;
+};
+
+struct Record {
+    // The recording's disk cache entry name and SPIR-V hash: a precompile under the same sources,
+    // device and switches rebuilds that name, and must then produce that SPIR-V.
+    std::string entry;
+    std::uint64_t spirvHash = 0;
+    ShaderStage stage = ShaderStage::Compute;
+    std::uint64_t codeAddress = 0;
+    CodeIdentity code;
+    std::uint32_t waveSize = 0;
+    std::uint32_t userDataBaseRegister = 0;
+    std::uint32_t userDataCount = 0;
+    std::optional<ShaderComputeStageInfo> compute;
+    std::optional<ShaderPixelStageInfo> pixel;
+    std::optional<ShaderVertexStageInfo> vertex;
+    std::optional<MeshConfiguration> mesh;
+    BindingLayout layout{};
+    ResourceSpecialization specialization;
+    SnapshotShape shape;
+    // Where the code lies in the game files: a path below app0 ('/' separated) and a byte offset.
+    std::string locatorPath;
+    std::uint64_t locatorOffset = 0;
+};
+
+[[nodiscard]] CodeIdentity IdentifyCode(std::span<const std::uint32_t> code);
+[[nodiscard]] std::uint64_t AnchorHash(std::span<const std::uint32_t> words);
+[[nodiscard]] bool CodeMatches(std::span<const std::byte> bytes, const CodeIdentity& identity);
+
+[[nodiscard]] Record Describe(const RecompileRequest& request, const ResourceSnapshot& snapshot, const ResourceSpecialization& specialization);
+[[nodiscard]] std::string Encode(const Record& record);
+[[nodiscard]] bool Decode(std::string_view line, Record& record);
+
+// A request (and snapshot) rebuilt from a record over the code and the device's target: its disk
+// cache key is the recording's when the code, the target and the switches are the same. The
+// request's spans point into the storage, which must outlive it.
+struct RebuiltRequest {
+    RecompileRequest request;
+    ResourceSnapshot snapshot;
+    std::vector<std::uint32_t> userData;
+    std::vector<LinkedProgram> linked;
+};
+void Rebuild(const Record& record, std::span<const std::uint32_t> code, const SpirvTarget& target, RebuiltRequest& rebuilt);
+
+// One hit of a scan: the code of identity `index` lies at byte `offset`.
+struct ScanHit {
+    std::size_t index;
+    std::uint64_t offset;
+
+    bool operator==(const ScanHit& other) const = default;
+};
+
+// Finds codes in file bytes by their anchor (a rolling hash over AnchorDwords dwords at every byte
+// alignment), each anchor match verified by the code's full hash. Codes shorter than AnchorDwords
+// are never found. Built once for the identities, then run over any number of files.
+class Scanner {
+public:
+    explicit Scanner(std::span<const CodeIdentity> identities);
+
+    // Every offset of every identity in `bytes`, by alignment phase then offset.
+    [[nodiscard]] std::vector<ScanHit> Find(std::span<const std::byte> bytes) const;
+
+private:
+    std::vector<CodeIdentity> identities;
+    std::vector<std::uint64_t> filter;
+    std::vector<std::pair<std::uint64_t, std::size_t>> anchors;
+};
+
+// APS5_SHADER_KEYS=<file>: every variant the recompiler creates (from the disk cache or compiled)
+// appends its record to the file, once per disk cache entry name (lines already there count).
+[[nodiscard]] bool Recording();
+void Note(const RecompileRequest& request, const ResourceSnapshot& snapshot, const ResourceSpecialization& specialization, std::string_view entry, const CompiledVariant& variant);
+[[nodiscard]] std::uint64_t Recorded();
+
+enum class PrecompileStatus {
+    Stored,
+    Present,
+    Diverged,
+    Disabled,
+};
+
+struct PrecompileOutcome {
+    PrecompileStatus status = PrecompileStatus::Disabled;
+    std::string entry;
+    std::uint64_t spirvHash = 0;
+};
+
+// Compiles the variant of a rebuilt request into the disk cache unless its entry is there
+// (Recompiler.cpp: the compile the recompiler itself runs on a miss). A variant whose entry
+// name is the recording's but whose SPIR-V is not is reported Diverged and not stored.
+[[nodiscard]] PrecompileOutcome Precompile(const Record& record, const RebuiltRequest& rebuilt);
+
+}
+
+#endif

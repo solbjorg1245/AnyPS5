@@ -1,0 +1,298 @@
+#include "ShaderKeyList.hpp"
+#include "CacheKey.hpp"
+#include "ShaderCacheDirectory.hpp"
+#include "ShaderDiskCache.hpp"
+#include <algorithm>
+#include <array>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <random>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace {
+
+using namespace ShaderRecompiler;
+namespace KeyList = ShaderRecompiler::ShaderKeyList;
+
+void require(bool condition, const std::string& message) {
+    if (!condition) throw std::runtime_error(message);
+}
+
+void setEnvironment(const char* name, const std::string& value) {
+#ifdef _WIN32
+    _putenv_s(name, value.c_str());
+#else
+    setenv(name, value.c_str(), 1);
+#endif
+}
+
+struct Target {
+    std::array<std::uint32_t, 2> capabilities{1u, 61u};
+    std::array<std::string_view, 1> extensions{"SPV_KHR_storage_buffer_storage_class"};
+    SpirvTarget target{};
+
+    Target() {
+        target.vulkanVersion = 0x00401000u;
+        target.spirvVersion = 0x00010300u;
+        target.subgroupSize = 32;
+        target.supportedCapabilities = capabilities;
+        target.supportedExtensions = extensions;
+        target.maxWorkgroupSize = {1024u, 1024u, 64u};
+        target.maxWorkgroupInvocations = 1024;
+        target.maxWorkgroupSharedMemoryBytes = 49152;
+    }
+};
+
+// A request of each stage family with every optional part the record carries, and a snapshot.
+struct Sample {
+    std::vector<std::uint32_t> code;
+    std::vector<std::uint32_t> userData{0x10000000u, 0x00100000u, 0x40u, 0x00027facu, 7u};
+    Target target;
+    MeshConfiguration mesh{3u, 64u, 128u, 128u, 64u, 128u, 512u, 0u, 16u};
+    GraphicsCompileContext graphics{};
+    RecompileRequest request{};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+
+    explicit Sample(ShaderStage stage) {
+        for (std::uint32_t i = 0; i < 48; ++i) code.push_back(0x9e3779b9u * (i + 1u));
+        request.shader = {stage, 0x1234500u, code, 0x1233f00u, {}};
+        request.context.waveSize = stage == ShaderStage::Fragment ? 32u : 64u;
+        request.context.userDataBaseRegister = 0x240u;
+        request.context.userData = userData;
+        request.target = target.target;
+        request.layout = {1u, 4u, 16u, 112u};
+        if (stage == ShaderStage::Compute) request.context.compute = ShaderComputeStageInfo{{64u, 2u, 1u}, 512u, {true, false, true}, true, 2u, {100u, 3u, 1u}};
+        if (stage == ShaderStage::Fragment) {
+            ShaderPixelStageInfo pixel{};
+            pixel.interpolatorCount = 3;
+            pixel.interpolatorSettings[0] = 0x20u;
+            pixel.interpolatorSettings[2] = 0x401u;
+            pixel.wave32 = true;
+            pixel.inputAddr = 0x302u;
+            pixel.posW = true;
+            pixel.earlyZ = true;
+            pixel.targetOutputMode = {4u, 0u, 9u, 0u, 0u, 0u, 0u, 1u};
+            pixel.targetExportMapping = {0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u};
+            request.context.pixel = pixel;
+        }
+        if (stage == ShaderStage::Vertex || stage == ShaderStage::Mesh) {
+            ShaderVertexStageInfo vertex{};
+            vertex.resourcesNum = 2;
+            vertex.resources[0].fields = {0x10000u, 0x00180000u, 1000u, 0x0007f000u};
+            vertex.resources[1].fields = {0x1000cu, 0x00180000u, 1000u, 0x0006a000u};
+            vertex.resourcesDst[0] = {4, 3, 0, 0u};
+            vertex.resourcesDst[1] = {-1, 2, 1, 1u};
+            vertex.fetchAttribReg = 2;
+            vertex.fetchBufferReg = 6;
+            vertex.fetchEmbedded = stage == ShaderStage::Mesh;
+            request.context.vertex = vertex;
+        }
+        if (stage == ShaderStage::Mesh) {
+            graphics.mesh = mesh;
+            request.graphics = graphics;
+        }
+        DescriptorValue buffer;
+        buffer.dwordCount = 4;
+        buffer.dwords = {1u, 2u, 3u, 4u};
+        DescriptorValue image;
+        image.dwordCount = 8;
+        DescriptorValue sampler;
+        sampler.dwordCount = 4;
+        snapshot.buffers = {buffer, buffer};
+        snapshot.images = {image};
+        snapshot.samplers = {sampler, sampler, sampler};
+        snapshot.flattenedSrt = {9u, 8u, 7u};
+        snapshot.deferredFlat = {{1u, 0x5000u}, {2u, 0x6000u}};
+        snapshot.userData = userData;
+        specialization.buffers = {{16u, IrBufferFormat::Invalid, 0xfacu, false}, {0u, IrBufferFormat::Invalid, 0u, true}};
+        ResourceSpecialization::Image specialized;
+        specialized.mipCount = 5;
+        specialized.cube = true;
+        specialized.depthUnorm16 = true;
+        specialization.images = {specialized};
+        specialization.boundDescriptors = {0u, 3u, 0xffffffffu};
+    }
+};
+
+void verifyRoundTrip() {
+    for (const auto stage : {ShaderStage::Compute, ShaderStage::Fragment, ShaderStage::Vertex, ShaderStage::Mesh}) {
+        Sample sample(stage);
+        auto record = KeyList::Describe(sample.request, sample.snapshot, sample.specialization);
+        record.entry = "0123456789abcdef0123456789abcdef.bin";
+        record.spirvHash = 0xfedcba9876543210ull;
+        if (stage == ShaderStage::Vertex) {
+            record.locatorPath = "some dir/shaders file.bin";
+            record.locatorOffset = 0x1235u;
+        }
+        const auto line = KeyList::Encode(record);
+        require(line.find('\n') == std::string::npos, "an encoded record spans lines");
+        KeyList::Record decoded;
+        require(KeyList::Decode(line, decoded), "an encoded record does not decode: " + line);
+        require(KeyList::Encode(decoded) == line, "a decoded record encodes differently");
+        require(KeyList::Decode(line + "\r", decoded) && KeyList::Encode(decoded) == line, "a record with a CR does not decode");
+        require(decoded.code == KeyList::IdentifyCode(sample.code), "the code identity changed");
+        require(decoded.locatorPath == record.locatorPath && decoded.locatorOffset == record.locatorOffset, "the locator changed");
+        require(decoded.specialization == sample.specialization, "the specialization changed");
+
+        // The rebuilt request has the recording's keys: the memory key and the disk cache key.
+        KeyList::RebuiltRequest rebuilt;
+        KeyList::Rebuild(decoded, sample.code, sample.target.target, rebuilt);
+        std::vector<std::uint64_t> original, again;
+        RecompileCacheKey::Build(sample.request, original);
+        RecompileCacheKey::Build(rebuilt.request, again);
+        require(original == again, "the rebuilt request has another memory key");
+        std::vector<std::byte> diskOriginal, diskAgain;
+        ShaderDiskCache::BuildKey(sample.request, 32, sample.specialization, diskOriginal);
+        ShaderDiskCache::BuildKey(rebuilt.request, 32, decoded.specialization, diskAgain);
+        require(diskOriginal == diskAgain, "the rebuilt request has another disk cache key");
+        const auto& snapshot = rebuilt.snapshot;
+        require(snapshot.buffers.size() == 2 && snapshot.buffers[1].dwordCount == 4 && snapshot.buffers[1].dwords[0] == 0u, "the buffer shape changed");
+        require(snapshot.images.size() == 1 && snapshot.images[0].dwordCount == 8 && snapshot.samplers.size() == 3, "the image or sampler shape changed");
+        require(snapshot.flattenedSrt.size() == 3 && snapshot.userData.size() == sample.userData.size(), "the flat or user data shape changed");
+        require(snapshot.deferredFlat.size() == 2 && snapshot.deferredFlat[1].first == 2u && snapshot.deferredFlat[1].second == 0u, "the deferred slots changed");
+        require(rebuilt.request.context.userData.size() == sample.userData.size(), "the user data count changed");
+    }
+}
+
+void verifyRejects() {
+    Sample sample(ShaderStage::Compute);
+    auto record = KeyList::Describe(sample.request, sample.snapshot, sample.specialization);
+    record.entry = "0123456789abcdef0123456789abcdef.bin";
+    const auto line = KeyList::Encode(record);
+    KeyList::Record decoded;
+    require(!KeyList::Decode("", decoded), "an empty line decodes");
+    require(!KeyList::Decode("k2" + line.substr(2), decoded), "another format tag decodes");
+    require(!KeyList::Decode("k1 0123.bin" + line.substr(line.find(".bin") + 4), decoded), "a short entry name decodes");
+    require(!KeyList::Decode(line.substr(0, line.rfind(' ')), decoded), "a record missing its last value decodes");
+    require(!KeyList::Decode(line + " 0", decoded), "a record with an extra value decodes");
+    require(!KeyList::Decode(line + " zz", decoded), "a record with a non-hex value decodes");
+    require(!KeyList::Decode(line + " @", decoded), "a locator without offset decodes");
+    require(!KeyList::Decode(line + " @ 10", decoded), "a locator without path decodes");
+    // The spirv hash is first; the stage second: a value beyond the enum's range must not decode.
+    auto tokens = line;
+    const auto stageStart = tokens.find(' ', tokens.find(' ', 3) + 1) + 1;
+    const auto stageEnd = tokens.find(' ', stageStart);
+    require(KeyList::Decode(tokens, decoded), "the record itself does not decode");
+    tokens.replace(stageStart, stageEnd - stageStart, "100000000");
+    require(!KeyList::Decode(tokens, decoded), "a stage beyond 32 bits decodes");
+}
+
+void verifyScanner() {
+    std::mt19937 random(1234);
+    std::vector<std::byte> file(1u << 20u);
+    for (auto& byte : file) byte = static_cast<std::byte>(random() & 0xffu);
+    const auto words = [&](std::size_t count) {
+        std::vector<std::uint32_t> code(count);
+        for (auto& word : code) word = static_cast<std::uint32_t>(random());
+        return code;
+    };
+    const auto place = [&](const std::vector<std::uint32_t>& code, std::size_t offset) { std::memcpy(file.data() + offset, code.data(), code.size() * sizeof(std::uint32_t)); };
+    const auto a = words(64), b = words(300), shortCode = words(5), c = words(40);
+    place(a, 4097);
+    place(a, 600002);
+    place(b, 8192);
+    place(shortCode, 20000);
+    // c's anchor without the rest of c: an anchor hit the full hash refuses.
+    auto decoy = c;
+    decoy[30] ^= 1u;
+    place(decoy, 30000);
+    // b runs to the very end of the file.
+    place(b, file.size() - b.size() * sizeof(std::uint32_t));
+    const std::vector<KeyList::CodeIdentity> identities{KeyList::IdentifyCode(a), KeyList::IdentifyCode(b), KeyList::IdentifyCode(shortCode), KeyList::IdentifyCode(c)};
+    const KeyList::Scanner scanner(identities);
+    auto hits = scanner.Find(file);
+    std::sort(hits.begin(), hits.end(), [](const auto& l, const auto& r) { return l.offset < r.offset; });
+    const std::vector<KeyList::ScanHit> expected{{0, 4097}, {1, 8192}, {0, 600002}, {1, file.size() - b.size() * sizeof(std::uint32_t)}};
+    require(hits == expected, "the scan found " + std::to_string(hits.size()) + " hits, not the 4 placed");
+    require(KeyList::CodeMatches(std::span(file).subspan(4097, a.size() * 4), identities[0]), "the code at its offset does not match");
+    require(!KeyList::CodeMatches(std::span(file).subspan(4097, a.size() * 4 - 4), identities[0]), "a shorter span matches");
+    require(scanner.Find(std::span(file).first(16)).empty(), "a file shorter than the anchor has hits");
+}
+
+struct ComputeRequest {
+    std::vector<std::uint32_t> code{0xe0700000u, 0x80000000u, 0xbf810000u};
+    std::array<std::uint32_t, 4> userData{0x10000000u, 0x00000000u, 0x40u, 0x00027facu};
+    std::array<std::uint32_t, 1> capabilities{1u};
+    RecompileRequest request{};
+
+    ComputeRequest() {
+        request.shader = {ShaderStage::Compute, 0x20000u, code, 0, {}};
+        request.context.waveSize = 64;
+        request.context.userDataBaseRegister = 0;
+        request.context.userData = userData;
+        request.context.compute = ShaderComputeStageInfo{{64u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = 32;
+        request.target.supportedCapabilities = capabilities;
+        request.layout.pushConstantSizeBytes = 128;
+    }
+};
+
+// A real recompile records its key; the record, rebuilt over the same code and target, finds the
+// entry present, and once the entry is gone compiles it again to the recorded SPIR-V.
+void verifyRecordAndPrecompile(const std::filesystem::path& keys) {
+    ComputeRequest compute;
+    const auto compiled = Recompile(compute.request);
+    ShaderDiskCache::Flush();
+    require(!compiled.spirv.empty(), "the compile produced no SPIR-V");
+    require(KeyList::Recorded() == 1, "the compile recorded " + std::to_string(KeyList::Recorded()) + " keys, not 1");
+    std::ifstream file(keys, std::ios::binary);
+    std::string line;
+    std::vector<KeyList::Record> records;
+    while (std::getline(file, line)) {
+        KeyList::Record record;
+        if (!line.empty() && line[0] != '#') {
+            require(KeyList::Decode(line, record), "a recorded line does not decode");
+            records.push_back(record);
+        }
+    }
+    require(records.size() == 1, "the key list holds " + std::to_string(records.size()) + " records, not 1");
+    const auto& record = records[0];
+    require(record.code == KeyList::IdentifyCode(compute.code) && record.locatorPath.empty(), "the recorded code identity is wrong");
+    KeyList::RebuiltRequest rebuilt;
+    KeyList::Rebuild(record, compute.code, compute.request.target, rebuilt);
+    auto outcome = KeyList::Precompile(record, rebuilt);
+    require(outcome.status == KeyList::PrecompileStatus::Present && outcome.entry == record.entry, "the precompile does not find the recorded entry present");
+    std::filesystem::remove(ShaderDiskCache::EntryDirectory() / record.entry);
+    outcome = KeyList::Precompile(record, rebuilt);
+    require(outcome.status == KeyList::PrecompileStatus::Stored, "the precompile did not store the missing entry");
+    require(outcome.entry == record.entry && outcome.spirvHash == record.spirvHash, "the precompile compiled other SPIR-V than the recording");
+    ShaderDiskCache::Flush();
+    require(std::filesystem::is_regular_file(ShaderDiskCache::EntryDirectory() / record.entry), "the precompiled entry was not written");
+    // A second recompile of the same key in this process records nothing new.
+    static_cast<void>(Recompile(compute.request));
+    require(KeyList::Recorded() == 1, "a repeated key was recorded again");
+}
+
+}
+
+int main() {
+    try {
+        const auto directory = std::filesystem::temp_directory_path() / ("aps5-shader-key-list-test-" + std::to_string(std::random_device{}()));
+        std::filesystem::remove_all(directory);
+        std::filesystem::create_directories(directory);
+        const auto keys = directory / "keys.txt";
+        setEnvironment("ANYPS5_NO_SHADER_CACHE", "0");
+        setEnvironment("ANYPS5_SHADER_CACHE_DIR", (directory / "cache").string());
+        setEnvironment("APS5_SHADER_KEYS", keys.string());
+        verifyRoundTrip();
+        verifyRejects();
+        verifyScanner();
+        verifyRecordAndPrecompile(keys);
+        std::error_code error;
+        std::filesystem::remove_all(directory, error);
+        std::cout << "shader key list tests passed\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}

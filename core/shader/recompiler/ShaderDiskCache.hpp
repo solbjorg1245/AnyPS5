@@ -50,6 +50,8 @@ void EncodeResult(const RecompileResult& result, std::vector<std::byte>& out);
 [[nodiscard]] std::filesystem::path EntryDirectory();
 
 [[nodiscard]] bool Load(std::span<const std::byte> key, CompiledVariant& variant);
+// Whether the key's entry file exists (the precompile skips those; not counted as a hit or miss).
+[[nodiscard]] bool Present(std::span<const std::byte> key);
 void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant);
 void Flush();
 [[nodiscard]] Counters Totals();
