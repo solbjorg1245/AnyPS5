@@ -14,7 +14,7 @@ Player archive for Demon's Souls (--game ds, in addition to the files above):
     DemonsSouls.exe) is the shader key list the port precompiles on a cold shader cache: identifiers only (code
     sizes and hashes, file offsets, compile settings), checked by check_shader_keys. --precompile-log <run log>
     is required with --game ds (check_precompile_log): a cold-cache run of this build's sources that compiled
-    every record of the list to the SPIR-V the recording stored.
+    every record of the list to the SPIR-V the recording stored (tools/package_release_test.py tests the gate).
 
 Every file comes from an explicit allowlist and is then checked against a denylist (game files,
 Sony firmware, shader caches, NVIDIA SDKs, development port folders); a hit aborts packaging.
@@ -260,10 +260,33 @@ def check_shader_keys(path):
 
 
 PRECOMPILE_SUMMARY = re.compile(
-    r"\[precompile\] .* \(shipped\): (\d+) records .*; (\d+) compiled \((\d+) by inputs digest, (\d+) unverified\), "
+    r"\[precompile\] .* \(shipped(?:, list hash ([0-9a-f]{16}))?\): (\d+) records .*; (\d+) compiled \((\d+) by inputs digest, (\d+) unverified\), "
     r"(\d+) present, (\d+) diverged, (\d+) unverifiable skipped, (\d+) failed in .*; (\d+) entry names as recorded, "
     r"(\d+) stored with the recorded SPIR-V; total")
 CACHE_VERSION = re.compile(r"\[shader-disk-cache\] .* \(source version ([0-9a-f]{16}), format \d+\)")
+
+
+def hash_bytes(data, seed=0):
+    """ShaderRecompiler::HashBytes (core/shader/recompiler/ShaderCacheDirectory.hpp), the precompile's list hash."""
+    mask = (1 << 64) - 1
+    multiplier = 0x9e3779b97f4a7c15
+    value = (seed ^ (len(data) * multiplier)) & mask
+
+    def mix(value, chunk):
+        chunk = (chunk * 0xff51afd7ed558ccd) & mask
+        chunk ^= chunk >> 32
+        value = ((value ^ chunk) * multiplier) & mask
+        return ((value << 27) | (value >> 37)) & mask
+
+    whole = len(data) // 8 * 8
+    for (chunk,) in struct.iter_unpack("<Q", data[:whole]):
+        value = mix(value, chunk)
+    if whole < len(data):
+        value = mix(value, int.from_bytes(data[whole:], "little") ^ (1 << 63))
+    for factor in (0xff51afd7ed558ccd, 0xc4ceb9fe1a85ec53):
+        value ^= value >> 33
+        value = (value * factor) & mask
+    return value ^ (value >> 33)
 
 
 def build_source_version(build):
@@ -278,14 +301,15 @@ def build_source_version(build):
     return versions.pop()
 
 
-def check_precompile_log(path, build, records):
+def check_precompile_log(path, build, records, list_hash):
     """The release gate for the shipped key list. A player's precompile stores a record by its inputs digest
     without comparing the SPIR-V (the recording build's output is not on the player's machine), so a compile
     input outside the key (a snapshot field the emitter starts to read, say) would store wrong shaders silently.
     The log of a cold-cache run on this build's sources (unpinned: APS5_SHADER_CACHE_VERSION='', a new
     ANYPS5_SHADER_CACHE_DIR, the shipped list) must show every record compiled, none present, failed, diverged
-    or unverified, and each stored with the SPIR-V the recording stored. Same sources give the same compile, so
-    the players' stores are checked too. Otherwise record the list again on this build."""
+    or unverified, and each stored with the SPIR-V the recording stored, for the list with the hash of the one
+    packaged. Same sources give the same compile, so the players' stores are checked too. Otherwise record the
+    list again on this build."""
     text = path.read_text(encoding="utf-8", errors="replace")
     versions = set(CACHE_VERSION.findall(text))
     expected = build_source_version(build)
@@ -295,7 +319,11 @@ def check_precompile_log(path, build, records):
     summaries = PRECOMPILE_SUMMARY.findall(text)
     if len(summaries) != 1:
         raise PackagingError(f"{path}: {len(summaries)} shipped precompile summaries, expected one cold run")
-    listed, compiled, by_digest, unverified, present, diverged, skipped, failed, _, same_spirv = map(int, summaries[0])
+    logged_hash, *counts = summaries[0]
+    if logged_hash != f"{list_hash:016x}":
+        raise PackagingError(f"{path}: the run precompiled the list with hash {logged_hash or '(none logged)'}, the "
+                             f"packaged {SHADER_KEYS} has {list_hash:016x} (run the packaged list on a cold cache)")
+    listed, compiled, by_digest, unverified, present, diverged, skipped, failed, _, same_spirv = map(int, counts)
     if listed != records or compiled != records or present or diverged or skipped or failed or unverified or same_spirv != compiled:
         raise PackagingError(f"{path}: the precompile of {listed} records compiled {compiled} ({by_digest} by inputs "
                              f"digest, {unverified} unverified), {present} present, {diverged} diverged, {skipped} "
@@ -372,7 +400,8 @@ def package(platform, build, output, version, mingw_bin, game=None, dry_run=Fals
                 raise PackagingError(f"Missing release file: {file}")
         shader_keys = check_shader_keys(source / PLAYER_FILES / SHADER_KEYS)
         if precompile_log is not None:
-            same_spirv = check_precompile_log(precompile_log, build, shader_keys)
+            list_hash = hash_bytes((source / PLAYER_FILES / SHADER_KEYS).read_bytes())
+            same_spirv = check_precompile_log(precompile_log, build, shader_keys, list_hash)
         elif not dry_run:
             raise PackagingError("--game ds needs --precompile-log <log of a cold-cache run of the shipped list on this build>")
         names = [arcname for arcname, _ in entries]

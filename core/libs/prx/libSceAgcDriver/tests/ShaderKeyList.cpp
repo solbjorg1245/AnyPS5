@@ -607,6 +607,14 @@ void verifyShippedList(const std::filesystem::path& directory) {
     require(ShaderDiskCache::ContextDigest(first.target) != ShaderDiskCache::ContextDigest(second.target), "the context digest does not follow the device target");
 }
 
+// tools/package_release.py (hash_bytes) hashes the shipped list as the precompile does; both must agree.
+void verifyListHash() {
+    const std::string_view sample = "k3 shader-keys sample\r\n";
+    const auto bytes = std::as_bytes(std::span(sample.data(), sample.size()));
+    require(ShaderRecompiler::HashBytes(bytes) == 0xd9d5f7fe862de207ull, "HashBytes changed: change hash_bytes in tools/package_release.py with it");
+    require(ShaderRecompiler::HashBytes({}) == 0, "HashBytes of nothing changed: change hash_bytes in tools/package_release.py with it");
+}
+
 // Only a run that a later launch cannot improve on is marked as done.
 void verifyMarkAllowed() {
     KeyList::PrecompileTally done;
@@ -654,6 +662,7 @@ int main() {
         verifyDigest();
         verifyShippedList(directory);
         verifyMarkAllowed();
+        verifyListHash();
         std::error_code error;
         std::filesystem::remove_all(directory, error);
         std::cout << "shader key list tests passed\n";
