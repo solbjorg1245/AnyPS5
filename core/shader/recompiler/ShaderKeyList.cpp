@@ -674,11 +674,27 @@ bool PrecompileDone(const std::filesystem::path& entryDirectory, std::uint64_t l
     return false;
 }
 
-void MarkPrecompiled(const std::filesystem::path& entryDirectory, std::uint64_t listHash, std::uint64_t context) {
+bool MarkPrecompiled(const std::filesystem::path& entryDirectory, std::uint64_t listHash, std::uint64_t context) {
+    std::error_code error;
+    std::filesystem::create_directories(entryDirectory, error);
+    const auto path = entryDirectory / std::string(MarkerName);
+    const auto size = std::filesystem::file_size(path, error);
+    const auto mode = !error && size > MaxMarkerBytes ? std::ios::binary | std::ios::trunc : std::ios::binary | std::ios::app;
+    std::ofstream file(path, mode);
+    file << markerLine(listHash, context) << '\n';
+    file.flush();
+    return static_cast<bool>(file);
+}
+
+bool MarkerWritable(const std::filesystem::path& entryDirectory) {
     std::error_code error;
     std::filesystem::create_directories(entryDirectory, error);
     std::ofstream file(entryDirectory / std::string(MarkerName), std::ios::binary | std::ios::app);
-    file << markerLine(listHash, context) << '\n';
+    return static_cast<bool>(file);
+}
+
+bool MarkAllowed(const PrecompileTally& tally) {
+    return tally.records != 0 && tally.codes != 0 && tally.notFound < tally.codes && tally.cut == 0 && tally.failed == 0 && tally.writeFailures == 0;
 }
 
 }

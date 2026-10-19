@@ -12,7 +12,9 @@ Player archive for Demon's Souls (--game ds, in addition to the files above):
     root as the player's entry point (it asks for the dump and runs the setup); the player relinks their own
     dump on first start; no game code, firmware or shader cache is ever packaged. shader-keys.txt (next to
     DemonsSouls.exe) is the shader key list the port precompiles on a cold shader cache: identifiers only (code
-    sizes and hashes, file offsets, compile settings), checked by check_shader_keys.
+    sizes and hashes, file offsets, compile settings), checked by check_shader_keys. --precompile-log <run log>
+    is required with --game ds (check_precompile_log): a cold-cache run of this build's sources that compiled
+    every record of the list to the SPIR-V the recording stored.
 
 Every file comes from an explicit allowlist and is then checked against a denylist (game files,
 Sony firmware, shader caches, NVIDIA SDKs, development port folders); a hit aborts packaging.
@@ -257,6 +259,51 @@ def check_shader_keys(path):
     return records
 
 
+PRECOMPILE_SUMMARY = re.compile(
+    r"\[precompile\] .* \(shipped\): (\d+) records .*; (\d+) compiled \((\d+) by inputs digest, (\d+) unverified\), "
+    r"(\d+) present, (\d+) diverged, (\d+) unverifiable skipped, (\d+) failed in .*; (\d+) entry names as recorded, "
+    r"(\d+) stored with the recorded SPIR-V; total")
+CACHE_VERSION = re.compile(r"\[shader-disk-cache\] .* \(source version ([0-9a-f]{16}), format \d+\)")
+
+
+def build_source_version(build):
+    """The shader cache source version of the build (generated from the recompiler and driver sources)."""
+    versions = set()
+    for header in build.rglob("ShaderCacheVersion.hpp"):
+        match = re.search(r"SourceVersion = 0x([0-9a-f]{1,16})ull;", header.read_text(encoding="utf-8"))
+        if match:
+            versions.add(f"{int(match.group(1), 16):016x}")
+    if len(versions) != 1:
+        raise PackagingError(f"{build}: no single generated shader cache source version ({sorted(versions)})")
+    return versions.pop()
+
+
+def check_precompile_log(path, build, records):
+    """The release gate for the shipped key list. A player's precompile stores a record by its inputs digest
+    without comparing the SPIR-V (the recording build's output is not on the player's machine), so a compile
+    input outside the key (a snapshot field the emitter starts to read, say) would store wrong shaders silently.
+    The log of a cold-cache run on this build's sources (unpinned: APS5_SHADER_CACHE_VERSION='', a new
+    ANYPS5_SHADER_CACHE_DIR, the shipped list) must show every record compiled, none present, failed, diverged
+    or unverified, and each stored with the SPIR-V the recording stored. Same sources give the same compile, so
+    the players' stores are checked too. Otherwise record the list again on this build."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    versions = set(CACHE_VERSION.findall(text))
+    expected = build_source_version(build)
+    if versions != {expected}:
+        raise PackagingError(f"{path}: shader cache source version {sorted(versions)}, the build has {expected} "
+                             "(a pinned APS5_SHADER_CACHE_VERSION or another build)")
+    summaries = PRECOMPILE_SUMMARY.findall(text)
+    if len(summaries) != 1:
+        raise PackagingError(f"{path}: {len(summaries)} shipped precompile summaries, expected one cold run")
+    listed, compiled, by_digest, unverified, present, diverged, skipped, failed, _, same_spirv = map(int, summaries[0])
+    if listed != records or compiled != records or present or diverged or skipped or failed or unverified or same_spirv != compiled:
+        raise PackagingError(f"{path}: the precompile of {listed} records compiled {compiled} ({by_digest} by inputs "
+                             f"digest, {unverified} unverified), {present} present, {diverged} diverged, {skipped} "
+                             f"skipped, {failed} failed, {same_spirv} with the recorded SPIR-V; the list has {records} "
+                             "records (record the list again on this build, or run it on a cold cache)")
+    return same_spirv
+
+
 def player_entries(platform, build, source, libraries, runtime, relinker, launcher):
     root = f"{PLAYER_ROOT}/"
     player = source / PLAYER_FILES
@@ -302,7 +349,7 @@ def write_tar(path, entries):
             archive.add(file, arcname=arcname, filter=normalize)
 
 
-def package(platform, build, output, version, mingw_bin, game=None, dry_run=False, source=SOURCE_ROOT):
+def package(platform, build, output, version, mingw_bin, game=None, dry_run=False, source=SOURCE_ROOT, precompile_log=None):
     if not re.fullmatch(r"v[0-9A-Za-z][0-9A-Za-z._-]*", version) or version.endswith("."):
         raise ValueError(f"Invalid release tag for asset filenames: {version}")
     libraries, skipped = select_libraries(build, source)
@@ -324,6 +371,10 @@ def package(platform, build, output, version, mingw_bin, game=None, dry_run=Fals
             if not Path(file).is_file():
                 raise PackagingError(f"Missing release file: {file}")
         shader_keys = check_shader_keys(source / PLAYER_FILES / SHADER_KEYS)
+        if precompile_log is not None:
+            same_spirv = check_precompile_log(precompile_log, build, shader_keys)
+        elif not dry_run:
+            raise PackagingError("--game ds needs --precompile-log <log of a cold-cache run of the shipped list on this build>")
         names = [arcname for arcname, _ in entries]
         duplicates = sorted({n for n in names if names.count(n) > 1})
         if duplicates:
@@ -351,6 +402,10 @@ def package(platform, build, output, version, mingw_bin, game=None, dry_run=Fals
             print(f"-- not packaged (not on the allowlist): {', '.join(skipped)}")
         if game == "ds":
             print(f"-- {SHADER_KEYS}: {shader_keys} format 3 records")
+            if precompile_log is not None:
+                print(f"-- {precompile_log}: {same_spirv} records stored with the recorded SPIR-V on this build's sources")
+            else:
+                print("-- WARNING: no --precompile-log; packaging without --dry-run refuses")
         print("-- checks passed: allowlist, allowed roots, denylist, library dependencies")
         return
 
@@ -386,6 +441,8 @@ def main():
                         help="MinGW runtime DLL directory (Windows; default $MINGW_BIN, else C:/winlibs/mingw64/bin)")
     parser.add_argument("--game", choices=("ds",), help="also build the player archive for this game")
     parser.add_argument("--dry-run", action="store_true", help="list the files and run every check; write nothing")
+    parser.add_argument("--precompile-log", type=Path,
+                        help="with --game ds: the log of a cold-cache run of the shipped key list on this build")
     args = parser.parse_args()
     if args.output is None and not args.dry_run:
         parser.error("--output is required unless --dry-run is given")
@@ -401,7 +458,8 @@ def main():
         else:
             if args.platform is None or args.build is None or args.version is None:
                 parser.error("--platform, --build and --version are required when --docs is not specified")
-            package(args.platform, args.build, args.output, args.version, args.mingw_bin, args.game, args.dry_run)
+            package(args.platform, args.build, args.output, args.version, args.mingw_bin, args.game, args.dry_run,
+                    precompile_log=args.precompile_log)
     except PackagingError as error:
         print(f"package_release: {error}", file=sys.stderr)
         sys.exit(1)

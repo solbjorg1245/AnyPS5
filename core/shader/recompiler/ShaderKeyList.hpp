@@ -213,7 +213,26 @@ struct ListChoice {
 // directory holds a MarkerName line for the list (the hash of its bytes) on this cache context
 // (ShaderDiskCache::ContextDigest: device target and switch set; the directory is per source version).
 [[nodiscard]] bool PrecompileDone(const std::filesystem::path& entryDirectory, std::uint64_t listHash, std::uint64_t context);
-void MarkPrecompiled(const std::filesystem::path& entryDirectory, std::uint64_t listHash, std::uint64_t context);
+// Appends the list's line (a marker over its size cap starts again); false when the file cannot be written.
+[[nodiscard]] bool MarkPrecompiled(const std::filesystem::path& entryDirectory, std::uint64_t listHash, std::uint64_t context);
+// Whether the marker can be written (the directory created, the marker opened for appending): an
+// unwritable cache would lose every precompiled entry and run the precompile again at every launch.
+[[nodiscard]] bool MarkerWritable(const std::filesystem::path& entryDirectory);
+
+// What one precompile of the shipped list did, for the marker decision.
+struct PrecompileTally {
+    std::size_t records = 0;
+    std::size_t codes = 0;
+    std::size_t notFound = 0;
+    std::size_t cut = 0;
+    std::size_t failed = 0;
+    std::uint64_t writeFailures = 0;
+};
+// A run is marked only when a later run cannot do better: it went to the end (no budget cut), every
+// record compiled without an exception, every store reached the disk, and the game files held some of
+// the codes (all locators stale: another exe or dump, which a later relink or patch can fix). Records
+// left unverifiable or diverged are not retried: the next run would decide them the same way.
+[[nodiscard]] bool MarkAllowed(const PrecompileTally& tally);
 
 }
 

@@ -34,6 +34,14 @@ void setEnvironment(const char* name, const std::string& value) {
 #endif
 }
 
+void unsetEnvironment(const char* name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
+
 struct Target {
     std::array<std::uint32_t, 2> capabilities{1u, 61u};
     std::array<std::string_view, 1> extensions{"SPV_KHR_storage_buffer_storage_class"};
@@ -568,16 +576,61 @@ void verifyShippedList(const std::filesystem::path& directory) {
 
     const auto cache = directory / "marker cache" / "0123456789abcdef";
     require(!KeyList::PrecompileDone(cache, 1, 2), "a cache without a marker is warm");
-    KeyList::MarkPrecompiled(cache, 1, 2);
+    require(KeyList::MarkerWritable(cache), "a new cache directory is not writable");
+    require(!KeyList::PrecompileDone(cache, 1, 2), "probing the marker marked the list");
+    require(KeyList::MarkPrecompiled(cache, 1, 2), "the marker write failed");
     require(KeyList::PrecompileDone(cache, 1, 2), "the marked list is still cold");
     require(!KeyList::PrecompileDone(cache, 1, 3) && !KeyList::PrecompileDone(cache, 4, 2), "another list or context counts as precompiled");
-    KeyList::MarkPrecompiled(cache, 4, 2);
+    require(KeyList::MarkPrecompiled(cache, 4, 2), "the second marker write failed");
     require(KeyList::PrecompileDone(cache, 1, 2) && KeyList::PrecompileDone(cache, 4, 2), "a second marker line lost the first");
+
+    // A marker over its size cap counts as cold and starts again at the next mark.
+    {
+        std::ofstream file(cache / std::string(KeyList::MarkerName), std::ios::binary | std::ios::app);
+        const std::string filler(1023, 'x');
+        for (int i = 0; i < 1100; ++i) file << filler << '\n';
+    }
+    require(!KeyList::PrecompileDone(cache, 1, 2), "an oversized marker is trusted");
+    require(KeyList::MarkPrecompiled(cache, 5, 6), "the oversized marker is not written again");
+    require(std::filesystem::file_size(cache / std::string(KeyList::MarkerName)) < 1024, "the oversized marker kept growing");
+    require(KeyList::PrecompileDone(cache, 5, 6) && !KeyList::PrecompileDone(cache, 1, 2), "the rewritten marker is wrong");
+
+    // A cache directory that cannot be created is not writable, and its marker write fails.
+    const auto blocker = directory / "marker blocker";
+    std::ofstream(blocker, std::ios::binary) << "file";
+    require(!KeyList::MarkerWritable(blocker / "0123456789abcdef"), "a cache under a file counts as writable");
+    require(!KeyList::MarkPrecompiled(blocker / "0123456789abcdef", 1, 2), "a marker under a file counts as written");
 
     Target first, second;
     second.target.subgroupSize = 64;
     require(ShaderDiskCache::ContextDigest(first.target) == ShaderDiskCache::ContextDigest(Target().target), "the context digest of one target changes");
     require(ShaderDiskCache::ContextDigest(first.target) != ShaderDiskCache::ContextDigest(second.target), "the context digest does not follow the device target");
+}
+
+// Only a run that a later launch cannot improve on is marked as done.
+void verifyMarkAllowed() {
+    KeyList::PrecompileTally done;
+    done.records = 1315;
+    done.codes = 702;
+    done.notFound = 3;
+    require(KeyList::MarkAllowed(done), "a finished run is not marked");
+    auto tally = done;
+    tally.cut = 1;
+    require(!KeyList::MarkAllowed(tally), "a run cut by the time budget is marked");
+    tally = done;
+    tally.failed = 1;
+    require(!KeyList::MarkAllowed(tally), "a run with a failed record is marked");
+    tally = done;
+    tally.writeFailures = 1;
+    require(!KeyList::MarkAllowed(tally), "a run with a failed cache write is marked");
+    tally = done;
+    tally.notFound = tally.codes;
+    require(!KeyList::MarkAllowed(tally), "a run that found none of the codes is marked");
+    tally = done;
+    tally.records = 0;
+    tally.codes = 0;
+    tally.notFound = 0;
+    require(!KeyList::MarkAllowed(tally), "an empty list is marked");
 }
 
 int main() {
@@ -589,6 +642,8 @@ int main() {
         setEnvironment("ANYPS5_NO_SHADER_CACHE", "0");
         setEnvironment("ANYPS5_SHADER_CACHE_DIR", (directory / "cache").string());
         setEnvironment("APS5_SHADER_KEYS", keys.string());
+        // The rule switches enter the key and so the pinned digest.
+        for (const char* name : {"APS5_NO_LEGACY_MAD_RULE", "APS5_NO_MULLIT_RULE", "APS5_CLAMP_NAN", "APS5_RAYTRACING", "APS5_NO_CODE_HASH_KEY"}) unsetEnvironment(name);
         verifyRoundTrip();
         verifyHostile();
         verifyRejects();
@@ -598,6 +653,7 @@ int main() {
         verifyRecordAndPrecompile(keys);
         verifyDigest();
         verifyShippedList(directory);
+        verifyMarkAllowed();
         std::error_code error;
         std::filesystem::remove_all(directory, error);
         std::cout << "shader key list tests passed\n";

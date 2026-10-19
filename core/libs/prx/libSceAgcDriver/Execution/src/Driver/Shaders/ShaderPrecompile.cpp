@@ -142,6 +142,11 @@ void precompileList(const ShaderRecompiler::SpirvTarget& target, const std::file
             std::fprintf(stderr, "[precompile] %s: precompiled into this cache before (%s), skipped in %.3f s (APS5_PRECOMPILE=0 turns the shipped list off)\n", listPath, std::string(KeyList::MarkerName).c_str(), secondsSince(started));
             return;
         }
+        // An unwritable cache keeps nothing: no compile at every launch for it.
+        if (!KeyList::MarkerWritable(entryDirectory)) {
+            std::fprintf(stderr, "[precompile] %s: the shader cache %s is not writable, skipped\n", listPath, pathText(entryDirectory).c_str());
+            return;
+        }
     }
     KeyList::ListFile list;
     if (!KeyList::ReadList(listFile, list)) {
@@ -149,6 +154,7 @@ void precompileList(const ShaderRecompiler::SpirvTarget& target, const std::file
         return;
     }
     auto& records = list.records;
+    if (records.empty()) std::fprintf(stderr, "[precompile] WARNING: %s holds no usable record\n", listPath);
 
     // One code per distinct identity; records with the same code share it.
     std::vector<Code> codes;
@@ -263,15 +269,16 @@ void precompileList(const ShaderRecompiler::SpirvTarget& target, const std::file
     // APS5_PRECOMPILE_UNVERIFIED=1: variants whose entry name differs from the recording's (another
     // device, sources or switch set: nothing to compare their SPIR-V with) are compiled and stored too.
     const bool storeUnverified = switchOn("APS5_PRECOMPILE_UNVERIFIED");
-    // APS5_PRECOMPILE_BUDGET_S=<seconds> (default 600): the compile stops taking records after that long
-    // since the precompile began; the rest is left to the on-demand compile.
-    double budgetSeconds = 600.0;
+    // APS5_PRECOMPILE_BUDGET_S=<seconds> (default 600, 120 for the shipped list): the compile stops taking
+    // records after that long since the precompile began; the rest is left to the on-demand compile.
+    double budgetSeconds = shipped ? 120.0 : 600.0;
     if (const char* value = std::getenv("APS5_PRECOMPILE_BUDGET_S"); value != nullptr && *value != '\0') budgetSeconds = std::clamp(std::strtod(value, nullptr), 1.0, 86400.0);
     std::atomic<std::size_t> cut{0};
     std::atomic<std::size_t> next{0};
     std::atomic<std::size_t> stored{0}, storedByInputs{0}, storedUnverified{0}, unverified{0}, present{0}, diverged{0}, failed{0}, sameEntry{0}, sameSpirv{0};
-    // The inputs digest of each record the compile verified by its entry name (for a record without one).
+    // The inputs digest of each record compiled and compared under its entry name (for a record without one).
     std::vector<std::uint64_t> digests(records.size(), 0);
+    const auto writeFailuresBefore = ShaderRecompiler::ShaderDiskCache::Totals().writeFailures;
     std::atomic<std::uint64_t> compileNs{0};
     HostMutex failureMutex;
     std::vector<std::string> failures;
@@ -299,10 +306,8 @@ void precompileList(const ShaderRecompiler::SpirvTarget& target, const std::file
                 case KeyList::PrecompileStatus::Diverged: diverged.fetch_add(1, std::memory_order_relaxed); break;
                 case KeyList::PrecompileStatus::Disabled: break;
                 }
-                if (outcome.entry == record.entry && outcome.status != KeyList::PrecompileStatus::Diverged) {
-                    sameEntry.fetch_add(1, std::memory_order_relaxed);
-                    digests[work[item]] = outcome.inputDigest;
-                }
+                if (outcome.entry == record.entry && outcome.status != KeyList::PrecompileStatus::Diverged) sameEntry.fetch_add(1, std::memory_order_relaxed);
+                if (outcome.status == KeyList::PrecompileStatus::Stored) digests[work[item]] = outcome.inputDigest;
                 if ((outcome.status == KeyList::PrecompileStatus::Stored || outcome.status == KeyList::PrecompileStatus::StoredByInputs) && outcome.spirvHash == record.spirvHash) sameSpirv.fetch_add(1, std::memory_order_relaxed);
             } catch (const std::exception& error) {
                 failed.fetch_add(1, std::memory_order_relaxed);
@@ -322,8 +327,10 @@ void precompileList(const ShaderRecompiler::SpirvTarget& target, const std::file
     }
     ShaderRecompiler::ShaderDiskCache::Flush();
     const auto compileSeconds = secondsSince(compileStarted);
+    const auto writeFailures = ShaderRecompiler::ShaderDiskCache::Totals().writeFailures - writeFailuresBefore;
 
-    // Records verified by their entry name gain their inputs digest, so the list verifies on later builds.
+    // Records compiled to the recorded SPIR-V under their entry name gain their inputs digest, so the
+    // list verifies on later builds (a record only found present was never compared).
     std::size_t digestsAdded = 0;
     for (std::size_t i = 0; i < records.size(); ++i) {
         if (records[i].inputDigest != 0 || digests[i] == 0) continue;
@@ -357,7 +364,17 @@ void precompileList(const ShaderRecompiler::SpirvTarget& target, const std::file
                  stored.load() + storedByInputs.load() + storedUnverified.load(), storedByInputs.load(), storedUnverified.load(), present.load(), diverged.load(), unverified.load(), failed.load(), compileSeconds, threads, static_cast<double>(compileNs.load()) / 1e9, sameEntry.load(), sameSpirv.load(), secondsSince(started));
     if (listUpdated && digestsAdded != 0) std::fprintf(stderr, "[precompile] %s: %zu inputs digests added (format 3)\n", listPath, digestsAdded);
     // The shipped list is done for this cache once it ran to the end (a budget cut leaves it cold).
-    if (shipped && cut.load() == 0) KeyList::MarkPrecompiled(entryDirectory, listHash, context);
+    if (shipped) {
+        KeyList::PrecompileTally tally;
+        tally.records = records.size();
+        tally.codes = codes.size();
+        tally.notFound = notFound;
+        tally.cut = cut.load();
+        tally.failed = failed.load();
+        tally.writeFailures = writeFailures;
+        if (!KeyList::MarkAllowed(tally)) std::fprintf(stderr, "[precompile] %s: not marked as done (%zu cut, %zu failed, %llu writes failed, %zu of %zu codes not found): the next launch tries again\n", listPath, tally.cut, tally.failed, static_cast<unsigned long long>(tally.writeFailures), tally.notFound, tally.codes);
+        else if (!KeyList::MarkPrecompiled(entryDirectory, listHash, context)) std::fprintf(stderr, "[precompile] %s: cannot write %s in %s: the next launch tries again\n", listPath, std::string(KeyList::MarkerName).c_str(), pathText(entryDirectory).c_str());
+    }
 }
 
 }
