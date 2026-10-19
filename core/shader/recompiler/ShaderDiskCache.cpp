@@ -1,4 +1,5 @@
 #include "ShaderDiskCache.hpp"
+#include "ShaderKeyList.hpp"
 #include "CacheKey.hpp"
 #include "ShaderCacheDirectory.hpp"
 #ifdef _WIN32
@@ -571,6 +572,8 @@ constexpr std::string_view NeutralSwitches[] = {
     // Only whether a capture fails on a mapped keyed-table entry or binds it null (as above).
     "APS5_NO_STRICT_TABLE_ENTRIES",
     "APS5_SHADER_CACHE_VERSION",
+    // Only where the key list goes (ShaderKeyList.hpp).
+    "APS5_SHADER_KEYS",
     "APS5_TRACE_BINDLESS",
 };
 
@@ -748,10 +751,13 @@ private:
         const auto loadNs = loadNanoseconds.load(std::memory_order_relaxed);
         const auto delta = [](std::uint64_t after, std::uint64_t before) { return static_cast<unsigned long long>(after - before); };
         if (totals.hits == reported.hits && totals.misses == reported.misses && totals.writes == reported.writes && totals.loadFailures == reported.loadFailures && totals.writeFailures == reported.writeFailures) return;
-        std::fprintf(stderr, "[shader-disk-cache] (10 s): %llu hits, %llu misses, %llu writes (%.1f MiB), %llu load failures, %llu write failures; %.1f MiB read in %.1f ms (totals: %llu hits, %llu misses, %llu writes)\n",
+        // APS5_SHADER_KEYS: the keys the key list gained this run.
+        char keys[64] = "";
+        if (ShaderKeyList::Recording()) std::snprintf(keys, sizeof(keys), ", %llu keys recorded", static_cast<unsigned long long>(ShaderKeyList::Recorded()));
+        std::fprintf(stderr, "[shader-disk-cache] (10 s): %llu hits, %llu misses, %llu writes (%.1f MiB), %llu load failures, %llu write failures; %.1f MiB read in %.1f ms (totals: %llu hits, %llu misses, %llu writes%s)\n",
                      delta(totals.hits, reported.hits), delta(totals.misses, reported.misses), delta(totals.writes, reported.writes), static_cast<double>(totals.bytesWritten - reported.bytesWritten) / (1024.0 * 1024.0),
                      delta(totals.loadFailures, reported.loadFailures), delta(totals.writeFailures, reported.writeFailures), static_cast<double>(totals.bytesRead - reported.bytesRead) / (1024.0 * 1024.0), static_cast<double>(loadNs - reportedLoadNs) / 1e6,
-                     static_cast<unsigned long long>(totals.hits), static_cast<unsigned long long>(totals.misses), static_cast<unsigned long long>(totals.writes));
+                     static_cast<unsigned long long>(totals.hits), static_cast<unsigned long long>(totals.misses), static_cast<unsigned long long>(totals.writes), keys);
         reported = totals;
         reportedLoadNs = loadNs;
     }
@@ -898,6 +904,12 @@ std::filesystem::path EntryDirectory() {
 bool Load(std::span<const std::byte> key, CompiledVariant& variant) {
     auto& instance = store();
     return instance.Enabled() && instance.Load(key, variant);
+}
+
+bool Present(std::span<const std::byte> key) {
+    auto& instance = store();
+    std::error_code error;
+    return instance.Enabled() && std::filesystem::is_regular_file(instance.Directory() / EntryName(key), error);
 }
 
 void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant) {

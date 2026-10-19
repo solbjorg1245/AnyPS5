@@ -10,6 +10,8 @@
 #include "CacheKey.hpp"
 #include "CompiledVariant.hpp"
 #include "ShaderDiskCache.hpp"
+#include "ShaderKeyList.hpp"
+#include "ShaderCacheDirectory.hpp"
 #include <list>
 #include <mutex>
 #include <shared_mutex>
@@ -416,10 +418,12 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
     }
     cacheHit = false;
     const bool disk = ShaderDiskCache::Enabled() && !DebugProbeActive();
+    // APS5_SHADER_KEYS (ShaderKeyList.hpp): each new variant's key goes to the key list.
+    const bool record = ShaderKeyList::Recording() && !DebugProbeActive();
     std::vector<std::byte> diskKey;
     std::shared_ptr<const CompiledVariant> variant;
+    if (disk || record) ShaderDiskCache::BuildKey(request, HostSubgroupSize(request), specialization, diskKey);
     if (disk) {
-        ShaderDiskCache::BuildKey(request, HostSubgroupSize(request), specialization, diskKey);
         CompiledVariant loaded;
         if (ShaderDiskCache::Load(diskKey, loaded)) {
             loaded.specialization = specialization;
@@ -428,11 +432,14 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
             variant = std::make_shared<const CompiledVariant>(std::move(loaded));
         }
     }
+    bool compiled = false;
     if (variant == nullptr) {
         auto program = PrepareResourceProgram(request);
         variant = std::make_shared<const CompiledVariant>(compileVariant(request, std::move(program), snapshot, specialization));
-        if (disk) ShaderDiskCache::Store(std::move(diskKey), variant);
+        compiled = true;
     }
+    if (record) ShaderKeyList::Note(request, snapshot, specialization, ShaderDiskCache::EntryName(diskKey), *variant);
+    if (disk && compiled) ShaderDiskCache::Store(std::move(diskKey), variant);
     source.variants.push_back(variant);
     return variant;
 }
@@ -876,6 +883,45 @@ RecompileResult Recompile(const RecompileRequest& request) {
 std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request, const ResourceCapture& capture, bool* memoHit) {
     if (memoHit != nullptr) *memoHit = false;
     return recompileReporting(request, [&] { return RecompileImpl(request, capture, memoHit); });
+}
+
+namespace ShaderKeyList {
+
+// The miss path of findOrCompileVariant over a rebuilt request: the same key, the same compile.
+// The compile reads the code, the stage, the context's stage info, wave size and user data count,
+// the target, the layout, graphics->mesh and the specialization: all of them in the disk key, all
+// of them in the record. It also reads the snapshot, but only into the descriptor values the SPIR-V
+// emitter never reads (it checks their counts). The code address also reaches the SPIR-V (the loop
+// guard's shader id under APS5_LOOP_GUARD) and the disk entry, so the record carries it.
+PrecompileOutcome Precompile(const Record& record, const RebuiltRequest& rebuilt, bool storeUnverified) {
+    PrecompileOutcome outcome;
+    if (!ShaderDiskCache::Enabled() || DebugProbeActive()) return outcome;
+    const auto& request = rebuilt.request;
+    std::vector<std::byte> key;
+    ShaderDiskCache::BuildKey(request, HostSubgroupSize(request), record.specialization, key);
+    outcome.entry = ShaderDiskCache::EntryName(key);
+    if (ShaderDiskCache::Present(key)) {
+        outcome.status = PrecompileStatus::Present;
+        return outcome;
+    }
+    // Another entry name than the recording's: nothing to compare the SPIR-V with.
+    const bool verifiable = outcome.entry == record.entry;
+    if (!verifiable && !storeUnverified) {
+        outcome.status = PrecompileStatus::Unverified;
+        return outcome;
+    }
+    auto program = PrepareResourceProgram(request);
+    auto variant = std::make_shared<const CompiledVariant>(compileVariant(request, std::move(program), rebuilt.snapshot, record.specialization));
+    outcome.spirvHash = HashBytes(std::as_bytes(std::span(variant->result.spirv.Words())));
+    if (verifiable && outcome.spirvHash != record.spirvHash) {
+        outcome.status = PrecompileStatus::Diverged;
+        return outcome;
+    }
+    ShaderDiskCache::Store(std::move(key), std::move(variant));
+    outcome.status = verifiable ? PrecompileStatus::Stored : PrecompileStatus::StoredUnverified;
+    return outcome;
+}
+
 }
 
 }
