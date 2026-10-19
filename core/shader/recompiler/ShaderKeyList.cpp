@@ -228,7 +228,27 @@ void visitRecord(TIo& io, Record& record) {
 
 // The counts a rebuild allocates by stay bounded (a damaged or hand-edited list).
 bool boundedRecord(const Record& record) {
-    return record.code.dwords != 0 && record.code.dwords <= MaxCodeDwords && record.userDataCount <= MaxCount && record.shape.flattenedSrt <= MaxCount && record.shape.userData <= MaxCount;
+    if (record.code.dwords == 0 || record.code.dwords > MaxCodeDwords || record.userDataCount > MaxCount || record.shape.flattenedSrt > MaxCount || record.shape.userData > MaxCount) return false;
+    // The wave size is a divisor and a modulus in the recompiler.
+    if (record.waveSize != 32u && record.waveSize != 64u) return false;
+    if (record.userDataBaseRegister > MaxCount) return false;
+    // Descriptor widths index DescriptorValue::dwords.
+    const auto widths = [](const std::vector<std::uint32_t>& values, std::uint32_t low, std::uint32_t high) {
+        return values.size() <= MaxCount && std::all_of(values.begin(), values.end(), [&](std::uint32_t width) { return width >= low && width <= high; });
+    };
+    constexpr std::uint32_t Capacity = static_cast<std::uint32_t>(std::tuple_size_v<decltype(DescriptorValue::dwords)>);
+    if (!widths(record.shape.buffers, 1u, Capacity) || !widths(record.shape.images, 1u, Capacity) || !widths(record.shape.samplers, 1u, Capacity)) return false;
+    if (record.shape.deferredFlat.size() > MaxCount || record.specialization.buffers.size() > MaxCount || record.specialization.images.size() > MaxCount || record.specialization.boundDescriptors.size() > MaxCount) return false;
+    if (record.compute) {
+        const auto& compute = *record.compute;
+        if (compute.ldsSizeDwords > MaxCount || compute.threadIdComponentCount > 3u) return false;
+        for (const auto threads : compute.numThreads) {
+            if (threads == 0 || threads > 1024u) return false;
+        }
+    }
+    if (record.pixel && record.pixel->interpolatorCount > record.pixel->interpolatorSettings.size()) return false;
+    if (record.mesh && record.mesh->ldsSizeDwords > MaxCount) return false;
+    return true;
 }
 
 std::uint64_t lineChecksum(std::string_view body) {
@@ -295,6 +315,7 @@ Record Describe(const RecompileRequest& request, const ResourceSnapshot& snapsho
     record.stage = request.shader.stage;
     record.code = IdentifyCode(request.shader.code);
     record.waveSize = request.context.waveSize;
+    record.codeAddress = request.shader.codeAddress;
     record.userDataBaseRegister = request.context.userDataBaseRegister;
     record.userDataCount = static_cast<std::uint32_t>(request.context.userData.size());
     record.compute = request.context.compute;
@@ -432,10 +453,15 @@ bool ReadList(const std::filesystem::path& path, ListFile& list) {
     std::string line;
     while (std::getline(file, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.size() > MaxLineBytes) {
+            ++list.unreadable;
+            continue;
+        }
         ListFile::Line kept{line};
         if (!line.empty() && line[0] != '#') {
             Record record;
-            if (!Decode(line, record)) ++list.unreadable;
+            if (list.records.size() >= MaxRecords) ++list.overLimit;
+            else if (!Decode(line, record)) ++list.unreadable;
             else if (!entries.insert(record.entry).second) ++list.duplicates;
             else {
                 if (startsWithTag(line, LegacyLineTag)) ++list.legacy;

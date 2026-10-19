@@ -45,6 +45,12 @@ struct Code {
     bool scanned = false;
 };
 
+// An APS5_* switch that is on only for a value starting with 1.
+bool switchOn(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] == '1';
+}
+
 unsigned processorCount() {
 #ifdef _WIN32
     return static_cast<unsigned>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
@@ -227,7 +233,7 @@ void precompileList(const ShaderRecompiler::SpirvTarget& target, const char* lis
             std::error_code error;
             recordingInto = std::filesystem::equivalent(keys, listPath, error) || std::string_view(keys) == listPath;
         }
-        if (changed && !recordingInto && std::getenv("APS5_PRECOMPILE_KEEP_LIST") == nullptr) listUpdated = KeyList::WriteList(listPath, list);
+        if (changed && !recordingInto && !switchOn("APS5_PRECOMPILE_KEEP_LIST")) listUpdated = KeyList::WriteList(listPath, list);
     }
 
     std::vector<std::size_t> work;
@@ -239,7 +245,12 @@ void precompileList(const ShaderRecompiler::SpirvTarget& target, const char* lis
     if (const char* value = std::getenv("APS5_PRECOMPILE_THREADS")) threads = std::clamp(static_cast<unsigned>(std::strtoul(value, nullptr, 10)), 1u, 64u);
     // APS5_PRECOMPILE_UNVERIFIED=1: variants whose entry name differs from the recording's (another
     // device, sources or switch set: nothing to compare their SPIR-V with) are compiled and stored too.
-    const bool storeUnverified = std::getenv("APS5_PRECOMPILE_UNVERIFIED") != nullptr;
+    const bool storeUnverified = switchOn("APS5_PRECOMPILE_UNVERIFIED");
+    // APS5_PRECOMPILE_BUDGET_S=<seconds> (default 600): the compile stops taking records after that long
+    // since the precompile began; the rest is left to the on-demand compile.
+    double budgetSeconds = 600.0;
+    if (const char* value = std::getenv("APS5_PRECOMPILE_BUDGET_S"); value != nullptr && *value != '\0') budgetSeconds = std::clamp(std::strtod(value, nullptr), 1.0, 86400.0);
+    std::atomic<std::size_t> cut{0};
     std::atomic<std::size_t> next{0};
     std::atomic<std::size_t> stored{0}, storedUnverified{0}, unverified{0}, present{0}, diverged{0}, failed{0}, sameEntry{0}, sameSpirv{0};
     std::atomic<std::uint64_t> compileNs{0};
@@ -251,6 +262,10 @@ void precompileList(const ShaderRecompiler::SpirvTarget& target, const char* lis
         while (true) {
             const auto item = next.fetch_add(1, std::memory_order_relaxed);
             if (item >= work.size()) return;
+            if (secondsSince(started) > budgetSeconds) {
+                cut.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
             const auto& record = records[work[item]];
             const auto itemStarted = std::chrono::steady_clock::now();
             try {
@@ -292,9 +307,11 @@ void precompileList(const ShaderRecompiler::SpirvTarget& target, const char* lis
         if (!code.located) ++notFound;
     }
     for (const auto& failure : failures) std::fprintf(stderr, "[precompile] compile failed: %s\n", failure.c_str());
+    if (cut.load() != 0) std::fprintf(stderr, "[precompile] time budget of %.0f s reached (APS5_PRECOMPILE_BUDGET_S): %zu of %zu variants left to the on-demand compile\n", budgetSeconds, cut.load(), work.size());
+    if (list.overLimit != 0) std::fprintf(stderr, "[precompile] %zu records beyond the %zu-record limit left out\n", list.overLimit, KeyList::MaxRecords);
     if (diverged.load() != 0) std::fprintf(stderr, "[precompile] %zu variants compiled to other SPIR-V than the recording under the same entry name: not stored (the rebuilt request misses an input)\n", diverged.load());
     if (unverified.load() != 0) std::fprintf(stderr, "[precompile] %zu variants have other entry names than the recording (another device, sources or switch set): not compiled (APS5_PRECOMPILE_UNVERIFIED=1 stores them unverified)\n", unverified.load());
-    std::fprintf(stderr, "[precompile] %s: %zu records (%zu unreadable lines, %zu duplicates, %zu format 1), %zu codes: %zu by locator (%zu stale), %zu by scan (%zu files, %.1f MiB, %.1f s), %zu not found%s; %zu compiled (%zu unverified), %zu present, %zu diverged, %zu unverifiable skipped, %zu failed in %.1f s on %u threads (%.1f s compiling); %zu entry names as recorded, %zu with the recorded SPIR-V; total %.1f s\n",
+    std::fprintf(stderr, "[precompile] %s: %zu records (%zu unreadable or oversized lines, %zu duplicates, %zu format 1), %zu codes: %zu by locator (%zu stale), %zu by scan (%zu files, %.1f MiB, %.1f s), %zu not found%s; %zu compiled (%zu unverified), %zu present, %zu diverged, %zu unverifiable skipped, %zu failed in %.1f s on %u threads (%.1f s compiling); %zu entry names as recorded, %zu with the recorded SPIR-V; total %.1f s\n",
                  listPath, records.size(), list.unreadable, list.duplicates, list.legacy, codes.size(), byLocator, staleLocators, byScan, scannedFiles, static_cast<double>(scannedBytes) / (1024.0 * 1024.0), scanSeconds, notFound, listUpdated ? ", list rewritten with the locators" : "",
                  stored.load() + storedUnverified.load(), storedUnverified.load(), present.load(), diverged.load(), unverified.load(), failed.load(), compileSeconds, threads, static_cast<double>(compileNs.load()) / 1e9, sameEntry.load(), sameSpirv.load(), secondsSince(started));
 }
@@ -328,7 +345,7 @@ void RunShaderPrecompile(const ShaderRecompiler::SpirvTarget& target) {
         std::fprintf(stderr, "[precompile] stopped by an unknown exception\n");
     }
     // APS5_PRECOMPILE_EXIT=1: the headless use (a one-time setup) ends the process once the cache is filled.
-    if (std::getenv("APS5_PRECOMPILE_EXIT") != nullptr) {
+    if (switchOn("APS5_PRECOMPILE_EXIT")) {
         std::fflush(stderr);
         std::_Exit(0);
     }

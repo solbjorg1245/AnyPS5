@@ -31,6 +31,9 @@ inline constexpr std::uint32_t MaxCodeDwords = 1u << 20u;
 inline constexpr std::size_t MaxCount = 1u << 16u;
 // A key list larger than this is not read.
 inline constexpr std::uintmax_t MaxListBytes = 64ull << 20u;
+// A line longer than this is unreadable; records beyond MaxRecords are left out (a hand-made list).
+inline constexpr std::size_t MaxLineBytes = 64u << 10u;
+inline constexpr std::size_t MaxRecords = 100000;
 // The locator path of the running program's own file (a port that links the game's executable into
 // its own carries that code there instead of in app0/eboot.bin).
 inline constexpr std::string_view ExecutableLocator = "@exe";
@@ -106,6 +109,8 @@ struct ListFile {
     std::vector<Record> records;
     std::size_t unreadable = 0;
     std::size_t duplicates = 0;
+    // Records left out of the list for the MaxRecords limit.
+    std::size_t overLimit = 0;
     // Records read from format 1 lines.
     std::size_t legacy = 0;
 };

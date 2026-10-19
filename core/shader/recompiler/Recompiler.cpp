@@ -891,7 +891,8 @@ namespace ShaderKeyList {
 // The compile reads the code, the stage, the context's stage info, wave size and user data count,
 // the target, the layout, graphics->mesh and the specialization: all of them in the disk key, all
 // of them in the record. It also reads the snapshot, but only into the descriptor values the SPIR-V
-// emitter never reads (it checks their counts), and the code address, only into diagnostics.
+// emitter never reads (it checks their counts). The code address also reaches the SPIR-V (the loop
+// guard's shader id under APS5_LOOP_GUARD) and the disk entry, so the record carries it.
 PrecompileOutcome Precompile(const Record& record, const RebuiltRequest& rebuilt, bool storeUnverified) {
     PrecompileOutcome outcome;
     if (!ShaderDiskCache::Enabled() || DebugProbeActive()) return outcome;

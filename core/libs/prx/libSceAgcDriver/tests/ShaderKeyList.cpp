@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -166,6 +167,56 @@ std::string legacyLine(const std::string& line) {
     return "k1" + line.substr(2, line.rfind(" ~") - 2);
 }
 
+// Values that index, size an allocation or divide later must not get past Decode.
+void verifyHostile() {
+    Sample sample(ShaderStage::Compute);
+    const auto base = KeyList::Describe(sample.request, sample.snapshot, sample.specialization);
+    const auto accepts = [&](const std::function<void(KeyList::Record&)>& change) {
+        auto record = base;
+        record.entry = "0123456789abcdef0123456789abcdef.bin";
+        change(record);
+        KeyList::Record decoded;
+        return KeyList::Decode(KeyList::Encode(record), decoded);
+    };
+    require(accepts([](KeyList::Record&) {}), "the sample record does not decode");
+    require(accepts([](KeyList::Record& r) { r.waveSize = 32; }) && accepts([](KeyList::Record& r) { r.waveSize = 64; }), "a valid wave size is refused");
+    require(!accepts([](KeyList::Record& r) { r.waveSize = 0; }), "wave size 0 decodes");
+    require(!accepts([](KeyList::Record& r) { r.waveSize = 16; }), "wave size 16 decodes");
+    require(accepts([](KeyList::Record& r) { r.shape.images = {8u, 1u}; r.shape.samplers = {4u}; }), "valid descriptor widths are refused");
+    require(!accepts([](KeyList::Record& r) { r.shape.images = {9u}; }), "an image width of 9 decodes");
+    require(!accepts([](KeyList::Record& r) { r.shape.images = {0xffffffffu}; }), "an image width of 2^32-1 decodes");
+    require(!accepts([](KeyList::Record& r) { r.shape.samplers = {8u, 9u}; }), "a sampler width of 9 decodes");
+    require(!accepts([](KeyList::Record& r) { r.shape.images = {0u}; }), "an image width of 0 decodes");
+    require(!accepts([](KeyList::Record& r) { r.shape.buffers = {0x10000000u}; }), "a buffer width of 2^28 decodes");
+    require(!accepts([](KeyList::Record& r) { r.userDataCount = 0xffffffffu; }), "a huge user data count decodes");
+    require(!accepts([](KeyList::Record& r) { r.shape.flattenedSrt = 0xffffffffu; }), "a huge flat SRT count decodes");
+    require(!accepts([](KeyList::Record& r) { r.shape.userData = 0x7fffffffu; }), "a huge snapshot user data count decodes");
+    require(!accepts([](KeyList::Record& r) { r.code.dwords = 0xffffffffu; }), "a huge code size decodes");
+    require(!accepts([](KeyList::Record& r) { r.userDataBaseRegister = 0xffffffffu; }), "a huge user data base register decodes");
+    require(!accepts([](KeyList::Record& r) { r.compute->ldsSizeDwords = 0xffffffffu; }), "a huge LDS size decodes");
+    require(!accepts([](KeyList::Record& r) { r.compute->numThreads[1] = 0u; }), "a zero thread count decodes");
+    // A count of list entries larger than the tokens that follow.
+    KeyList::Record decoded;
+    auto line = KeyList::Encode([&] { auto r = base; r.entry = "0123456789abcdef0123456789abcdef.bin"; return r; }());
+    line = "k1" + line.substr(2, line.rfind(" ~") - 2) + " ffffffffffffffff";
+    require(!KeyList::Decode(line, decoded), "a record with a trailing huge value decodes");
+    // The list reader leaves out oversized lines and records beyond the limit.
+    const auto path = std::filesystem::temp_directory_path() / "aps5-shader-key-list-hostile.txt";
+    {
+        auto record = base;
+        record.entry = "0123456789abcdef0123456789abcdef.bin";
+        const auto good = KeyList::Encode(record);
+        std::ofstream out(path, std::ios::binary);
+        out << good << '\n' << std::string(KeyList::MaxLineBytes + 1, 'x') << '\n';
+        record.entry = "1123456789abcdef0123456789abcdef.bin";
+        out << KeyList::Encode(record) << '\n';
+    }
+    KeyList::ListFile list;
+    require(KeyList::ReadList(path, list) && list.records.size() == 2 && list.unreadable == 1 && list.lines.size() == 2, "an oversized line was kept or the good ones lost");
+    std::error_code error;
+    std::filesystem::remove(path, error);
+}
+
 void verifyRejects() {
     Sample sample(ShaderStage::Compute);
     auto record = KeyList::Describe(sample.request, sample.snapshot, sample.specialization);
@@ -173,7 +224,7 @@ void verifyRejects() {
     const auto sealed = KeyList::Encode(record);
     KeyList::Record decoded;
     require(sealed.compare(0, 3, "k2 ") == 0 && KeyList::Decode(sealed, decoded), "a format 2 line does not decode");
-    require(record.codeAddress == 0 && decoded.codeAddress == 0, "the record carries the code address");
+    require(record.codeAddress == 0x1234500u && decoded.codeAddress == record.codeAddress, "the record carries the code address");
     // A cut line never decodes: the checksum, or a value before it.
     require(!KeyList::Decode(sealed.substr(0, sealed.size() - 1), decoded), "a line missing its checksum's last digit decodes");
     require(!KeyList::Decode(sealed.substr(0, sealed.rfind(" ~")), decoded), "a format 2 line without its checksum decodes");
@@ -387,6 +438,7 @@ int main() {
         setEnvironment("ANYPS5_SHADER_CACHE_DIR", (directory / "cache").string());
         setEnvironment("APS5_SHADER_KEYS", keys.string());
         verifyRoundTrip();
+        verifyHostile();
         verifyRejects();
         verifyTakeCode();
         verifyListFile(directory);
