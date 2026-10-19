@@ -971,12 +971,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     // Storage buffer bounds on the device (from KytyPS5 357b3ac4): where robustBufferAccess2 checks the
     // bound range byte-exactly (robustStorageBufferAccessSizeAlignment 1, NVIDIA), an out-of-range load
     // reads zero and a store is dropped, as the shaders' index < OpArrayLength check does over the same
-    // descriptor range, so the shaders leave that check out. APS5_ROBUST_BUFFERS=0 keeps the checks and
-    // the device as before.
+    // descriptor range, so the shaders leave that check out. Opt-in (APS5_ROBUST_BUFFERS=1): no gain
+    // beyond noise so far, and the shipped shader key list is recorded without it (on, its SPIR-V
+    // differs from the recording). Unset or 0 keeps the checks and the device as before.
     VkPhysicalDeviceRobustness2FeaturesEXT robustness2Features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
     const char* robustBuffers = std::getenv("APS5_ROBUST_BUFFERS");
     std::uint32_t robustAlignment = 0;
-    if ((robustBuffers == nullptr || std::strcmp(robustBuffers, "0") != 0) && hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
+    if (robustBuffers != nullptr && std::strcmp(robustBuffers, "1") == 0 && hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &robustness2Features};
         state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
         VkPhysicalDeviceRobustness2PropertiesEXT robustness2Properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT};

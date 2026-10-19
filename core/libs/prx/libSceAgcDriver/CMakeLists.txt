@@ -281,6 +281,13 @@ target_include_directories(agc_shader_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_shader_memory_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_memory_tests)
+# The concurrent recompiles run on std::async threads that exit mid-test. libgcc's emutls frees a
+# thread's thread_local storage before the CRT runs its thread_local destructors (the disk cache's
+# key and file buffers): a heap corruption at thread exit (exit 127). The driver's
+# __emutls_get_address keeps the storage, as it does in the driver.
+if(MINGW)
+    target_sources(agc_shader_memory_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FastEmutls.cpp)
+endif()
 # The fast walk's decline must not throw: tests/ShaderMemory.cpp counts every C++ throw of the
 # test's objects and static libraries through a __cxa_throw wrapper (GNU ld and lld --wrap).
 if(MINGW OR CMAKE_SYSTEM_NAME STREQUAL "Linux")

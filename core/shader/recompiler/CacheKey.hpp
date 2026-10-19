@@ -205,8 +205,9 @@ private:
         append(key, value.maxWorkgroupSharedMemoryBytes);
         append(key, value.mesh);
         append(key, value.tessellation);
-        append(key, value.nonConstantImageOffsets);
-        append(key, value.deviceStorageBufferBounds);
+        // deviceStorageBufferBounds shares the word so a target without it keys as before: a shader key
+        // list's inputs digest (ShaderDiskCache::InputDigest) stays the recording's.
+        append(key, static_cast<std::uint64_t>(value.nonConstantImageOffsets) | (static_cast<std::uint64_t>(value.deviceStorageBufferBounds) << 1u));
     }
 };
 

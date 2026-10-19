@@ -1818,6 +1818,7 @@ void verifyDeviceStorageBufferBounds() {
         request.target.spirvVersion = 0x00010300u;
         request.target.subgroupSize = 32;
         request.target.fragmentShaderBarycentricEnabled = false;
+        request.target.bdaAbiVersion = BdaAbi::Version;
         request.target.deviceStorageBufferBounds = device;
         request.layout.pushConstantSizeBytes = 128;
         request.useCache = false;
