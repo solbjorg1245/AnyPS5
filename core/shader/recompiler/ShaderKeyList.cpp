@@ -247,7 +247,13 @@ bool boundedRecord(const Record& record) {
         }
     }
     if (record.pixel && record.pixel->interpolatorCount > record.pixel->interpolatorSettings.size()) return false;
-    if (record.mesh && record.mesh->ldsSizeDwords > MaxCount) return false;
+    if (record.mesh && (record.mesh->ldsSizeDwords > MaxCount || record.mesh->maxVertices > 256u || record.mesh->maxPrimitives > 256u || record.mesh->threadsPerGroup > 1024u)) return false;
+    if (static_cast<std::uint32_t>(record.stage) > static_cast<std::uint32_t>(ShaderStage::Mesh)) return false;
+    // The mip count is two 4-bit fields of the descriptor: 1..16.
+    for (const auto& image : record.specialization.images) {
+        if (image.mipCount == 0 || image.mipCount > 16u) return false;
+        if (static_cast<std::uint32_t>(image.numericClass) > static_cast<std::uint32_t>(IrTextureNumericClass::Sint) || static_cast<std::uint32_t>(image.dimension) > static_cast<std::uint32_t>(RdnaImageDimension::Dim2DMsaaArray)) return false;
+    }
     return true;
 }
 
@@ -455,6 +461,7 @@ bool ReadList(const std::filesystem::path& path, ListFile& list) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.size() > MaxLineBytes) {
             ++list.unreadable;
+            list.lines.push_back(ListFile::Line{std::move(line)});
             continue;
         }
         ListFile::Line kept{line};

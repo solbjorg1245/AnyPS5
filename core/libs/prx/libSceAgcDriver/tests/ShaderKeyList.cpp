@@ -4,6 +4,7 @@
 #include "ShaderDiskCache.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -195,6 +196,39 @@ void verifyHostile() {
     require(!accepts([](KeyList::Record& r) { r.userDataBaseRegister = 0xffffffffu; }), "a huge user data base register decodes");
     require(!accepts([](KeyList::Record& r) { r.compute->ldsSizeDwords = 0xffffffffu; }), "a huge LDS size decodes");
     require(!accepts([](KeyList::Record& r) { r.compute->numThreads[1] = 0u; }), "a zero thread count decodes");
+    require(!accepts([](KeyList::Record& r) { r.specialization.images[0].mipCount = 0u; }), "a mip count of 0 decodes");
+    require(!accepts([](KeyList::Record& r) { r.specialization.images[0].mipCount = 0xffffffffu; }), "a mip count of 2^32-1 decodes");
+    require(!accepts([](KeyList::Record& r) { r.specialization.images[0].mipCount = 17u; }), "a mip count of 17 decodes");
+    require(accepts([](KeyList::Record& r) { r.specialization.images[0].mipCount = 16u; }), "a mip count of 16 is refused");
+    require(!accepts([](KeyList::Record& r) { r.compute->numThreads[0] = 1025u; }), "1025 threads decode");
+    require(!accepts([](KeyList::Record& r) { r.compute->threadIdComponentCount = 4u; }), "4 thread id components decode");
+    require(!accepts([](KeyList::Record& r) { r.stage = static_cast<ShaderStage>(8); }), "a stage beyond the enum decodes");
+    require(!accepts([](KeyList::Record& r) { r.specialization.images[0].dimension = static_cast<RdnaImageDimension>(99); }), "an image dimension beyond the enum decodes");
+    {
+        Sample fragment(ShaderStage::Fragment);
+        auto pixelBase = KeyList::Describe(fragment.request, fragment.snapshot, fragment.specialization);
+        pixelBase.entry = "0123456789abcdef0123456789abcdef.bin";
+        KeyList::Record again;
+        require(KeyList::Decode(KeyList::Encode(pixelBase), again), "the fragment sample does not decode");
+        pixelBase.pixel->interpolatorCount = 33u;
+        require(!KeyList::Decode(KeyList::Encode(pixelBase), again), "33 interpolators decode");
+    }
+    {
+        Sample mesh(ShaderStage::Mesh);
+        auto meshBase = KeyList::Describe(mesh.request, mesh.snapshot, mesh.specialization);
+        meshBase.entry = "0123456789abcdef0123456789abcdef.bin";
+        KeyList::Record again;
+        require(KeyList::Decode(KeyList::Encode(meshBase), again), "the mesh sample does not decode");
+        auto big = meshBase;
+        big.mesh->ldsSizeDwords = 0xffffffffu;
+        require(!KeyList::Decode(KeyList::Encode(big), again), "a huge mesh LDS decodes");
+        big = meshBase;
+        big.mesh->maxVertices = 100000u;
+        require(!KeyList::Decode(KeyList::Encode(big), again), "100000 mesh vertices decode");
+        big = meshBase;
+        big.mesh->threadsPerGroup = 4096u;
+        require(!KeyList::Decode(KeyList::Encode(big), again), "4096 mesh threads decode");
+    }
     // A count of list entries larger than the tokens that follow.
     KeyList::Record decoded;
     auto line = KeyList::Encode([&] { auto r = base; r.entry = "0123456789abcdef0123456789abcdef.bin"; return r; }());
@@ -212,7 +246,20 @@ void verifyHostile() {
         out << KeyList::Encode(record) << '\n';
     }
     KeyList::ListFile list;
-    require(KeyList::ReadList(path, list) && list.records.size() == 2 && list.unreadable == 1 && list.lines.size() == 2, "an oversized line was kept or the good ones lost");
+    require(KeyList::ReadList(path, list) && list.records.size() == 2 && list.unreadable == 1 && list.lines.size() == 3 && list.lines[1].record < 0 && list.lines[1].text.size() == KeyList::MaxLineBytes + 1, "an oversized line was dropped or the good ones lost");
+    // The records beyond MaxRecords are counted, and their lines stay.
+    {
+        auto record = base;
+        std::ofstream out(path, std::ios::binary);
+        for (std::size_t i = 0; i < KeyList::MaxRecords + 3; ++i) {
+            char name[40];
+            std::snprintf(name, sizeof(name), "%032zx.bin", i);
+            record.entry = name;
+            out << KeyList::Encode(record) << '\n';
+        }
+    }
+    KeyList::ListFile many;
+    require(KeyList::ReadList(path, many) && many.records.size() == KeyList::MaxRecords && many.overLimit == 3 && many.lines.size() == KeyList::MaxRecords + 3, "the record limit did not cut");
     std::error_code error;
     std::filesystem::remove(path, error);
 }
