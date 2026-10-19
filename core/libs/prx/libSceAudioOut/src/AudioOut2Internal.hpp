@@ -126,8 +126,10 @@ struct AudioOut2Context {
 // Mixes every port of the context that carries PCM data into out (stereo float, frames frames), summing
 // onto the zeroed buffer. Returns the number of ports mixed. meters (may be null) takes the ports' levels.
 std::uint32_t AudioOut2MixPorts(const AudioOut2Context& context, float* out, float* padOut, std::uint32_t frames, AudioOut2Meters* meters);
-// Whether the ambisonic decoder is on (APS5_AUDIO2_AMBISONICS), and its mode.
+// The ambisonic decoder's mode (APS5_AUDIO2_AMBISONICS, validated: 0 = off), and whether vibration ports
+// play in the main mix without a pad card (APS5_AUDIO2_HAPTICS_MAIN).
 std::uint32_t AudioOut2AmbisonicMode();
+bool AudioOut2HapticsMain();
 bool AudioOut2HasPadPorts(const AudioOut2Context& context);
 // Forgets the ports of a context being destroyed.
 void AudioOut2ReleasePorts(const AudioOut2Context& context);

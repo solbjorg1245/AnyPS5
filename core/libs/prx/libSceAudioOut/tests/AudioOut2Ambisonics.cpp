@@ -117,6 +117,43 @@ int main() {
     Require(!AudioOut2SkipInMainMix(0x100, 1, false) && !AudioOut2SkipInMainMix(0, 8, false), "game ports stay");
     Require(!AudioOut2SkipInMainMix(AUDIO_OUT2_PORT_TYPE_PAD_VIBRATION, 8, false), "an 8-channel type 0x6 is not a vibration port");
 
+    // The switch path as the mixer takes it: value -> decoder mode -> master gain -> port gains.
+    struct ModeCase {
+        const char* value;
+        std::uint32_t mode;
+        bool valid;
+    };
+    for (const ModeCase& c : {ModeCase{nullptr, 0, true}, ModeCase{"", 0, true}, ModeCase{"0", 0, true}, ModeCase{"1", 1, true},
+             ModeCase{"2", 2, true}, ModeCase{"3", 0, false}, ModeCase{"5", 0, false}, ModeCase{"-1", 0, false},
+             ModeCase{"1x", 0, false}, ModeCase{"on", 0, false}, ModeCase{"4294967297", 0, false}}) {
+        bool valid = false;
+        const auto mode = AudioOut2ParseAmbisonicMode(c.value, valid);
+        Require(mode == c.mode && valid == c.valid, "APS5_AUDIO2_AMBISONICS parse");
+        const auto decoder = AudioOut2MakeAmbisonicDecoder(mode);
+        Require(decoder.mode == c.mode, "the decoder takes the parsed mode");
+        bool gainValid = false;
+        const float gain = AudioOut2MasterGain(decoder.mode, nullptr, gainValid);
+        Require(gainValid && gain == (c.mode != 0 ? AUDIO_OUT2_DECODED_GAIN : AUDIO_OUT2_SUM_GAIN), "the gain follows the decoder's mode");
+        if (c.mode == 0) {
+            AudioOut2MonoGains(decoder, 0x41, 0, l, r);
+            Require(l == 1.0f && r == 1.0f && gain == 0.5f, "a refused mode is the old sum at the old level");
+        }
+    }
+
+    struct GainCase {
+        const char* value;
+        float gain;
+        bool valid;
+    };
+    for (const GainCase& c : {GainCase{"0.25", 0.25f, true}, GainCase{"2", 2.0f, true}, GainCase{"16", 16.0f, true}, GainCase{"", 0.5f, true},
+             GainCase{"0", 0.5f, false}, GainCase{"-1", 0.5f, false}, GainCase{"loud", 0.5f, false}, GainCase{"0.5dB", 0.5f, false},
+             GainCase{"nan", 0.5f, false}, GainCase{"inf", 0.5f, false}, GainCase{"1e30", 0.5f, false}, GainCase{"17", 0.5f, false}}) {
+        bool valid = false;
+        const float gain = AudioOut2MasterGain(0, c.value, valid);
+        Require(gain == c.gain && valid == c.valid, "APS5_AUDIO2_GAIN on the old sum");
+        Require(c.valid || AudioOut2MasterGain(2, c.value, valid) == AUDIO_OUT2_DECODED_GAIN, "a refused gain keeps the decoded gain");
+    }
+
     std::printf("audio_out2_ambisonics_tests: ok\n");
     return 0;
 }

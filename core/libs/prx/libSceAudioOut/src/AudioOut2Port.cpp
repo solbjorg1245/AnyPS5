@@ -35,22 +35,24 @@ static constexpr std::uint32_t FORMAT_CHANNELS_SHIFT = 8;
 static constexpr std::uint32_t FORMAT_CHANNELS_MASK = 0xFu;
 static constexpr std::uint32_t FORMAT_TYPE_MASK = 0x7Fu;
 
-std::uint32_t AudioOut2AmbisonicMode() {
-    static const std::uint32_t mode = [] {
+static const AudioOut2AmbisonicDecoder& Decoder() {
+    static const AudioOut2AmbisonicDecoder decoder = [] {
         const char* value = std::getenv("APS5_AUDIO2_AMBISONICS");
-        return value != nullptr ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+        bool valid = true;
+        const auto mode = AudioOut2ParseAmbisonicMode(value, valid);
+        if (!valid) std::fprintf(stderr, "[audio] APS5_AUDIO2_AMBISONICS=%s refused (0, 1 or 2): the ports are summed as before\n", value);
+        return AudioOut2MakeAmbisonicDecoder(mode);
     }();
-    return mode;
+    return decoder;
 }
 
-static const AudioOut2AmbisonicDecoder& Decoder() {
-    static const AudioOut2AmbisonicDecoder decoder = AudioOut2MakeAmbisonicDecoder(AudioOut2AmbisonicMode());
-    return decoder;
+std::uint32_t AudioOut2AmbisonicMode() {
+    return Decoder().mode;
 }
 
 // APS5_AUDIO2_HAPTICS_MAIN=0: without a controller sound card the vibration ports stay out of the
 // speakers. Unset or 1: the old route (into the main mix).
-static bool HapticsMain() {
+bool AudioOut2HapticsMain() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_AUDIO2_HAPTICS_MAIN");
         return value == nullptr || std::strcmp(value, "0") != 0;
@@ -158,7 +160,7 @@ std::uint32_t AudioOut2MixPorts(const AudioOut2Context& context, float* out, flo
     for (const auto& port : g_ports) {
         if (!port.used || port.context != &context || port.data == nullptr || port.channels == 0) continue;
         const auto route = padOut != nullptr ? AudioOut2RouteForPort(port.type, port.channels) : AudioOut2Route::Main;
-        const bool skipped = padOut == nullptr && AudioOut2SkipInMainMix(port.type, port.channels, HapticsMain());
+        const bool skipped = padOut == nullptr && AudioOut2SkipInMainMix(port.type, port.channels, AudioOut2HapticsMain());
         if (meters != nullptr) Meter(port, skipped, frames, *meters);
         if (skipped) continue;
         if (route == AudioOut2Route::Main) AccumulatePort(port, out, frames);

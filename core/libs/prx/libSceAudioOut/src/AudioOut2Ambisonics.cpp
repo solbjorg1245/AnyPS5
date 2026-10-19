@@ -99,6 +99,31 @@ static void MakeFullOrder(AudioOut2AmbisonicDecoder& decoder) {
     }
 }
 
+std::uint32_t AudioOut2ParseAmbisonicMode(const char* value, bool& valid) {
+    valid = true;
+    if (value == nullptr || *value == '\0') return 0;
+    char* end = nullptr;
+    const unsigned long mode = std::strtoul(value, &end, 10);
+    if (end == value || *end != '\0' || value[0] == '-' || mode > AUDIO_OUT2_AMBISONIC_MODE_MAX) {
+        valid = false;
+        return 0;
+    }
+    return static_cast<std::uint32_t>(mode);
+}
+
+float AudioOut2MasterGain(std::uint32_t decoderMode, const char* value, bool& valid) {
+    valid = true;
+    const float gain = decoderMode != 0 ? AUDIO_OUT2_DECODED_GAIN : AUDIO_OUT2_SUM_GAIN;
+    if (value == nullptr || *value == '\0') return gain;
+    char* end = nullptr;
+    const float requested = std::strtof(value, &end);
+    if (end == value || *end != '\0' || !std::isfinite(requested) || requested <= 0.0f || requested > AUDIO_OUT2_GAIN_MAX) {
+        valid = false;
+        return gain;
+    }
+    return requested;
+}
+
 AudioOut2AmbisonicDecoder AudioOut2MakeAmbisonicDecoder(std::uint32_t mode) {
     AudioOut2AmbisonicDecoder decoder;
     if (mode == 1) {

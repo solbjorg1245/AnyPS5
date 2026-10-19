@@ -12,6 +12,7 @@
 #include <vector>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "AudioOut2Ambisonics.hpp"
 #include "AudioOut2Internal.hpp"
 
 // An AudioOut2 context is the hardware output queue: every push mixes the ports' current grain
@@ -38,11 +39,9 @@ static constexpr std::chrono::milliseconds FULL_WAIT_STEP{1};
 static constexpr std::uint16_t DEVICE_SAMPLES = 512;
 // The summed ports (a 7.1 bed folded to stereo plus the object ports) peak above full scale in the
 // intro cutscene (2.1 measured); the device takes float and clips hard, so the mix is attenuated
-// and clamped.
-static constexpr float MASTER_GAIN = 0.5f;
-// The decoded mix (APS5_AUDIO2_AMBISONICS) plays a source ahead at its own level instead of summing 36
-// harmonics, so it needs no attenuation; APS5_AUDIO2_GAIN overrides the gain on either path.
-static constexpr float DECODED_GAIN = 1.0f;
+// and clamped (AUDIO_OUT2_SUM_GAIN). The decoded mix (APS5_AUDIO2_AMBISONICS) plays a source ahead at its
+// own level instead of summing 36 harmonics, so it needs no attenuation (AUDIO_OUT2_DECODED_GAIN); the
+// gain follows the decoder's actual mode, and APS5_AUDIO2_GAIN overrides it on either path.
 static constexpr std::chrono::seconds DIGEST_INTERVAL{10};
 // APS5_AUDIO_DUMP=<file.wav> records the mix of the first context that pushes as 16-bit stereo PCM WAV:
 // what is queued, after the master gain and the clamp, APS5_AUDIO_DUMP_SECONDS long at most (default
@@ -70,10 +69,24 @@ bool AudioOut2DigestEnabled() {
 static float MasterGain() {
     static const float gain = [] {
         const char* value = std::getenv("APS5_AUDIO2_GAIN");
-        if (value != nullptr && *value != '\0') return std::strtof(value, nullptr);
-        return AudioOut2AmbisonicMode() != 0 ? DECODED_GAIN : MASTER_GAIN;
+        bool valid = true;
+        const float chosen = AudioOut2MasterGain(AudioOut2AmbisonicMode(), value, valid);
+        if (!valid) std::fprintf(stderr, "[audio] APS5_AUDIO2_GAIN=%s refused (a number above 0, at most %g): gain %.2f\n", value, static_cast<double>(AUDIO_OUT2_GAIN_MAX), static_cast<double>(chosen));
+        return chosen;
     }();
     return gain;
+}
+
+// One line at the first context: the audio switches in effect.
+static void LogSwitches() {
+    static const bool logged = [] {
+        const char* dump = std::getenv("APS5_AUDIO_DUMP");
+        std::fprintf(stderr, "[audio] switches: ambisonics %u (APS5_AUDIO2_AMBISONICS), haptics %s (APS5_AUDIO2_HAPTICS_MAIN), gain %.2f (APS5_AUDIO2_GAIN), dump %s (APS5_AUDIO_DUMP), digest %s\n",
+            AudioOut2AmbisonicMode(), AudioOut2HapticsMain() ? "main mix without a pad card" : "off the speakers without a pad card", static_cast<double>(MasterGain()),
+            dump != nullptr && *dump != '\0' ? dump : "off", AudioOut2DigestEnabled() ? "on" : "off");
+        return true;
+    }();
+    (void)logged;
 }
 
 struct AudioDump {
@@ -408,6 +421,7 @@ int APS5_VABI sceAudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
 
 int APS5_VABI sceAudioOut2ContextCreate(const AudioOut2ContextParam* params, void* buffer, size_t buffer_size, AudioOut2ContextHandle* ctx) {
     if (!params || !ctx) return SCE_AUDIO_OUT2_ERROR_INVALID_ARGUMENT;
+    LogSwitches();
     static std::atomic<std::uint32_t> nextId{1};
     auto* context = new AudioOut2Context();
     context->id = nextId.fetch_add(1, std::memory_order_relaxed);

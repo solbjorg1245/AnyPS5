@@ -19,6 +19,12 @@ static constexpr std::uint32_t AUDIO_OUT2_AMBISONIC_CHANNELS = (AUDIO_OUT2_AMBIS
 // Port attribute 5 as SharpEmu reads it: 1 plays a mono port on the left speaker only, 2 on the right.
 static constexpr std::uint32_t AUDIO_OUT2_PASSTHROUGH_LEFT = 1;
 static constexpr std::uint32_t AUDIO_OUT2_PASSTHROUGH_RIGHT = 2;
+static constexpr std::uint32_t AUDIO_OUT2_AMBISONIC_MODE_MAX = 2;
+// Master gain of the old sum (the summed harmonics peaked at 2.1 in the intro cutscene) and of a decoded mix.
+static constexpr float AUDIO_OUT2_SUM_GAIN = 0.5f;
+static constexpr float AUDIO_OUT2_DECODED_GAIN = 1.0f;
+// APS5_AUDIO2_GAIN above this is refused.
+static constexpr float AUDIO_OUT2_GAIN_MAX = 16.0f;
 
 struct AudioOut2AmbisonicDecoder {
     std::uint32_t mode = 0;
@@ -31,6 +37,12 @@ double AudioOut2Sn3d(std::uint32_t acn, double x, double y, double z);
 std::uint32_t AudioOut2AmbisonicOrder(std::uint32_t acn);
 // The ACN a port's attribute 8 names, or -1 when it names none this decoder knows.
 int AudioOut2AmbisonicChannel(std::uint32_t attribute);
+// The decoder mode an APS5_AUDIO2_AMBISONICS value selects: unset or empty = 0 (valid); anything but a whole
+// 0..AUDIO_OUT2_AMBISONIC_MODE_MAX is refused (valid = false) and gives 0, the old sum.
+std::uint32_t AudioOut2ParseAmbisonicMode(const char* value, bool& valid);
+// The master gain for the decoder's actual mode, or the APS5_AUDIO2_GAIN value when it is a finite number in
+// (0, AUDIO_OUT2_GAIN_MAX]; any other value is refused (valid = false) and the mode's gain is kept.
+float AudioOut2MasterGain(std::uint32_t decoderMode, const char* value, bool& valid);
 // Mode 0 (or an unknown mode) leaves every gain at zero.
 AudioOut2AmbisonicDecoder AudioOut2MakeAmbisonicDecoder(std::uint32_t mode);
 // The stereo gains of a mono port: the decoder's for an ambisonic channel, one side for a passthrough
