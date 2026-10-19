@@ -208,22 +208,24 @@ std::string VramFloorReport();
 // recorder's draw snapshot cache) instead of their host import. The floor runs t1281-t1284 showed
 // the geometry passes reading through the import cost ~12 ms per present more than through
 // separate snapshot buffers in the same host memory, so the gain is not video memory but the
-// import binding. APS5_DRAW_VRAM_MIN_KIB (default 0) keeps smaller elements in place;
-// APS5_DRAW_VRAM_ENTRIES and APS5_DRAW_VRAM_MIB bound the storage snapshot cache (default
-// Recorder::DrawSnapshotEntries, DrawSnapshotBudget). The [draw-vram] line (APS5_PROFILE_DRAW)
-// counts the uses by element size, the misses by reason and the evictions.
+// import binding. Elements of APS5_DRAW_VRAM_MIN_KIB (default 0) up to APS5_DRAW_VRAM_MAX_KIB
+// (default unbounded) snapshot, the others stay in place; APS5_DRAW_VRAM_ENTRIES and
+// APS5_DRAW_VRAM_MIB bound the storage snapshot cache (default Recorder::DrawSnapshotEntries,
+// DrawSnapshotBudget). The [draw-vram] line (APS5_PROFILE_DRAW) counts the uses by element size,
+// the misses by reason and the evictions.
 struct DrawVramSettings {
     unsigned mode = 0;
     std::size_t minBytes = 0;
+    std::size_t maxBytes = 0;
     std::size_t entries = 0;
     std::size_t budget = 0;
 };
 // The settings from the variables' values (any may be null): mode 0 while the first is unset or 0.
-DrawVramSettings DrawVramSettingsFrom(const char* mode, const char* minKib, const char* entries, const char* mib);
+DrawVramSettings DrawVramSettingsFrom(const char* mode, const char* minKib, const char* maxKib, const char* entries, const char* mib);
 const DrawVramSettings& DrawVram();
 // Whether an element of `bytes` binds a snapshot under the settings.
 inline bool DrawVramSnapshot(const DrawVramSettings& settings, std::size_t bytes) {
-    return settings.mode != 0 && bytes >= settings.minBytes;
+    return settings.mode != 0 && bytes >= settings.minBytes && bytes <= settings.maxBytes;
 }
 // A snapshot use: `bytes` the element's, `hit` a kept snapshot served it, else `stale` (a kept one
 // was out of date) or none was kept. A storage snapshot evicted for the cache's bounds.

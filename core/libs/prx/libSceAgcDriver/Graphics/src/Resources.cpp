@@ -299,18 +299,19 @@ std::size_t drawVramNumber(const char* text, std::size_t fallback) {
 
 }
 
-DrawVramSettings DrawVramSettingsFrom(const char* mode, const char* minKib, const char* entries, const char* mib) {
+DrawVramSettings DrawVramSettingsFrom(const char* mode, const char* minKib, const char* maxKib, const char* entries, const char* mib) {
     DrawVramSettings settings;
     if (mode == nullptr || *mode == '\0' || std::strcmp(mode, "0") == 0) return settings;
     settings.mode = 1;
     settings.minBytes = drawVramNumber(minKib, 0) << 10u;
+    settings.maxBytes = drawVramNumber(maxKib, std::size_t{1} << 30u) << 10u;
     settings.entries = std::max<std::size_t>(drawVramNumber(entries, Recorder::DrawSnapshotEntries), 1);
     settings.budget = std::max<std::size_t>(drawVramNumber(mib, Recorder::DrawSnapshotBudget >> 20u), 1) << 20u;
     return settings;
 }
 
 const DrawVramSettings& DrawVram() {
-    static const DrawVramSettings settings = DrawVramSettingsFrom(std::getenv("APS5_DRAW_VRAM"), std::getenv("APS5_DRAW_VRAM_MIN_KIB"), std::getenv("APS5_DRAW_VRAM_ENTRIES"), std::getenv("APS5_DRAW_VRAM_MIB"));
+    static const DrawVramSettings settings = DrawVramSettingsFrom(std::getenv("APS5_DRAW_VRAM"), std::getenv("APS5_DRAW_VRAM_MIN_KIB"), std::getenv("APS5_DRAW_VRAM_MAX_KIB"), std::getenv("APS5_DRAW_VRAM_ENTRIES"), std::getenv("APS5_DRAW_VRAM_MIB"));
     return settings;
 }
 
@@ -337,7 +338,7 @@ std::string DrawVramReport() {
     auto& counters = drawVramCounters();
     static constexpr const char* names[DrawVramClasses] = {"<4K", "<64K", "<1M", ">=1M"};
     char text[1024];
-    int n = std::snprintf(text, sizeof(text), "[draw-vram] (10 s, APS5_DRAW_VRAM=%u, min %zu KiB, cache %zu entries / %zu MiB) snapshot uses by element size, hits/misses (MiB used, MiB copied):", settings.mode, settings.minBytes >> 10u, settings.entries, settings.budget >> 20u);
+    int n = std::snprintf(text, sizeof(text), "[draw-vram] (10 s, APS5_DRAW_VRAM=%u, elements %zu-%zu KiB, cache %zu entries / %zu MiB) snapshot uses by element size, hits/misses (MiB used, MiB copied):", settings.mode, settings.minBytes >> 10u, settings.maxBytes >> 10u, settings.entries, settings.budget >> 20u);
     for (std::size_t size = 0; size < DrawVramClasses && n > 0 && static_cast<std::size_t>(n) < sizeof(text); ++size) {
         const auto hits = counters.hits[size].exchange(0, std::memory_order_relaxed);
         const auto misses = counters.misses[size].exchange(0, std::memory_order_relaxed);

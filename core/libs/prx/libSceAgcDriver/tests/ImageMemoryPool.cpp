@@ -74,13 +74,13 @@ void RunImageMemoryPoolTests() {
     // bounds default to the recorder's, a size floor keeps smaller elements in place.
     using AgcDriver::Graphics::DrawVramSettingsFrom;
     using AgcDriver::Graphics::DrawVramSnapshot;
-    const auto off = DrawVramSettingsFrom(nullptr, "4", nullptr, nullptr);
-    require(off.mode == 0 && DrawVramSettingsFrom("0", nullptr, nullptr, nullptr).mode == 0 && DrawVramSettingsFrom("", nullptr, nullptr, nullptr).mode == 0 && !DrawVramSnapshot(off, 1u << 20u), "draw vram off");
-    const auto defaults = DrawVramSettingsFrom("1", nullptr, nullptr, nullptr);
-    require(defaults.mode == 1 && defaults.minBytes == 0 && defaults.entries == AgcDriver::Graphics::Recorder::DrawSnapshotEntries && defaults.budget == AgcDriver::Graphics::Recorder::DrawSnapshotBudget && DrawVramSnapshot(defaults, 16), "draw vram defaults");
-    const auto bounded = DrawVramSettingsFrom("1", "64", "4096", "512");
-    require(bounded.minBytes == 65536 && bounded.entries == 4096 && bounded.budget == (std::size_t{512} << 20u), "draw vram bounds");
-    require(!DrawVramSnapshot(bounded, 65535) && DrawVramSnapshot(bounded, 65536), "draw vram size floor");
-    const auto garbage = DrawVramSettingsFrom("1", "x", "0", "");
-    require(garbage.minBytes == 0 && garbage.entries == 1 && garbage.budget == AgcDriver::Graphics::Recorder::DrawSnapshotBudget, "draw vram unparsable values");
+    const auto off = DrawVramSettingsFrom(nullptr, "4", nullptr, nullptr, nullptr);
+    require(off.mode == 0 && DrawVramSettingsFrom("0", nullptr, nullptr, nullptr, nullptr).mode == 0 && DrawVramSettingsFrom("", nullptr, nullptr, nullptr, nullptr).mode == 0 && !DrawVramSnapshot(off, 1u << 20u), "draw vram off");
+    const auto defaults = DrawVramSettingsFrom("1", nullptr, nullptr, nullptr, nullptr);
+    require(defaults.mode == 1 && defaults.minBytes == 0 && defaults.entries == AgcDriver::Graphics::Recorder::DrawSnapshotEntries && defaults.budget == AgcDriver::Graphics::Recorder::DrawSnapshotBudget && DrawVramSnapshot(defaults, 16) && DrawVramSnapshot(defaults, std::size_t{1} << 30u), "draw vram defaults");
+    const auto bounded = DrawVramSettingsFrom("1", "64", "1024", "4096", "512");
+    require(bounded.minBytes == 65536 && bounded.maxBytes == (std::size_t{1} << 20u) && bounded.entries == 4096 && bounded.budget == (std::size_t{512} << 20u), "draw vram bounds");
+    require(!DrawVramSnapshot(bounded, 65535) && DrawVramSnapshot(bounded, 65536) && DrawVramSnapshot(bounded, std::size_t{1} << 20u) && !DrawVramSnapshot(bounded, (std::size_t{1} << 20u) + 1), "draw vram size window");
+    const auto garbage = DrawVramSettingsFrom("1", "x", "y", "0", "");
+    require(garbage.minBytes == 0 && garbage.maxBytes == (std::size_t{1} << 40u) && garbage.entries == 1 && garbage.budget == AgcDriver::Graphics::Recorder::DrawSnapshotBudget, "draw vram unparsable values");
 }
