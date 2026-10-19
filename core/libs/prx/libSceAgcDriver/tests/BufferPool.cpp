@@ -316,6 +316,8 @@ void AttachmentReclaim() {
     Expect(refuse({VK_ERROR_OUT_OF_DEVICE_MEMORY}) == 0, "an attachment was placed in host memory although reclaiming the pool made room in device memory");
     Expect(refuse({VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_ERROR_OUT_OF_DEVICE_MEMORY}) == 1, "an attachment still refused device memory after reclaiming the pool was not placed in host memory");
     Expect(mock.liveBytes == 0, "an attachment allocation leaked memory");
+}
+
 constexpr VkDeviceSize HeapBytes = VkDeviceSize{8} << 30u;
 constexpr VkDeviceSize HeapTarget = HeapBytes;
 constexpr VkBufferUsageFlags BudgetUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
