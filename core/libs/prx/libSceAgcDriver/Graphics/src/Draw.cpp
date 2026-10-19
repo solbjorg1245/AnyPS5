@@ -474,6 +474,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     std::fprintf(stderr, "%s\n", line);
     RecordProfile::Report();
     ReportDrawRepeat();
+    if (const auto drawVram = DrawVramReport(); !drawVram.empty()) std::fprintf(stderr, "%s\n", drawVram.c_str());
     // The skipped packets by reason head: the top 8 per kind with their time (APS5_NO_DRAW_SKIP_REASONS=1: no line).
     bool anyReason = false;
     for (const auto& tally : profile.skipReasons) anyReason = anyReason || tally.Keys() != 0 || tally.Overflow() != 0;

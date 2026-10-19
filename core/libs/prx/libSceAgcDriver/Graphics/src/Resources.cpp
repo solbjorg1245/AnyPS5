@@ -272,6 +272,85 @@ std::string VramFloorReport() {
     return text;
 }
 
+namespace {
+
+// [draw-vram] counts by element size class: < 4 KiB, < 64 KiB, < 1 MiB, larger.
+constexpr std::size_t DrawVramClasses = 4;
+struct DrawVramCounters {
+    std::array<std::atomic<std::uint64_t>, DrawVramClasses> hits{}, misses{}, missBytes{}, useBytes{};
+    std::atomic<std::uint64_t> stale{0}, evicted{0};
+};
+
+DrawVramCounters& drawVramCounters() {
+    static DrawVramCounters counters;
+    return counters;
+}
+
+std::size_t drawVramClass(std::size_t bytes) {
+    return bytes < 4096 ? 0 : bytes < 65536 ? 1 : bytes < 1048576 ? 2 : 3;
+}
+
+std::size_t drawVramNumber(const char* text, std::size_t fallback) {
+    if (text == nullptr || *text == '\0') return fallback;
+    char* end = nullptr;
+    const auto value = std::strtoull(text, &end, 10);
+    return end != text ? static_cast<std::size_t>(std::min<unsigned long long>(value, 1ull << 30u)) : fallback;
+}
+
+}
+
+DrawVramSettings DrawVramSettingsFrom(const char* mode, const char* minKib, const char* entries, const char* mib) {
+    DrawVramSettings settings;
+    if (mode == nullptr || *mode == '\0' || std::strcmp(mode, "0") == 0) return settings;
+    settings.mode = 1;
+    settings.minBytes = drawVramNumber(minKib, 0) << 10u;
+    settings.entries = std::max<std::size_t>(drawVramNumber(entries, Recorder::DrawSnapshotEntries), 1);
+    settings.budget = std::max<std::size_t>(drawVramNumber(mib, Recorder::DrawSnapshotBudget >> 20u), 1) << 20u;
+    return settings;
+}
+
+const DrawVramSettings& DrawVram() {
+    static const DrawVramSettings settings = DrawVramSettingsFrom(std::getenv("APS5_DRAW_VRAM"), std::getenv("APS5_DRAW_VRAM_MIN_KIB"), std::getenv("APS5_DRAW_VRAM_ENTRIES"), std::getenv("APS5_DRAW_VRAM_MIB"));
+    return settings;
+}
+
+void NoteDrawVramUse(std::size_t bytes, bool hit, bool stale) noexcept {
+    auto& counters = drawVramCounters();
+    const auto size = drawVramClass(bytes);
+    counters.useBytes[size].fetch_add(bytes, std::memory_order_relaxed);
+    if (hit) {
+        counters.hits[size].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    counters.misses[size].fetch_add(1, std::memory_order_relaxed);
+    counters.missBytes[size].fetch_add(bytes, std::memory_order_relaxed);
+    if (stale) counters.stale.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteDrawVramEviction() noexcept {
+    drawVramCounters().evicted.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::string DrawVramReport() {
+    const auto& settings = DrawVram();
+    if (settings.mode == 0) return {};
+    auto& counters = drawVramCounters();
+    static constexpr const char* names[DrawVramClasses] = {"<4K", "<64K", "<1M", ">=1M"};
+    char text[1024];
+    int n = std::snprintf(text, sizeof(text), "[draw-vram] (10 s, APS5_DRAW_VRAM=%u, min %zu KiB, cache %zu entries / %zu MiB) snapshot uses by element size, hits/misses (MiB used, MiB copied):", settings.mode, settings.minBytes >> 10u, settings.entries, settings.budget >> 20u);
+    for (std::size_t size = 0; size < DrawVramClasses && n > 0 && static_cast<std::size_t>(n) < sizeof(text); ++size) {
+        const auto hits = counters.hits[size].exchange(0, std::memory_order_relaxed);
+        const auto misses = counters.misses[size].exchange(0, std::memory_order_relaxed);
+        const auto used = counters.useBytes[size].exchange(0, std::memory_order_relaxed);
+        const auto copied = counters.missBytes[size].exchange(0, std::memory_order_relaxed);
+        n += std::snprintf(text + n, sizeof(text) - static_cast<std::size_t>(n), " %s %llu/%llu (%.0f, %.0f)", names[size], static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), static_cast<double>(used) / 1048576.0, static_cast<double>(copied) / 1048576.0);
+    }
+    const auto stale = counters.stale.exchange(0, std::memory_order_relaxed);
+    const auto evicted = counters.evicted.exchange(0, std::memory_order_relaxed);
+    if (n > 0 && static_cast<std::size_t>(n) < sizeof(text)) std::snprintf(text + n, sizeof(text) - static_cast<std::size_t>(n), "; misses over a stale snapshot %llu, evicted for the bounds %llu", static_cast<unsigned long long>(stale), static_cast<unsigned long long>(evicted));
+    return text;
+}
+
 bool PoisonPool() {
     static const bool poison = [] {
         const char* value = std::getenv("APS5_POISON_POOL");

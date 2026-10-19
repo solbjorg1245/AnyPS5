@@ -3851,11 +3851,12 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
     drawSnapshots.erase(entry);
 }
 
-std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived) {
+std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, bool* stale) {
     auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) return {};
     if (found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
         eraseDrawSnapshot(found);
+        if (stale != nullptr) *stale = true;
         return {};
     }
     auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
@@ -3866,8 +3867,11 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
 
 void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived) {
     const bool storage = use == SnapshotUse::Storage;
-    const auto budget = storage ? DrawSnapshotBudget : DrawInputBudget;
-    const auto maxEntries = storage ? DrawSnapshotEntries : DrawInputEntries;
+    // APS5_DRAW_VRAM: the storage snapshots' bounds may be set (DrawVram), their evictions counted.
+    const auto& drawVram = DrawVram();
+    const bool drawVramStorage = storage && drawVram.mode != 0;
+    const auto budget = drawVramStorage ? drawVram.budget : storage ? DrawSnapshotBudget : DrawInputBudget;
+    const auto maxEntries = drawVramStorage ? drawVram.entries : storage ? DrawSnapshotEntries : DrawInputEntries;
     auto& pool = drawSnapshotPools[SnapshotPool(use)];
     if (generation == 0 || bytes > budget) return;
     if (use == SnapshotUse::Vertex) {
@@ -3875,7 +3879,10 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     } else if (const auto found = drawSnapshots.find({address, use, bytes}); found != drawSnapshots.end()) {
         eraseDrawSnapshot(found);
     }
-    while (!pool.recency.empty() && (pool.bytes + bytes > budget || pool.recency.size() >= maxEntries)) eraseDrawSnapshot(drawSnapshots.find(pool.recency.front()));
+    while (!pool.recency.empty() && (pool.bytes + bytes > budget || pool.recency.size() >= maxEntries)) {
+        eraseDrawSnapshot(drawSnapshots.find(pool.recency.front()));
+        if (drawVramStorage) NoteDrawVramEviction();
+    }
     const DrawSnapshotKey key{address, use, bytes};
     RecordCensus::Touch(RecordCensus::RecorderLists);
     pool.recency.push_back(key);

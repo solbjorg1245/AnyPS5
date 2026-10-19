@@ -203,6 +203,35 @@ void NoteVramFloorBuffer(std::uint64_t bytes, bool placed) noexcept;
 // The floor's counts appended to the [vram] line, reset each call; empty while the switch is off.
 std::string VramFloorReport();
 
+// APS5_DRAW_VRAM=1 (default off; s64 P-DRAWVRAM, port/reports/s64-p-drawvram.md): a draw's
+// read-only guest buffer elements bind kept snapshots (ShaderResources::PrepareDrawBindings, the
+// recorder's draw snapshot cache) instead of their host import. The floor runs t1281-t1284 showed
+// the geometry passes reading through the import cost ~12 ms per present more than through
+// separate snapshot buffers in the same host memory, so the gain is not video memory but the
+// import binding. APS5_DRAW_VRAM_MIN_KIB (default 0) keeps smaller elements in place;
+// APS5_DRAW_VRAM_ENTRIES and APS5_DRAW_VRAM_MIB bound the storage snapshot cache (default
+// Recorder::DrawSnapshotEntries, DrawSnapshotBudget). The [draw-vram] line (APS5_PROFILE_DRAW)
+// counts the uses by element size, the misses by reason and the evictions.
+struct DrawVramSettings {
+    unsigned mode = 0;
+    std::size_t minBytes = 0;
+    std::size_t entries = 0;
+    std::size_t budget = 0;
+};
+// The settings from the variables' values (any may be null): mode 0 while the first is unset or 0.
+DrawVramSettings DrawVramSettingsFrom(const char* mode, const char* minKib, const char* entries, const char* mib);
+const DrawVramSettings& DrawVram();
+// Whether an element of `bytes` binds a snapshot under the settings.
+inline bool DrawVramSnapshot(const DrawVramSettings& settings, std::size_t bytes) {
+    return settings.mode != 0 && bytes >= settings.minBytes;
+}
+// A snapshot use: `bytes` the element's, `hit` a kept snapshot served it, else `stale` (a kept one
+// was out of date) or none was kept. A storage snapshot evicted for the cache's bounds.
+void NoteDrawVramUse(std::size_t bytes, bool hit, bool stale) noexcept;
+void NoteDrawVramEviction() noexcept;
+// The [draw-vram] line, reset each call; empty while the switch is off.
+std::string DrawVramReport();
+
 // Records a whole-range buffer copy.
 void CopyBuffer(const Context& context, VkCommandBuffer commands, VkBuffer source, VkDeviceSize sourceOffset, VkBuffer destination, VkDeviceSize destinationOffset, VkDeviceSize bytes);
 

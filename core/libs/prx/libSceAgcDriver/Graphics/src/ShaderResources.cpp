@@ -4288,6 +4288,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     ScratchLease<InPlaceReadsScratch> scratch;
     const auto reads = guestMemory.InPlaceReads(scratch->reads);
     const bool inPlace = InPlaceBindings();
+    const auto& drawVram = DrawVram();
+    static const bool profileDraw = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     // APS5_DRAW_MEMOS=1 (s4-plan S4.2): moved elements find their imports through the thread's memo;
     // recordDraw (Draw, DrawWithRecipe) runs under GuestMemory::GpuMutex, as HostImportMemoized requires.
     // The repeat path (APS5_DRAW_REPEAT, default on) likewise.
@@ -4346,10 +4348,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         // In place (InPlaceBindings): an unmoved element stays bound as built; a moved one binds its
         // import at the draw's offset, which must sit on the storage buffer offset alignment as the
         // built one does (the adjustment is the object's: part of the key). Else a snapshot.
-        if (inPlace && !moved) continue;
+        // APS5_DRAW_VRAM: an element of the switch's sizes binds a kept snapshot either way.
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(size) + item.adjustment;
-        if (inPlace) {
+        const bool drawVramSnapshot = DrawVramSnapshot(drawVram, bytes);
+        if (inPlace && !moved && !drawVramSnapshot) continue;
+        if (inPlace && !drawVramSnapshot) {
             const auto* import = memoizedImports ? HostImportMemoized(context, begin, bytes) : HostImportFor(context, begin, bytes);
             if (import != nullptr && (begin - import->base) % context.limits.minStorageBufferOffsetAlignment == 0) {
                 select(index, {import->buffer, begin - import->base, bytes});
@@ -4364,8 +4368,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         const auto generation = GuestMemory::CollectWrites(begin, bytes);
-        auto buffer = recorder.ReusableDrawSnapshot(begin, bytes);
+        bool stale = false;
+        auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, &stale);
         const bool reused = buffer != nullptr;
+        if (drawVramSnapshot && profileDraw) NoteDrawVramUse(bytes, reused, stale);
         if (buffer == nullptr) {
             buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, GpuReadHostProperties());
             std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);

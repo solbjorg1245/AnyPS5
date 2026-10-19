@@ -1,6 +1,7 @@
 #include "GraphicsTests.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageMemoryPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -68,4 +69,18 @@ void RunImageMemoryPoolTests() {
     require(VramFloorPartsFrom(nullptr, "3") == 0 && VramFloorPartsFrom("0", nullptr) == 0 && VramFloorPartsFrom("", "1") == 0, "vram floor off");
     require(VramFloorPartsFrom("1", nullptr) == AgcDriver::Graphics::VramFloorAll && VramFloorPartsFrom("1", "") == AgcDriver::Graphics::VramFloorAll, "vram floor all parts");
     require(VramFloorPartsFrom("1", "5") == 5u && VramFloorPartsFrom("1", "0x8") == 8u && VramFloorPartsFrom("1", "0x30") == 0u, "vram floor parts mask");
+
+    // APS5_DRAW_VRAM's settings (Resources.hpp): off unless set and not 0; the snapshot cache's
+    // bounds default to the recorder's, a size floor keeps smaller elements in place.
+    using AgcDriver::Graphics::DrawVramSettingsFrom;
+    using AgcDriver::Graphics::DrawVramSnapshot;
+    const auto off = DrawVramSettingsFrom(nullptr, "4", nullptr, nullptr);
+    require(off.mode == 0 && DrawVramSettingsFrom("0", nullptr, nullptr, nullptr).mode == 0 && DrawVramSettingsFrom("", nullptr, nullptr, nullptr).mode == 0 && !DrawVramSnapshot(off, 1u << 20u), "draw vram off");
+    const auto defaults = DrawVramSettingsFrom("1", nullptr, nullptr, nullptr);
+    require(defaults.mode == 1 && defaults.minBytes == 0 && defaults.entries == AgcDriver::Graphics::Recorder::DrawSnapshotEntries && defaults.budget == AgcDriver::Graphics::Recorder::DrawSnapshotBudget && DrawVramSnapshot(defaults, 16), "draw vram defaults");
+    const auto bounded = DrawVramSettingsFrom("1", "64", "4096", "512");
+    require(bounded.minBytes == 65536 && bounded.entries == 4096 && bounded.budget == (std::size_t{512} << 20u), "draw vram bounds");
+    require(!DrawVramSnapshot(bounded, 65535) && DrawVramSnapshot(bounded, 65536), "draw vram size floor");
+    const auto garbage = DrawVramSettingsFrom("1", "x", "0", "");
+    require(garbage.minBytes == 0 && garbage.entries == 1 && garbage.budget == AgcDriver::Graphics::Recorder::DrawSnapshotBudget, "draw vram unparsable values");
 }

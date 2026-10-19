@@ -442,7 +442,8 @@ public:
     static constexpr std::size_t DrawSnapshotEntries = 1024;
     static constexpr std::size_t DrawInputBudget = std::size_t{1024} << 20u;
     static constexpr std::size_t DrawInputEntries = 16384;
-    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr);
+    // `stale`, when given, tells a kept snapshot that was out of date (dropped) from none kept.
+    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, bool* stale = nullptr);
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
     void OnComplete(std::function<void()> action);
     // APS5_LATE_LAND_CHECK (GuestMemory::CheckLateLand): a GPU store into the import decided at
