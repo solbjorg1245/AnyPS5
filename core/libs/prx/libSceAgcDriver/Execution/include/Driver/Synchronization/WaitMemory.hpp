@@ -43,6 +43,11 @@ struct WaitOutcomes {
     // how many of them were then satisfied, how many gave up at the patience limit, the longest extra wait.
     std::uint64_t patientWaits = 0, patientSatisfied = 0, patientGaveUp = 0;
     double patientLongestMs = 0;
+    // APS5_WAIT_PIPE_PROGRESS (Driver::waitPipeProgress): timeouts while the recording pipe worked (an item
+    // unrecorded or recorded after the last packet progress: the switch would have restarted the timeout),
+    // and the waits the switch kept past the old rule's timeout, the longest of those waits past that point.
+    std::uint64_t timedOutPipeBusy = 0, pipeHeld = 0;
+    double pipeHeldLongestMs = 0;
 };
 
 struct EpochBumps {

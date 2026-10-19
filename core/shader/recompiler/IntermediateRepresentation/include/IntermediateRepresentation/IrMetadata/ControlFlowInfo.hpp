@@ -39,6 +39,15 @@ struct DescriptorSource {
         // The key is a loop counter: the loop samples every entry from its start up to its count,
         // so no entry inside `entryLimit` is one the draw leaves unselected.
         bool loopKey = false;
+        // The key is v_readfirstlane of a per-lane value (a waterfall loop: Demon's Souls' particle
+        // passes pick a 3D texture per force volume from a T# table behind an SRT pointer). When
+        // the value is a record read (`materialRecords`), the records' keys are mapped; else, with
+        // APS5_LOOP_TABLE_RUN=2 only, the table spans the bindless slots (RuntimeKeySpan).
+        bool runtimeKey = false;
+        // The material is `materialRecords` records behind a raw 64-bit address (materialSource is
+        // a GetAddressResource): a waterfall key's records, read at `i * selectorStride +
+        // selectorOffset`. 0: the material is a V# (its size bounds the records).
+        std::uint32_t materialRecords = 0;
 
         bool operator==(const IndirectImage& other) const = default;
     };

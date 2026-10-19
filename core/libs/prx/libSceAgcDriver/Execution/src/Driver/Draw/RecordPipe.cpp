@@ -522,6 +522,14 @@ void NoteRecordPipeIdle(std::uint64_t ns) {
     queueZeroIdleNs.fetch_add(ns, std::memory_order_relaxed);
 }
 
+RecordPipeProgress RecordPipeProgressNow() {
+    if (!RecordPipeActive()) return {};
+    auto& pipe = recordPipe();
+    // consumed first: handed, read after it, is never behind it.
+    const auto consumed = pipe.ring.consumed.load(std::memory_order_acquire);
+    return {pipe.ring.handed.load(std::memory_order_acquire), consumed};
+}
+
 bool RecordPipeDispatchActive() {
     static const bool active = [] {
         const char* value = std::getenv("APS5_RECORD_PIPE_DISPATCH");

@@ -4769,7 +4769,10 @@ void sharedViewFineTrackingTests() {
     Require(collect(true) == 0, "an armed range nobody wrote reported writes");
     guest[3 * part + 5] = 1;
     Require(collect(true) == 0xf, "a store into a coarse view page did not report the whole page");
+    // CoarseWriteView (APS5_FIX_CORNER's snapshot key): a view page is coarse until TrackParts, any address in it.
+    Require(GuestArena::GuestArenaCoarseWriteView_nid_postfix(base + 2 * part + 7) && GuestArena::GuestArenaCoarseWriteView_nid_postfix(base + viewPage), "a shared view page not yet made fine was not coarse");
     Require(GuestArena::GuestArenaTrackWriteParts_nid_postfix(base, part) == 1, "the first view page was not made fine");
+    Require(!GuestArena::GuestArenaCoarseWriteView_nid_postfix(base + 3 * part) && GuestArena::GuestArenaCoarseWriteView_nid_postfix(base + viewPage), "making one view page fine did not end its coarse tracking alone");
     Require(GuestArena::GuestArenaTrackWriteParts_nid_postfix(base, viewPage) == 0, "a fine view page was made fine again");
     Require(collect(true) == 0, "making an armed, unwritten view page fine reported writes");
     guest[3 * part + 5] = 2;

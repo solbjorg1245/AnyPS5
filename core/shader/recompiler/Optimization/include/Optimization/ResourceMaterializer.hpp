@@ -92,6 +92,29 @@ public:
     // `limit`: the largest such span, at least 1; 0 when even one slot each does not fit. A span
     // at or above every table's slots cuts nothing.
     static std::uint32_t LoopTableSpan(std::uint32_t fixedSlots, const std::vector<std::uint32_t>& loopSlots, std::uint32_t limit);
+    // Whether a T# table behind a raw address keyed by v_readfirstlane of a per-lane value (a
+    // waterfall loop) binds through the records the key is read from, every key they hold mapped
+    // (APS5_LOOP_TABLE_RUN, default on; =0 fails the dispatch as before: "GetImageResource dword 0
+    // is not a valid runtime value").
+    static bool RuntimeKeyTables();
+    // APS5_LOOP_TABLE_RUN=2 only: a waterfall key that is no record read spans the bindless slots
+    // (inexact: a key past the span samples zeros; the valid T#s just past it are counted).
+    static bool RuntimeKeySpan();
+    struct RuntimeKeyCounts {
+        // Tables keyed through their records (every key a record holds mapped: exact), and the
+        // distinct keys mapped.
+        std::uint64_t probed = 0;
+        std::uint64_t keys = 0;
+        // Tables whose key is no record read: they span the bindless slots, and the valid T#s just
+        // past the span are counted (keys no slot maps; 0 = every texture the table holds bound).
+        std::uint64_t spanned = 0;
+        std::uint64_t pastSpan = 0;
+
+        bool operator==(const RuntimeKeyCounts& other) const = default;
+    };
+    // The runtime-key tables resolved since the last call. Also on the [bindless] line
+    // (APS5_PROFILE_DRAW).
+    static RuntimeKeyCounts TakeRuntimeKeyTables();
     // The elements bound as null for `reason` since the last call (the APS5_PROFILE_DRAW digest).
     static std::uint64_t TakeNullBound(NullBoundImage reason);
 };

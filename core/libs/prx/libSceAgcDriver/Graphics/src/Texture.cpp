@@ -106,6 +106,20 @@ std::size_t traceEdgeFine(const char* when, const GuestTextureResource& descript
     return made;
 }
 std::array<std::atomic<std::uint64_t>, 5> edgeCauses{};
+// APS5_FIX_CORNER (default on; =0 = the old merge): an edge block's surface pages the CPU stamped
+// take the results when their view page was still tracked per 16 KiB at the layer's upload and
+// their bytes still equal the ones read then: the stamp was the view page's, from a CPU store into
+// the data next door before TrackEdgeParts made it fine (a Bink plane's first merge: the intro
+// movie's bottom-right rectangle). A CPU store of the very same bytes is taken for no store.
+bool fixCorner() {
+    static const bool on = [] {
+        const char* value = std::getenv("APS5_FIX_CORNER");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return on;
+}
+std::atomic<std::uint64_t> edgeUnchangedPages{0};
+std::atomic<std::uint64_t> edgeSnapshotsRead{0};
 // Images stored by a FlushPending after a hook skip of theirs (AccessKeptByCpu), of which by the
 // hook for the read site of the last skip; images evictStale dropped (the [hooksync] and [storage] lines).
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
@@ -354,7 +368,10 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
-    std::fprintf(stderr, "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu, edge blocks to the CPU %llu (cpu pages %llu, driver pages %llu, driver whole %llu, unknown %llu), edge blocks merged per page %llu (GPU pages %llu, view pages made fine %llu, at creation %llu)%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), take(edgeBlocksToCpu), take(edgeCauses[1]), take(edgeCauses[2]), take(edgeCauses[3]), take(edgeCauses[4]), take(edgeBlocksMerged), take(edgeGpuPages), take(edgeFinePages), take(edgeFineAtCreation), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
+    // APS5_FIX_CORNER's fields: with the switch off the line keeps its old shape.
+    char corner[96] = "";
+    if (fixCorner()) std::snprintf(corner, sizeof(corner), ", unchanged CPU-stamped pages %llu, edge snapshots %llu", take(edgeUnchangedPages), take(edgeSnapshotsRead));
+    std::fprintf(stderr, "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu, edge blocks to the CPU %llu (cpu pages %llu, driver pages %llu, driver whole %llu, unknown %llu), edge blocks merged per page %llu (GPU pages %llu, view pages made fine %llu, at creation %llu%s)%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), take(edgeBlocksToCpu), take(edgeCauses[1]), take(edgeCauses[2]), take(edgeCauses[3]), take(edgeCauses[4]), take(edgeBlocksMerged), take(edgeGpuPages), take(edgeFinePages), take(edgeFineAtCreation), corner, ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
@@ -1589,6 +1606,7 @@ bool StorageTexture::Refresh() {
                 scanBlocks();
                 for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
                     if (stampedBlocks[unit] == 0) {
+                        carryEdgeSnapshot(unit, layerGeneration[unit], current);
                         layerGeneration[unit] = current;
                         continue;
                     }
@@ -1649,6 +1667,9 @@ bool StorageTexture::Refresh() {
     }
     if (unchanged) {
         ++Profile().storageReused;
+        if ((edgeSnapshotAt[0] | edgeSnapshotAt[1]) != 0) {
+            for (const int side : {0, 1}) carryEdgeSnapshot(edgeLayer(side), layerGeneration[edgeLayer(side)], current);
+        }
         layerGeneration.assign(trackedLayers, current);
         refreshGeneration();
         RecordCensus::Touch(RecordCensus::RefreshMemo);
@@ -1804,7 +1825,14 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     // A layer selection applies to the direct path alone (the others upload everything); it names
     // array layers, which the tracked layers are when there are several.
     if (layers != nullptr && ((!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; }))) layers = nullptr;
+    // APS5_FIX_CORNER: the edge bytes of the layers this upload stamps are read before the collect
+    // below (a CPU store racing it then differs from them); a side of an unselected layer keeps its
+    // snapshot and generation (a path uploading everything anyway moves the layer past it).
+    const auto snapped = fixCorner() ? snapshotEdges(layers) : 0u;
     const auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    for (const int side : {0, 1}) {
+        if ((snapped >> side & 1u) != 0) edgeSnapshotGeneration[side] = now;
+    }
     const auto stampLayers = [&](bool selectedOnly) {
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (!selectedOnly || layers == nullptr || (*layers)[layer]) layerGeneration[layer] = now;
@@ -1825,6 +1853,8 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         originalValid = false;
         forgetBorrowed(0, trackedLayers);
         stampLayers(false);
+        edgeSnapshotAt[0] = edgeSnapshotAt[1] = 0;
+        edgeSnapshotGeneration[0] = edgeSnapshotGeneration[1] = 0;
         static const bool recordClear = std::getenv("APS5_NO_RECORDED_CLEAR") == nullptr;
         auto* recorder = recordClear ? Recorder::Active() : nullptr;
         std::unique_ptr<CommandBatch> batch;
@@ -3837,6 +3867,10 @@ void StorageTexture::advanceAdjacent(const std::vector<Adjacent>& adjacent, std:
         if (begin < beforeEnd && !GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(beforeEnd - begin), seen)) continue;
         if (afterBegin < end && !GuestMemory::UnchangedSince(afterBegin, static_cast<std::size_t>(end - afterBegin), seen)) continue;
         if (trace) std::fprintf(stderr, "[flush] adjacent pending image 0x%llx+0x%llx layer %u advanced past a write-back's stamps (generation %llu -> %llu)\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), layer, static_cast<unsigned long long>(seen), static_cast<unsigned long long>(now));
+        // APS5_FIX_CORNER: unchanged outside the shared block since `seen`, so the edge bytes read at
+        // `seen` still vouch (the byte compare catches a write inside it; the Bink luma plane's store
+        // advancing the chroma plane after it).
+        texture->carryEdgeSnapshot(layer, seen, now);
         texture->layerGeneration[layer] = now;
         texture->refreshGeneration();
     }
@@ -4021,6 +4055,86 @@ void StorageTexture::storeKeys(const char* caller, const std::vector<bool>& laye
     if (outcome.stored && outcome.kept == 0) keysSeen = outcome.collected != 0 ? outcome.collected : GuestMemory::TrackerGeneration();
 }
 
+std::uint32_t StorageTexture::edgeLayer(int side) const {
+    if (side == 0 || trackedLayerBytes == 0) return 0;
+    return static_cast<std::uint32_t>(std::min<std::uint64_t>((guestBytes - 1) / trackedLayerBytes, trackedLayers - 1));
+}
+
+void StorageTexture::carryEdgeSnapshot(std::uint32_t layer, std::uint64_t from, std::uint64_t to) {
+    for (const int side : {0, 1}) {
+        if (edgeSnapshotAt[side] != 0 && edgeLayer(side) == layer && from != 0 && edgeSnapshotGeneration[side] == from) edgeSnapshotGeneration[side] = to;
+    }
+}
+
+std::uint32_t StorageTexture::snapshotEdges(const std::vector<bool>* layers, bool read) {
+    constexpr std::uint64_t viewPage = 0x4000;
+    const auto begin = descriptor.baseAddress;
+    const auto end = begin + guestBytes;
+    const std::uint64_t from[2] = {begin, std::max(end & ~(viewPage - 1), begin)};
+    const std::uint64_t to[2] = {std::min((begin + viewPage - 1) & ~(viewPage - 1), end), end};
+    // The tracked layers a side's bytes lie in that `layers` selects, of how many (a side spans
+    // several when a layer is smaller than its 16 KiB).
+    const auto selection = [&](int side) {
+        if (from[side] >= to[side] || trackedLayerBytes == 0) return std::pair<std::uint64_t, std::uint64_t>{(*layers)[edgeLayer(side)] ? 1u : 0u, 1u};
+        const auto first = std::min<std::uint64_t>(trackedLayers - 1, (from[side] - begin) / trackedLayerBytes);
+        const auto last = std::min<std::uint64_t>(trackedLayers - 1, (to[side] - 1 - begin) / trackedLayerBytes);
+        std::uint64_t selected = 0;
+        for (auto layer = first; layer <= last; ++layer) selected += (*layers)[static_cast<std::size_t>(layer)] ? 1u : 0u;
+        return std::pair<std::uint64_t, std::uint64_t>{selected, last - first + 1};
+    };
+    std::uint32_t snapped = 0;
+    for (int side = 0; side < 2; ++side) {
+        const auto [selected, spanned] = layers != nullptr ? selection(side) : std::pair<std::uint64_t, std::uint64_t>{1, 1};
+        if (selected == 0) continue;
+        edgeSnapshotAt[side] = 0;
+        edgeSnapshotGeneration[side] = 0;
+        if (!read || selected != spanned) {
+            std::vector<std::byte>().swap(edgeSnapshot[side]);
+            continue;
+        }
+        // A side on a view page boundary shares no page; a surface inside one view page has one side.
+        // Only a view page still tracked per 16 KiB stamps the surface for its neighbours' stores (a
+        // fine one, plain memory and fine tracking off read nothing: most uploads stop here).
+        if ((side == 0 ? begin : end) % viewPage == 0 || from[side] >= to[side] || (side == 1 && edgeSnapshotAt[0] != 0 && from[1] < to[0]) || !GuestMemory::CoarseViewPage(from[side])) {
+            std::vector<std::byte>().swap(edgeSnapshot[side]);
+            continue;
+        }
+        // Read in place, no flush (the refresh flushed the surface; GPU stores landing later differ),
+        // and only where every byte is readable (else nothing is vouched for).
+        const auto bytes = static_cast<std::size_t>(to[side] - from[side]);
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(from[side]), bytes)) {
+            std::vector<std::byte>().swap(edgeSnapshot[side]);
+            continue;
+        }
+        edgeSnapshot[side].resize(bytes);
+        std::memcpy(edgeSnapshot[side].data(), reinterpret_cast<const void*>(from[side]), bytes);
+        edgeSnapshotAt[side] = from[side];
+        snapped |= 1u << side;
+        edgeSnapshotsRead.fetch_add(1, std::memory_order_relaxed);
+    }
+    return snapped;
+}
+
+std::uint32_t StorageTexture::unchangedEdgePages(std::uint64_t block, std::uint32_t pages, std::uint64_t generation) const {
+    constexpr std::uint64_t page = GuestMemory::UnstoredPageBytes;
+    std::uint32_t unchanged = 0;
+    for (std::uint32_t p = 0; p < 32; ++p) {
+        if ((pages >> p & 1u) == 0) continue;
+        const auto from = std::max(block + p * page, descriptor.baseAddress);
+        const auto to = std::min(block + (p + 1) * page, descriptor.baseAddress + guestBytes);
+        if (from >= to) continue;
+        for (int side = 0; side < 2; ++side) {
+            const auto at = edgeSnapshotAt[side];
+            if (at == 0 || from < at || to > at + edgeSnapshot[side].size()) continue;
+            if (generation == 0 || edgeSnapshotGeneration[side] != generation) break;
+            // No flush: pending GPU stores into the page are this image's own results or differ.
+            if (GuestMemory::EqualsCommittedUnsynced(from, std::span<const std::byte>(edgeSnapshot[side]).subspan(static_cast<std::size_t>(from - at), static_cast<std::size_t>(to - from)))) unchanged |= 1u << p;
+            break;
+        }
+    }
+    return unchanged;
+}
+
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     // The crash report's store ring names this image for every store below (texels and keys), the
@@ -4100,26 +4214,33 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                 // re-upload with the layer, which keeps its generation as for a kept block).
                 auto cause = GuestMemory::PageStoreCause::None;
                 std::uint32_t cpuPages = 0, driverPages = 0;
-                const auto gpuPages = GuestMemory::PagesUnstoredSince(from, static_cast<std::size_t>(to - from), layerGeneration[layer], &cause, &cpuPages, &driverPages);
+                auto gpuPages = GuestMemory::PagesUnstoredSince(from, static_cast<std::size_t>(to - from), layerGeneration[layer], &cause, &cpuPages, &driverPages);
                 std::uint32_t surfacePages = 0;
                 for (auto p = (from - at) / GuestMemory::UnstoredPageBytes; p <= (to - 1 - at) / GuestMemory::UnstoredPageBytes; ++p) surfacePages |= 1u << p;
                 // CPU-stamped surface pages may be a 16 KiB shared-view stamp over the CPU data next
                 // door: from now on such pages are tracked per 4 KiB (TrackEdgeParts).
+                std::size_t madeFine = 0;
                 if (const auto cpuSurface = cpuPages & surfacePages; cpuSurface != 0) {
                     const auto low = static_cast<std::uint64_t>(std::countr_zero(cpuSurface));
                     const auto high = static_cast<std::uint64_t>(31 - std::countl_zero(cpuSurface));
                     const auto fineAt = at + low * GuestMemory::UnstoredPageBytes;
                     const auto fineBytes = (high - low + 1) * GuestMemory::UnstoredPageBytes;
-                    edgeFinePages.fetch_add(traceEdgeFine("after a merge", descriptor, guestBytes, fineAt, fineBytes, GuestMemory::TrackEdgeParts(fineAt, static_cast<std::size_t>(fineBytes))), std::memory_order_relaxed);
+                    madeFine = GuestMemory::TrackEdgeParts(fineAt, static_cast<std::size_t>(fineBytes));
+                    edgeFinePages.fetch_add(traceEdgeFine("after a merge", descriptor, guestBytes, fineAt, fineBytes, madeFine), std::memory_order_relaxed);
                 }
+                // APS5_FIX_CORNER: while the layer keeps the generation of the upload that read its edge
+                // bytes with their view page still per 16 KiB (whichever surface's merge made it fine
+                // since), CPU-stamped surface pages no driver store reached whose bytes still equal them
+                // take the results (see fixCorner). A later upload reads a fine page: nothing to vouch.
+                const auto vouched = fixCorner() && cause == GuestMemory::PageStoreCause::CpuPages ? unchangedEdgePages(at, cpuPages & surfacePages & ~driverPages & ~gpuPages, layerGeneration[layer]) : 0u;
                 // Debug aid: APS5_TRACE_EDGE_MERGE names the first 64 edge blocks whose surface pages
                 // a store record keeps from the results (block, surface pages, GPU pages, CPU and
-                // driver page masks, the layer's generation).
+                // driver page masks, the layer's generation, the pages APS5_FIX_CORNER vouches for and its snapshots).
                 static const bool traceEdge = std::getenv("APS5_TRACE_EDGE_MERGE") != nullptr;
                 static std::atomic<int> edgeTraced{0};
                 if (traceEdge) {
                     if (gpuPages != surfacePages && edgeTraced.fetch_add(1, std::memory_order_relaxed) < 64) {
-                        std::fprintf(stderr, "[edge-merge] image 0x%llx+0x%llx layer %u block 0x%llx surface %04x gpu %04x cpu %04x driver %04x cause %u generation %llu\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), layer, static_cast<unsigned long long>(at), surfacePages, gpuPages, cpuPages, driverPages, static_cast<unsigned>(cause), static_cast<unsigned long long>(layerGeneration[layer]));
+                        std::fprintf(stderr, "[edge-merge] image 0x%llx+0x%llx layer %u block 0x%llx surface %04x gpu %04x cpu %04x driver %04x cause %u generation %llu unchanged %04x (snapshots 0x%llx@%llu 0x%llx@%llu)\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), layer, static_cast<unsigned long long>(at), surfacePages, gpuPages, cpuPages, driverPages, static_cast<unsigned>(cause), static_cast<unsigned long long>(layerGeneration[layer]), vouched, static_cast<unsigned long long>(edgeSnapshotAt[0]), static_cast<unsigned long long>(edgeSnapshotGeneration[0]), static_cast<unsigned long long>(edgeSnapshotAt[1]), static_cast<unsigned long long>(edgeSnapshotGeneration[1]));
                     }
                     // APS5_TRACE_EDGE_DUMP=<dir> also saves the whole 64 KiB block's guest bytes for the
                     // first 32 such blocks whose surface pages the CPU stored to (what the CPU wrote).
@@ -4145,6 +4266,10 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                             }
                         }
                     }
+                }
+                if (vouched != 0) {
+                    gpuPages |= vouched;
+                    edgeUnchangedPages.fetch_add(static_cast<std::uint64_t>(std::popcount(vouched)), std::memory_order_relaxed);
                 }
                 if (gpuPages == 0) {
                     edgeBlocksToCpu.fetch_add(1, std::memory_order_relaxed);
@@ -4206,15 +4331,32 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     std::vector<ShadowedRange> shadowed;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> imported;
     const HostImport* shadowImport = nullptr;
-    const auto settle = [&](bool memoizedCollect) {
+    const auto settle = [&](bool memoizedCollect, bool landed = true) {
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (layers[layer]) layerPending[layer] = false;
         }
         const bool allKept = std::none_of(skippedLayer.begin(), skippedLayer.end(), [](bool kept) { return kept; });
         if (allKept || !adjacent.empty()) {
+            // APS5_FIX_CORNER: the re-stamped layers' edge bytes (what was just stored) are read again
+            // before the collect, as an upload reads them (a Bink plane stored whole before the first
+            // frame whose table store stamps its edge pages through the shared view page). A store
+            // into a host import lands when its batch runs: read now, the bytes would be the old ones
+            // (t1193's luma head), so those sides are dropped and vouch for nothing until an upload.
+            // A skipped layer keeps its old generation and snapshot: its edge block is BlockWritten, so the
+            // next Refresh sees the same 64 KiB stamp and re-uploads it (new generation, new snapshot)
+            // before any later merge can vouch with it.
+            std::uint32_t snapped = 0;
+            if (fixCorner()) {
+                std::vector<bool> restamped(trackedLayers, false);
+                for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) restamped[layer] = layers[layer] && !skippedLayer[layer];
+                snapped = snapshotEdges(&restamped, landed);
+            }
             const auto now = memoizedCollect ? GuestMemory::CollectWrites(firstStored, static_cast<std::size_t>(lastStored - firstStored)) : GuestMemory::CollectWritesUncached(firstStored, static_cast<std::size_t>(lastStored - firstStored));
             for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
                 if (layers[layer] && !skippedLayer[layer]) layerGeneration[layer] = now;
+            }
+            for (const int side : {0, 1}) {
+                if ((snapped >> side & 1u) != 0) edgeSnapshotGeneration[side] = now;
             }
             refreshGeneration();
             advanceAdjacent(adjacent, now, firstBlock, lastBlock);
@@ -4257,7 +4399,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             storeKeys("block write-back", layers);
             uploadedKeys = DccKeys::Uncompressed;
             for (const auto& [from, to] : keep) GuestMemory::MarkWritten(from, static_cast<std::size_t>(to - from));
-            settle(true);
+            settle(true, Recorder::Active() == nullptr);
             ++Profile().storageDirectWriteBacks;
             return;
         }
@@ -4400,7 +4542,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         // The walk covers this surface's pages only: an adjacent image's later CPU write is stamped
         // newer than this value when its own range is collected. No CPU wrote the pages here
         // (MarkWritten made the only stamps), so the memoized collect is exact.
-        settle(true);
+        settle(true, batch != nullptr);
         ++Profile().storageDirectWriteBacks;
         return;
     }
