@@ -34,6 +34,14 @@ void setEnvironment(const char* name, const std::string& value) {
 #endif
 }
 
+void unsetEnvironment(const char* name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
+
 struct Target {
     std::array<std::uint32_t, 2> capabilities{1u, 61u};
     std::array<std::string_view, 1> extensions{"SPV_KHR_storage_buffer_storage_class"};
@@ -163,9 +171,23 @@ void verifyRoundTrip() {
     }
 }
 
-// The format 1 form of a line: the k1 tag and no checksum.
+// The format 1 form of a line: the k1 tag, no inputs digest and no checksum.
 std::string legacyLine(const std::string& line) {
-    return "k1" + line.substr(2, line.rfind(" ~") - 2);
+    const auto entryEnd = line.find(' ', 3);
+    const auto digestEnd = line.find(' ', entryEnd + 1);
+    return "k1" + line.substr(2, entryEnd - 2) + line.substr(digestEnd, line.rfind(" ~") - digestEnd);
+}
+
+// A line body with its checksum (ShaderKeyList.cpp's ChecksumSeed).
+std::string seal(const std::string& body) {
+    char checksum[24];
+    std::snprintf(checksum, sizeof(checksum), " ~%016llx", static_cast<unsigned long long>(HashBytes(std::as_bytes(std::span(body.data(), body.size())), 0x6b65796c69737403ull)));
+    return body + checksum;
+}
+
+// The format 2 form of a line: the k2 tag, a checksum and no inputs digest.
+std::string sealedLine(const std::string& line) {
+    return seal("k2" + legacyLine(line).substr(2));
 }
 
 // Values that index, size an allocation or divide later must not get past Decode.
@@ -232,7 +254,7 @@ void verifyHostile() {
     // A count of list entries larger than the tokens that follow.
     KeyList::Record decoded;
     auto line = KeyList::Encode([&] { auto r = base; r.entry = "0123456789abcdef0123456789abcdef.bin"; return r; }());
-    line = "k1" + line.substr(2, line.rfind(" ~") - 2) + " ffffffffffffffff";
+    line = legacyLine(line) + " ffffffffffffffff";
     require(!KeyList::Decode(line, decoded), "a record with a trailing huge value decodes");
     // The list reader leaves out oversized lines and records beyond the limit.
     const auto path = std::filesystem::temp_directory_path() / "aps5-shader-key-list-hostile.txt";
@@ -270,11 +292,22 @@ void verifyRejects() {
     record.entry = "0123456789abcdef0123456789abcdef.bin";
     const auto sealed = KeyList::Encode(record);
     KeyList::Record decoded;
-    require(sealed.compare(0, 3, "k2 ") == 0 && KeyList::Decode(sealed, decoded), "a format 2 line does not decode");
+    require(sealed.compare(0, 3, "k3 ") == 0 && KeyList::Decode(sealed, decoded), "a format 3 line does not decode");
+    // Format 3 carries the inputs digest after the entry name; format 2 lines (no digest) still decode.
+    auto digested = record;
+    digested.inputDigest = 0x0123456789abcdefull;
+    const auto withDigest = KeyList::Encode(digested);
+    require(KeyList::Decode(withDigest, decoded) && decoded.inputDigest == digested.inputDigest && KeyList::Encode(decoded) == withDigest, "the inputs digest does not round-trip");
+    require(KeyList::Decode(sealedLine(withDigest), decoded) && decoded.inputDigest == 0 && KeyList::Encode(decoded) == sealed, "a format 2 line does not decode to the record without a digest");
+    const auto body = withDigest.substr(0, withDigest.rfind(" ~"));
+    const auto digestStart = body.find(' ', 3) + 1;
+    require(!KeyList::Decode(seal(body.substr(0, digestStart) + "zz" + body.substr(body.find(' ', digestStart))), decoded), "a non-hex inputs digest decodes");
+    require(!KeyList::Decode(seal("k3" + legacyLine(withDigest).substr(2)), decoded), "a format 3 line without its digest decodes");
+    require(KeyList::Decode(sealed, decoded), "the format 3 line does not decode again");
     require(record.codeAddress == 0x1234500u && decoded.codeAddress == record.codeAddress, "the record carries the code address");
     // A cut line never decodes: the checksum, or a value before it.
     require(!KeyList::Decode(sealed.substr(0, sealed.size() - 1), decoded), "a line missing its checksum's last digit decodes");
-    require(!KeyList::Decode(sealed.substr(0, sealed.rfind(" ~")), decoded), "a format 2 line without its checksum decodes");
+    require(!KeyList::Decode(sealed.substr(0, sealed.rfind(" ~")), decoded), "a format 3 line without its checksum decodes");
     auto cut = sealed;
     cut.erase(cut.rfind(" ~") - 1, 1);
     require(!KeyList::Decode(cut, decoded), "a line whose last value lost a digit decodes");
@@ -282,7 +315,7 @@ void verifyRejects() {
     const auto line = legacyLine(sealed);
     require(KeyList::Decode(line, decoded) && KeyList::Encode(decoded) == sealed, "a format 1 line does not decode to the same record");
     require(!KeyList::Decode("", decoded), "an empty line decodes");
-    require(!KeyList::Decode("k3" + line.substr(2), decoded), "another format tag decodes");
+    require(!KeyList::Decode("k4" + line.substr(2), decoded), "another format tag decodes");
     require(!KeyList::Decode("k1 0123.bin" + line.substr(line.find(".bin") + 4), decoded), "a short entry name decodes");
     require(!KeyList::Decode(line.substr(0, line.rfind(' ')), decoded), "a record missing its last value decodes");
     require(!KeyList::Decode(line + " 0", decoded), "a record with an extra value decodes");
@@ -424,7 +457,8 @@ struct ComputeRequest {
 };
 
 // A real recompile records its key; the record, rebuilt over the same code and target, finds the
-// entry present, and once the entry is gone compiles it again to the recorded SPIR-V.
+// entry present, and once the entry is gone compiles it again to the recorded SPIR-V. A record of
+// another build (another entry name) is stored by its inputs digest, and one without a digest is not.
 void verifyRecordAndPrecompile(const std::filesystem::path& keys) {
     // The list ends in a cut line (a recorder killed mid-write): the first record starts a line of its own.
     {
@@ -443,8 +477,9 @@ void verifyRecordAndPrecompile(const std::filesystem::path& keys) {
     require(record.code == KeyList::IdentifyCode(compute.code) && record.locatorPath.empty(), "the recorded code identity is wrong");
     KeyList::RebuiltRequest rebuilt;
     KeyList::Rebuild(record, compute.code, compute.request.target, rebuilt);
+    require(record.inputDigest != 0 && record.inputDigest == ShaderDiskCache::InputDigest(rebuilt.request, record.specialization), "the record does not carry the rebuilt request's inputs digest");
     auto outcome = KeyList::Precompile(record, rebuilt, false);
-    require(outcome.status == KeyList::PrecompileStatus::Present && outcome.entry == record.entry, "the precompile does not find the recorded entry present");
+    require(outcome.status == KeyList::PrecompileStatus::Present && outcome.entry == record.entry && outcome.inputDigest == record.inputDigest, "the precompile does not find the recorded entry present");
     const auto entryFile = ShaderDiskCache::EntryDirectory() / record.entry;
     std::filesystem::remove(entryFile);
     // Other SPIR-V under the recording's entry name is never stored.
@@ -453,9 +488,10 @@ void verifyRecordAndPrecompile(const std::filesystem::path& keys) {
     outcome = KeyList::Precompile(changed, rebuilt, true);
     ShaderDiskCache::Flush();
     require(outcome.status == KeyList::PrecompileStatus::Diverged && !std::filesystem::exists(entryFile), "a diverged variant was stored");
-    // Another entry name than the recording's cannot be compared: skipped, or stored when asked to.
+    // Neither the recording's entry name nor its inputs digest: skipped, or stored when asked to.
     changed = record;
     changed.entry = "ffffffffffffffffffffffffffffffff.bin";
+    changed.inputDigest ^= 1u;
     outcome = KeyList::Precompile(changed, rebuilt, false);
     ShaderDiskCache::Flush();
     require(outcome.status == KeyList::PrecompileStatus::Unverified && outcome.entry == record.entry && !std::filesystem::exists(entryFile), "an unverifiable variant was stored");
@@ -463,6 +499,18 @@ void verifyRecordAndPrecompile(const std::filesystem::path& keys) {
     ShaderDiskCache::Flush();
     require(outcome.status == KeyList::PrecompileStatus::StoredUnverified && std::filesystem::is_regular_file(entryFile), "an unverifiable variant was not stored when asked to");
     std::filesystem::remove(entryFile);
+    // A list recorded by another build (another source version: another entry name) with the inputs digest.
+    changed = record;
+    changed.entry = "ffffffffffffffffffffffffffffffff.bin";
+    outcome = KeyList::Precompile(changed, rebuilt, false);
+    ShaderDiskCache::Flush();
+    require(outcome.status == KeyList::PrecompileStatus::StoredByInputs && outcome.entry == record.entry && outcome.spirvHash == record.spirvHash && std::filesystem::is_regular_file(entryFile), "a record of another build was not stored by its inputs digest");
+    std::filesystem::remove(entryFile);
+    // The same record from a format 2 list (no digest) cannot be verified.
+    changed.inputDigest = 0;
+    outcome = KeyList::Precompile(changed, rebuilt, false);
+    ShaderDiskCache::Flush();
+    require(outcome.status == KeyList::PrecompileStatus::Unverified && !std::filesystem::exists(entryFile), "a record of another build without a digest was stored");
     outcome = KeyList::Precompile(record, rebuilt, false);
     require(outcome.status == KeyList::PrecompileStatus::Stored, "the precompile did not store the missing entry");
     require(outcome.entry == record.entry && outcome.spirvHash == record.spirvHash, "the precompile compiled other SPIR-V than the recording");
@@ -475,6 +523,124 @@ void verifyRecordAndPrecompile(const std::filesystem::path& keys) {
 
 }
 
+// The inputs digest leaves out what a key list record does not decide (the device target, the host
+// subgroup size, the source version and the switches) and keeps the rest. Its value for a fixed
+// request is pinned: a change to the request part of the disk key (CacheKey.hpp, ShaderDiskCache's
+// BuildKey) changes every digest, and shipped key lists stop verifying until they are recorded again.
+constexpr std::uint64_t PinnedDigest = 0x6ed03554c726762full;
+
+void verifyDigest() {
+    Sample sample(ShaderStage::Compute);
+    const auto digest = ShaderDiskCache::InputDigest(sample.request, sample.specialization);
+    char text[24];
+    std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(digest));
+    require(digest == PinnedDigest, std::string("the sample's inputs digest is now ") + text + ": the disk key's request part changed; record the shipped key lists again (APS5_SHADER_KEYS) and pin the new value here");
+    auto other = sample.request;
+    other.target.subgroupSize = 64;
+    other.target.maxWorkgroupInvocations = 512;
+    require(ShaderDiskCache::InputDigest(other, sample.specialization) == digest, "the device target changes the inputs digest");
+    std::vector<std::byte> key, otherKey;
+    ShaderDiskCache::BuildKey(sample.request, 32, sample.specialization, key);
+    ShaderDiskCache::BuildKey(other, 32, sample.specialization, otherKey);
+    require(key != otherKey, "the device target left the disk key");
+    other = sample.request;
+    other.context.waveSize = 32;
+    require(ShaderDiskCache::InputDigest(other, sample.specialization) != digest, "the wave size does not change the inputs digest");
+    auto specialization = sample.specialization;
+    specialization.images[0].mipCount = 4;
+    require(ShaderDiskCache::InputDigest(sample.request, specialization) != digest, "the specialization does not change the inputs digest");
+}
+
+// APS5_PRECOMPILE: a named list, the shipped list next to the program, or off; the shipped list runs
+// while the cache has no marker line for it on this context.
+void verifyShippedList(const std::filesystem::path& directory) {
+    const auto program = directory / "program dir";
+    std::filesystem::create_directories(program);
+    require(KeyList::ChooseList(nullptr, program).path.empty(), "a missing shipped list is chosen");
+    std::filesystem::create_directories(program / std::string(KeyList::ShippedListName));
+    require(KeyList::ChooseList(nullptr, program).path.empty(), "a folder named like the shipped list is chosen");
+    std::filesystem::remove(program / std::string(KeyList::ShippedListName));
+    const auto shipped = program / std::string(KeyList::ShippedListName);
+    {
+        std::ofstream file(shipped, std::ios::binary);
+        file << "# shipped\n";
+    }
+    auto choice = KeyList::ChooseList(nullptr, program);
+    require(choice.path == shipped && choice.shipped, "the shipped list next to the program is not chosen");
+    choice = KeyList::ChooseList("", program);
+    require(choice.path == shipped && choice.shipped, "an empty APS5_PRECOMPILE does not choose the shipped list");
+    require(KeyList::ChooseList("0", program).path.empty(), "APS5_PRECOMPILE=0 does not turn the precompile off");
+    choice = KeyList::ChooseList("other keys.txt", program);
+    require(choice.path == std::filesystem::path("other keys.txt") && !choice.shipped, "a named list is not chosen as before");
+    require(KeyList::ChooseList(nullptr, {}).path.empty(), "a list is chosen without a program directory");
+
+    const auto cache = directory / "marker cache" / "0123456789abcdef";
+    require(!KeyList::PrecompileDone(cache, 1, 2), "a cache without a marker is warm");
+    require(KeyList::MarkerWritable(cache), "a new cache directory is not writable");
+    require(!KeyList::PrecompileDone(cache, 1, 2), "probing the marker marked the list");
+    require(KeyList::MarkPrecompiled(cache, 1, 2), "the marker write failed");
+    require(KeyList::PrecompileDone(cache, 1, 2), "the marked list is still cold");
+    require(!KeyList::PrecompileDone(cache, 1, 3) && !KeyList::PrecompileDone(cache, 4, 2), "another list or context counts as precompiled");
+    require(KeyList::MarkPrecompiled(cache, 4, 2), "the second marker write failed");
+    require(KeyList::PrecompileDone(cache, 1, 2) && KeyList::PrecompileDone(cache, 4, 2), "a second marker line lost the first");
+
+    // A marker over its size cap counts as cold and starts again at the next mark.
+    {
+        std::ofstream file(cache / std::string(KeyList::MarkerName), std::ios::binary | std::ios::app);
+        const std::string filler(1023, 'x');
+        for (int i = 0; i < 1100; ++i) file << filler << '\n';
+    }
+    require(!KeyList::PrecompileDone(cache, 1, 2), "an oversized marker is trusted");
+    require(KeyList::MarkPrecompiled(cache, 5, 6), "the oversized marker is not written again");
+    require(std::filesystem::file_size(cache / std::string(KeyList::MarkerName)) < 1024, "the oversized marker kept growing");
+    require(KeyList::PrecompileDone(cache, 5, 6) && !KeyList::PrecompileDone(cache, 1, 2), "the rewritten marker is wrong");
+
+    // A cache directory that cannot be created is not writable, and its marker write fails.
+    const auto blocker = directory / "marker blocker";
+    std::ofstream(blocker, std::ios::binary) << "file";
+    require(!KeyList::MarkerWritable(blocker / "0123456789abcdef"), "a cache under a file counts as writable");
+    require(!KeyList::MarkPrecompiled(blocker / "0123456789abcdef", 1, 2), "a marker under a file counts as written");
+
+    Target first, second;
+    second.target.subgroupSize = 64;
+    require(ShaderDiskCache::ContextDigest(first.target) == ShaderDiskCache::ContextDigest(Target().target), "the context digest of one target changes");
+    require(ShaderDiskCache::ContextDigest(first.target) != ShaderDiskCache::ContextDigest(second.target), "the context digest does not follow the device target");
+}
+
+// tools/package_release.py (hash_bytes) hashes the shipped list as the precompile does; both must agree.
+void verifyListHash() {
+    const std::string_view sample = "k3 shader-keys sample\r\n";
+    const auto bytes = std::as_bytes(std::span(sample.data(), sample.size()));
+    require(ShaderRecompiler::HashBytes(bytes) == 0xd9d5f7fe862de207ull, "HashBytes changed: change hash_bytes in tools/package_release.py with it");
+    require(ShaderRecompiler::HashBytes({}) == 0, "HashBytes of nothing changed: change hash_bytes in tools/package_release.py with it");
+}
+
+// Only a run that a later launch cannot improve on is marked as done.
+void verifyMarkAllowed() {
+    KeyList::PrecompileTally done;
+    done.records = 1315;
+    done.codes = 702;
+    done.notFound = 3;
+    require(KeyList::MarkAllowed(done), "a finished run is not marked");
+    auto tally = done;
+    tally.cut = 1;
+    require(!KeyList::MarkAllowed(tally), "a run cut by the time budget is marked");
+    tally = done;
+    tally.failed = 1;
+    require(!KeyList::MarkAllowed(tally), "a run with a failed record is marked");
+    tally = done;
+    tally.writeFailures = 1;
+    require(!KeyList::MarkAllowed(tally), "a run with a failed cache write is marked");
+    tally = done;
+    tally.notFound = tally.codes;
+    require(!KeyList::MarkAllowed(tally), "a run that found none of the codes is marked");
+    tally = done;
+    tally.records = 0;
+    tally.codes = 0;
+    tally.notFound = 0;
+    require(!KeyList::MarkAllowed(tally), "an empty list is marked");
+}
+
 int main() {
     try {
         const auto directory = std::filesystem::temp_directory_path() / ("aps5-shader-key-list-test-" + std::to_string(std::random_device{}()));
@@ -484,6 +650,8 @@ int main() {
         setEnvironment("ANYPS5_NO_SHADER_CACHE", "0");
         setEnvironment("ANYPS5_SHADER_CACHE_DIR", (directory / "cache").string());
         setEnvironment("APS5_SHADER_KEYS", keys.string());
+        // The rule switches enter the key and so the pinned digest.
+        for (const char* name : {"APS5_NO_LEGACY_MAD_RULE", "APS5_NO_MULLIT_RULE", "APS5_CLAMP_NAN", "APS5_RAYTRACING", "APS5_NO_CODE_HASH_KEY"}) unsetEnvironment(name);
         verifyRoundTrip();
         verifyHostile();
         verifyRejects();
@@ -491,6 +659,10 @@ int main() {
         verifyListFile(directory);
         verifyScanner();
         verifyRecordAndPrecompile(keys);
+        verifyDigest();
+        verifyShippedList(directory);
+        verifyMarkAllowed();
+        verifyListHash();
         std::error_code error;
         std::filesystem::remove_all(directory, error);
         std::cout << "shader key list tests passed\n";

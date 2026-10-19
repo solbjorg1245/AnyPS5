@@ -21,9 +21,11 @@
 // byte offset) or by scanning files for the code's anchor hash.
 namespace ShaderRecompiler::ShaderKeyList {
 
-// Format 2 ("k2" lines) ends each line in a checksum, so a cut line never decodes; "k1" lines (format
-// 1, no checksum) still decode, and a list rewrite turns them into k2.
-inline constexpr std::uint32_t FormatVersion = 2;
+// Format 3 ("k3" lines) carries the record's inputs digest after the entry name, so the list verifies
+// on other builds and devices. Format 2 ("k2") and format 3 lines end in a checksum, so a cut line
+// never decodes; "k2" and "k1" lines (format 1, no checksum) still decode, and a list rewrite turns
+// them into k3.
+inline constexpr std::uint32_t FormatVersion = 3;
 // Dwords the anchor hash covers: the first AnchorDwords of the code.
 inline constexpr std::size_t AnchorDwords = 8;
 // Bounds a decoded record must keep: a code's dwords, and the user data, flat SRT and other counts.
@@ -37,6 +39,10 @@ inline constexpr std::size_t MaxRecords = 100000;
 // The locator path of the running program's own file (a port that links the game's executable into
 // its own carries that code there instead of in app0/eboot.bin).
 inline constexpr std::string_view ExecutableLocator = "@exe";
+// The list a release ships next to the program, precompiled by default (ChooseList).
+inline constexpr std::string_view ShippedListName = "shader-keys.txt";
+// The file in the shader cache's entry directory that names the lists precompiled into it (PrecompileDone).
+inline constexpr std::string_view MarkerName = "precompiled.txt";
 
 struct CodeIdentity {
     std::uint32_t dwords = 0;
@@ -63,6 +69,10 @@ struct Record {
     // device and switches rebuilds that name, and must then produce that SPIR-V.
     std::string entry;
     std::uint64_t spirvHash = 0;
+    // ShaderDiskCache::InputDigest of the recording's request: a precompile under other sources,
+    // device or switches rebuilds it when the rebuilt request is the recording's. 0: not recorded
+    // (format 1 and 2 lines).
+    std::uint64_t inputDigest = 0;
     ShaderStage stage = ShaderStage::Compute;
     // Not part of any key (it names the program in diagnostics only): Describe leaves it 0.
     std::uint64_t codeAddress = 0;
@@ -111,7 +121,7 @@ struct ListFile {
     std::size_t duplicates = 0;
     // Records left out of the list for the MaxRecords limit.
     std::size_t overLimit = 0;
-    // Records read from format 1 lines.
+    // Records read from format 1 or 2 lines.
     std::size_t legacy = 0;
 };
 [[nodiscard]] bool ReadList(const std::filesystem::path& path, ListFile& list);
@@ -156,16 +166,19 @@ private:
 // APS5_SHADER_KEYS=<file>: every variant the recompiler creates (from the disk cache or compiled)
 // appends its record to the file, once per disk cache entry name (lines already there count).
 [[nodiscard]] bool Recording();
-void Note(const RecompileRequest& request, const ResourceSnapshot& snapshot, const ResourceSpecialization& specialization, std::string_view entry, const CompiledVariant& variant);
+void Note(const RecompileRequest& request, const ResourceSnapshot& snapshot, const ResourceSpecialization& specialization, std::string_view entry, std::uint64_t inputDigest, const CompiledVariant& variant);
 [[nodiscard]] std::uint64_t Recorded();
 
 enum class PrecompileStatus {
     // Stored under the recording's entry name, with the recording's SPIR-V.
     Stored,
-    // Stored under another entry name than the recording's (another device, sources or switch set),
-    // so nothing could compare it: only with storeUnverified.
+    // Stored under another entry name than the recording's (another build, device or switch set),
+    // with the recording's inputs digest: the rebuilt request is the recording's, so the entry is
+    // the one the game asks for here, compiled as the game's own miss would compile it.
+    StoredByInputs,
+    // Stored with neither the recording's entry name nor its inputs digest: only with storeUnverified.
     StoredUnverified,
-    // Not compiled: another entry name than the recording's, without storeUnverified.
+    // Not compiled: neither the recording's entry name nor its inputs digest, without storeUnverified.
     Unverified,
     Present,
     Diverged,
@@ -176,13 +189,50 @@ struct PrecompileOutcome {
     PrecompileStatus status = PrecompileStatus::Disabled;
     std::string entry;
     std::uint64_t spirvHash = 0;
+    // The rebuilt request's inputs digest (a list rewrite adds it to records verified by entry name).
+    std::uint64_t inputDigest = 0;
 };
 
 // Compiles the variant of a rebuilt request into the disk cache unless its entry is there
 // (Recompiler.cpp: the compile the recompiler itself runs on a miss). A variant whose entry
 // name is the recording's but whose SPIR-V is not is reported Diverged and not stored; one whose
-// entry name differs from the recording's is compiled and stored only with storeUnverified.
+// entry name and inputs digest both differ from the recording's is compiled and stored only with
+// storeUnverified.
 [[nodiscard]] PrecompileOutcome Precompile(const Record& record, const RebuiltRequest& rebuilt, bool storeUnverified);
+
+// The list a launch precompiles, from APS5_PRECOMPILE: a path names that list (precompiled at every
+// launch); unset or empty, the shipped list (ShippedListName in the program's directory) when it
+// exists; "0" turns the precompile off. An empty path: no precompile.
+struct ListChoice {
+    std::filesystem::path path;
+    bool shipped = false;
+};
+[[nodiscard]] ListChoice ChooseList(const char* setting, const std::filesystem::path& programDirectory);
+
+// The shipped list is precompiled only while the cache is cold for it: until the cache's entry
+// directory holds a MarkerName line for the list (the hash of its bytes) on this cache context
+// (ShaderDiskCache::ContextDigest: device target and switch set; the directory is per source version).
+[[nodiscard]] bool PrecompileDone(const std::filesystem::path& entryDirectory, std::uint64_t listHash, std::uint64_t context);
+// Appends the list's line (a marker over its size cap starts again); false when the file cannot be written.
+[[nodiscard]] bool MarkPrecompiled(const std::filesystem::path& entryDirectory, std::uint64_t listHash, std::uint64_t context);
+// Whether the marker can be written (the directory created, the marker opened for appending): an
+// unwritable cache would lose every precompiled entry and run the precompile again at every launch.
+[[nodiscard]] bool MarkerWritable(const std::filesystem::path& entryDirectory);
+
+// What one precompile of the shipped list did, for the marker decision.
+struct PrecompileTally {
+    std::size_t records = 0;
+    std::size_t codes = 0;
+    std::size_t notFound = 0;
+    std::size_t cut = 0;
+    std::size_t failed = 0;
+    std::uint64_t writeFailures = 0;
+};
+// A run is marked only when a later run cannot do better: it went to the end (no budget cut), every
+// record compiled without an exception, every store reached the disk, and the game files held some of
+// the codes (all locators stale: another exe or dump, which a later relink or patch can fix). Records
+// left unverifiable or diverged are not retried: the next run would decide them the same way.
+[[nodiscard]] bool MarkAllowed(const PrecompileTally& tally);
 
 }
 
