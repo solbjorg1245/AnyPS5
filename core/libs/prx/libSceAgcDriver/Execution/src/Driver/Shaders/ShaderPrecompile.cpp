@@ -85,6 +85,12 @@ std::filesystem::path executablePath() {
 #endif
 }
 
+// A path for the log, as UTF-8 (string() can throw on Windows for names outside the code page).
+std::string pathText(const std::filesystem::path& path) {
+    const auto text = path.u8string();
+    return std::string(text.begin(), text.end());
+}
+
 std::filesystem::path locatorFile(const std::filesystem::path& app0, std::string_view locator) {
     return locator == KeyList::ExecutableLocator ? executablePath() : app0 / std::filesystem::path(std::string(locator));
 }
@@ -115,10 +121,30 @@ void collectFiles(const std::filesystem::path& root, std::string_view pattern, s
     }
 }
 
-// The precompile of one list (RunShaderPrecompile); throws only what it cannot handle itself.
-void precompileList(const ShaderRecompiler::SpirvTarget& target, const char* listPath, std::chrono::steady_clock::time_point started) {
+// The precompile of one list (RunShaderPrecompile); throws only what it cannot handle itself. The
+// shipped list (KeyList::ChooseList) runs only while the cache is cold for it and is never rewritten.
+void precompileList(const ShaderRecompiler::SpirvTarget& target, const std::filesystem::path& listFile, bool shipped, std::chrono::steady_clock::time_point started) {
+    const auto listText = pathText(listFile);
+    const char* listPath = listText.c_str();
+    const auto entryDirectory = ShaderRecompiler::ShaderDiskCache::EntryDirectory();
+    std::uint64_t listHash = 0, context = 0;
+    if (shipped) {
+        std::vector<std::byte> bytes;
+        std::error_code error;
+        const auto size = std::filesystem::file_size(listFile, error);
+        if (error || size > KeyList::MaxListBytes || !ShaderRecompiler::ReadWholeFile(listFile, bytes)) {
+            std::fprintf(stderr, "[precompile] cannot read %s (over %llu MiB?)\n", listPath, static_cast<unsigned long long>(KeyList::MaxListBytes >> 20u));
+            return;
+        }
+        listHash = ShaderRecompiler::HashBytes(bytes);
+        context = ShaderRecompiler::ShaderDiskCache::ContextDigest(target);
+        if (KeyList::PrecompileDone(entryDirectory, listHash, context)) {
+            std::fprintf(stderr, "[precompile] %s: precompiled into this cache before (%s), skipped in %.3f s (APS5_PRECOMPILE=0 turns the shipped list off)\n", listPath, std::string(KeyList::MarkerName).c_str(), secondsSince(started));
+            return;
+        }
+    }
     KeyList::ListFile list;
-    if (!KeyList::ReadList(listPath, list)) {
+    if (!KeyList::ReadList(listFile, list)) {
         std::fprintf(stderr, "[precompile] cannot read %s (missing, or over %llu MiB)\n", listPath, static_cast<unsigned long long>(KeyList::MaxListBytes >> 20u));
         return;
     }
@@ -216,24 +242,15 @@ void precompileList(const ShaderRecompiler::SpirvTarget& target, const char* lis
         scanSeconds = secondsSince(scanStarted);
     }
 
-    // The list gains the locators found, and format 1 lines become format 2; every other line stays
-    // as it was. APS5_PRECOMPILE_KEEP_LIST=1 leaves the file alone, and so does a recording into it.
-    bool listUpdated = false;
-    {
-        bool changed = list.legacy != 0;
-        for (std::size_t i = 0; i < records.size(); ++i) {
-            const auto& code = codes[recordCode[i]];
-            if (!code.located || code.path.empty() || (records[i].locatorPath == code.path && records[i].locatorOffset == code.offset)) continue;
-            records[i].locatorPath = code.path;
-            records[i].locatorOffset = code.offset;
-            changed = true;
-        }
-        bool recordingInto = false;
-        if (const char* keys = std::getenv("APS5_SHADER_KEYS"); keys != nullptr && *keys != '\0') {
-            std::error_code error;
-            recordingInto = std::filesystem::equivalent(keys, listPath, error) || std::string_view(keys) == listPath;
-        }
-        if (changed && !recordingInto && !switchOn("APS5_PRECOMPILE_KEEP_LIST")) listUpdated = KeyList::WriteList(listPath, list);
+    // The list gains the locators found, and format 1 and 2 lines become format 3 (written after the
+    // compile, with the inputs digests it adds); every other line stays as it was.
+    bool listChanged = list.legacy != 0;
+    for (std::size_t i = 0; i < records.size(); ++i) {
+        const auto& code = codes[recordCode[i]];
+        if (!code.located || code.path.empty() || (records[i].locatorPath == code.path && records[i].locatorOffset == code.offset)) continue;
+        records[i].locatorPath = code.path;
+        records[i].locatorOffset = code.offset;
+        listChanged = true;
     }
 
     std::vector<std::size_t> work;
@@ -252,7 +269,9 @@ void precompileList(const ShaderRecompiler::SpirvTarget& target, const char* lis
     if (const char* value = std::getenv("APS5_PRECOMPILE_BUDGET_S"); value != nullptr && *value != '\0') budgetSeconds = std::clamp(std::strtod(value, nullptr), 1.0, 86400.0);
     std::atomic<std::size_t> cut{0};
     std::atomic<std::size_t> next{0};
-    std::atomic<std::size_t> stored{0}, storedUnverified{0}, unverified{0}, present{0}, diverged{0}, failed{0}, sameEntry{0}, sameSpirv{0};
+    std::atomic<std::size_t> stored{0}, storedByInputs{0}, storedUnverified{0}, unverified{0}, present{0}, diverged{0}, failed{0}, sameEntry{0}, sameSpirv{0};
+    // The inputs digest of each record the compile verified by its entry name (for a record without one).
+    std::vector<std::uint64_t> digests(records.size(), 0);
     std::atomic<std::uint64_t> compileNs{0};
     HostMutex failureMutex;
     std::vector<std::string> failures;
@@ -273,16 +292,18 @@ void precompileList(const ShaderRecompiler::SpirvTarget& target, const char* lis
                 const auto outcome = KeyList::Precompile(record, rebuilt, storeUnverified);
                 switch (outcome.status) {
                 case KeyList::PrecompileStatus::Stored: stored.fetch_add(1, std::memory_order_relaxed); break;
+                case KeyList::PrecompileStatus::StoredByInputs: storedByInputs.fetch_add(1, std::memory_order_relaxed); break;
                 case KeyList::PrecompileStatus::StoredUnverified: storedUnverified.fetch_add(1, std::memory_order_relaxed); break;
                 case KeyList::PrecompileStatus::Unverified: unverified.fetch_add(1, std::memory_order_relaxed); break;
                 case KeyList::PrecompileStatus::Present: present.fetch_add(1, std::memory_order_relaxed); break;
                 case KeyList::PrecompileStatus::Diverged: diverged.fetch_add(1, std::memory_order_relaxed); break;
                 case KeyList::PrecompileStatus::Disabled: break;
                 }
-                if (outcome.entry == record.entry) {
+                if (outcome.entry == record.entry && outcome.status != KeyList::PrecompileStatus::Diverged) {
                     sameEntry.fetch_add(1, std::memory_order_relaxed);
-                    if (outcome.status == KeyList::PrecompileStatus::Stored && outcome.spirvHash == record.spirvHash) sameSpirv.fetch_add(1, std::memory_order_relaxed);
+                    digests[work[item]] = outcome.inputDigest;
                 }
+                if ((outcome.status == KeyList::PrecompileStatus::Stored || outcome.status == KeyList::PrecompileStatus::StoredByInputs) && outcome.spirvHash == record.spirvHash) sameSpirv.fetch_add(1, std::memory_order_relaxed);
             } catch (const std::exception& error) {
                 failed.fetch_add(1, std::memory_order_relaxed);
                 std::lock_guard lock(failureMutex);
@@ -302,6 +323,24 @@ void precompileList(const ShaderRecompiler::SpirvTarget& target, const char* lis
     ShaderRecompiler::ShaderDiskCache::Flush();
     const auto compileSeconds = secondsSince(compileStarted);
 
+    // Records verified by their entry name gain their inputs digest, so the list verifies on later builds.
+    std::size_t digestsAdded = 0;
+    for (std::size_t i = 0; i < records.size(); ++i) {
+        if (records[i].inputDigest != 0 || digests[i] == 0) continue;
+        records[i].inputDigest = digests[i];
+        ++digestsAdded;
+    }
+    // APS5_PRECOMPILE_KEEP_LIST=1 leaves the file alone, and so do a recording into it and the shipped list.
+    bool listUpdated = false;
+    if (listChanged || digestsAdded != 0) {
+        bool recordingInto = false;
+        if (const char* keys = std::getenv("APS5_SHADER_KEYS"); keys != nullptr && *keys != '\0') {
+            std::error_code error;
+            recordingInto = std::filesystem::equivalent(keys, listFile, error) || std::filesystem::path(keys) == listFile;
+        }
+        if (!shipped && !recordingInto && !switchOn("APS5_PRECOMPILE_KEEP_LIST")) listUpdated = KeyList::WriteList(listFile, list);
+    }
+
     std::size_t notFound = 0;
     for (const auto& code : codes) {
         if (!code.located) ++notFound;
@@ -310,10 +349,15 @@ void precompileList(const ShaderRecompiler::SpirvTarget& target, const char* lis
     if (cut.load() != 0) std::fprintf(stderr, "[precompile] time budget of %.0f s reached (APS5_PRECOMPILE_BUDGET_S): %zu of %zu variants left to the on-demand compile\n", budgetSeconds, cut.load(), work.size());
     if (list.overLimit != 0) std::fprintf(stderr, "[precompile] %zu records beyond the %zu-record limit left out\n", list.overLimit, KeyList::MaxRecords);
     if (diverged.load() != 0) std::fprintf(stderr, "[precompile] %zu variants compiled to other SPIR-V than the recording under the same entry name: not stored (the rebuilt request misses an input)\n", diverged.load());
-    if (unverified.load() != 0) std::fprintf(stderr, "[precompile] %zu variants have other entry names than the recording (another device, sources or switch set): not compiled (APS5_PRECOMPILE_UNVERIFIED=1 stores them unverified)\n", unverified.load());
-    std::fprintf(stderr, "[precompile] %s: %zu records (%zu unreadable or oversized lines, %zu duplicates, %zu format 1), %zu codes: %zu by locator (%zu stale), %zu by scan (%zu files, %.1f MiB, %.1f s), %zu not found%s; %zu compiled (%zu unverified), %zu present, %zu diverged, %zu unverifiable skipped, %zu failed in %.1f s on %u threads (%.1f s compiling); %zu entry names as recorded, %zu with the recorded SPIR-V; total %.1f s\n",
-                 listPath, records.size(), list.unreadable, list.duplicates, list.legacy, codes.size(), byLocator, staleLocators, byScan, scannedFiles, static_cast<double>(scannedBytes) / (1024.0 * 1024.0), scanSeconds, notFound, listUpdated ? ", list rewritten with the locators" : "",
-                 stored.load() + storedUnverified.load(), storedUnverified.load(), present.load(), diverged.load(), unverified.load(), failed.load(), compileSeconds, threads, static_cast<double>(compileNs.load()) / 1e9, sameEntry.load(), sameSpirv.load(), secondsSince(started));
+    if (unverified.load() != 0) std::fprintf(stderr, "[precompile] %zu variants have neither the recording's entry name nor its inputs digest (a format 1 or 2 record from another build, device or switch set): not compiled (APS5_PRECOMPILE_UNVERIFIED=1 stores them unverified)\n", unverified.load());
+    if (!work.empty() && stored.load() + storedByInputs.load() + present.load() == 0) std::fprintf(stderr, "[precompile] WARNING: no record of %s verified on this build and device (%zu unverifiable, %zu diverged, %zu failed): record the list again (APS5_SHADER_KEYS)\n", listPath, unverified.load(), diverged.load(), failed.load());
+    if (!codes.empty() && notFound == codes.size()) std::fprintf(stderr, "[precompile] WARNING: none of the %zu codes of %s is in the game files at its locator (another game version? APS5_PRECOMPILE_SCAN searches for them)\n", codes.size(), listPath);
+    std::fprintf(stderr, "[precompile] %s%s: %zu records (%zu unreadable or oversized lines, %zu duplicates, %zu format 1 or 2), %zu codes: %zu by locator (%zu stale), %zu by scan (%zu files, %.1f MiB, %.1f s), %zu not found%s; %zu compiled (%zu by inputs digest, %zu unverified), %zu present, %zu diverged, %zu unverifiable skipped, %zu failed in %.1f s on %u threads (%.1f s compiling); %zu entry names as recorded, %zu stored with the recorded SPIR-V; total %.1f s\n",
+                 listPath, shipped ? " (shipped)" : "", records.size(), list.unreadable, list.duplicates, list.legacy, codes.size(), byLocator, staleLocators, byScan, scannedFiles, static_cast<double>(scannedBytes) / (1024.0 * 1024.0), scanSeconds, notFound, listUpdated ? ", list rewritten" : "",
+                 stored.load() + storedByInputs.load() + storedUnverified.load(), storedByInputs.load(), storedUnverified.load(), present.load(), diverged.load(), unverified.load(), failed.load(), compileSeconds, threads, static_cast<double>(compileNs.load()) / 1e9, sameEntry.load(), sameSpirv.load(), secondsSince(started));
+    if (listUpdated && digestsAdded != 0) std::fprintf(stderr, "[precompile] %s: %zu inputs digests added (format 3)\n", listPath, digestsAdded);
+    // The shipped list is done for this cache once it ran to the end (a budget cut leaves it cold).
+    if (shipped && cut.load() == 0) KeyList::MarkPrecompiled(entryDirectory, listHash, context);
 }
 
 }
@@ -329,8 +373,11 @@ void RunShaderPrecompile(const ShaderRecompiler::SpirvTarget& target) {
             std::this_thread::sleep_for(std::chrono::milliseconds(ms));
         }
     }
-    const char* listPath = std::getenv("APS5_PRECOMPILE");
-    if (listPath == nullptr || *listPath == '\0' || ran.exchange(true)) return;
+    // APS5_PRECOMPILE=<list> precompiles that list at every launch; unset, the list shipped next to the
+    // program is precompiled while the cache is cold for it; APS5_PRECOMPILE=0 turns both off.
+    if (ran.exchange(true)) return;
+    const auto choice = KeyList::ChooseList(std::getenv("APS5_PRECOMPILE"), executablePath().parent_path());
+    if (choice.path.empty()) return;
     const auto started = std::chrono::steady_clock::now();
     if (!ShaderRecompiler::ShaderDiskCache::Enabled()) {
         std::fprintf(stderr, "[precompile] the shader disk cache is off: nothing to fill\n");
@@ -338,7 +385,7 @@ void RunShaderPrecompile(const ShaderRecompiler::SpirvTarget& target) {
     }
     // This runs in the device's constructor: whatever fails, the game goes on without the precompile.
     try {
-        precompileList(target, listPath, started);
+        precompileList(target, choice.path, choice.shipped, started);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[precompile] stopped: %s\n", error.what());
     } catch (...) {

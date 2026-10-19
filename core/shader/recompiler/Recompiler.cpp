@@ -438,7 +438,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
         variant = std::make_shared<const CompiledVariant>(compileVariant(request, std::move(program), snapshot, specialization));
         compiled = true;
     }
-    if (record) ShaderKeyList::Note(request, snapshot, specialization, ShaderDiskCache::EntryName(diskKey), *variant);
+    if (record) ShaderKeyList::Note(request, snapshot, specialization, ShaderDiskCache::EntryName(diskKey), ShaderDiskCache::InputDigest(request, specialization), *variant);
     if (disk && compiled) ShaderDiskCache::Store(std::move(diskKey), variant);
     source.variants.push_back(variant);
     return variant;
@@ -893,6 +893,10 @@ namespace ShaderKeyList {
 // of them in the record. It also reads the snapshot, but only into the descriptor values the SPIR-V
 // emitter never reads (it checks their counts). The code address also reaches the SPIR-V (the loop
 // guard's shader id under APS5_LOOP_GUARD) and the disk entry, so the record carries it.
+// A record of another build, device or switch set has another entry name. Its inputs digest then
+// shows that the rebuilt request is the recording's in every part of the key the record decides, so
+// the entry is the one the game asks for here, and the compile is the one this build runs on that
+// miss: the disk cache itself serves an entry for any value of the inputs outside its key.
 PrecompileOutcome Precompile(const Record& record, const RebuiltRequest& rebuilt, bool storeUnverified) {
     PrecompileOutcome outcome;
     if (!ShaderDiskCache::Enabled() || DebugProbeActive()) return outcome;
@@ -900,25 +904,27 @@ PrecompileOutcome Precompile(const Record& record, const RebuiltRequest& rebuilt
     std::vector<std::byte> key;
     ShaderDiskCache::BuildKey(request, HostSubgroupSize(request), record.specialization, key);
     outcome.entry = ShaderDiskCache::EntryName(key);
+    outcome.inputDigest = ShaderDiskCache::InputDigest(request, record.specialization);
     if (ShaderDiskCache::Present(key)) {
         outcome.status = PrecompileStatus::Present;
         return outcome;
     }
-    // Another entry name than the recording's: nothing to compare the SPIR-V with.
-    const bool verifiable = outcome.entry == record.entry;
-    if (!verifiable && !storeUnverified) {
+    // The recording's entry name: the SPIR-V must be the recording's too.
+    const bool sameEntry = outcome.entry == record.entry;
+    const bool sameInputs = record.inputDigest != 0 && outcome.inputDigest == record.inputDigest;
+    if (!sameEntry && !sameInputs && !storeUnverified) {
         outcome.status = PrecompileStatus::Unverified;
         return outcome;
     }
     auto program = PrepareResourceProgram(request);
     auto variant = std::make_shared<const CompiledVariant>(compileVariant(request, std::move(program), rebuilt.snapshot, record.specialization));
     outcome.spirvHash = HashBytes(std::as_bytes(std::span(variant->result.spirv.Words())));
-    if (verifiable && outcome.spirvHash != record.spirvHash) {
+    if (sameEntry && outcome.spirvHash != record.spirvHash) {
         outcome.status = PrecompileStatus::Diverged;
         return outcome;
     }
     ShaderDiskCache::Store(std::move(key), std::move(variant));
-    outcome.status = verifiable ? PrecompileStatus::Stored : PrecompileStatus::StoredUnverified;
+    outcome.status = sameEntry ? PrecompileStatus::Stored : sameInputs ? PrecompileStatus::StoredByInputs : PrecompileStatus::StoredUnverified;
     return outcome;
 }
 

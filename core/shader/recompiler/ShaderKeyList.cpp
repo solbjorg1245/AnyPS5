@@ -27,10 +27,11 @@ namespace {
 
 constexpr std::uint64_t CodeSeeds[2] = {0x6b65796c69737401ull, 0x6b65796c69737402ull};
 constexpr std::uint64_t AnchorBase = 0x100000001b3ull;
-constexpr std::string_view LineTag = "k2";
+constexpr std::string_view LineTag = "k3";
+constexpr std::string_view SealedLineTag = "k2";
 constexpr std::string_view LegacyLineTag = "k1";
 constexpr std::uint64_t ChecksumSeed = 0x6b65796c69737403ull;
-// " ~" and 16 hex digits end a k2 line.
+// " ~" and 16 hex digits end a k2 or k3 line.
 constexpr std::size_t ChecksumChars = 16;
 constexpr std::size_t MaxListLength = MaxCount;
 
@@ -299,6 +300,15 @@ const char* keyListPath() {
     return path;
 }
 
+// A marker file larger than this is not read (the cache is then cold for every list).
+constexpr std::uintmax_t MaxMarkerBytes = 1u << 20u;
+
+std::string markerLine(std::uint64_t listHash, std::uint64_t context) {
+    char text[40];
+    std::snprintf(text, sizeof(text), "%016llx %016llx", static_cast<unsigned long long>(listHash), static_cast<unsigned long long>(context));
+    return text;
+}
+
 }
 
 std::uint64_t AnchorHash(std::span<const std::uint32_t> words) {
@@ -350,6 +360,9 @@ std::string Encode(const Record& record) {
     line += ' ';
     line += record.entry;
     char digits[24];
+    const auto digestEnd = std::to_chars(digits, digits + sizeof(digits), record.inputDigest, 16).ptr;
+    line += ' ';
+    line.append(digits, digestEnd);
     for (const auto value : values) {
         const auto end = std::to_chars(digits, digits + sizeof(digits), value, 16).ptr;
         line += ' ';
@@ -371,7 +384,7 @@ std::string Encode(const Record& record) {
 
 bool Decode(std::string_view line, Record& record) {
     while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.remove_suffix(1);
-    if (startsWithTag(line, LineTag)) {
+    if (startsWithTag(line, LineTag) || startsWithTag(line, SealedLineTag)) {
         // The checksum: exactly 16 hex digits after the last " ~", over everything before it.
         const auto mark = line.rfind(" ~");
         if (mark == std::string_view::npos || line.size() - mark - 2 != ChecksumChars) return false;
@@ -392,11 +405,16 @@ bool Decode(std::string_view line, Record& record) {
         return line.substr(start, at - start);
     };
     const auto tag = token();
-    if (tag != LineTag && tag != LegacyLineTag) return false;
+    if (tag != LineTag && tag != SealedLineTag && tag != LegacyLineTag) return false;
     record = Record{};
     const auto entry = token();
     if (!validEntry(entry)) return false;
     record.entry = std::string(entry);
+    if (tag == LineTag) {
+        const auto digest = token();
+        const auto parsed = std::from_chars(digest.data(), digest.data() + digest.size(), record.inputDigest, 16);
+        if (digest.empty() || parsed.ec != std::errc() || parsed.ptr != digest.data() + digest.size()) return false;
+    }
     std::vector<std::uint64_t> values;
     bool locator = false;
     while (true) {
@@ -471,7 +489,7 @@ bool ReadList(const std::filesystem::path& path, ListFile& list) {
             else if (!Decode(line, record)) ++list.unreadable;
             else if (!entries.insert(record.entry).second) ++list.duplicates;
             else {
-                if (startsWithTag(line, LegacyLineTag)) ++list.legacy;
+                if (!startsWithTag(line, LineTag)) ++list.legacy;
                 kept.record = static_cast<std::ptrdiff_t>(list.records.size());
                 list.records.push_back(std::move(record));
             }
@@ -579,7 +597,7 @@ std::uint64_t Recorded() {
     return keyFile().recorded.load(std::memory_order_relaxed);
 }
 
-void Note(const RecompileRequest& request, const ResourceSnapshot& snapshot, const ResourceSpecialization& specialization, std::string_view entry, const CompiledVariant& variant) {
+void Note(const RecompileRequest& request, const ResourceSnapshot& snapshot, const ResourceSpecialization& specialization, std::string_view entry, std::uint64_t inputDigest, const CompiledVariant& variant) {
     const char* path = keyListPath();
     if (path == nullptr) return;
     auto& keys = keyFile();
@@ -592,7 +610,7 @@ void Note(const RecompileRequest& request, const ResourceSnapshot& snapshot, con
             std::string line;
             while (std::getline(existing, line)) {
                 empty = false;
-                if (line.size() > LineTag.size() + 37 && (startsWithTag(line, LineTag) || startsWithTag(line, LegacyLineTag))) keys.entries.insert(line.substr(LineTag.size() + 1, 36));
+                if (line.size() > LineTag.size() + 37 && (startsWithTag(line, LineTag) || startsWithTag(line, SealedLineTag) || startsWithTag(line, LegacyLineTag))) keys.entries.insert(line.substr(LineTag.size() + 1, 36));
             }
         }
         // A list cut in its last line (a process killed mid-write) gets a line break first, so the
@@ -616,6 +634,7 @@ void Note(const RecompileRequest& request, const ResourceSnapshot& snapshot, con
     if (keys.file == nullptr || !validEntry(entry) || !keys.entries.insert(std::string(entry)).second) return;
     auto record = Describe(request, snapshot, specialization);
     record.entry = std::string(entry);
+    record.inputDigest = inputDigest;
     const auto& words = variant.result.spirv.Words();
     record.spirvHash = HashBytes(std::as_bytes(std::span(words)));
     const auto line = Encode(record);
@@ -623,6 +642,43 @@ void Note(const RecompileRequest& request, const ResourceSnapshot& snapshot, con
     std::fputc('\n', keys.file);
     std::fflush(keys.file);
     keys.recorded.fetch_add(1, std::memory_order_relaxed);
+}
+
+ListChoice ChooseList(const char* setting, const std::filesystem::path& programDirectory) {
+    ListChoice choice;
+    if (setting != nullptr && *setting != '\0') {
+        if (std::string_view(setting) != "0") choice.path = setting;
+        return choice;
+    }
+    if (programDirectory.empty()) return choice;
+    const auto shipped = programDirectory / std::string(ShippedListName);
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(shipped, error)) return choice;
+    choice.path = shipped;
+    choice.shipped = true;
+    return choice;
+}
+
+bool PrecompileDone(const std::filesystem::path& entryDirectory, std::uint64_t listHash, std::uint64_t context) {
+    const auto path = entryDirectory / std::string(MarkerName);
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error || size > MaxMarkerBytes) return false;
+    std::ifstream file(path, std::ios::binary);
+    const auto wanted = markerLine(listHash, context);
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line == wanted) return true;
+    }
+    return false;
+}
+
+void MarkPrecompiled(const std::filesystem::path& entryDirectory, std::uint64_t listHash, std::uint64_t context) {
+    std::error_code error;
+    std::filesystem::create_directories(entryDirectory, error);
+    std::ofstream file(entryDirectory / std::string(MarkerName), std::ios::binary | std::ios::app);
+    file << markerLine(listHash, context) << '\n';
 }
 
 }

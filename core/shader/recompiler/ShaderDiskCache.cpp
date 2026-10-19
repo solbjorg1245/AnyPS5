@@ -798,17 +798,22 @@ std::uint64_t SourceVersion() {
     return version;
 }
 
-void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, const ResourceSpecialization& specialization, std::vector<std::byte>& key) {
+namespace {
+
+// BuildKey's key, or with inputsOnly the part of it the request and the specialization decide.
+void buildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, const ResourceSpecialization& specialization, bool inputsOnly, std::vector<std::byte>& key) {
     key.clear();
     Writer writer(key);
-    writer.Value(FileMagic);
-    writer.Value(FormatVersion);
-    writer.Value(SourceVersion());
+    if (!inputsOnly) {
+        writer.Value(FileMagic);
+        writer.Value(FormatVersion);
+        writer.Value(SourceVersion());
+    }
     thread_local std::vector<std::uint64_t> memoryKey;
     RecompileCacheKey::Build(request, memoryKey);
     writer.Values(std::span<const std::uint64_t>(memoryKey));
     writer.Values(request.shader.code);
-    writer.Value(hostSubgroupSize);
+    if (!inputsOnly) writer.Value(hostSubgroupSize);
     writer.Value(request.layout.descriptorSet);
     writer.Value(request.layout.firstBinding);
     writer.Value(request.layout.pushConstantOffsetBytes);
@@ -835,8 +840,32 @@ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, c
         out.Value(image.depthUnorm16);
     });
     writer.Values(std::span<const std::uint32_t>(specialization.boundDescriptors));
+    if (inputsOnly) return;
     const auto& switches = switchKey();
     key.insert(key.end(), switches.begin(), switches.end());
+}
+
+}
+
+void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, const ResourceSpecialization& specialization, std::vector<std::byte>& key) {
+    buildKey(request, hostSubgroupSize, specialization, false, key);
+}
+
+std::uint64_t InputDigest(const RecompileRequest& request, const ResourceSpecialization& specialization) {
+    // The target leaves the memory key too: the recording's device need not be this one.
+    auto neutral = request;
+    neutral.target = SpirvTarget{};
+    thread_local std::vector<std::byte> key;
+    buildKey(neutral, 0, specialization, true, key);
+    return HashBytes(key, 0x5eed0003ull);
+}
+
+std::uint64_t ContextDigest(const SpirvTarget& target) {
+    RecompileRequest request{};
+    request.target = target;
+    std::vector<std::byte> key;
+    buildKey(request, target.subgroupSize, ResourceSpecialization{}, false, key);
+    return HashBytes(key, 0x5eed0004ull);
 }
 
 std::string EntryName(std::span<const std::byte> key) {
