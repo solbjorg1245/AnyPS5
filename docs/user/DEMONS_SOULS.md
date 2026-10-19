@@ -78,7 +78,10 @@ patch (slow; for troubleshooting only). On an Intel CPU, `-ToIntel` / `--to-inte
 it is untested with this game, so use it only if the game crashes with an illegal instruction.
 
 The first launch, and every new area, compiles shaders into `shader_cache/`. This makes the first
-minutes stutter heavily. Saves are stored in `_sd/` in the install folder; back them up from there.
+minutes stutter heavily. To shorten this, the first launch of each version precompiles the shaders of the
+opening areas listed in `shader-keys.txt` (shader identifiers, no game code) from your dump: the window
+stays black for a few seconds before the first frame. `APS5_PRECOMPILE=0` turns this off.
+Saves are stored in `_sd/` in the install folder; back them up from there.
 
 ## Settings
 

@@ -10,7 +10,9 @@ Player archive for Demon's Souls (--game ds, in addition to the files above):
     The archive holds only files built from this source (relinker, libs/*.prx, the settings launcher), the MinGW runtime
     DLLs, launchers, the stdlib-only patch tool, docs and licenses. The settings launcher sits at the archive
     root as the player's entry point (it asks for the dump and runs the setup); the player relinks their own
-    dump on first start; no game code, firmware or shader cache is ever packaged.
+    dump on first start; no game code, firmware or shader cache is ever packaged. shader-keys.txt (next to
+    DemonsSouls.exe) is the shader key list the port precompiles on a cold shader cache: identifiers only (code
+    sizes and hashes, file offsets, compile settings), checked by check_shader_keys.
 
 Every file comes from an explicit allowlist and is then checked against a denylist (game files,
 Sony firmware, shader caches, NVIDIA SDKs, development port folders); a hit aborts packaging.
@@ -34,6 +36,8 @@ EXCLUDED_LIBRARIES = {"libcohtml.prx"}
 EXTRA_LIBRARIES = {"libcohtml.Prospero.prx"}
 PLAYER_ROOT = "AnyPS5-DemonsSouls"
 PLAYER_FILES = Path("packaging/demons-souls")
+# The shader key list (P-PRECOMPILE) the port precompiles on a cold shader cache when it sits next to the program.
+SHADER_KEYS = "shader-keys.txt"
 LAUNCHER_NAMES = {"DemonsSouls.ps1", "DemonsSouls.bat", "DemonsSouls.sh"}
 EXECUTABLE_NAMES = {"relinker", "anyps5-launcher", "DemonsSouls.sh", "ds_patch.py"}
 
@@ -222,6 +226,37 @@ def license_entries(build, source, root):
     return entries
 
 
+def check_shader_keys(path):
+    """The shipped key list holds format 3 records only ("k3": with the inputs digest that lets a record verify
+    on any build; a k1/k2 record verifies only against the build that recorded it, and a player's precompile
+    would skip it), and its locators stay below the game folder or name the program. To make the list again:
+    a cold-cache run with APS5_SHADER_KEYS=<new list>, then one with APS5_PRECOMPILE=<new list>
+    APS5_PRECOMPILE_SCAN='@exe;*.csdr' (writes the locators), then copy it to packaging/demons-souls. The
+    pinned digest in tests/ShaderKeyList.cpp fails when a change to the disk key needs this."""
+    if path.stat().st_size > 64 << 20:
+        raise PackagingError(f"{path}: over 64 MiB")
+    records = 0
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line or line.startswith("#"):
+            continue
+        tokens = line.split(" ")
+        if (len(tokens) < 6 or tokens[0] != "k3" or not re.fullmatch(r"[0-9a-f]{32}\.bin", tokens[1])
+                or not re.fullmatch(r"[0-9a-f]{1,16}", tokens[2]) or int(tokens[2], 16) == 0
+                or not re.fullmatch(r"~[0-9a-f]{16}", tokens[-1])):
+            raise PackagingError(f"{path}:{number}: not a format 3 record with an inputs digest (record the list again)")
+        if " @ " in line:
+            located = line.rsplit(" ~", 1)[0].split(" @ ", 1)[1].split(" ", 1)
+            locator = located[1] if len(located) == 2 else ""
+            parts = locator.split("/")
+            if locator != "@exe" and (not locator or locator.startswith("/") or "\\" in locator or ":" in locator
+                                      or any(part in ("", ".", "..") for part in parts)):
+                raise PackagingError(f"{path}:{number}: locator outside the game folder: {locator!r}")
+        records += 1
+    if records == 0:
+        raise PackagingError(f"{path}: no records")
+    return records
+
+
 def player_entries(platform, build, source, libraries, runtime, relinker, launcher):
     root = f"{PLAYER_ROOT}/"
     player = source / PLAYER_FILES
@@ -232,6 +267,7 @@ def player_entries(platform, build, source, libraries, runtime, relinker, launch
         (f"{root}anyps5-settings.ini.example", player / "anyps5-settings.ini.example"),
         (f"{root}tools/ds_patch.py", source / "tools/ds_patch.py"),
         (f"{root}tools/{relinker.name}", relinker),
+        (f"{root}{SHADER_KEYS}", player / SHADER_KEYS),
     ]
     if platform == "windows":
         entries += [(f"{root}DemonsSouls.ps1", player / "DemonsSouls.ps1"),
@@ -287,6 +323,7 @@ def package(platform, build, output, version, mingw_bin, game=None, dry_run=Fals
         for _, file in entries:
             if not Path(file).is_file():
                 raise PackagingError(f"Missing release file: {file}")
+        shader_keys = check_shader_keys(source / PLAYER_FILES / SHADER_KEYS)
         names = [arcname for arcname, _ in entries]
         duplicates = sorted({n for n in names if names.count(n) > 1})
         if duplicates:
@@ -312,6 +349,8 @@ def package(platform, build, output, version, mingw_bin, game=None, dry_run=Fals
             print(f"== {name}  <-  {file}")
         if skipped:
             print(f"-- not packaged (not on the allowlist): {', '.join(skipped)}")
+        if game == "ds":
+            print(f"-- {SHADER_KEYS}: {shader_keys} format 3 records")
         print("-- checks passed: allowlist, allowed roots, denylist, library dependencies")
         return
 
