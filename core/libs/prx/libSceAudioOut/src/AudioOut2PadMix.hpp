@@ -25,6 +25,10 @@ struct AudioOut2PadLayout {
 };
 
 AudioOut2Route AudioOut2RouteForPort(std::uint16_t type, std::uint32_t channels);
+// With no controller sound card open: whether a port stays out of the main mix. The vibration port
+// carries actuator waveforms (low thumps in the speakers); APS5_AUDIO2_HAPTICS_MAIN=0 drops it, unset or
+// 1 keeps the old route (hapticsMain). Pad speaker sounds are game audio and always stay.
+bool AudioOut2SkipInMainMix(std::uint16_t type, std::uint32_t channels, bool hapticsMain);
 bool AudioOut2IsPadAudioDevice(const char* name);
 void AudioOut2AccumulatePadFrame(AudioOut2Route route, const float* in, std::uint32_t channels, const float* volume, float* pad);
 void AudioOut2FinishPadMix(float* out, std::uint32_t frames);

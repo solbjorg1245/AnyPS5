@@ -1,5 +1,6 @@
 add_library(libSceAudioOut SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/src/AudioOut.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/AudioOut2Ambisonics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/AudioOut2Context.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/AudioOut2PadMix.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/AudioOut2Port.cpp
@@ -30,6 +31,15 @@ if(BUILD_TESTING)
     add_test(NAME audio_out2_pad_mix COMMAND audio_out2_pad_mix_tests)
     if(WIN32)
         set_tests_properties(audio_out2_pad_mix PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test_executable(audio_out2_ambisonics_tests tests/AudioOut2Ambisonics.cpp src/AudioOut2Ambisonics.cpp src/AudioOut2PadMix.cpp)
+    target_include_directories(audio_out2_ambisonics_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(audio_out2_ambisonics_tests PRIVATE libc)
+    configure_windows_unwind(audio_out2_ambisonics_tests)
+    add_test(NAME audio_out2_ambisonics COMMAND audio_out2_ambisonics_tests)
+    if(WIN32)
+        set_tests_properties(audio_out2_ambisonics PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

@@ -9,6 +9,7 @@ extern "C" {
 }
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -49,6 +50,24 @@ bool TraceEnabled() {
     do { \
         if (TraceEnabled()) std::fprintf(stderr, __VA_ARGS__); \
     } while (0)
+
+// APS5_PROFILE_DRAW prints an `[ajm] 10s:` digest line: decode runs, frames and the result bits the runs
+// reported in the window, and the instances (ever) left decoding silence or decoding 3OA substreams.
+bool DigestEnabled() {
+    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return enabled;
+}
+
+struct DigestCounters {
+    std::atomic<std::uint64_t> runs{0};
+    std::atomic<std::uint64_t> frames{0};
+    std::atomic<std::uint64_t> invalid{0};
+    std::atomic<std::uint64_t> partial{0};
+    std::atomic<std::uint64_t> noRoom{0};
+    std::atomic<std::uint64_t> silentInstances{0};
+    std::atomic<std::uint64_t> ambisonicInstances{0};
+};
+DigestCounters g_digest;
 
 constexpr std::uint64_t RUN_MULTIPLE_FRAMES = 1ull << 12;
 constexpr std::uint64_t SIDEBAND_GAPLESS_DECODE = 1ull << 45;
@@ -288,6 +307,7 @@ void EnterSilentMode(Instance& instance, const std::uint8_t* parameters, std::ui
     std::memcpy(config, parameters, std::min<std::uint64_t>(size, sizeof(config)));
     const std::uint32_t flagChannels = static_cast<std::uint32_t>(instance.flags & 0x7fu);
     instance.silent = true;
+    g_digest.silentInstances.fetch_add(1, std::memory_order_relaxed);
     instance.silentChannels = flagChannels >= 1 && flagChannels <= 16 ? flagChannels : 16;
     instance.silentRate = size >= 2 ? AT9_SAMPLE_RATES[config[1] >> 4] : 48000;
     instance.silentSuperframeBytes = SILENT_BYTES_PER_CHANNEL * instance.silentChannels;
@@ -326,6 +346,7 @@ std::int32_t InitializeInstance(Instance& instance, const std::uint8_t* paramete
     for (void* handle : instance.substreams) Atrac9ReleaseHandle(handle);
     instance.substreams.clear();
     if (size >= ATRAC9_CONFIG_DATA_SIZE && std::memcmp(parameters, AMBISONIC_CONFIG, sizeof(AMBISONIC_CONFIG)) == 0) {
+        g_digest.ambisonicInstances.fetch_add(1, std::memory_order_relaxed);
         instance.silent = true;
         instance.silentChannels = AMBISONIC_CHANNELS;
         instance.silentRate = AT9_SAMPLE_RATES[parameters[1] >> 4];
@@ -439,6 +460,13 @@ void EmitFrame(Instance& instance, PcmOutputs& outputs, const std::uint8_t* pcm,
 }
 
 void WriteRunSideband(const JobHeader& job, const Instance& instance, std::int32_t result, std::size_t consumed, std::size_t produced, std::uint32_t frames, const SidebandFormat& format) {
+    if (DigestEnabled()) {
+        g_digest.runs.fetch_add(1, std::memory_order_relaxed);
+        g_digest.frames.fetch_add(frames, std::memory_order_relaxed);
+        if (result & AJM_RESULT_INVALID_DATA) g_digest.invalid.fetch_add(1, std::memory_order_relaxed);
+        if (result & AJM_RESULT_PARTIAL_INPUT) g_digest.partial.fetch_add(1, std::memory_order_relaxed);
+        if (result & AJM_RESULT_NOT_ENOUGH_ROOM) g_digest.noRoom.fetch_add(1, std::memory_order_relaxed);
+    }
     auto* sideband = static_cast<std::uint8_t*>(job.sideband);
     std::size_t offset = 0;
     const auto write = [&](const void* value, std::size_t size) {
@@ -658,6 +686,26 @@ void RunMp3(Instance& instance, const JobHeader& job, const AjmBuffer* inputs, c
               instance.mp3Channels, instance.mp3SampleRate, instance.mp3Bitrate, static_cast<unsigned long long>(instance.totalDecodedSamples));
     WriteRunSideband(job, instance, result, consumed, pcmOutputs.produced, frames, SidebandFormat{instance.mp3Channels, ChannelMask(instance.mp3Channels), instance.mp3SampleRate, encoding, instance.mp3Bitrate, 0});
 }
+void PrintDigest() {
+    if (!DigestEnabled()) return;
+    using Clock = std::chrono::steady_clock;
+    static std::mutex digestLock;
+    static Clock::time_point start;
+    std::lock_guard lock(digestLock);
+    const auto now = Clock::now();
+    if (start == Clock::time_point{}) start = now;
+    if (now - start < std::chrono::seconds(10)) return;
+    start = now;
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+    const auto runs = take(g_digest.runs);
+    const auto frames = take(g_digest.frames);
+    const auto invalid = take(g_digest.invalid);
+    const auto partial = take(g_digest.partial);
+    const auto noRoom = take(g_digest.noRoom);
+    std::fprintf(stderr, "[ajm] 10s: runs %llu frames %llu invalid %llu partial %llu noroom %llu silent-instances %llu ambisonic-instances %llu\n", runs, frames, invalid, partial, noRoom,
+                 static_cast<unsigned long long>(g_digest.silentInstances.load(std::memory_order_relaxed)), static_cast<unsigned long long>(g_digest.ambisonicInstances.load(std::memory_order_relaxed)));
+}
+
 void Execute(const JobHeader& job, const AjmBuffer* inputs, const AjmBuffer* outputs) {
     if (job.kind == JobKind::GetStatistics) {
         AJM_TRACE("[ajm] statistics job: sideband %llu bytes\n", static_cast<unsigned long long>(job.sidebandSize));
@@ -882,6 +930,7 @@ int APS5_VABI sceAjmBatchStart(uint32_t context, const AjmBatchInfo* info, int p
         Execute(job, buffers.data(), buffers.data() + job.inputCount);
         cursor += record.bytes;
     }
+    PrintDigest();
     if (error) std::memset(error, 0, sizeof(*error));
     *batch = g_nextBatch.fetch_add(1, std::memory_order_relaxed);
     return 0;
