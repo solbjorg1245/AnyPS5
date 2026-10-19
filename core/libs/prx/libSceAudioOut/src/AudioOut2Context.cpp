@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -39,6 +40,18 @@ static constexpr std::uint16_t DEVICE_SAMPLES = 512;
 // intro cutscene (2.1 measured); the device takes float and clips hard, so the mix is attenuated
 // and clamped.
 static constexpr float MASTER_GAIN = 0.5f;
+// The decoded mix (APS5_AUDIO2_AMBISONICS) plays a source ahead at its own level instead of summing 36
+// harmonics, so it needs no attenuation; APS5_AUDIO2_GAIN overrides the gain on either path.
+static constexpr float DECODED_GAIN = 1.0f;
+static constexpr std::chrono::seconds DIGEST_INTERVAL{10};
+// APS5_AUDIO_DUMP=<file.wav> records the mix of the first context that pushes as 16-bit stereo PCM WAV:
+// what is queued, after the master gain and the clamp, APS5_AUDIO_DUMP_SECONDS long at most (default
+// 300 s, 55 MB). The header's sizes are patched every 10 s of audio and when the context goes, so a
+// killed game still leaves a valid file. It records the content, not the delivery (see primes).
+static constexpr std::uint32_t DUMP_DEFAULT_SECONDS = 300;
+static constexpr std::uint64_t DUMP_PATCH_FRAMES = AUDIO_OUT2_SAMPLE_RATE * 10ull;
+static constexpr std::size_t DUMP_FILE_BUFFER = 1 << 20;
+static constexpr std::size_t WAV_HEADER_BYTES = 44;
 static constexpr std::size_t OUTPUT_FRAME_BYTES = AUDIO_OUT2_OUTPUT_CHANNELS * sizeof(float);
 static constexpr std::uint32_t OUTPUT_BYTES_PER_MS = AUDIO_OUT2_SAMPLE_RATE * OUTPUT_FRAME_BYTES / 1000;
 static constexpr std::chrono::seconds PAD_PROBE_INTERVAL{2};
@@ -47,6 +60,96 @@ static constexpr std::uint32_t PAD_SLACK_GRAINS = 2;
 bool AudioOut2TraceEnabled() {
     static const bool enabled = std::getenv("APS5_TRACE_AUDIOOUT2") != nullptr;
     return enabled;
+}
+
+bool AudioOut2DigestEnabled() {
+    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return enabled;
+}
+
+static float MasterGain() {
+    static const float gain = [] {
+        const char* value = std::getenv("APS5_AUDIO2_GAIN");
+        if (value != nullptr && *value != '\0') return std::strtof(value, nullptr);
+        return AudioOut2AmbisonicMode() != 0 ? DECODED_GAIN : MASTER_GAIN;
+    }();
+    return gain;
+}
+
+struct AudioDump {
+    std::FILE* file = nullptr;
+    std::uint64_t frames = 0;
+    std::uint64_t maxFrames = 0;
+    std::uint64_t patchedFrames = 0;
+    std::vector<std::int16_t> samples;
+};
+// The first context to push owns the dump; only it touches g_dump, under its context lock.
+static std::atomic<AudioOut2Context*> g_dumpOwner{nullptr};
+static AudioDump g_dump;
+
+static void PutLe(std::uint8_t* out, std::uint32_t value, std::size_t bytes) {
+    for (std::size_t index = 0; index < bytes; index++) out[index] = static_cast<std::uint8_t>(value >> (8 * index));
+}
+
+static void WriteDumpHeader() {
+    constexpr std::uint32_t frameBytes = AUDIO_OUT2_OUTPUT_CHANNELS * sizeof(std::int16_t);
+    const auto dataBytes = static_cast<std::uint32_t>(g_dump.frames * frameBytes);
+    std::uint8_t header[WAV_HEADER_BYTES] = {};
+    std::memcpy(header, "RIFF", 4);
+    PutLe(header + 4, static_cast<std::uint32_t>(WAV_HEADER_BYTES - 8) + dataBytes, 4);
+    std::memcpy(header + 8, "WAVEfmt ", 8);
+    PutLe(header + 16, 16, 4);
+    PutLe(header + 20, 1, 2);
+    PutLe(header + 22, AUDIO_OUT2_OUTPUT_CHANNELS, 2);
+    PutLe(header + 24, AUDIO_OUT2_SAMPLE_RATE, 4);
+    PutLe(header + 28, AUDIO_OUT2_SAMPLE_RATE * frameBytes, 4);
+    PutLe(header + 32, frameBytes, 2);
+    PutLe(header + 34, 16, 2);
+    std::memcpy(header + 36, "data", 4);
+    PutLe(header + 40, dataBytes, 4);
+    std::fflush(g_dump.file);
+    std::fseek(g_dump.file, 0, SEEK_SET);
+    std::fwrite(header, 1, sizeof(header), g_dump.file);
+    std::fseek(g_dump.file, 0, SEEK_END);
+    std::fflush(g_dump.file);
+    g_dump.patchedFrames = g_dump.frames;
+}
+
+static void CloseDump() {
+    if (g_dump.file == nullptr) return;
+    WriteDumpHeader();
+    std::fclose(g_dump.file);
+    g_dump.file = nullptr;
+    std::fprintf(stderr, "[audio] dump closed after %.1f s\n", static_cast<double>(g_dump.frames) / AUDIO_OUT2_SAMPLE_RATE);
+}
+
+// Appends the context's mixed grain to the dump. The caller holds the context lock.
+static void DumpGrain(AudioOut2Context& context) {
+    static const char* path = std::getenv("APS5_AUDIO_DUMP");
+    if (path == nullptr || *path == '\0') return;
+    if (g_dumpOwner.load(std::memory_order_acquire) != &context) {
+        AudioOut2Context* expected = nullptr;
+        if (!g_dumpOwner.compare_exchange_strong(expected, &context)) return;
+        const char* seconds = std::getenv("APS5_AUDIO_DUMP_SECONDS");
+        const auto limit = seconds != nullptr ? std::strtoul(seconds, nullptr, 10) : 0ul;
+        g_dump.maxFrames = static_cast<std::uint64_t>(limit != 0 ? limit : DUMP_DEFAULT_SECONDS) * AUDIO_OUT2_SAMPLE_RATE;
+        g_dump.file = std::fopen(path, "wb");
+        if (g_dump.file == nullptr) {
+            std::fprintf(stderr, "[audio] dump: cannot open %s\n", path);
+            return;
+        }
+        std::setvbuf(g_dump.file, nullptr, _IOFBF, DUMP_FILE_BUFFER);
+        WriteDumpHeader();
+        std::fprintf(stderr, "[audio] dump: ctx %u to %s (%llu s at most)\n", context.id, path, static_cast<unsigned long long>(g_dump.maxFrames / AUDIO_OUT2_SAMPLE_RATE));
+    }
+    if (g_dump.file == nullptr) return;
+    const auto frames = static_cast<std::size_t>(std::min<std::uint64_t>(context.grain, g_dump.maxFrames - g_dump.frames));
+    g_dump.samples.resize(frames * AUDIO_OUT2_OUTPUT_CHANNELS);
+    for (std::size_t index = 0; index < g_dump.samples.size(); index++) g_dump.samples[index] = static_cast<std::int16_t>(std::lrint(context.mix[index] * 32767.0f));
+    std::fwrite(g_dump.samples.data(), sizeof(std::int16_t), g_dump.samples.size(), g_dump.file);
+    g_dump.frames += frames;
+    if (g_dump.frames >= g_dump.maxFrames) CloseDump();
+    else if (g_dump.frames - g_dump.patchedFrames >= DUMP_PATCH_FRAMES) WriteDumpHeader();
 }
 
 double AudioOut2TraceSeconds() {
@@ -196,11 +299,30 @@ static std::uint32_t Render(AudioOut2Context& context, Clock::time_point now) {
         pad = context.padMix.data();
     }
     std::fill(context.mix.begin(), context.mix.end(), 0.0f);
-    const auto mixed = AudioOut2MixPorts(context, context.mix.data(), pad, context.grain);
+    const bool metering = AudioOut2DigestEnabled();
+    const auto mixed = AudioOut2MixPorts(context, context.mix.data(), pad, context.grain, metering ? &context.meters : nullptr);
+    const float gain = MasterGain();
     for (float& sample : context.mix) {
-        sample = std::clamp(sample * MASTER_GAIN, -1.0f, 1.0f);
+        sample *= gain;
+        if (metering) {
+            const float magnitude = std::abs(sample);
+            context.meters.peak = std::max(context.meters.peak, magnitude);
+            if (magnitude > 1.0f) context.meters.over++;
+        }
+        sample = std::clamp(sample, -1.0f, 1.0f);
         if (AudioOut2TraceEnabled()) context.summaryPeak = std::max(context.summaryPeak, std::abs(sample));
     }
+    if (metering) {
+        for (std::uint32_t frame = 0; frame < context.grain; frame++) {
+            const double left = context.mix[frame * AUDIO_OUT2_OUTPUT_CHANNELS];
+            const double right = context.mix[frame * AUDIO_OUT2_OUTPUT_CHANNELS + 1];
+            context.meters.outLeft += left * left;
+            context.meters.outRight += right * right;
+            context.meters.outCross += left * right;
+        }
+        context.meters.frames += context.grain;
+    }
+    DumpGrain(context);
     if (pad != nullptr) {
         AudioOut2FinishPadMix(pad, context.grain);
         QueuePadGrain(context);
@@ -240,6 +362,36 @@ static void TraceSummary(AudioOut2Context& context, Clock::time_point now) {
     context.summaryPeak = 0.0f;
 }
 
+// `[audio] 10s:` (APS5_PROFILE_DRAW): pushes and their rate; primes = the SDL queue ran dry (an audible
+// gap) and dropped = grains beyond MAX_QUEUED_MS, both in the window; the SDL queue now and the device.
+// Then the RMS (summed power) of the bed, object and pad ports after their volume, the object ports by
+// ambisonic order, where the vibration ports went (card, main mix, or off), and the output: RMS per
+// side, the peak before the clamp, the L/R correlation (1.000 = mono) and the samples the clamp cut.
+static void PrintDigest(AudioOut2Context& context, Clock::time_point now) {
+    if (!AudioOut2DigestEnabled()) return;
+    if (context.digestStart == Clock::time_point{}) context.digestStart = now;
+    if (now - context.digestStart < DIGEST_INTERVAL) return;
+    const auto elapsed = std::chrono::duration<double>(now - context.digestStart).count();
+    const auto& meters = context.meters;
+    const double frames = static_cast<double>(std::max<std::uint64_t>(meters.frames, 1));
+    const auto rms = [frames](double sum) { return std::sqrt(sum / frames); };
+    const double power = std::sqrt(meters.outLeft * meters.outRight);
+    const double correlation = power > 0.0 ? meters.outCross / power : 0.0;
+    const char* route = meters.padSkipped != 0 ? "off" : (context.padDevice != 0 ? "card" : "main");
+    const auto pushes = context.pushes - context.digestPushes;
+    std::fprintf(stderr, "[audio] 10s: ctx %u pushes %llu (%.1f/s) primes %llu dropped %llu sdl %u ms dev %u | bed %u rms %.4f | obj %u ambi %u o0..o5 rms %.4f %.4f %.4f %.4f %.4f %.4f | pad %u rms %.4f route %s | out rms %.4f %.4f peak %.3f corr %.3f over %llu | mode %u gain %.2f dump %.0f s\n",
+        context.id, static_cast<unsigned long long>(pushes), static_cast<double>(pushes) / elapsed, static_cast<unsigned long long>(context.primes - context.digestPrimes),
+        static_cast<unsigned long long>(context.dropped - context.digestDropped), SdlQueuedMs(context), context.device, meters.bedPorts, rms(meters.bed), meters.objectPorts,
+        meters.ambisonicPorts, rms(meters.order[0]), rms(meters.order[1]), rms(meters.order[2]), rms(meters.order[3]), rms(meters.order[4]), rms(meters.order[5]), meters.padPorts,
+        rms(meters.pad), route, rms(meters.outLeft), rms(meters.outRight), static_cast<double>(meters.peak), correlation, static_cast<unsigned long long>(meters.over),
+        AudioOut2AmbisonicMode(), static_cast<double>(MasterGain()), g_dumpOwner.load(std::memory_order_relaxed) == &context ? static_cast<double>(g_dump.frames) / AUDIO_OUT2_SAMPLE_RATE : 0.0);
+    context.meters = AudioOut2Meters{};
+    context.digestStart = now;
+    context.digestPushes = context.pushes;
+    context.digestPrimes = context.primes;
+    context.digestDropped = context.dropped;
+}
+
 extern "C" {
 
 // The title's per-tick step between setting the ports' data and pushing. The ports are mixed at push
@@ -256,7 +408,9 @@ int APS5_VABI sceAudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
 
 int APS5_VABI sceAudioOut2ContextCreate(const AudioOut2ContextParam* params, void* buffer, size_t buffer_size, AudioOut2ContextHandle* ctx) {
     if (!params || !ctx) return SCE_AUDIO_OUT2_ERROR_INVALID_ARGUMENT;
+    static std::atomic<std::uint32_t> nextId{1};
     auto* context = new AudioOut2Context();
+    context->id = nextId.fetch_add(1, std::memory_order_relaxed);
     context->grain = params->num_grains ? params->num_grains : AUDIO_OUT2_DEFAULT_GRAIN;
     context->queueDepth = params->queue_depth ? params->queue_depth : 1;
     context->playHead = Clock::now();
@@ -277,6 +431,7 @@ int APS5_VABI sceAudioOut2ContextDestroy(AudioOut2ContextHandle ctx) {
         std::lock_guard lock(context->lock);
         CloseDevice(*context);
         ClosePadDevice(*context);
+        if (g_dumpOwner.load(std::memory_order_acquire) == context) CloseDump();
     }
     AudioOut2ReleasePorts(*context);
     delete context;
@@ -325,6 +480,7 @@ int APS5_VABI sceAudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t block
             mixed, QueueLevel(*context, now), context->queueDepth, SdlQueuedMs(*context));
     }
     TraceSummary(*context, now);
+    PrintDigest(*context, now);
     return 0;
 }
 

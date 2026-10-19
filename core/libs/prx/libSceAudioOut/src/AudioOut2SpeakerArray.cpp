@@ -7,6 +7,7 @@
 #include <string>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "AudioOut2Ambisonics.hpp"
 
 namespace {
 
@@ -37,29 +38,7 @@ SpeakerArray& Array(AudioOut2SpeakerArrayHandle handle) {
 }
 
 float Sn3d(std::uint32_t acn, const AudioOut2Position& direction) {
-    const int n = static_cast<int>(std::sqrt(static_cast<double>(acn)));
-    const int m = static_cast<int>(acn) - n * n - n;
-    const int am = std::abs(m);
-    const double length = std::sqrt(double(direction.x) * direction.x + double(direction.y) * direction.y + double(direction.z) * direction.z);
-    const double sinEl = length > 0 ? direction.z / length : 0;
-    const double cosEl = std::sqrt(std::max(0.0, 1 - sinEl * sinEl));
-    const double azimuth = std::atan2(direction.y, direction.x);
-    double legendre = 1;
-    for (int i = 1; i <= am; ++i) legendre *= (2 * i - 1) * cosEl;
-    if (n > am) {
-        double previous = legendre;
-        double current = sinEl * (2 * am + 1) * legendre;
-        for (int l = am + 2; l <= n; ++l) {
-            const double next = (sinEl * (2 * l - 1) * current - (l + am - 1) * previous) / (l - am);
-            previous = current;
-            current = next;
-        }
-        legendre = current;
-    }
-    double ratio = 1;
-    for (int i = n - am + 1; i <= n + am; ++i) ratio /= i;
-    const double norm = std::sqrt((m == 0 ? 1.0 : 2.0) * ratio);
-    return static_cast<float>(norm * legendre * (m < 0 ? std::sin(am * azimuth) : std::cos(am * azimuth)));
+    return static_cast<float>(AudioOut2Sn3d(acn, direction.x, direction.y, direction.z));
 }
 
 }
