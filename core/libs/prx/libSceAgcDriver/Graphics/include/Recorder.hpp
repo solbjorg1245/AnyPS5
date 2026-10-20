@@ -19,6 +19,7 @@
 #include <span>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -445,6 +446,17 @@ public:
     // `stale`, when given, tells a kept snapshot that was out of date (dropped) from none kept.
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, bool* stale = nullptr);
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
+    // APS5_DRAW_VRAM (Resources.hpp DrawVram): ReusableDrawSnapshot for a draw's read-only storage
+    // element through a hash index of the kept snapshots (the ordered map takes ~14 steps at the
+    // switch's 16384 entries), which also counts each range's uses and stale snapshots. A range
+    // whose snapshot went stale at most of its uses (rewritten about once per use: its snapshots
+    // are only copies) is demoted for DrawVramDemoteUses uses: `demoted` is set and the caller binds
+    // it in place. Otherwise the range is collected first (`generation`, `registryGeneration` for a
+    // new snapshot's KeepDrawSnapshot) and the kept snapshot returned when it is current; `stale`
+    // tells a dropped out-of-date one from none kept.
+    static constexpr std::uint32_t DrawVramDemoteStales = 4;
+    static constexpr std::uint32_t DrawVramDemoteUses = 256;
+    std::shared_ptr<Buffer> DrawVramSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t& generation, std::uint64_t& registryGeneration, bool& demoted, bool& stale);
     void OnComplete(std::function<void()> action);
     // APS5_LATE_LAND_CHECK (GuestMemory::CheckLateLand): a GPU store into the import decided at
     // `generation`, checked for CPU stores under it before the open batch's submit and after it finished.
@@ -1319,6 +1331,22 @@ private:
     std::map<DrawSnapshotKey, DrawSnapshot> drawSnapshots;
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
+    // APS5_DRAW_VRAM: a storage range's record (DrawVramSnapshot): its kept snapshot, when there is
+    // one, and its uses and stale snapshots since it was last (re)tried; demotedUntil is the use
+    // count at which a demoted range is tried again (0: not demoted).
+    struct DrawVramRange {
+        std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry{};
+        bool kept = false;
+        std::uint32_t uses = 0;
+        std::uint32_t stales = 0;
+        std::uint32_t demotedUntil = 0;
+    };
+    struct DrawVramRangeHash {
+        std::size_t operator()(const std::pair<std::uint64_t, std::size_t>& range) const noexcept {
+            return static_cast<std::size_t>((range.first ^ (static_cast<std::uint64_t>(range.second) << 40u)) * 0x9E3779B97F4A7C15ull >> 16u);
+        }
+    };
+    std::unordered_map<std::pair<std::uint64_t, std::size_t>, DrawVramRange, DrawVramRangeHash> drawVramRanges;
 };
 
 // APS5_PROFILE_GPU: the [gputime] totals of the timed ranges between two reports and the report's

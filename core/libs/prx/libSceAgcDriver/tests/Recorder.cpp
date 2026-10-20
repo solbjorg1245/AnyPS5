@@ -2342,6 +2342,53 @@ void drawSnapshotEvictionTests(const Device& device) {
     Require(cache.ReusableDrawSnapshot(address, 16) == nullptr && cache.ReusableDrawSnapshot(address, 16) == nullptr, "a snapshot outlived a CPU store");
 }
 
+void drawVramSnapshotTests(const Device& device) {
+    using namespace AgcDriver::GuestMemory;
+    constexpr std::size_t bytes = 65536;
+    void* block = WriteWatched() ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "write watching unavailable: draw vram snapshots not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto* guest = static_cast<std::byte*>(block);
+    constexpr std::size_t size = 4096;
+    Recorder cache(device.GetContext());
+    const auto buffer = std::make_shared<Buffer>(device.GetContext(), 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::uint64_t generation = 0;
+    std::uint64_t registry = 0;
+    bool demoted = false;
+    bool stale = false;
+    const auto use = [&] {
+        generation = 0;
+        registry = 0;
+        demoted = false;
+        stale = false;
+        return cache.DrawVramSnapshot(address, size, generation, registry, demoted, stale);
+    };
+    Require(use() == nullptr && !stale && !demoted && generation != 0, "a range without a snapshot was served or not collected");
+    cache.KeepDrawSnapshot(address, size, generation, registry, buffer);
+    Require(use() == buffer && !stale && !demoted && cache.ReusableDrawSnapshot(address, size) == buffer, "a kept snapshot was not served");
+    for (std::uint32_t i = 1; i < Recorder::DrawVramDemoteStales; ++i) {
+        cache.KeepDrawSnapshot(address, size, generation, registry, buffer);
+        guest[i] = std::byte{0x5a};
+        Require(use() == nullptr && stale && !demoted && cache.ReusableDrawSnapshot(address, size) == nullptr, "a stale snapshot was served, kept or demoted early");
+    }
+    cache.KeepDrawSnapshot(address, size, generation, registry, buffer);
+    guest[0] = std::byte{0x5a};
+    Require(use() == nullptr && stale && demoted, "a range stale at most of its uses was not demoted");
+    for (std::uint32_t i = 1; i < Recorder::DrawVramDemoteUses; ++i) {
+        Require(use() == nullptr && demoted && !stale && generation == 0, "a demoted range was collected or served");
+    }
+    Require(use() == nullptr && !demoted && !stale && generation != 0, "a demoted range was not tried again");
+    cache.KeepDrawSnapshot(address, size, generation, registry, buffer);
+    Require(use() == buffer && !demoted, "the range tried again does not serve its new snapshot");
+}
+
 void drawInputReuseTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     using Use = Recorder::SnapshotUse;
@@ -7173,6 +7220,7 @@ int main() {
         misalignedSnapshotTests(device, recorder);
         drawSnapshotReuseTests(device, recorder);
         drawSnapshotEvictionTests(device);
+        drawVramSnapshotTests(device);
         drawInputReuseTests(device, recorder);
         RunResidentPresentTests(device.GetContext());
         storeRunTests(device, recorder);

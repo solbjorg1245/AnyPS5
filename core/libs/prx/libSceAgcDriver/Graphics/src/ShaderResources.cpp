@@ -4352,8 +4352,18 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(size) + item.adjustment;
         const bool drawVramSnapshot = DrawVramSnapshot(drawVram, bytes);
-        if (inPlace && !moved && !drawVramSnapshot) continue;
-        if (inPlace && !drawVramSnapshot) {
+        // Its kept snapshot first (Recorder::DrawVramSnapshot, which collects the range): a range
+        // demoted for its stale snapshots stays in place.
+        std::shared_ptr<Buffer> drawVramKept;
+        std::uint64_t drawVramGeneration = 0;
+        std::uint64_t drawVramRegistry = 0;
+        bool drawVramDemoted = false;
+        bool stale = false;
+        if (drawVramSnapshot) drawVramKept = recorder.DrawVramSnapshot(begin, bytes, drawVramGeneration, drawVramRegistry, drawVramDemoted, stale);
+        if (drawVramDemoted && profileDraw) NoteDrawVramDemoted(bytes);
+        const bool snapshotRead = drawVramSnapshot && !drawVramDemoted;
+        if (inPlace && !moved && !snapshotRead) continue;
+        if (inPlace && !snapshotRead) {
             const auto* import = memoizedImports ? HostImportMemoized(context, begin, bytes) : HostImportFor(context, begin, bytes);
             if (import != nullptr && (begin - import->base) % context.limits.minStorageBufferOffsetAlignment == 0) {
                 select(index, {import->buffer, begin - import->base, bytes});
@@ -4366,12 +4376,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (result == nullptr) result = std::make_shared<DrawBindings>();
             ++(import == nullptr ? result->refusedNoImport : result->refusedAlignment);
         }
-        const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-        const auto generation = GuestMemory::CollectWrites(begin, bytes);
-        bool stale = false;
-        auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, &stale);
+        const bool collected = drawVramSnapshot && !drawVramDemoted;
+        const auto registryGeneration = collected ? drawVramRegistry : GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        const auto generation = collected ? drawVramGeneration : GuestMemory::CollectWrites(begin, bytes);
+        auto buffer = collected ? std::move(drawVramKept) : recorder.ReusableDrawSnapshot(begin, bytes);
         const bool reused = buffer != nullptr;
-        if (drawVramSnapshot && profileDraw) NoteDrawVramUse(bytes, reused, stale);
+        if (collected && profileDraw) NoteDrawVramUse(bytes, reused, stale);
         if (buffer == nullptr) {
             buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, GpuReadHostProperties());
             std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);

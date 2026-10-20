@@ -3845,6 +3845,9 @@ std::size_t SnapshotPool(Recorder::SnapshotUse use) {
 }
 
 void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
+    if (std::get<1>(entry->first) == SnapshotUse::Storage && !drawVramRanges.empty()) {
+        if (const auto range = drawVramRanges.find({std::get<0>(entry->first), std::get<2>(entry->first)}); range != drawVramRanges.end()) range->second.kept = false;
+    }
     auto& pool = drawSnapshotPools[SnapshotPool(std::get<1>(entry->first))];
     pool.bytes -= std::get<2>(entry->first);
     pool.recency.erase(entry->second.recent);
@@ -3886,13 +3889,54 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     const DrawSnapshotKey key{address, use, bytes};
     RecordCensus::Touch(RecordCensus::RecorderLists);
     pool.recency.push_back(key);
+    std::map<DrawSnapshotKey, DrawSnapshot>::iterator kept;
     try {
-        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived});
+        kept = drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived}).first;
     } catch (...) {
         pool.recency.pop_back();
         throw;
     }
     pool.bytes += bytes;
+    if (drawVramStorage || (storage && !drawVramRanges.empty())) {
+        // Records of ranges without a snapshot (demoted ones too) are dropped once they outnumber
+        // the cache 4 to 1.
+        if (drawVramRanges.size() > 4 * maxEntries) {
+            for (auto range = drawVramRanges.begin(); range != drawVramRanges.end();) range = range->second.kept ? std::next(range) : drawVramRanges.erase(range);
+        }
+        auto& range = drawVramRanges[{address, bytes}];
+        range.entry = kept;
+        range.kept = true;
+    }
+}
+
+std::shared_ptr<Buffer> Recorder::DrawVramSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t& generation, std::uint64_t& registryGeneration, bool& demoted, bool& stale) {
+    auto& range = drawVramRanges[{address, bytes}];
+    ++range.uses;
+    if (range.demotedUntil != 0) {
+        if (range.uses < range.demotedUntil) {
+            demoted = true;
+            return {};
+        }
+        range.demotedUntil = 0;
+        range.uses = 1;
+        range.stales = 0;
+    }
+    registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    generation = GuestMemory::CollectWrites(address, bytes);
+    if (!range.kept) return {};
+    const auto found = range.entry;
+    if (found->second.registryGeneration != registryGeneration || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
+        eraseDrawSnapshot(found);
+        stale = true;
+        if (++range.stales >= DrawVramDemoteStales && range.stales * 2 > range.uses) {
+            range.demotedUntil = range.uses + DrawVramDemoteUses;
+            demoted = true;
+        }
+        return {};
+    }
+    auto& recency = drawSnapshotPools[SnapshotPool(SnapshotUse::Storage)].recency;
+    recency.splice(recency.end(), recency, found->second.recent);
+    return found->second.buffer;
 }
 
 void Recorder::OnComplete(std::function<void()> action) {

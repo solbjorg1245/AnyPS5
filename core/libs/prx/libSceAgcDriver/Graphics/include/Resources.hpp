@@ -231,6 +231,8 @@ inline bool DrawVramSnapshot(const DrawVramSettings& settings, std::size_t bytes
 // was out of date) or none was kept. A storage snapshot evicted for the cache's bounds.
 void NoteDrawVramUse(std::size_t bytes, bool hit, bool stale) noexcept;
 void NoteDrawVramEviction() noexcept;
+// A use of a range demoted for its stale snapshots (Recorder::DrawVramSnapshot), bound in place.
+void NoteDrawVramDemoted(std::size_t bytes) noexcept;
 // The [draw-vram] line, reset each call; empty while the switch is off.
 std::string DrawVramReport();
 
