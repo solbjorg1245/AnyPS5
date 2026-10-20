@@ -3771,6 +3771,92 @@ void dataRefreshTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 }
 
+// APS5_SET_MEMO (set at the start of main): a rebased hit whose words repeat the previous set copy
+// of its template in the open batch binds that set copy again; other words, another batch, a
+// registry change, a data refresh of the template and deferred flat slots beside a data copy each
+// make a set copy of their own.
+void setMemoTests(const Device& device, Recorder& recorder) {
+    if (!ShaderResources::SetMemo()) {
+        std::cout << "APS5_SET_MEMO off: set memo not tested\n";
+        return;
+    }
+    const auto& context = device.GetContext();
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.guestDescriptor = {1, 2, 3, 4};
+    program.bindings.push_back(binding);
+    auto moved = program;
+    moved.bindings[0].guestDescriptor[2] = 0x33;
+    auto other = program;
+    other.bindings[0].guestDescriptor[2] = 0x44;
+    auto deferred = moved;
+    deferred.bindings[0].deferredWords = {{1, 0x1000}};
+    const CompiledShader built{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    const CompiledShader first{ShaderRecompiler::ShaderStage::Compute, &moved, 0};
+    const CompiledShader second{ShaderRecompiler::ShaderStage::Compute, &other, 0};
+    const CompiledShader filled{ShaderRecompiler::ShaderStage::Compute, &deferred, 0};
+    {
+        auto memoContext = context;
+        DescriptorCache cache(memoContext);
+        memoContext.descriptorCache = &cache;
+        Recorder memoRecorder(memoContext);
+        memoRecorder.Activate();
+        ShaderResources resources(memoContext, built);
+        const auto setsMade = [&] { return cache.TransientCounters().sets + cache.Counters().sets; };
+        const auto prepare = [&](const CompiledShader& shader) { return resources.PrepareDrawBindings(memoRecorder, std::span<const CompiledShader>(&shader, 1)); };
+        // The data copy holds the draw's words (third word: `word`).
+        const auto holds = [](const std::shared_ptr<ShaderResources::DrawBindings>& bindings, std::uint32_t word) {
+            if (bindings == nullptr || bindings->dataCopies != 1 || bindings->snapshots.size() != 1) return false;
+            std::uint32_t words[4]{};
+            std::memcpy(words, bindings->snapshots[0].buffer->Bytes().data(), sizeof(words));
+            return words[0] == 1 && words[1] == 2 && words[2] == word && words[3] == 4;
+        };
+        Require(prepare(built) == nullptr, "a draw with the built words made a set copy");
+        auto sets = setsMade();
+        const auto a = prepare(first);
+        Require(holds(a, 0x33) && setsMade() == sets + 1, "a rebased data buffer was not copied into a set of its own");
+        Require(prepare(first) == a && setsMade() == sets + 1, "repeated words did not bind the kept set copy");
+        const auto b = prepare(second);
+        Require(holds(b, 0x44) && b != a && b->allocation.set != a->allocation.set && setsMade() == sets + 2, "other words bound the kept set copy");
+        Require(prepare(second) == b, "the second words' set copy was not kept");
+        const auto c = prepare(first);
+        Require(holds(c, 0x33) && c != a && setsMade() == sets + 3, "the memo answered words older than its last set copy");
+        // A set copy lives in its batch's transient pool: a new batch makes its own.
+        memoRecorder.Submit();
+        const auto d = prepare(first);
+        Require(holds(d, 0x33) && d != c && setsMade() == sets + 4, "a set copy of a submitted batch was bound again");
+        Require(prepare(first) == d, "the new batch's set copy was not kept");
+        // A registry mutation (generation) may have retired an in-place element's import.
+        {
+            GuestAllocations::Mutation mutation;
+        }
+        const auto e = prepare(first);
+        Require(holds(e, 0x33) && e != d, "a set copy outlived a registry mutation");
+        Require(prepare(first) == e, "the set copy made after the mutation was not kept");
+        // A data refresh of the template drops the memo (its data words changed).
+        Require(resources.RefreshData(memoRecorder.Commands(), second, &memoRecorder), "the template refresh recorded nothing");
+        Require(prepare(second) == nullptr, "a draw with the refreshed words made a set copy");
+        const auto f = prepare(first);
+        Require(holds(f, 0x33) && f != e, "a set copy outlived a data refresh of its template");
+        // Deferred flat slots fill a data copy on the CPU for its own draw: never kept or bound again.
+        sets = setsMade();
+        const auto g = prepare(filled);
+        const auto h = prepare(filled);
+        Require(holds(g, 0x33) && holds(h, 0x33) && g != h && setsMade() == sets + 2, "a data copy with deferred flat slots was bound again");
+        Require(prepare(first) != f, "a set copy beside deferred flat slots left the old memo");
+        memoRecorder.Submit();
+        device.WaitQueue();
+        memoRecorder.Sync();
+    }
+    recorder.Activate();
+    std::cout << "set memo checked\n";
+}
+
 }
 
 class SampleProgram {
@@ -7146,6 +7232,8 @@ void gpuTimingRecorderTests(const Device& device, Recorder& recorder) {
 }
 
 int main() {
+    // APS5_SET_MEMO (read once): the draw tests below run with the set memo, setMemoTests checks it.
+    _putenv_s("APS5_SET_MEMO", "1");
     try {
         gpuTimingDigestTests();
         retileRowDigestTests();
@@ -7199,6 +7287,7 @@ int main() {
         contentKeyIntoTests();
         resultCopyCostTests();
         dataRefreshTests(device, recorder);
+        setMemoTests(device, recorder);
         minLodTests(device, recorder);
         firstLayerViewTests(device, recorder);
         metadataPassTests(device, recorder);

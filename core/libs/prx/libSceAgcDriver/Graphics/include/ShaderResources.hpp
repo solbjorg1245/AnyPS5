@@ -221,6 +221,21 @@ public:
     // overwrite the range before the batch ran, which the game's own fences keep (the copy HLE
     // refuses its CPU path on a noted read); APS5_FLIP_READ_CHECK=1 checks it at the flip.
     static bool InPlaceBindings();
+    // APS5_SET_MEMO=1 (P-SETMEMO, default off; the old path otherwise): a draw whose words repeat
+    // the previous set copy of this template in the open batch binds that set copy again
+    // (PrepareDrawBindings returns those very bindings, which the batch keeps already): no select,
+    // allocate, copy or write. The memo answers only in the batch it was made in (its transient set
+    // lives that long), under the registry generation and import epoch it was made under (every
+    // in-place element's import is still the one a lookup finds, and alive), while its bindings
+    // live, for the same words of every binding a set copy reads (guest buffers and data buffers).
+    // A set copy with guest snapshots, or with data copies while a stage fills deferred flat slots
+    // (recordDeferredFlat writes those on the CPU), is never kept; RefreshData, an adoption and
+    // rebaseLease drop the memo with ForkData's. APS5_SET_MEMO_VERIFY=1: a hit also makes the set
+    // copy the old way and compares the two (the fresh one is bound).
+    static bool SetMemo();
+    // The [draws] set memo line (APS5_PROFILE_DRAW, under APS5_SET_MEMO): hits, kept and not kept
+    // set copies, misses by reason and the verify counts over the window.
+    static void ReportSetMemo();
     // The data buffer a draw binds at Vulkan binding `vulkanBinding` (a ShaderData/FlattenedSrt
     // role): the snapshot PrepareDrawBindings made for it (`hostBytes` then points at its mapped
     // bytes, which only this draw uses), else the object's own (`hostBytes` null); VK_NULL_HANDLE
@@ -709,6 +724,31 @@ private:
         std::vector<std::uint32_t> words;
     };
     ForkMemo lastFork;
+    // PrepareDrawBindings' memo (APS5_SET_MEMO), under GuestMemory::GpuMutex (every draw records
+    // under it): the batch it serves (recorder, serial), the registry generation and import epoch
+    // after its lookups, the bindings (the batch keeps them; expired: none), whether they hold data
+    // copies, and the words of every source binding (setMemoSources) with their lengths. Under
+    // APS5_SET_MEMO_VERIFY also the selected elements and their descriptors.
+    struct DrawSetMemo {
+        const Recorder* recorder = nullptr;
+        std::uint64_t serial = 0;
+        std::uint64_t generation = 0;
+        std::uint64_t epoch = 0;
+        std::weak_ptr<DrawBindings> bindings;
+        bool dataCopies = false;
+        std::vector<std::uint32_t> words;
+        std::vector<std::uint32_t> lengths;
+        std::vector<std::size_t> selected;
+        std::vector<VkDescriptorBufferInfo> infos;
+    };
+    mutable DrawSetMemo drawSetMemo;
+    // The (stage, binding) pairs a set copy reads words from (each guest and data buffer's source),
+    // listed at the first kept set copy.
+    mutable std::vector<std::pair<std::int32_t, std::uint32_t>> setMemoSources;
+    mutable bool setMemoSourcesListed = false;
+    std::shared_ptr<DrawBindings> setMemoHit(const Recorder& recorder, std::span<const CompiledShader> shaders) const;
+    void setMemoKeep(const Recorder& recorder, std::span<const CompiledShader> shaders, const std::shared_ptr<DrawBindings>& result, std::span<const std::size_t> selected, std::span<const VkDescriptorBufferInfo> infos) const;
+    void setMemoVerify(const DrawBindings& memo, const DrawBindings* fresh, std::span<const std::size_t> selected, std::span<const VkDescriptorBufferInfo> infos) const;
     BuildTiming timing;
     // Build state carried from stage A to stage B: the bindings in plan order, the image bindings
     // still to look up (index into `bindings`; the DescriptorBinding lives in the compiled shader),
