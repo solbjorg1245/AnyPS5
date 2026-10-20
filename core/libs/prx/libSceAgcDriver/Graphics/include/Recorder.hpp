@@ -453,7 +453,9 @@ public:
     // are only copies) is demoted for DrawVramDemoteUses uses: `demoted` is set and the caller binds
     // it in place. Otherwise the range is collected first (`generation`, `registryGeneration` for a
     // new snapshot's KeepDrawSnapshot) and the kept snapshot returned when it is current; `stale`
-    // tells a dropped out-of-date one from none kept.
+    // tells a dropped out-of-date one from none kept. A kept snapshot validated or copied in the
+    // calling thread's current collect epoch, with no block stamped since (GuestMemory::StampSerial),
+    // is returned without a collect (APS5_DRAW_VRAM_EPOCH=0: every use collects).
     static constexpr std::uint32_t DrawVramDemoteStales = 4;
     static constexpr std::uint32_t DrawVramDemoteUses = 256;
     std::shared_ptr<Buffer> DrawVramSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t& generation, std::uint64_t& registryGeneration, bool& demoted, bool& stale);
@@ -1340,6 +1342,9 @@ private:
         std::uint32_t uses = 0;
         std::uint32_t stales = 0;
         std::uint32_t demotedUntil = 0;
+        // The collect epoch and StampSerial of its last collect (epoch 0: none to reuse).
+        std::uint64_t epoch = 0;
+        std::uint64_t serial = 0;
     };
     struct DrawVramRangeHash {
         std::size_t operator()(const std::pair<std::uint64_t, std::size_t>& range) const noexcept {

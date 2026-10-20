@@ -108,6 +108,8 @@ std::atomic<int> guardedPagesAsHoles{-1};
 std::atomic<std::uint64_t> collectMemoHits{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
+// Block stamps made (StampSerial).
+std::atomic<std::uint64_t> stampSerial{0};
 // What a collect memo entry is valid under: the unwatch serial plus, on Windows, the arena's mapping
 // serial. A page mapped (or committed over a placeholder) after a walk holds bytes no write made,
 // reported by the next walk only: a memo hit in the same epoch hid it, and a texture snapshot read
@@ -1091,6 +1093,7 @@ struct WriteTracker {
     }
 
     void stamp(std::uint64_t block, std::uint32_t stampGeneration, StampKind kind) {
+        stampSerial.fetch_add(1, std::memory_order_release);
         const bool cpu = kind != StampKind::Driver;
         const bool written = kind != StampKind::ImportWindow;
 #ifdef _WIN32
@@ -2252,6 +2255,11 @@ void ArmEdgeWatch(std::uint64_t address, std::size_t bytes) {
 #else
 void ArmEdgeWatch(std::uint64_t, std::size_t) {}
 #endif
+
+std::uint64_t StampSerial() {
+    // Both only grow, so the sum changes whenever either does.
+    return stampSerial.load(std::memory_order_acquire) + memoSerial(std::memory_order_acquire);
+}
 
 std::uint64_t TrackerGeneration() {
     auto& tracker = Tracker();

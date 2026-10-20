@@ -3922,7 +3922,23 @@ std::shared_ptr<Buffer> Recorder::DrawVramSnapshot(std::uint64_t address, std::s
         range.stales = 0;
     }
     registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    static const bool epochReuse = [] {
+        const char* value = std::getenv("APS5_DRAW_VRAM_EPOCH");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    // Read before the collect: a stamp made during it lapses the record.
+    const auto epoch = epochReuse ? GuestMemory::ThreadCollectEpoch() : 0;
+    const auto serial = epoch != 0 ? GuestMemory::StampSerial() : 0;
+    if (epoch != 0 && range.kept && range.epoch == epoch && range.serial == serial && range.entry->second.registryGeneration == registryGeneration) {
+        NoteDrawVramUncollected();
+        generation = range.entry->second.generation;
+        auto& recency = drawSnapshotPools[SnapshotPool(SnapshotUse::Storage)].recency;
+        recency.splice(recency.end(), recency, range.entry->second.recent);
+        return range.entry->second.buffer;
+    }
     generation = GuestMemory::CollectWrites(address, bytes);
+    range.epoch = epoch;
+    range.serial = serial;
     if (!range.kept) return {};
     const auto found = range.entry;
     if (found->second.registryGeneration != registryGeneration || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {

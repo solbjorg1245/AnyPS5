@@ -2359,6 +2359,8 @@ void drawVramSnapshotTests(const Device& device) {
     constexpr std::size_t size = 4096;
     Recorder cache(device.GetContext());
     const auto buffer = std::make_shared<Buffer>(device.GetContext(), 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    // A fresh epoch per collect until the epoch part below.
+    ResetCollectEpoch();
     std::uint64_t generation = 0;
     std::uint64_t registry = 0;
     bool demoted = false;
@@ -2387,6 +2389,16 @@ void drawVramSnapshotTests(const Device& device) {
     Require(use() == nullptr && !demoted && !stale && generation != 0, "a demoted range was not tried again");
     cache.KeepDrawSnapshot(address, size, generation, registry, buffer);
     Require(use() == buffer && !demoted, "the range tried again does not serve its new snapshot");
+    BumpCollectEpoch();
+    Require(use() == buffer && use() == buffer && generation != 0, "a snapshot validated in this epoch was not served again");
+    MarkWritten(address + 64, 4);
+    Require(use() == nullptr && stale, "a snapshot outlived a driver store in its epoch");
+    cache.KeepDrawSnapshot(address, size, generation, registry, buffer);
+    Require(use() == buffer, "the snapshot copied in this epoch was not served");
+    BumpCollectEpoch();
+    guest[6] = std::byte{0x5a};
+    Require(use() == nullptr && stale, "a snapshot outlived a CPU store across epochs");
+    ResetCollectEpoch();
 }
 
 void drawInputReuseTests(const Device& device, Recorder& recorder) {

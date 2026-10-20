@@ -233,6 +233,8 @@ void NoteDrawVramUse(std::size_t bytes, bool hit, bool stale) noexcept;
 void NoteDrawVramEviction() noexcept;
 // A use of a range demoted for its stale snapshots (Recorder::DrawVramSnapshot), bound in place.
 void NoteDrawVramDemoted(std::size_t bytes) noexcept;
+// A kept snapshot served without a collect (same collect epoch, no stamps since).
+void NoteDrawVramUncollected() noexcept;
 // The [draw-vram] line, reset each call; empty while the switch is off.
 std::string DrawVramReport();
 

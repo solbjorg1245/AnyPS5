@@ -278,7 +278,7 @@ namespace {
 constexpr std::size_t DrawVramClasses = 4;
 struct DrawVramCounters {
     std::array<std::atomic<std::uint64_t>, DrawVramClasses> hits{}, misses{}, missBytes{}, useBytes{};
-    std::atomic<std::uint64_t> stale{0}, evicted{0}, demoted{0}, demotedBytes{0};
+    std::atomic<std::uint64_t> stale{0}, evicted{0}, demoted{0}, demotedBytes{0}, uncollected{0};
 };
 
 DrawVramCounters& drawVramCounters() {
@@ -332,6 +332,10 @@ void NoteDrawVramEviction() noexcept {
     drawVramCounters().evicted.fetch_add(1, std::memory_order_relaxed);
 }
 
+void NoteDrawVramUncollected() noexcept {
+    drawVramCounters().uncollected.fetch_add(1, std::memory_order_relaxed);
+}
+
 void NoteDrawVramDemoted(std::size_t bytes) noexcept {
     auto& counters = drawVramCounters();
     counters.demoted.fetch_add(1, std::memory_order_relaxed);
@@ -356,7 +360,8 @@ std::string DrawVramReport() {
     const auto evicted = counters.evicted.exchange(0, std::memory_order_relaxed);
     const auto demoted = counters.demoted.exchange(0, std::memory_order_relaxed);
     const auto demotedBytes = counters.demotedBytes.exchange(0, std::memory_order_relaxed);
-    if (n > 0 && static_cast<std::size_t>(n) < sizeof(text)) std::snprintf(text + n, sizeof(text) - static_cast<std::size_t>(n), "; misses over a stale snapshot %llu, evicted for the bounds %llu; uses in place for stale snapshots (demoted) %llu (%.0f MiB)", static_cast<unsigned long long>(stale), static_cast<unsigned long long>(evicted), static_cast<unsigned long long>(demoted), static_cast<double>(demotedBytes) / 1048576.0);
+    const auto uncollected = counters.uncollected.exchange(0, std::memory_order_relaxed);
+    if (n > 0 && static_cast<std::size_t>(n) < sizeof(text)) std::snprintf(text + n, sizeof(text) - static_cast<std::size_t>(n), "; misses over a stale snapshot %llu, evicted for the bounds %llu; uses in place for stale snapshots (demoted) %llu (%.0f MiB); hits without a collect (same epoch, no stamps) %llu", static_cast<unsigned long long>(stale), static_cast<unsigned long long>(evicted), static_cast<unsigned long long>(demoted), static_cast<double>(demotedBytes) / 1048576.0, static_cast<unsigned long long>(uncollected));
     return text;
 }
 

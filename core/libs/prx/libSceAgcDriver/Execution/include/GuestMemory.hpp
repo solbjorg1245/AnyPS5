@@ -153,6 +153,12 @@ std::uint64_t CollectEpochBumps();
 std::uint64_t ThreadCollectEpoch();
 void ResetCollectEpoch();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
+// Changes whenever the tracker stamps a block (a collect that found written pages, a driver store,
+// an import window) or a collect memo entry would lapse (memoSerial: an unwatch, a mapping). While
+// it and the calling thread's collect epoch (non-zero) stay the same, a range collected and found
+// unchanged in that epoch still is: what a collect memo hit followed by UnchangedSince answers,
+// without the tracker lock (APS5_DRAW_VRAM, Recorder::DrawVramSnapshot).
+std::uint64_t StampSerial();
 // The tracker's current generation (every collect and MarkWritten bumps it): a stamp taken after
 // a set of driver stores, for UnchangedSinceCollected to compare against later. Read under the
 // tracker mutex, so every collect that bumped before it has finished its walk and every later
