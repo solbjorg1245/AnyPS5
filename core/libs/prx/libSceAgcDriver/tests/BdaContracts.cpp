@@ -2,8 +2,21 @@
 #include "ControlFlow/RequestSerializer.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
 #include <array>
+#include <string>
 
 namespace {
+
+// Instructions with the opcode (OpVariable: of the storage class) in a SPIR-V module.
+std::size_t countInstructions(const std::vector<std::uint32_t>& code, spv::Op opcode, std::uint32_t storage = 0xffffffffu) {
+    std::size_t found = 0;
+    for (std::size_t offset = 5; offset < code.size();) {
+        const auto words = code[offset] >> spv::WordCountShift;
+        if (words == 0) break;
+        if ((code[offset] & spv::OpCodeMask) == static_cast<std::uint32_t>(opcode) && (storage == 0xffffffffu || (words > 3 && code[offset + 3] == storage))) ++found;
+        offset += words;
+    }
+    return found;
+}
 
 template<typename TAction>
 void reject(TAction action, const char* expected) {
@@ -56,4 +69,17 @@ void RunBdaContractTests() {
     invalid[0] = invalid[0] == 'A' ? 'B' : 'A';
     reject([&] { static_cast<void>(serializer.Deserialize(invalid)); }, "request signature");
     reject([&] { static_cast<void>(serializer.Deserialize("NVNQQWMAAAA=")); }, "serialization version");
+    // APS5_SPIRV_BDA_UNIFORM: the Private lookup state of each stage (header check and count from 1, the
+    // last range from 2) and the subgroup search of stage 3, which needs subgroup ballots.
+    const std::array<BdaTestAccess, 2> accesses{{{0x7fff12300000ULL, 4}, {0x7fff12300040ULL, 0}}};
+    for (std::uint32_t stage = 0; stage <= 3; ++stage) {
+        SetBdaUniformStageForTests(static_cast<int>(stage));
+        for (const bool uniform : {false, true}) {
+            const auto code = MakeBdaLookupTestShader(accesses, 32, uniform);
+            AgcDriver::Graphics::Require(countInstructions(code, spv::OpVariable, spv::StorageClassPrivate) == (stage == 0 ? 0u : stage == 1 ? 2u : 6u), "BDA lookup state does not match APS5_SPIRV_BDA_UNIFORM stage " + std::to_string(stage));
+            AgcDriver::Graphics::Require((countInstructions(code, spv::OpGroupNonUniformBroadcastFirst) != 0) == (stage == 3), "BDA subgroup search does not match APS5_SPIRV_BDA_UNIFORM stage " + std::to_string(stage));
+        }
+    }
+    AgcDriver::Graphics::Require(countInstructions(MakeBdaLookupTestShader(accesses, 32, true, false), spv::OpGroupNonUniformBroadcastFirst) == 0, "BDA subgroup search emitted without subgroup ballots");
+    SetBdaUniformStageForTests(-1);
 }

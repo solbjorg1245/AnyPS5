@@ -104,6 +104,17 @@ struct SpirvEmitterState {
     std::uint32_t bdaProbeFunction = 0;
     std::uint32_t bdaWritePointerFunction = 0;
     std::uint32_t bdaNoteWriteFunction = 0;
+    // APS5_SPIRV_BDA_UNIFORM (see BdaUniformStage): the stage this program uses, its Private lookup state
+    // (header check, range count, last range: begin, end, device base, permissions), the lookups that
+    // search once per subgroup (stage 3) and the wave-uniform IR values that pick them.
+    std::uint32_t bdaUniformStage = 0;
+    std::uint32_t bdaTableStateVariable = 0;
+    std::uint32_t bdaTableCountVariable = 0;
+    std::array<std::uint32_t, 4> bdaLastRangeVariables {};
+    std::uint32_t bdaUniformPointerFunction = 0;
+    std::uint32_t bdaUniformProbeFunction = 0;
+    std::uint32_t bdaUniformWritePointerFunction = 0;
+    std::unordered_set<const IrValue*> bdaUniformValues;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).
     bool bdaStopsInvocations = true;
     // Execution scope of the barriers that keep one guest wave's LDS accesses in program order across

@@ -12,6 +12,7 @@
 #include <list>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
@@ -290,7 +291,22 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             ++it;
         }
     }
-    table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    // APS5_BDA_TABLE_VRAM=1 (default off): the table in host-visible video memory (ReBAR or the BAR
+    // window), where every address-based access's lookup reads it; host memory when no such type exists.
+    constexpr VkMemoryPropertyFlags videoHost = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    static const bool tableInVideoMemory = [&] {
+        const char* value = std::getenv("APS5_BDA_TABLE_VRAM");
+        if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) return false;
+        try {
+            static_cast<void>(context.MemoryType(~0u, videoHost));
+        } catch (const std::runtime_error&) {
+            std::fprintf(stderr, "[bda] APS5_BDA_TABLE_VRAM: no host-visible video memory, page tables stay in host memory\n");
+            return false;
+        }
+        std::fprintf(stderr, "[bda] APS5_BDA_TABLE_VRAM: page tables in host-visible video memory\n");
+        return true;
+    }();
+    table = tableInVideoMemory ? std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, videoHost) : std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), 0};
     std::memcpy(table->Bytes().data(), &header, sizeof(header));
     if (!ranges.empty()) std::memcpy(table->Bytes().data() + sizeof(header), ranges.data(), ranges.size() * sizeof(ranges.front()));
