@@ -191,7 +191,11 @@ void ReportPoolPoison();
 // snapshots instead of the import. What stays in host memory: a draw build's descriptor regions,
 // GPU-side indirect arguments, BDA (address-based) reads, written regions, transfers. The [vram]
 // line counts the video-memory host buffers made (APS5_PROFILE_DRAW).
-enum VramFloorPart : unsigned { VramFloorBar = 1, VramFloorDispatchReads = 2, VramFloorDrawInputs = 4, VramFloorDrawBindings = 8, VramFloorAll = 15 };
+// 16 (VramFloorBdaSpaces, s64 P-BDAVRAM; only when the mask names it, never with 1, 2 or 15): a
+// dispatch build's address space maps its read-only ranges to device-local copies refreshed from
+// the import by a GPU copy, without CPU write tracking (stale between refreshes; GuestBufferMemory.cpp
+// BdaFloorCopy). VramFloorKnown masks APS5_VRAM_FLOOR_PARTS; the default (all) stays 15.
+enum VramFloorPart : unsigned { VramFloorBar = 1, VramFloorDispatchReads = 2, VramFloorDrawInputs = 4, VramFloorDrawBindings = 8, VramFloorAll = 15, VramFloorBdaSpaces = 16, VramFloorKnown = 31 };
 // The parts from the two variables' values (either may be null): 0 while the first is unset or 0.
 unsigned VramFloorPartsFrom(const char* enabled, const char* parts);
 bool VramFloor(unsigned part);

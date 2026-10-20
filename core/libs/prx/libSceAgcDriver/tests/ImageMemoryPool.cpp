@@ -67,5 +67,7 @@ void RunImageMemoryPoolTests() {
     using AgcDriver::Graphics::VramFloorPartsFrom;
     require(VramFloorPartsFrom(nullptr, "3") == 0 && VramFloorPartsFrom("0", nullptr) == 0 && VramFloorPartsFrom("", "1") == 0, "vram floor off");
     require(VramFloorPartsFrom("1", nullptr) == AgcDriver::Graphics::VramFloorAll && VramFloorPartsFrom("1", "") == AgcDriver::Graphics::VramFloorAll, "vram floor all parts");
-    require(VramFloorPartsFrom("1", "5") == 5u && VramFloorPartsFrom("1", "0x8") == 8u && VramFloorPartsFrom("1", "0x30") == 0u, "vram floor parts mask");
+    require(VramFloorPartsFrom("1", "5") == 5u && VramFloorPartsFrom("1", "0x8") == 8u && VramFloorPartsFrom("1", "0x60") == 0u, "vram floor parts mask");
+    // Part 16 (VramFloorBdaSpaces) only when the mask names it, never among the default parts.
+    require(VramFloorPartsFrom("1", "16") == AgcDriver::Graphics::VramFloorBdaSpaces && VramFloorPartsFrom("1", "0x30") == 16u && (VramFloorPartsFrom("1", nullptr) & AgcDriver::Graphics::VramFloorBdaSpaces) == 0, "vram floor part 16");
 }

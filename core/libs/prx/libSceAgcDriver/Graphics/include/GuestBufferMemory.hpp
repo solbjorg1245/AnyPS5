@@ -788,6 +788,9 @@ private:
     // through the import (a draw build, a descriptor inside or a span over one): it binds the
     // space's import table (AddressSpace::importRanges) and notes those ranges as read in place.
     bool residentUnsplit = false;
+    // APS5_VRAM_FLOOR part 16 (experiment): this dispatch build binds the space's floor table
+    // (AddressSpace::floorRanges), whose copies each recorded use refreshes (RecheckResidentReads).
+    bool floorBound = false;
     // NoteAddressStores: the table maps resident written ranges writable and the program may store
     // through it (each use queues their lands).
     bool residentMappedStores = false;

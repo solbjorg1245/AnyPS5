@@ -239,7 +239,7 @@ VramFloorCounters& vramFloorCounters() {
 unsigned VramFloorPartsFrom(const char* enabled, const char* parts) {
     if (enabled == nullptr || *enabled == '\0' || std::strcmp(enabled, "0") == 0) return 0;
     if (parts == nullptr || *parts == '\0') return VramFloorAll;
-    return static_cast<unsigned>(std::strtoul(parts, nullptr, 0)) & VramFloorAll;
+    return static_cast<unsigned>(std::strtoul(parts, nullptr, 0)) & VramFloorKnown;
 }
 
 bool VramFloor(unsigned part) {
@@ -259,14 +259,14 @@ void NoteVramFloorBuffer(std::uint64_t bytes, bool placed) noexcept {
 }
 
 std::string VramFloorReport() {
-    if (!VramFloor(VramFloorAll)) return {};
+    if (!VramFloor(VramFloorKnown)) return {};
     auto& counters = vramFloorCounters();
     const auto placed = counters.placed.exchange(0, std::memory_order_relaxed);
     const auto placedBytes = counters.placedBytes.exchange(0, std::memory_order_relaxed);
     const auto fellBack = counters.fellBack.exchange(0, std::memory_order_relaxed);
     const auto fellBackBytes = counters.fellBackBytes.exchange(0, std::memory_order_relaxed);
     unsigned parts = 0;
-    for (unsigned part = 1; part <= VramFloorAll; part <<= 1u) parts |= VramFloor(part) ? part : 0u;
+    for (unsigned part = 1; part <= VramFloorKnown; part <<= 1u) parts |= VramFloor(part) ? part : 0u;
     char text[256];
     std::snprintf(text, sizeof(text), "; floor (APS5_VRAM_FLOOR parts 0x%x): video-memory host buffers made %llu (%.0f MiB), fell back to host memory %llu (%.0f MiB)", parts, static_cast<unsigned long long>(placed), static_cast<double>(placedBytes) / 1048576.0, static_cast<unsigned long long>(fellBack), static_cast<double>(fellBackBytes) / 1048576.0);
     return text;

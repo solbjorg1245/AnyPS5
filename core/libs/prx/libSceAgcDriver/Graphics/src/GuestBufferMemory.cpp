@@ -67,6 +67,22 @@ struct ImageMirror {
     std::uint64_t serial = 0;
 };
 
+// APS5_VRAM_FLOOR part 16 (see bdaFloorTable): a device-local copy of one read-only base range of
+// the address space, filled from its import or mirror by a GPU copy (refreshBdaFloor), shared by
+// the spaces mapping the same range from the same source; the last refresh (recorder, its
+// submission count, the time).
+struct BdaFloorCopy {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    VkBuffer source = VK_NULL_HANDLE;
+    std::uint64_t sourceBase = 0;
+    std::shared_ptr<Buffer> buffer;
+    bool filled = false;
+    const Recorder* refreshedBy = nullptr;
+    std::uint64_t refreshedAt = 0;
+    std::chrono::steady_clock::time_point refreshedTime {};
+};
+
 // The address space. An address-based build maps every readable registered range; building that
 // list per build (the lease's ~1200 shared_ptrs, an import lookup per range, the sort and merge, the
 // upload loop, the BDA table) repeated the same result while the registry stood still. One space is
@@ -115,6 +131,12 @@ struct GuestBufferMemory::AddressSpace {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> residentHoles;
     std::vector<ShaderRecompiler::BdaAbi::Range> importRanges;
     std::uint64_t importSerial = 0;
+    // APS5_VRAM_FLOOR part 16 (experiment, never default): the copies of the read-only base ranges
+    // and the table mapping each to its copy instead of the import or mirror, with its own serial
+    // (empty: none). Bound by a dispatch build alone (floorBound).
+    std::vector<std::shared_ptr<BdaFloorCopy>> floorCopies;
+    std::vector<ShaderRecompiler::BdaAbi::Range> floorRanges;
+    std::uint64_t floorSerial = 0;
 };
 
 namespace {
@@ -161,6 +183,21 @@ std::vector<std::shared_ptr<ResidentWrite>> residentSpaceRanges(std::uint64_t& e
 bool residentWritesOverAny(std::uint64_t begin, std::uint64_t end);
 bool residentWritesWritable();
 void splitResidentEntry(VkBuffer import, std::uint64_t importBase, const std::vector<std::shared_ptr<ResidentWrite>>& live, std::vector<ShaderRecompiler::BdaAbi::Range>& ranges, std::vector<std::shared_ptr<ResidentWrite>>& mapped, std::vector<std::pair<std::uint64_t, std::uint64_t>>& holes, std::vector<std::shared_ptr<ResidentWrite>>* writable);
+
+// APS5_VRAM_FLOOR part 16 (defined with the staging buffers): whether it is on, a base range a new
+// space could map to a copy (`entry` of its table), the copies and floor table of a new space, and
+// the part of the [address] line.
+struct BdaFloorWanted {
+    std::size_t entry;
+    std::uint64_t begin;
+    std::uint64_t end;
+    VkBuffer source;
+    std::uint64_t sourceBase;
+    bool mirror;
+};
+bool bdaFloorEnabled();
+void bdaFloorTable(const Context& context, std::vector<BdaFloorWanted>& wanted, const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges, std::vector<ShaderRecompiler::BdaAbi::Range>& floorRanges, std::vector<std::shared_ptr<BdaFloorCopy>>& copies);
+std::string bdaFloorReport();
 
 bool addressSpaceCacheEnabled() {
     static const bool disabled = std::getenv("APS5_NO_ADDRESS_SPACE_CACHE") != nullptr;
@@ -1690,7 +1727,7 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
     const auto rearmProof = static_cast<unsigned long long>(Spaces().rearmProof.exchange(0, std::memory_order_relaxed));
     const auto rearmRebase = static_cast<unsigned long long>(Spaces().rearmRebase.exchange(0, std::memory_order_relaxed));
     const auto rebased = static_cast<unsigned long long>(Spaces().rebased.exchange(0, std::memory_order_relaxed));
-    std::fprintf(stderr, "[address] %llu address-based builds (10 s), us per build: lease %.0f, imports pass %.0f, mirror prepare %.0f, compare %.0f (%.0f blocks, %.1f copied), snapshots %.0f; space hits %llu / rebuilds: generation %llu, epoch %llu, device %llu, waiter drop %llu, first %llu; unpublished %llu, dissolved: overlap %llu, imports %llu%s, spanned %llu (span imports %llu, refused %llu); lease reuse: rearmed %llu (rebased %llu), refused: busy %llu, space %llu, proof %llu, rebase %llu; [bda-table] hits %llu / misses %llu (space tables %llu), first entry: expired %llu, hash differs low %llu / heap %llu, same hash %llu, none held %llu\n", static_cast<unsigned long long>(totals.builds), per(totals.sums.leaseUs), per(totals.sums.importsUs), per(totals.sums.mirrorsUs), per(totals.sums.compareUs), per(static_cast<double>(totals.sums.blocksCompared)), per(static_cast<double>(totals.sums.blocksCopied)), per(totals.snapshotsUs), delta(space.hits, spaceSeen.hits), delta(space.rebuiltGeneration, spaceSeen.rebuiltGeneration), delta(space.rebuiltEpoch, spaceSeen.rebuiltEpoch), delta(space.rebuiltDevice, spaceSeen.rebuiltDevice), delta(space.rebuiltWaiterDrop, spaceSeen.rebuiltWaiterDrop), delta(space.rebuiltFirst, spaceSeen.rebuiltFirst), delta(space.unpublished, spaceSeen.unpublished), delta(space.dissolvedOverlap, spaceSeen.dissolvedOverlap), delta(space.dissolvedImports, spaceSeen.dissolvedImports), space.enabled ? "" : " (cache off)", spanned, spanImports, spanFailures, rearmed, rebased, rearmBusy, rearmSpace, rearmProof, rearmRebase, delta(table.hits, seen.hits), delta(table.misses, seen.misses), delta(table.spaceTables, seen.spaceTables), delta(table.firstExpired, seen.firstExpired), delta(table.firstDiffersLow, seen.firstDiffersLow), delta(table.firstDiffersHeap, seen.firstDiffersHeap), delta(table.firstSameHash, seen.firstSameHash), delta(table.firstEmpty, seen.firstEmpty));
+    std::fprintf(stderr, "[address] %llu address-based builds (10 s), us per build: lease %.0f, imports pass %.0f, mirror prepare %.0f, compare %.0f (%.0f blocks, %.1f copied), snapshots %.0f; space hits %llu / rebuilds: generation %llu, epoch %llu, device %llu, waiter drop %llu, first %llu; unpublished %llu, dissolved: overlap %llu, imports %llu%s, spanned %llu (span imports %llu, refused %llu); lease reuse: rearmed %llu (rebased %llu), refused: busy %llu, space %llu, proof %llu, rebase %llu; [bda-table] hits %llu / misses %llu (space tables %llu), first entry: expired %llu, hash differs low %llu / heap %llu, same hash %llu, none held %llu%s\n", static_cast<unsigned long long>(totals.builds), per(totals.sums.leaseUs), per(totals.sums.importsUs), per(totals.sums.mirrorsUs), per(totals.sums.compareUs), per(static_cast<double>(totals.sums.blocksCompared)), per(static_cast<double>(totals.sums.blocksCopied)), per(totals.snapshotsUs), delta(space.hits, spaceSeen.hits), delta(space.rebuiltGeneration, spaceSeen.rebuiltGeneration), delta(space.rebuiltEpoch, spaceSeen.rebuiltEpoch), delta(space.rebuiltDevice, spaceSeen.rebuiltDevice), delta(space.rebuiltWaiterDrop, spaceSeen.rebuiltWaiterDrop), delta(space.rebuiltFirst, spaceSeen.rebuiltFirst), delta(space.unpublished, spaceSeen.unpublished), delta(space.dissolvedOverlap, spaceSeen.dissolvedOverlap), delta(space.dissolvedImports, spaceSeen.dissolvedImports), space.enabled ? "" : " (cache off)", spanned, spanImports, spanFailures, rearmed, rebased, rearmBusy, rearmSpace, rearmProof, rearmRebase, delta(table.hits, seen.hits), delta(table.misses, seen.misses), delta(table.spaceTables, seen.spaceTables), delta(table.firstExpired, seen.firstExpired), delta(table.firstDiffersLow, seen.firstDiffersLow), delta(table.firstDiffersHeap, seen.firstDiffersHeap), delta(table.firstSameHash, seen.firstSameHash), delta(table.firstEmpty, seen.firstEmpty), bdaFloorReport().c_str());
     totals.tableSeen = table;
     totals.spaceSeen = space;
     totals.builds = 0;
@@ -1839,6 +1876,9 @@ void GuestBufferMemory::AcquireRegistered() {
             std::vector<std::shared_ptr<ResidentWrite>> residentWritable;
             std::vector<std::pair<std::uint64_t, std::uint64_t>> residentHoles;
             std::vector<ShaderRecompiler::BdaAbi::Range> importRanges;
+            // APS5_VRAM_FLOOR part 16: the read-only entries the space may map to copies.
+            const bool floorOn = bdaFloorEnabled();
+            std::vector<BdaFloorWanted> floorWanted;
             {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
@@ -1849,10 +1889,18 @@ void GuestBufferMemory::AcquireRegistered() {
                     for (const auto& region : regions) {
                         if (region.direct == nullptr && region.mirror == nullptr) continue;
                         ranges.push_back(addressRange(region));
-                        if (residentLive.empty()) continue;
-                        importRanges.push_back(ranges.back());
-                        // A writable entry too (S7c, APS5_RESIDENT_WRITES_WRITABLE): R maps to D Read|Write.
-                        if (region.direct != nullptr && (!region.writable || residentWritesWritable()) && !region.span) splitResidentEntry(region.direct->buffer, region.direct->base, residentLive, ranges, residentMapped, residentHoles, region.writable ? &residentWritable : nullptr);
+                        const auto entry = ranges.size() - 1;
+                        const auto whole = ranges.back();
+                        if (!residentLive.empty()) {
+                            importRanges.push_back(ranges.back());
+                            // A writable entry too (S7c, APS5_RESIDENT_WRITES_WRITABLE): R maps to D Read|Write.
+                            if (region.direct != nullptr && (!region.writable || residentWritesWritable()) && !region.span) splitResidentEntry(region.direct->buffer, region.direct->base, residentLive, ranges, residentMapped, residentHoles, region.writable ? &residentWritable : nullptr);
+                        }
+                        // APS5_VRAM_FLOOR part 16: a read-only entry the split left whole.
+                        if (floorOn && !region.writable && !region.span && ranges.size() == entry + 1 && ranges[entry].deviceAddress == whole.deviceAddress && (region.direct != nullptr || !region.mirror->writable)) {
+                            if (region.direct != nullptr) floorWanted.push_back({entry, region.begin, region.end, region.direct->buffer, region.direct->base, false});
+                            else floorWanted.push_back({entry, region.begin, region.end, region.mirror->buffer->Handle(), region.mirror->base, true});
+                        }
                     }
                 }
             }
@@ -1872,6 +1920,11 @@ void GuestBufferMemory::AcquireRegistered() {
                     built->residentHoles = std::move(residentHoles);
                     built->importRanges = std::move(importRanges);
                     built->importSerial = spaces.serials.fetch_add(1, std::memory_order_relaxed) + 1;
+                }
+                if (!floorWanted.empty()) {
+                    bdaFloorTable(context, floorWanted, built->ranges, built->floorRanges, built->floorCopies);
+                    if (!built->floorCopies.empty()) built->floorSerial = spaces.serials.fetch_add(1, std::memory_order_relaxed) + 1;
+                    else built->floorRanges.clear();
                 }
                 std::vector<Region> extras;
                 for (auto& region : regions) {
@@ -2413,6 +2466,202 @@ std::shared_ptr<Buffer> stagingBuffer(const Context& context, std::size_t bytes,
         Copies().stagingRefused.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
+}
+
+// APS5_VRAM_FLOOR part 16 (experiment, s64 P-BDAVRAM; Resources.hpp VramFloorBdaSpaces): the floor
+// of host-memory latency in address-based programs. A new address space maps each read-only base
+// range (an import or a read-only mirror, not split around resident written ranges) to a
+// device-local copy, smallest first within APS5_VRAM_FLOOR_BDA_MIB (default 1024; 0 lists the
+// ranges and maps none), shared by the spaces mapping the same range from the same source. Only a
+// dispatch build binds that table (floorBound); each recorded use refreshes the copies by a GPU
+// copy from the source into the open batch, once per batch (APS5_VRAM_FLOOR_BDA_MS=N: at most every
+// N ms). No CPU write tracking and no flush of queued stores: a copy may be stale until its next
+// refresh, so this is a measurement, never a default.
+struct BdaFloorState {
+    HostMutex mutex;
+    VkDevice device = VK_NULL_HANDLE;
+    std::map<std::tuple<std::uint64_t, std::uint64_t, VkBuffer, std::uint64_t>, std::weak_ptr<BdaFloorCopy>> copies;
+    std::atomic<int> tablesListed{0};
+    // The [address] line's counts (10 s).
+    std::atomic<std::uint64_t> tables{0}, made{0}, madeBytes{0}, reused{0}, overCap{0}, overCapBytes{0}, refused{0};
+    std::atomic<std::uint64_t> boundBuilds{0}, unboundBuilds{0}, uses{0}, refreshes{0}, refreshedBytes{0};
+};
+
+BdaFloorState& bdaFloorState() {
+    static BdaFloorState state;
+    return state;
+}
+
+std::uint64_t bdaFloorSetting(const char* name, std::uint64_t fallback) {
+    const char* value = std::getenv(name);
+    return value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : fallback;
+}
+
+bool bdaFloorEnabled() {
+    return VramFloor(VramFloorBdaSpaces);
+}
+
+void bdaFloorTable(const Context& context, std::vector<BdaFloorWanted>& wanted, const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges, std::vector<ShaderRecompiler::BdaAbi::Range>& floorRanges, std::vector<std::shared_ptr<BdaFloorCopy>>& copies) {
+    static const std::uint64_t cap = bdaFloorSetting("APS5_VRAM_FLOOR_BDA_MIB", 1024) << 20u;
+    auto& floor = bdaFloorState();
+    floorRanges = ranges;
+    std::sort(wanted.begin(), wanted.end(), [](const BdaFloorWanted& left, const BdaFloorWanted& right) { return left.end - left.begin < right.end - right.begin; });
+    std::uint64_t left = cap;
+    std::uint64_t wantedBytes = 0, mirrorBytes = 0, madeBytes = 0, overBytes = 0;
+    std::size_t mirrors = 0, made = 0, reused = 0, over = 0, refused = 0;
+    {
+        std::lock_guard lock(floor.mutex);
+        if (floor.device != context.device) {
+            floor.copies.clear();
+            floor.device = context.device;
+        }
+        std::erase_if(floor.copies, [](const auto& item) { return item.second.expired(); });
+        for (const auto& want : wanted) {
+            const auto bytes = want.end - want.begin;
+            wantedBytes += bytes;
+            if (want.mirror) {
+                ++mirrors;
+                mirrorBytes += bytes;
+            }
+            if (bytes > left) {
+                ++over;
+                overBytes += bytes;
+                continue;
+            }
+            const auto key = std::make_tuple(want.begin, want.end, want.source, want.sourceBase);
+            std::shared_ptr<BdaFloorCopy> copy;
+            if (const auto found = floor.copies.find(key); found != floor.copies.end()) copy = found->second.lock();
+            if (copy != nullptr) {
+                ++reused;
+            } else {
+                std::shared_ptr<Buffer> buffer;
+                if (AdmitVram(VramClass::Buffers, BufferPool::Capacity(static_cast<std::size_t>(bytes)))) {
+                    try {
+                        buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), gpuCopyUsage(true), VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                    } catch (const std::exception&) {
+                        buffer.reset();
+                    }
+                }
+                if (buffer == nullptr) {
+                    ++refused;
+                    continue;
+                }
+                copy = std::make_shared<BdaFloorCopy>();
+                copy->begin = want.begin;
+                copy->end = want.end;
+                copy->source = want.source;
+                copy->sourceBase = want.sourceBase;
+                copy->buffer = std::move(buffer);
+                floor.copies[key] = copy;
+                ++made;
+                madeBytes += bytes;
+            }
+            left -= bytes;
+            floorRanges[want.entry].deviceAddress = copy->buffer->DeviceAddress();
+            copies.push_back(std::move(copy));
+        }
+    }
+    floor.tables.fetch_add(1, std::memory_order_relaxed);
+    floor.made.fetch_add(made, std::memory_order_relaxed);
+    floor.madeBytes.fetch_add(madeBytes, std::memory_order_relaxed);
+    floor.reused.fetch_add(reused, std::memory_order_relaxed);
+    floor.overCap.fetch_add(over, std::memory_order_relaxed);
+    floor.overCapBytes.fetch_add(overBytes, std::memory_order_relaxed);
+    floor.refused.fetch_add(refused, std::memory_order_relaxed);
+    // The first tables listed once: what the space maps, and its largest eligible ranges.
+    if (floor.tablesListed.fetch_add(1, std::memory_order_relaxed) >= 6) return;
+    std::uint64_t mapped = 0, writable = 0;
+    for (const auto& range : ranges) {
+        mapped += range.end - range.begin;
+        if ((range.permissions & ShaderRecompiler::BdaAbi::Write) != 0) writable += range.end - range.begin;
+    }
+    constexpr double MiB = 1048576.0;
+    std::string largest;
+    for (auto it = wanted.rbegin(); it != wanted.rend() && it - wanted.rbegin() < 8; ++it) {
+        char entry[96];
+        std::snprintf(entry, sizeof(entry), "%s0x%llx+%.2f MiB%s", largest.empty() ? "" : ", ", static_cast<unsigned long long>(it->begin), static_cast<double>(it->end - it->begin) / MiB, it->mirror ? " (mirror)" : "");
+        largest += entry;
+    }
+    std::fprintf(stderr, "[bda-floor] space table: %zu entries, %.1f MiB mapped (%.1f MiB writable); read-only whole entries %zu (%.1f MiB, %zu mirrors %.1f MiB): copies made %zu (%.1f MiB), reused %zu, over the cap %zu (%.1f MiB), refused %zu; largest: %s\n", ranges.size(), static_cast<double>(mapped) / MiB, static_cast<double>(writable) / MiB, wanted.size(), static_cast<double>(wantedBytes) / MiB, mirrors, static_cast<double>(mirrorBytes) / MiB, made, static_cast<double>(madeBytes) / MiB, reused, over, static_cast<double>(overBytes) / MiB, refused, largest.c_str());
+}
+
+void noteBdaFloorBuild(bool bound) {
+    (bound ? bdaFloorState().boundBuilds : bdaFloorState().unboundBuilds).fetch_add(1, std::memory_order_relaxed);
+}
+
+// Records the GPU copies of the copies due (never filled; else not yet refreshed in the recorder's
+// open batch, or APS5_VRAM_FLOOR_BDA_MS since the last refresh) into the open batch, after every
+// earlier write of the sources and reader of the copies, before the use's dispatch.
+void refreshBdaFloor(const Context& context, Recorder& recorder, const std::vector<std::shared_ptr<BdaFloorCopy>>& copies) {
+    static const auto interval = std::chrono::milliseconds(bdaFloorSetting("APS5_VRAM_FLOOR_BDA_MS", 0));
+    auto& floor = bdaFloorState();
+    floor.uses.fetch_add(1, std::memory_order_relaxed);
+    const auto submissions = recorder.Submissions();
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<BdaFloorCopy*> due;
+    {
+        std::lock_guard lock(floor.mutex);
+        for (const auto& copy : copies) {
+            const bool stale = !copy->filled || (interval.count() == 0 ? copy->refreshedBy != &recorder || copy->refreshedAt != submissions : now - copy->refreshedTime >= interval);
+            if (!stale) continue;
+            copy->filled = true;
+            copy->refreshedBy = &recorder;
+            copy->refreshedAt = submissions;
+            copy->refreshedTime = now;
+            due.push_back(copy.get());
+        }
+    }
+    if (due.empty()) return;
+    const auto commands = recorder.CommandsKeepingCopyBacks();
+    const auto timing = recorder.BeginGpuTiming(StagingCopyInKey);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+    std::uint64_t copied = 0;
+    for (auto* copy : due) {
+        const auto bytes = copy->end - copy->begin;
+        CopyBuffer(context, commands, copy->source, copy->begin - copy->sourceBase, copy->buffer->Handle(), 0, bytes);
+        recorder.Keep(copy->buffer);
+        copied += bytes;
+    }
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+    recorder.MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    recorder.EndGpuTiming(timing, copied);
+    floor.refreshes.fetch_add(due.size(), std::memory_order_relaxed);
+    floor.refreshedBytes.fetch_add(copied, std::memory_order_relaxed);
+}
+
+std::string bdaFloorReport() {
+    if (!bdaFloorEnabled()) return {};
+    auto& floor = bdaFloorState();
+    std::size_t held = 0;
+    std::uint64_t heldBytes = 0;
+    {
+        // Counted from the keys: locking an entry here could release its last owner under the mutex.
+        std::lock_guard lock(floor.mutex);
+        for (const auto& [key, copy] : floor.copies) {
+            if (copy.expired()) continue;
+            ++held;
+            heldBytes += std::get<1>(key) - std::get<0>(key);
+        }
+    }
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    constexpr double MiB = 1048576.0;
+    const auto tables = take(floor.tables);
+    const auto made = take(floor.made);
+    const auto madeMiB = static_cast<double>(take(floor.madeBytes)) / MiB;
+    const auto reused = take(floor.reused);
+    const auto overCap = take(floor.overCap);
+    const auto overMiB = static_cast<double>(take(floor.overCapBytes)) / MiB;
+    const auto refused = take(floor.refused);
+    const auto bound = take(floor.boundBuilds);
+    const auto unbound = take(floor.unboundBuilds);
+    const auto uses = take(floor.uses);
+    const auto refreshes = take(floor.refreshes);
+    const auto refreshedMiB = static_cast<double>(take(floor.refreshedBytes)) / MiB;
+    char text[512];
+    std::snprintf(text, sizeof(text), "; [bda-floor] (APS5_VRAM_FLOOR part 16) space tables %llu (copies made %llu, %.0f MiB; reused %llu; over the cap %llu, %.0f MiB; refused %llu), copies held %zu (%.0f MiB), builds bound %llu / not bound %llu, uses %llu, refreshes %llu (%.0f MiB copied)", tables, made, madeMiB, reused, overCap, overMiB, refused, held, static_cast<double>(heldBytes) / MiB, bound, unbound, uses, refreshes, refreshedMiB);
+    return text;
 }
 
 // APS5_TRACE_STAGING=1: every distinct staged range once, with its size and whether an atomic
@@ -4544,6 +4793,10 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     // A space mapping resident written ranges to their device copy: a draw build (no per-use check,
     // VulkanDevice::recordDispatch's RecheckResidentReads) binds the space's import table.
     if (space != nullptr && !space->residentMapped.empty() && !stagingAllowed) residentUnsplit = true;
+    // APS5_VRAM_FLOOR part 16: a dispatch build (each recorded use refreshes the copies first,
+    // RecheckResidentReads) that does not bind the import table binds the floor table.
+    floorBound = space != nullptr && !space->floorCopies.empty() && stagingAllowed && !(residentUnsplit && !space->residentMapped.empty());
+    if (space != nullptr && !space->floorCopies.empty()) noteBdaFloorBuild(floorBound);
     if (!residentWanted.empty()) {
         // Resident reads: a region takes the cached copy of its range while the import it was
         // bound to is still the one serving the range (the flushes and copies above may have
@@ -5200,7 +5453,7 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
     // The table is searched by address (the recompiler's lookup bisects it): both lists are sorted
     // and disjoint, so a merge keeps it so.
     // A build reading a mapped range through the import binds the import table.
-    const auto& spaceRanges = residentUnsplit && !space->residentMapped.empty() ? space->importRanges : space->ranges;
+    const auto& spaceRanges = residentUnsplit && !space->residentMapped.empty() ? space->importRanges : floorBound ? space->floorRanges : space->ranges;
     std::vector<ShaderRecompiler::BdaAbi::Range> merged;
     merged.reserve(result.size() + spaceRanges.size());
     std::merge(spaceRanges.begin(), spaceRanges.end(), result.begin(), result.end(), std::back_inserter(merged), [](const auto& left, const auto& right) { return left.begin < right.begin; });
@@ -5211,6 +5464,7 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
     if (space == nullptr || !regions.empty()) return std::nullopt;
     Require(uploaded && !committed, "guest GPU address ranges are not available");
     if (residentUnsplit && !space->residentMapped.empty()) return CachedTable{space->importSerial, &space->importRanges};
+    if (floorBound) return CachedTable{space->floorSerial, &space->floorRanges};
     return CachedTable{space->serial, &space->ranges};
 }
 
@@ -5674,6 +5928,9 @@ bool GuestBufferMemory::RecordResidentReads(Recorder& recorder) {
 }
 
 void GuestBufferMemory::RecheckResidentReads(Recorder& recorder) {
+    // APS5_VRAM_FLOOR part 16: the floor table's copies are refreshed into the open batch before
+    // the use reads them (once per batch, or per APS5_VRAM_FLOOR_BDA_MS).
+    if (floorBound && space != nullptr && uploaded && !committed) refreshBdaFloor(context, recorder, space->floorCopies);
     if (residentWriteRegions && uploaded && !committed && residentWritesCheckedAt != recorder.Submissions()) checkResidentWrites(recorder);
     // Resident written ranges its table maps to their device copy: checked at every recorded use.
     if (space != nullptr && !residentUnsplit && !space->residentMapped.empty() && uploaded && !committed) checkMappedResidentWrites(recorder);
