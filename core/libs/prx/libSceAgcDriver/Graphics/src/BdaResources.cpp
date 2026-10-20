@@ -290,7 +290,15 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             ++it;
         }
     }
-    table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, GpuReadHostProperties());
+    // APS5_VRAM_FLOOR part 16 with APS5_VRAM_FLOOR_BDA_TABLE=1 (experiment): the table in
+    // host-visible video memory (ReBAR, host memory when none), where every address-based access's
+    // lookup reads it; the other floor parts' buffers stay where they were.
+    static const bool tableInVideoMemory = [] {
+        const char* value = std::getenv("APS5_VRAM_FLOOR_BDA_TABLE");
+        return VramFloor(VramFloorBdaSpaces) && value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    constexpr VkMemoryPropertyFlags videoHost = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, tableInVideoMemory ? videoHost : GpuReadHostProperties());
     const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), 0};
     std::memcpy(table->Bytes().data(), &header, sizeof(header));
     if (!ranges.empty()) std::memcpy(table->Bytes().data() + sizeof(header), ranges.data(), ranges.size() * sizeof(ranges.front()));

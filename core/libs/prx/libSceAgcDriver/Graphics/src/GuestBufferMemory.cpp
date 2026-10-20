@@ -137,6 +137,9 @@ struct GuestBufferMemory::AddressSpace {
     std::vector<std::shared_ptr<BdaFloorCopy>> floorCopies;
     std::vector<ShaderRecompiler::BdaAbi::Range> floorRanges;
     std::uint64_t floorSerial = 0;
+    // The copies by their range's first byte: with APS5_VRAM_FLOOR_BDA_DESCRIPTORS=1 a floor-bound
+    // build's views no descriptor writes bind them too (Descriptor, RebasedDescriptor).
+    std::map<std::uint64_t, const BdaFloorCopy*> floorByBegin;
 };
 
 namespace {
@@ -198,6 +201,7 @@ struct BdaFloorWanted {
 };
 bool bdaFloorEnabled();
 bool bdaFloorWritable();
+bool bdaFloorDescriptors();
 void bdaFloorTable(const Context& context, std::vector<BdaFloorWanted>& wanted, const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges, std::vector<ShaderRecompiler::BdaAbi::Range>& floorRanges, std::vector<std::shared_ptr<BdaFloorCopy>>& copies);
 std::string bdaFloorReport();
 
@@ -1929,6 +1933,7 @@ void GuestBufferMemory::AcquireRegistered() {
                     bdaFloorTable(context, floorWanted, built->ranges, built->floorRanges, built->floorCopies);
                     if (!built->floorCopies.empty()) built->floorSerial = spaces.serials.fetch_add(1, std::memory_order_relaxed) + 1;
                     else built->floorRanges.clear();
+                    for (const auto& copy : built->floorCopies) built->floorByBegin.emplace(copy->begin, copy.get());
                 }
                 std::vector<Region> extras;
                 for (auto& region : regions) {
@@ -2511,6 +2516,14 @@ bool bdaFloorEnabled() {
 bool bdaFloorWritable() {
     static const bool writable = bdaFloorSetting("APS5_VRAM_FLOOR_BDA_WRITABLE", 0) != 0;
     return writable;
+}
+
+// APS5_VRAM_FLOOR_BDA_DESCRIPTORS=1: a floor-bound build's buffer views inside a base range with a
+// copy, which no descriptor of the build writes, bind the copy as well (the address-based
+// programs' V# reads, not only their reads through the table).
+bool bdaFloorDescriptors() {
+    static const bool descriptors = bdaFloorSetting("APS5_VRAM_FLOOR_BDA_DESCRIPTORS", 0) != 0;
+    return descriptors;
 }
 
 void bdaFloorTable(const Context& context, std::vector<BdaFloorWanted>& wanted, const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges, std::vector<ShaderRecompiler::BdaAbi::Range>& floorRanges, std::vector<std::shared_ptr<BdaFloorCopy>>& copies) {
@@ -5444,6 +5457,16 @@ VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std:
         Require(adjustment % 4 == 0 && bytes + adjustment <= context.limits.maxStorageBufferRange, "resident guest buffer view off its alignment or over the descriptor range limit");
         return {region.resident->buffer->Handle(), offset - adjustment, bytes + adjustment};
     }
+    // APS5_VRAM_FLOOR part 16 (APS5_VRAM_FLOOR_BDA_DESCRIPTORS=1): the base range's copy, which
+    // holds it from its first byte.
+    if (floorBound && space != nullptr && (region.direct != nullptr || region.mirror != nullptr) && bdaFloorDescriptors() && !WritesOverlap(address, bytes)) {
+        if (const auto copy = space->floorByBegin.find(region.begin); copy != space->floorByBegin.end() && copy->second->end == region.end) {
+            const auto offset = address - region.begin;
+            adjustment = static_cast<std::uint32_t>(offset % context.limits.minStorageBufferOffsetAlignment);
+            Require(adjustment % 4 == 0 && bytes + adjustment <= context.limits.maxStorageBufferRange, "floor copy view off its alignment or over the descriptor range limit");
+            return {copy->second->buffer->Handle(), offset - adjustment, bytes + adjustment};
+        }
+    }
     const auto base = region.direct != nullptr ? region.direct->base : region.mirror != nullptr ? region.mirror->base : region.begin;
     const auto offset = address - base;
     Require(context.limits.minStorageBufferOffsetAlignment != 0, "no storage buffer offset alignment");
@@ -5815,6 +5838,17 @@ bool GuestBufferMemory::RebasedDescriptor(std::uint64_t address, std::size_t byt
     if (region.direct == nullptr && (region.mirror == nullptr || region.mirror->writable || region.mirror->heap)) return false;
     const auto alignment = context.limits.minStorageBufferOffsetAlignment;
     if (alignment == 0) return false;
+    // APS5_VRAM_FLOOR part 16 (APS5_VRAM_FLOOR_BDA_DESCRIPTORS=1): the copy, as Descriptor binds it.
+    if (floorBound && bdaFloorDescriptors()) {
+        if (const auto copy = space->floorByBegin.find(region.begin); copy != space->floorByBegin.end() && copy->second->end == region.end) {
+            const auto offset = address - region.begin;
+            const auto moved = static_cast<std::uint32_t>(offset % alignment);
+            if (moved % 4 != 0 || bytes + moved > context.limits.maxStorageBufferRange) return false;
+            info = {copy->second->buffer->Handle(), offset - moved, bytes + moved};
+            adjustment = moved;
+            return true;
+        }
+    }
     const auto base = region.direct != nullptr ? region.direct->base : region.mirror->base;
     const auto offset = address - base;
     const auto moved = static_cast<std::uint32_t>(offset % alignment);
