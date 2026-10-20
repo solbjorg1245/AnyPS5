@@ -153,6 +153,15 @@ std::uint64_t CollectEpochBumps();
 std::uint64_t ThreadCollectEpoch();
 void ResetCollectEpoch();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
+// Moves with every block stamp: a collect that found written pages, MarkWritten, the driver's own
+// stores. While it is what an earlier load returned, no UnchangedSince answer has changed since (no
+// block moved past any generation). Read without the tracker mutex (APS5_REVALIDATE_GEN,
+// ShaderResources::Revalidate).
+std::uint64_t StampSerial();
+// What a collect memo entry is valid under (the unwatch and mapping serials, see CollectWrites):
+// while it and the calling thread's collect epoch are what they were at a collect, that range is
+// not walked again in the epoch.
+std::uint64_t CollectMemoSerial();
 // The tracker's current generation (every collect and MarkWritten bumps it): a stamp taken after
 // a set of driver stores, for UnchangedSinceCollected to compare against later. Read under the
 // tracker mutex, so every collect that bumped before it has finished its walk and every later

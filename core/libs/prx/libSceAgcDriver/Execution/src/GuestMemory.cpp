@@ -927,6 +927,8 @@ struct WriteTracker {
     // bumps, or an image refreshed after a stamp would keep failing UnchangedSince until the next
     // walk of its range and re-upload at every use of the epoch.
     std::atomic<std::uint32_t> generation{1};
+    // Block stamps so far (StampSerial): bumped under the mutex with each stamp, read without it.
+    std::atomic<std::uint64_t> stamps{0};
     std::vector<void*> pages;
     // Collect memo: page-rounded ranges walked during the current epoch (see BumpCollectEpoch). A
     // collect fully inside one skips GetWriteWatch, whose cost is proportional to the range's pages,
@@ -1091,6 +1093,7 @@ struct WriteTracker {
     }
 
     void stamp(std::uint64_t block, std::uint32_t stampGeneration, StampKind kind) {
+        stamps.store(stamps.load(std::memory_order_relaxed) + 1, std::memory_order_release);
         const bool cpu = kind != StampKind::Driver;
         const bool written = kind != StampKind::ImportWindow;
 #ifdef _WIN32
@@ -2252,6 +2255,14 @@ void ArmEdgeWatch(std::uint64_t address, std::size_t bytes) {
 #else
 void ArmEdgeWatch(std::uint64_t, std::size_t) {}
 #endif
+
+std::uint64_t StampSerial() {
+    return Tracker().stamps.load(std::memory_order_acquire);
+}
+
+std::uint64_t CollectMemoSerial() {
+    return memoSerial(std::memory_order_acquire);
+}
 
 std::uint64_t TrackerGeneration() {
     auto& tracker = Tracker();

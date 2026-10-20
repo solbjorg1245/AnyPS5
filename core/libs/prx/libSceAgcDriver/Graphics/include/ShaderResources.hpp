@@ -9,6 +9,7 @@
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RevalidateGen.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -430,6 +431,25 @@ public:
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.
     bool ProveCurrent(std::span<const CompiledShader> shaders, ProofReport* report = nullptr) { return Revalidate(shaders, report); }
     bool ProveCurrent(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(shader, report); }
+    // APS5_REVALIDATE_GEN (RevalidateGen.hpp; default off): the totals of its decisions since start,
+    // counted under APS5_PROFILE_DRAW, APS5_REVALIDATE_GEN_VERIFY=1 or a test's mode. `steps` by
+    // RevalidateGenFor's answer, `misses` the allowed skips the element checks refused, `skipped`
+    // the proofs taken from the memo, `kept` the plain fast proofs kept as the memo, `keyed` those
+    // not kept (an element with DCC keys); with the verify switch the old proof runs beside each
+    // skip (`compared`) and `wouldDiffer` counts the skips it did not prove plainly.
+    struct RevalidateGenTotals {
+        std::array<std::uint64_t, static_cast<std::size_t>(RevalidateGenStep::Count)> steps{};
+        std::array<std::uint64_t, static_cast<std::size_t>(RevalidateGenMiss::Count)> misses{};
+        std::uint64_t skipped = 0;
+        std::uint64_t kept = 0;
+        std::uint64_t keyed = 0;
+        std::uint64_t compared = 0;
+        std::uint64_t wouldDiffer = 0;
+    };
+    static RevalidateGenTotals RevalidateGenCounts();
+    // Tests: the switch's mode instead of the environment's (0 off, 1 on, 2 on with the verify
+    // switch; -1 back to the environment), its decisions counted.
+    static void SetRevalidateGenForTests(int mode);
     // FNV over the ShaderData/FlattenedSrt words, in binding order: of this object's data buffers
     // as the recorded work will find them (maintained by addDataBuffer and RefreshData), and of a
     // compiled shader's descriptors. A recipe hit refreshes the template iff the two differ.
@@ -709,6 +729,20 @@ private:
     std::uint64_t depthSerialSeen = 0;
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
+    // APS5_REVALIDATE_GEN: the thread's collect epoch, the collect memo's serial and the stamp
+    // serial loaded before the last plain fast proof (no T1 refresh, no accepted overlap) of an
+    // object without DCC keys; with pendingSerialSeen and depthSerialSeen they are what
+    // RevalidateGenFor compares (epoch 0: none). Dropped at the start of every Revalidate that
+    // uses the switch, kept again only by a proof that ends plainly.
+    RevalidateGenState genKept;
+    // The skip's per-element checks (RevalidateGenFor allowed it): each depth-served element is
+    // still served (DepthSurfaceServes, with its side effect), each view's image and each storage
+    // image is still cached and serves its keys, the ranges are unchanged since their generations
+    // (only when `checkStamps`: stamps moved somewhere), then the cache touch and NoteProved as the
+    // proof makes them. The records and generations stay as they are.
+    bool genProve(bool checkStamps, RevalidateGenMiss& miss);
+    // Whether no element has DCC keys (the skip proves none: their proofs read the key bytes).
+    bool genEligible() const;
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).
     std::uint64_t dataWordsHash = 14695981039346656037ull;
     void rehashDataWords();

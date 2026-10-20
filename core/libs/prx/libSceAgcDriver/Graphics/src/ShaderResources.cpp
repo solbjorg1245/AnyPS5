@@ -1732,6 +1732,86 @@ RevalidateProfile& Revalidations() {
     return profile;
 }
 
+// APS5_REVALIDATE_GEN=1 (RevalidateGen.hpp; default off): 0 off, 1 on, 2 on with
+// APS5_REVALIDATE_GEN_VERIFY=1 (the old proof runs beside every skip and decides). A test's mode
+// (SetRevalidateGenForTests) stands in for the environment's while it is not -1.
+std::atomic<int> revalidateGenForTests{-1};
+
+int RevalidateGenMode() {
+    static const int fromEnvironment = [] {
+        const char* value = std::getenv("APS5_REVALIDATE_GEN");
+        if (value == nullptr || std::strcmp(value, "1") != 0) return 0;
+        const char* verify = std::getenv("APS5_REVALIDATE_GEN_VERIFY");
+        const bool verifying = verify != nullptr && std::strcmp(verify, "1") == 0;
+        std::fprintf(stderr, "[rescache] APS5_REVALIDATE_GEN: template proofs skipped while nothing they read moved%s\n", verifying ? " (verify: the old proof runs beside each skip)" : "");
+        return verifying ? 2 : 1;
+    }();
+    const auto forced = revalidateGenForTests.load(std::memory_order_relaxed);
+    return forced >= 0 ? forced : fromEnvironment;
+}
+
+struct RevalidateGenProfile {
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(RevalidateGenStep::Count)> steps{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(RevalidateGenMiss::Count)> misses{};
+    std::atomic<std::uint64_t> skipped{0};
+    std::atomic<std::uint64_t> kept{0};
+    std::atomic<std::uint64_t> keyed{0};
+    std::atomic<std::uint64_t> compared{0};
+    std::atomic<std::uint64_t> wouldDiffer{0};
+    // Draw templates' proofs (the rest are dispatches') and their skips, with the 10 s line's last.
+    std::atomic<std::uint64_t> drawProofs{0};
+    std::atomic<std::uint64_t> drawSkipped{0};
+    std::uint64_t printedDrawProofs = 0;
+    std::uint64_t printedDrawSkipped = 0;
+    // The totals the last 10 s line printed (only the line's printer touches them).
+    ShaderResources::RevalidateGenTotals printed;
+};
+
+RevalidateGenProfile& RevalidateGens() {
+    static RevalidateGenProfile profile;
+    return profile;
+}
+
+void countRevalidateGen(RevalidateGenStep step, RevalidateGenMiss miss, bool skipped, bool draw) {
+    auto& counts = RevalidateGens();
+    counts.steps[static_cast<std::size_t>(step)].fetch_add(1, std::memory_order_relaxed);
+    if (miss != RevalidateGenMiss::None) counts.misses[static_cast<std::size_t>(miss)].fetch_add(1, std::memory_order_relaxed);
+    if (skipped) counts.skipped.fetch_add(1, std::memory_order_relaxed);
+    if (draw) {
+        counts.drawProofs.fetch_add(1, std::memory_order_relaxed);
+        if (skipped) counts.drawSkipped.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+// The [rescache] revalidate gen line (APS5_PROFILE_DRAW, with the [rescache] revalidate line):
+// per 10 s, the skips, why the proof ran (the first input RevalidateGenFor found moved, or the
+// element check that refused the skip), the memos kept, and the verify counts with their totals.
+void reportRevalidateGen() {
+    if (RevalidateGenMode() == 0) return;
+    const auto now = ShaderResources::RevalidateGenCounts();
+    auto& last = RevalidateGens().printed;
+    const auto delta = [](std::uint64_t value, std::uint64_t before) { return static_cast<unsigned long long>(value - before); };
+    std::string ran;
+    char item[96];
+    for (std::size_t step = static_cast<std::size_t>(RevalidateGenStep::NoMemo); step < now.steps.size(); ++step) {
+        std::snprintf(item, sizeof(item), " %s %llu", RevalidateGenStepNames[step], delta(now.steps[step], last.steps[step]));
+        ran += item;
+    }
+    std::string refused;
+    for (std::size_t miss = 1; miss < now.misses.size(); ++miss) {
+        std::snprintf(item, sizeof(item), " %s %llu", RevalidateGenMissNames[miss], delta(now.misses[miss], last.misses[miss]));
+        refused += item;
+    }
+    const auto allowed = [&](RevalidateGenStep step) { return delta(now.steps[static_cast<std::size_t>(step)], last.steps[static_cast<std::size_t>(step)]); };
+    auto& counts = RevalidateGens();
+    const auto drawProofs = counts.drawProofs.load(std::memory_order_relaxed);
+    const auto drawSkipped = counts.drawSkipped.load(std::memory_order_relaxed);
+    std::fprintf(stderr, "[rescache] revalidate gen (10 s): skipped %llu of %llu allowed (stamps unchanged %llu, ranges checked %llu), draws %llu of %llu proofs; proof ran:%s; skip refused:%s; memo kept %llu, not kept (keys) %llu; verify: compared %llu, would differ %llu (total %llu of %llu)\n", delta(now.skipped, last.skipped), allowed(RevalidateGenStep::Skip) + allowed(RevalidateGenStep::SkipCheckStamps), allowed(RevalidateGenStep::Skip), allowed(RevalidateGenStep::SkipCheckStamps), delta(drawSkipped, counts.printedDrawSkipped), delta(drawProofs, counts.printedDrawProofs), ran.c_str(), refused.c_str(), delta(now.kept, last.kept), delta(now.keyed, last.keyed), delta(now.compared, last.compared), delta(now.wouldDiffer, last.wouldDiffer), static_cast<unsigned long long>(now.wouldDiffer), static_cast<unsigned long long>(now.compared));
+    last = now;
+    counts.printedDrawProofs = drawProofs;
+    counts.printedDrawSkipped = drawSkipped;
+}
+
 void countFastFail(FastFail reason) {
     if (BuildProfiled()) Revalidations().fastFails[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
 }
@@ -1873,6 +1953,7 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto fallbacks = byReason(profile.ownFallbacks, OwnRefreshFallbackNames);
     std::fprintf(stderr, "[rescache] revalidate %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()));
     std::fprintf(stderr, "[rescache] revalidate split: calls that walked or failed %.1f ms (fast proofs the rest); depth-served elements proven %llu\n", profile.fullNanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.depthRecords.load()));
+    reportRevalidateGen();
     if (const auto samples = profile.phaseSamples.load(); samples != 0) {
         const auto us = [&](std::size_t phase) { return profile.phaseNanoseconds[phase].load() / 1e3 / static_cast<double>(samples); };
         const auto per = [&](const std::atomic<std::uint64_t>& count) { return static_cast<double>(count.load()) / static_cast<double>(samples); };
@@ -2321,6 +2402,85 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
     return OwnRefreshFallback::Count;
 }
 
+ShaderResources::RevalidateGenTotals ShaderResources::RevalidateGenCounts() {
+    const auto& counts = RevalidateGens();
+    RevalidateGenTotals totals;
+    for (std::size_t i = 0; i < totals.steps.size(); ++i) totals.steps[i] = counts.steps[i].load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < totals.misses.size(); ++i) totals.misses[i] = counts.misses[i].load(std::memory_order_relaxed);
+    totals.skipped = counts.skipped.load(std::memory_order_relaxed);
+    totals.kept = counts.kept.load(std::memory_order_relaxed);
+    totals.keyed = counts.keyed.load(std::memory_order_relaxed);
+    totals.compared = counts.compared.load(std::memory_order_relaxed);
+    totals.wouldDiffer = counts.wouldDiffer.load(std::memory_order_relaxed);
+    return totals;
+}
+
+void ShaderResources::SetRevalidateGenForTests(int mode) {
+    revalidateGenForTests.store(mode, std::memory_order_relaxed);
+}
+
+bool ShaderResources::genEligible() const {
+    if (validatedTextures.size() != textures.size()) return false;
+    for (const auto& surface : validatedTextures) {
+        if (!surface.valid) return false;
+        if (surface.depth) continue;
+        if (surface.resource.dccAddress != 0 || (surface.source != nullptr && surface.source->Descriptor().dccAddress != 0)) return false;
+    }
+    for (std::size_t i = 0; i < storageTextures.size(); ++i) {
+        if (storageTextures[i] == nullptr || storageTextures[i]->Descriptor().dccAddress != 0 || i >= storageKeys.size() || storageKeys[i] != 0) return false;
+    }
+    return true;
+}
+
+// fastRevalidate's checks that a collect inside the epoch and unchanged serials leave open, in its
+// order per element; what it skips is what those answer: the collects (the memo's), the depth scan
+// (depthSerialSeen), the pending queries (pendingSerialSeen; no element has keys, so no identity
+// query), the key proofs (none) and, with `checkStamps` false, the stamps (no block was stamped).
+bool ShaderResources::genProve(bool checkStamps, RevalidateGenMiss& miss) {
+    miss = RevalidateGenMiss::None;
+    const auto refuse = [&miss](RevalidateGenMiss why) {
+        miss = why;
+        return false;
+    };
+    if (validatedTextures.size() != textures.size()) return refuse(RevalidateGenMiss::Records);
+    auto* const scratch = proofScratch();
+    auto& queries = scratch != nullptr ? scratch->queries : SeparateLocal<std::vector<GuestMemory::UnchangedQuery>, 0>();
+    auto& images = scratch != nullptr ? scratch->images : SeparateLocal<std::vector<const StorageTexture*>, 0>();
+    queries.clear();
+    images.clear();
+    for (std::size_t i = 0; i < textures.size(); ++i) {
+        const auto& surface = validatedTextures[i];
+        if (!surface.valid) return refuse(RevalidateGenMiss::Records);
+        if (surface.depth) {
+            if (!DepthSurfaceServes(context, surface.resource, textures[i].get())) return refuse(RevalidateGenMiss::DepthSurface);
+            continue;
+        }
+        const auto bytes = static_cast<std::size_t>(surface.bytes);
+        if (const auto* source = surface.source; source != nullptr) {
+            if (source->UploadedKeys() != DccKeys::Uncompressed) return refuse(RevalidateGenMiss::Keys);
+            if (!source->Cached()) return refuse(RevalidateGenMiss::Evicted);
+            queries.push_back({surface.resource.baseAddress, bytes, source->Generation()});
+            images.push_back(source);
+        } else {
+            if (surface.keys != DccKeys::Uncompressed) return refuse(RevalidateGenMiss::Keys);
+            queries.push_back({surface.resource.baseAddress, bytes, surface.generation});
+        }
+    }
+    for (std::size_t i = 0; i < storageTextures.size(); ++i) {
+        if (storageTextures[i] != nullptr && (i >= storageKeys.size() || !StorageImageServesKeys(*storageTextures[i], storageKeys[i]))) return refuse(RevalidateGenMiss::Keys);
+        if (i != 0 && storageTextures[i] == storageTextures[i - 1]) continue;
+        const auto* image = storageTextures[i].get();
+        if (image == nullptr) return refuse(RevalidateGenMiss::Records);
+        if (!image->Cached()) return refuse(RevalidateGenMiss::Evicted);
+        queries.push_back({image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()), image->Generation()});
+        images.push_back(image);
+    }
+    if (checkStamps && !queries.empty() && !GuestMemory::UnchangedSinceAll(queries)) return refuse(RevalidateGenMiss::Stamps);
+    if (!StorageImagesCached(context, images)) return refuse(RevalidateGenMiss::Evicted);
+    for (const auto* image : images) image->NoteProved();
+    return true;
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
@@ -2358,6 +2518,21 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // Loaded before any check (the memo rule of fastRevalidate): kept as the memo only when the
     // registry did not move through the whole proof, flushes of this call included.
     const auto serialBefore = StorageTexture::PendingSerial();
+    // APS5_REVALIDATE_GEN (RevalidateGen.hpp): the last plain proof stands for (1) while nothing it
+    // read moved (genKept, loaded here before any check); the imports (2) and the staging copies
+    // (3) run as always. Under the verify switch the proof runs anyway and decides.
+    const int genMode = !noFast && EpochRevalidate() ? RevalidateGenMode() : 0;
+    const bool genCounted = genMode != 0 && (profile || genMode == 2 || revalidateGenForTests.load(std::memory_order_relaxed) >= 0);
+    RevalidateGenState genNow;
+    bool genSkip = false;
+    if (genMode != 0) {
+        genNow = {GuestMemory::ThreadCollectEpoch(), GuestMemory::CollectMemoSerial(), GuestMemory::StampSerial(), serialBefore, DepthSurfaceSerial()};
+        const auto step = RevalidateGenFor({genKept.epoch, genKept.collectMemo, genKept.stamps, pendingSerialSeen, depthSerialSeen}, genNow);
+        auto miss = RevalidateGenMiss::None;
+        if (step == RevalidateGenStep::Skip || step == RevalidateGenStep::SkipCheckStamps) genSkip = genProve(step == RevalidateGenStep::SkipCheckStamps, miss);
+        if (genCounted) countRevalidateGen(step, miss, genSkip, shaders.front().stage != ShaderRecompiler::ShaderStage::Compute);
+        genKept.epoch = 0;
+    }
     // (1) Textures and storage images, from stamps when every element allows it (fastRevalidate),
     // else by the same lookups as the build (which refresh or replace them as guest memory changed):
     // they must hand back the very objects the set's views belong to. The build appended them stage
@@ -2463,7 +2638,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     FastFail reason = FastFail::Count;
     bool accepted = false;
     outerMark(0);
-    bool fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+    if (genSkip && genMode == 1) overlapping.clear();
+    bool fast = genSkip && genMode == 1 ? true : !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
     outerMark(1);
     // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
     // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
@@ -2493,6 +2669,18 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             else fallback = OwnRefreshFallback::Rerun;
         }
         if (fallback != OwnRefreshFallback::Count) countOwnRefreshFallback(fallback);
+    }
+    if (genSkip && genMode == 2) {
+        // APS5_REVALIDATE_GEN_VERIFY: the skip would have differed unless the proof passed plainly.
+        auto& counts = RevalidateGens();
+        counts.compared.fetch_add(1, std::memory_order_relaxed);
+        if (!fast || ownRefreshed || accepted) {
+            const auto wrong = counts.wouldDiffer.fetch_add(1, std::memory_order_relaxed);
+            if (wrong < 24) {
+                const auto variantId = shaders.front().program != nullptr ? shaders.front().program->variantId : 0;
+                std::fprintf(stderr, "[rescache] revalidate gen verify: a skip would differ (stage %u variant 0x%llx, %zu textures %zu storage images): the proof %s%s\n", static_cast<unsigned>(shaders.front().stage), static_cast<unsigned long long>(variantId), textures.size(), storageTextures.size(), !fast ? "failed: " : ownRefreshed ? "passed after the own-object refresh" : "passed by accepting a foreign overlap", !fast && reason != FastFail::Count ? FastFailNames[static_cast<std::size_t>(reason)] : "");
+            }
+        }
     }
     if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
     // APS5_TRACE_PENDING_WALK (see TracePendingWalk).
@@ -2826,6 +3014,15 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
     }
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
+    if (genMode != 0 && fast && !ownRefreshed && !accepted && genNow.epoch != 0) {
+        // A skip's object was eligible when its memo was kept; the elements never change after.
+        if (genSkip || genEligible()) {
+            genKept = {genNow.epoch, genNow.collectMemo, genNow.stamps, 0, 0};
+            if (genCounted && !genSkip) RevalidateGens().kept.fetch_add(1, std::memory_order_relaxed);
+        } else if (genCounted) {
+            RevalidateGens().keyed.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     return finish(fast, true);
 }
 

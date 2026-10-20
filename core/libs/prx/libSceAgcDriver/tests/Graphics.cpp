@@ -8,6 +8,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
@@ -1224,6 +1227,69 @@ void misalignedShaderDataTests() {
     Require(mock.live == 0, "misaligned shader data resources leaked Vulkan objects");
 }
 
+// APS5_REVALIDATE_GEN (RevalidateGen.hpp) inside Revalidate: a plain proof on a thread with a
+// collect epoch is kept and the next proof in the epoch skips; a new epoch, a thread without one,
+// a moved pending registry or the switch off run the proof; the verify mode runs it beside the skip
+// and finds no difference. The template holds no images, so the proof passes whenever it runs.
+void revalidateGenTests() {
+    namespace GuestMemory = AgcDriver::GuestMemory;
+    using AgcDriver::Graphics::ShaderResources;
+    using Step = AgcDriver::Graphics::RevalidateGenStep;
+    // The proof needs write watching (UnchangedSinceAll); without it no proof is plain.
+    if (!GuestMemory::WriteWatched()) {
+        std::cout << "revalidate gen: no write watching, skipped\n";
+        return;
+    }
+    mock = MockVulkan{};
+    auto context = mockContext();
+    {
+        ShaderRecompiler::RecompileResult compute;
+        compute.bindings.push_back(makeBinding(Role::ShaderData, 0, 1, {0x11, 0x22, 0}));
+        const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &compute, 0};
+        ShaderResources resources(context, shader);
+        Require(resources.Reusable(), "revalidate gen: the test's template is not reusable");
+        AgcDriver::Graphics::StorageTexture::BumpPendingSerial();
+        ShaderResources::SetRevalidateGenForTests(1);
+        const auto before = ShaderResources::RevalidateGenCounts();
+        const auto step = [&](Step which) {
+            const auto now = ShaderResources::RevalidateGenCounts();
+            return now.steps[static_cast<std::size_t>(which)] - before.steps[static_cast<std::size_t>(which)];
+        };
+        const auto skipped = [&] { return ShaderResources::RevalidateGenCounts().skipped - before.skipped; };
+        const auto kept = [&] { return ShaderResources::RevalidateGenCounts().kept - before.kept; };
+        GuestMemory::ResetCollectEpoch();
+        Require(resources.Revalidate(shader) && step(Step::NoMemo) == 1 && kept() == 0, "revalidate gen: a proof without a collect epoch was kept");
+        Require(resources.Revalidate(shader) && step(Step::NoMemo) == 2 && skipped() == 0, "revalidate gen: a thread without a collect epoch skipped");
+        GuestMemory::BumpCollectEpoch();
+        Require(resources.Revalidate(shader) && step(Step::NoMemo) == 3 && kept() == 1, "revalidate gen: a plain proof in an epoch was not kept");
+        Require(resources.Revalidate(shader) && skipped() == 1 && step(Step::Skip) + step(Step::SkipCheckStamps) == 1, "revalidate gen: the next proof in the epoch did not skip");
+        Require(resources.Revalidate(shader) && skipped() == 2 && kept() == 1, "revalidate gen: a skip did not keep the memo");
+        AgcDriver::Graphics::StorageTexture::BumpPendingSerial();
+        Require(resources.Revalidate(shader) && step(Step::Pending) == 1 && skipped() == 2 && kept() == 2, "revalidate gen: a moved pending registry skipped");
+        Require(resources.Revalidate(shader) && skipped() == 3, "revalidate gen: the proof after a pending move was not kept");
+        GuestMemory::BumpCollectEpoch();
+        Require(resources.Revalidate(shader) && step(Step::Epoch) == 1 && skipped() == 3 && kept() == 3, "revalidate gen: a new epoch skipped");
+        GuestMemory::ResetCollectEpoch();
+        Require(resources.Revalidate(shader) && step(Step::Epoch) == 2 && skipped() == 3 && kept() == 3, "revalidate gen: a thread that left its epoch skipped or kept");
+        Require(resources.Revalidate(shader) && step(Step::NoMemo) == 4, "revalidate gen: a proof without an epoch left a memo");
+        // The verify mode: the proof runs beside the skip and agrees.
+        ShaderResources::SetRevalidateGenForTests(2);
+        GuestMemory::BumpCollectEpoch();
+        Require(resources.Revalidate(shader) && kept() == 4, "revalidate gen verify: the plain proof was not kept");
+        const auto compared = ShaderResources::RevalidateGenCounts().compared;
+        Require(resources.Revalidate(shader) && skipped() == 4, "revalidate gen verify: the proof in the epoch did not skip");
+        const auto verified = ShaderResources::RevalidateGenCounts();
+        Require(verified.compared == compared + 1 && verified.wouldDiffer == before.wouldDiffer, "revalidate gen verify: the skip was not compared, or it differed");
+        // Off: no decision is taken or counted.
+        ShaderResources::SetRevalidateGenForTests(0);
+        const auto off = ShaderResources::RevalidateGenCounts();
+        Require(resources.Revalidate(shader) && resources.Revalidate(shader) && ShaderResources::RevalidateGenCounts().skipped == off.skipped && ShaderResources::RevalidateGenCounts().steps == off.steps, "revalidate gen: the switch off took a decision");
+        ShaderResources::SetRevalidateGenForTests(-1);
+        GuestMemory::ResetCollectEpoch();
+    }
+    Require(mock.live == 0, "revalidate gen resources leaked Vulkan objects");
+}
+
 struct ModuleShape {
     bool fragment = false;
     bool push = false;
@@ -2125,6 +2191,7 @@ int main() {
         pushConstantTests();
         resourceTests();
         misalignedShaderDataTests();
+        revalidateGenTests();
         debugBranchTests();
         validationTests();
         vertexCopyTests();

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RevalidateGen.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -492,6 +493,73 @@ void CheckThreadEpoch() {
     const auto again = CollectWrites(base, Block);
     Require(ThreadCollectEpoch() == 0 && CollectWrites(base, Block) != again, "a reset thread reused a walk");
 }
+
+// APS5_REVALIDATE_GEN's inputs: the stamp serial moves with every stamp (a driver store, a collect
+// that found CPU stores) and with nothing else; inside one collect epoch a range already collected
+// is not walked, so a CPU store there moves nothing until the next epoch; a new mapping moves the
+// collect memo's serial.
+void CheckStampSerial() {
+    void* memory = AllocateWatched(2 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x22, 2 * Block);
+    ResetCollectEpoch();
+    CollectWrites(base, 2 * Block);
+    const auto clean = StampSerial();
+    CollectWrites(base, 2 * Block);
+    CollectWritesUncached(base, Block);
+    Require(StampSerial() == clean, "a collect that found no store moved the stamp serial");
+    MarkWritten(base + 16, 8);
+    const auto driver = StampSerial();
+    Require(driver > clean, "a driver store did not move the stamp serial");
+    static_cast<volatile std::uint8_t*>(memory)[Block + 64] = 0x33;
+    Require(StampSerial() == driver, "a CPU store moved the stamp serial before any collect");
+    CollectWrites(base, 2 * Block);
+    const auto cpu = StampSerial();
+    Require(cpu > driver, "a collect that found a CPU store did not move the stamp serial");
+    BumpCollectEpoch();
+    CollectWrites(base, 2 * Block);
+    const auto inEpoch = StampSerial();
+    static_cast<volatile std::uint8_t*>(memory)[96] = 0x44;
+    CollectWrites(base, 2 * Block);
+    Require(StampSerial() == inEpoch, "a collect inside the epoch walked a range it had collected");
+    BumpCollectEpoch();
+    CollectWrites(base, 2 * Block);
+    Require(StampSerial() > inEpoch, "the next epoch's collect did not stamp the CPU store");
+    ResetCollectEpoch();
+#ifdef _WIN32
+    const auto memo = CollectMemoSerial();
+    AllocateWatched(Block);
+    Require(CollectMemoSerial() != memo, "a new mapping did not move the collect memo's serial");
+#endif
+}
+
+// RevalidateGenFor: the last plain proof stands only on the same thread in the same epoch, with
+// the same collect memo serial, an unchanged pending registry and depth registry; a stamp anywhere
+// asks the template's ranges.
+void CheckRevalidateGenRule() {
+    using AgcDriver::Graphics::RevalidateGenFor;
+    using AgcDriver::Graphics::RevalidateGenState;
+    using Step = AgcDriver::Graphics::RevalidateGenStep;
+    const RevalidateGenState kept{7, 3, 100, 41, 9};
+    const auto with = [&](auto change) {
+        auto now = kept;
+        change(now);
+        return RevalidateGenFor(kept, now);
+    };
+    Require(RevalidateGenFor(kept, kept) == Step::Skip, "an unchanged state did not skip");
+    Require(RevalidateGenFor({0, 3, 100, 41, 9}, kept) == Step::NoMemo, "a template without a memo skipped");
+    Require(with([](auto& now) { now.epoch = 8; }) == Step::Epoch, "another collect epoch skipped");
+    Require(with([](auto& now) { now.epoch = 0; }) == Step::Epoch, "a thread without a collect epoch skipped");
+    Require(with([](auto& now) { now.collectMemo = 4; }) == Step::Mapping, "a moved collect memo serial skipped");
+    Require(with([](auto& now) { now.pending = 42; }) == Step::Pending, "a moved pending registry skipped");
+    Require(RevalidateGenFor({7, 3, 100, 0, 9}, {7, 3, 100, 0, 9}) == Step::Pending, "a memo without a pending serial skipped");
+    Require(with([](auto& now) { now.depth = 10; }) == Step::Depth, "a moved depth registry skipped");
+    Require(with([](auto& now) { now.stamps = 101; }) == Step::SkipCheckStamps, "a stamp elsewhere did not ask the template's ranges");
+    Require(with([](auto& now) { now.epoch = 8; now.stamps = 101; now.pending = 42; }) == Step::Epoch, "the epoch is not the first input asked");
+    static_assert(RevalidateGenFor({1, 2, 3, 4, 5}, {1, 2, 3, 4, 5}) == Step::Skip);
+    static_assert(std::size(AgcDriver::Graphics::RevalidateGenStepNames) == static_cast<std::size_t>(Step::Count));
+    static_assert(std::size(AgcDriver::Graphics::RevalidateGenMissNames) == static_cast<std::size_t>(AgcDriver::Graphics::RevalidateGenMiss::Count));
+}
 }
 
 int main() {
@@ -518,6 +586,8 @@ int main() {
         CheckKeepCpuStores();
         CheckLateLands();
         CheckThreadEpoch();
+        CheckStampSerial();
+        CheckRevalidateGenRule();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;
