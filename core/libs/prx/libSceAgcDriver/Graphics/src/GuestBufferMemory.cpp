@@ -2517,8 +2517,22 @@ void bdaFloorTable(const Context& context, std::vector<BdaFloorWanted>& wanted, 
     static const std::uint64_t cap = bdaFloorSetting("APS5_VRAM_FLOOR_BDA_MIB", 1024) << 20u;
     auto& floor = bdaFloorState();
     floorRanges = ranges;
-    // APS5_VRAM_FLOOR_BDA_LARGEST=1: the largest ranges first.
+    // APS5_VRAM_FLOOR_BDA_LARGEST=1: the largest ranges first. APS5_VRAM_FLOOR_BDA_RANGES=<a,b,...>
+    // (hex or decimal guest addresses): only the entries beginning there (a bisection of which
+    // ranges the programs read); the listing below still names every eligible entry.
     static const bool largestFirst = bdaFloorSetting("APS5_VRAM_FLOOR_BDA_LARGEST", 0) != 0;
+    static const std::set<std::uint64_t> only = [] {
+        std::set<std::uint64_t> listed;
+        const char* value = std::getenv("APS5_VRAM_FLOOR_BDA_RANGES");
+        while (value != nullptr && *value != '\0') {
+            char* next = nullptr;
+            const auto address = std::strtoull(value, &next, 0);
+            if (next == value) break;
+            if (address != 0) listed.insert(address);
+            value = *next == ',' ? next + 1 : next;
+        }
+        return listed;
+    }();
     std::sort(wanted.begin(), wanted.end(), [](const BdaFloorWanted& left, const BdaFloorWanted& right) { return left.end - left.begin < right.end - right.begin; });
     if (largestFirst) std::reverse(wanted.begin(), wanted.end());
     std::uint64_t left = cap;
@@ -2538,6 +2552,7 @@ void bdaFloorTable(const Context& context, std::vector<BdaFloorWanted>& wanted, 
                 ++mirrors;
                 mirrorBytes += bytes;
             }
+            if (!only.empty() && !only.contains(want.begin)) continue;
             if (bytes > left) {
                 ++over;
                 overBytes += bytes;
