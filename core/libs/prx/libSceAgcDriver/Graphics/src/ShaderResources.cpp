@@ -2433,9 +2433,10 @@ bool ShaderResources::genEligible() const {
 }
 
 // fastRevalidate's checks that a collect inside the epoch and unchanged serials leave open, in its
-// order per element; what it skips is what those answer: the collects (the memo's), the depth scan
-// (depthSerialSeen), the pending queries (pendingSerialSeen; no element has keys, so no identity
-// query), the key proofs (none) and, with `checkStamps` false, the stamps (no block was stamped).
+// order per element, and its one side effect (the depth note of a written storage image); what it
+// skips is what those answer: the collects (the memo's), the depth scan (depthSerialSeen), the
+// pending queries (pendingSerialSeen; no element has keys, so no identity query), the key proofs
+// (none) and, with `checkStamps` false, the stamps (no block was stamped).
 bool ShaderResources::genProve(bool checkStamps, RevalidateGenMiss& miss) {
     miss = RevalidateGenMiss::None;
     const auto refuse = [&miss](RevalidateGenMiss why) {
@@ -2471,6 +2472,9 @@ bool ShaderResources::genProve(bool checkStamps, RevalidateGenMiss& miss) {
         if (i != 0 && storageTextures[i] == storageTextures[i - 1]) continue;
         const auto* image = storageTextures[i].get();
         if (image == nullptr) return refuse(RevalidateGenMiss::Records);
+        // fastRevalidate's side effect, kept: a depth draw since the last proof clears a surface's
+        // overwritten flag without moving the depth serial, so the note is due on every proof.
+        if (i < storageWritten.size() && storageWritten[i] && FastDepthNote()) NoteDepthSurfaceWrite(image->Descriptor().baseAddress, image->Descriptor().width, image->Descriptor().height);
         if (!image->Cached()) return refuse(RevalidateGenMiss::Evicted);
         queries.push_back({image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()), image->Generation()});
         images.push_back(image);
