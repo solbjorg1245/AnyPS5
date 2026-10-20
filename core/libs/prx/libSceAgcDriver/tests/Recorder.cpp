@@ -3826,20 +3826,10 @@ void setMemoTests(const Device& device, Recorder& recorder) {
         Require(prepare(second) == b, "the second words' set copy was not kept");
         const auto c = prepare(first);
         Require(holds(c, 0x33) && c != a && setsMade() == sets + 3, "the memo answered words older than its last set copy");
-        // A set copy lives in its batch's transient pool: a new batch makes its own (APS5_SET_MEMO=1),
-        // or binds the earlier batch's and keeps it with its pool (=2).
+        // A set copy lives in its batch's transient pool: a new batch makes its own.
         memoRecorder.Submit();
         const auto d = prepare(first);
-        if (ShaderResources::SetMemoLevel() >= 2) {
-            Require(d == c && setsMade() == sets + 3 && d->poolHold != nullptr, "a set copy of a submitted batch was not bound again with its pool");
-            memoRecorder.Submit();
-            device.WaitQueue();
-            memoRecorder.Sync();
-            // Both batches ran and released: the bindings held here still hold their pool unreset.
-            Require(prepare(first) == d && setsMade() == sets + 3 && cache.TransientCounters().resets == 0, "a pool held by bindings was reset");
-        } else {
-            Require(holds(d, 0x33) && d != c && setsMade() == sets + 4, "a set copy of a submitted batch was bound again");
-        }
+        Require(holds(d, 0x33) && d != c && setsMade() == sets + 4, "a set copy of a submitted batch was bound again");
         Require(prepare(first) == d, "the new batch's set copy was not kept");
         // A registry mutation (generation) may have retired an in-place element's import.
         {
@@ -7242,9 +7232,8 @@ void gpuTimingRecorderTests(const Device& device, Recorder& recorder) {
 }
 
 int main() {
-    // APS5_SET_MEMO (read once): the draw tests below run with the set memo, setMemoTests checks it
-    // (=2: the cross-batch level, which includes =1's rules).
-    _putenv_s("APS5_SET_MEMO", "2");
+    // APS5_SET_MEMO (read once): the draw tests below run with the set memo, setMemoTests checks it.
+    _putenv_s("APS5_SET_MEMO", "1");
     try {
         gpuTimingDigestTests();
         retileRowDigestTests();

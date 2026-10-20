@@ -132,10 +132,6 @@ public:
     // of host or device memory): the caller takes its old path, it never throws for those.
     // Called by the recording thread under GuestMemory::GpuMutex.
     VkDescriptorSet AllocateTransient(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, Recorder& recorder);
-    // APS5_SET_MEMO=2: the return of the pool the last AllocateTransient took its set from (null
-    // when none or once its batch released it): whoever holds it keeps the pool from being reset, as
-    // the batch it serves does.
-    std::shared_ptr<void> TransientHold() const { return transientHold.lock(); }
     // APS5_PROFILE_DRAW counters of AllocateTransient: sets made, pools created, pools reset for
     // reuse after their batch, sets refused (needs over one pool, or a pool or set the device could
     // not make), pools destroyed on their return (more than a few reset ones waiting).
@@ -164,8 +160,6 @@ private:
     std::shared_ptr<TransientPools> transient;
     VkDescriptorPool transientPool = VK_NULL_HANDLE;
     std::uint64_t transientSerial = 0;
-    // APS5_SET_MEMO=2: the open pool's TransientReturn (TransientHold), which its batch keeps.
-    std::weak_ptr<void> transientHold;
 };
 
 class ShaderResources {
@@ -212,9 +206,6 @@ public:
         std::uint32_t dataCopies = 0;
         std::uint32_t refusedNoImport = 0;
         std::uint32_t refusedAlignment = 0;
-        // APS5_SET_MEMO=2: the transient pool of `allocation` (DescriptorCache::TransientHold), so a
-        // later batch that binds this set again (and keeps these bindings) keeps the pool unreset.
-        std::shared_ptr<void> poolHold;
         ~DrawBindings();
     };
     // With `shaders` (the draw's own stages, which may be a rebased hit, see RebaseEligible), each
@@ -240,12 +231,8 @@ public:
     // A set copy with guest snapshots, or with data copies while a stage fills deferred flat slots
     // (recordDeferredFlat writes those on the CPU), is never kept; RefreshData, an adoption and
     // rebaseLease drop the memo with ForkData's. APS5_SET_MEMO_VERIFY=1: a hit also makes the set
-    // copy the old way and compares the two (the fresh one is bound). APS5_SET_MEMO=2 also binds the
-    // memo's set copy in a later batch of its recorder: that batch keeps the bindings, and with them
-    // their transient pool (DrawBindings::poolHold), so neither is released before both batches ran;
-    // nothing ever writes such a set again, so two batches may bind it.
+    // copy the old way and compares the two (the fresh one is bound).
     static bool SetMemo();
-    static int SetMemoLevel();
     // The [draws] set memo line (APS5_PROFILE_DRAW, under APS5_SET_MEMO): hits, kept and not kept
     // set copies, misses by reason and the verify counts over the window.
     static void ReportSetMemo();
@@ -759,7 +746,7 @@ private:
     // listed at the first kept set copy.
     mutable std::vector<std::pair<std::int32_t, std::uint32_t>> setMemoSources;
     mutable bool setMemoSourcesListed = false;
-    std::shared_ptr<DrawBindings> setMemoHit(Recorder& recorder, std::span<const CompiledShader> shaders) const;
+    std::shared_ptr<DrawBindings> setMemoHit(const Recorder& recorder, std::span<const CompiledShader> shaders) const;
     void setMemoKeep(const Recorder& recorder, std::span<const CompiledShader> shaders, const std::shared_ptr<DrawBindings>& result, std::span<const std::size_t> selected, std::span<const VkDescriptorBufferInfo> infos) const;
     void setMemoVerify(const DrawBindings& memo, const DrawBindings* fresh, std::span<const std::size_t> selected, std::span<const VkDescriptorBufferInfo> infos) const;
     BuildTiming timing;

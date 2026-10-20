@@ -3315,9 +3315,7 @@ VkDescriptorSet DescriptorCache::AllocateTransient(VkDescriptorSetLayout layout,
             transientSerial = serial;
             // Keep only appends to the open batch's kept list (nothing is released here); the
             // return takes the pools' lock when that batch is released, on the release thread.
-            auto hold = std::make_shared<TransientReturn>(transient, pool);
-            if (ShaderResources::SetMemoLevel() >= 2) transientHold = hold;
-            recorder.Keep(std::move(hold));
+            recorder.Keep(std::make_shared<TransientReturn>(transient, pool));
         }
         allocation.descriptorPool = transientPool;
         VkDescriptorSet set = VK_NULL_HANDLE;
@@ -4293,7 +4291,6 @@ namespace {
 // APS5_SET_MEMO_VERIFY's compares and mismatches.
 struct SetMemoCounters {
     std::atomic<std::uint64_t> hits{0};
-    std::atomic<std::uint64_t> earlierBatch{0};
     std::atomic<std::uint64_t> kept{0};
     std::atomic<std::uint64_t> notKept{0};
     std::atomic<std::uint64_t> otherBatch{0};
@@ -4331,24 +4328,18 @@ bool FillsDeferredFlat(std::span<const CompiledShader> shaders) {
 
 }
 
-int ShaderResources::SetMemoLevel() {
-    static const int level = [] {
-        const char* value = std::getenv("APS5_SET_MEMO");
-        if (value == nullptr) return 0;
-        return value[0] == '1' ? 1 : value[0] == '2' ? 2 : 0;
-    }();
-    return level;
-}
-
 bool ShaderResources::SetMemo() {
-    return SetMemoLevel() != 0;
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_SET_MEMO");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
 }
 
 void ShaderResources::ReportSetMemo() {
     if (!SetMemo()) return;
     auto& totals = SetMemoTotals();
     const auto hits = totals.hits.exchange(0, std::memory_order_relaxed);
-    const auto earlierBatch = totals.earlierBatch.exchange(0, std::memory_order_relaxed);
     const auto kept = totals.kept.exchange(0, std::memory_order_relaxed);
     const auto notKept = totals.notKept.exchange(0, std::memory_order_relaxed);
     const auto otherBatch = totals.otherBatch.exchange(0, std::memory_order_relaxed);
@@ -4357,17 +4348,14 @@ void ShaderResources::ReportSetMemo() {
     const auto deferred = totals.deferred.exchange(0, std::memory_order_relaxed);
     const auto verified = totals.verified.exchange(0, std::memory_order_relaxed);
     const auto mismatched = totals.mismatched.load(std::memory_order_relaxed);
-    std::fprintf(stderr, "[draws] set memo (APS5_SET_MEMO=%d, 10 s): %llu set copies bound again (%llu made in an earlier batch), %llu kept, %llu not kept (guest snapshots, or data copies with deferred flat slots); misses: %llu no memo in the open batch, %llu imports changed, %llu words differ, %llu deferred flat slots; verify %llu compared, %llu mismatched since the start\n", SetMemoLevel(), static_cast<unsigned long long>(hits), static_cast<unsigned long long>(earlierBatch), static_cast<unsigned long long>(kept), static_cast<unsigned long long>(notKept), static_cast<unsigned long long>(otherBatch), static_cast<unsigned long long>(imports), static_cast<unsigned long long>(words), static_cast<unsigned long long>(deferred), static_cast<unsigned long long>(verified), static_cast<unsigned long long>(mismatched));
+    std::fprintf(stderr, "[draws] set memo (APS5_SET_MEMO, 10 s): %llu set copies bound again, %llu kept, %llu not kept (guest snapshots, or data copies with deferred flat slots); misses: %llu no memo in the open batch, %llu imports changed, %llu words differ, %llu deferred flat slots; verify %llu compared, %llu mismatched since the start\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(kept), static_cast<unsigned long long>(notKept), static_cast<unsigned long long>(otherBatch), static_cast<unsigned long long>(imports), static_cast<unsigned long long>(words), static_cast<unsigned long long>(deferred), static_cast<unsigned long long>(verified), static_cast<unsigned long long>(mismatched));
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::setMemoHit(Recorder& recorder, std::span<const CompiledShader> shaders) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::setMemoHit(const Recorder& recorder, std::span<const CompiledShader> shaders) const {
     auto& totals = SetMemoTotals();
-    auto& memo = drawSetMemo;
-    // The set copy lives as long as the batches that keep it: the open one (AllocateTransient);
-    // APS5_SET_MEMO=2 also an earlier one still kept, which the open batch then keeps too.
-    const auto serial = recorder.Submissions() + 1;
-    const bool earlier = memo.serial != serial;
-    auto bindings = memo.recorder == &recorder && (!earlier || (SetMemoLevel() >= 2 && memo.serial < serial)) ? memo.bindings.lock() : nullptr;
+    const auto& memo = drawSetMemo;
+    // The set copy lives as long as its batch: the open one only (AllocateTransient).
+    auto bindings = memo.recorder == &recorder && memo.serial == recorder.Submissions() + 1 ? memo.bindings.lock() : nullptr;
     if (bindings == nullptr) {
         totals.otherBatch.fetch_add(1, std::memory_order_relaxed);
         return {};
@@ -4390,12 +4378,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::setMemoHit(Recor
     if (memo.dataCopies && FillsDeferredFlat(shaders)) {
         totals.deferred.fetch_add(1, std::memory_order_relaxed);
         return {};
-    }
-    if (earlier) {
-        // The open batch keeps the bindings and their transient pool (poolHold) from here on.
-        recorder.Keep(bindings);
-        memo.serial = serial;
-        totals.earlierBatch.fetch_add(1, std::memory_order_relaxed);
     }
     totals.hits.fetch_add(1, std::memory_order_relaxed);
     return bindings;
@@ -4588,7 +4570,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             const auto used = static_cast<std::size_t>(std::remove_if(sizes.begin(), sizes.end(), [](const auto& size) { return size.descriptorCount == 0; }) - sizes.begin());
             const auto set = context.descriptorCache->AllocateTransient(_layout, std::span<const VkDescriptorPoolSize>(sizes.data(), used), recorder);
             if (set != VK_NULL_HANDLE) result->allocation = {set, VK_NULL_HANDLE};
-            if (set != VK_NULL_HANDLE && memo && SetMemoLevel() >= 2) result->poolHold = context.descriptorCache->TransientHold();
         }
     }
     if (result->allocation.set == VK_NULL_HANDLE) {
