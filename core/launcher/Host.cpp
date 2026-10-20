@@ -4,7 +4,10 @@
 #include "HostText.hpp"
 
 #include <SDL.h>
+// SDL_syswm.h pulls in Xlib on Linux, whose None/Bool/Status macros break Outcome::None; only Windows reads it.
+#ifdef _WIN32
 #include <SDL_syswm.h>
+#endif
 
 #include <algorithm>
 #include <cerrno>
