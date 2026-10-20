@@ -98,7 +98,7 @@ std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKep
 // from an earlier copy, units superseded by this image's own results, units read from memory after
 // all, and fallback stores (no direct upload, or a unit rejected after the flush).
 struct SubaliasCounters {
-    std::atomic<std::uint64_t> refreshes{0}, candidates{0}, kept{0}, idle{0}, rejectedState{0}, rejectedShape{0}, rejectedUnits{0}, rejectedShared{0};
+    std::atomic<std::uint64_t> refreshes{0}, candidates{0}, kept{0}, idle{0}, rejectedState{0}, rejectedShape{0}, rejectedUnits{0}, rejectedShared{0}, rejectedStoredOver{0};
     std::atomic<std::uint64_t> copies{0}, units{0}, bytes{0}, held{0}, superseded{0}, reread{0}, fallbacks{0};
     // Shape rejections by SubresourceMismatch.
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(SubresourceMismatch::Count)> mismatches{};
@@ -392,13 +392,13 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     if (SubaliasRefreshEnabled()) {
         auto& s = Subaliases();
         const auto refreshes = take(s.refreshes), candidates = take(s.candidates), kept = take(s.kept), idle = take(s.idle);
-        const auto state = take(s.rejectedState), shape = take(s.rejectedShape), units = take(s.rejectedUnits), shared = take(s.rejectedShared);
+        const auto state = take(s.rejectedState), shape = take(s.rejectedShape), units = take(s.rejectedUnits), shared = take(s.rejectedShared), storedOver = take(s.rejectedStoredOver);
         const auto copies = take(s.copies), copied = take(s.units), bytes = take(s.bytes), held = take(s.held), superseded = take(s.superseded), reread = take(s.reread), fallbacks = take(s.fallbacks);
         std::string reasons;
         for (std::size_t i = 1; i < s.mismatches.size(); ++i) {
             if (const auto count = take(s.mismatches[i]); count != 0) reasons += std::string(reasons.empty() ? "" : ", ") + SubresourceMismatchName(static_cast<SubresourceMismatch>(i)) + " " + std::to_string(count);
         }
-        std::fprintf(stderr, "[storage] subalias (APS5_SUBALIAS_REFRESH, 10 s): %llu refreshes looked, %llu pending images over them: %llu kept, %llu idle, rejected state %llu, shape %llu, units %llu, shared %llu; %llu device copies (%llu units, %.1f MiB), %llu units held, %llu superseded, %llu re-read, %llu fallback stores; shape by reason: %s\n", refreshes, candidates, kept, idle, state, shape, units, shared, copies, copied, static_cast<double>(bytes) / 1048576.0, held, superseded, reread, fallbacks, reasons.empty() ? "-" : reasons.c_str());
+        std::fprintf(stderr, "[storage] subalias (APS5_SUBALIAS_REFRESH, 10 s): %llu refreshes looked, %llu pending images over them: %llu kept, %llu idle, rejected state %llu, shape %llu, units %llu, shared %llu, stored over %llu; %llu device copies (%llu units, %.1f MiB), %llu units held, %llu superseded, %llu re-read, %llu fallback stores; shape by reason: %s\n", refreshes, candidates, kept, idle, state, shape, units, shared, storedOver, copies, copied, static_cast<double>(bytes) / 1048576.0, held, superseded, reread, fallbacks, reasons.empty() ? "-" : reasons.c_str());
     }
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
@@ -1598,7 +1598,6 @@ bool StorageTexture::Refresh() {
     } subExemptScope{std::exchange(refreshAliases, subExempt.empty() ? nullptr : &subExempt)};
     // No publish: the upload below reads the stored units from the unit shadow itself.
     const bool flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.get(), "storage refresh", PublishScope::None);
-    refreshAliases = subExemptScope.previous;
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
     // `original` holds the guest bytes the image was last uploaded from or written back as; while the
     // guest memory and the DCC keys still match, the image content is current. Pages nobody wrote
@@ -1706,6 +1705,8 @@ bool StorageTexture::Refresh() {
                 borrowedUnits.clear();
             }
         }
+        // The kept sub-aliases stayed exempt through the compare above too (its flush hook).
+        refreshAliases = subExemptScope.previous;
         if (!subAliases.empty()) planSubBorrows(subAliases, direct, changed, unchanged);
     }
     if (unchanged) {
@@ -4047,13 +4048,25 @@ std::vector<StorageTexture::SubAlias> StorageTexture::pendingSubAliases() const 
     std::vector<SubAlias> aliases;
     if (!blockUnits || descriptor.dccAddress != 0) return aliases;
     std::vector<std::shared_ptr<StorageTexture>> candidates;
+    // Per candidate: pending units inside this memory (the flush stores it unless it is kept).
+    std::vector<bool> storesInside;
+    // Guest ranges of the other pending images the flush stores over this memory.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> stored;
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
         if (!pending.textures.MayOverlap(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) return aliases;
         for (auto* texture : pending.textures) {
-            if (texture == this || !texture->blockUnits || !texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) continue;
-            if (auto alive = texture->weak_from_this().lock()) candidates.push_back(std::move(alive));
+            if (texture == this || !texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) continue;
+            const bool inside = texture->pendingUnitInside(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+            if (!texture->blockUnits) {
+                if (inside) stored.emplace_back(texture->descriptor.baseAddress, texture->descriptor.baseAddress + texture->guestBytes);
+                continue;
+            }
+            if (auto alive = texture->weak_from_this().lock()) {
+                candidates.push_back(std::move(alive));
+                storesInside.push_back(inside);
+            }
         }
     }
     if (candidates.empty()) return aliases;
@@ -4120,6 +4133,22 @@ std::vector<StorageTexture::SubAlias> StorageTexture::pendingSubAliases() const 
         return false;
     });
     counters.rejectedShared.fetch_add(shared, std::memory_order_relaxed);
+    // An image the flush stores first over a unit a kept alias has pending would decide that unit
+    // against the pending-list order: such aliases are stored by the flush as well.
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        if (!storesInside[i]) continue;
+        const auto* texture = candidates[i].get();
+        if (std::none_of(aliases.begin(), aliases.end(), [&](const SubAlias& alias) { return alias.texture.get() == texture; })) stored.emplace_back(texture->descriptor.baseAddress, texture->descriptor.baseAddress + texture->guestBytes);
+    }
+    if (!aliases.empty() && !stored.empty()) {
+        std::vector<SubresourceLender> lenders;
+        lenders.reserve(aliases.size());
+        for (const auto& alias : aliases) lenders.push_back({alias.texture->descriptor.baseAddress, alias.texture->descriptor.baseAddress + alias.texture->guestBytes, alias.pendingBefore});
+        const auto given = SubresourceStoredOver(descriptor.baseAddress, trackedLayers, std::move(stored), lenders);
+        std::size_t index = 0;
+        const auto storedOver = std::erase_if(aliases, [&](const SubAlias&) { return given[index++]; });
+        counters.rejectedStoredOver.fetch_add(storedOver, std::memory_order_relaxed);
+    }
     counters.kept.fetch_add(aliases.size(), std::memory_order_relaxed);
     return aliases;
 }

@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -134,6 +136,26 @@ void mismatchTests() {
     Require(std::string(SubresourceMismatchName(SubresourceMismatch::LayerAlignment)) == "layer alignment", "mismatch names");
 }
 
+void storedOverTests() {
+    constexpr std::uint64_t base = 0x2c4900000;
+    // A reader of 8 units; lender A has units 1-2 pending, lender B unit 6.
+    std::vector<SubresourceLender> lenders(2);
+    lenders[0] = {base + 0x10000, base + 0x30000, std::vector<bool>{false, true, true, false, false, false, false, false}};
+    lenders[1] = {base + 0x60000, base + 0x70000, std::vector<bool>{false, false, false, false, false, false, true, false}};
+    auto given = SubresourceStoredOver(base, 8, {}, lenders);
+    Require(!given[0] && !given[1], "no other store keeps every lender");
+    given = SubresourceStoredOver(base, 8, {{base + 0x48000, base + 0x50000}}, lenders);
+    Require(!given[0] && !given[1], "a store over units no lender has pending keeps every lender");
+    given = SubresourceStoredOver(base, 8, {{base + 0x2ffff, base + 0x30001}}, lenders);
+    Require(given[0] && !given[1], "a store reaching a lent unit by one byte gives that lender back");
+    // Given back, A is stored over its whole range: a lender pending inside it follows.
+    lenders[0].end = base + 0x70000;
+    given = SubresourceStoredOver(base, 8, {{base + 0x20000, base + 0x21000}}, lenders);
+    Require(given[0] && given[1], "a lender given back gives back the lenders under its range");
+    given = SubresourceStoredOver(base, 8, {{base - 0x10000, base}, {base + 0x80000, base + 0x90000}}, lenders);
+    Require(!given[0] && !given[1], "stores outside the reader keep every lender");
+}
+
 void unitPlanTests() {
     using Plan = SubresourceUnitPlan;
     SubresourceUnit unit;
@@ -171,5 +193,6 @@ void unitPlanTests() {
 void RunSubresourceAliasTests() {
     layerOffsetTests();
     mismatchTests();
+    storedOverTests();
     unitPlanTests();
 }

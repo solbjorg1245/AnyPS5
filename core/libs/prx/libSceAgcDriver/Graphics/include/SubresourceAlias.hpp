@@ -2,11 +2,14 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_SUBRESOURCEALIAS_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <utility>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -150,6 +153,45 @@ inline SubresourceUnitPlan PlanSubresourceUnit(const SubresourceUnit& unit) {
     if (unit.readerPending) return SubresourceUnitPlan::Reject;
     if (unit.held) return SubresourceUnitPlan::Leave;
     return SubresourceUnitPlan::Borrow;
+}
+
+// A kept sub-alias: its guest range and the reader's 64 KiB units it has pending.
+struct SubresourceLender {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::vector<bool> pending;
+};
+
+// Which lenders go back to the old order: the refresh flush stores every other pending image over
+// the reader's memory first (`stored`, guest ranges), and a store over a unit a lender has pending
+// would decide the unit against the pending-list order. A lender given back is stored with them,
+// so the rule repeats until nothing more is given back. `units` 64 KiB units from `base`.
+inline std::vector<bool> SubresourceStoredOver(std::uint64_t base, std::uint32_t units, std::vector<std::pair<std::uint64_t, std::uint64_t>> stored, const std::vector<SubresourceLender>& lenders) {
+    std::vector<bool> given(lenders.size(), false);
+    std::vector<bool> covered(units, false);
+    std::size_t marked = 0;
+    for (bool again = true; again;) {
+        again = false;
+        for (; marked < stored.size(); ++marked) {
+            const auto [begin, end] = stored[marked];
+            const auto limit = base + static_cast<std::uint64_t>(units) * 65536;
+            if (end <= base || begin >= limit || end <= begin) continue;
+            const auto first = begin > base ? (begin - base) / 65536 : 0;
+            const auto last = std::min<std::uint64_t>(units, (std::min(end, limit) - base + 65535) / 65536);
+            for (auto unit = first; unit < last; ++unit) covered[static_cast<std::size_t>(unit)] = true;
+        }
+        for (std::size_t i = 0; i < lenders.size(); ++i) {
+            if (given[i]) continue;
+            for (std::uint32_t unit = 0; unit < units && unit < lenders[i].pending.size(); ++unit) {
+                if (!lenders[i].pending[unit] || !covered[unit]) continue;
+                given[i] = true;
+                stored.emplace_back(lenders[i].begin, lenders[i].end);
+                again = true;
+                break;
+            }
+        }
+    }
+    return given;
 }
 
 }
