@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RecordCensus.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerfDiag.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -375,6 +376,12 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
+    if (PerfDiag::Enabled()) {
+        static std::uint64_t reportedPresents = 0;
+        const auto presents = Recorder::Presents();
+        std::fprintf(stderr, "%s\n", PerfDiag::Refreshes().Line(presents - reportedPresents).c_str());
+        reportedPresents = presents;
+    }
     reportRetiles();
 }
 
@@ -1543,6 +1550,12 @@ bool StorageTexture::Refresh() {
     // stamped); an untracked unit is stored whole by that write-back, and a unit pending in both
     // images takes the old order (store, then this image re-uploads it).
     auto alias = pendingAlias();
+    // APS5_PERF_DIAG: the alias as found, and the images the flush below writes back (its listing).
+    const bool diagAliasFound = PerfDiag::Enabled() && alias != nullptr;
+    const auto diagSurface = [](const StorageTexture& image) {
+        const auto& shape = image.descriptor;
+        return PerfDiag::Surface{shape.baseAddress, image.guestBytes, shape.format, BytesPerElement(shape.format), static_cast<std::uint32_t>(shape.tileMode), shape.width, shape.height, shape.depthOrLastArray, shape.baseArray, shape.mipCount, static_cast<std::uint32_t>(shape.dimension), shape.dccAddress != 0};
+    };
     if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
     if (alias != nullptr) {
         std::vector<std::uint8_t> aliasStamped(trackedLayers);
@@ -1553,6 +1566,16 @@ bool StorageTexture::Refresh() {
                 alias = nullptr;
                 break;
             }
+        }
+    }
+    std::vector<PerfDiag::RefreshPairs::Writer> diagWriters;
+    const bool diagAliasKept = alias != nullptr;
+    if (PerfDiag::Enabled()) {
+        for (const auto& writer : overlappingPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+            if (writer == alias) continue;
+            const auto from = std::max(descriptor.baseAddress, writer->descriptor.baseAddress);
+            const auto to = std::min(descriptor.baseAddress + guestBytes, writer->descriptor.baseAddress + writer->guestBytes);
+            diagWriters.push_back({diagSurface(*writer), to > from ? to - from : 0});
         }
     }
     // No publish: the upload below reads the stored units from the unit shadow itself.
@@ -1665,6 +1688,7 @@ bool StorageTexture::Refresh() {
             }
         }
     }
+    if (PerfDiag::Enabled() && (!diagWriters.empty() || diagAliasFound)) PerfDiag::Refreshes().Note(diagSurface(*this), diagWriters, cpuWrote, diagAliasFound, diagAliasKept, anyBorrowed);
     if (unchanged) {
         ++Profile().storageReused;
         if ((edgeSnapshotAt[0] | edgeSnapshotAt[1]) != 0) {

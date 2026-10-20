@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/FastDispatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastRing.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RecordProfile.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerfDiag.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
@@ -6970,6 +6971,77 @@ void gpuTimingDigestTests() {
     std::cout << "gpu timing digest checked\n";
 }
 
+// APS5_PERF_DIAG (PerfDiag.hpp) without a device: the copy-back watch's classes and closes (a
+// shared read list tested only against the entries made since its last note), the refresh pair
+// facts and the draw programs line.
+void perfDiagTests() {
+    using Ranges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    constexpr std::uint64_t K64 = 0x10000;
+    const auto has = [](const std::string& line, const std::string& part) { return line.find(part) != std::string::npos; };
+    {
+        PerfDiag::CopyBackWatch watch(32);
+        watch.CopyBack(0x10000, 0x20000, 1);
+        watch.CopyBack(0x40000, 0x50000, 1);
+        watch.CopyBack(0x80000, 0x90000, 1);
+        watch.CopyBack(0x100000, 0x110000, 1);
+        watch.Read(0x30000, 0x38000, 0);
+        const auto set = std::make_shared<const Ranges>(Ranges{{0x0, 0x8000}, {0x48000, 0x49000}});
+        watch.ReadSet(set, PerfDiag::AddressBasedReader);
+        watch.Read(0x8f000, 0x91000, 6);
+        watch.CopyIn(0x18000, 0x19000);
+        watch.CopyIn(0x40000, 0x50000);
+        watch.CopyIn(0x10000, 0x20000);
+        watch.CopyBack(0x88000, 0x98000, 2);
+        const auto later = std::make_shared<const Ranges>(Ranges{{0x200000, 0x201000}});
+        watch.ReadSet(later, PerfDiag::AddressBasedReader);
+        watch.CopyBack(0x200000, 0x210000, 3);
+        watch.ReadSet(later, PerfDiag::AddressBasedReader);
+        watch.ReadSet(later, PerfDiag::AddressBasedReader);
+        const auto first = watch.Take(10, 8);
+        using Watch = PerfDiag::CopyBackWatch;
+        Require(first.watched == 6 && first.count[Watch::NeverRead] == 2 && first.bytes[Watch::NeverRead] == 2 * K64 && first.count[Watch::AddressBasedOnly] == 1 && first.count[Watch::ReadInPlace] == 1, "perf-diag: wrong copy-back classes");
+        Require(first.closed[Watch::ClosedByCopyIn] == 2 && first.closed[Watch::ClosedByCopyBack] == 1 && first.closed[Watch::ClosedByAge] == 1 && first.open == 2 && first.openBytes == 2 * K64, "perf-diag: wrong copy-back closes");
+        Require(first.readerBytes[PerfDiag::AddressBasedReader] == K64 && first.readerBytes[6] == K64 && first.readerBytes[0] == 0, "perf-diag: wrong reader bytes");
+        const auto line = Watch::Line(first, 1, 8);
+        Require(has(line, "watched x6.0 0.4 MiB") && has(line, "never read x2.0 0.1 MiB (50.0% of closed bytes)") && has(line, "draw input 0.1; open 2"), "perf-diag: wrong copy-back line: " + line);
+        const auto idle = watch.Take(10, 8);
+        Require(idle.watched == 0 && idle.open == 2, "perf-diag: Take kept the window");
+        const auto aged = watch.Take(100, 8);
+        Require(aged.count[Watch::NeverRead] == 1 && aged.count[Watch::AddressBasedOnly] == 1 && aged.closed[Watch::ClosedByAge] == 2 && aged.open == 0, "perf-diag: wrong aged copy-backs");
+        watch.Read(0x88000, 0x98000, 0);
+        Require(watch.Take(100, 8).open == 0, "perf-diag: a closed entry came back");
+    }
+    {
+        const PerfDiag::Surface reader{0x100000, 0x40000, 10, 4, 13, 256, 256, 0, 0, 1, 1, false};
+        auto other = reader;
+        other.format = 11;
+        Require(PerfDiag::ClassifyPair(other, reader, false)[PerfDiag::GpuOnlySameShape] && !PerfDiag::ClassifyPair(other, reader, false)[PerfDiag::SameFormat], "perf-diag: a format change broke the same shape");
+        Require(!PerfDiag::ClassifyPair(reader, reader, true)[PerfDiag::GpuOnlySameShape], "perf-diag: a CPU store kept the pair GPU-only");
+        auto tiled = reader;
+        tiled.tileMode = 0;
+        Require(!PerfDiag::ClassifyPair(tiled, reader, false)[PerfDiag::GpuOnlySameShape] && PerfDiag::ClassifyPair(tiled, reader, false)[PerfDiag::SameShape], "perf-diag: a tiling change kept the pair");
+        PerfDiag::RefreshPairs pairs;
+        const std::array<PerfDiag::RefreshPairs::Writer, 2> writers{{{other, 0x40000}, {tiled, 0x40000}}};
+        pairs.Note(reader, writers, false, true, false, false);
+        const auto line = pairs.Line(1);
+        Require(has(line, "2.0 pairs 0.5 MiB") && has(line, "GPU-only same-shape 1.0 (50%)") && has(line, "found 1.0, kept past keys/import 0.0") && has(line, "(2 distinct)"), "perf-diag: wrong refresh line: " + line);
+        Require(has(pairs.Line(1), "0.0 pairs"), "perf-diag: the refresh line kept the window");
+    }
+    {
+        PerfDiag::TargetPrograms targets;
+        const int vertex = 0, pixel = 0, other = 0;
+        targets.Name(&vertex, 0x1234);
+        targets.Draw(0x50000, &vertex, 100, &pixel, 200, true, 1920, 1080, 37);
+        targets.Draw(0x50000, &vertex, 100, &pixel, 200, true, 1920, 1080, 37);
+        targets.Draw(0x50000, &other, 50, nullptr, 0, false, 1920, 1080, 37);
+        const std::array<PerfDiag::TargetPrograms::Ranked, 1> ranked{{{0x50000, 1.5, 3, 2}}};
+        const auto line = targets.Line(ranked, 1);
+        Require(has(line, "0x50000 1.50ms 3.0d L2.0 (recorded 3.0d L2.0 = 67%, 1920x1080 format 37, 2 pairs): vs 0x1234 ps ? 2.0d L2.0 spv 100/200, vs ? ps - 1.0d L0.0 spv 50/0;"), "perf-diag: wrong draw programs line: " + line);
+        Require(has(targets.Line(ranked, 1), "(no recorded draws)"), "perf-diag: the draw programs line kept the window");
+    }
+    std::cout << "perf diag checked\n";
+}
+
 // The [gputime] retile row sums the write-back's three stages (ContinueGpuTiming) and counts the
 // write-back once, by its first stage; its bytes are the stored ones.
 void retileRowDigestTests() {
@@ -7149,6 +7221,7 @@ int main() {
     try {
         gpuTimingDigestTests();
         retileRowDigestTests();
+        perfDiagTests();
         Device device;
         std::lock_guard gpu(GpuMutex());
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RecordCensus.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerfDiag.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -4706,6 +4707,10 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     Require(!capture || CaptureTrace::Enabled(), "GPU copy capture requires APS5_CAPTURE_TRACE");
     auto* recorder = Recorder::Active();
     Require(recorder != nullptr, "GPU buffer copies need an active recorder");
+    // APS5_PERF_DIAG: the next use of each range ends the watch of the copy-backs over it.
+    if (PerfDiag::Enabled()) {
+        for (const auto* region : copies) PerfDiag::Watch().CopyIn(region->begin, region->end);
+    }
     // Staging chain decisions come before anything is recorded: the first recording records the
     // copy-backs deferred so far (Recorder::Commands), and a region that takes the shadow of an
     // earlier use claims that use's deferred copy-backs, which its own copy-back takes over. Copy-
@@ -5084,6 +5089,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 // Exactly the sub-range the shader may write, in place in the import: what the
                 // shader would have stored there itself had the range been bindable.
                 CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, to - from);
+                if (PerfDiag::Enabled()) PerfDiag::Watch().CopyBack(from, to, Recorder::Presents());
             }
             copiedBytes += to - from;
             recorder.Keep(region.buffer);

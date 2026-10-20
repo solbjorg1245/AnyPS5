@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerfDiag.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <chrono>
@@ -113,6 +114,8 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::compileDrawStag
     phaseTiming.Phase(DrawRowCapture);
 
     stageCapture.compiled = reuseCapture ? ShaderRecompiler::Recompile(request, *capture) : std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::Recompile(request));
+    // APS5_PERF_DIAG: the draw programs line names the result by its guest code address.
+    if (Graphics::PerfDiag::Enabled()) Graphics::PerfDiag::Targets().Name(stageCapture.compiled.get(), program.binary.codeAddress);
     phaseTiming.Phase(DrawRowRecompile);
     return stageCapture.compiled;
 }

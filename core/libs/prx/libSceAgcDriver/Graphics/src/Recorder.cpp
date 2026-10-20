@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RecordCensus.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerfDiag.hpp"
 #include "prx/libc/include/HostMutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
@@ -2317,6 +2318,10 @@ std::uint64_t Recorder::recordCopyPass(VkCommandBuffer commands, std::vector<Def
     // The shaders' stores into the shadows (whichever stage made them) precede the copies.
     recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, copyStages, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, copyReads);
     CountBarriers(CommandClass::StagingOut);
+    if (PerfDiag::Enabled()) {
+        const auto present = Presents();
+        for (const auto& copy : copies) PerfDiag::Watch().CopyBack(copy.address, copy.address + copy.bytes, present);
+    }
     const auto bytes = recordCopyCommands(commands, std::move(copies));
     // As a GPU label store or fill: visible to everything recorded after (shaders, transfers, an
     // indirect dispatch's arguments) and to the host once the batch completed.
@@ -3184,6 +3189,15 @@ void reportBarriers() {
         lastPageForced = pageForced;
     }
     std::fputc('\n', stderr);
+    if (PerfDiag::Enabled()) {
+        // APS5_PERF_DIAG: whether anything read the copy-backs' imports before the next copy-in.
+        constexpr std::uint64_t maxAge = 8;
+        static std::uint64_t reportedPresents = 0;
+        const auto present = Recorder::Presents();
+        const auto watched = PerfDiag::Watch().Take(present, maxAge);
+        std::fprintf(stderr, "%s\n", PerfDiag::CopyBackWatch::Line(watched, present - reportedPresents, maxAge).c_str());
+        reportedPresents = present;
+    }
 }
 
 }
@@ -3511,6 +3525,15 @@ void Recorder::readGpuTiming(Batch& batch) {
     const auto refusedNow = refused - timingRefusedReported;
     timingRefusedReported = refused;
     for (const auto& line : timingDigest.Report(presents, timingDropped.exchange(0, std::memory_order_relaxed), GpuTimingRangeCap(), refusedNow)) std::fprintf(stderr, "%s\n", line.c_str());
+    if (PerfDiag::Enabled()) {
+        // APS5_PERF_DIAG: the four costliest pass targets' draws by program.
+        const double per = presents != 0 ? 1.0 / static_cast<double>(presents) : 0.0;
+        std::vector<PerfDiag::TargetPrograms::Ranked> ranked;
+        for (const auto& [target, totals] : timingDigest.Passes()) ranked.push_back({target, totals.ms * per, static_cast<double>(totals.draws) * per, static_cast<double>(totals.leased) * per});
+        std::sort(ranked.begin(), ranked.end(), [](const PerfDiag::TargetPrograms::Ranked& a, const PerfDiag::TargetPrograms::Ranked& b) { return a.ms > b.ms; });
+        if (ranked.size() > 4) ranked.resize(4);
+        std::fprintf(stderr, "%s\n", PerfDiag::Targets().Line(ranked, presents).c_str());
+    }
     timingDigest.Clear();
     lock.unlock();
     reportBarriers();
@@ -4099,6 +4122,7 @@ bool Recorder::ReadTracking() {
 
 void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind) {
     CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%zu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, static_cast<int>(kind));
+    if (PerfDiag::Enabled() && bytes != 0) PerfDiag::Watch().Read(address, address + bytes, static_cast<std::size_t>(kind));
     if (bytes == 0 || !ReadTrackingEnabled()) return;
     ensureOpen();
     open->reads.push_back({address, address + bytes, kind});
@@ -4106,6 +4130,9 @@ void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKin
 }
 
 void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind) {
+    if (PerfDiag::Enabled()) {
+        for (const auto& [begin, end] : ranges) PerfDiag::Watch().Read(begin, end, static_cast<std::size_t>(kind));
+    }
     if (ranges.empty() || !ReadTrackingEnabled()) return;
     ensureOpen();
     for (const auto& [begin, end] : ranges) {
@@ -4116,6 +4143,7 @@ void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::ui
 }
 
 void Recorder::NotePendingReadSet(std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> ranges, ReadKind kind) {
+    if (PerfDiag::Enabled()) PerfDiag::Watch().ReadSet(ranges, static_cast<std::size_t>(kind));
     if (ranges == nullptr || ranges->empty() || !ReadTrackingEnabled()) return;
     if (!ReadSets()) {
         NotePendingReads(*ranges, kind);
