@@ -7020,11 +7020,17 @@ void perfDiagTests() {
         auto tiled = reader;
         tiled.tileMode = 0;
         Require(!PerfDiag::ClassifyPair(tiled, reader, false)[PerfDiag::GpuOnlySameShape] && PerfDiag::ClassifyPair(tiled, reader, false)[PerfDiag::SameShape], "perf-diag: a tiling change kept the pair");
+        // One slice of a three-slice array over the same memory: a GPU-only subresource pair.
+        const PerfDiag::Surface array{0x200000, 0xc0000, 10, 4, 13, 256, 256, 2, 0, 1, 1, false};
+        const PerfDiag::Surface slice{0x240000, 0x40000, 10, 4, 13, 256, 256, 0, 0, 1, 1, false};
+        const auto nested = PerfDiag::ClassifyPair(slice, array, false);
+        Require(nested[PerfDiag::Nested] && nested[PerfDiag::GpuOnlySubresource] && nested[PerfDiag::GpuOnlyCopyable] && !nested[PerfDiag::SameShape] && !nested[PerfDiag::GpuOnlySameShape], "perf-diag: a slice of an array is not a GPU-only subresource");
+        Require(!PerfDiag::ClassifyPair(slice, array, true)[PerfDiag::GpuOnlyCopyable] && !PerfDiag::ClassifyPair(slice, reader, false)[PerfDiag::Nested], "perf-diag: a CPU-stored or disjoint pair passed as a subresource");
         PerfDiag::RefreshPairs pairs;
         const std::array<PerfDiag::RefreshPairs::Writer, 2> writers{{{other, 0x40000}, {tiled, 0x40000}}};
         pairs.Note(reader, writers, false, true, false, false);
         const auto line = pairs.Line(1);
-        Require(has(line, "2.0 pairs 0.5 MiB") && has(line, "GPU-only same-shape 1.0 (50%)") && has(line, "found 1.0, kept past keys/import 0.0") && has(line, "(2 distinct)"), "perf-diag: wrong refresh line: " + line);
+        Require(has(line, "2.0 pairs 0.5 MiB") && has(line, "GPU-only same-shape 1.0 (50%)") && has(line, "GPU-only copyable 1.0 (50%)") && has(line, "gpu-only same-shape;") && has(line, "found 1.0, kept past keys/import 0.0") && has(line, "(2 distinct)"), "perf-diag: wrong refresh line: " + line);
         Require(has(pairs.Line(1), "0.0 pairs"), "perf-diag: the refresh line kept the window");
     }
     {
@@ -7036,8 +7042,15 @@ void perfDiagTests() {
         targets.Draw(0x50000, &other, 50, nullptr, 0, false, 1920, 1080, 37);
         const std::array<PerfDiag::TargetPrograms::Ranked, 1> ranked{{{0x50000, 1.5, 3, 2}}};
         const auto line = targets.Line(ranked, 1);
-        Require(has(line, "0x50000 1.50ms 3.0d L2.0 (recorded 3.0d L2.0 = 67%, 1920x1080 format 37, 2 pairs): vs 0x1234 ps ? 2.0d L2.0 spv 100/200, vs ? ps - 1.0d L0.0 spv 50/0;"), "perf-diag: wrong draw programs line: " + line);
-        Require(has(targets.Line(ranked, 1), "(no recorded draws)"), "perf-diag: the draw programs line kept the window");
+        Require(has(line, "0x50000 1.50ms 3.0d L2.0 (recorded 3.0d L2.0 = 67%, 1920x1080 format 37, 2 pairs, 2 compiled results): vs 0x1234 ps ? 2.0d L2.0 spv 100/200 (1 results), vs ? ps - 1.0d L0.0 spv 50/0 (1 results);"), "perf-diag: wrong draw programs line: " + line);
+        // Another compiled result of the same named program: the same pair, one more result.
+        const int variant = 0;
+        targets.Name(&variant, 0x1234);
+        targets.Draw(0x60000, &vertex, 100, &pixel, 200, false, 64, 64, 37);
+        targets.Draw(0x60000, &variant, 120, &pixel, 200, false, 64, 64, 37);
+        const std::array<PerfDiag::TargetPrograms::Ranked, 2> second{{{0x60000, 0.5, 2, 0}, {0x50000, 0.1, 1, 0}}};
+        const auto variants = targets.Line(second, 1);
+        Require(has(variants, "0x60000 0.50ms 2.0d L0.0 (recorded 2.0d L0.0 = 0%, 64x64 format 37, 1 pairs, 2 compiled results): vs 0x1234 ps ? 2.0d L0.0 spv 120/200 (2 results); 0x50000 0.10ms 1.0d L0.0 (no recorded draws);"), "perf-diag: the draw programs line kept the window or split a program's results: " + variants);
     }
     std::cout << "perf diag checked\n";
 }

@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <span>
 #include <string>
 #include <tuple>
@@ -50,9 +51,10 @@ inline double Mib(std::uint64_t bytes) {
     return static_cast<double>(bytes) / 1048576.0;
 }
 
-// Item 3: the draws recorded into each pass target (Draw.cpp noteDrawTiming), keyed by the compiled
-// results of their vertex and pixel stages, which the draw capture names by guest code address
-// (Name; a result never named prints as '?').
+// Item 3: the draws recorded into each pass target (Draw.cpp noteDrawTiming), keyed by the guest code
+// addresses of their vertex and pixel stages: the draw capture names each compiled result (Name; one
+// never named counts as '?', a missing stage as '-'). One program pair has as many compiled results
+// as its captures made (variants by the bound data).
 class TargetPrograms {
 public:
     struct Pair {
@@ -60,6 +62,7 @@ public:
         std::uint64_t leased = 0;
         std::size_t vertexWords = 0;
         std::size_t pixelWords = 0;
+        std::uint64_t results = 0;
     };
     struct Target {
         std::uint64_t draws = 0;
@@ -67,7 +70,8 @@ public:
         std::uint32_t width = 0;
         std::uint32_t height = 0;
         std::uint32_t format = 0;
-        std::map<std::pair<const void*, const void*>, Pair> pairs;
+        std::map<std::pair<std::uint64_t, std::uint64_t>, Pair> pairs;
+        std::set<std::pair<const void*, const void*>> results;
     };
     // A pass target as the [gputime] digest ranked it: its GPU ms, draws and address-based draws
     // per present.
@@ -89,17 +93,14 @@ public:
         entry.width = width;
         entry.height = height;
         entry.format = format;
-        auto& pair = entry.pairs[{vertex, pixel}];
+        auto& pair = entry.pairs[{address(vertex), address(pixel)}];
         ++pair.draws;
         if (leased) ++pair.leased;
-        pair.vertexWords = vertexWords;
-        pair.pixelWords = pixelWords;
+        pair.vertexWords = std::max(pair.vertexWords, vertexWords);
+        pair.pixelWords = std::max(pair.pixelWords, pixelWords);
+        if (entry.results.emplace(vertex, pixel).second) ++pair.results;
     }
-    std::uint64_t Address(const void* program) {
-        std::lock_guard lock(mutex);
-        const auto found = names.find(program);
-        return found != names.end() ? found->second : 0;
-    }
+
     // The line for the ranked targets (per present over `presents`), then a fresh window.
     std::string Line(std::span<const Ranked> ranked, std::uint64_t presents, std::size_t topPairs = 3) {
         std::lock_guard lock(mutex);
@@ -113,22 +114,19 @@ public:
                 continue;
             }
             const auto& entry = found->second;
-            Append(line, " (recorded %.1fd L%.1f = %.0f%%, %ux%u format %u, %zu pairs):", static_cast<double>(entry.draws) * per, static_cast<double>(entry.leased) * per, entry.draws != 0 ? 100.0 * static_cast<double>(entry.leased) / static_cast<double>(entry.draws) : 0.0, entry.width, entry.height, entry.format, entry.pairs.size());
-            std::vector<std::pair<std::pair<const void*, const void*>, const Pair*>> sorted;
+            Append(line, " (recorded %.1fd L%.1f = %.0f%%, %ux%u format %u, %zu pairs, %zu compiled results):", static_cast<double>(entry.draws) * per, static_cast<double>(entry.leased) * per, entry.draws != 0 ? 100.0 * static_cast<double>(entry.leased) / static_cast<double>(entry.draws) : 0.0, entry.width, entry.height, entry.format, entry.pairs.size(), entry.results.size());
+            std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, const Pair*>> sorted;
             sorted.reserve(entry.pairs.size());
             for (const auto& [key, pair] : entry.pairs) sorted.emplace_back(key, &pair);
             std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second->draws > b.second->draws; });
             for (std::size_t i = 0; i < sorted.size() && i < topPairs; ++i) {
-                const auto name = [&](const void* program) {
-                    std::string text;
-                    const auto address = names.find(program);
-                    if (program == nullptr) text = "-";
-                    else if (address == names.end()) text = "?";
-                    else Append(text, "0x%llx", static_cast<unsigned long long>(address->second));
+                const auto name = [](std::uint64_t address) {
+                    std::string text = address == Missing ? "-" : address == Unnamed ? "?" : "";
+                    if (text.empty()) Append(text, "0x%llx", static_cast<unsigned long long>(address));
                     return text;
                 };
                 const auto& pair = *sorted[i].second;
-                Append(line, " vs %s ps %s %.1fd L%.1f spv %zu/%zu", name(sorted[i].first.first).c_str(), name(sorted[i].first.second).c_str(), static_cast<double>(pair.draws) * per, static_cast<double>(pair.leased) * per, pair.vertexWords, pair.pixelWords);
+                Append(line, " vs %s ps %s %.1fd L%.1f spv %zu/%zu (%llu results)", name(sorted[i].first.first).c_str(), name(sorted[i].first.second).c_str(), static_cast<double>(pair.draws) * per, static_cast<double>(pair.leased) * per, pair.vertexWords, pair.pixelWords, static_cast<unsigned long long>(pair.results));
                 line += i + 1 < sorted.size() && i + 1 < topPairs ? "," : "";
             }
             line += ";";
@@ -138,6 +136,14 @@ public:
     }
 
 private:
+    static constexpr std::uint64_t Missing = 0;
+    static constexpr std::uint64_t Unnamed = 1;
+    std::uint64_t address(const void* program) const {
+        if (program == nullptr) return Missing;
+        const auto found = names.find(program);
+        return found != names.end() ? found->second : Unnamed;
+    }
+
     HostMutex mutex;
     std::unordered_map<const void*, std::uint64_t> names;
     std::map<std::uint64_t, Target> targets;
@@ -164,12 +170,16 @@ struct Surface {
     bool dcc = false;
 };
 
-enum PairFact : std::size_t { SameSurface, SameShape, SameFormat, SameElementBytes, SameTiling, AnyDcc, CpuStored, GpuOnlySameShape, PairFacts };
-inline constexpr std::array<const char*, PairFacts> PairFactNames{"same surface", "same shape", "same format", "same element size", "same tiling", "DCC", "CPU-stored", "GPU-only same-shape"};
+enum PairFact : std::size_t { SameSurface, SameShape, SameFormat, SameElementBytes, SameTiling, AnyDcc, CpuStored, GpuOnlySameShape, Nested, SameExtent, GpuOnlySubresource, GpuOnlyCopyable, PairFacts };
+inline constexpr std::array<const char*, PairFacts> PairFactNames{"same surface", "same shape", "same format", "same element size", "same tiling", "DCC", "CPU-stored", "GPU-only same-shape", "nested (one inside the other)", "same extent", "GPU-only subresource", "GPU-only copyable"};
 
 // A pair is "GPU-only same-shape" when an image -> image copy could stand in for the write-back and
 // the re-upload: the same surface (base and bytes), the same extent, layers and mips, the same
-// element size and tile mode, and no CPU store into R's memory since R's generations.
+// element size and tile mode, and no CPU store into R's memory since R's generations. A
+// "GPU-only subresource" pair is the other surface of one memory: one image lies inside the other
+// (a slice or layer range of an array, a view of one mip) with the same extent, mips, element size
+// and tiling, and no CPU store; a layer-range image -> image copy could stand in there. Either is
+// "GPU-only copyable".
 inline std::array<bool, PairFacts> ClassifyPair(const Surface& writer, const Surface& reader, bool cpuStored) {
     std::array<bool, PairFacts> facts{};
     facts[SameSurface] = writer.base == reader.base && writer.bytes == reader.bytes;
@@ -180,6 +190,11 @@ inline std::array<bool, PairFacts> ClassifyPair(const Surface& writer, const Sur
     facts[AnyDcc] = writer.dcc || reader.dcc;
     facts[CpuStored] = cpuStored;
     facts[GpuOnlySameShape] = facts[SameSurface] && facts[SameShape] && facts[SameElementBytes] && facts[SameTiling] && !cpuStored;
+    const auto inside = [](const Surface& inner, const Surface& outer) { return inner.base >= outer.base && inner.base + inner.bytes <= outer.base + outer.bytes; };
+    facts[Nested] = inside(writer, reader) || inside(reader, writer);
+    facts[SameExtent] = writer.width == reader.width && writer.height == reader.height && writer.mips == reader.mips;
+    facts[GpuOnlySubresource] = !facts[SameSurface] && facts[Nested] && facts[SameExtent] && facts[SameElementBytes] && facts[SameTiling] && !cpuStored;
+    facts[GpuOnlyCopyable] = facts[GpuOnlySameShape] || facts[GpuOnlySubresource];
     return facts;
 }
 
@@ -211,7 +226,7 @@ public:
             top.bytes += writer.overlap;
             top.writer = writer.surface;
             top.reader = reader;
-            top.gpuOnly = facts[GpuOnlySameShape];
+            top.gpuOnly = facts[GpuOnlySameShape] ? 1 : facts[GpuOnlySubresource] ? 2 : 0;
         }
     }
     std::string Line(std::uint64_t presents, std::size_t topPairs = 6) {
@@ -220,7 +235,7 @@ public:
         std::string line;
         Append(line, "[storage] perf-diag refresh write-backs (APS5_PERF_DIAG, per present over %llu presents): %.1f pairs %.1f MiB (overlap bytes) in %.1f refreshes with a write-back or an alias;", static_cast<unsigned long long>(presents), static_cast<double>(pairs) * per, Mib(bytes) * per, static_cast<double>(refreshes) * per);
         for (std::size_t i = 0; i < PairFacts; ++i) Append(line, " %s %.1f (%.0f%%) %.1f MiB%s", PairFactNames[i], static_cast<double>(factCounts[i]) * per, pairs != 0 ? 100.0 * static_cast<double>(factCounts[i]) / static_cast<double>(pairs) : 0.0, Mib(factBytes[i]) * per, i + 1 < PairFacts ? "," : ";");
-        Append(line, " alias (same surface, borrowable shape): found %.1f, kept past keys/import %.1f, units borrowed %.1f; top pairs W -> R (format, tile, WxH, mips):", static_cast<double>(aliasesFound) * per, static_cast<double>(aliasesKept) * per, static_cast<double>(aliasesBorrowed) * per);
+        Append(line, " alias (same surface, borrowable shape): found %.1f, kept past keys/import %.1f, units borrowed %.1f; top pairs W -> R (format, tile, WxH depth/last array @ base array, mips, MiB):", static_cast<double>(aliasesFound) * per, static_cast<double>(aliasesKept) * per, static_cast<double>(aliasesBorrowed) * per);
         std::vector<const Top*> sorted;
         sorted.reserve(tops.size());
         for (const auto& [key, top] : tops) sorted.push_back(&top);
@@ -229,10 +244,10 @@ public:
             const auto& top = *sorted[i];
             const auto surface = [](const Surface& one) {
                 std::string text;
-                Append(text, "0x%llx (%u, %u, %ux%u, %u%s)", static_cast<unsigned long long>(one.base), one.format, one.tileMode, one.width, one.height, one.mips, one.dcc ? ", dcc" : "");
+                Append(text, "0x%llx (%u, %u, %ux%u d%u@%u, %u, %.1f%s)", static_cast<unsigned long long>(one.base), one.format, one.tileMode, one.width, one.height, one.depth, one.baseArray, one.mips, Mib(one.bytes), one.dcc ? ", dcc" : "");
                 return text;
             };
-            Append(line, " %s -> %s x%.1f %.1f MiB%s;", surface(top.writer).c_str(), surface(top.reader).c_str(), static_cast<double>(top.count) * per, Mib(top.bytes) * per, top.gpuOnly ? " gpu-only same-shape" : "");
+            Append(line, " %s -> %s x%.1f %.1f MiB%s;", surface(top.writer).c_str(), surface(top.reader).c_str(), static_cast<double>(top.count) * per, Mib(top.bytes) * per, top.gpuOnly == 1 ? " gpu-only same-shape" : top.gpuOnly == 2 ? " gpu-only subresource" : "");
         }
         Append(line, " (%zu distinct)", tops.size());
         refreshes = pairs = bytes = aliasesFound = aliasesKept = aliasesBorrowed = 0;
@@ -248,7 +263,7 @@ private:
         std::uint64_t bytes = 0;
         Surface writer;
         Surface reader;
-        bool gpuOnly = false;
+        int gpuOnly = 0;
     };
     HostMutex mutex;
     std::uint64_t refreshes = 0, pairs = 0, bytes = 0, aliasesFound = 0, aliasesKept = 0, aliasesBorrowed = 0;
