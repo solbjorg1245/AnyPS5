@@ -482,6 +482,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         tests/TextureFormat.cpp
         tests/TexelStats.cpp
         tests/TextureTiling.cpp
+        tests/SubresourceAlias.cpp
         tests/ImageMemoryPool.cpp
         tests/GuestTextureResource.cpp
         tests/GuestSamplerResource.cpp

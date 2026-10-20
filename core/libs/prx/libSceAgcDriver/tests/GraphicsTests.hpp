@@ -32,6 +32,7 @@ struct TextureDetilerTestAccess {
 void RunTextureFormatTests();
 void RunTexelStatsTests();
 void RunTextureTilingTests();
+void RunSubresourceAliasTests();
 void RunImageMemoryPoolTests();
 void RunGuestTextureResourceTests();
 void RunGuestSamplerResourceTests();

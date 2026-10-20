@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageMemoryPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/SubresourceAlias.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TexelStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
@@ -421,6 +422,33 @@ private:
     // stays responsible for storing them until this image's own results supersede them
     // (markLayersPending). APS5_NO_ALIAS_BORROW=1 stores and re-reads as before.
     std::shared_ptr<StorageTexture> pendingAlias() const;
+    // APS5_SUBALIAS_REFRESH: a pending image over a layer range of this memory (SubresourceLayerOffset)
+    // whose pending units here this image can take on the device (PlanSubresourceUnit); like the
+    // alias above it stays pending through Refresh's flush and responsible for storing them.
+    struct SubAlias {
+        std::shared_ptr<StorageTexture> texture;
+        // This image's layer j is the alias's layer j + layerOffset, its unit u the alias's unit
+        // u + unitOffset.
+        std::int64_t layerOffset = 0;
+        std::int64_t unitOffset = 0;
+        // Per unit of this image: the alias had results pending there before the flush; taken.
+        std::vector<bool> pendingBefore;
+        std::vector<bool> units;
+        bool any = false;
+    };
+    // The subresource aliases a Refresh keeps out of its flush: every pending unit of theirs inside
+    // this image takeable, none pending in two of them; empty without a direct upload.
+    std::vector<SubAlias> pendingSubAliases() const;
+    // PlanSubresourceUnit per unit of this image for the alias, with the facts it was given (Leave
+    // and no facts outside the alias).
+    void subUnitPlans(const SubAlias& alias, std::vector<SubresourceUnitPlan>& plans, std::vector<SubresourceUnit>& facts) const;
+    // After Refresh's flush: the units each alias lends (`units`). Units an alias no longer lends
+    // (stored meanwhile, or stamped since) are `changed` and read from memory; when one cannot be
+    // taken, or the upload is not `direct`, every alias is stored as the flush would have.
+    void planSubBorrows(std::vector<SubAlias>& aliases, bool direct, std::vector<bool>& changed, bool& unchanged);
+    void borrowSubUnits(SubAlias& alias);
+    void forgetSubBorrowed(std::uint32_t first, std::uint32_t count);
+    SubresourceShape subresourceShape() const;
     // The pending images FlushPending(address, bytes) would store (not the one a Refresh validates,
     // a pending unit inside the range), kept alive across the caller's use.
     static std::vector<std::shared_ptr<StorageTexture>> overlappingPending(std::uint64_t address, std::size_t bytes);
@@ -439,6 +467,9 @@ private:
     // still the pending ones and a write-back for the range would store them.
     bool skippedResultsInside(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t borrowUnits(StorageTexture& source, const std::vector<bool>& units);
+    // The device copy of borrowUnits: the selected units from `source`, whose layer j + layerOffset
+    // holds this image's layer j.
+    std::uint64_t copyUnitsFrom(StorageTexture& source, const std::vector<bool>& units, std::int64_t layerOffset);
     void forgetBorrowed(std::uint32_t first, std::uint32_t count);
     bool clearByKeysFill(DccKeys keys, std::uint8_t key);
     KeyStoreGuard keyStoreGuard(const char* caller, const std::vector<bool>& layers) const;
@@ -516,6 +547,15 @@ private:
     std::weak_ptr<StorageTexture> borrowedFrom;
     std::uint64_t borrowedVersion = 0;
     std::vector<bool> borrowedUnits;
+    // Units holding a subresource alias's results (APS5_SUBALIAS_REFRESH), per lender at its version
+    // then; markLayersPending supersedes them as above.
+    struct SubBorrow {
+        std::weak_ptr<StorageTexture> source;
+        std::uint64_t version = 0;
+        std::int64_t unitOffset = 0;
+        std::vector<bool> units;
+    };
+    std::vector<SubBorrow> subBorrows;
     // Units of this image were borrowed since it was last written: the borrower's proofs
     // (the resource cache's serial memo) hold only while this image's version does, so the next
     // write here bumps the pending serial although the image was pending already.
