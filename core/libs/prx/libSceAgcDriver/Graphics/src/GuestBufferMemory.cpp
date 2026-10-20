@@ -194,8 +194,10 @@ struct BdaFloorWanted {
     VkBuffer source;
     std::uint64_t sourceBase;
     bool mirror;
+    bool writable;
 };
 bool bdaFloorEnabled();
+bool bdaFloorWritable();
 void bdaFloorTable(const Context& context, std::vector<BdaFloorWanted>& wanted, const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges, std::vector<ShaderRecompiler::BdaAbi::Range>& floorRanges, std::vector<std::shared_ptr<BdaFloorCopy>>& copies);
 std::string bdaFloorReport();
 
@@ -1878,6 +1880,7 @@ void GuestBufferMemory::AcquireRegistered() {
             std::vector<ShaderRecompiler::BdaAbi::Range> importRanges;
             // APS5_VRAM_FLOOR part 16: the read-only entries the space may map to copies.
             const bool floorOn = bdaFloorEnabled();
+            const bool floorWritable = floorOn && bdaFloorWritable();
             std::vector<BdaFloorWanted> floorWanted;
             {
                 auto& state = Imports();
@@ -1896,10 +1899,11 @@ void GuestBufferMemory::AcquireRegistered() {
                             // A writable entry too (S7c, APS5_RESIDENT_WRITES_WRITABLE): R maps to D Read|Write.
                             if (region.direct != nullptr && (!region.writable || residentWritesWritable()) && !region.span) splitResidentEntry(region.direct->buffer, region.direct->base, residentLive, ranges, residentMapped, residentHoles, region.writable ? &residentWritable : nullptr);
                         }
-                        // APS5_VRAM_FLOOR part 16: a read-only entry the split left whole.
-                        if (floorOn && !region.writable && !region.span && ranges.size() == entry + 1 && ranges[entry].deviceAddress == whole.deviceAddress && (region.direct != nullptr || !region.mirror->writable)) {
-                            if (region.direct != nullptr) floorWanted.push_back({entry, region.begin, region.end, region.direct->buffer, region.direct->base, false});
-                            else floorWanted.push_back({entry, region.begin, region.end, region.mirror->buffer->Handle(), region.mirror->base, true});
+                        // APS5_VRAM_FLOOR part 16: a read-only entry the split left whole (a writable
+                        // one too with APS5_VRAM_FLOOR_BDA_WRITABLE=1).
+                        if (floorOn && (!region.writable || floorWritable) && !region.span && ranges.size() == entry + 1 && ranges[entry].deviceAddress == whole.deviceAddress && (region.direct != nullptr || !region.mirror->writable || floorWritable)) {
+                            if (region.direct != nullptr) floorWanted.push_back({entry, region.begin, region.end, region.direct->buffer, region.direct->base, false, region.writable});
+                            else floorWanted.push_back({entry, region.begin, region.end, region.mirror->buffer->Handle(), region.mirror->base, true, region.writable});
                         }
                     }
                 }
@@ -2501,11 +2505,22 @@ bool bdaFloorEnabled() {
     return VramFloor(VramFloorBdaSpaces);
 }
 
+// APS5_VRAM_FLOOR_BDA_WRITABLE=1: writable base ranges map to copies as well, with their Write
+// permission: a store through the table lands in the copy alone (lost to every other reader and
+// overwritten by the next refresh), so the measurement may change what later work reads.
+bool bdaFloorWritable() {
+    static const bool writable = bdaFloorSetting("APS5_VRAM_FLOOR_BDA_WRITABLE", 0) != 0;
+    return writable;
+}
+
 void bdaFloorTable(const Context& context, std::vector<BdaFloorWanted>& wanted, const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges, std::vector<ShaderRecompiler::BdaAbi::Range>& floorRanges, std::vector<std::shared_ptr<BdaFloorCopy>>& copies) {
     static const std::uint64_t cap = bdaFloorSetting("APS5_VRAM_FLOOR_BDA_MIB", 1024) << 20u;
     auto& floor = bdaFloorState();
     floorRanges = ranges;
+    // APS5_VRAM_FLOOR_BDA_LARGEST=1: the largest ranges first.
+    static const bool largestFirst = bdaFloorSetting("APS5_VRAM_FLOOR_BDA_LARGEST", 0) != 0;
     std::sort(wanted.begin(), wanted.end(), [](const BdaFloorWanted& left, const BdaFloorWanted& right) { return left.end - left.begin < right.end - right.begin; });
+    if (largestFirst) std::reverse(wanted.begin(), wanted.end());
     std::uint64_t left = cap;
     std::uint64_t wantedBytes = 0, mirrorBytes = 0, madeBytes = 0, overBytes = 0;
     std::size_t mirrors = 0, made = 0, reused = 0, over = 0, refused = 0;
@@ -2576,13 +2591,25 @@ void bdaFloorTable(const Context& context, std::vector<BdaFloorWanted>& wanted, 
         if ((range.permissions & ShaderRecompiler::BdaAbi::Write) != 0) writable += range.end - range.begin;
     }
     constexpr double MiB = 1048576.0;
+    // The eligible entries by size class (count, MiB): < 64 KiB, < 1, < 16, < 256 MiB, larger.
+    std::array<std::size_t, 5> classCount{};
+    std::array<std::uint64_t, 5> classBytes{};
+    for (const auto& want : wanted) {
+        const auto bytes = want.end - want.begin;
+        const std::size_t index = bytes < (64ull << 10u) ? 0 : bytes < (1ull << 20u) ? 1 : bytes < (16ull << 20u) ? 2 : bytes < (256ull << 20u) ? 3 : 4;
+        ++classCount[index];
+        classBytes[index] += bytes;
+    }
+    std::vector<const BdaFloorWanted*> bySize;
+    for (const auto& want : wanted) bySize.push_back(&want);
+    std::sort(bySize.begin(), bySize.end(), [](const BdaFloorWanted* left, const BdaFloorWanted* right) { return left->end - left->begin > right->end - right->begin; });
     std::string largest;
-    for (auto it = wanted.rbegin(); it != wanted.rend() && it - wanted.rbegin() < 8; ++it) {
-        char entry[96];
-        std::snprintf(entry, sizeof(entry), "%s0x%llx+%.2f MiB%s", largest.empty() ? "" : ", ", static_cast<unsigned long long>(it->begin), static_cast<double>(it->end - it->begin) / MiB, it->mirror ? " (mirror)" : "");
+    for (std::size_t index = 0; index < bySize.size() && index < 10; ++index) {
+        char entry[112];
+        std::snprintf(entry, sizeof(entry), "%s0x%llx+%.2f MiB%s%s", largest.empty() ? "" : ", ", static_cast<unsigned long long>(bySize[index]->begin), static_cast<double>(bySize[index]->end - bySize[index]->begin) / MiB, bySize[index]->mirror ? " mirror" : "", bySize[index]->writable ? " w" : "");
         largest += entry;
     }
-    std::fprintf(stderr, "[bda-floor] space table: %zu entries, %.1f MiB mapped (%.1f MiB writable); read-only whole entries %zu (%.1f MiB, %zu mirrors %.1f MiB): copies made %zu (%.1f MiB), reused %zu, over the cap %zu (%.1f MiB), refused %zu; largest: %s\n", ranges.size(), static_cast<double>(mapped) / MiB, static_cast<double>(writable) / MiB, wanted.size(), static_cast<double>(wantedBytes) / MiB, mirrors, static_cast<double>(mirrorBytes) / MiB, made, static_cast<double>(madeBytes) / MiB, reused, over, static_cast<double>(overBytes) / MiB, refused, largest.c_str());
+    std::fprintf(stderr, "[bda-floor] space table: %zu entries, %.1f MiB mapped (%.1f MiB writable); eligible whole entries %zu (%.1f MiB, %zu mirrors %.1f MiB; by size <64K %zu %.1f, <1M %zu %.1f, <16M %zu %.1f, <256M %zu %.1f, larger %zu %.1f MiB): copies made %zu (%.1f MiB), reused %zu, over the cap %zu (%.1f MiB), refused %zu; largest: %s\n", ranges.size(), static_cast<double>(mapped) / MiB, static_cast<double>(writable) / MiB, wanted.size(), static_cast<double>(wantedBytes) / MiB, mirrors, static_cast<double>(mirrorBytes) / MiB, classCount[0], static_cast<double>(classBytes[0]) / MiB, classCount[1], static_cast<double>(classBytes[1]) / MiB, classCount[2], static_cast<double>(classBytes[2]) / MiB, classCount[3], static_cast<double>(classBytes[3]) / MiB, classCount[4], static_cast<double>(classBytes[4]) / MiB, made, static_cast<double>(madeBytes) / MiB, reused, over, static_cast<double>(overBytes) / MiB, refused, largest.c_str());
 }
 
 void noteBdaFloorBuild(bool bound) {
