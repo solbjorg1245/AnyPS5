@@ -120,6 +120,20 @@ void layerOffsetTests() {
     requireOffset(inconsistent, slice(1, 1), std::nullopt, "a surface whose layers do not fill it does not pair");
 }
 
+void mismatchTests() {
+    std::int64_t offset = 7;
+    Require(SubresourcePairing(array4(), slice(1, 1), offset) == SubresourceMismatch::None && offset == -1, "a pairing names no mismatch");
+    Require(SubresourcePairing(array4(), slice(1, 0), offset) == SubresourceMismatch::Swizzle && offset == 0, "a swizzle mismatch is named");
+    auto other = slice(1, 1);
+    other.width = 1280;
+    Require(SubresourcePairing(array4(), other, offset) == SubresourceMismatch::Extent, "an extent mismatch is named");
+    Require(SubresourcePairing(slice(1, 1), slice(2, 2), offset) == SubresourceMismatch::NotNested, "two slices are not nested");
+    other = slice(1, 1);
+    other.dcc = true;
+    Require(SubresourcePairing(array4(), other, offset) == SubresourceMismatch::Dcc, "a DCC writer is named");
+    Require(std::string(SubresourceMismatchName(SubresourceMismatch::LayerAlignment)) == "layer alignment", "mismatch names");
+}
+
 void unitPlanTests() {
     using Plan = SubresourceUnitPlan;
     SubresourceUnit unit;
@@ -156,5 +170,6 @@ void unitPlanTests() {
 
 void RunSubresourceAliasTests() {
     layerOffsetTests();
+    mismatchTests();
     unitPlanTests();
 }

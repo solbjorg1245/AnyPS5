@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_SUBRESOURCEALIAS_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -44,29 +45,76 @@ struct SubresourceShape {
     bool blockUnits = false;
 };
 
+// Why two storage images do not pair (SubresourcePairing), counted per reason on the [storage]
+// subalias line.
+enum class SubresourceMismatch {
+    None,
+    // Either surface is not 2D or a 2D array.
+    Dimension,
+    // Thick, volume, or a layer count the image does not have.
+    Layout,
+    // No 64 KiB block units (an unaligned base, or block tracking off).
+    Units,
+    Dcc,
+    Linear,
+    Same,
+    Extent,
+    Mips,
+    ElementSize,
+    Tiling,
+    LayerBytes,
+    NotNested,
+    LayerAlignment,
+    Swizzle,
+    Count
+};
+
+inline const char* SubresourceMismatchName(SubresourceMismatch mismatch) {
+    static constexpr const char* names[static_cast<std::size_t>(SubresourceMismatch::Count)] = {"none", "dimension", "layout", "units", "dcc", "linear", "same surface", "extent", "mips", "element size", "tiling", "layer bytes", "not nested", "layer alignment", "swizzle"};
+    return mismatch < SubresourceMismatch::Count ? names[static_cast<std::size_t>(mismatch)] : "?";
+}
+
 // The layer offset d such that layer j of `reader` holds the texels of layer j + d of `writer`
 // (a device copy moves them bit for bit, as a write-back and a re-upload through guest memory
-// would), or none. The two must be distinct surfaces of one memory, one inside the other, with
-// the same per-layer layout: extent, mips, element size and tiling, 2D or 2D array, thin, both
-// tracked in 64 KiB units, no DCC (its keys are stored by the write-back), and an XOR swizzle
-// taking the same slice index for the paired layers.
-inline std::optional<std::int64_t> SubresourceLayerOffset(const SubresourceShape& reader, const SubresourceShape& writer) {
+// would), or why there is none. The two must be distinct surfaces of one memory, one inside the
+// other, with the same per-layer layout: extent, mips, element size and tiling, 2D or 2D array,
+// thin, both tracked in 64 KiB units, no DCC (its keys are stored by the write-back), and an XOR
+// swizzle taking the same slice index for the paired layers.
+inline SubresourceMismatch SubresourcePairing(const SubresourceShape& reader, const SubresourceShape& writer, std::int64_t& offset) {
+    offset = 0;
     const auto planar = [](const SubresourceShape& shape) {
-        return (shape.dimension == TextureDimension::k2D || shape.dimension == TextureDimension::k2DArray) && shape.flat && shape.blockUnits && !shape.dcc && shape.tileMode != TextureTileMode::kLinear && shape.layers != 0 && shape.layerBytes != 0 && shape.layerBytes * shape.layers == shape.guestBytes;
+        if (shape.dimension != TextureDimension::k2D && shape.dimension != TextureDimension::k2DArray) return SubresourceMismatch::Dimension;
+        if (!shape.flat || shape.layers == 0 || shape.layerBytes == 0 || shape.layerBytes * shape.layers != shape.guestBytes) return SubresourceMismatch::Layout;
+        if (!shape.blockUnits) return SubresourceMismatch::Units;
+        if (shape.dcc) return SubresourceMismatch::Dcc;
+        if (shape.tileMode == TextureTileMode::kLinear) return SubresourceMismatch::Linear;
+        return SubresourceMismatch::None;
     };
-    if (!planar(reader) || !planar(writer)) return std::nullopt;
-    if (reader.baseAddress == writer.baseAddress && reader.guestBytes == writer.guestBytes) return std::nullopt;
-    if (reader.width != writer.width || reader.height != writer.height || reader.mipCount != writer.mipCount || reader.elementBytes != writer.elementBytes || reader.blockWidth != writer.blockWidth || reader.tileMode != writer.tileMode || reader.layerBytes != writer.layerBytes) return std::nullopt;
+    if (const auto mismatch = planar(reader); mismatch != SubresourceMismatch::None) return mismatch;
+    if (const auto mismatch = planar(writer); mismatch != SubresourceMismatch::None) return mismatch;
+    if (reader.baseAddress == writer.baseAddress && reader.guestBytes == writer.guestBytes) return SubresourceMismatch::Same;
+    if (reader.width != writer.width || reader.height != writer.height) return SubresourceMismatch::Extent;
+    if (reader.mipCount != writer.mipCount) return SubresourceMismatch::Mips;
+    if (reader.elementBytes != writer.elementBytes || reader.blockWidth != writer.blockWidth) return SubresourceMismatch::ElementSize;
+    if (reader.tileMode != writer.tileMode) return SubresourceMismatch::Tiling;
+    if (reader.layerBytes != writer.layerBytes) return SubresourceMismatch::LayerBytes;
     const auto readerEnd = reader.baseAddress + reader.guestBytes;
     const auto writerEnd = writer.baseAddress + writer.guestBytes;
     const bool readerInside = writer.baseAddress <= reader.baseAddress && readerEnd <= writerEnd;
     const bool writerInside = reader.baseAddress <= writer.baseAddress && writerEnd <= readerEnd;
-    if (!readerInside && !writerInside) return std::nullopt;
+    if (!readerInside && !writerInside) return SubresourceMismatch::NotNested;
     const auto distance = reader.baseAddress >= writer.baseAddress ? reader.baseAddress - writer.baseAddress : writer.baseAddress - reader.baseAddress;
-    if (distance % reader.layerBytes != 0) return std::nullopt;
+    if (distance % reader.layerBytes != 0) return SubresourceMismatch::LayerAlignment;
     const auto layers = static_cast<std::int64_t>(distance / reader.layerBytes);
-    const auto offset = reader.baseAddress >= writer.baseAddress ? layers : -layers;
-    if (XorSwizzleMode(reader.tileMode) != 0 && static_cast<std::int64_t>(reader.swizzleSlice) != static_cast<std::int64_t>(writer.swizzleSlice) + offset) return std::nullopt;
+    const auto pairing = reader.baseAddress >= writer.baseAddress ? layers : -layers;
+    if (XorSwizzleMode(reader.tileMode) != 0 && static_cast<std::int64_t>(reader.swizzleSlice) != static_cast<std::int64_t>(writer.swizzleSlice) + pairing) return SubresourceMismatch::Swizzle;
+    offset = pairing;
+    return SubresourceMismatch::None;
+}
+
+inline std::optional<std::int64_t> SubresourceLayerOffset(const SubresourceShape& reader, const SubresourceShape& writer) {
+    std::int64_t offset = 0;
+    if (SubresourcePairing(reader, writer, offset) != SubresourceMismatch::None) return std::nullopt;
     return offset;
 }
 

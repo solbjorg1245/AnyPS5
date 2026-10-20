@@ -100,6 +100,8 @@ std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKep
 struct SubaliasCounters {
     std::atomic<std::uint64_t> refreshes{0}, candidates{0}, kept{0}, idle{0}, rejectedState{0}, rejectedShape{0}, rejectedUnits{0}, rejectedShared{0};
     std::atomic<std::uint64_t> copies{0}, units{0}, bytes{0}, held{0}, superseded{0}, reread{0}, fallbacks{0};
+    // Shape rejections by SubresourceMismatch.
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(SubresourceMismatch::Count)> mismatches{};
 };
 SubaliasCounters& Subaliases() {
     static SubaliasCounters counters;
@@ -392,7 +394,11 @@ void reportStorageTraffic(StorageTraffic& traffic) {
         const auto refreshes = take(s.refreshes), candidates = take(s.candidates), kept = take(s.kept), idle = take(s.idle);
         const auto state = take(s.rejectedState), shape = take(s.rejectedShape), units = take(s.rejectedUnits), shared = take(s.rejectedShared);
         const auto copies = take(s.copies), copied = take(s.units), bytes = take(s.bytes), held = take(s.held), superseded = take(s.superseded), reread = take(s.reread), fallbacks = take(s.fallbacks);
-        std::fprintf(stderr, "[storage] subalias (APS5_SUBALIAS_REFRESH, 10 s): %llu refreshes looked, %llu pending images over them: %llu kept, %llu idle, rejected state %llu, shape %llu, units %llu, shared %llu; %llu device copies (%llu units, %.1f MiB), %llu units held, %llu superseded, %llu re-read, %llu fallback stores\n", refreshes, candidates, kept, idle, state, shape, units, shared, copies, copied, static_cast<double>(bytes) / 1048576.0, held, superseded, reread, fallbacks);
+        std::string reasons;
+        for (std::size_t i = 1; i < s.mismatches.size(); ++i) {
+            if (const auto count = take(s.mismatches[i]); count != 0) reasons += std::string(reasons.empty() ? "" : ", ") + SubresourceMismatchName(static_cast<SubresourceMismatch>(i)) + " " + std::to_string(count);
+        }
+        std::fprintf(stderr, "[storage] subalias (APS5_SUBALIAS_REFRESH, 10 s): %llu refreshes looked, %llu pending images over them: %llu kept, %llu idle, rejected state %llu, shape %llu, units %llu, shared %llu; %llu device copies (%llu units, %.1f MiB), %llu units held, %llu superseded, %llu re-read, %llu fallback stores; shape by reason: %s\n", refreshes, candidates, kept, idle, state, shape, units, shared, copies, copied, static_cast<double>(bytes) / 1048576.0, held, superseded, reread, fallbacks, reasons.empty() ? "-" : reasons.c_str());
     }
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
@@ -4064,12 +4070,25 @@ std::vector<StorageTexture::SubAlias> StorageTexture::pendingSubAliases() const 
             counters.rejectedState.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
-        const auto offset = SubresourceLayerOffset(mine, candidate->subresourceShape());
-        if (!offset) {
+        const auto theirs = candidate->subresourceShape();
+        std::int64_t offset = 0;
+        if (const auto mismatch = SubresourcePairing(mine, theirs, offset); mismatch != SubresourceMismatch::None) {
             counters.rejectedShape.fetch_add(1, std::memory_order_relaxed);
+            counters.mismatches[static_cast<std::size_t>(mismatch)].fetch_add(1, std::memory_order_relaxed);
+            // Debug aid: APS5_TRACE_SUBALIAS names the first 48 pairs rejected by shape.
+            static const bool trace = std::getenv("APS5_TRACE_SUBALIAS") != nullptr;
+            static std::atomic<int> traced{0};
+            if (trace && traced.fetch_add(1, std::memory_order_relaxed) < 48) {
+                const auto describe = [](const SubresourceShape& shape) {
+                    char text[200];
+                    std::snprintf(text, sizeof(text), "0x%llx+0x%llx %ux%u mips %u layers %u x 0x%llx bpe %u tile %d dim %d swizzle %u dcc %d flat %d units %d", static_cast<unsigned long long>(shape.baseAddress), static_cast<unsigned long long>(shape.guestBytes), shape.width, shape.height, shape.mipCount, shape.layers, static_cast<unsigned long long>(shape.layerBytes), shape.elementBytes, static_cast<int>(shape.tileMode), static_cast<int>(shape.dimension), shape.swizzleSlice, shape.dcc ? 1 : 0, shape.flat ? 1 : 0, shape.blockUnits ? 1 : 0);
+                    return std::string(text);
+                };
+                std::fprintf(stderr, "[subalias] refresh %s, pending %s: %s\n", describe(mine).c_str(), describe(theirs).c_str(), SubresourceMismatchName(mismatch));
+            }
             continue;
         }
-        SubAlias alias{candidate, *offset, static_cast<std::int64_t>(descriptor.baseAddress / 65536) - static_cast<std::int64_t>(candidate->descriptor.baseAddress / 65536), std::vector<bool>(trackedLayers, false), std::vector<bool>(trackedLayers, false), false};
+        SubAlias alias{candidate, offset, static_cast<std::int64_t>(descriptor.baseAddress / 65536) - static_cast<std::int64_t>(candidate->descriptor.baseAddress / 65536), std::vector<bool>(trackedLayers, false), std::vector<bool>(trackedLayers, false), false};
         subUnitPlans(alias, plans, facts);
         if (std::find(plans.begin(), plans.end(), SubresourceUnitPlan::Reject) != plans.end()) {
             counters.rejectedUnits.fetch_add(1, std::memory_order_relaxed);
