@@ -455,7 +455,8 @@ public:
     // new snapshot's KeepDrawSnapshot) and the kept snapshot returned when it is current; `stale`
     // tells a dropped out-of-date one from none kept. A kept snapshot validated or copied in the
     // calling thread's current collect epoch, with no block stamped since (GuestMemory::StampSerial),
-    // is returned without a collect (APS5_DRAW_VRAM_EPOCH=0: every use collects).
+    // is returned without a collect (APS5_DRAW_VRAM_EPOCH=0: every use collects). The collect may
+    // cover an aligned window around the range (APS5_DRAW_VRAM_WINDOW_KIB, Recorder.cpp).
     static constexpr std::uint32_t DrawVramDemoteStales = 4;
     static constexpr std::uint32_t DrawVramDemoteUses = 256;
     std::shared_ptr<Buffer> DrawVramSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t& generation, std::uint64_t& registryGeneration, bool& demoted, bool& stale);

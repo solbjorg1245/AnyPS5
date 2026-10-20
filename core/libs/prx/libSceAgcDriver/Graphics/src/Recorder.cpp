@@ -3936,7 +3936,21 @@ std::shared_ptr<Buffer> Recorder::DrawVramSnapshot(std::uint64_t address, std::s
         recency.splice(recency.end(), recency, range.entry->second.recent);
         return range.entry->second.buffer;
     }
-    generation = GuestMemory::CollectWrites(address, bytes);
+    // APS5_DRAW_VRAM_WINDOW_KIB (a power of two, default 0: off): collect the aligned window around
+    // the range, so the other small elements of its pool hit the thread's collect memo for the rest
+    // of the epoch instead of walking their pages each; the range alone when the window's walk fails.
+    static const std::uint64_t window = [] {
+        const char* value = std::getenv("APS5_DRAW_VRAM_WINDOW_KIB");
+        const auto kib = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
+        return kib != 0 && (kib & (kib - 1)) == 0 && kib <= (1ull << 20u) ? kib << 10u : 0;
+    }();
+    generation = 0;
+    if (window != 0 && bytes <= window) {
+        const auto first = address & ~(window - 1);
+        const auto stop = (address + bytes + window - 1) & ~(window - 1);
+        generation = GuestMemory::CollectWrites(first, static_cast<std::size_t>(stop - first));
+    }
+    if (generation == 0) generation = GuestMemory::CollectWrites(address, bytes);
     range.epoch = epoch;
     range.serial = serial;
     if (!range.kept) return {};
