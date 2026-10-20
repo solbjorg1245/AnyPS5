@@ -13,7 +13,7 @@
 
 namespace AgcDriver::Graphics {
 
-// APS5_SUBALIAS_REFRESH=1 (default off): a storage refresh takes the pending results of images
+// APS5_SUBALIAS_REFRESH=0 (default on, 0 is the kill switch): a storage refresh takes the pending results of images
 // over a layer range of its memory (a slice image inside this array, or the array this slice is
 // one layer of) from their images on the device, a copy with a layer offset, instead of having
 // them written back to guest memory and read in again (StorageTexture::pendingSubAliases). The
@@ -21,7 +21,7 @@ namespace AgcDriver::Graphics {
 inline bool SubaliasRefreshEnabled() {
     static const bool on = [] {
         const char* value = std::getenv("APS5_SUBALIAS_REFRESH");
-        return value != nullptr && std::strcmp(value, "0") != 0;
+        return value == nullptr || std::strcmp(value, "0") != 0;
     }();
     return on;
 }
