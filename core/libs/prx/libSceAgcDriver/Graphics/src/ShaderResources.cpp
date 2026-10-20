@@ -4279,9 +4279,21 @@ bool ShaderResources::RebaseEligible(std::span<const CompiledShader> shaders, co
     return true;
 }
 
+namespace {
+
+// InPlaceBindingsForTests: -1 the environment's answer, 0 off, 1 on.
+std::atomic<int> inPlaceBindingsForTests{-1};
+
+}
+
 bool ShaderResources::InPlaceBindings() {
     static const bool inPlace = std::getenv("APS5_NO_INPLACE_BINDINGS") == nullptr && std::getenv("APS5_CAPTURE_INPUTS") == nullptr;
-    return inPlace;
+    const auto forced = inPlaceBindingsForTests.load(std::memory_order_relaxed);
+    return forced < 0 ? inPlace : forced != 0;
+}
+
+void ShaderResources::InPlaceBindingsForTests(int inPlace) {
+    inPlaceBindingsForTests.store(inPlace, std::memory_order_relaxed);
 }
 
 namespace {
@@ -4351,7 +4363,7 @@ void ShaderResources::ReportSetMemo() {
     std::fprintf(stderr, "[draws] set memo (APS5_SET_MEMO, 10 s): %llu set copies bound again, %llu kept, %llu not kept (guest snapshots, or data copies with deferred flat slots); misses: %llu no memo in the open batch, %llu imports changed, %llu words differ, %llu deferred flat slots; verify %llu compared, %llu mismatched since the start\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(kept), static_cast<unsigned long long>(notKept), static_cast<unsigned long long>(otherBatch), static_cast<unsigned long long>(imports), static_cast<unsigned long long>(words), static_cast<unsigned long long>(deferred), static_cast<unsigned long long>(verified), static_cast<unsigned long long>(mismatched));
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::setMemoHit(const Recorder& recorder, std::span<const CompiledShader> shaders) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::setMemoHit(const Recorder& recorder, std::span<const CompiledShader> shaders, std::uint64_t generation, std::uint64_t epoch) const {
     auto& totals = SetMemoTotals();
     const auto& memo = drawSetMemo;
     // The set copy lives as long as its batch: the open one only (AllocateTransient).
@@ -4362,7 +4374,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::setMemoHit(const
     }
     // No registration changed and no import retired since: each in-place element's import is the
     // one HostImportFor finds now (HostImportMemoized's rule), and alive.
-    if (memo.generation != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || memo.epoch != HostImportsEpoch()) {
+    if (memo.generation != generation || memo.epoch != epoch) {
         totals.imports.fetch_add(1, std::memory_order_relaxed);
         return {};
     }
@@ -4383,7 +4395,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::setMemoHit(const
     return bindings;
 }
 
-void ShaderResources::setMemoKeep(const Recorder& recorder, std::span<const CompiledShader> shaders, const std::shared_ptr<DrawBindings>& result, std::span<const std::size_t> selected, std::span<const VkDescriptorBufferInfo> infos) const {
+void ShaderResources::setMemoKeep(const Recorder& recorder, std::span<const CompiledShader> shaders, const std::shared_ptr<DrawBindings>& result, std::span<const std::size_t> selected, std::span<const VkDescriptorBufferInfo> infos, std::uint64_t generation, std::uint64_t epoch) const {
     auto& totals = SetMemoTotals();
     auto& memo = drawSetMemo;
     // A snapshot holds guest bytes of its draw (ReusableDrawSnapshot decides on the write-watch);
@@ -4403,8 +4415,8 @@ void ShaderResources::setMemoKeep(const Recorder& recorder, std::span<const Comp
     }
     memo.recorder = &recorder;
     memo.serial = recorder.Submissions() + 1;
-    memo.generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    memo.epoch = HostImportsEpoch();
+    memo.generation = generation;
+    memo.epoch = epoch;
     memo.bindings = result;
     memo.dataCopies = result->dataCopies != 0;
     memo.words.clear();
@@ -4447,9 +4459,16 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     // APS5_SET_MEMO: the open batch's last set copy of this object, when this draw's words are its words.
     const bool memo = SetMemo();
     std::shared_ptr<DrawBindings> memoHit;
+    // Taken before this draw's lookups: a registry change or a retired import during them leaves
+    // the kept memo with the older values, so the next draw misses rather than trust an import
+    // the lookups may not have seen.
+    std::uint64_t memoGeneration = 0;
+    std::uint64_t memoEpoch = 0;
     if (memo) {
         RecordProfile::Scope memoSpan(RecordProfile::SetMemoCheck);
-        memoHit = setMemoHit(recorder, shaders);
+        memoGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        memoEpoch = HostImportsEpoch();
+        memoHit = setMemoHit(recorder, shaders, memoGeneration, memoEpoch);
         if (memoHit != nullptr && !SetMemoVerify()) return memoHit;
     }
     RecordProfile::Scope selectSpan(RecordProfile::SetSelect);
@@ -4618,7 +4637,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     recorder.Keep(result);
     if (memo) {
         if (memoHit != nullptr) setMemoVerify(*memoHit, result.get(), selected, infos);
-        else setMemoKeep(recorder, shaders, result, selected, infos);
+        else setMemoKeep(recorder, shaders, result, selected, infos, memoGeneration, memoEpoch);
     }
     return result;
 }

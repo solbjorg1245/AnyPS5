@@ -221,6 +221,9 @@ public:
     // overwrite the range before the batch ran, which the game's own fences keep (the copy HLE
     // refuses its CPU path on a noted read); APS5_FLIP_READ_CHECK=1 checks it at the flip.
     static bool InPlaceBindings();
+    // The tests turn in-place bindings on or off whatever the environment said (1 on, 0 off, -1
+    // back to the environment), as KeysStampCheckForTests does.
+    static void InPlaceBindingsForTests(int inPlace);
     // APS5_SET_MEMO=1 (P-SETMEMO, default off; the old path otherwise): a draw whose words repeat
     // the previous set copy of this template in the open batch binds that set copy again
     // (PrepareDrawBindings returns those very bindings, which the batch keeps already): no select,
@@ -726,9 +729,10 @@ private:
     ForkMemo lastFork;
     // PrepareDrawBindings' memo (APS5_SET_MEMO), under GuestMemory::GpuMutex (every draw records
     // under it): the batch it serves (recorder, serial), the registry generation and import epoch
-    // after its lookups, the bindings (the batch keeps them; expired: none), whether they hold data
-    // copies, and the words of every source binding (setMemoSources) with their lengths. Under
-    // APS5_SET_MEMO_VERIFY also the selected elements and their descriptors.
+    // taken before its lookups (a change during them misses the next draw), the bindings (the
+    // batch keeps them; expired: none), whether they hold data copies, and the words of every
+    // source binding (setMemoSources) with their lengths. Under APS5_SET_MEMO_VERIFY also the
+    // selected elements and their descriptors.
     struct DrawSetMemo {
         const Recorder* recorder = nullptr;
         std::uint64_t serial = 0;
@@ -746,8 +750,8 @@ private:
     // listed at the first kept set copy.
     mutable std::vector<std::pair<std::int32_t, std::uint32_t>> setMemoSources;
     mutable bool setMemoSourcesListed = false;
-    std::shared_ptr<DrawBindings> setMemoHit(const Recorder& recorder, std::span<const CompiledShader> shaders) const;
-    void setMemoKeep(const Recorder& recorder, std::span<const CompiledShader> shaders, const std::shared_ptr<DrawBindings>& result, std::span<const std::size_t> selected, std::span<const VkDescriptorBufferInfo> infos) const;
+    std::shared_ptr<DrawBindings> setMemoHit(const Recorder& recorder, std::span<const CompiledShader> shaders, std::uint64_t generation, std::uint64_t epoch) const;
+    void setMemoKeep(const Recorder& recorder, std::span<const CompiledShader> shaders, const std::shared_ptr<DrawBindings>& result, std::span<const std::size_t> selected, std::span<const VkDescriptorBufferInfo> infos, std::uint64_t generation, std::uint64_t epoch) const;
     void setMemoVerify(const DrawBindings& memo, const DrawBindings* fresh, std::span<const std::size_t> selected, std::span<const VkDescriptorBufferInfo> infos) const;
     BuildTiming timing;
     // Build state carried from stage A to stage B: the bindings in plan order, the image bindings
