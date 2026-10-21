@@ -1,6 +1,12 @@
 #include "prx/libc/include/exceptions/Runtime.hpp"
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #ifdef _WIN32
 #include <windows.h>
@@ -210,6 +216,105 @@ bool Match(const std::type_info* caught, const std::type_info* thrown, void*& ob
     if (search.count == 1) { object = search.found; return true; }
     return false;
 }
+
+// APS5_PROFILE_DRAW (R-STALLS): every throw counted by its site, as [throws] once a window of
+// about 10 s has passed (printed by that window's first later throw, so a window without throws
+// prints nothing). A caught throw costs about 1 ms in the unwinder: per-slot or per-dispatch throws
+// on a hot path (the precollect and presync null elements were) show here. A native std::exception
+// is keyed by its what() with digit runs folded to '#', anything else by its type name. Fixed
+// slots and a spin flag: nothing here allocates or throws.
+namespace {
+struct ThrowSite {
+    char key[96];
+    std::uint64_t count;
+};
+struct ThrowCensus {
+    std::atomic_flag busy = ATOMIC_FLAG_INIT;
+    ThrowSite sites[48];
+    std::size_t used = 0;
+    std::uint64_t total = 0;
+    std::uint64_t other = 0;
+    std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
+};
+ThrowCensus census;
+
+void FoldKey(const char* text, char* key, std::size_t size) {
+    std::size_t out = 0;
+    for (std::size_t in = 0; text[in] != '\0' && out + 1 < size; ++in) {
+        const char c = text[in];
+        if (c == '0' && (text[in + 1] == 'x' || text[in + 1] == 'X')) {
+            if (out + 4 >= size) break;
+            key[out++] = '0';
+            key[out++] = 'x';
+            key[out++] = '#';
+            in += 2;
+            while (std::isxdigit(static_cast<unsigned char>(text[in]))) ++in;
+            --in;
+        } else if (std::isdigit(static_cast<unsigned char>(c))) {
+            if (out == 0 || key[out - 1] != '#') key[out++] = '#';
+        } else {
+            key[out++] = c == '\n' ? ' ' : c;
+        }
+    }
+    key[out] = '\0';
+}
+
+void NoteThrow(Header* header, void* object) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    char key[sizeof(ThrowSite::key)];
+    const char* what = nullptr;
+    void* exception = object;
+    if (header->_pad && header->type && Match(&typeid(std::exception), header->type, exception)) {
+        struct VtableLayout { std::ptrdiff_t offset; const void* type; void (*destroy)(void*); void (*del)(void*); const char* (*whatFn)(const void*); };
+        const void* vtable = *static_cast<const void* const*>(exception);
+        auto* layout = reinterpret_cast<const VtableLayout*>(static_cast<const char*>(vtable) - offsetof(VtableLayout, destroy));
+        what = layout->whatFn(exception);
+    }
+    FoldKey(what != nullptr ? what : header->type != nullptr ? header->type->name() : "?", key, sizeof(key));
+    char report[1024];
+    report[0] = '\0';
+    while (census.busy.test_and_set(std::memory_order_acquire)) {
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - census.windowStart).count();
+    if (seconds >= 10.0 && census.total != 0) {
+        std::sort(census.sites, census.sites + census.used, [](const ThrowSite& a, const ThrowSite& b) { return a.count > b.count; });
+        int length = std::snprintf(report, sizeof(report), "[throws] (%.0f s): %llu caught or uncaught throws, %zu sites", seconds, static_cast<unsigned long long>(census.total), census.used);
+        for (std::size_t site = 0; site < census.used && site < 6 && length > 0 && length < static_cast<int>(sizeof(report)); ++site) {
+            length += std::snprintf(report + length, sizeof(report) - static_cast<std::size_t>(length), "%s %llu x '%s'", site == 0 ? ":" : ";", static_cast<unsigned long long>(census.sites[site].count), census.sites[site].key);
+        }
+        if (census.other != 0 && length > 0 && length < static_cast<int>(sizeof(report))) length += std::snprintf(report + length, sizeof(report) - static_cast<std::size_t>(length), "; %llu at sites past the table", static_cast<unsigned long long>(census.other));
+        if (length > 0 && length < static_cast<int>(sizeof(report)) - 1) {
+            report[length] = '\n';
+            report[length + 1] = '\0';
+        } else {
+            report[sizeof(report) - 2] = '\n';
+            report[sizeof(report) - 1] = '\0';
+        }
+        census.used = 0;
+        census.total = 0;
+        census.other = 0;
+        census.windowStart = now;
+    } else if (census.total == 0) {
+        census.windowStart = now;
+    }
+    ++census.total;
+    std::size_t site = 0;
+    while (site < census.used && std::strcmp(census.sites[site].key, key) != 0) ++site;
+    if (site < census.used) {
+        ++census.sites[site].count;
+    } else if (census.used < sizeof(census.sites) / sizeof(census.sites[0])) {
+        std::memcpy(census.sites[census.used].key, key, sizeof(key));
+        census.sites[census.used].count = 1;
+        ++census.used;
+    } else {
+        ++census.other;
+    }
+    census.busy.clear(std::memory_order_release);
+    if (report[0] != '\0') RawLog("%s", report);
+}
+}
 }
 
 extern "C" {
@@ -238,6 +343,7 @@ void APS5_VABI __cxa_free_exception_nid_postfix(void* object) {
     header->adjusted = object;
     header->unwind.exception_class = PrimaryClass;
     header->unwind.exception_cleanup = Cleanup;
+    NoteThrow(header, object);
     ++globals.uncaught;
     _Unwind_RaiseException_nid_postfix(&header->unwind);
     RawLog("[libc] unhandled exception '%s' thrown from %p\n", type ? type->name() : "?", __builtin_return_address(0));
