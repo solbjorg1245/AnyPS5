@@ -193,6 +193,19 @@ void RunCheck(CheckJob& job) {
     job.addons = dumps.empty() && job.addonDir.empty() ? std::vector<AddonContent::Found>() : AddonContent::Find(dumps, AddonContent::PathFromText(job.addonDir));
 }
 
+// APS5_PRESENT_AUTO (frame rate S3, experimental until the window's changes are approved): the FPS limit
+// gains 120 and the display's refresh, and a Present row writes PresentMode. Without it the window shows and
+// writes what it did before.
+bool PresentAuto() {
+    static const bool on = std::getenv("APS5_PRESENT_AUTO") != nullptr;
+    return on;
+}
+
+// Model::fpsChoice past the first four (auto, 30, 60, custom), only with PresentAuto().
+constexpr int FpsChoiceCustom = 3;
+constexpr int FpsChoice120 = 4;
+constexpr int FpsChoiceDisplay = 5;
+
 // What the window edits; `settings` holds the choices as the parser's values.
 struct Model {
     Options options;
@@ -202,8 +215,9 @@ struct Model {
     PortSettings::Settings settings;
     std::vector<ResolutionChoice> resolutions;
     int resolution = 0;
-    int fpsChoice = 0;  // auto, 30, 60, custom
+    int fpsChoice = 0;  // auto, 30, 60, custom; FpsChoice120 and FpsChoiceDisplay with APS5_PRESENT_AUTO
     double customFps = 45.0;
+    int refreshHz = 0;  // the desktop's refresh, 0 when unknown
     std::string status;
     bool statusError = false;
 
@@ -327,11 +341,12 @@ void LoadModel(Model& model) {
         model.status = error;
         model.statusError = true;
     }
-    model.settings = PortSettings::Parse(model.text, PortSettings::PathText(model.options.settings.filename()));
+    model.settings = PortSettings::Parse(model.text, PortSettings::PathText(model.options.settings.filename()), PortSettings::SwitchOn(std::getenv(PortSettings::UpscalerSettingsSwitch)));
     const double fps = model.settings.fpsLimit;
     if (fps == 0.0) model.fpsChoice = 0;
     else if (std::abs(fps - 30.0) < 0.1) model.fpsChoice = 1;
     else if (std::abs(fps - 60.0) < 0.1) model.fpsChoice = 2;
+    else if (PresentAuto() && std::abs(fps - 120.0) < 0.1) model.fpsChoice = FpsChoice120;
     else {
         model.fpsChoice = 3;
         model.customFps = fps;
@@ -345,6 +360,20 @@ void LoadModel(Model& model) {
     model.editTime = -1.0;
 }
 
+// The "Display (N Hz)" preset's limit, 0 when the window has no such entry: the refresh is unknown or the
+// 30, 60 or 120 entry already matches it.
+double DisplayPreset(const Model& model) {
+    const double fps = PortSettings::DisplayFpsLimit(model.refreshHz);
+    return fps == 30.0 || fps == 60.0 || fps == 120.0 ? 0.0 : fps;
+}
+
+// The desktop's refresh, known once SDL runs (after LoadModel): a file limit equal to the display preset selects it.
+void SetRefresh(Model& model, int refreshHz) {
+    model.refreshHz = refreshHz;
+    const double display = DisplayPreset(model);
+    if (PresentAuto() && model.fpsChoice == FpsChoiceCustom && display != 0.0 && std::abs(model.customFps - display) < 0.1) model.fpsChoice = FpsChoiceDisplay;
+}
+
 // The choices as settings (the launcher's rules applied).
 PortSettings::Settings Chosen(const Model& model) {
     auto settings = model.settings;
@@ -353,7 +382,10 @@ PortSettings::Settings Chosen(const Model& model) {
     settings.height = resolution.height;
     static constexpr double fixedRates[] = {0.0, 30.0, 60.0};
     // A custom value the slider never moved keeps the file's number (it may be fractional).
-    settings.fpsLimit = model.fpsChoice < 3 ? fixedRates[model.fpsChoice] : model.customFps;
+    settings.fpsLimit = model.fpsChoice < 3 ? fixedRates[model.fpsChoice]
+        : model.fpsChoice == FpsChoice120   ? 120.0
+        : model.fpsChoice == FpsChoiceDisplay ? DisplayPreset(model)
+                                              : model.customFps;
     if (!model.options.fromGame) {
         // A valid folder as resolved (the app0 inside a picked parent); otherwise the text, kept for next time
         // (not one with a double quote, which the file's quoting cannot hold).
@@ -369,7 +401,11 @@ PortSettings::Settings Chosen(const Model& model) {
 std::string NewText(const Model& model) {
     const std::string header = model.existed ? std::string() : std::string("# AnyPS5 settings, written by the launcher (keys: anyps5-settings.ini.example).\n");
     // The window's own folder is always written, so clearing the field clears it in the file.
-    return PortSettings::SetIniValues(model.existed ? model.text : header, PortSettings::LauncherValuesWithGameDir(Chosen(model), !model.options.fromGame));
+    const auto chosen = Chosen(model);
+    auto values = PortSettings::LauncherValuesWithGameDir(chosen, !model.options.fromGame);
+    // The Present row's choice with APS5_PRESENT_AUTO; without it a PresentMode line in the file stays as it is.
+    if (PresentAuto()) values.emplace_back("PresentMode", PortSettings::PresentModeName(chosen.presentMode));
+    return PortSettings::SetIniValues(model.existed ? model.text : header, values);
 }
 
 bool Save(Model& model) {
@@ -511,6 +547,49 @@ void Colored(const ImVec4& color, const std::string& text) {
     ImGui::PopStyleColor();
 }
 
+// The upscaler rows under APS5_UPSCALER_SETTINGS=1 (experimental, docs/design/dlss.md S3): off or the port's
+// temporal upscaler (FSR and DLSS listed, not available yet) and its render size; the output is 3840x2160,
+// scaled to the window as before. Not with native aspect (ApplyLauncherRules turns it off).
+void DrawUpscaler(Model& model, bool nativeAspect) {
+    // APS5_UPSCALER / APS5_UPSCALER_QUALITY win over the ini (the game reads them): the rows show what the game will do.
+    auto shown = model.settings;
+    const auto environment = [&shown](const char* variable, const char* key) {
+        const char* value = std::getenv(variable);
+        if (value == nullptr || value[0] == '\0') return std::string();
+        PortSettings::SetKey(shown, key, value, variable);
+        return std::string("(set by ") + variable + "=" + value + ")";
+    };
+    const auto upscalerSet = environment("APS5_UPSCALER", "Upscaler");
+    const auto qualitySet = environment("APS5_UPSCALER_QUALITY", "UpscalerQuality");
+    const int current = !nativeAspect && shown.upscaler != PortSettings::Upscaler::Off ? 1 : 0;
+    static const char* const names[] = {"Off", "Port upscaler (experimental)", "FSR (not available yet)", "DLSS (not available yet)"};
+    ImGui::BeginDisabled(!upscalerSet.empty() || nativeAspect);
+    if (ImGui::BeginCombo("##upscaler", names[current])) {
+        for (int index = 0; index < IM_ARRAYSIZE(names); ++index) {
+            if (ImGui::Selectable(names[index], index == current, index >= 2 ? ImGuiSelectableFlags_Disabled : 0)) {
+                model.settings.upscaler = index == 1 ? PortSettings::Upscaler::Port : PortSettings::Upscaler::Off;
+                model.settings.upscalerBackend = model.settings.upscaler;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::EndDisabled();
+    if (!upscalerSet.empty()) Note(upscalerSet.c_str());
+    if (nativeAspect) Note("Not with native aspect yet.");
+
+    Label("Upscaler quality");
+    ImGui::BeginDisabled(!qualitySet.empty() || current == 0);
+    if (ImGui::BeginCombo("##upscalerquality", PortSettings::PresetOf(shown.upscalerQuality).label)) {
+        for (const auto& preset : PortSettings::UpscalerPresets) {
+            if (ImGui::Selectable(preset.label, preset.quality == shown.upscalerQuality)) model.settings.upscalerQuality = preset.quality;
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::EndDisabled();
+    if (!qualitySet.empty()) Note(qualitySet.c_str());
+    else if (current == 1) Note("Rendered at this size and upscaled to 3840x2160 in the game's PS5 Pro path.");
+}
+
 // The Deluxe Edition add-on (s61 T-deluxe): it can be on only when the dump holds it (AddonContent.hpp,
 // the same search the game's entitlement query answers from); the checkbox turns an owned add-on off.
 void DrawDeluxe(Model& model) {
@@ -611,6 +690,48 @@ void DrawSetup(Model& model) {
     if (!model.memoryWarning.empty()) Colored(Warn, model.memoryWarning);
 }
 
+// The FPS limit's entries with APS5_PRESENT_AUTO: 120 and, when no entry matches the display, its refresh.
+void DrawFpsPresets(Model& model) {
+    std::vector<std::pair<std::string, int>> entries{{"Auto (the game's graphics mode)", 0}, {"30", 1}, {"60", 2}, {"120", FpsChoice120}};
+    if (DisplayPreset(model) != 0.0) entries.emplace_back("Display (" + std::to_string(model.refreshHz) + " Hz)", FpsChoiceDisplay);
+    entries.emplace_back("Custom", FpsChoiceCustom);
+    const auto current = std::find_if(entries.begin(), entries.end(), [&](const auto& entry) { return entry.second == model.fpsChoice; });
+    if (ImGui::BeginCombo("##fps", current != entries.end() ? current->first.c_str() : "")) {
+        for (const auto& [name, choice] : entries) {
+            const bool selected = choice == model.fpsChoice;
+            if (ImGui::Selectable(name.c_str(), selected)) model.fpsChoice = choice;
+            if (selected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+}
+
+// The Present row with APS5_PRESENT_AUTO: how finished frames reach the display (PresentMode; the game's
+// ChoosePresentMode decides auto).
+void DrawPresent(Model& model, const PortSettings::Settings& chosen) {
+    using PortSettings::PresentMode;
+    Label("Present");
+    // APS5_PRESENT_MODE wins over the ini (the game reads it): the row shows what the game will do.
+    const char* environment = std::getenv("APS5_PRESENT_MODE");
+    const bool overridden = environment != nullptr && environment[0] != '\0';
+    PortSettings::Settings fromEnvironment;
+    if (overridden) PortSettings::SetKey(fromEnvironment, "PresentMode", environment, "APS5_PRESENT_MODE");
+    const PresentMode mode = overridden ? fromEnvironment.presentMode : model.settings.presentMode;
+    // In PresentMode's order.
+    static const char* const presentNames[] = {"Auto", "Wait for the display (fifo)", "Newest frame (mailbox)", "Immediate (tears)"};
+    int present = static_cast<int>(mode);
+    ImGui::BeginDisabled(overridden);
+    if (ImGui::Combo("##present", &present, presentNames, IM_ARRAYSIZE(presentNames))) model.settings.presentMode = static_cast<PresentMode>(present);
+    ImGui::EndDisabled();
+    if (overridden) Note((std::string("(set by APS5_PRESENT_MODE=") + environment + ")").c_str());
+    if (model.refreshHz <= 0 || !(chosen.fpsLimit > model.refreshHz + 1.0)) return;
+    const auto refresh = std::to_string(model.refreshHz);
+    if (mode == PresentMode::Auto || mode == PresentMode::Mailbox)
+        Note(("Above the display's " + refresh + " Hz: the newest frame is shown at each refresh (frames dropped, no tearing).").c_str());
+    else if (mode == PresentMode::Fifo)
+        Note(("The display shows at most " + refresh + " frames a second and holds the game to that rate.").c_str());
+}
+
 Action Draw(Model& model) {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
@@ -673,7 +794,8 @@ Action Draw(Model& model) {
 
         Label("FPS limit");
         static const char* const fpsNames[] = {"Auto (the game's graphics mode)", "30", "60", "Custom"};
-        ImGui::Combo("##fps", &model.fpsChoice, fpsNames, IM_ARRAYSIZE(fpsNames));
+        if (PresentAuto()) DrawFpsPresets(model);
+        else ImGui::Combo("##fps", &model.fpsChoice, fpsNames, IM_ARRAYSIZE(fpsNames));
         if (model.fpsChoice == 3) {
             int custom = static_cast<int>(std::lround(model.customFps));
             ImGui::SetNextItemWidth(-FLT_MIN);
@@ -690,6 +812,7 @@ Action Draw(Model& model) {
         ImGui::EndDisabled();
         if (forced) Note("Limits other than 30 and 60 need the variable timestep (set automatically).");
         else Note("Variable: the game speed follows the real frame rate (experimental).");
+        if (PresentAuto()) DrawPresent(model, chosen);
 
         Label("Native aspect");
         ImGui::BeginDisabled(chosen.width == 0);
@@ -699,11 +822,15 @@ Action Draw(Model& model) {
         if (chosen.width == 0) Note("Needs a resolution other than Auto.");
 
         Label("Upscaler");
-        ImGui::BeginDisabled();
-        int upscaler = 0;
-        static const char* const upscalerNames[] = {"Off (FSR / DLSS coming later)"};
-        ImGui::Combo("##upscaler", &upscaler, upscalerNames, IM_ARRAYSIZE(upscalerNames));
-        ImGui::EndDisabled();
+        if (model.settings.upscalerSettings) {
+            DrawUpscaler(model, chosen.nativeAspect);
+        } else {
+            ImGui::BeginDisabled();
+            int upscaler = 0;
+            static const char* const upscalerNames[] = {"Off (FSR / DLSS coming later)"};
+            ImGui::Combo("##upscaler", &upscaler, upscalerNames, IM_ARRAYSIZE(upscalerNames));
+            ImGui::EndDisabled();
+        }
 
         Label("Frame generation");
         ImGui::BeginDisabled();
@@ -726,7 +853,7 @@ Action Draw(Model& model) {
     }
 
     // What the game will make of it: the parser's own summary and warnings on the text that would be saved.
-    auto preview = PortSettings::Parse(NewText(model), PortSettings::PathText(model.options.settings.filename()));
+    auto preview = PortSettings::Parse(NewText(model), PortSettings::PathText(model.options.settings.filename()), model.settings.upscalerSettings);
     PortSettings::Normalize(preview);
     preview.source = PortSettings::PathText(model.options.settings);
     ImGui::Spacing();
@@ -823,6 +950,7 @@ int Run(Model& model) {
     SDL_DisplayMode desktop{};
     if (SDL_GetDesktopDisplayMode(0, &desktop) != 0) desktop = {};
     BuildResolutions(model, desktop.w, desktop.h);
+    SetRefresh(model, desktop.refresh_rate);
 
     // A Steam Deck sized screen (or smaller) gets the whole screen; a desktop a window of 60% of its height.
     const bool small = desktop.w > 0 && (desktop.w <= 1280 || desktop.h <= 800);

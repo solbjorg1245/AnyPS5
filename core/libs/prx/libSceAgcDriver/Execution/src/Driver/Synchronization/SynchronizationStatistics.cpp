@@ -16,6 +16,9 @@ std::atomic<std::uint64_t> recordTriesSkipped{0};
 
 std::atomic<bool> queue0Dormant{false};
 
+std::atomic<const std::atomic<std::uint64_t>*> queue0Queued{nullptr};
+std::atomic<bool> queue0Running{false};
+
 std::atomic<std::uint64_t> packetLockRecordUs{0}, packetLockSubmitUs{0};
 
 std::atomic<std::uint64_t> triesFailed[TrySites] = {};

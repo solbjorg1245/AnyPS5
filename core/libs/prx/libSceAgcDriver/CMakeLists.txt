@@ -60,6 +60,34 @@ add_custom_command(
         VERBATIM
 )
 
+# APS5_MFSR_EXEC's bilinear upscale pass (Graphics/src/Upscale.cpp).
+set(agcUpscaleBilinearShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/UpscaleBilinear.comp)
+set(agcUpscaleBilinearShaderSpv ${agcTextureDetileGeneratedDir}/UpscaleBilinear.spv)
+set(agcUpscaleBilinearShaderHeader ${agcTextureDetileGeneratedDir}/UpscaleBilinear_spv.h)
+add_custom_command(
+        OUTPUT "${agcUpscaleBilinearShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcUpscaleBilinearShaderSpv}" "${agcUpscaleBilinearShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcUpscaleBilinearShaderSpv} -DOUTPUT=${agcUpscaleBilinearShaderHeader}
+        -DSYMBOL=UPSCALE_BILINEAR_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcUpscaleBilinearShaderSource}" glslang-standalone
+        VERBATIM
+)
+
+# APS5_UPSCALER_PORT's temporal upscale pass (Graphics/src/Upscale.cpp).
+set(agcUpscaleTemporalShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/UpscaleTemporal.comp)
+set(agcUpscaleTemporalShaderSpv ${agcTextureDetileGeneratedDir}/UpscaleTemporal.spv)
+set(agcUpscaleTemporalShaderHeader ${agcTextureDetileGeneratedDir}/UpscaleTemporal_spv.h)
+add_custom_command(
+        OUTPUT "${agcUpscaleTemporalShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcUpscaleTemporalShaderSpv}" "${agcUpscaleTemporalShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcUpscaleTemporalShaderSpv} -DOUTPUT=${agcUpscaleTemporalShaderHeader}
+        -DSYMBOL=UPSCALE_TEMPORAL_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcUpscaleTemporalShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
@@ -123,6 +151,8 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/SynchronizationStatistics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitStatistics.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Upscale/Plugin.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Upscale/Upscale.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/WorkerSampler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
@@ -143,6 +173,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/LaneCensus.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderInputState.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/VramReclaimers.cpp
@@ -161,9 +192,12 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureDetiler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Texture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Upscale.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
         ${agcCopyBackDiffShaderHeader}
+        ${agcUpscaleBilinearShaderHeader}
+        ${agcUpscaleTemporalShaderHeader}
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Event.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Query.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Resource/src/Lifecycle.cpp
@@ -239,6 +273,8 @@ endforeach()
 
 add_test_executable(agc_driver_tests EXCLUDE_FROM_ALL
         tests/Submit.cpp
+        tests/LaneCensus.cpp
+        tests/LaneChain.cpp
 )
 
 target_include_directories(agc_driver_tests PRIVATE
@@ -255,6 +291,26 @@ target_link_libraries(agc_driver_tests PRIVATE
 
 set_target_properties(agc_driver_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_tests)
+
+# APS5_UPSCALER_PLUGIN's in-tree sample (docs/design/dlss.md S4): aps5_upscaler_blit.dll, plain C on
+# Execution/include/UpscalerPlugin.h, beside the test binaries and built with agc_driver_tests, which
+# loads it by its path.
+enable_language(C)
+add_library(aps5_upscaler_blit SHARED EXCLUDE_FROM_ALL
+        tests/plugin/UpscalerBlitPlugin.c
+)
+target_include_directories(aps5_upscaler_blit PRIVATE
+        ${LIBS_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include
+)
+set_target_properties(aps5_upscaler_blit PROPERTIES PREFIX ""
+        RUNTIME_OUTPUT_DIRECTORY "$<1:${ANYPS5_TEST_OUTPUT_DIRECTORY}>"
+        LIBRARY_OUTPUT_DIRECTORY "$<1:${ANYPS5_TEST_OUTPUT_DIRECTORY}>")
+if(MINGW)
+    target_link_options(aps5_upscaler_blit PRIVATE -static-libgcc)
+endif()
+add_dependencies(agc_driver_tests aps5_upscaler_blit)
+target_compile_definitions(agc_driver_tests PRIVATE "APS5_UPSCALER_BLIT_PLUGIN_PATH=\"$<TARGET_FILE:aps5_upscaler_blit>\"")
 
 add_test_executable(agc_driver_recompiler_tests EXCLUDE_FROM_ALL
         tests/Recompiler.cpp
@@ -515,6 +571,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/UnitShadow.cpp
         Graphics/src/Sampler.cpp
         Graphics/src/Recorder.cpp
+        Graphics/src/LaneCensus.cpp
         Graphics/src/ShaderInputState.cpp
         ${agcTextureDetileShaderHeader}
         ${agcCopyBackDiffShaderHeader}
@@ -708,6 +765,7 @@ if(AGC_BUILD_VISUAL_TEST)
             Graphics/src/VramReclaimers.cpp
             Graphics/src/ShaderAddressResources.cpp
             Graphics/src/GuestBufferMemory.cpp
+            Graphics/src/LaneCensus.cpp
             Graphics/src/BdaResources.cpp
             Graphics/src/BufferAddress.cpp
             Graphics/src/ShaderValidation.cpp

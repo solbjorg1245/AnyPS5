@@ -10,6 +10,8 @@ namespace AgcDriver::DriverDetail {
 
 struct SubmissionCosts {
     std::atomic<std::uint64_t> submissions{0}, validateNs{0}, copyNs{0}, dequeueNs{0}, completeNs{0}, suspendNs{0}, suspends{0}, suspendsSkipped{0}, endSubmits{0}, endSkipped{0}, notifiesSkipped{0};
+    // APS5_COMPUTE_END_DEFER: deferred ends the deferring worker sent at the deadline (sendDeferredEnd).
+    std::atomic<std::uint64_t> endDeferredSent{0};
 };
 
 extern std::atomic<std::uint64_t> gpuLabels, completionLabels, notImportedLabels, noOpLabels, unlockedDrains;
@@ -23,6 +25,11 @@ extern std::atomic<std::uint64_t> packetLockRecords, packetLockSubmits, packetLo
 extern std::atomic<std::uint64_t> recordTriesSkipped;
 
 extern std::atomic<bool> queue0Dormant;
+
+// APS5_COMPUTE_END_DEFER (ComputeEndDefers): queue 0's worker's queued count, set once it runs, and
+// whether it runs a submission (set before its dequeue lowers the count, cleared after it executed).
+extern std::atomic<const std::atomic<std::uint64_t>*> queue0Queued;
+extern std::atomic<bool> queue0Running;
 
 extern std::atomic<std::uint64_t> packetLockRecordUs, packetLockSubmitUs;
 

@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Upscale.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VideoMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
@@ -25,6 +26,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/FastRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/PortSettings.hpp"
 #ifdef _WIN32
 #include "prx/libc/include/HostThread.hpp"
 #include <windows.h>
@@ -209,10 +211,33 @@ private:
 // The [present] line's counters (see the header); mutated under State::presentMutex.
 VulkanDevice::PresentStatistics presentCounters{};
 
+// The present modes the surface offers (none when the query fails).
+std::vector<VkPresentModeKHR> offeredPresentModes(PFN_vkGetPhysicalDeviceSurfacePresentModesKHR getModes, VkPhysicalDevice physical, VkSurfaceKHR surface) {
+    std::uint32_t count = 0;
+    std::vector<VkPresentModeKHR> modes;
+    if (getModes(physical, surface, &count, nullptr) == VK_SUCCESS) {
+        modes.resize(count);
+        if (getModes(physical, surface, &count, modes.data()) != VK_SUCCESS) count = 0;
+        modes.resize(count);
+    }
+    return modes;
+}
+
 // The swapchain's present mode: FIFO unless APS5_PRESENT_MODE=mailbox|immediate asks otherwise and the
 // surface offers it. The title is paced by the VideoOut vblank either way; FIFO also holds each present
 // to the display refresh, so a 120 FPS run (APS5_VBLANK_HZ=119.88) on a 60 Hz display needs mailbox.
-VkPresentModeKHR choosePresentMode(PFN_vkGetPhysicalDeviceSurfacePresentModesKHR getModes, VkPhysicalDevice physical, VkSurfaceKHR surface) {
+// APS5_PRESENT_AUTO=1 (frame rate S2): the player's PresentMode (APS5_PRESENT_MODE through the settings,
+// auto by default) with the window's vblank rate and display refresh decides (PortSettings::ChoosePresentMode):
+// auto takes mailbox when the vblank runs above the display refresh, else FIFO, and never immediate.
+VkPresentModeKHR choosePresentMode(PFN_vkGetPhysicalDeviceSurfacePresentModesKHR getModes, VkPhysicalDevice physical, VkSurfaceKHR surface, double vblankHz, double displayHz) {
+    static const bool presentAuto = std::getenv("APS5_PRESENT_AUTO") != nullptr;
+    if (presentAuto) {
+        const auto modes = offeredPresentModes(getModes, physical, surface);
+        const auto offered = [&](VkPresentModeKHR mode) { return std::find(modes.begin(), modes.end(), mode) != modes.end(); };
+        const auto choice = PortSettings::ChoosePresentMode(GetPortSettings_nid_no_patch().presentMode, vblankHz, displayHz, offered(VK_PRESENT_MODE_MAILBOX_KHR), offered(VK_PRESENT_MODE_IMMEDIATE_KHR));
+        std::fprintf(stderr, "[present] present mode %s (%s) (APS5_PRESENT_AUTO=1)\n", PortSettings::PresentModeName(choice.mode), choice.reason.c_str());
+        return choice.mode == PortSettings::PresentMode::Mailbox ? VK_PRESENT_MODE_MAILBOX_KHR : choice.mode == PortSettings::PresentMode::Immediate ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
+    }
     const char* value = std::getenv("APS5_PRESENT_MODE");
     if (value == nullptr || std::strcmp(value, "fifo") == 0) return VK_PRESENT_MODE_FIFO_KHR;
     VkPresentModeKHR wanted = VK_PRESENT_MODE_FIFO_KHR;
@@ -222,13 +247,7 @@ VkPresentModeKHR choosePresentMode(PFN_vkGetPhysicalDeviceSurfacePresentModesKHR
         std::fprintf(stderr, "[present] APS5_PRESENT_MODE=%s refused (fifo, mailbox or immediate); using fifo\n", value);
         return VK_PRESENT_MODE_FIFO_KHR;
     }
-    std::uint32_t count = 0;
-    std::vector<VkPresentModeKHR> modes;
-    if (getModes(physical, surface, &count, nullptr) == VK_SUCCESS) {
-        modes.resize(count);
-        if (getModes(physical, surface, &count, modes.data()) != VK_SUCCESS) count = 0;
-        modes.resize(count);
-    }
+    const auto modes = offeredPresentModes(getModes, physical, surface);
     if (std::find(modes.begin(), modes.end(), wanted) == modes.end()) {
         std::fprintf(stderr, "[present] APS5_PRESENT_MODE=%s is not offered by the surface; using fifo\n", value);
         return VK_PRESENT_MODE_FIFO_KHR;
@@ -272,6 +291,8 @@ struct VulkanDevice::State {
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
+    // APS5_COMPUTE_QUEUE: index 1 of the queue's family, lane C's (Graphics::LaneChain); null when off.
+    VkQueue computeQueue = VK_NULL_HANDLE;
     VkCommandPool pool = VK_NULL_HANDLE;
     void* window = nullptr;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
@@ -352,6 +373,15 @@ struct VulkanDevice::State {
     };
     std::map<std::uint64_t, FastComputePipeline> fastComputePipelines;
     std::unique_ptr<Graphics::GpuColorTransfer> colorTransfer;
+    // APS5_MFSR_EXEC's pass (UpscaleBilinear), made on first use.
+    std::unique_ptr<Graphics::BilinearUpscaler> upscaler;
+    // APS5_UPSCALER_PORT's pass and history images (UpscaleTemporal), made on first use.
+    std::unique_ptr<Graphics::TemporalUpscaler> temporalUpscaler;
+    // APS5_UPSCALER_PLUGIN (Upscale::ActivePlugin): the plugin while this device enabled its extensions,
+    // the queue family it is told, and its pass (UpscalePlugin), made on first use.
+    const Upscale::LoadedPlugin* plugin = nullptr;
+    std::uint32_t pluginFamily = 0;
+    std::unique_ptr<Graphics::PluginUpscaler> pluginUpscaler;
     std::shared_ptr<Graphics::BufferPool> bufferPool;
     std::unique_ptr<Graphics::Buffer> emptyBuffer;
     std::unique_ptr<Graphics::TextureCache> textureCache;
@@ -658,6 +688,9 @@ struct VulkanDevice::State {
             // "shadows" reclaimer would otherwise free them on a destroyed device).
             Graphics::ClearStagedShadows(device);
             patternBuffers.clear();
+            upscaler.reset();
+            temporalUpscaler.reset();
+            pluginUpscaler.reset();
             fastRing.reset();
             fastLayouts.reset();
             descriptorCache.reset();
@@ -742,6 +775,21 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
         create.ppEnabledExtensionNames = instanceExtensions.data();
     }
+    // APS5_UPSCALER_PLUGIN: the plugin's instance extensions the loader offers (a required one missing
+    // turns it off); without the plugin the instance is made as before.
+    state->plugin = Upscale::ActivePlugin();
+    if (state->plugin != nullptr) {
+        std::uint32_t availableCount = 0;
+        const auto enumerateExtensions = state->InstanceFunction<PFN_vkEnumerateInstanceExtensionProperties>("vkEnumerateInstanceExtensionProperties");
+        check(enumerateExtensions(nullptr, &availableCount, nullptr), "vkEnumerateInstanceExtensionProperties");
+        std::vector<VkExtensionProperties> available(availableCount);
+        check(enumerateExtensions(nullptr, &availableCount, available.data()), "vkEnumerateInstanceExtensionProperties");
+        Aps5UpscalerExtensions wanted{sizeof(wanted)};
+        const auto status = state->plugin->api.get_instance_extensions(&wanted);
+        if (!Upscale::AddPluginExtensions(*state->plugin, "instance", status, wanted, available, instanceExtensions)) state->plugin = nullptr;
+        create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
+        create.ppEnabledExtensionNames = instanceExtensions.empty() ? nullptr : instanceExtensions.data();
+    }
     check(state->InstanceFunction<PFN_vkCreateInstance>("vkCreateInstance")(&create, nullptr, &state->instance), "vkCreateInstance");
     APS5_LOG_OUT("Vulkan instance created instance=%p", reinterpret_cast<void*>(state->instance));
     if (window != nullptr) {
@@ -815,6 +863,19 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         throw std::runtime_error(window ? "Vulkan: no Vulkan 1.1 device with graphics, compute and swapchain presentation" : "Vulkan: no Vulkan 1.1 graphics and compute queue");
     }
     APS5_LOG_OUT("Physical device selected physical=%p queueFamily=%u", reinterpret_cast<void*>(selected), family);
+    if (Graphics::LaneCensusOn) {
+        // APS5_LANE_CENSUS (docs/design/fewer-submits.md S3): the selected device's queue families, so the
+        // second queue's source (another queue of this family or a compute-only family) is known before S3.
+        std::uint32_t familyCount = 0;
+        auto listFamilies = state->InstanceFunction<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
+        listFamilies(selected, &familyCount, nullptr);
+        std::vector<VkQueueFamilyProperties> familyList(familyCount);
+        listFamilies(selected, &familyCount, familyList.data());
+        for (std::uint32_t i = 0; i < familyCount; ++i) {
+            const auto flags = familyList[i].queueFlags;
+            std::fprintf(stderr, "[recorder] lane census: queue family %u%s: %u queues, flags 0x%x (graphics %d, compute %d, transfer %d), timestamp bits %u\n", i, i == family ? " (used)" : "", familyList[i].queueCount, static_cast<unsigned>(flags), (flags & VK_QUEUE_GRAPHICS_BIT) != 0 ? 1 : 0, (flags & VK_QUEUE_COMPUTE_BIT) != 0 ? 1 : 0, (flags & VK_QUEUE_TRANSFER_BIT) != 0 ? 1 : 0, familyList[i].timestampValidBits);
+        }
+    }
     VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     properties.pNext = &state->subgroup;
     state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &properties);
@@ -993,11 +1054,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         state->spirvExtensions.push_back("SPV_EXT_mesh_shader");
     }
     APS5_LOG_OUT("Vulkan features tessellationAvailable=%u mesh=%u depthClip=%u depthRangeUnrestricted=%u", static_cast<unsigned>(state->tessellationShader), static_cast<unsigned>(state->meshShader), static_cast<unsigned>(state->depthClipControl), static_cast<unsigned>(state->depthRangeUnrestricted));
-    const float priority = 1.0f;
+    const float priorities[2] = {1.0f, 1.0f};
     VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queueInfo.queueFamilyIndex = family;
     queueInfo.queueCount = 1;
-    queueInfo.pQueuePriorities = &priority;
+    queueInfo.pQueuePriorities = priorities;
     VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
@@ -1142,12 +1203,41 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     } else {
         std::fprintf(stderr, "[gpu] timeline semaphores unavailable or disabled; drains wait under the GPU mutex\n");
     }
+    // APS5_UPSCALER_PLUGIN: the plugin's device extensions this device offers, as for the instance.
+    if (state->plugin != nullptr) {
+        Aps5UpscalerExtensions wanted{sizeof(wanted)};
+        const auto status = state->plugin->api.get_device_extensions(state->instance, selected, state->instanceProc, &wanted);
+        if (!Upscale::AddPluginExtensions(*state->plugin, "device", status, wanted, availableExtensions, deviceExtensions)) state->plugin = nullptr;
+        state->pluginFamily = family;
+        deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
+        deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
+    }
     bdaFeatures.pNext = &byteFeatures;
     deviceInfo.pNext = &bdaFeatures;
+    if (Graphics::ComputeQueueAsked()) {
+        // APS5_COMPUTE_QUEUE=1: a second queue of the same family (no ownership transfers, one command
+        // pool) for lane C's batches, chained to the first in serial order by the recorder's timeline.
+        std::uint32_t familyCount = 0;
+        auto listFamilies = state->InstanceFunction<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
+        listFamilies(selected, &familyCount, nullptr);
+        std::vector<VkQueueFamilyProperties> familyList(familyCount);
+        listFamilies(selected, &familyCount, familyList.data());
+        const char* off = !state->timelineSemaphores ? "no timeline semaphores" : family >= familyCount || familyList[family].queueCount < 2 ? "the queue family has one queue" : nullptr;
+        if (off == nullptr) queueInfo.queueCount = 2;
+        else std::fprintf(stderr, "[recorder] compute queue: off, %s; lane C stays on queue family %u index 0 (APS5_COMPUTE_QUEUE=1)\n", off, family);
+    }
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
     if (deviceFault) InstallDeviceFaultReport(state->device, state->DeviceFunction<PFN_vkGetDeviceFaultInfoEXT>("vkGetDeviceFaultInfoEXT"), faultBinary);
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
-    if (checkpoints) Graphics::InstallCheckpoints(state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV"), state->DeviceFunction<PFN_vkGetQueueCheckpointDataNV>("vkGetQueueCheckpointDataNV"), state->queue);
+    if (queueInfo.queueCount == 2) {
+        state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 1, &state->computeQueue);
+        std::fprintf(stderr, "[recorder] compute queue: lane C submits to queue family %u index 1, chained in serial order (APS5_COMPUTE_QUEUE=1)\n", family);
+    }
+    // APS5_ASYNC_COMPUTE needs the second queue (the recorder prints the line when it is on).
+    if (const int level = Graphics::AsyncComputeLevel(); level != 0 && queueInfo.queueCount != 2) std::fprintf(stderr, "[recorder] async compute: off, %s (APS5_ASYNC_COMPUTE=%d)\n", Graphics::ComputeQueueAsked() ? "no second queue" : "APS5_COMPUTE_QUEUE=1 is not set", level);
+    // APS5_IMAGE_EDGES needs APS5_ASYNC_COMPUTE=1 (the recorder prints the line when it is on).
+    if (Graphics::ImageEdgesAsked() && (Graphics::AsyncComputeLevel() == 0 || queueInfo.queueCount != 2)) std::fprintf(stderr, "[recorder] image edges: off, APS5_ASYNC_COMPUTE=1 is not on (APS5_IMAGE_EDGES=1)\n");
+    if (checkpoints) Graphics::InstallCheckpoints(state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV"), state->DeviceFunction<PFN_vkGetQueueCheckpointDataNV>("vkGetQueueCheckpointDataNV"), state->queue, state->computeQueue);
     else if (Graphics::CheckpointsRequested()) std::fprintf(stderr, "[checkpoints] VK_NV_device_diagnostic_checkpoints unavailable\n");
     APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family);
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -1232,7 +1322,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         std::vector<VkSurfaceFormatKHR> formats(formatCount);
         check(getFormats(selected, state->surface, &formatCount, formats.data()), "vkGetPhysicalDeviceSurfaceFormatsKHR");
         require(std::any_of(formats.begin(), formats.end(), [](const auto& format) { return format.format == VK_FORMAT_B8G8R8A8_UNORM && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR; }), "BGRA8 sRGB-nonlinear surface format is unavailable");
-        state->presentMode = choosePresentMode(state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>("vkGetPhysicalDeviceSurfacePresentModesKHR"), selected, state->surface);
+        state->presentMode = choosePresentMode(state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>("vkGetPhysicalDeviceSurfacePresentModesKHR"), selected, state->surface, window->vblankHz, window->displayHz);
         VkSwapchainCreateInfoKHR swapchain{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
         swapchain.surface = state->surface;
         swapchain.minImageCount = swapchainImageCount(surface, state->presentMode);
@@ -2238,7 +2328,10 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     // The frame's recorded work (and a refresh of the resident image) must reach the queue before the
     // presentation's own submission, which reads the image in queue order. No reap first: queue 0
     // reaps at its next packet, so the presenter's hold carries no completions.
-    SubmitRecorded(false);
+    {
+        const Graphics::SubmitCauseScope submitCause(Graphics::SubmitCause::Present);
+        SubmitRecorded(false);
+    }
     std::chrono::steady_clock::time_point lastSubmittedAt{};
     const std::uint64_t batchesAtBlit = state->recorder ? state->recorder->NewestSubmitted(&lastSubmittedAt) : 0;
     CaptureTrace::Log("blit dump=%d batch=%llu slot=%zu image=%u direct=%d", dumpFrame ? state->nextDumpIndex : -1, static_cast<unsigned long long>(batchesAtBlit), state->presentCursor, index, direct);
@@ -2371,7 +2464,9 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     timing.Mark("command_record_scale");
     // The slot's fence signaled (retired above) or was never used: the reset cannot block.
     check(state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence), "vkResetFences present");
-    check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
+    // APS5_COMPUTE_QUEUE: chained to the recorder's batches (Recorder::SubmitOneShot).
+    const bool chained = state->recorder != nullptr && state->recorder->ChainsOneShots(state->queue);
+    check(chained ? state->recorder->SubmitOneShot(submit, slot.fence) : state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
     const auto submittedAt = std::chrono::steady_clock::now();
     timing.Mark("queue_submit");
     APS5_LOG_CHARS_OUT_DEBUG("Presentation vkQueueSubmit OK");
@@ -2571,6 +2666,8 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.softwareDevice = state->properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
     context.memoryBudget = state->memoryBudget;
     context.memoryProperties2 = state->memoryProperties2;
+    context.computeQueue = state->computeQueue;
+    context.asyncCompute = state->computeQueue != VK_NULL_HANDLE ? Graphics::AsyncComputeLevel() : 0;
     return context;
 }
 
@@ -2584,6 +2681,28 @@ std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::Stat
 
 void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
     Graphics::RunColorMetadataPass(graphicsContext(), pass);
+}
+
+std::optional<Upscale::Skip> VulkanDevice::UpscaleBilinear(const Upscale::Plan& plan) {
+    const auto context = graphicsContext();
+    if (state->upscaler == nullptr) state->upscaler = std::make_unique<Graphics::BilinearUpscaler>(context);
+    return state->upscaler->Record(context, plan);
+}
+
+std::optional<Upscale::Skip> VulkanDevice::UpscaleTemporal(const Upscale::TemporalPlan& plan) {
+    const auto context = graphicsContext();
+    if (state->temporalUpscaler == nullptr) state->temporalUpscaler = std::make_unique<Graphics::TemporalUpscaler>(context);
+    return state->temporalUpscaler->Record(context, plan);
+}
+
+bool VulkanDevice::UpscalerPluginReady() const {
+    return state->plugin != nullptr;
+}
+
+std::optional<Upscale::Skip> VulkanDevice::UpscalePlugin(const Upscale::TemporalPlan& plan, std::string& detail) {
+    const auto context = graphicsContext();
+    if (state->pluginUpscaler == nullptr) state->pluginUpscaler = std::make_unique<Graphics::PluginUpscaler>(context, *state->plugin, Graphics::PluginUpscaler::Device{state->instance, state->instanceProc, state->pluginFamily, VK_API_VERSION_1_1});
+    return state->pluginUpscaler->Record(context, plan, detail);
 }
 
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {
@@ -3264,7 +3383,10 @@ std::uint64_t VulkanDevice::presync(std::span<const std::pair<std::uint64_t, std
                 open = open || info->open;
                 serial = std::max(serial, info->serial);
             }
-            if (open) serial = state->recorder->SubmitAndEpoch();
+            if (open) {
+                const Graphics::SubmitCauseScope submitCause(Graphics::SubmitCause::Presync);
+                serial = state->recorder->SubmitAndEpoch();
+            }
         }
     }
     if (serial != 0) {
@@ -3707,13 +3829,15 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     const auto guestOrder = Graphics::Recorder::DispatchOverlap() && argumentImport == nullptr && !resources.HoldsLease() ? Graphics::Recorder::GuestOrder() : Graphics::Recorder::GuestOrderKey{};
     const bool holdsTrail = recorder.HoldDispatchTrail(guestOrder);
     VkAccessFlags covered = 0;
-    const auto commands = keepCopyBacks ? recorder.CommandsKeepingCopyBacks(&covered) : recorder.Commands(&covered, Graphics::Recorder::CommandSite::Dispatch);
+    const auto commands = keepCopyBacks ? recorder.CommandsKeepingCopyBacks(&covered, Graphics::Recorder::CommandSite::Dispatch) : recorder.Commands(&covered, Graphics::Recorder::CommandSite::Dispatch);
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
     recorder.Keep(record.resources);
     recordStep(PhaseRecordKeeps);
     // APS5_TEMPLATE_REFRESH_RING: the set bound in place of the template's (ForkData's copy).
     VkDescriptorSet forkedSet = VK_NULL_HANDLE;
+    // APS5_IMAGE_EDGES: whether RefreshData recorded a write of the template's data buffers.
+    bool dataWritten = false;
     if (record.dataRefresh != RecordedDispatch::DataRefresh::None) {
         // The template's data buffers take this dispatch's words: a transfer write the pre-dispatch
         // barrier makes visible (so it is recorded whatever the previous command covered), ordered
@@ -3756,6 +3880,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             ++d.templateRefreshed;
             d.templateRevalidateMs += record.revalidateMs;
             record.refreshed = true;
+            dataWritten = true;
         } else {
             ++d.templateSameWords;
         }
@@ -3777,6 +3902,10 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         const auto images = resources.StorageImages();
         recorder.NoteAccess(CommandClass::DispatchLeading, Graphics::Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, resources.HoldsLease()});
     }
+    // APS5_IMAGE_EDGES: the object's data buffers (a template's are shared by its uses on either
+    // lane), by its address: every use reads them (a fork keeps the bindings whose words are
+    // equal), a recorded refresh writes them.
+    if (recorder.ImageEdges()) recorder.NoteImageEdge(reinterpret_cast<std::uint64_t>(&resources), dataWritten, Graphics::Recorder::ImageNote::Template);
     if (argumentImport != nullptr) {
         // The group counts were stored by earlier recorded work (a dispatch in place, a fill) or the
         // host; the indirect read follows all of it.

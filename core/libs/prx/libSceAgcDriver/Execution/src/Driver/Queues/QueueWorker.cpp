@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
@@ -48,6 +49,7 @@ void Driver::run(std::uint32_t id) noexcept {
     if (id == 0) StartWorkerSampler();
     Submission submission;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool endDefer = ComputeEndDefer();
     auto& costs = submissionCosts(id);
     try {
         for (;;) {
@@ -58,6 +60,7 @@ void Driver::run(std::uint32_t id) noexcept {
                 auto& worker = workers.at(id);
                 auto& pending = worker.pending;
                 workerQueued() = &worker.queued;
+                if (endDefer && id == 0) queue0Queued.store(&worker.queued, std::memory_order_release);
                 if (traceGpu && pending.empty()) std::fprintf(stderr, "[gpu] %.1f idle queue=0x%x\n", TraceMs(), id);
                 const auto ready = [&] { return failure || stopping || !pending.empty(); };
                 const auto poll = [&](const auto& done) {
@@ -82,6 +85,15 @@ void Driver::run(std::uint32_t id) noexcept {
                 // APS5_PROFILE_DRAW: queue 0's wait for a submission, reaps included (the [pipe] labels line).
                 const auto idleStart = profile && id == 0 && !ready() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 while (!ready()) {
+                    // APS5_COMPUTE_END_DEFER: a submission end this worker left to the deadline goes out
+                    // by it although no packet follows on any queue (ComputeEndDefers).
+                    if (endDefer && id != 0 && deferredEndOpen()) {
+                        if (poll(ready)) break;
+                        lock.unlock();
+                        sendDeferredEnd(id);
+                        lock.lock();
+                        continue;
+                    }
                     if (!completionsPending() || (id != 0 && Graphics::Recorder::PendingCompletionLabels() == 0)) {
                         if (id == 0) queue0Dormant.store(true, std::memory_order_relaxed);
                         changed.wait(lock, ready);
@@ -100,10 +112,12 @@ void Driver::run(std::uint32_t id) noexcept {
                 }
                 submission = std::move(pending.front());
                 pending.pop_front();
+                if (endDefer && id == 0) queue0Running.store(true, std::memory_order_release);
                 worker.queued.fetch_sub(1, std::memory_order_acq_rel);
                 if (profile && submission.enqueuedAt != std::chrono::steady_clock::time_point{}) costs.dequeueNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submission.enqueuedAt).count());
             }
             execute(submission);
+            if (endDefer && id == 0) queue0Running.store(false, std::memory_order_release);
             if (traceGpu) std::fprintf(stderr, "[gpu] %.1f done serial=%llu queue=0x%x\n", TraceMs(), static_cast<unsigned long long>(submission.serial), id);
             const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             bool notify = true;

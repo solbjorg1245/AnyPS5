@@ -1,11 +1,16 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
+#include "prx/libSceAgcDriver/Execution/include/MfsrPacket.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/NewDrawKeyTally.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RecordPipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FastRead.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Upscale/Plugin.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Upscale/Upscale.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FastDispatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
@@ -13,6 +18,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "prx/libc/include/ProLitePatch.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
@@ -38,6 +44,10 @@
 
 extern "C" int APS5_VABI sceKernelCreateEqueue(KernelEqueue* eq, const char* name);
 extern "C" int APS5_VABI sceKernelDeleteEqueue(KernelEqueue eq);
+// tests/LaneCensus.cpp
+void testLaneCensus();
+// tests/LaneChain.cpp
+void testLaneChain();
 
 static_assert(sizeof(Packet) == 16);
 static_assert(offsetof(Packet, addr) == 0);
@@ -409,6 +419,19 @@ void testNewDrawKeyTally() {
     check(tally.Top(1).size() == 1, "tally top keeps the count asked for");
     tally.Reset();
     check(tally.keys == 0 && tally.bases.empty() && tally.Top(10).empty(), "tally reset");
+}
+
+// APS5_COMPUTE_END_DEFER (fewer-submits.md S2): only a compute queue's end defers, never with the
+// switch off or a rewind tail, and only while queue 0 has a submission queued or runs one.
+void testComputeEndDefer() {
+    using namespace AgcDriver::DriverDetail;
+    static_assert(ComputeEndDefers(true, 0x20, 1, false, false) && ComputeEndDefers(true, 0x57, 0, true, false));
+    check(ComputeEndDefers(true, 0x38, 3, true, false), "compute end defer: a busy queue 0 did not defer a compute end");
+    check(!ComputeEndDefers(false, 0x38, 3, true, false), "compute end defer: deferred with the switch off");
+    check(!ComputeEndDefers(true, 0x38, 0, false, false), "compute end defer: deferred while queue 0 is idle");
+    check(!ComputeEndDefers(true, 0x38, 1, true, true), "compute end defer: deferred with a rewind tail");
+    check(!ComputeEndDefers(true, 0, 1, true, false), "compute end defer: deferred queue 0's own end");
+    check(!ComputeEndDefers(true, 0x1f, 1, true, false) && !ComputeEndDefers(true, 0x58, 1, true, false), "compute end defer: deferred outside the compute queues");
 }
 
 // The idle queue worker's sleep between completion reaps (QueueWorker.cpp): on Windows a wake
@@ -1312,6 +1335,239 @@ void testDrawPipelineKey() {
     check(memo.Find(fresh, KeyHash(fresh), 3, pool.get()) == nullptr, "draw pipeline memo: an entry answered after the store removed one");
 }
 
+// The upscaler probe (docs/design/dlss.md S0): the Psml packet round-trips through MfsrPacket.hpp, is
+// exactly Words dwords, and today's PM4 parser validates and skips it; Pro-lite's site check.
+void testMfsrPacket() {
+    using namespace AgcDriver;
+    std::array<unsigned char, MfsrPacket::BlockBytes> block{};
+    std::array<MfsrPacket::Descriptor, 6> targets{};
+    for (std::size_t index = 0; index < targets.size(); ++index) {
+        for (std::size_t word = 0; word < 8; ++word) targets[index][word] = static_cast<std::uint32_t>(index * 0x100 + word);
+    }
+    // The output T#: 3840x2160, format 0x40 (width - 1 split over words 1 and 2, height - 1 in word 2).
+    targets[0][1] = (0x40u << 20u) | (3u << 30u);
+    targets[0][2] = (3839u >> 2u) | (2159u << 14u);
+    const auto setPointer = [&](std::size_t offset, const void* pointer) {
+        const auto value = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(pointer));
+        std::memcpy(block.data() + offset, &value, sizeof(value));
+    };
+    setPointer(0x00, &targets[0]);
+    setPointer(0x08, &targets[1]);
+    setPointer(0x10, &targets[2]);
+    setPointer(0x20, &targets[3]);
+    setPointer(0x28, &targets[5]);
+    const std::array<std::uint32_t, 2> render{2688, 1512};
+    const std::array<float, 2> jitter{0.25f, -0.75f};
+    std::memcpy(block.data() + MfsrPacket::RenderSizeOffset, render.data(), sizeof(render));
+    std::memcpy(block.data() + MfsrPacket::JitterOffset, jitter.data(), sizeof(jitter));
+    block[MfsrPacket::ResetOffset] = 1;
+    const auto dispatch = MfsrPacket::Capture(block.data());
+    check(dispatch.present == 0x2fu, "mfsr: four images and the descriptor captured, the null +0x30 left clear");
+    check(dispatch.images[1] == targets[1] && dispatch.images[4] == MfsrPacket::Descriptor{} && dispatch.descriptor == targets[5], "mfsr: the copies are the pointed-to words");
+    std::vector<std::uint32_t> words(MfsrPacket::Words + 1, 0xdeadbeefu);
+    MfsrPacket::Encode(dispatch, std::span<std::uint32_t, MfsrPacket::Words>(words.data(), MfsrPacket::Words));
+    check(words.back() == 0xdeadbeefu, "mfsr: the packet writes exactly Words dwords");
+    words.pop_back();
+    check(MfsrPacket::Words == 139 && AgcDriver::Pm4::PacketWords(words[0]) == MfsrPacket::Words, "mfsr: the header's count is the packet's dword count");
+    check(((words[0] >> 8u) & 0xffu) == 0x10u && ((words[0] >> 2u) & 0x3fu) == 0 && (words[0] & 3u) == 0 && (words[1] >> 16u) != 0x6875u, "mfsr: a NOP, sub-op 0, flags 0, not a typed user-data marker");
+    QueueState state;
+    AgcDriver::Pm4::Validate(words, 0);
+    AgcDriver::Pm4::Execute(words, state);
+    const auto decoded = MfsrPacket::Decode(words);
+    check(decoded.has_value() && decoded->block == dispatch.block && decoded->images == dispatch.images && decoded->descriptor == dispatch.descriptor && decoded->present == dispatch.present, "mfsr: decode returns what was encoded");
+    check(decoded->Field<std::array<std::uint32_t, 2>>(MfsrPacket::RenderSizeOffset) == render && decoded->Field<std::array<float, 2>>(MfsrPacket::JitterOffset) == jitter && decoded->Field<std::uint8_t>(MfsrPacket::ResetOffset) == 1, "mfsr: block fields survive");
+    const auto output = MfsrPacket::DecodeImageSize(decoded->images[0]);
+    check(output.width == 3840 && output.height == 2160 && output.format == 0x40, "mfsr: the output T# decodes to 3840x2160 format 0x40");
+    words[1] ^= 1u;
+    check(!MfsrPacket::Decode(words).has_value(), "mfsr: another magic is not ours");
+    words[1] ^= 1u;
+    check(!MfsrPacket::Decode(std::span<const std::uint32_t>(words).first(MfsrPacket::Words - 1)).has_value(), "mfsr: a short packet is not ours");
+
+    std::array<unsigned char, 8> site{0xe8, 0xf8, 0x1d, 0xe6, 0xff, 0x84, 0xc0, 0x74};
+    check(ProLitePatch::Classify(site.data()) == ProLitePatch::Site::Original, "pro-lite: the IsPro call matches");
+    std::memcpy(site.data(), ProLitePatch::Patched.data(), ProLitePatch::Patched.size());
+    check(ProLitePatch::Classify(site.data()) == ProLitePatch::Site::Patched, "pro-lite: an already patched site is recognised");
+    site[1] = 0x00;
+    check(ProLitePatch::Classify(site.data()) == ProLitePatch::Site::Unknown, "pro-lite: other bytes are refused");
+    std::vector<std::string> args{"+r_Wants4K=WantsHigh", "+TargetFramesPerSecond=60"};
+    ProLitePatch::ForceTrinityTier(args);
+    check(args == std::vector<std::string>{"+TargetFramesPerSecond=60", "+r_Wants4K=WantsTrinity"}, "pro-lite: the tier argument is replaced by WantsTrinity");
+    check(!ProLitePatch::Enabled(nullptr) && !ProLitePatch::Enabled("0") && ProLitePatch::Enabled("1"), "pro-lite: off unless APS5_MFSR_PROBE is set and not 0");
+}
+
+// The bilinear stand-in's plan (docs/design/dlss.md S1): sizes, 8x8 groups, MainColor's render
+// sub-rectangle mapped over the output, and every packet-side skip.
+void testUpscalePlan() {
+    using namespace AgcDriver;
+    const auto image = [](std::uint32_t width, std::uint32_t height, std::uint32_t format) {
+        MfsrPacket::Descriptor words{};
+        words[1] = (format << 20u) | (((width - 1u) & 3u) << 30u);
+        words[2] = ((width - 1u) >> 2u) | ((height - 1u) << 14u);
+        return words;
+    };
+    MfsrPacket::Dispatch dispatch;
+    dispatch.present = 0x2f;
+    dispatch.images[0] = image(3840, 2160, 0x40);
+    dispatch.images[1] = image(3840, 2160, 0x41);
+    const auto setRender = [&](std::uint32_t width, std::uint32_t height) {
+        const std::array<std::uint32_t, 2> render{width, height};
+        std::memcpy(dispatch.block.data() + MfsrPacket::RenderSizeOffset, render.data(), sizeof(render));
+    };
+    const auto skipOf = [&] {
+        const auto planned = Upscale::PlanBilinear(dispatch);
+        const auto* skip = std::get_if<Upscale::Skip>(&planned);
+        return skip != nullptr ? std::optional<Upscale::Skip>(*skip) : std::nullopt;
+    };
+    setRender(2688, 1512);
+    const auto planned = Upscale::PlanBilinear(dispatch);
+    const auto* plan = std::get_if<Upscale::Plan>(&planned);
+    check(plan != nullptr && plan->output.width == 3840 && plan->output.height == 2160 && plan->output.format == 0x40 && plan->color.format == 0x41 && plan->render == std::array<std::uint32_t, 2>{2688, 1512}, "upscale: the plan carries the output, MainColor and render sizes");
+    check(plan->groups == std::array<std::uint32_t, 2>{480, 270} && plan->outputWords == dispatch.images[0] && plan->colorWords == dispatch.images[1], "upscale: 8x8 groups cover the output, the T#s are carried");
+    // Where an output texel samples, in MainColor texels (the shader's clamp of (texel + 0.5) * scale).
+    const auto place = [&](std::size_t axis, float texel) {
+        const float position = (texel + 0.5f) * plan->scale[axis];
+        const float clamped = position < plan->low[axis] ? plan->low[axis] : position > plan->high[axis] ? plan->high[axis] : position;
+        return clamped * static_cast<float>(axis == 0 ? plan->color.width : plan->color.height);
+    };
+    const auto about = [](float value, float expected) { return value > expected - 0.01f && value < expected + 0.01f; };
+    check(about(place(0, 0), 0.5f) && about(place(0, 1920), 1344.35f) && about(place(0, 3839), 2687.5f) && about(place(1, 2159), 1511.5f), "upscale: the output spans the render rectangle, half a texel inside it, not the whole MainColor");
+    setRender(3840, 2161);
+    check(skipOf() == Upscale::Skip::RenderOutsideColor, "upscale: a render rectangle past MainColor is skipped");
+    setRender(0, 1512);
+    check(skipOf() == Upscale::Skip::RenderSize, "upscale: a zero render size is skipped");
+    setRender(0x80000000u, 1512);
+    check(skipOf() == Upscale::Skip::RenderSize, "upscale: a render size above 16384 is skipped");
+    setRender(3840, 2160);
+    check(!skipOf().has_value(), "upscale: a render rectangle of MainColor's size is planned");
+    dispatch.present = 0x2e;
+    check(skipOf() == Upscale::Skip::NoOutput, "upscale: no output T#, no pass");
+    dispatch.present = 0x2d;
+    check(skipOf() == Upscale::Skip::NoColor, "upscale: no MainColor T#, no pass");
+    for (std::size_t skip = 0; skip < static_cast<std::size_t>(Upscale::Skip::Count); ++skip) check(Upscale::SkipName(static_cast<Upscale::Skip>(skip)) != nullptr, "upscale: every skip has its log name");
+    check(!Upscale::Enabled(nullptr) && !Upscale::Enabled("") && !Upscale::Enabled("0") && Upscale::Enabled("1"), "upscale: off unless APS5_MFSR_EXEC is set and not 0");
+    check(!Upscale::ExpandOn(nullptr) && !Upscale::ExpandOn("") && Upscale::ExpandOn("1") && !Upscale::ExpandOn("0"), "upscale: the output is expanded only with APS5_UPSCALER_EXPAND=1");
+    check(Upscale::ExposureOn(nullptr) && Upscale::ExposureOn("") && Upscale::ExposureOn("1") && !Upscale::ExposureOn("0"), "upscale: the output is exposed unless APS5_UPSCALER_EXPOSURE=0");
+    // The +0x28 descriptor is the exposure texture, carried when present bit 5 is set.
+    dispatch.descriptor = image(1, 1, 22);
+    dispatch.present = 0x2f;
+    const auto exposed = Upscale::PlanBilinear(dispatch);
+    check(std::holds_alternative<Upscale::Plan>(exposed) && std::get<Upscale::Plan>(exposed).exposure && std::get<Upscale::Plan>(exposed).exposureWords == dispatch.descriptor, "upscale: the exposure T# is carried with present bit 5");
+    dispatch.present = 0x0f;
+    const auto unexposed = Upscale::PlanBilinear(dispatch);
+    check(std::holds_alternative<Upscale::Plan>(unexposed) && !std::get<Upscale::Plan>(unexposed).exposure, "upscale: no present bit 5, no exposure");
+    dispatch.present = 0x2f;
+    // The game's compression c / (1 + luma) and the passes' expansion c / (1 - luma) round-trip.
+    const std::array<float, 3> hdr{12.0f, 3.0f, 0.25f};
+    const float luma = 0.3f * hdr[0] + 0.59f * hdr[1] + 0.11f * hdr[2];
+    const std::array<float, 3> compressed{hdr[0] / (1.0f + luma), hdr[1] / (1.0f + luma), hdr[2] / (1.0f + luma)};
+    const auto expanded = Upscale::Expanded(compressed);
+    check(about(expanded[0], 12.0f) && about(expanded[1], 3.0f) && about(expanded[2], 0.25f), "upscale: expanding the compressed colour gives the HDR colour back");
+    const auto white = Upscale::Expanded({1.0f, 1.0f, 1.0f});
+    check(std::isfinite(white[0]) && white[0] > 1990.0f && white[0] < 2010.0f, "upscale: luma 1 stays finite (held below 0.9995)");
+}
+
+// The temporal upscaler's plan (docs/design/dlss.md S2): its resets (the packet's bit, a first frame,
+// a size change), the skips for a missing Motion or MainDepth, the signs knob, the groups.
+void testUpscaleTemporalPlan() {
+    using namespace AgcDriver;
+    const auto image = [](std::uint32_t width, std::uint32_t height, std::uint32_t format) {
+        MfsrPacket::Descriptor words{};
+        words[1] = (format << 20u) | (((width - 1u) & 3u) << 30u);
+        words[2] = ((width - 1u) >> 2u) | ((height - 1u) << 14u);
+        return words;
+    };
+    MfsrPacket::Dispatch dispatch;
+    dispatch.present = 0x2f;
+    dispatch.images = {image(3840, 2160, 0x40), image(2688, 1512, 0x41), image(2688, 1512, 0x13), image(2688, 1512, 0x14), {}};
+    const auto set = [&](std::size_t offset, const auto& value) { std::memcpy(dispatch.block.data() + offset, &value, sizeof(value)); };
+    set(MfsrPacket::RenderSizeOffset, std::array<std::uint32_t, 2>{2688, 1512});
+    set(MfsrPacket::JitterOffset, std::array<float, 2>{0.25f, -0.125f});
+    set(MfsrPacket::MotionScaleOffset, std::array<float, 2>{-2688.0f, -1512.0f});
+    const auto defaults = Upscale::ParseSigns(nullptr);
+    const auto planOf = [&](const Upscale::History& previous, const Upscale::Signs& signs) {
+        const auto planned = Upscale::PlanTemporal(dispatch, previous, signs);
+        const auto* plan = std::get_if<Upscale::TemporalPlan>(&planned);
+        return plan != nullptr ? std::optional<Upscale::TemporalPlan>(*plan) : std::nullopt;
+    };
+    const auto skipOf = [&] {
+        const auto planned = Upscale::PlanTemporal(dispatch, {}, defaults);
+        const auto* skip = std::get_if<Upscale::Skip>(&planned);
+        return skip != nullptr ? std::optional<Upscale::Skip>(*skip) : std::nullopt;
+    };
+    const auto first = planOf({}, defaults);
+    check(first && first->reset && first->base.groups == std::array<std::uint32_t, 2>{480, 270} && first->motionWords == dispatch.images[2] && first->depthWords == dispatch.images[3], "upscale port: a first frame resets, 8x8 groups cover the output, Motion and MainDepth are carried");
+    check(first->next.output == std::array<std::uint32_t, 2>{3840, 2160} && first->next.render == std::array<std::uint32_t, 2>{2688, 1512}, "upscale port: the history the pass leaves has the output and render sizes");
+    check(first->jitter == std::array<float, 2>{0.25f, -0.125f} && first->motionScale == std::array<float, 2>{-2688.0f, -1512.0f} && !first->smallestNearest && defaults.letters[0] == '\0', "upscale port: by default the jitter as stored, the MV scale as given, reversed Z");
+    check(!planOf(first->next, defaults)->reset, "upscale port: the same sizes keep the history");
+    set(MfsrPacket::ResetOffset, std::uint8_t{1});
+    check(planOf(first->next, defaults)->reset, "upscale port: the packet's reset bit resets");
+    set(MfsrPacket::ResetOffset, std::uint8_t{0});
+    set(MfsrPacket::RenderSizeOffset, std::array<std::uint32_t, 2>{1920, 1080});
+    check(planOf(first->next, defaults)->reset, "upscale port: a render size change resets");
+    set(MfsrPacket::RenderSizeOffset, std::array<std::uint32_t, 2>{2688, 1512});
+    dispatch.images[0] = image(2560, 1440, 0x40);
+    const auto smaller = planOf(first->next, defaults);
+    check(smaller->reset && smaller->base.groups == std::array<std::uint32_t, 2>{320, 180}, "upscale port: an output size change resets");
+    dispatch.images[0] = image(3840, 2160, 0x40);
+    const auto flipped = planOf(first->next, Upscale::ParseSigns("yjz"));
+    check(flipped->jitter == std::array<float, 2>{-0.25f, -0.125f} && flipped->motionScale == std::array<float, 2>{-2688.0f, 1512.0f} && flipped->smallestNearest, "upscale port: y flips the MV scale's y, j the jitter's x, z the depth order");
+    const auto every = Upscale::ParseSigns("kxjyq");
+    check(every.motion == std::array<float, 2>{-1.0f, -1.0f} && every.jitter == std::array<float, 2>{-1.0f, -1.0f} && !every.smallestNearest && std::string(every.letters.data()) == "xyjk", "upscale port: the knob's letters in any order, others ignored, logged in xyjkz order");
+    dispatch.present = 0x2b;
+    check(skipOf() == Upscale::Skip::NoMotion, "upscale port: no Motion T#, bilinear instead");
+    dispatch.present = 0x27;
+    check(skipOf() == Upscale::Skip::NoDepth, "upscale port: no MainDepth T#, bilinear instead");
+    dispatch.present = 0x2e;
+    check(skipOf() == Upscale::Skip::NoOutput, "upscale port: the bilinear plan's skips come first");
+    dispatch.present = 0x2f;
+    set(MfsrPacket::JitterOffset, std::array<float, 2>{std::numeric_limits<float>::quiet_NaN(), 0.0f});
+    check(skipOf() == Upscale::Skip::Parameters, "upscale port: a jitter that is not finite, bilinear instead");
+}
+
+// APS5_UPSCALER_PLUGIN (docs/design/dlss.md S4): the in-tree blit plugin loaded and queried (no device),
+// each load failure's reason, the extension merge and the frame's backend choice.
+void testUpscalerPlugin() {
+    using namespace AgcDriver;
+    auto loaded = Upscale::LoadPlugin(APS5_UPSCALER_BLIT_PLUGIN_PATH);
+    const auto* reason = std::get_if<std::string>(&loaded);
+    check(reason == nullptr, reason != nullptr ? reason->c_str() : "");
+    const auto& plugin = *std::get<std::shared_ptr<Upscale::LoadedPlugin>>(loaded);
+    check(plugin.name == "aps5-blit" && plugin.version == 1 && plugin.api.abi_version == APS5_UPSCALER_PLUGIN_ABI_VERSION && plugin.api.struct_size == sizeof(Aps5UpscalerPluginApi), "upscaler plugin: the blit sample loads with its name, version and ABI");
+    Aps5UpscalerExtensions wanted{sizeof(wanted)};
+    check(plugin.api.get_instance_extensions(&wanted) == APS5_UPSCALER_OK && wanted.required_count == 0 && wanted.optional_count == 0, "upscaler plugin: the blit sample wants no instance extensions");
+    Aps5UpscalerCreateInfo create{sizeof(create)};
+    Aps5UpscalerContext* context = nullptr;
+    check(plugin.api.create(&create, &context) != APS5_UPSCALER_OK && context == nullptr && std::string(Upscale::PluginError(plugin, nullptr)) == "no device", "upscaler plugin: create without a device fails with its reason");
+    const auto refusal = [](std::variant<std::shared_ptr<Upscale::LoadedPlugin>, std::string> result) {
+        const auto* text = std::get_if<std::string>(&result);
+        return text != nullptr ? *text : std::string();
+    };
+    check(refusal(Upscale::LoadPlugin(APS5_UPSCALER_BLIT_PLUGIN_PATH, APS5_UPSCALER_PLUGIN_QUERY_NAME, APS5_UPSCALER_PLUGIN_ABI_VERSION + 1)).starts_with("ABI version 1 (the port's 2)"), "upscaler plugin: another ABI version is refused");
+    check(refusal(Upscale::LoadPlugin("aps5_no_such_plugin.dll")).starts_with("cannot load aps5_no_such_plugin.dll"), "upscaler plugin: a missing file is refused");
+    check(refusal(Upscale::LoadPlugin(APS5_UPSCALER_BLIT_PLUGIN_PATH, "APS5_NoSuchEntry")).starts_with("no APS5_NoSuchEntry in "), "upscaler plugin: a missing entry point is refused");
+    // The merge: what is offered and not enabled yet is added once, the rest reported missing.
+    const std::array<const char*, 3> required{"VK_A", "VK_B", "VK_A"};
+    const std::array<const char*, 2> optional{"VK_C", "VK_D"};
+    std::array<VkExtensionProperties, 3> offered{};
+    std::strcpy(offered[0].extensionName, "VK_A");
+    std::strcpy(offered[1].extensionName, "VK_C");
+    std::strcpy(offered[2].extensionName, "VK_E");
+    const std::array<const char*, 1> enabled{"VK_C"};
+    const Aps5UpscalerExtensions lists{sizeof(lists), 3, required.data(), 2, optional.data()};
+    const auto merge = Upscale::MergeExtensions(lists, offered, enabled);
+    check(merge.added.size() == 1 && std::string(merge.added[0]) == "VK_A" && merge.missingRequired == std::vector<std::string>{"VK_B"} && merge.missingOptional == std::vector<std::string>{"VK_D"}, "upscaler plugin: extensions merged once, missing ones reported");
+    check(Upscale::JoinNames({"VK_B", "VK_D"}) == "VK_B, VK_D", "upscaler plugin: missing names joined for the log");
+    // The choice: the plugin only with the switch, a path, Upscaler = fsr or dlss under the settings, and its device.
+    using PortSettings::Upscaler;
+    check(Upscale::ChooseBackend(false, "x.dll", true, Upscaler::Dlss, true) == Upscale::Backend::Port, "upscaler plugin: the switch off is the port's");
+    check(Upscale::ChooseBackend(true, "x.dll", true, Upscaler::Dlss, true) == Upscale::Backend::Plugin && Upscale::ChooseBackend(true, "x.dll", true, Upscaler::Fsr, true) == Upscale::Backend::Plugin, "upscaler plugin: dlss and fsr take the plugin");
+    check(Upscale::ChooseBackend(true, "x.dll", true, Upscaler::Dlss, false) == Upscale::Backend::Port, "upscaler plugin: a device without its extensions is the port's");
+    check(Upscale::ChooseBackend(true, "x.dll", true, Upscaler::Port, true) == Upscale::Backend::Port && Upscale::ChooseBackend(true, "x.dll", false, Upscaler::Dlss, true) == Upscale::Backend::Port
+            && Upscale::ChooseBackend(true, "", true, Upscaler::Dlss, true) == Upscale::Backend::Port, "upscaler plugin: Upscaler = port, no settings or no path is the port's");
+    check(std::string(Upscale::PluginRefusal(false, "", false, Upscaler::Off)).empty() && std::string(Upscale::PluginRefusal(true, "", true, Upscaler::Dlss)).starts_with("no path")
+            && std::string(Upscale::PluginRefusal(true, "x.dll", true, Upscaler::Port)).starts_with("Upscaler is not fsr or dlss") && Upscale::PluginRefusal(true, "x.dll", true, Upscaler::Fsr) == nullptr, "upscaler plugin: the off reasons");
+}
+
 // Native aspect's UI rect (AspectFit): the part of the 16:9 display buffer that is shown undistorted
 // at the window's aspect, and a viewport or scissor carried into it.
 void testUndistortedRect() {
@@ -1373,6 +1629,9 @@ int main() {
         testPipeCensus();
         testRecordPipe();
         testPollWake();
+        testComputeEndDefer();
+        testLaneCensus();
+        testLaneChain();
         testFastDispatchVerify();
         testFastReader();
         testFastReaderLabels();
@@ -1381,6 +1640,10 @@ int main() {
         testFastPipelineMemo();
         testDrawPipelineKey();
         testUndistortedRect();
+        testMfsrPacket();
+        testUpscalePlan();
+        testUpscaleTemporalPlan();
+        testUpscalerPlugin();
         LibcRunShutdown_nid_postfix();
         std::puts("AGC driver submit tests passed");
         return 0;

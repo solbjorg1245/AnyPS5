@@ -2,7 +2,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace AgcDriver::DriverDetail {
 
@@ -24,6 +26,16 @@ bool QueuedLabelTable() {
 
 bool LabelBatchSubmit() {
     static const bool enabled = std::getenv("APS5_NO_LABEL_BATCH_SUBMIT") == nullptr && std::getenv("APS5_NO_LABEL_BATCHING") == nullptr;
+    return enabled;
+}
+
+bool ComputeEndDefer() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_COMPUTE_END_DEFER");
+        const bool on = value != nullptr && std::strcmp(value, "1") == 0;
+        if (on) std::fprintf(stderr, "[packets] compute submission ends defer to the label deadline while queue 0 is busy (APS5_COMPUTE_END_DEFER=1)\n");
+        return on;
+    }();
     return enabled;
 }
 
@@ -143,6 +155,7 @@ bool Driver::recordLabelsForPacket(VulkanDevice* localDevice, std::uint32_t queu
     if (localDevice == nullptr || !packetFlush || !Graphics::Recorder::PendingLabelSince().has_value()) return false;
 
     const auto submitStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const Graphics::SubmitCauseScope submitCause(Graphics::SubmitCause::LabelPacket);
     localDevice->SubmitRecorded(queue == 0);
     ++packetLockSubmits;
     if (profile) packetLockSubmitUs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - submitStart).count());

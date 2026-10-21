@@ -1,6 +1,11 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/AddonContent.hpp"
 #include "prx/libc/include/PortSettings.hpp"
+#include "prx/libc/include/MovieWatch.hpp"
+#include "prx/libSceVideoOut/include/TitleJobBudget.hpp"
+#include "prx/libSceVideoOut/include/TitleRefreshField.hpp"
+#include "prx/libSceVideoOut/include/TitleRefreshTable.hpp"
+#include "prx/libSceVideoOut/include/TitleStepWindow.hpp"
 #include "SceTypes.hpp"
 #include "prx/libkernel/File/include/FileFlags.hpp"
 
@@ -8,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -155,6 +161,171 @@ static void TestPacer() {
         step = 1.0 / timed.Flip(now);
     }
     Require(Near(gameSeconds / (static_cast<double>(now - 5000 * ms) / 1e9), 1.0, 0.01), "variable steps keep the game speed");
+}
+
+// APS5_FRAME_PROBE's window (libSceVideoOut TimestepPatch): the title's own float step, read once per flip.
+static void TestTitleStep() {
+    const TitleStepWindow empty{};
+    Require(empty.Steps() == 0 && empty.Unreadable() == 0 && empty.Speed(10.0) == 0.0 && empty.MinHz() == 0.0 && empty.MaxHz() == 0.0, "empty window");
+    // Ten seconds of flips at flipHz, each reading a step of 1/stepHz.
+    const auto speed = [](double stepHz, double flipHz) {
+        TitleStepWindow window;
+        const long flips = std::lround(flipHz * 10.0);
+        for (long flip = 0; flip < flips; ++flip) window.Add(static_cast<float>(1.0 / stepHz));
+        return window.Speed(static_cast<double>(flips) / flipHz);
+    };
+    Require(Near(speed(PortSettings::GameRefresh60, PortSettings::GameRefresh60), 1.0, 0.001), "60 FPS mode at the 59.94 Hz vblank: real time");
+    Require(Near(speed(120.0, 120.0), 1.0, 0.001), "1/120 s steps at 120 flips/s: real time");
+    Require(Near(speed(PortSettings::GameRefresh60, 120.0), 120.0 / PortSettings::GameRefresh60, 0.001), "1/59.94 s steps at 120 flips/s (APS5_VBLANK_HZ alone): 2x");
+    TitleStepWindow mixed;
+    for (const double value : {0.0, -1.0 / 60.0, 0.0005, 1.5, std::nan(""), HUGE_VAL}) mixed.Add(value);
+    Require(mixed.Steps() == 0 && mixed.Unreadable() == 6 && mixed.Speed(1.0) == 0.0 && mixed.MaxHz() == 0.0, "implausible values ignored");
+    for (const double hz : {120.0, 29.97, PortSettings::GameRefresh60}) mixed.Add(1.0 / hz);
+    Require(mixed.Steps() == 3 && Near(mixed.MinHz(), 29.97, 1e-9) && Near(mixed.MaxHz(), 120.0, 1e-9), "step range");
+    Require(Near(mixed.Speed(2.0), (1.0 / 120.0 + 1.0 / 29.97 + 1.0 / PortSettings::GameRefresh60) / 2.0, 1e-12), "speed sums the plausible steps only");
+}
+
+// APS5_TIMESTEP_FIELD's decision (libSceVideoOut TimestepPatch): the title's refresh field once per flip, with
+// the table's 60 FPS entry at 41 Hz and its 30 FPS entry at 25 Hz.
+static void TestRefreshField() {
+    using Action = TitleRefreshField::Action;
+    const auto decide = [](std::int32_t mode, float current, std::optional<float> known) { return TitleRefreshField::Decide(mode, current, known, 41.0f, 25.0f); };
+    const auto first = decide(1, 59.94f, std::nullopt);
+    Require(first.action == Action::Write && first.value == 41.0f && !first.titleRewrote, "60 FPS mode, first sight of 59.94: the 60 FPS entry");
+    Require(decide(2, 29.97f, std::nullopt).action == Action::Write && decide(2, 29.97f, std::nullopt).value == 25.0f, "30 FPS mode: the 30 FPS entry");
+    Require(decide(0, 59.94f, std::nullopt).action == Action::Write && decide(0, 59.94f, std::nullopt).value == 41.0f, "Unlocked (the 59.94 constant): the 60 FPS entry");
+    Require(decide(3, 19.98f, std::nullopt).action == Action::OtherMode && decide(3, 19.98f, 41.0f).action == Action::OtherMode, "20 FPS mode: left alone");
+    Require(decide(7, 41.0f, 41.0f).action == Action::OtherMode, "another enum once known: left alone");
+    for (const float value : {1234.5f, std::nanf(""), 0.0f, 41.0f, 59.96f}) Require(decide(1, value, std::nullopt).action == Action::Refuse, "not a title refresh before the first write: refused");
+    Require(decide(4, 59.94f, std::nullopt).action == Action::Refuse && decide(-1, 19.98f, std::nullopt).action == Action::Refuse, "enum outside 0-3 before the first write: refused");
+    Require(decide(1, 29.975f, std::nullopt).action == Action::Write, "a title refresh within 0.01");
+    const auto rewrite = decide(2, 29.97f, 41.0f);
+    Require(rewrite.action == Action::Write && rewrite.value == 25.0f && rewrite.titleRewrote, "the title's rewrite at a mode change: written and counted");
+    const auto copied = decide(1, 37.5f, 41.0f);
+    Require(copied.action == Action::Write && copied.value == 41.0f && copied.titleRewrote, "the title's copy of an older entry: written and counted");
+    const auto same = decide(1, 41.0f, 41.0f);
+    Require(same.action == Action::AlreadySet && !same.titleRewrote, "equal value: no store");
+    Require(TitleRefreshField::Decide(1, 59.94f, std::nullopt, 59.94f, 29.97f).action == Action::AlreadySet, "first sight already holding the entry: no store");
+    Require(decide(1, std::nanf(""), 41.0f).action == Action::Write, "any value once known: written");
+}
+
+static void TestJobBudget() {
+    using Action = TitleJobBudget::Action;
+    const auto decide = [](double limit, float unlocked, float mode60) { return TitleJobBudget::Decide(limit, unlocked, mode60); };
+    Require(TitleJobBudget::Bits(60.0f) == TitleJobBudget::UnlockedBits && TitleJobBudget::Bits(59.94f) == TitleJobBudget::Mode60Bits && TitleJobBudget::Bits(119.88f) == TitleJobBudget::PatchedMode60Bits,
+        "the image's bits: 60.0, 59.94 and patch_game.py's 119.88");
+    const auto at120 = decide(120.0, 60.0f, 59.94f);
+    Require(at120.action == Action::Write && at120.value == 120.0f, "120 over the title's 60 / 59.94: 120 into both");
+    Require(decide(144.0, 60.0f, 59.94f).action == Action::Write && decide(144.0, 60.0f, 59.94f).value == 144.0f, "144: 144");
+    for (const double limit : {PortSettings::GameRefresh60, 60.0, 60.005, 30.0, 0.0, std::nan("")}) Require(decide(limit, 60.0f, 59.94f).action == Action::NotAbove, "at or below the title's 60: left alone");
+    Require(decide(60.5, 60.0f, 59.94f).action == Action::Write, "just above 60: written");
+    Require(decide(120.0, 60.0f, 119.88f).action == Action::Write && decide(120.0, 60.0f, 119.88f).value == 120.0f, "patch_game.py --fps120's 119.88: replaced by the limit");
+    const auto already = decide(120.0, 120.0f, 120.0f);
+    Require(already.action == Action::AlreadySet && already.value == 120.0f, "both holding the limit: already set");
+    for (const auto& pair : {std::pair{59.94f, 59.94f}, std::pair{60.0f, 60.0f}, std::pair{60.0f, 59.95f}, std::pair{0.0f, 0.0f}, std::pair{120.0f, 59.94f}, std::pair{60.0f, 120.0f}, std::pair{std::nanf(""), 59.94f}})
+        Require(decide(120.0, pair.first, pair.second).action == Action::Refuse, "anything else: refused");
+}
+
+// APS5_TABLE_COMPAT (libSceVideoOut TimestepPatch): the refresh table's two forms, the refresh field's guard on a
+// patch_game.py --fps120 table and the game speed the fixed step gives such a table.
+static void TestTableCompat() {
+    using Form = TitleRefreshTable::Form;
+    const float original[4] = {59.94f, 59.94f, 29.97f, 19.98f};
+    const float patched[4] = {59.94f, 119.88f, 29.97f, 19.98f};
+    Require(std::memcmp(original, TitleRefreshTable::Original.data(), sizeof(original)) == 0 && std::memcmp(patched, TitleRefreshTable::Fps120.data(), sizeof(patched)) == 0,
+        "the signatures are the floats' bits");
+    Require(TitleJobBudget::Bits(TitleRefreshTable::PatchedRefresh) == TitleJobBudget::PatchedMode60Bits, "patch_game.py's 119.88: 0x42efc28f");
+    Require(TitleRefreshTable::Classify(TitleRefreshTable::Original.data()) == Form::Original, "the image's table: original");
+    Require(TitleRefreshTable::Classify(TitleRefreshTable::Fps120.data()) == Form::Fps120, "patch_game.py --fps120's table: fps120");
+    for (std::size_t bit = 0; bit < 128; ++bit) {
+        auto bytes = TitleRefreshTable::Fps120;
+        bytes[bit / 8] ^= static_cast<unsigned char>(1u << (bit % 8));
+        // Bit 55 is entry 1's lowest exponent bit: 119.88 back to 59.94.
+        Require(TitleRefreshTable::Classify(bytes.data()) == (bit == 55 ? Form::Original : Form::None), "one bit off the fps120 form: none");
+    }
+    using Action = TitleRefreshField::Action;
+    Require(TitleRefreshField::Decide(1, 119.88f, std::nullopt, 41.0f, 25.0f).action == Action::Refuse, "119.88 on an original table: refused");
+    const auto patchedField = TitleRefreshField::Decide(1, 119.88f, std::nullopt, 41.0f, 25.0f, true);
+    Require(patchedField.action == Action::Write && patchedField.value == 41.0f, "119.88 on a patched table: a title refresh, the 60 FPS entry");
+    Require(TitleRefreshField::Decide(1, 119.885f, std::nullopt, 41.0f, 25.0f, true).action == Action::Write, "within 0.01 of 119.88");
+    Require(TitleRefreshField::Decide(1, 119.9f, std::nullopt, 41.0f, 25.0f, true).action == Action::Refuse, "0.02 off 119.88: refused");
+    Require(TitleRefreshField::Decide(2, 29.97f, std::nullopt, 41.0f, 25.0f, true).action == Action::Write, "the other refreshes still on a patched table");
+    char text[16];
+    const double slow = TitleRefreshTable::Speed(TitleRefreshTable::PatchedRefresh, PortSettings::GameRefresh60);
+    std::snprintf(text, sizeof(text), "%.2f", slow);
+    Require(std::string(text) == "0.50" && !TitleRefreshTable::RightSpeed(slow), "the 59.94 Hz vblank: 0.50x");
+    const double right = TitleRefreshTable::Speed(TitleRefreshTable::PatchedRefresh, 120000.0 / 1001.0);
+    std::snprintf(text, sizeof(text), "%.2f", right);
+    Require(std::string(text) == "1.00" && TitleRefreshTable::RightSpeed(right), "the 119.88 Hz vblank: 1.00x");
+    Require(TitleRefreshTable::Speed(0.0, 59.94) == 0.0, "no title refresh: 0");
+}
+
+static void TestPresentMode() {
+    using PortSettings::PresentMode;
+    Require(FromText("").presentMode == PresentMode::Auto, "PresentMode: auto by default");
+    Require(FromText("PresentMode = fifo").presentMode == PresentMode::Fifo && FromText("PresentMode = Mailbox").presentMode == PresentMode::Mailbox, "PresentMode: fifo, mailbox (any case)");
+    Require(FromText("presentmode = IMMEDIATE").presentMode == PresentMode::Immediate && FromText("PresentMode = fifo\nPresentMode = AUTO").presentMode == PresentMode::Auto, "PresentMode: immediate, auto");
+    const auto bad = FromText("PresentMode = fifo\nPresentMode = vsync");
+    Require(bad.presentMode == PresentMode::Fifo && bad.warnings.size() == 1 && bad.warnings[0].find("refused") != std::string::npos, "PresentMode: a refused value warns and keeps the previous one");
+    const auto badOnly = FromText("PresentMode = vsync");
+    Require(badOnly.presentMode == PresentMode::Auto && badOnly.warnings.size() == 1, "PresentMode: a refused value keeps auto");
+    Require(!FromText("PresentMode = mailbox").Any(), "PresentMode alone is not Any()");
+    Require(PortSettings::Describe(FromText("Resolution = 1920x1080\nFpsLimit = 120\nTimestep = variable\nPresentMode = mailbox")) == PortSettings::Describe(FromText("Resolution = 1920x1080\nFpsLimit = 120\nTimestep = variable")), "PresentMode leaves Describe byte-identical");
+
+    auto settings = PortSettings::Parse("PresentMode = fifo\n", "test.ini");
+    const std::map<std::string, std::string> environment{{"APS5_PRESENT_MODE", "mailbox"}};
+    PortSettings::ApplyEnvironment(settings, [&](const char* name) -> const char* {
+        const auto found = environment.find(name);
+        return found == environment.end() ? nullptr : found->second.c_str();
+    });
+    Require(settings.presentMode == PresentMode::Mailbox && settings.warnings.empty(), "APS5_PRESENT_MODE overrides the file");
+    auto refused = PortSettings::Parse("PresentMode = fifo\n", "test.ini");
+    PortSettings::ApplyEnvironment(refused, [](const char* name) -> const char* { return std::string(name) == "APS5_PRESENT_MODE" ? "tearing" : nullptr; });
+    Require(refused.presentMode == PresentMode::Fifo && refused.warnings.size() == 1 && refused.warnings[0].find("APS5_PRESENT_MODE") != std::string::npos, "an invalid APS5_PRESENT_MODE warns and keeps the file's");
+
+    const auto choose = [](PresentMode wanted, double vblank, double display, bool mailbox, bool immediate, PresentMode expected) {
+        const auto choice = PortSettings::ChoosePresentMode(wanted, vblank, display, mailbox, immediate);
+        return choice.mode == expected && !choice.reason.empty();
+    };
+    Require(choose(PresentMode::Auto, 120.0, 60.0, true, true, PresentMode::Mailbox), "auto: vblank 120 on a 60 Hz display, mailbox offered");
+    Require(PortSettings::ChoosePresentMode(PresentMode::Auto, 120.0, 60.0, true, false).reason == "auto: vblank 120.00 Hz above the display's 60 Hz", "auto: the reason");
+    Require(choose(PresentMode::Auto, 120.0, 60.0, false, true, PresentMode::Fifo), "auto: mailbox not offered, fifo");
+    Require(PortSettings::ChoosePresentMode(PresentMode::Auto, 120.0, 60.0, false, true).reason.find("mailbox is not offered") != std::string::npos, "auto: why not mailbox");
+    Require(choose(PresentMode::Auto, 0.0, 60.0, true, true, PresentMode::Fifo), "auto: the default 59.94 on a 60 Hz display, fifo");
+    Require(PortSettings::ChoosePresentMode(PresentMode::Auto, 0.0, 60.0, true, true).reason == "auto: vblank 59.94 Hz within the display's 60 Hz", "auto: the default vblank's reason");
+    Require(choose(PresentMode::Auto, 60.0, 59.0, true, true, PresentMode::Fifo), "auto: within 1 Hz, fifo");
+    Require(choose(PresentMode::Auto, 120.0, 0.0, true, true, PresentMode::Fifo), "auto: display refresh unknown, fifo");
+    Require(choose(PresentMode::Auto, 120.0, 144.0, true, true, PresentMode::Fifo), "auto: vblank 120 on a 144 Hz display, fifo");
+    for (const double vblank : {0.0, 20.0, 30.0, 60.0, 120.0, 240.0}) {
+        for (const double display : {0.0, 30.0, 60.0, 144.0}) {
+            for (const bool mailbox : {false, true}) Require(PortSettings::ChoosePresentMode(PresentMode::Auto, vblank, display, mailbox, true).mode != PresentMode::Immediate, "auto never tears");
+        }
+    }
+    Require(choose(PresentMode::Immediate, 0.0, 60.0, true, true, PresentMode::Immediate), "immediate offered: immediate");
+    Require(choose(PresentMode::Immediate, 0.0, 60.0, true, false, PresentMode::Fifo), "immediate not offered: fifo");
+    Require(choose(PresentMode::Mailbox, 0.0, 60.0, true, false, PresentMode::Mailbox) && choose(PresentMode::Mailbox, 120.0, 60.0, false, true, PresentMode::Fifo), "mailbox: as asked when offered, else fifo");
+    Require(PortSettings::ChoosePresentMode(PresentMode::Mailbox, 0.0, 60.0, false, true).reason == "PresentMode mailbox is not offered by the surface; using fifo", "mailbox not offered: the reason");
+    Require(choose(PresentMode::Fifo, 120.0, 60.0, true, true, PresentMode::Fifo), "fifo: fifo even above the display refresh");
+}
+
+// The launcher's "Display (N Hz)" preset and its PresentMode line (frame rate S3, APS5_PRESENT_AUTO=1).
+static void TestDisplayFpsLimit() {
+    Require(PortSettings::DisplayFpsLimit(0) == 0.0 && PortSettings::DisplayFpsLimit(-1) == 0.0, "display limit: unknown refresh");
+    Require(PortSettings::DisplayFpsLimit(59) == 60.0 && PortSettings::DisplayFpsLimit(60) == 60.0 && PortSettings::DisplayFpsLimit(61) == 60.0, "display limit: 59-61 is 60");
+    Require(PortSettings::DisplayFpsLimit(29) == 30.0 && PortSettings::DisplayFpsLimit(30) == 30.0 && PortSettings::DisplayFpsLimit(31) == 30.0, "display limit: 29-31 is 30");
+    Require(PortSettings::DisplayFpsLimit(119) == 120.0 && PortSettings::DisplayFpsLimit(120) == 120.0 && PortSettings::DisplayFpsLimit(121) == 120.0, "display limit: 119-121 is 120");
+    Require(PortSettings::DisplayFpsLimit(144) == 144.0 && PortSettings::DisplayFpsLimit(165) == 165.0 && PortSettings::DisplayFpsLimit(75) == 75.0, "display limit: other refreshes as they are");
+    Require(PortSettings::DisplayFpsLimit(10) == 0.0 && PortSettings::DisplayFpsLimit(360) == 0.0, "display limit: outside 20-240");
+
+    PortSettings::Settings chosen;
+    chosen.fpsLimit = 120.0;
+    chosen.presentMode = PortSettings::PresentMode::Mailbox;
+    PortSettings::ApplyLauncherRules(chosen);
+    auto values = PortSettings::LauncherValues(chosen);
+    values.emplace_back("PresentMode", PortSettings::PresentModeName(chosen.presentMode));
+    const auto reread = FromText(PortSettings::SetIniValues("", values).c_str());
+    Require(reread.warnings.empty() && reread.presentMode == PortSettings::PresentMode::Mailbox && reread.fpsLimit == 120.0 && reread.variableTimestep,
+            "round trip: 120 with the variable timestep and PresentMode mailbox");
 }
 
 static std::string ReadGuest(const char* path) {
@@ -421,6 +592,105 @@ static void TestResolution4kUi() {
     Require(withEnvironment("Resolution = 1920x1080\n", "APS5_RESOLUTION_4K_UI", "1").resolution4kUi, "APS5_RESOLUTION_4K_UI=1");
     const auto nativeOff = withEnvironment("NativeAspect = on\nResolution = 1280x800\n", "APS5_NO_RESOLUTION_4K_UI", "1");
     Require(std::string(PortSettings::PlanTierRewrite(nativeOff).slot->convar) == "WantsHigh", "native aspect's 4K UI is its own switch");
+}
+
+// APS5_UPSCALER_SETTINGS (docs/design/dlss.md S3): the Upscaler keys with the switch off (as before) and on,
+// the quality sizes, the slot-5 plan, the stage switches and the launcher's keys.
+static void TestUpscalerSettings() {
+    using PortSettings::Upscaler;
+    using PortSettings::UpscalerQuality;
+    const auto parsed = [](const std::string& text, bool on) {
+        auto settings = PortSettings::Parse(text, "test.ini", on);
+        PortSettings::Normalize(settings);
+        return settings;
+    };
+    for (const char* value : {"port", "fsr", "dlss", "bogus"}) {
+        const auto off = parsed(std::string("Upscaler = ") + value + "\nUpscalerQuality = ultra\n", false);
+        Require(off.upscaler == Upscaler::Off && off.warnings.size() == 1 && !PortSettings::UpscalerActive(off) && !off.Any() && PortSettings::GameArgs(off).empty(), "switch off: the upscaler stays off");
+    }
+    Require(parsed("Upscaler = port\n", false).warnings[0].find("refused (off, fsr or dlss)") != std::string::npos, "switch off: port refused as before");
+    Require(parsed("Upscaler = fsr\n", false).warnings[0] == "test.ini:1: Upscaler = fsr is not implemented yet; using off", "switch off: fsr warns as before");
+    Require(PortSettings::Describe(parsed("Resolution = 1920x1080\n", false)).find(", Upscaler off") != std::string::npos, "switch off: describe");
+
+    const auto port = parsed("Upscaler = port\n", true);
+    Require(port.upscaler == Upscaler::Port && port.warnings.empty() && PortSettings::UpscalerActive(port) && port.Any() && port.upscalerQuality == UpscalerQuality::Native, "port");
+    for (const char* value : {"fsr", "DLSS"}) {
+        const auto missing = parsed(std::string("Upscaler = ") + value + "\n", true);
+        Require(missing.upscaler == Upscaler::Port && missing.warnings.size() == 1 && missing.warnings[0].find("not available yet; using port") != std::string::npos, "fsr and dlss: port, one line");
+    }
+    Require(parsed("Upscaler = bogus\n", true).warnings[0].find("refused (off, port, fsr or dlss)") != std::string::npos, "unknown upscaler refused");
+    // The backend as written, for APS5_UPSCALER_PLUGIN (dlss.md S4); the plugin's path, unquoted.
+    Require(parsed("Upscaler = DLSS\n", true).upscalerBackend == Upscaler::Dlss && parsed("Upscaler = fsr\n", true).upscalerBackend == Upscaler::Fsr && port.upscalerBackend == Upscaler::Port
+            && parsed("Upscaler = dlss\nUpscaler = off\n", true).upscalerBackend == Upscaler::Off && parsed("Upscaler = dlss\n", false).upscalerBackend == Upscaler::Off, "the backend as written");
+    const auto pluginPath = parsed("UpscalerPlugin = \"C:\\Mods\\aps5 dlss.dll\"\n", false);
+    Require(pluginPath.upscalerPlugin == "C:\\Mods\\aps5 dlss.dll" && pluginPath.warnings.empty(), "the plugin path, unquoted");
+    PortSettings::Settings fromEnvironment;
+    PortSettings::ApplyEnvironment(fromEnvironment, [](const char* name) { return std::string_view(name) == "APS5_UPSCALER_PLUGIN_PATH" ? "D:\\aps5_dlss.dll" : nullptr; });
+    Require(fromEnvironment.upscalerPlugin == "D:\\aps5_dlss.dll", "APS5_UPSCALER_PLUGIN_PATH sets the plugin path");
+    const auto ultra = parsed("Upscaler = port\nUpscalerQuality = ultra\n", true);
+    Require(ultra.upscalerQuality == UpscalerQuality::Native && ultra.warnings.size() == 1 && ultra.warnings[0].find("using native") != std::string::npos, "unknown quality: native");
+
+    const std::array<std::pair<std::uint32_t, std::uint32_t>, 4> sizes{{{2688, 1512}, {2560, 1440}, {2224, 1252}, {1920, 1080}}};
+    for (std::size_t index = 0; index < sizes.size(); ++index) {
+        const auto& preset = PortSettings::UpscalerPresets[index];
+        Require(static_cast<std::size_t>(preset.quality) == index && preset.width == sizes[index].first && preset.height == sizes[index].second, "quality sizes");
+        Require(preset.width % 8 == 0 && preset.height % 4 == 0 && preset.height >= 1080 && preset.width <= 2688 && preset.height <= 1512, "sizes fit mode 5's targets and the gate");
+        Require(parsed(std::string("Upscaler = port\nUpscalerQuality = ") + preset.name + "\n", true).upscalerQuality == preset.quality, "quality parse");
+    }
+
+    Require(!PortSettings::PlanUpscaler(port).Active() && !PortSettings::PlanTierRewrite(port).Active(), "native: no table write");
+    Require(PortSettings::GameArgs(port) == std::vector<std::string>{"+r_Wants4K=WantsTrinity"}, "native: WantsTrinity");
+    const auto performance = parsed("Resolution = 1280x720\nUpscaler = port\nUpscalerQuality = performance\n", true);
+    const auto plan = PortSettings::PlanTierRewrite(performance);
+    Require(plan.Active() && plan.uiOnly && plan.slot->mode == 5 && std::string(plan.slot->convar) == "WantsTrinity" && plan.renderWidth == 1920 && plan.renderHeight == 1080
+            && plan.Aspect() == 16.0f / 9.0f && plan.SharedNative() && plan.sharedWidth == 1920 && plan.sharedHeight == 1080 && !plan.DisplayNative(),
+        "performance: the slot-5 plan, shared targets at the preset (TrinitySites)");
+    auto tableOnly = performance;
+    PortSettings::ApplyEnvironment(tableOnly, [](const char* name) { return std::string_view(name) == "APS5_UPSCALER_TARGETS" ? "0" : nullptr; });
+    const auto tableOnlyPlan = PortSettings::PlanTierRewrite(tableOnly);
+    Require(!tableOnly.upscalerTargets && tableOnlyPlan.Active() && tableOnlyPlan.renderWidth == 1920 && !tableOnlyPlan.SharedNative(),
+        "APS5_UPSCALER_TARGETS=0: the table alone, the shared targets keep 2688x1512");
+    Require(!PortSettings::PlanResolution4kUi(performance).Active(), "no 4K UI rewrite with the upscaler");
+    Require(PortSettings::GameArgs(performance) == std::vector<std::string>{"+r_Wants4K=WantsTrinity"}, "performance: one r_Wants4K");
+    const auto writes = PortSettings::TierTableWrites(plan, true);
+    Require(writes.size() == 2 && writes[0].entry == 4 && writes[0].value == 1920 && writes[1].entry == 9 && writes[1].value == 1080, "entries 4 and 9");
+    Require(PortSettings::DisplayAspectBits(PortSettings::Aspect16x9Bits, 5, plan) == PortSettings::Aspect16x9Bits, "the aspect field stays 16:9");
+    const auto described = PortSettings::Describe(performance);
+    Require(described.find(", Upscaler port, performance (1920x1080 -> 3840x2160)") != std::string::npos && described.find("render r_Wants4K=WantsTrinity, ") != std::string::npos
+            && described.find("4K UI") == std::string::npos, "describe");
+    Require(!PortSettings::UpscalerActive(PortSettings::Running(performance, false)) && PortSettings::GameArgs(PortSettings::Running(performance, false))[0] == "+r_Wants4K=WantsHigh"
+            && PortSettings::UpscalerActive(PortSettings::Running(performance, true)), "without Pro-lite: Upscaler = off's arguments");
+
+    const auto wide = parsed("NativeAspect = on\nResolution = 2560x1080\nUpscaler = port\n", true);
+    Require(wide.upscaler == Upscaler::Off && wide.nativeAspect && wide.warnings.size() == 1 && std::string(PortSettings::PlanTierRewrite(wide).slot->convar) == "WantsHigh", "native aspect wins");
+
+    auto environment = PortSettings::Parse("Upscaler = port\n", "test.ini");
+    const std::map<std::string, std::string> variables{{"APS5_UPSCALER_SETTINGS", "1"}, {"APS5_UPSCALER", "port"}, {"APS5_UPSCALER_QUALITY", "Balanced"}};
+    PortSettings::ApplyEnvironment(environment, [&](const char* name) -> const char* {
+        const auto found = variables.find(name);
+        return found == variables.end() ? nullptr : found->second.c_str();
+    });
+    PortSettings::Normalize(environment);
+    Require(PortSettings::UpscalerActive(environment) && environment.upscalerQuality == UpscalerQuality::Balanced && PortSettings::PlanTierRewrite(environment).renderWidth == 2224, "environment");
+
+    const auto chain = [](bool active, const char* probe, const char* exec, const char* portSwitch) {
+        const auto planned = PortSettings::PlanUpscalerChain(active, probe, exec, portSwitch);
+        return (planned.probe ? 4 : 0) | (planned.exec ? 2 : 0) | (planned.port ? 1 : 0);
+    };
+    Require(chain(false, nullptr, nullptr, nullptr) == 0 && chain(false, "1", "", "0") == 4 && chain(false, nullptr, "1", nullptr) == 2 && chain(false, "0", "0", "yes") == 1, "chain: each switch alone");
+    Require(chain(true, nullptr, "0", nullptr) == 7 && chain(true, "1", "1", "1") == 7, "chain: the settings upscaler turns all three on");
+
+    Require(PortSettings::LauncherValues(PortSettings::Settings{}).size() == 7 && PortSettings::SetIniValues("", PortSettings::LauncherValues(port)).find("Upscaler") != std::string::npos
+            && PortSettings::SetIniValues("", PortSettings::LauncherValues(parsed("Upscaler = port\n", false))).find("Upscaler") == std::string::npos, "launcher: Upscaler keys only with the switch");
+    const auto saved = PortSettings::SetIniValues("", PortSettings::LauncherValues(performance));
+    const auto reread = parsed(saved, true);
+    Require(saved.find("Upscaler = port\n") != std::string::npos && reread.upscaler == Upscaler::Port && reread.upscalerQuality == UpscalerQuality::Performance, "launcher round trip");
+    const auto dlssSaved = PortSettings::SetIniValues("", PortSettings::LauncherValues(parsed("Upscaler = dlss\n", true)));
+    Require(dlssSaved.find("Upscaler = dlss\n") != std::string::npos && parsed(dlssSaved, true).upscalerBackend == Upscaler::Dlss, "launcher: dlss (a plugin backend) survives a save");
+    auto chosen = performance;
+    chosen.nativeAspect = true;
+    PortSettings::ApplyLauncherRules(chosen);
+    Require(chosen.upscaler == Upscaler::Off, "launcher: native aspect turns the upscaler off");
 }
 
 // The settings launcher (s61): when it is skipped, and the ini read/modify/write round trip it saves with.
@@ -793,7 +1063,59 @@ static void TestAddonContent() {
     std::filesystem::remove_all(base, error);
 }
 
+// APS5_MOVIE_WATCH (MovieWatch.hpp): the Bink 2 header and the speed of one pass from its reads.
+static void TestMovieWatch() {
+    // logo_intro.bk2's header: 360 frames, 3840x2160, 30/1 fps.
+    unsigned char header[MovieWatch::HeaderBytes] = {'K', 'B', '2', 'm'};
+    const auto put = [&](std::size_t at, std::uint32_t value) {
+        for (std::size_t i = 0; i < 4; ++i) header[at + i] = static_cast<unsigned char>(value >> (8u * i));
+    };
+    put(4, 71054660u - 8u);
+    put(8, 360);
+    put(12, 1u << 20u);
+    put(16, 360);
+    put(20, 3840);
+    put(24, 2160);
+    put(28, 30);
+    put(32, 1);
+    const auto parsed = MovieWatch::ParseHeader(header, sizeof(header));
+    Require(parsed.valid && parsed.frames == 360 && parsed.width == 3840 && parsed.height == 2160, "Bink 2 header fields");
+    Require(Near(parsed.Fps(), 30.0, 1e-9) && Near(parsed.Seconds(), 12.0, 1e-9), "Bink 2 frame rate and length");
+    Require(!MovieWatch::ParseHeader(header, MovieWatch::HeaderBytes - 1).valid, "a short header is no header");
+    header[0] = 'B';
+    Require(!MovieWatch::ParseHeader(header, sizeof(header)).valid, "another signature is not followed");
+    Require(MovieWatch::IsMovie("movies/logo_intro.bk2") && MovieWatch::IsMovie("A/B.BK2") && !MovieWatch::IsMovie("a.bk2x") && !MovieWatch::IsMovie("bk2"),
+        "movie file names");
+
+    // A 12 s, 72 MB movie streamed in 1 MB reads after a 6 MB preload, at 1x (6 MB/s) and at 2x.
+    const std::uint64_t mb = 1u << 20u, size = 72 * mb;
+    for (const double rate : {1.0, 2.0}) {
+        MovieWatch::Pass pass(size, 12.0);
+        Require(!pass.Read(0.0, 0, 6 * mb), "a preload does not measure");
+        int measured = 0;
+        double seconds = 0.0;
+        for (std::uint64_t at = 6 * mb; at < size; at += mb) {
+            seconds += 1.0 / (6.0 * rate);
+            if (pass.Read(seconds, at, at + mb)) ++measured;
+        }
+        Require(measured == 1 && pass.Measured(), "the stream crosses three quarters once");
+        Require(Near(pass.Speed(), rate, 0.03 * rate), "speed from the middle half");
+        Require(pass.Bytes() == size && pass.Reached() == size, "bytes of the pass");
+        Require(pass.Loops(0) && !pass.Loops(size / 2), "a read at the start after the end half is a loop");
+        pass.Restart();
+        Require(!pass.Measured() && pass.Bytes() == 0 && !pass.Loops(0), "a restarted pass starts clean");
+    }
+    // A whole file read at once: measured, but the speed is not measurable.
+    MovieWatch::Pass whole(size, 12.0);
+    Require(whole.Read(1.0, 0, size) && whole.Speed() == 0.0, "a whole-file read has no speed");
+    // An earlier range again does not move the crossings back.
+    MovieWatch::Pass repeat(size, 12.0);
+    repeat.Read(0.0, 0, size / 2);
+    Require(!repeat.Read(1.0, 0, mb) && repeat.Reached() == size / 2, "an earlier range does not move the furthest end");
+}
+
 int main() {
+    TestUpscalerSettings();
     TestAddonContent();
     TestLauncher();
     TestGameFolder();
@@ -806,6 +1128,13 @@ int main() {
     TestRenderTier();
     TestFrameRate();
     TestPacer();
+    TestTitleStep();
+    TestRefreshField();
+    TestJobBudget();
+    TestTableCompat();
+    TestMovieWatch();
+    TestPresentMode();
+    TestDisplayFpsLimit();
     TestWindowSize();
     TestOverlay();
     std::printf("port_settings_tests: ok\n");

@@ -34,7 +34,8 @@ bool ReportDestroyedImport(VkBuffer buffer, const char* where, std::uint64_t det
 // each pipeline stage reached, naming the work that faulted. SetCheckpointWork gives the calling
 // thread's next draw its programs (the driver sets them per draw packet).
 bool CheckpointsRequested();
-void InstallCheckpoints(PFN_vkCmdSetCheckpointNV set, PFN_vkGetQueueCheckpointDataNV get, VkQueue queue);
+// `computeQueue`: APS5_COMPUTE_QUEUE's second queue, reported after the first (null: none).
+void InstallCheckpoints(PFN_vkCmdSetCheckpointNV set, PFN_vkGetQueueCheckpointDataNV get, VkQueue queue, VkQueue computeQueue = VK_NULL_HANDLE);
 void SetCheckpointWork(std::uint64_t first, std::uint64_t second);
 void RecordCheckpoint(VkCommandBuffer commands, char kind, std::uint64_t first, std::uint64_t second, std::uint64_t detail);
 void RecordDrawCheckpoint(VkCommandBuffer commands, std::uint64_t detail);

@@ -189,6 +189,7 @@ FPS120 = [FPS120_A, FPS120_B]
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    # The runtime path instead: Timestep = variable (APS5_TABLE_COMPAT=1 also runs an executable patched with --fps120).
     parser.add_argument("--fps120", action="store_true",
                         help="also apply FPS120-A/B (run the port with APS5_VBLANK_HZ=119.88)")
     parser.add_argument("paths", nargs="+", metavar="[eboot.bin] DemonsSouls.exe")

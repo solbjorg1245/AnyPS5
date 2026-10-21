@@ -1195,7 +1195,10 @@ bool WaitForLeases() noexcept {
             if (recorder != nullptr && recorder == state.leaseRecorder && target > state.finishedLeaseSerial) {
                 // The open batch may be the target; FinishUpTo waits front to back up to it only.
                 Recorder::CountSync(4);
-                recorder->Submit();
+                {
+                    const SubmitCauseScope submitCause(SubmitCause::Lease);
+                    recorder->Submit();
+                }
                 recorder->FinishUpTo(target);
                 state.finishedLeaseSerial = target;
                 synced = true;
@@ -2643,6 +2646,8 @@ struct StagedShadow {
     // stood for the import when the shadow was registered.
     VkDeviceSize baselineDelta = 0;
     bool baselineTrusted = false;
+    // APS5_ASYNC_COMPUTE: the registering thread's lane (a take by the other lane is an edge).
+    Lane lane = Lane::G;
 };
 
 struct StagedShadows {
@@ -2686,6 +2691,7 @@ std::shared_ptr<Buffer> takeStagedShadow(const Recorder* recorder, std::uint64_t
     auto& shadows = stagedShadows();
     std::shared_ptr<Buffer> source;
     std::uint64_t generation = 0;
+    Lane registered = Lane::G;
     if (baselineDelta != nullptr) *baselineDelta = 0;
     if (baselineTrusted != nullptr) *baselineTrusted = false;
     {
@@ -2694,6 +2700,7 @@ std::shared_ptr<Buffer> takeStagedShadow(const Recorder* recorder, std::uint64_t
         if (found != shadows.entries.end() && found->second.recorder == recorder) {
             source = found->second.buffer;
             generation = found->second.generation;
+            registered = found->second.lane;
             if (baselineDelta != nullptr) *baselineDelta = found->second.baselineDelta;
             if (baselineTrusted != nullptr) *baselineTrusted = found->second.baselineTrusted;
         }
@@ -2713,7 +2720,11 @@ std::shared_ptr<Buffer> takeStagedShadow(const Recorder* recorder, std::uint64_t
             }
         }
     }
-    if (source != nullptr && GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(end - begin), generation)) return source;
+    if (source != nullptr && GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(end - begin), generation)) {
+        if (LaneCensusOn) LaneCensus::Shared().ShadowTaken(LaneOf(GuestMemory::GpuLockThreadTag()), begin, end);
+        if (AsyncComputeLevel() != 0 && recorder != nullptr) recorder->NoteShadowTake(registered);
+        return source;
+    }
     // No shadow to chain from: no baseline either.
     if (baselineDelta != nullptr) *baselineDelta = 0;
     if (baselineTrusted != nullptr) *baselineTrusted = false;
@@ -2767,6 +2778,8 @@ VramCacheCensus stagedShadowCensus() {
 }
 
 void registerStagedShadow(const Recorder* recorder, std::uint64_t begin, std::uint64_t end, std::shared_ptr<Buffer> buffer, std::uint64_t generation, VkDeviceSize baselineDelta = 0, bool baselineTrusted = false) {
+    if (LaneCensusOn) LaneCensus::Shared().ShadowRegistered(LaneOf(GuestMemory::GpuLockThreadTag()), begin, end);
+    const Lane lane = AsyncComputeLevel() != 0 ? LaneOf(GuestMemory::GpuLockThreadTag()) : Lane::G;
     auto& shadows = stagedShadows();
     std::lock_guard lock(shadows.mutex);
     // A few hundred ranges in practice; a runaway set starts over.
@@ -2775,14 +2788,14 @@ void registerStagedShadow(const Recorder* recorder, std::uint64_t begin, std::ui
         shadows.byBuffer.clear();
     }
     if (!shadowIndexEnabled()) {
-        shadows.entries[{begin, end}] = StagedShadow{recorder, std::move(buffer), generation, baselineDelta, baselineTrusted};
+        shadows.entries[{begin, end}] = StagedShadow{recorder, std::move(buffer), generation, baselineDelta, baselineTrusted, lane};
         return;
     }
     const std::pair<std::uint64_t, std::uint64_t> key{begin, end};
     auto& entry = shadows.entries[key];
     if (entry.buffer != nullptr) unindexShadow(shadows, entry.buffer.get(), key);
     shadows.byBuffer.emplace(buffer.get(), key);
-    entry = StagedShadow{recorder, std::move(buffer), generation, baselineDelta, baselineTrusted};
+    entry = StagedShadow{recorder, std::move(buffer), generation, baselineDelta, baselineTrusted, lane};
 }
 
 }

@@ -9,6 +9,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/ReadPatch.hpp"
+#include "prx/libc/include/MovieWatch.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
@@ -98,6 +99,7 @@ std::int64_t NativePread(std::int32_t fd, void* buf, std::size_t nbyte, std::int
 #endif
     if (read > 0) {
         if (const auto patches = ReadPatchesForDescriptor_nid_no_patch(fd)) ApplyReadPatches_nid_no_patch(*patches, "aio", static_cast<std::uint64_t>(offset), buf, static_cast<std::uint64_t>(read));
+        NoteMovieDescriptorRead_nid_no_patch(fd, "aio", offset, static_cast<std::uint64_t>(read));
     }
     return read;
 }

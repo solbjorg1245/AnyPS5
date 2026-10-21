@@ -403,7 +403,10 @@ CommandBatch::CommandBatch(const Context& context) : context(context) {
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         Check(context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands, &begin), "vkBeginCommandBuffer");
         // Work recorded so far goes first in queue order, so this batch sees its results.
-        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) recorder->Submit();
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) {
+            const SubmitCauseScope submitCause(SubmitCause::CommandBatch);
+            recorder->Submit();
+        }
     } catch (...) {
         release();
         throw;
@@ -441,7 +444,10 @@ void CommandBatch::Submit() {
     submission.commandBufferCount = 1;
     submission.pCommandBuffers = &commands;
     timing.Mark("command_end");
-    Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
+    // APS5_COMPUTE_QUEUE: chained to the recorder's batches (Recorder::SubmitOneShot).
+    auto* recorder = Recorder::Active();
+    if (recorder != nullptr && recorder->ChainsOneShots(context.queue)) Check(recorder->SubmitOneShot(submission, fence), "vkQueueSubmit graphics");
+    else Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
     timing.Mark("queue_submit");
     pending = true;
     submitted = true;

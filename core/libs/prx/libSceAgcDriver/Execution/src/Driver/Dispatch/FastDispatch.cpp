@@ -71,7 +71,8 @@ std::uint64_t nanosecondsSince(std::chrono::steady_clock::time_point started) {
 }
 
 // The modes whose diagnostics need the old path's capture or build (design 2.11): probes, dumps,
-// traces, synchronous dispatches, the barrier validator, a locked device; and the modes the fast
+// traces, synchronous dispatches, the barrier validator's hazard tracker (the image edges,
+// APS5_IMAGE_EDGES, take the fast dispatch's notes), a locked device; and the modes the fast
 // dispatch has no counterpart of: GPU results kept out of guest memory (APS5_GPU_NO_WRITEBACK,
 // MarkGpuWrites' SkipWriteBack), queued labels without the table the reader asks
 // (APS5_NO_QUEUED_LABELS, APS5_NO_LABEL_BATCHING: the old path's recordQueuedLabelsAfterCapture
@@ -81,7 +82,7 @@ bool debugMode() {
         for (const char* name : {"APS5_PROBE_DISPATCH", "APS5_DUMP_SHADERS", "APS5_TRACE_DISPATCH_IO", "APS5_TRACE_DISPATCH_CACHE", "APS5_SYNC_DISPATCH", "APS5_TRACE_CAPSYNC", "APS5_CAPTURE_INPUTS", "APS5_NO_UNLOCKED_DEVICE", "APS5_GPU_NO_WRITEBACK"}) {
             if (std::getenv(name) != nullptr) return true;
         }
-        return !QueuedLabelTable() || Graphics::Recorder::BarrierValidate();
+        return !QueuedLabelTable() || Graphics::Recorder::HazardCounting();
     }();
     return active;
 }

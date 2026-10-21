@@ -113,6 +113,7 @@ struct Checkpoints {
     PFN_vkCmdSetCheckpointNV set = nullptr;
     PFN_vkGetQueueCheckpointDataNV get = nullptr;
     VkQueue queue = VK_NULL_HANDLE;
+    VkQueue computeQueue = VK_NULL_HANDLE;
     std::atomic<std::uint64_t> next{0};
     std::vector<CheckpointEntry> ring = std::vector<CheckpointEntry>(Size);
 };
@@ -132,11 +133,12 @@ bool CheckpointsRequested() {
     return requested;
 }
 
-void InstallCheckpoints(PFN_vkCmdSetCheckpointNV set, PFN_vkGetQueueCheckpointDataNV get, VkQueue queue) {
+void InstallCheckpoints(PFN_vkCmdSetCheckpointNV set, PFN_vkGetQueueCheckpointDataNV get, VkQueue queue, VkQueue computeQueue) {
     auto& marks = Marks();
     marks.set = set;
     marks.get = get;
     marks.queue = queue;
+    marks.computeQueue = computeQueue;
     std::fprintf(stderr, "[checkpoints] %s%s", set != nullptr && get != nullptr ? "recording a checkpoint before every draw and dispatch" : "unavailable", "\n");
 }
 
@@ -166,11 +168,6 @@ void RecordDrawCheckpoint(VkCommandBuffer commands, std::uint64_t detail) {
 void ReportCheckpoints() {
     auto& marks = Marks();
     if (marks.get == nullptr || marks.queue == VK_NULL_HANDLE) return;
-    std::uint32_t count = 0;
-    marks.get(marks.queue, &count, nullptr);
-    std::vector<VkCheckpointDataNV> data(count, VkCheckpointDataNV{VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
-    if (count != 0) marks.get(marks.queue, &count, data.data());
-    std::fprintf(stderr, "[checkpoints] %u stage checkpoint(s), %llu recorded in all%s", count, static_cast<unsigned long long>(marks.next.load()), "\n");
     const auto describe = [&](std::uint64_t serial, const char* prefix) {
         const auto& entry = marks.ring[serial % Checkpoints::Size];
         if (serial == 0 || entry.serial.load(std::memory_order_acquire) != serial) {
@@ -179,14 +176,24 @@ void ReportCheckpoints() {
         }
         std::fprintf(stderr, "[checkpoints] %s #%llu %s programs 0x%llx / 0x%llx, %s 0x%llx%s", prefix, static_cast<unsigned long long>(serial), entry.kind == 'D' ? "draw" : "dispatch", static_cast<unsigned long long>(entry.first), static_cast<unsigned long long>(entry.second), entry.kind == 'D' ? "color target" : "groups", static_cast<unsigned long long>(entry.detail), "\n");
     };
-    for (const auto& checkpoint : data) {
-        const auto serial = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(checkpoint.pCheckpointMarker));
-        std::fprintf(stderr, "[checkpoints] stage 0x%x reached:%s", static_cast<unsigned>(checkpoint.stage), "\n");
-        for (std::uint64_t back = 3; back > 0; --back) {
-            if (serial > back) describe(serial - back, "  before");
+    // APS5_COMPUTE_QUEUE: the compute queue's checkpoints follow the first queue's, named.
+    for (const auto queue : {marks.queue, marks.computeQueue}) {
+        if (queue == VK_NULL_HANDLE) continue;
+        const char* name = queue == marks.queue ? "" : "compute queue: ";
+        std::uint32_t count = 0;
+        marks.get(queue, &count, nullptr);
+        std::vector<VkCheckpointDataNV> data(count, VkCheckpointDataNV{VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
+        if (count != 0) marks.get(queue, &count, data.data());
+        std::fprintf(stderr, "[checkpoints] %s%u stage checkpoint(s), %llu recorded in all%s", name, count, static_cast<unsigned long long>(marks.next.load()), "\n");
+        for (const auto& checkpoint : data) {
+            const auto serial = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(checkpoint.pCheckpointMarker));
+            std::fprintf(stderr, "[checkpoints] %sstage 0x%x reached:%s", name, static_cast<unsigned>(checkpoint.stage), "\n");
+            for (std::uint64_t back = 3; back > 0; --back) {
+                if (serial > back) describe(serial - back, "  before");
+            }
+            describe(serial, "  last  ");
+            describe(serial + 1, "  next  ");
         }
-        describe(serial, "  last  ");
-        describe(serial + 1, "  next  ");
     }
 }
 
