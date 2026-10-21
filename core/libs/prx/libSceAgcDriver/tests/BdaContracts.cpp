@@ -84,6 +84,6 @@ void RunBdaContractTests() {
     AgcDriver::Graphics::Require(countInstructions(MakeBdaLookupTestShader(accesses, 32, true, false), spv::OpGroupNonUniformBroadcastFirst) == 0, "BDA subgroup search emitted without subgroup ballots");
     SetBdaUniformStageForTests(-1);
     // Defaults: unset is stage 2 and table in video memory, 0 is the kill switch.
-    AgcDriver::Graphics::Require(BdaUniformStageFromEnv(nullptr) == 2 && BdaUniformStageFromEnv("0") == 0 && BdaUniformStageFromEnv("1") == 1 && BdaUniformStageFromEnv("3") == 3 && BdaUniformStageFromEnv("9") == 3, "APS5_SPIRV_BDA_UNIFORM default");
-    AgcDriver::Graphics::Require(AgcDriver::Graphics::BdaTableVramRequested(nullptr) && AgcDriver::Graphics::BdaTableVramRequested("") && AgcDriver::Graphics::BdaTableVramRequested("1") && !AgcDriver::Graphics::BdaTableVramRequested("0"), "APS5_BDA_TABLE_VRAM default");
+    AgcDriver::Graphics::Require(BdaUniformStageFromEnv(nullptr) == 2 && BdaUniformStageFromEnv("0") == 0 && BdaUniformStageFromEnv("1") == 1 && BdaUniformStageFromEnv("3") == 3 && BdaUniformStageFromEnv("9") == 2 && BdaUniformStageFromEnv("") == 2 && BdaUniformStageFromEnv("abc") == 2 && BdaUniformStageFromEnv("-1") == 2 && BdaUniformStageFromEnv("01") == 2, "APS5_SPIRV_BDA_UNIFORM default");
+    AgcDriver::Graphics::Require(AgcDriver::Graphics::BdaTableVramRequested(nullptr) && AgcDriver::Graphics::BdaTableVramRequested("") && AgcDriver::Graphics::BdaTableVramRequested("1") && !AgcDriver::Graphics::BdaTableVramRequested("0") && AgcDriver::Graphics::BdaTableVramRequested("abc") && AgcDriver::Graphics::BdaTableVramRequested("-1") && AgcDriver::Graphics::BdaTableVramRequested("9"), "APS5_BDA_TABLE_VRAM default");
 }

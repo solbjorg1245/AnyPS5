@@ -33,8 +33,9 @@ bool BdaByteReadsForced();
 // address, and only the lanes outside that range search on their own. Every fault is the one the full
 // lookup records. Stage 3 falls back to 2 without subgroup ballot support and stays opt-in.
 std::uint32_t BdaUniformStage();
-// The stage an environment value selects (nullptr: unset, the default 2).
-std::uint32_t BdaUniformStageFromEnv(const char* value);
+// The stage an environment value selects: exactly 0-3 as written, unset, empty or anything else the default 2
+// (anything else, not empty, sets valid to false).
+std::uint32_t BdaUniformStageFromEnv(const char* value, bool* valid = nullptr);
 // Pins the stage for tests; -1 returns to the environment.
 void SetBdaUniformStageForTests(int stage);
 // Calls a lookup function (state.bdaPointerFunction and the like) and returns the device address, 0 after a

@@ -296,7 +296,10 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     constexpr VkMemoryPropertyFlags videoHost = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     static const bool tableInVideoMemory = [&] {
         const char* value = std::getenv("APS5_BDA_TABLE_VRAM");
-        if (!BdaTableVramRequested(value)) return false;
+        bool valid = true;
+        const bool requested = BdaTableVramRequested(value, &valid);
+        if (!valid) std::fprintf(stderr, "[bda] APS5_BDA_TABLE_VRAM=%s is not 0 or 1, treated as on\n", value);
+        if (!requested) return false;
         try {
             static_cast<void>(context.MemoryType(~0u, videoHost));
         } catch (const std::runtime_error&) {
@@ -306,7 +309,18 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
         std::fprintf(stderr, "[bda] APS5_BDA_TABLE_VRAM: page tables in host-visible video memory\n");
         return true;
     }();
-    table = tableInVideoMemory ? std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, videoHost) : std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    // Default-on, so an allocation failure (memory type excluded for this buffer, full BAR heap) must not fail the
+    // draw: this table goes to host memory and VRAM tables are not tried again.
+    static std::atomic<bool> videoTableFailed{false};
+    if (tableInVideoMemory && !videoTableFailed.load(std::memory_order_relaxed)) {
+        try {
+            table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, videoHost);
+        } catch (const std::exception& error) {
+            videoTableFailed.store(true, std::memory_order_relaxed);
+            std::fprintf(stderr, "[bda] APS5_BDA_TABLE_VRAM: video memory table failed (%s), page tables stay in host memory\n", error.what());
+        }
+    }
+    if (!table) table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), 0};
     std::memcpy(table->Bytes().data(), &header, sizeof(header));
     if (!ranges.empty()) std::memcpy(table->Bytes().data() + sizeof(header), ranges.data(), ranges.size() * sizeof(ranges.front()));

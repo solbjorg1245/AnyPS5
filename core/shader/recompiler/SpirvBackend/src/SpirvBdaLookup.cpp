@@ -241,16 +241,19 @@ void DefineBdaLookupState(SpirvEmitterState& state) {
 
 // APS5_SPIRV_BDA_UNIFORM=<0-3>, default 2 when unset, 0 is the old lookups (see SpirvBda.hpp). A set value enters
 // the shader disk cache key with the other recompiler switches.
-std::uint32_t BdaUniformStageFromEnv(const char* value) {
-    if (value == nullptr) return 2u;
-    return static_cast<std::uint32_t>(std::min<unsigned long>(std::strtoul(value, nullptr, 10), 3ul));
+std::uint32_t BdaUniformStageFromEnv(const char* value, bool* valid) {
+    const bool single = value != nullptr && value[0] >= '0' && value[0] <= '3' && value[1] == '\0';
+    if (valid != nullptr) *valid = value == nullptr || *value == '\0' || single;
+    return single ? static_cast<std::uint32_t>(value[0] - '0') : 2u;
 }
 
 std::uint32_t BdaUniformStage() {
     if (uniformStageForTests >= 0) return static_cast<std::uint32_t>(uniformStageForTests);
     static const std::uint32_t stage = [] {
         const char* value = std::getenv("APS5_SPIRV_BDA_UNIFORM");
-        const auto parsed = BdaUniformStageFromEnv(value);
+        bool valid = true;
+        const auto parsed = BdaUniformStageFromEnv(value, &valid);
+        if (!valid) std::fprintf(stderr, "[spirv] APS5_SPIRV_BDA_UNIFORM=%s is not 0-3, using the default 2\n", value);
         std::fprintf(stderr, "[spirv] APS5_SPIRV_BDA_UNIFORM=%u%s: BDA lookups %s\n", parsed, value == nullptr ? " (default)" : "", parsed == 0u ? "unchanged" : parsed == 1u ? "check the table header in one branch" : parsed == 2u ? "check the header in one branch, skip the call inside the last read range" : "check the header in one branch, skip the call inside the last read range, search once per subgroup for uniform bases");
         return parsed;
     }();

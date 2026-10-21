@@ -8,9 +8,11 @@ namespace AgcDriver::Graphics {
 
 bool LoopGuardTripped();
 
-// APS5_BDA_TABLE_VRAM: on when unset or empty, 0 turns it off.
-inline bool BdaTableVramRequested(const char* value) {
-    return value == nullptr || *value == '\0' || std::strcmp(value, "0") != 0;
+// APS5_BDA_TABLE_VRAM: on when unset, empty or anything but exactly 0; 0 turns it off. A value other than
+// empty, 0 or 1 is reported through valid=false.
+inline bool BdaTableVramRequested(const char* value, bool* valid = nullptr) {
+    if (valid != nullptr) *valid = value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0 || std::strcmp(value, "1") == 0;
+    return value == nullptr || std::strcmp(value, "0") != 0;
 }
 
 // Debug aid APS5_CHECK_STALE_IMPORTS=1: every page table made is kept weakly with its ranges, and an
