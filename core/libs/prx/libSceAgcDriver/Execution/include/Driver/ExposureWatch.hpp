@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -23,7 +24,8 @@ namespace AgcDriver::ExposureWatch {
 // behind the GPU) and prints an [exposure] line when the exposure moves by more than
 // APS5_EXPOSURE_WATCH_RATIO (default 1.5x) between presents or goes non-finite, with the previous
 // presents' records (=2: a line per present); under APS5_PROFILE_DRAW a 10 s digest line;
-// APS5_EXPOSURE_WATCH_DUMP=<dir> also writes the list and the state at jumps and digests.
+// APS5_EXPOSURE_WATCH_DUMP=<dir> also writes the list and the state at jumps and digests. Dark dips
+// (DipTracker) print an [exposure] dark dip line each (up to 20 per 10 s) and count in the digest.
 bool Enabled();
 // The packet loop, after a dispatch packet: decodes the table when the program is the watched one.
 void AtDispatch(const QueueState& queue, std::uint32_t queueId);
@@ -158,6 +160,66 @@ inline bool Jumped(float previous, float now, float ratio) {
     if (previous <= 0 || now <= 0) return (previous <= 0) != (now <= 0);
     return now > previous * ratio || previous > now * ratio;
 }
+
+// Dark dips (R-DARKSCENE, s64): a present whose window mean falls below `ratio` (APS5_EXPOSURE_WATCH_DIP,
+// default 0.4) of the median of the last 16 presents' window means. Demon's Souls' "dark scene, HUD
+// drawn" stills are such presents: while the camera swings, the view sits behind level geometry for
+// one frame (sometimes 2-4; t1466 pass dumps: every pixel's depth within ~20x of the near plane, the
+// player out of view, 1,721-2,480 draws of ~7,800) and the window mean drops 3-10x for that present
+// only (t1479: every pan-sweep capture below luma 1.8 matched one). The title does this on any machine;
+// at the port's 7-10 FPS the frame stays up for 100-140 ms, where a screenshot catches it. Non-finite
+// means are skipped; every finite one enters the history, so a lasting darker view becomes the median.
+class DipTracker {
+public:
+    static constexpr std::size_t History = 16;
+    static constexpr std::size_t MinPresents = History / 2;
+
+    struct Result {
+        bool low = false;
+        // A dip ended at this present (the previous presents were low, this one is not): its length.
+        std::uint32_t endedRun = 0;
+        // The median the present was judged against (0: not judged yet).
+        float reference = 0;
+    };
+
+    explicit DipTracker(float ratio = 0.4f) : ratio(ratio) {}
+
+    Result Observe(float value) {
+        Result result;
+        if (!std::isfinite(value)) return result;
+        result.reference = filled >= MinPresents ? Median() : 0.0f;
+        result.low = result.reference > 0 && value < ratio * result.reference;
+        if (result.low) {
+            ++run;
+        } else if (run != 0) {
+            result.endedRun = run;
+            run = 0;
+        }
+        recent[next] = value;
+        next = (next + 1) % History;
+        if (filled < History) ++filled;
+        return result;
+    }
+
+    // The open dip's length so far (0 when the last judged present was not low).
+    std::uint32_t OpenRun() const { return run; }
+
+    float Median() const {
+        if (filled == 0) return 0.0f;
+        std::array<float, History> sorted{};
+        std::copy(recent.begin(), recent.begin() + static_cast<std::ptrdiff_t>(filled), sorted.begin());
+        const auto middle = sorted.begin() + static_cast<std::ptrdiff_t>(filled / 2);
+        std::nth_element(sorted.begin(), middle, sorted.begin() + static_cast<std::ptrdiff_t>(filled));
+        return *middle;
+    }
+
+private:
+    float ratio;
+    std::array<float, History> recent{};
+    std::size_t next = 0;
+    std::size_t filled = 0;
+    std::uint32_t run = 0;
+};
 
 }
 

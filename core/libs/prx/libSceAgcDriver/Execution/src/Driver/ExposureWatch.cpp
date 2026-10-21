@@ -39,6 +39,15 @@ float jumpRatio() {
     return ratio;
 }
 
+float dipRatio() {
+    static const float ratio = [] {
+        const char* value = std::getenv("APS5_EXPOSURE_WATCH_DIP");
+        const float parsed = value != nullptr ? std::strtof(value, nullptr) : 0.0f;
+        return parsed > 0.0f && parsed < 1.0f ? parsed : 0.4f;
+    }();
+    return ratio;
+}
+
 // The last decoded table (the packet loop writes it, the presenter copies it).
 struct Watch {
     HostMutex mutex;
@@ -159,6 +168,13 @@ void AtPresent() {
     static float evLow = 0, evHigh = 0, targetLow = 0, targetHigh = 0, listMax = 0;
     static std::uint32_t windowNonZeroMax = 0, hugeMax = 0, unsorted = 0, nonFinite = 0, jumps = 0, printed = 0, unread = 0;
     static std::vector<float> values, stateValues, listValues;
+    // Dark dips: the open one (first present, its stamp, lowest mean, reference), this window's by
+    // length (1, 2, 3, 4 and more presents) and all of them.
+    static DipTracker dips(dipRatio());
+    static char dipStamp[16] = {};
+    static std::uint64_t dipPresent = 0, dipTotal = 0;
+    static float dipLeast = 0, dipReference = 0;
+    static std::uint32_t dipCounts[4] = {}, dipLongest = 0, dipPrinted = 0;
 
     Table table;
     std::uint64_t dispatches = 0, unreadable = 0;
@@ -189,7 +205,27 @@ void AtPresent() {
         record.slot = table.historyIndex % ringCount;
         record.newest = values[record.slot];
     }
-    if (readFloats(table.sorted.address, table.sorted.Elements(4, 1u << 16u), table.sorted.Step(4), listValues)) record.list = Summarize(listValues, table.sortedOffset, table.sortedCount);
+    if (readFloats(table.sorted.address, table.sorted.Elements(4, 1u << 16u), table.sorted.Step(4), listValues)) {
+        record.list = Summarize(listValues, table.sortedOffset, table.sortedCount);
+        const auto dip = dips.Observe(record.list.windowMean);
+        if (dip.low && dips.OpenRun() == 1) {
+            std::memcpy(dipStamp, record.stamp, sizeof(dipStamp));
+            dipPresent = record.present;
+            dipLeast = record.list.windowMean;
+            dipReference = dip.reference;
+        } else if (dip.low) {
+            dipLeast = std::min(dipLeast, record.list.windowMean);
+        }
+        if (dip.endedRun != 0) {
+            ++dipTotal;
+            ++dipCounts[std::min<std::uint32_t>(dip.endedRun, 4) - 1];
+            dipLongest = std::max(dipLongest, dip.endedRun);
+            if (dipPrinted < 20) {
+                ++dipPrinted;
+                std::fprintf(stderr, "[exposure] dark dip of %u present(s) from p%llu %s: window mean %.4g, median of the last presents %.4g (%.0f%%)\n", dip.endedRun, static_cast<unsigned long long>(dipPresent), dipStamp, dipLeast, dipReference, dipReference > 0 ? 100.0 * dipLeast / dipReference : 0.0);
+            }
+        }
+    }
 
     const float before = previous;
     const bool jumped = presents > 1 && Jumped(before, record.exposure, jumpRatio());
@@ -230,10 +266,11 @@ void AtPresent() {
     dumpList("digest", record.present, listValues, stateValues);
     std::sort(exposures.begin(), exposures.end());
     const auto at = [&](double fraction) { return exposures.empty() ? 0.0f : exposures[std::min(exposures.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(exposures.size())))]; };
-    if (profile) std::fprintf(stderr, "[exposure] 10 s: %zu presents read, exposure min %.4g p10 %.4g median %.4g max %.4g, adapted EV %.3f..%.3f, target EV %.3f..%.3f (clamp %.3g..%.3g), non-finite %u, unread %u, jumps %u, list max %.4g, huge tiles max %u, unsorted presents %u, window non-zero max %u; %llu dispatches decoded (%llu unreadable tables), state 0x%llx\n", exposures.size(), at(0.0), at(0.1), at(0.5), exposures.empty() ? 0.0f : exposures.back(), evLow, evHigh, targetLow, targetHigh, table.minEv, table.maxEv, nonFinite, unread, jumps, listMax, hugeMax, unsorted, windowNonZeroMax, static_cast<unsigned long long>(dispatches), static_cast<unsigned long long>(unreadable), static_cast<unsigned long long>(table.state.address));
+    if (profile) std::fprintf(stderr, "[exposure] 10 s: %zu presents read, exposure min %.4g p10 %.4g median %.4g max %.4g, adapted EV %.3f..%.3f, target EV %.3f..%.3f (clamp %.3g..%.3g), non-finite %u, unread %u, jumps %u, list max %.4g, huge tiles max %u, unsorted presents %u, window non-zero max %u, dark dips %u/%u/%u/%u of 1/2/3/4+ presents (longest %u, %llu since the start); %llu dispatches decoded (%llu unreadable tables), state 0x%llx\n", exposures.size(), at(0.0), at(0.1), at(0.5), exposures.empty() ? 0.0f : exposures.back(), evLow, evHigh, targetLow, targetHigh, table.minEv, table.maxEv, nonFinite, unread, jumps, listMax, hugeMax, unsorted, windowNonZeroMax, dipCounts[0], dipCounts[1], dipCounts[2], dipCounts[3], dipLongest, static_cast<unsigned long long>(dipTotal), static_cast<unsigned long long>(dispatches), static_cast<unsigned long long>(unreadable), static_cast<unsigned long long>(table.state.address));
     exposures.clear();
     listMax = 0;
     windowNonZeroMax = hugeMax = unsorted = nonFinite = jumps = printed = unread = 0;
+    dipCounts[0] = dipCounts[1] = dipCounts[2] = dipCounts[3] = dipLongest = dipPrinted = 0;
 }
 
 }
