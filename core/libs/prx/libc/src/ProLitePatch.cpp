@@ -21,8 +21,11 @@ namespace {
 std::atomic<bool> active{false};
 
 #ifdef _WIN32
+constexpr std::uintptr_t LinkedImageBase = 0x140000000;
+
 // The running address of a PE VA in the main image's code: the image has a dynamic base, so the VA is
-// taken relative to the header's ImageBase; null when it falls outside an executable section.
+// taken relative to the linked base (the loader rewrites the loaded header's ImageBase to the relocated
+// one); null when it falls outside an executable section.
 unsigned char* mapCode(std::uintptr_t va, std::size_t bytes) {
     auto* image = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
     if (image == nullptr) return nullptr;
@@ -30,8 +33,8 @@ unsigned char* mapCode(std::uintptr_t va, std::size_t bytes) {
     if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0) return nullptr;
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(image + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return nullptr;
-    if (va < nt->OptionalHeader.ImageBase) return nullptr;
-    const auto rva = va - nt->OptionalHeader.ImageBase;
+    if (va < LinkedImageBase) return nullptr;
+    const auto rva = va - LinkedImageBase;
     const auto* sections = IMAGE_FIRST_SECTION(nt);
     for (unsigned index = 0; index < nt->FileHeader.NumberOfSections; ++index) {
         const auto& section = sections[index];
