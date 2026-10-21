@@ -262,7 +262,7 @@ bool PrecollectNullSkip() {
 std::atomic<std::uint64_t> precollectNullsSkipped{0};
 std::atomic<std::uint64_t> precollectThrows{0};
 
-// APS5_PRESYNC_NULL_SKIP=1 (R-STALLS): the same for PresyncSurfaces of a build whose stage A has not
+// APS5_PRESYNC_NULL_SKIP (R-STALLS, default on, =0 restores the throw): the same for PresyncSurfaces of a build whose stage A has not
 // run (an address-based build): a null element has no surface to wait for, so it is skipped instead
 // of decoded, which threw and was caught. The walk stall (t1511/t1512) was this: the compute
 // workers' PrepareDispatch spent 1-1.7 ms per dispatch in the presync, almost all of it in the
@@ -270,7 +270,7 @@ std::atomic<std::uint64_t> precollectThrows{0};
 bool PresyncNullSkip() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_PRESYNC_NULL_SKIP");
-        return text != nullptr && std::strcmp(text, "1") == 0;
+        return text == nullptr || std::strcmp(text, "0") != 0;
     }();
     return enabled;
 }
