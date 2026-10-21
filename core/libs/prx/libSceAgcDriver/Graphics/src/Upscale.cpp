@@ -115,12 +115,13 @@ std::optional<Upscale::Skip> BilinearUpscaler::Record(const Context& context, co
     for (std::uint32_t binding = 0; binding < writes.size(); ++binding) {
         writes[binding] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, binding, 0, 1, binding == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &images[binding], nullptr, nullptr};
     }
-    // UpscaleBilinear.comp's Parameters (std430).
+    // UpscaleBilinear.comp's Parameters (std430); bit 0 of flags: the output expanded.
     struct Push {
         std::uint32_t width, height;
         std::array<float, 2> scale, low, high;
+        std::uint32_t flags;
     };
-    const Push push{plan.output.width, plan.output.height, plan.scale, plan.low, plan.high};
+    const Push push{plan.output.width, plan.output.height, plan.scale, plan.low, plan.high, Upscale::ExpandEnabled() ? 1u : 0u};
     // 2. The record (recordPass, under TimingKey), then the output's mark.
     auto& recorder = *context.recorder;
     VkAccessFlags covered = 0;
@@ -278,7 +279,7 @@ std::optional<Upscale::Skip> TemporalUpscaler::Record(const Context& context, co
         float exposure, currentWeight;
         std::uint32_t flags;
     };
-    const Push push{size[0], size[1], plan.base.render[0], plan.base.render[1], plan.jitter, plan.motionScale, 1.0f, Upscale::PortCurrentWeight, (plan.reset || fresh ? 1u : 0u) | (plan.smallestNearest ? 2u : 0u)};
+    const Push push{size[0], size[1], plan.base.render[0], plan.base.render[1], plan.jitter, plan.motionScale, 1.0f, Upscale::PortCurrentWeight, (plan.reset || fresh ? 1u : 0u) | (plan.smallestNearest ? 2u : 0u) | (Upscale::ExpandEnabled() ? 4u : 0u)};
     // 2. The command buffer (after the lookups and the images, which may record or reclaim). On a
     // reset the history images go from undefined to GENERAL (their content is not read), where they
     // stay: the passes' global barriers order their reads and writes. Then the record (recordPass,

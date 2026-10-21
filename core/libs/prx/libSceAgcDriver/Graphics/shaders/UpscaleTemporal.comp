@@ -7,7 +7,9 @@
 // pixels) to its place last frame; the history fetched there (Catmull-Rom from 5 bilinear taps),
 // clipped to the 3x3's YCoCg box and blended with the current colour (all current on a reset or when
 // last frame's place is off screen). The result goes to the next history image and to the output (a
-// storage view of the guest's own format, written without a format qualifier).
+// storage view of the guest's own format, written without a format qualifier). MainColor holds the
+// game's compressed colour c / (1 + luma): the history stays compressed, and with bit 2 of flags the
+// output is written expanded, c / (1 - luma), as the game's TAA pass does (APS5_UPSCALER_EXPAND).
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) uniform sampler2D color;
@@ -27,7 +29,8 @@ layout(push_constant, std430) uniform Parameters {
     // +0x118 (1.0 so far): scales the luma that weights the blend.
     float exposure;
     float currentWeight;
-    // Bit 0: reset (the history is not read); bit 1: the nearest depth is the smallest (else reversed Z).
+    // Bit 0: reset (the history is not read); bit 1: the nearest depth is the smallest (else reversed Z);
+    // bit 2: the output expanded.
     uint flags;
 };
 
@@ -125,5 +128,8 @@ void main() {
     result = clamp(result, vec3(0.0), vec3(65504.0));
     float alpha = texelFetch(color, clamp(nearest, ivec2(0), last), 0).a;
     imageStore(nextHistory, ivec2(texel), vec4(result, 1.0));
+    if ((flags & 4u) != 0u) {
+        result /= 1.0 - min(dot(result, vec3(0.3, 0.59, 0.11)), 0.9995);
+    }
     imageStore(target, ivec2(texel), vec4(result, alpha));
 }

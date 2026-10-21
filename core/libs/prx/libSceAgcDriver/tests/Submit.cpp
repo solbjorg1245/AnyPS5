@@ -1445,6 +1445,15 @@ void testUpscalePlan() {
     check(skipOf() == Upscale::Skip::NoColor, "upscale: no MainColor T#, no pass");
     for (std::size_t skip = 0; skip < static_cast<std::size_t>(Upscale::Skip::Count); ++skip) check(Upscale::SkipName(static_cast<Upscale::Skip>(skip)) != nullptr, "upscale: every skip has its log name");
     check(!Upscale::Enabled(nullptr) && !Upscale::Enabled("") && !Upscale::Enabled("0") && Upscale::Enabled("1"), "upscale: off unless APS5_MFSR_EXEC is set and not 0");
+    check(Upscale::ExpandOn(nullptr) && Upscale::ExpandOn("") && Upscale::ExpandOn("1") && !Upscale::ExpandOn("0"), "upscale: the output is expanded unless APS5_UPSCALER_EXPAND=0");
+    // The game's compression c / (1 + luma) and the passes' expansion c / (1 - luma) round-trip.
+    const std::array<float, 3> hdr{12.0f, 3.0f, 0.25f};
+    const float luma = 0.3f * hdr[0] + 0.59f * hdr[1] + 0.11f * hdr[2];
+    const std::array<float, 3> compressed{hdr[0] / (1.0f + luma), hdr[1] / (1.0f + luma), hdr[2] / (1.0f + luma)};
+    const auto expanded = Upscale::Expanded(compressed);
+    check(about(expanded[0], 12.0f) && about(expanded[1], 3.0f) && about(expanded[2], 0.25f), "upscale: expanding the compressed colour gives the HDR colour back");
+    const auto white = Upscale::Expanded({1.0f, 1.0f, 1.0f});
+    check(std::isfinite(white[0]) && white[0] > 1990.0f && white[0] < 2010.0f, "upscale: luma 1 stays finite (held below 0.9995)");
 }
 
 // The temporal upscaler's plan (docs/design/dlss.md S2): its resets (the packet's bit, a first frame,

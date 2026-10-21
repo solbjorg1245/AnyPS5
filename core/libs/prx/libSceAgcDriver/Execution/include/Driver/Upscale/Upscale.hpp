@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_UPSCALE_UPSCALE_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/MfsrPacket.hpp"
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -142,6 +143,22 @@ inline std::variant<TemporalPlan, Skip> PlanTemporal(const MfsrPacket::Dispatch&
 
 // APS5_UPSCALER_PORT, or the settings' upscaler as for Enabled().
 bool PortEnabled();
+
+// APS5_UPSCALER_EXPAND (default on; "0" = the passes as first written, which leave the 3D view about
+// 10x too dark): MainColor holds the game's compressed colour c / (1 + luma), luma = 0.3 r + 0.59 g +
+// 0.11 b, which its TAA pass (cs 0x24893aa00) writes expanded, c / (1 - luma), for the post chain
+// (t1449's pass dump: MainColor at most 1.0, the TAA output up to 982). The bilinear and port passes
+// write the output expanded the same way (luma held below 0.9995); the port pass's history stays
+// compressed. Expanded is the reference for the shaders.
+inline bool ExpandOn(const char* value) { return value == nullptr || std::strcmp(value, "0") != 0; }
+inline bool ExpandEnabled() {
+    static const bool on = ExpandOn(std::getenv("APS5_UPSCALER_EXPAND"));
+    return on;
+}
+inline std::array<float, 3> Expanded(const std::array<float, 3>& colour) {
+    const float luma = std::min(0.3f * colour[0] + 0.59f * colour[1] + 0.11f * colour[2], 0.9995f);
+    return {colour[0] / (1.0f - luma), colour[1] / (1.0f - luma), colour[2] / (1.0f - luma)};
+}
 inline const Signs& PortSigns() {
     static const Signs signs = ParseSigns(std::getenv("APS5_UPSCALER_PORT_SIGNS"));
     return signs;
