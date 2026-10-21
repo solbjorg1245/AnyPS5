@@ -245,7 +245,7 @@ TextureCounters& TextureCounts() {
 // Sampled elements the driver could not decode and bound as null (see decodeBoundSampled).
 std::atomic<std::uint64_t> sampledNullBound{0};
 
-// APS5_PRECOLLECT_NULL_SKIP=1 (R-STALLS): stage A's precollect hands a null image element (base
+// APS5_PRECOLLECT_NULL_SKIP (R-STALLS, default on, =0 restores the throw): stage A's precollect hands a null image element (base
 // address 0, see NullTextureWords) to stage B undecoded instead of decoding it, which threw. Stage B
 // binds the null texture for it as before, so only the throw goes: a bindless array of mostly null
 // slots threw once per slot through the guest libc's unwinder, ~50 ms per build, and an address-based
@@ -254,7 +254,7 @@ std::atomic<std::uint64_t> sampledNullBound{0};
 bool PrecollectNullSkip() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_PRECOLLECT_NULL_SKIP");
-        return text != nullptr && std::strcmp(text, "1") == 0;
+        return text == nullptr || std::strcmp(text, "0") != 0;
     }();
     return enabled;
 }
