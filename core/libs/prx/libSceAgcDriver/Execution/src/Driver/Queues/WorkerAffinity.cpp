@@ -12,6 +12,7 @@ std::uint64_t WorkerAffinityMask() {
         if (std::getenv("APS5_NO_WORKER_AFFINITY") != nullptr) return std::uint64_t{0};
         const auto requested = CpuTopology::MaskFromEnvironment("APS5_WORKER_AFFINITY_MASK");
         if (requested != 0) return requested;
+        if (const auto split = CpuTopology::CoreSplit().driver; split != 0) return split;
 #ifndef __linux__
         if (std::getenv("APS5_WORKER_AFFINITY") == nullptr) return std::uint64_t{0};
 #endif

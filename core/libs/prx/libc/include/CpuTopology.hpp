@@ -21,11 +21,19 @@
 // a mask is given explicitly. Header-only so libkernel and the AGC driver share it without a link.
 namespace CpuTopology {
 
+// One physical core: its logical processors (SMT siblings) and its efficiency class.
+struct Core {
+    std::uint64_t mask = 0;
+    unsigned char efficiencyClass = 0;
+};
+
 struct Layout {
     std::uint64_t process = 0;
     std::uint64_t efficient = 0;
     std::uint64_t performant = 0;
     bool hybrid = false;
+    Core cores[64] = {};
+    unsigned coreCount = 0;
 };
 
 #ifdef __linux__
@@ -75,6 +83,7 @@ inline const Layout& Get() {
                 const unsigned cls = entry->Processor.EfficiencyClass;
                 byClass[cls] |= static_cast<std::uint64_t>(entry->Processor.GroupMask[0].Mask);
                 seen[cls] = true;
+                if (result.coreCount < 64) result.cores[result.coreCount++] = {static_cast<std::uint64_t>(entry->Processor.GroupMask[0].Mask), static_cast<unsigned char>(cls)};
             }
             offset += entry->Size;
         }
@@ -99,6 +108,15 @@ inline const Layout& Get() {
         result.performant = MaskFromCpuList("/sys/devices/cpu_core/cpus");
         result.efficient = MaskFromCpuList("/sys/devices/cpu_atom/cpus");
         result.hybrid = result.efficient != 0 && result.performant != 0 && (result.efficient & result.performant) == 0;
+        std::uint64_t counted = 0;
+        for (unsigned cpu = 0; cpu < 64 && result.coreCount < 64; ++cpu) {
+            if (((result.process >> cpu) & 1u) == 0 || ((counted >> cpu) & 1u) != 0) continue;
+            const std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings_list";
+            const auto siblings = MaskFromCpuList(path.c_str());
+            if (siblings == 0) continue;
+            counted |= siblings;
+            result.cores[result.coreCount++] = {siblings, static_cast<unsigned char>(result.hybrid && (siblings & result.performant) != 0 ? 1 : 0)};
+        }
 #endif
         return result;
     }();
@@ -165,6 +183,58 @@ inline std::uint64_t PinTraced(const char* role, void* handle, std::uint64_t mas
 inline void PinHelperThread(const char* role) {
     static const std::uint64_t mask = MaskFromEnvironment("APS5_HELPER_AFFINITY_MASK");
     if (mask != 0) PinTraced(role, nullptr, mask);
+}
+
+// APS5_CORE_SPLIT=<n>: the title's 13 job workers spin at full load on every core, so the driver's
+// queue-0 worker and recording pipe share a core with one and pay ~20 % more per draw. The split gives
+// the driver's queue workers, recording pipe and presenter the n physical cores (every SMT sibling) of
+// the highest efficiency class with the highest processor numbers, and the job workers the other cores
+// of the process. Empty when n is 0 or fewer than n + 2 cores would remain.
+struct Split {
+    std::uint64_t driver = 0;
+    std::uint64_t jobs = 0;
+};
+
+inline Split SplitCores(const Core* cores, unsigned count, std::uint64_t process, unsigned reserve) {
+    Split split{};
+    if (process == 0) process = ~std::uint64_t{0};
+    std::uint64_t all = 0;
+    unsigned usable = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        const auto mask = cores[i].mask & process;
+        if (mask == 0 || (all & mask) != 0) continue;
+        all |= mask;
+        ++usable;
+    }
+    if (reserve == 0 || usable < reserve + 2) return split;
+    for (unsigned picked = 0; picked < reserve; ++picked) {
+        int best = -1;
+        std::uint64_t bestMask = 0;
+        for (unsigned i = 0; i < count; ++i) {
+            const auto mask = cores[i].mask & process;
+            if (mask == 0 || (split.driver & mask) != 0) continue;
+            // Core masks are disjoint, so the larger mask holds the higher processor numbers.
+            if (best < 0 || cores[i].efficiencyClass > cores[best].efficiencyClass || (cores[i].efficiencyClass == cores[best].efficiencyClass && mask > bestMask)) {
+                best = static_cast<int>(i);
+                bestMask = mask;
+            }
+        }
+        split.driver |= bestMask;
+    }
+    split.jobs = all & ~split.driver;
+    return split;
+}
+
+inline const Split& CoreSplit() {
+    static const Split split = [] {
+        const char* text = std::getenv("APS5_CORE_SPLIT");
+        if (text == nullptr || *text == '\0') return Split{};
+        const auto& layout = Get();
+        const auto result = SplitCores(layout.cores, layout.coreCount, layout.process, static_cast<unsigned>(std::strtoul(text, nullptr, 10)));
+        if (result.driver == 0) std::fprintf(stderr, "[affinity] APS5_CORE_SPLIT=%s not applied (%u cores)\n", text, layout.coreCount);
+        return result;
+    }();
+    return split;
 }
 
 }

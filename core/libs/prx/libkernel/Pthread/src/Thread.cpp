@@ -118,7 +118,7 @@ static void ReleaseThread(PthreadPrivate* thread) {
 // The title's job workers ("BPE JobWorkerThread CPU0".."CPU12") spin at full load on one core each.
 // Pinning them to the efficiency cores of a hybrid CPU (APS5_JOB_AFFINITY=1, with the driver's
 // worker pinning) measured 0 to -9 % at the video stage, so the default leaves them free;
-// APS5_JOB_AFFINITY_MASK=<hex> picks the cores.
+// APS5_JOB_AFFINITY_MASK=<hex> picks the cores, APS5_CORE_SPLIT=<n> gives them all but the driver's n.
 static constexpr const char* JOB_WORKER_PREFIX = "BPE JobWorkerThread";
 
 static std::uint64_t JobWorkerMask() {
@@ -126,6 +126,7 @@ static std::uint64_t JobWorkerMask() {
         if (std::getenv("APS5_NO_JOB_AFFINITY") != nullptr) return std::uint64_t{0};
         const auto requested = CpuTopology::MaskFromEnvironment("APS5_JOB_AFFINITY_MASK");
         if (requested != 0) return requested;
+        if (const auto split = CpuTopology::CoreSplit().jobs; split != 0) return split;
         if (std::getenv("APS5_JOB_AFFINITY") == nullptr) return std::uint64_t{0};
         const auto& layout = CpuTopology::Get();
         return layout.hybrid ? layout.efficient : std::uint64_t{0};
