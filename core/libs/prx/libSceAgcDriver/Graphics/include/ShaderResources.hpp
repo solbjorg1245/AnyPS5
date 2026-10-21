@@ -224,7 +224,7 @@ public:
     // The tests turn in-place bindings on or off whatever the environment said (1 on, 0 off, -1
     // back to the environment), as KeysStampCheckForTests does.
     static void InPlaceBindingsForTests(int inPlace);
-    // APS5_SET_MEMO=1 (P-SETMEMO, default off; the old path otherwise): a draw whose words repeat
+    // APS5_SET_MEMO (P-SETMEMO, default on since s64; =0 is the old path): a draw whose words repeat
     // the previous set copy of this template in the open batch binds that set copy again
     // (PrepareDrawBindings returns those very bindings, which the batch keeps already): no select,
     // allocate, copy or write. The memo answers only in the batch it was made in (its transient set

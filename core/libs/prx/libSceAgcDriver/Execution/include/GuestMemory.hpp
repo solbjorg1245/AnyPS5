@@ -148,7 +148,7 @@ void BumpCollectEpoch();
 std::uint64_t CollectEpochBumps();
 // The calling thread's collect epoch (0 while it never bumped, or since ResetCollectEpoch), and its
 // return to a fresh epoch per collect. The queue-0 recording thread follows the epochs its items were
-// handed over in (APS5_RECORD_PIPE_EPOCH=1, RecordPipe.cpp): it bumps when an item's differs from
+// handed over in (APS5_RECORD_PIPE_EPOCH, default on, RecordPipe.cpp): it bumps when an item's differs from
 // the previous item's, and resets for an item handed over without one.
 std::uint64_t ThreadCollectEpoch();
 void ResetCollectEpoch();
