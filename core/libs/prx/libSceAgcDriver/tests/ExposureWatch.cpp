@@ -114,12 +114,60 @@ void jumpTests() {
     Expect(Jumped(1.0f, 0.0f, 1.5f) && !Jumped(0.0f, 0.0f, 1.5f), "to zero once");
 }
 
+// Feeds `count` presents of `value` and returns how many were low.
+std::uint32_t feedDips(DipTracker& dips, float value, std::uint32_t count) {
+    std::uint32_t low = 0;
+    for (std::uint32_t i = 0; i < count; ++i) low += dips.Observe(value).low ? 1u : 0u;
+    return low;
+}
+
+// t1479's window means: ~0.00107 in the pan sweep, 0.000107-0.00019 for the dark present.
+void dipTests() {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    DipTracker early;
+    Expect(feedDips(early, 0.00107f, DipTracker::MinPresents - 1) == 0, "steady presents are not low");
+    Expect(!early.Observe(0.0001f).low, "nothing is judged before MinPresents presents");
+
+    DipTracker dips;
+    feedDips(dips, 0.00107f, 20);
+    const auto dark = dips.Observe(0.000107f);
+    Expect(dark.low && dark.endedRun == 0, "a 10x drop is a dip, still open");
+    Expect(std::fabs(dark.reference - 0.00107f) < 1e-9f, "judged against the median");
+    Expect(!dips.Observe(nan).low && dips.OpenRun() == 1, "a non-finite mean is skipped");
+    const auto back = dips.Observe(0.00105f);
+    Expect(!back.low && back.endedRun == 1, "a one-present dip ends with its length");
+    Expect(!dips.Observe(0.0005f).low, "half the median is a darker view, not a dip");
+    dips.Observe(0.00019f);
+    dips.Observe(0.00021f);
+    Expect(dips.Observe(0.00107f).endedRun == 2, "a two-present dip");
+
+    // A lasting darker view becomes the median: its run ends by itself.
+    DipTracker lasting;
+    feedDips(lasting, 0.001f, 16);
+    std::uint32_t ended = 0, length = 0;
+    for (int i = 0; i < 32; ++i) {
+        const auto result = lasting.Observe(0.0002f);
+        if (result.endedRun != 0) {
+            ++ended;
+            length = result.endedRun;
+        }
+    }
+    Expect(ended == 1 && length >= 8 && length <= 9, "a lasting view ends its run once it is the median");
+
+    // APS5_EXPOSURE_WATCH_DIP: a stricter ratio.
+    DipTracker strict(0.2f);
+    feedDips(strict, 0.00107f, 16);
+    Expect(!strict.Observe(0.00030f).low, "0.28x is above a 0.2 ratio");
+    Expect(strict.Observe(0.00019f).low, "0.18x is below a 0.2 ratio");
+}
+
 }
 
 int main() {
     tableTests();
     listTests();
     jumpTests();
+    dipTests();
     if (failures != 0) {
         std::fprintf(stderr, "%d exposure watch test(s) failed\n", failures);
         return 1;
