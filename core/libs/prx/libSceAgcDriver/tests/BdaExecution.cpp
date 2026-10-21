@@ -1,9 +1,13 @@
 #include "BdaShader.hpp"
 #include "BdaAbi.hpp"
+#include "SpirvBackend/SpirvBda.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <limits>
+#include <string>
+#include <utility>
 
 namespace {
 
@@ -85,9 +89,88 @@ private:
     VkPipeline pipeline = VK_NULL_HANDLE;
 };
 
+// APS5_SPIRV_BDA_UNIFORM: 32 invocations read through a table of three 64-byte ranges (A, B, then C past a
+// gap), several reads each, so the per-invocation state sees hits, misses, spans across ranges and faults
+// after hits, and the uniform lookups see lanes inside and outside the first lane's range. Expected values
+// and faults are worked out byte by byte, as the full lookup resolves them.
+void RunBdaLookupTests(const Context& context, std::uint32_t stage, bool uniform) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    constexpr std::uint32_t lanes = 32;
+    constexpr std::uint32_t sentinel = 0xdeadbeef;
+    constexpr std::uint64_t guest = 0x7fff12300000ULL;
+    constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    Buffer a(context, 64, usage);
+    Buffer b(context, 64, usage);
+    Buffer c(context, 64, usage);
+    const std::array<Buffer*, 3> data{&a, &b, &c};
+    for (std::uint32_t range = 0; range < data.size(); ++range) {
+        for (std::uint32_t byte = 0; byte < 64; ++byte) data[range]->Bytes()[byte] = static_cast<std::byte>(range * 64 + byte + 1);
+    }
+    const std::array<std::uint64_t, 3> begins{guest, guest + 64, guest + 256};
+    Buffer table(context, sizeof(Abi::Header) + 3 * sizeof(Abi::Range), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer fault(context, sizeof(Abi::Fault), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer output(context, lanes * 8 * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const auto run = [&](std::initializer_list<BdaTestAccess> list, std::uint32_t middlePermissions) {
+        const std::vector<BdaTestAccess> accesses(list);
+        std::array<Abi::Range, 3> ranges{};
+        for (std::uint32_t range = 0; range < ranges.size(); ++range) ranges[range] = {begins[range], begins[range] + 64, data[range]->DeviceAddress(), range == 1 ? middlePermissions : Abi::Read, 0};
+        const Abi::Header header{Abi::Version, 3, sizeof(Abi::Range), 0};
+        std::memcpy(table.Bytes().data(), &header, sizeof(header));
+        std::memcpy(table.Bytes().data() + sizeof(header), ranges.data(), sizeof(ranges));
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        for (std::size_t word = 0; word < output.Bytes().size() / sizeof(sentinel); ++word) std::memcpy(output.Bytes().data() + word * sizeof(sentinel), &sentinel, sizeof(sentinel));
+        Pipeline pipeline(context, MakeBdaLookupTestShader(accesses, lanes, uniform), {&table, &fault, &output});
+        pipeline.Run(1);
+        struct Expected {
+            std::uint64_t address;
+            Abi::FaultReason reason;
+            std::uint32_t instruction;
+        };
+        std::vector<Expected> faults;
+        const auto where = "stage " + std::to_string(stage) + (uniform ? " uniform" : "") + ", first access at guest + " + std::to_string(static_cast<std::int64_t>(accesses.front().address - guest));
+        for (std::uint32_t lane = 0; lane < lanes; ++lane) {
+            bool stopped = false;
+            for (std::uint32_t index = 0; index < accesses.size(); ++index) {
+                std::uint32_t stored = 0;
+                std::memcpy(&stored, output.Bytes().data() + (lane * accesses.size() + index) * sizeof(stored), sizeof(stored));
+                const auto address = accesses[index].address + static_cast<std::uint64_t>(lane) * accesses[index].laneStride;
+                std::uint32_t value = 0;
+                for (std::uint32_t byte = 0; byte < 4 && !stopped; ++byte) {
+                    const auto at = address + byte;
+                    const auto range = std::find_if(ranges.begin(), ranges.end(), [&](const Abi::Range& entry) { return entry.begin <= at && at < entry.end; });
+                    if (range == ranges.end() || (range->permissions & Abi::Read) == 0) {
+                        faults.push_back({at, range == ranges.end() ? Abi::FaultReason::Unmapped : Abi::FaultReason::Permission, 0x1234 + index});
+                        stopped = true;
+                        break;
+                    }
+                    value |= static_cast<std::uint32_t>(data[range - ranges.begin()]->Bytes()[at - range->begin]) << (byte * 8);
+                }
+                Require(stored == (stopped ? sentinel : value), "BDA lookup read wrong data (" + where + ", lane " + std::to_string(lane) + ", access " + std::to_string(index) + ")");
+            }
+        }
+        Abi::Fault report{};
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        if (faults.empty()) {
+            Require(report.state == Abi::FaultState::Empty, "BDA lookup recorded a fault no lane makes (" + where + ")");
+            return;
+        }
+        Require(report.state == Abi::FaultState::Ready && std::any_of(faults.begin(), faults.end(), [&](const Expected& expected) { return report.address == expected.address && report.reason == expected.reason && report.instruction == expected.instruction; }), "BDA lookup fault differs from the full lookup's (" + where + ")");
+    };
+    // Uniform reads: hits in A, a miss into B, back to A, then C.
+    run({{guest, 0}, {guest + 4, 0}, {guest + 64, 0}, {guest + 8, 0}, {guest + 260, 0}}, Abi::Read);
+    // Lanes split over A and B, unaligned spans across A/B (byte path; lane 31 runs into the gap after B),
+    // then lanes inside C.
+    run({{guest, 4}, {guest + 2, 4}, {guest + 256, 2}, {guest, 4}}, Abi::Read);
+    // A fault after hits: lanes 16-31 of the second read land in the gap after B.
+    run({{guest, 4}, {guest + 64, 4}, {guest + 4, 0}}, Abi::Read);
+    // Below the first range, at the start of a read.
+    run({{guest - 4, 0}, {guest, 0}}, Abi::Read);
+    // B readable by no lookup: Permission after hits in A, for every lane and for the split lanes only.
+    run({{guest, 0}, {guest + 64, 0}}, Abi::Write);
+    run({{guest + 8, 0}, {guest, 4}}, Abi::Write);
 }
 
-void RunBdaExecutionTests(const Context& context) {
+void RunBdaReadTests(const Context& context, bool uniform) {
     namespace Abi = ShaderRecompiler::BdaAbi;
     Buffer first(context, 3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     Buffer second(context, 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
@@ -108,7 +191,7 @@ void RunBdaExecutionTests(const Context& context) {
         std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
         const std::uint32_t sentinel = 0xdeadbeef;
         std::memcpy(output.Bytes().data(), &sentinel, sizeof(sentinel));
-        Pipeline pipeline(context, MakeBdaTestShader(address, bits, offset), {&table, &fault, &output});
+        Pipeline pipeline(context, MakeBdaTestShader(address, bits, offset, uniform), {&table, &fault, &output});
         pipeline.Run(groups);
         Abi::Fault report{};
         std::uint32_t result = 0;
@@ -132,4 +215,16 @@ void RunBdaExecutionTests(const Context& context) {
     run(1, 8, 0, Abi::FaultReason::Overflow, 2, 1, -4);
     ranges[0].permissions = 0;
     run(guest, 8, 0, Abi::FaultReason::Permission);
+}
+
+}
+
+void RunBdaExecutionTests(const Context& context) {
+    // Every case under each APS5_SPIRV_BDA_UNIFORM stage, stage 3 with plain and uniform-base reads.
+    for (const auto& config : std::array<std::pair<int, bool>, 5>{{{0, false}, {1, false}, {2, false}, {3, false}, {3, true}}}) {
+        ShaderRecompiler::SetBdaUniformStageForTests(config.first);
+        RunBdaReadTests(context, config.second);
+        RunBdaLookupTests(context, static_cast<std::uint32_t>(config.first), config.second);
+    }
+    ShaderRecompiler::SetBdaUniformStageForTests(-1);
 }
