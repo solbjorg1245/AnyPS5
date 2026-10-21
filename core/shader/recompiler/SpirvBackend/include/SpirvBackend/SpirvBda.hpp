@@ -27,14 +27,17 @@ void EmitBdaWrite(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t
 std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t dwords, bool everyDword = false);
 bool BdaByteReadsForced();
 // APS5_SPIRV_BDA_UNIFORM=<stage>, default off: cheaper BDA lookups, each stage adding to the ones before.
-// 1: the table header is validated once per invocation; 2: the last range a lookup found is kept per
-// invocation, and an access inside it reads no table word; 3: an access whose address base is wave-uniform
+// 1: the table header checks share one branch; 2: the last range a read lookup found is kept per
+// invocation, and a read inside it calls no lookup; 3: an access whose address base is wave-uniform
 // (scalar loads, SGPR-based global loads, GPU-selected V#s) first searches for the subgroup's first active
 // address, and only the lanes outside that range search on their own. Every fault is the one the full
 // lookup records. Stage 3 falls back to 2 without subgroup ballot support.
 std::uint32_t BdaUniformStage();
 // Pins the stage for tests; -1 returns to the environment.
 void SetBdaUniformStageForTests(int stage);
+// Calls a lookup function (state.bdaPointerFunction and the like) and returns the device address, 0 after a
+// fault. From APS5_SPIRV_BDA_UNIFORM=2 on, a read inside the last range found skips the call.
+std::uint32_t EmitBdaLookupCall(SpirvEmitterState& state, std::uint32_t lookup, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction);
 std::uint32_t AddBdaAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, bool subtract);
 std::uint32_t AddBdaImmediate(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::int32_t immediate);
 

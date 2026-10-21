@@ -2,6 +2,7 @@
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
@@ -25,10 +26,6 @@ void ReturnBdaValueIf(SpirvEmitterState& state, std::uint32_t condition, std::ui
     EmitLabel(state, next);
 }
 
-void ReturnBdaZeroIf(SpirvEmitterState& state, std::uint32_t condition) {
-    ReturnBdaValueIf(state, condition, BdaConstant(state, 0u), [] {});
-}
-
 std::uint32_t LoadPrivate(SpirvEmitterState& state, std::uint32_t type, std::uint32_t variable) {
     const auto value = state.module.AllocateId();
     state.module.AddFunction(spv::OpLoad, type, value, variable);
@@ -39,15 +36,42 @@ struct BdaRange {
     std::uint32_t begin = 0;
     std::uint32_t end = 0;
     std::uint32_t base = 0;
-    std::uint32_t permissions = 0;
 };
 
+// What a read lookup returns from APS5_SPIRV_BDA_UNIFORM=2 on: the device address, then the range holding it
+// (guest begin and end, device base); all zero after a fault, so the range never matches.
+std::uint32_t TypeBdaRangedResult(SpirvEmitterState& state) {
+    const auto u64 = TypeScalarU64(state);
+    return state.module.Type(spv::OpTypeStruct, u64, u64, u64, u64);
+}
+
+// Whether [address, address + bytes) lies in the range (with the permission, when permissions is given) and
+// maps without wrapping, so every check after the full lookup's search passes; and the device address.
+std::pair<std::uint32_t, std::uint32_t> TranslateBdaRange(SpirvEmitterState& state, const BdaRange& range, std::uint32_t address, std::uint32_t bytes, std::uint32_t permissions = 0, std::uint32_t permission = 0) {
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    const auto binary = [&](std::uint32_t op, std::uint32_t type, std::uint32_t left, std::uint32_t right) { return Binary(state, op, type, left, right); };
+    const auto both = [&](std::uint32_t left, std::uint32_t right) { return binary(spv::OpLogicalAnd, boolean, left, right); };
+    const auto size = Unary(state, spv::OpUConvert, u64, bytes);
+    const auto end = binary(spv::OpIAdd, u64, address, size);
+    const auto result = binary(spv::OpIAdd, u64, range.base, binary(spv::OpISub, u64, address, range.begin));
+    const auto deviceEnd = binary(spv::OpIAdd, u64, result, size);
+    auto hit = both(binary(spv::OpUGreaterThan, boolean, end, address), binary(spv::OpUGreaterThanEqual, boolean, address, range.begin));
+    hit = both(hit, binary(spv::OpULessThanEqual, boolean, end, range.end));
+    if (permissions != 0) hit = both(hit, binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, TypeU32(state), permissions, ConstantU32(state, permission)), ConstantU32(state, 0u)));
+    hit = both(hit, binary(spv::OpUGreaterThanEqual, boolean, result, range.base));
+    hit = both(hit, binary(spv::OpUGreaterThan, boolean, deviceEnd, result));
+    return {hit, result};
+}
+
 // (u64 address, u32 bytes, u32 instruction) -> u64 device address of the range holding all the bytes,
-// or 0 after a fault (recorded when recordFaults). With APS5_SPIRV_BDA_UNIFORM (state.bdaUniformStage, see BdaUniformStage) the header is validated once per
-// invocation (1), a range the full lookup accepted answers the next accesses inside it (2), and a uniform
-// lookup first searches for the subgroup's first active address (3). The table is sorted and disjoint
-// (GuestBufferMemory::AddressRanges), so a range holding [address, address + bytes) is the one the search
-// finds, and a shortcut returns only what the full lookup would return without a fault.
+// or 0 after a fault (recorded when recordFaults). With APS5_SPIRV_BDA_UNIFORM (state.bdaUniformStage, see
+// BdaUniformStage) the header checks share one branch (1), read lookups also return the range they found for
+// EmitBdaLookupCall to keep (2), and a uniform lookup first searches for the subgroup's first active address
+// (3). The functions keep no state of their own: a Private variable used across the call would leave the
+// registers. The table is sorted and disjoint (GuestBufferMemory::AddressRanges), so a range holding
+// [address, address + bytes) is the one the search finds, and a shortcut returns only what the full lookup
+// would return without a fault.
 std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool recordFaults, std::uint32_t permission = BdaAbi::Read, bool uniform = false) {
     const auto u32 = TypeU32(state);
     const auto u64 = TypeScalarU64(state);
@@ -55,15 +79,19 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
     const auto binary = [&](std::uint32_t op, std::uint32_t type, std::uint32_t left, std::uint32_t right) { return Binary(state, op, type, left, right); };
     const auto both = [&](std::uint32_t left, std::uint32_t right) { return binary(spv::OpLogicalAnd, boolean, left, right); };
+    const auto either = [&](std::uint32_t left, std::uint32_t right) { return binary(spv::OpLogicalOr, boolean, left, right); };
     const auto load = [&](std::uint32_t pointer) {
         const auto value = state.module.AllocateId();
         state.module.AddFunction(spv::OpLoad, u32, value, pointer);
         return value;
     };
     const auto stage = state.bdaUniformStage;
+    const bool ranged = stage >= 2u && permission == BdaAbi::Read;
+    const auto resultType = ranged ? TypeBdaRangedResult(state) : u64;
+    const auto failed = ranged ? state.module.Constant(spv::OpConstantNull, resultType) : BdaConstant(state, 0u);
     const auto function = state.module.AllocateId();
     state.module.AddName(function, name);
-    state.module.AddFunction(spv::OpFunction, u64, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, u64, u64, u32, u32));
+    state.module.AddFunction(spv::OpFunction, resultType, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, resultType, u64, u32, u32));
     const auto address = state.module.AllocateId();
     const auto bytes = state.module.AllocateId();
     const auto instruction = state.module.AllocateId();
@@ -77,67 +105,34 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     state.module.AddFunction(spv::OpVariable, pointer, low, spv::StorageClassFunction);
     state.module.AddFunction(spv::OpVariable, pointer, high, spv::StorageClassFunction);
     const auto fail = [&](std::uint32_t condition, BdaAbi::FaultReason reason) {
-        if (recordFaults) {
-            ReturnBdaFailureIf(state, condition, address, bytes, instruction, reason);
-        } else {
-            ReturnBdaZeroIf(state, condition);
-        }
+        ReturnBdaValueIf(state, condition, failed, [&] {
+            if (recordFaults) RecordBdaFault(state, address, bytes, instruction, reason);
+        });
+    };
+    const auto found = [&](std::uint32_t result, const BdaRange& range) {
+        if (!ranged) return result;
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeConstruct, resultType, value, result, range.begin, range.end, range.base);
+        return value;
     };
     const auto end = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
-    // Whether [address, end) lies in the range with the permission and maps without wrapping (every check
-    // after the search passes), and the device address.
-    const auto translate = [&](const BdaRange& range) {
-        const auto result = binary(spv::OpIAdd, u64, range.base, binary(spv::OpISub, u64, address, range.begin));
-        const auto deviceEnd = binary(spv::OpIAdd, u64, result, Unary(state, spv::OpUConvert, u64, bytes));
-        auto hit = both(binary(spv::OpUGreaterThan, boolean, end, address), binary(spv::OpUGreaterThanEqual, boolean, address, range.begin));
-        hit = both(hit, binary(spv::OpULessThanEqual, boolean, end, range.end));
-        hit = both(hit, binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, range.permissions, constant(permission)), constant(0)));
-        hit = both(hit, binary(spv::OpUGreaterThanEqual, boolean, result, range.base));
-        hit = both(hit, binary(spv::OpUGreaterThan, boolean, deviceEnd, result));
-        return std::pair{hit, result};
-    };
-    const auto remember = [&](const BdaRange& range) {
-        if (stage < 2) return;
-        state.module.AddFunction(spv::OpStore, state.bdaLastRangeVariables[0], range.begin);
-        state.module.AddFunction(spv::OpStore, state.bdaLastRangeVariables[1], range.end);
-        state.module.AddFunction(spv::OpStore, state.bdaLastRangeVariables[2], range.base);
-        state.module.AddFunction(spv::OpStore, state.bdaLastRangeVariables[3], range.permissions);
-    };
-    if (stage >= 2) {
-        const BdaRange last{LoadPrivate(state, u64, state.bdaLastRangeVariables[0]), LoadPrivate(state, u64, state.bdaLastRangeVariables[1]), LoadPrivate(state, u64, state.bdaLastRangeVariables[2]), LoadPrivate(state, u32, state.bdaLastRangeVariables[3])};
-        const auto cached = translate(last);
-        ReturnBdaValueIf(state, cached.first, cached.second, [] {});
-    }
-    std::uint32_t count = 0;
-    if (stage >= 1) {
-        // Every header check faults as InvalidTable, so one combined check per invocation records the same fault.
-        EmitIfCondition(state, binary(spv::OpIEqual, boolean, LoadPrivate(state, u32, state.bdaTableStateVariable), constant(0)), [&] {
-            const auto length = state.module.AllocateId();
-            state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
-            state.module.AddFunction(spv::OpStore, state.bdaTableStateVariable, constant(2));
-            EmitIfCondition(state, binary(spv::OpUGreaterThanEqual, boolean, length, constant(4)), [&] {
-                const auto entries = BdaLoadWord(state, constant(1));
-                const auto available = binary(spv::OpISub, u32, length, constant(4));
-                auto valid = binary(spv::OpIEqual, boolean, BdaLoadWord(state, constant(0)), constant(BdaAbi::Version));
-                valid = both(valid, binary(spv::OpIEqual, boolean, BdaLoadWord(state, constant(2)), constant(sizeof(BdaAbi::Range))));
-                valid = both(valid, binary(spv::OpIEqual, boolean, BdaLoadWord(state, constant(3)), constant(0)));
-                valid = both(valid, binary(spv::OpIEqual, boolean, binary(spv::OpBitwiseAnd, u32, available, constant(7)), constant(0)));
-                valid = both(valid, binary(spv::OpIEqual, boolean, entries, binary(spv::OpShiftRightLogical, u32, available, constant(3))));
-                state.module.AddFunction(spv::OpStore, state.bdaTableCountVariable, entries);
-                state.module.AddFunction(spv::OpStore, state.bdaTableStateVariable, Select(state, u32, valid, constant(1), constant(2)));
-            });
-        });
-        fail(binary(spv::OpINotEqual, boolean, LoadPrivate(state, u32, state.bdaTableStateVariable), constant(1)), BdaAbi::FaultReason::InvalidTable);
-        count = LoadPrivate(state, u32, state.bdaTableCountVariable);
+    const auto length = state.module.AllocateId();
+    state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
+    fail(binary(spv::OpULessThan, boolean, length, constant(4)), BdaAbi::FaultReason::InvalidTable);
+    const auto count = BdaLoadWord(state, constant(1));
+    const auto available = binary(spv::OpISub, u32, length, constant(4));
+    if (stage >= 1u) {
+        // Every header check faults as InvalidTable with the same record, so one branch takes them all.
+        auto invalid = binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(0)), constant(BdaAbi::Version));
+        invalid = either(invalid, binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(2)), constant(sizeof(BdaAbi::Range))));
+        invalid = either(invalid, binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(3)), constant(0)));
+        invalid = either(invalid, binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, available, constant(7)), constant(0)));
+        invalid = either(invalid, binary(spv::OpINotEqual, boolean, count, binary(spv::OpShiftRightLogical, u32, available, constant(3))));
+        fail(invalid, BdaAbi::FaultReason::InvalidTable);
     } else {
-        const auto length = state.module.AllocateId();
-        state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
-        fail(binary(spv::OpULessThan, boolean, length, constant(4)), BdaAbi::FaultReason::InvalidTable);
         fail(binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(0)), constant(BdaAbi::Version)), BdaAbi::FaultReason::InvalidTable);
         fail(binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(2)), constant(sizeof(BdaAbi::Range))), BdaAbi::FaultReason::InvalidTable);
         fail(binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(3)), constant(0)), BdaAbi::FaultReason::InvalidTable);
-        count = BdaLoadWord(state, constant(1));
-        const auto available = binary(spv::OpISub, u32, length, constant(4));
         fail(binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, available, constant(7)), constant(0)), BdaAbi::FaultReason::InvalidTable);
         fail(binary(spv::OpINotEqual, boolean, count, binary(spv::OpShiftRightLogical, u32, available, constant(3))), BdaAbi::FaultReason::InvalidTable);
     }
@@ -189,12 +184,12 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         EmitIfCondition(state, binary(spv::OpINotEqual, boolean, candidate, constant(0)), [&] {
             const auto selected = entryWord(candidate);
             const auto at = [&](std::uint32_t offset) { return binary(spv::OpIAdd, u32, selected, constant(offset)); };
-            const BdaRange range{BdaLoadAddress(state, selected), BdaLoadAddress(state, at(2)), BdaLoadAddress(state, at(4)), BdaLoadWord(state, at(6))};
+            const BdaRange range{BdaLoadAddress(state, selected), BdaLoadAddress(state, at(2)), BdaLoadAddress(state, at(4))};
             auto valid = binary(spv::OpIEqual, boolean, BdaLoadWord(state, at(7)), constant(0));
             valid = both(valid, binary(spv::OpULessThan, boolean, range.begin, range.end));
             valid = both(valid, binary(spv::OpINotEqual, boolean, range.base, BdaConstant(state, 0)));
-            const auto shared = translate(range);
-            ReturnBdaValueIf(state, both(valid, shared.first), shared.second, [&] { remember(range); });
+            const auto shared = TranslateBdaRange(state, range, address, bytes, BdaLoadWord(state, at(6)), permission);
+            ReturnBdaValueIf(state, both(valid, shared.first), found(shared.second, range), [] {});
         });
     }
     const auto index = search(address);
@@ -215,30 +210,26 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     fail(binary(spv::OpULessThan, boolean, result, base), BdaAbi::FaultReason::Overflow);
     const auto deviceEnd = binary(spv::OpIAdd, u64, result, Unary(state, spv::OpUConvert, u64, bytes));
     fail(binary(spv::OpULessThanEqual, boolean, deviceEnd, result), BdaAbi::FaultReason::Overflow);
-    remember({begin, finish, base, permissions});
-    state.module.AddFunction(spv::OpReturnValue, result);
+    state.module.AddFunction(spv::OpReturnValue, found(result, {begin, finish, base}));
     state.module.AddFunction(spv::OpFunctionEnd);
     return function;
 }
 
-// The per-invocation lookup state of APS5_SPIRV_BDA_UNIFORM: the header check (0 not yet, 1 valid, 2
-// invalid), the validated range count and the last range found. Stage 3 needs subgroup ballot support.
+// The per-invocation state of APS5_SPIRV_BDA_UNIFORM=2 and up: the last range a read lookup found (guest
+// begin and end, device base), read and written only by the code calling the lookups. Stage 3 needs subgroup
+// ballot support.
 void DefineBdaLookupState(SpirvEmitterState& state) {
     auto stage = BdaUniformStage();
     const auto& capabilities = state.supportedCapabilities;
     if (stage >= 3u && std::find(capabilities.begin(), capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityGroupNonUniformBallot)) == capabilities.end()) stage = 2u;
     state.bdaUniformStage = stage;
-    if (stage == 0u) return;
-    const auto define = [&](std::uint32_t type, const char* name) {
-        const auto variable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, type), spv::StorageClassPrivate);
+    if (stage < 2u) return;
+    const auto define = [&](const char* name) {
+        const auto variable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeScalarU64(state)), spv::StorageClassPrivate);
         state.module.AddName(variable, name);
         return variable;
     };
-    state.bdaTableStateVariable = define(TypeU32(state), "bda_table_state");
-    state.bdaTableCountVariable = define(TypeU32(state), "bda_table_count");
-    if (stage >= 2u) {
-        state.bdaLastRangeVariables = {define(TypeScalarU64(state), "bda_last_begin"), define(TypeScalarU64(state), "bda_last_end"), define(TypeScalarU64(state), "bda_last_base"), define(TypeU32(state), "bda_last_permissions")};
-    }
+    state.bdaLastRangeVariables = {define("bda_last_begin"), define("bda_last_end"), define("bda_last_base")};
     if (stage >= 3u) {
         state.module.RequireVersion(0x00010300u);
         state.module.EmitCapability(spv::CapabilityGroupNonUniform);
@@ -256,7 +247,7 @@ std::uint32_t BdaUniformStage() {
         const char* value = std::getenv("APS5_SPIRV_BDA_UNIFORM");
         if (value == nullptr) return 0u;
         const auto parsed = static_cast<std::uint32_t>(std::min<unsigned long>(std::strtoul(value, nullptr, 10), 3ul));
-        std::fprintf(stderr, "[spirv] APS5_SPIRV_BDA_UNIFORM=%u: BDA lookups %s\n", parsed, parsed == 0u ? "unchanged" : parsed == 1u ? "validate the table once" : parsed == 2u ? "validate once, keep the last range" : "validate once, keep the last range, search once per subgroup for uniform bases");
+        std::fprintf(stderr, "[spirv] APS5_SPIRV_BDA_UNIFORM=%u: BDA lookups %s\n", parsed, parsed == 0u ? "unchanged" : parsed == 1u ? "check the table header in one branch" : parsed == 2u ? "check the header in one branch, skip the call inside the last read range" : "check the header in one branch, skip the call inside the last read range, search once per subgroup for uniform bases");
         return parsed;
     }();
     return stage;
@@ -267,14 +258,34 @@ void SetBdaUniformStageForTests(int stage) {
 }
 
 void EmitBdaLookupInit(SpirvEmitterState& state) {
-    if (state.bdaTableStateVariable == 0) return;
+    if (state.bdaLastRangeVariables[0] == 0) return;
     // Stored in the entry function, so the variables stay Private: a pass moving a Private variable that only
     // one function uses into that function would reset the state on every call.
-    state.module.AddFunction(spv::OpStore, state.bdaTableStateVariable, ConstantU32(state, 0u));
-    state.module.AddFunction(spv::OpStore, state.bdaTableCountVariable, ConstantU32(state, 0u));
-    if (state.bdaLastRangeVariables[0] == 0) return;
-    for (std::uint32_t word = 0; word < 3u; ++word) state.module.AddFunction(spv::OpStore, state.bdaLastRangeVariables[word], BdaConstant(state, 0u));
-    state.module.AddFunction(spv::OpStore, state.bdaLastRangeVariables[3], ConstantU32(state, 0u));
+    for (const auto variable : state.bdaLastRangeVariables) state.module.AddFunction(spv::OpStore, variable, BdaConstant(state, 0u));
+}
+
+std::uint32_t EmitBdaLookupCall(SpirvEmitterState& state, std::uint32_t lookup, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction) {
+    const auto u64 = TypeScalarU64(state);
+    const bool ranged = state.bdaLastRangeVariables[0] != 0 && lookup != state.bdaWritePointerFunction && lookup != state.bdaUniformWritePointerFunction;
+    if (!ranged) {
+        const auto physical = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionCall, u64, physical, lookup, address, bytes, instruction);
+        return physical;
+    }
+    // Read lookups found every remembered range readable, so a hit needs no permission check.
+    const BdaRange last{LoadPrivate(state, u64, state.bdaLastRangeVariables[0]), LoadPrivate(state, u64, state.bdaLastRangeVariables[1]), LoadPrivate(state, u64, state.bdaLastRangeVariables[2])};
+    const auto cached = TranslateBdaRange(state, last, address, bytes);
+    return EmitValueIfElse(state, cached.first, u64, [&] { return cached.second; }, [&] {
+        const auto found = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionCall, TypeBdaRangedResult(state), found, lookup, address, bytes, instruction);
+        std::array<std::uint32_t, 4> words{};
+        for (std::uint32_t word = 0; word < words.size(); ++word) {
+            words[word] = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, u64, words[word], found, word);
+            if (word != 0) state.module.AddFunction(spv::OpStore, state.bdaLastRangeVariables[word - 1], words[word]);
+        }
+        return words[0];
+    });
 }
 
 static std::uint32_t DefineBdaNoteWrite(SpirvEmitterState& state) {

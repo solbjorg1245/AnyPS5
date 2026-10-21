@@ -53,8 +53,7 @@ BdaLookups LookupsFor(const SpirvValueEmitContext& ctx, const IrValue& inst) {
 std::uint32_t EmitBdaByte(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t instruction, std::uint32_t accessMask, std::uint32_t lookup) {
     const auto byteType = state.module.Type(spv::OpTypeInt, 8u, 0u);
     const auto bytePointer = TypePointer(state, spv::StorageClassPhysicalStorageBuffer, byteType);
-    const auto physical = state.module.AllocateId();
-    state.module.AddFunction(spv::OpFunctionCall, TypeScalarU64(state), physical, lookup, guest, ConstantU32(state, 1u), instruction);
+    const auto physical = EmitBdaLookupCall(state, lookup, guest, ConstantU32(state, 1u), instruction);
     if (state.bdaStopsInvocations) {
         StopBdaInvocationIf(state, Binary(state, spv::OpIEqual, TypeBool(state), physical, BdaConstant(state, 0u)));
         const auto pointer = state.module.AllocateId();
@@ -175,8 +174,7 @@ void EmitBdaWrite(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t
     const auto unaligned = Binary(state, spv::OpINotEqual, TypeBool(state), Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), address, BdaConstant(state, 3u)), BdaConstant(state, 0u));
     EmitIfCondition(state, unaligned, [&] { RecordBdaFault(state, address, ConstantU32(state, 4u), instruction, BdaAbi::FaultReason::Unaligned); });
     EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), unaligned), [&] {
-        const auto physical = state.module.AllocateId();
-        state.module.AddFunction(spv::OpFunctionCall, TypeScalarU64(state), physical, writeLookup, address, ConstantU32(state, 4u), instruction);
+        const auto physical = EmitBdaLookupCall(state, writeLookup, address, ConstantU32(state, 4u), instruction);
         EmitIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), physical, BdaConstant(state, 0u)), [&] {
             const auto pointer = state.module.AllocateId();
             state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, physical);
@@ -229,8 +227,7 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
         readBytes(values);
         return values;
     }
-    const auto physical = state.module.AllocateId();
-    state.module.AddFunction(spv::OpFunctionCall, u64, physical, lookups.probe, addresses[first], ConstantU32(state, (last - first + 1u) * 4u), instruction);
+    const auto physical = EmitBdaLookupCall(state, lookups.probe, addresses[first], ConstantU32(state, (last - first + 1u) * 4u), instruction);
     const auto mapped = Binary(state, spv::OpINotEqual, TypeBool(state), physical, BdaConstant(state, 0u));
     const auto aligned = Binary(state, spv::OpIEqual, TypeBool(state), Binary(state, spv::OpBitwiseAnd, u64, physical, BdaConstant(state, 3u)), BdaConstant(state, 0u));
     const auto wide = Binary(state, spv::OpLogicalAnd, TypeBool(state), mapped, aligned);
