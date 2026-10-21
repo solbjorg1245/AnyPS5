@@ -257,6 +257,9 @@ struct ComputePipelineObjects {
     VkShaderModule module = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    // APS5_PREPARE_PIPELINE: the descriptor cache's set layout the pipeline layout was made with
+    // before the dispatch's build (null: made in the dispatch from its build's layout).
+    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
     ~ComputePipelineObjects() {
         if (pipeline != VK_NULL_HANDLE) destroyPipeline(device, pipeline, nullptr);
         if (layout != VK_NULL_HANDLE) destroyLayout(device, layout, nullptr);
@@ -2821,6 +2824,76 @@ bool NoPresync() {
     return noPresync;
 }
 
+// APS5_PREPARE_PIPELINE=1 (R-STALLS, default off): a compute variant's first dispatch makes its
+// pipeline in PrepareDispatch, without the mutex, instead of in the dispatch under it. A new
+// shader's vkCreateComputePipelines takes 27-390 ms and up to ~30 s for the 125k-413k-word ones
+// (t1506, t1513): under the mutex every queue and the frame's draws waited behind it.
+bool PreparePipeline() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_PREPARE_PIPELINE");
+        return text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return enabled;
+}
+
+// APS5_PROFILE_DRAW: compute pipelines made before the mutex (PreparePipeline) and in the dispatch
+// under it, as [pipeline-prepare] every 10 s.
+struct PipelinePrepareCounters {
+    std::atomic<std::uint64_t> prepared{0};
+    std::atomic<std::uint64_t> preparedUs{0};
+    std::atomic<std::uint64_t> preparedMaxUs{0};
+    // Another prepare of the variant mapped its pipeline first (this one's was dropped).
+    std::atomic<std::uint64_t> raced{0};
+    // No descriptor-cache layout for the bindings, or a Vulkan call failed: left to the dispatch.
+    std::atomic<std::uint64_t> underived{0};
+    std::atomic<std::uint64_t> failed{0};
+    std::atomic<std::uint64_t> locked{0};
+    std::atomic<std::uint64_t> lockedUs{0};
+    std::atomic<std::uint64_t> lockedMaxUs{0};
+    // A prepared pipeline whose set layout is not the build's: the dispatch made its own.
+    std::atomic<std::uint64_t> mismatched{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+PipelinePrepareCounters& PipelinePrepares() {
+    static PipelinePrepareCounters counters;
+    return counters;
+}
+
+void NotePipelineMade(bool prepared, std::chrono::steady_clock::time_point started) {
+    auto& counters = PipelinePrepares();
+    const auto us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+    (prepared ? counters.prepared : counters.locked).fetch_add(1, std::memory_order_relaxed);
+    (prepared ? counters.preparedUs : counters.lockedUs).fetch_add(us, std::memory_order_relaxed);
+    auto& maximum = prepared ? counters.preparedMaxUs : counters.lockedMaxUs;
+    auto seen = maximum.load(std::memory_order_relaxed);
+    while (us > seen && !maximum.compare_exchange_weak(seen, us, std::memory_order_relaxed)) {
+    }
+}
+
+void ReportPipelinePrepares() {
+    auto& counters = PipelinePrepares();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counters.lastReport.load();
+    if (last == 0) {
+        counters.lastReport.compare_exchange_strong(last, nowMs);
+        return;
+    }
+    if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto prepared = take(counters.prepared);
+    const auto preparedUs = take(counters.preparedUs);
+    const auto preparedMaxUs = take(counters.preparedMaxUs);
+    const auto raced = take(counters.raced);
+    const auto underived = take(counters.underived);
+    const auto failed = take(counters.failed);
+    const auto locked = take(counters.locked);
+    const auto lockedUs = take(counters.lockedUs);
+    const auto lockedMaxUs = take(counters.lockedMaxUs);
+    const auto mismatched = take(counters.mismatched);
+    std::fprintf(stderr, "[pipeline-prepare] (10 s): %llu compute pipelines made before the GPU mutex in %.1f ms (max %.1f ms), %llu made twice by racing prepares, %llu without a cached set layout, %llu failed; made in the dispatch under the mutex: %llu in %.1f ms (max %.1f ms); %llu set-layout mismatches (APS5_PREPARE_PIPELINE %s)\n", prepared, static_cast<double>(preparedUs) / 1000.0, static_cast<double>(preparedMaxUs) / 1000.0, raced, underived, failed, locked, static_cast<double>(lockedUs) / 1000.0, static_cast<double>(lockedMaxUs) / 1000.0, mismatched, PreparePipeline() ? "on" : "off");
+}
+
 // Debug aid: APS5_SYNC_DISPATCH=1 waits for every dispatch, as before batching.
 bool SyncEachDispatch() {
     static const bool syncEachDispatch = std::getenv("APS5_SYNC_DISPATCH") != nullptr;
@@ -3345,8 +3418,73 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
         prepared->presyncSerial = presync(surfaces);
         phase(PreparedDispatch::PreparePresync);
     }
-    if (profile) prepared->prepareMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    // After stage A and the pre-sync: a build that throws above leaves no pipeline made for nothing.
+    if (PreparePipeline()) preparePipeline(shader, context);
+    if (profile) {
+        ReportPipelinePrepares();
+        prepared->prepareMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    }
     return prepared;
+}
+
+void VulkanDevice::preparePipeline(const ShaderRecompiler::RecompileResult& shader, const Graphics::Context& context) {
+    if (shader.variantId == 0) return;
+    // The dispatch's key and push range (see dispatch): the map entry it then finds.
+    const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
+    const auto pushStages = Graphics::PushConstantStages(shaders);
+    if (pushStages != 0 && state->properties.limits.maxPushConstantsSize < Graphics::PipelinePushConstantBytes) return;
+    const std::uint64_t pipelineKey = (shader.variantId << 1u) | (pushStages != 0 ? 1u : 0u);
+    {
+        std::lock_guard pipelines(state->computePipelinesMutex);
+        if (state->computePipelines.find(pipelineKey) != state->computePipelines.end()) return;
+    }
+    auto& counters = PipelinePrepares();
+    const auto started = std::chrono::steady_clock::now();
+    // The descriptor cache's layout for the bindings is the one every build of the variant holds,
+    // so the pipeline layout made with it is the dispatch's (which checks the handle).
+    const auto setLayout = Graphics::ShaderResources::CachedComputeLayout(context, shaders[0]);
+    if (setLayout == VK_NULL_HANDLE) {
+        counters.underived.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    auto objects = std::make_shared<ComputePipelineObjects>();
+    try {
+        objects->device = state->device;
+        objects->destroyModule = state->DeviceFunction<PFN_vkDestroyShaderModule>("vkDestroyShaderModule");
+        objects->destroyLayout = state->DeviceFunction<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout");
+        objects->destroyPipeline = state->DeviceFunction<PFN_vkDestroyPipeline>("vkDestroyPipeline");
+        objects->setLayout = setLayout;
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = shader.spirv.size() * sizeof(std::uint32_t);
+        moduleInfo.pCode = shader.spirv.data();
+        check(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule")(state->device, &moduleInfo, nullptr, &objects->module), "vkCreateShaderModule");
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::PipelinePushConstantBytes};
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.setLayoutCount = 1;
+        layoutInfo.pSetLayouts = &setLayout;
+        layoutInfo.pushConstantRangeCount = pushStages != 0 ? 1 : 0;
+        layoutInfo.pPushConstantRanges = pushStages != 0 ? &push : nullptr;
+        check(state->DeviceFunction<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(state->device, &layoutInfo, nullptr, &objects->layout), "vkCreatePipelineLayout");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = objects->module;
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.layout = objects->layout;
+        check(state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(state->device, context.pipelineCache, 1, &pipelineInfo, nullptr, &objects->pipeline), "vkCreateComputePipelines");
+    } catch (const std::exception&) {
+        // The dispatch makes it under the mutex as without the switch, and reports a failure there.
+        counters.failed.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    bool inserted = false;
+    {
+        // Find-or-insert, as the dispatch does: a racing prepare's or dispatch's objects stay.
+        std::lock_guard pipelines(state->computePipelinesMutex);
+        inserted = state->computePipelines.try_emplace(pipelineKey, objects).second;
+    }
+    if (!inserted) counters.raced.fetch_add(1, std::memory_order_relaxed);
+    NotePipelineMade(true, started);
 }
 
 namespace {
@@ -4093,7 +4231,17 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     }
     timing.Mark("shader_resources");
     timer.phase(PhaseResources);
+    // APS5_PREPARE_PIPELINE: a prepared pipeline's layout is the descriptor cache's for the
+    // variant's bindings, which this build's must then be; one that is not gets its own pipeline
+    // below, kept out of the map (not expected: counted on [pipeline-prepare]).
+    bool ownPipeline = false;
+    if (objects != nullptr && objects->setLayout != VK_NULL_HANDLE && objects->setLayout != resources->Layout()) {
+        PipelinePrepares().mismatched.fetch_add(1, std::memory_order_relaxed);
+        objects = nullptr;
+        ownPipeline = true;
+    }
     if (objects == nullptr) {
+        const auto pipelineStart = std::chrono::steady_clock::now();
         objects = std::make_shared<ComputePipelineObjects>();
         objects->device = state->device;
         objects->destroyModule = state->DeviceFunction<PFN_vkDestroyShaderModule>("vkDestroyShaderModule");
@@ -4121,13 +4269,17 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] creating a pipeline for %zu SPIR-V words (program 0x%llx)\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress));
         check(state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(state->device, context.pipelineCache, 1, &pipelineInfo, nullptr, &objects->pipeline), "vkCreateComputePipelines");
         timing.Mark("pipeline_create");
-        if (pipelineKey != 0) {
+        if (pipelineKey != 0 && !ownPipeline) {
             // Find-or-insert: objects another dispatch of the variant mapped meanwhile serve this
             // one too (this call's go with the batch that keeps them).
             std::lock_guard pipelines(state->computePipelinesMutex);
             objects = state->computePipelines.try_emplace(pipelineKey, objects).first->second;
         }
         timer.phase(PhasePipeline);
+        if (profile) {
+            NotePipelineMade(false, pipelineStart);
+            ReportPipelinePrepares();
+        }
     }
     // Recorded into the device's open batch: the CPU moves on to the next command while the GPU
     // works; the batch is waited for where the guest expects results (labels, flips, CPU reads).

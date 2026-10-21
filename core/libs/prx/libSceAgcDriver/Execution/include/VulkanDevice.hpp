@@ -364,6 +364,9 @@ private:
     IndirectOutcome dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipe);
     // The stage-A pre-sync over `surfaces` (see PrepareDispatch): the serial waited for, 0 none.
     std::uint64_t presync(std::span<const std::pair<std::uint64_t, std::uint64_t>> surfaces);
+    // APS5_PREPARE_PIPELINE (see PrepareDispatch): the variant's compute pipeline made before the
+    // mutex when the map lacks it.
+    void preparePipeline(const ShaderRecompiler::RecompileResult& shader, const Graphics::Context& context);
     // A DISPATCH_INDIRECT's argument path (see DispatchIndirect): GPU-side from the host import, or
     // the counts read on the CPU (the record then continues as a direct dispatch).
     void decideIndirect(RecordedDispatch& record, IndirectOutcome& outcome, char* groupsText);

@@ -179,6 +179,11 @@ public:
     ShaderResources(const ShaderResources&) = delete;
     ShaderResources& operator=(const ShaderResources&) = delete;
     VkDescriptorSetLayout Layout() const;
+    // The set layout a compute build of `compute` gets (buildPrepare's, which follows from the
+    // binding list alone), from the descriptor cache: the same handle the build will hold.
+    // VK_NULL_HANDLE without the cache (APS5_NO_LAYOUT_CACHE) or for bindings the build refuses.
+    // APS5_PREPARE_PIPELINE makes a variant's pipeline with it before the dispatch's build.
+    static VkDescriptorSetLayout CachedComputeLayout(const Context& context, const CompiledShader& compute);
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
     // Binds `set` in place of this object's own: a set of the same layout (ForkData's).
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, VkDescriptorSet set) const;

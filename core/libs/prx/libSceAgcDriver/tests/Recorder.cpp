@@ -3981,6 +3981,56 @@ void setMemoTests(const Device& device, Recorder& recorder) {
     std::cout << "set memo checked\n";
 }
 
+// APS5_PREPARE_PIPELINE: the set layout CachedComputeLayout derives from a compute shader's
+// bindings is the handle a build of the shader holds, and nothing for what the build refuses.
+void cachedComputeLayoutTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.guestDescriptor = {1, 2, 3, 4};
+    program.bindings.push_back(binding);
+    auto wider = program;
+    wider.bindings.push_back(binding);
+    wider.bindings[1].binding = 1;
+    wider.bindings[1].role = ShaderRecompiler::DescriptorRole::ShaderData;
+    auto refused = program;
+    refused.bindings[0].role = ShaderRecompiler::DescriptorRole::GuestImages;
+    const CompiledShader built{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    const CompiledShader widerShader{ShaderRecompiler::ShaderStage::Compute, &wider, 0};
+    const CompiledShader refusedShader{ShaderRecompiler::ShaderStage::Compute, &refused, 0};
+    const CompiledShader fragment{ShaderRecompiler::ShaderStage::Fragment, &program, 0};
+    auto uncached = context;
+    uncached.descriptorCache = nullptr;
+    Require(ShaderResources::CachedComputeLayout(uncached, built) == VK_NULL_HANDLE, "a set layout was derived without the descriptor cache");
+    {
+        auto layoutContext = context;
+        DescriptorCache cache(layoutContext);
+        layoutContext.descriptorCache = &cache;
+        Recorder layoutRecorder(layoutContext);
+        layoutRecorder.Activate();
+        const auto derived = ShaderResources::CachedComputeLayout(layoutContext, built);
+        Require(derived != VK_NULL_HANDLE, "no set layout was derived for a storage buffer binding");
+        ShaderResources resources(layoutContext, built);
+        Require(resources.Layout() == derived, "the derived set layout is not the build's");
+        const auto widerLayout = ShaderResources::CachedComputeLayout(layoutContext, widerShader);
+        Require(widerLayout != VK_NULL_HANDLE && widerLayout != derived, "another binding list derived the same set layout");
+        ShaderResources widerResources(layoutContext, widerShader);
+        Require(widerResources.Layout() == widerLayout, "the derived set layout of two bindings is not the build's");
+        Require(ShaderResources::CachedComputeLayout(layoutContext, refusedShader) == VK_NULL_HANDLE, "a set layout was derived for a binding the build refuses");
+        Require(ShaderResources::CachedComputeLayout(layoutContext, fragment) == VK_NULL_HANDLE, "a set layout was derived for a fragment shader");
+        layoutRecorder.Submit();
+        device.WaitQueue();
+        layoutRecorder.Sync();
+    }
+    recorder.Activate();
+    std::cout << "cached compute layout checked\n";
+}
+
 }
 
 class SampleProgram {
@@ -7412,6 +7462,7 @@ int main() {
         resultCopyCostTests();
         dataRefreshTests(device, recorder);
         setMemoTests(device, recorder);
+        cachedComputeLayoutTests(device, recorder);
         minLodTests(device, recorder);
         firstLayerViewTests(device, recorder);
         metadataPassTests(device, recorder);

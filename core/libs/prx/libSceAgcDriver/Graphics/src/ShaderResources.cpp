@@ -1443,6 +1443,31 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
     }
 }
 
+VkDescriptorSetLayout ShaderResources::CachedComputeLayout(const Context& context, const CompiledShader& compute) {
+    static const bool noLayoutCache = std::getenv("APS5_NO_LAYOUT_CACHE") != nullptr;
+    if (context.descriptorCache == nullptr || noLayoutCache || compute.stage != ShaderRecompiler::ShaderStage::Compute || compute.program == nullptr) return VK_NULL_HANDLE;
+    // buildPrepare's layout walk: one layout binding per shader binding, in order, its type from
+    // the kind (addImageBinding for the image roles); what the build would refuse stays unmade.
+    const VkShaderStageFlags flags = VulkanStage(compute.stage);
+    std::vector<VkDescriptorSetLayoutBinding> description;
+    std::vector<std::uint32_t> key;
+    for (const auto& binding : compute.program->bindings) {
+        using Role = ShaderRecompiler::DescriptorRole;
+        using Kind = ShaderRecompiler::DescriptorKind;
+        const bool bufferRole = binding.role == Role::BdaPagetable || binding.role == Role::FaultBuffer || binding.role == Role::GuestBuffers || binding.role == Role::ShaderData || binding.role == Role::FlattenedSrt;
+        VkDescriptorType type;
+        if (binding.role == Role::GuestImages && binding.kind == Kind::StorageImage) type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        else if (binding.role == Role::GuestImages && binding.kind == Kind::SampledImage) type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        else if (binding.role == Role::GuestSamplers && binding.kind == Kind::Sampler) type = VK_DESCRIPTOR_TYPE_SAMPLER;
+        else if (bufferRole && binding.kind == Kind::StorageBuffer) type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        else return VK_NULL_HANDLE;
+        if (binding.count == 0) return VK_NULL_HANDLE;
+        description.push_back({binding.binding, type, binding.count, flags, nullptr});
+        key.insert(key.end(), {binding.binding, static_cast<std::uint32_t>(type), binding.count, flags});
+    }
+    return context.descriptorCache->Layout(key, description);
+}
+
 void ShaderResources::buildComplete() {
     const auto stageStart = std::chrono::steady_clock::now();
     phaseStart = stageStart;
