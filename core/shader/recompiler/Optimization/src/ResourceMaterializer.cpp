@@ -37,6 +37,18 @@ bool MaterializeProfiled() {
     return profile;
 }
 
+// APS5_TABLE_DECODE_NOTHROW=1 (R-STALLS, default off): a bindless table entry the image decoder
+// rejects is padded null without a throw (decodeImageDescriptorInto) instead of a caught one. The
+// [throws] census of t1516 counted ~300-600 'sampled image descriptor uses an unsupported format'
+// per 10 s from resolveTableImage, about 1 ms each in the unwinder; the entry ends the same either way.
+bool TableDecodeNoThrow() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_TABLE_DECODE_NOTHROW");
+        return text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return enabled;
+}
+
 struct DecodedImage {
     IrTextureNumericClass numericClass = IrTextureNumericClass::Unsupported;
     RdnaImageDimension dimension = RdnaImageDimension::Unknown;
@@ -79,6 +91,23 @@ std::uint32_t descriptorImageSwizzle(const DescriptorValue& descriptor) {
 
 bool descriptorIsCube(const DescriptorValue& descriptor) {
     return rawImageType(descriptor) == ImageType::Cube;
+}
+
+// The image types descriptorDimension maps (it throws for the others).
+bool supportedImageType(const DescriptorValue& descriptor) {
+    switch (rawImageType(descriptor)) {
+        case ImageType::Color1D:
+        case ImageType::Color1DArray:
+        case ImageType::Color3D:
+        case ImageType::Cube:
+        case ImageType::Color2DArray:
+        case ImageType::Color2DMsaaArray:
+        case ImageType::Color2D:
+        case ImageType::Color2DMsaa:
+            return true;
+        default:
+            return false;
+    }
 }
 
 RdnaImageDimension descriptorDimension(const DescriptorValue& descriptor, RdnaImageDimension requested) {
@@ -176,34 +205,35 @@ std::uint32_t storageMipCount(const ImageResource& base, const DescriptorValue& 
     return mipBase <= mipLast ? mipLast - mipBase + 1u : 0u;
 }
 
-DecodedImage decodeImageDescriptor(const DescriptorValue& descriptor, const ImageResource& base) {
-    DecodedImage decoded;
+// decodeImageDescriptor's body: the error it would throw, or nullptr with `decoded` filled.
+const char* decodeImageDescriptorInto(const DescriptorValue& descriptor, const ImageResource& base, DecodedImage& decoded) {
     decoded.mipCount = storageMipCount(base, descriptor);
     if (decoded.mipCount == 0u) {
-        throw std::runtime_error("storage image descriptor has an invalid mip range");
+        return "storage image descriptor has an invalid mip range";
     }
     if (nullImageDescriptor(descriptor)) {
         decoded.numericClass = base.atomic ? IrTextureNumericClass::Uint : IrTextureNumericClass::Float;
         decoded.dimension = RdnaImageDimension::Dim2D;
         decoded.cube = false;
-        return decoded;
+        return nullptr;
     }
     if (base.resourceClass == ImageResourceClass::None || (base.atomic && base.resourceClass != ImageResourceClass::Storage)) {
-        throw std::runtime_error("image resource has an invalid class");
+        return "image resource has an invalid class";
     }
     if (!validImageDescriptor(descriptor, base.r128)) {
-        throw std::runtime_error("image descriptor is invalid");
+        return "image descriptor is invalid";
     }
+    if (!supportedImageType(descriptor)) return "image descriptor has an unsupported type";
     decoded.dimension = descriptorDimension(descriptor, base.dimension);
     decoded.cube = descriptorIsCube(descriptor);
     const auto format = rawImageFormat(descriptor);
     if (base.atomic && format != IrBufferFormat::Format32UInt) {
-        throw std::runtime_error("atomic image descriptor uses an unsupported format");
+        return "atomic image descriptor uses an unsupported format";
     }
     const bool storage = base.resourceClass == ImageResourceClass::Storage;
     decoded.fmask = IsFmaskTextureFormat(format);
     if (decoded.fmask && (storage || base.depthCompare || base.indirectRoot != ImageResource::NoIndirectImage)) {
-        throw std::runtime_error("FMASK requires a direct sampled image load");
+        return "FMASK requires a direct sampled image load";
     }
     decoded.conversionFormat = RemapTextureFormat(format) != format ? format : IrBufferFormat::Invalid;
     if (storage || decoded.conversionFormat != IrBufferFormat::Invalid) {
@@ -220,14 +250,20 @@ DecodedImage decodeImageDescriptor(const DescriptorValue& descriptor, const Imag
     }
     if (storage) {
         if ((!rawSintStorage && decoded.numericClass == IrTextureNumericClass::Sint) || decoded.numericClass == IrTextureNumericClass::Unsupported) {
-            throw std::runtime_error("storage image descriptor uses an unsupported format");
+            return "storage image descriptor uses an unsupported format";
         }
         if (rawSintStorage) {
             decoded.numericClass = IrTextureNumericClass::Uint;
         }
     } else if (decoded.numericClass == IrTextureNumericClass::Unsupported || (base.depthCompare && decoded.numericClass != IrTextureNumericClass::Float)) {
-        throw std::runtime_error("sampled image descriptor uses an unsupported format");
+        return "sampled image descriptor uses an unsupported format";
     }
+    return nullptr;
+}
+
+DecodedImage decodeImageDescriptor(const DescriptorValue& descriptor, const ImageResource& base) {
+    DecodedImage decoded;
+    if (const char* error = decodeImageDescriptorInto(descriptor, base, decoded)) throw std::runtime_error(error);
     return decoded;
 }
 
@@ -547,7 +583,9 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         }
         DecodedImage decoded;
         bool usable = !nullImageDescriptor(candidate) && validImageDescriptor(candidate, image.r128) && imageAddressBelowUserLimit(candidate);
-        if (usable) {
+        if (usable && TableDecodeNoThrow()) {
+            usable = decodeImageDescriptorInto(candidate, image, decoded) == nullptr;
+        } else if (usable) {
             try {
                 decoded = decodeImageDescriptor(candidate, image);
             } catch (const std::exception&) {
