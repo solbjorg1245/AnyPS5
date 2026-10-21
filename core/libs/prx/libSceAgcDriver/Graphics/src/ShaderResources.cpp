@@ -4341,9 +4341,13 @@ bool FillsDeferredFlat(std::span<const CompiledShader> shaders) {
 }
 
 bool ShaderResources::SetMemo() {
+    // On by default since s64 (t1341 verify 0 mismatches, t1397-t1405 same-binary A/B, a reload check
+    // with the verify knobs); APS5_SET_MEMO=0 is the old path.
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_SET_MEMO");
-        return value != nullptr && value[0] == '1';
+        const bool on = value == nullptr || value[0] != '0';
+        std::fprintf(stderr, "[draws] set memo (APS5_SET_MEMO): %s\n", on ? "on" : "off (APS5_SET_MEMO=0)");
+        return on;
     }();
     return enabled;
 }

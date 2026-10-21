@@ -543,8 +543,10 @@ bool RecordPipeDispatchActive() {
 
 bool RecordPipeEpochActive() {
     static const bool active = [] {
+        // On by default since s64 (t1397-t1405 same-binary A/B, with and without APS5_SET_MEMO; a reload
+        // check with the verify knobs); APS5_RECORD_PIPE_EPOCH=0 is the old path (B never bumps).
         const char* value = std::getenv("APS5_RECORD_PIPE_EPOCH");
-        if (value == nullptr || std::strcmp(value, "1") != 0 || !RecordPipeActive()) return false;
+        if ((value != nullptr && std::strcmp(value, "0") == 0) || !RecordPipeActive()) return false;
         std::fprintf(stderr, "[pipe] queue 0 recording pipe: B collect epochs follow A's\n");
         return true;
     }();

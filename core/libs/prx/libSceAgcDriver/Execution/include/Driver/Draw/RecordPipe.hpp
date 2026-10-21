@@ -33,8 +33,8 @@ bool RecordPipeActive();
 // and APS5_ASPECT_PROBE (their state is A's).
 bool RecordPipeDispatchActive();
 
-// APS5_RECORD_PIPE_EPOCH=1 (read once, only with the pipe on; default off; parallel-recording-s4-plan.md
-// S4.1): B's collect epoch follows A's. A stamps each item with its thread's epoch at hand-over
+// APS5_RECORD_PIPE_EPOCH (read once, only with the pipe on; default on since s64, =0 turns it off;
+// parallel-recording-s4-plan.md S4.1): B's collect epoch follows A's. A stamps each item with its thread's epoch at hand-over
 // (GuestMemory::ThreadCollectEpoch); B bumps its own before an item whose stamp differs from the
 // previous item's, so B reuses a walk (the collect memo) only among the items A handed over in one
 // epoch: the reuse A had while it recorded them itself. Without it B never bumps (a fresh epoch per
