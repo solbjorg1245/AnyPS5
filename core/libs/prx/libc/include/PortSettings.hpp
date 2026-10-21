@@ -55,6 +55,8 @@
 //                                                   upscales instead of port (docs/design/dlss.md S4)
 //   UpscalerQuality = native  APS5_UPSCALER_QUALITY native 2688x1512, quality 2560x1440, balanced 2224x1252 or
 //                                                   performance 1920x1080 rendered, 3840x2160 out (PlanUpscaler)
+//                             APS5_UPSCALER_TARGETS=0 (environment only): mode 5's shared render targets keep
+//                             2688x1512 (only the tier table's render entries take the preset, as before s64)
 //   GameDir = "D:\PPSA01341-app0"                   the player's dump (app0), set by the launcher; the game ignores it
 //   DeluxeEdition = auto      APS5_DELUXE_EDITION   the Deluxe Edition add-on, owned when the dump holds it
 //                                                   (AddonContent.hpp); off answers 'not owned' even then
@@ -98,6 +100,8 @@ struct Settings {
     bool resolution4kUi = true;
     Upscaler upscaler = Upscaler::Off;
     UpscalerQuality upscalerQuality = UpscalerQuality::Native;
+    // Mode 5's shared render targets take the preset's size too (PlanUpscaler); APS5_UPSCALER_TARGETS=0 keeps 2688x1512.
+    bool upscalerTargets = true;
     // APS5_UPSCALER_SETTINGS (ApplyEnvironment, and Parse's argument for the file): Upscaler = port applies.
     bool upscalerSettings = false;
     // Upscaler as written under APS5_UPSCALER_SETTINGS (fsr and dlss run as port in `upscaler`): what
@@ -465,6 +469,8 @@ inline void ApplyEnvironment(Settings& settings, const std::function<const char*
         const char* value = lookup(variable);
         if (value != nullptr && value[0] != '\0') settings.*field = std::string_view(value) != "0";
     }
+    // The upscaler's shared render targets (s64 S3b): APS5_UPSCALER_TARGETS=0 leaves them at mode 5's 2688x1512.
+    if (const char* value = lookup("APS5_UPSCALER_TARGETS"); value != nullptr && value[0] != '\0') settings.upscalerTargets = std::string_view(value) != "0";
     // Native aspect's 4K UI (s61): APS5_NATIVE_ASPECT_4K_UI=0 or APS5_NO_NATIVE_ASPECT_4K_UI=1 (any value
     // but 0) brings back the smallest slot that holds the render size (WantsPerf at 1280x800).
     if (const char* value = lookup("APS5_NATIVE_ASPECT_4K_UI"); value != nullptr && value[0] != '\0') settings.nativeAspect4kUi = std::string_view(value) != "0";
@@ -725,9 +731,11 @@ inline NativeAspectPlan PlanResolution4kUi(const Settings& settings) {
 inline constexpr NativeAspectSlot TrinitySlot{2688, 1512, 3840, 2160, 5, "WantsTrinity"};
 
 // UpscalerQuality below native (docs/design/dlss.md "Sizes"): mode 5's render entries rewritten to the
-// preset's size, as PlanResolution4kUi does for WantsHigh. SetMode loads the shared targets' 2688x1512
-// apart from the table, so they keep it and the views render a top-left sub-rectangle, which the hand-over's
-// render size names; output and post stay 3840x2160. Native renders the slot's own size: no rewrite.
+// preset's size, as PlanResolution4kUi does for WantsHigh, and (upscalerTargets, part 2: NativeAspectPatch's
+// TrinitySites) the shared render targets too: SetMode and Init load mode 5's 2688x1512 apart from the table,
+// and with the table alone the frame still rendered and handed over 2688x1512 (s64 t1460-t1463: GPU busy
+// flat across the presets). The display buffer, output and post stay 3840x2160. Native renders the slot's
+// own size: no rewrite.
 inline NativeAspectPlan PlanUpscaler(const Settings& settings) {
     NativeAspectPlan plan;
     if (!UpscalerActive(settings) || settings.upscalerQuality == UpscalerQuality::Native) return plan;
@@ -735,6 +743,10 @@ inline NativeAspectPlan PlanUpscaler(const Settings& settings) {
     plan.slot = &TrinitySlot;
     plan.renderWidth = preset.width;
     plan.renderHeight = preset.height;
+    if (settings.upscalerTargets) {
+        plan.sharedWidth = preset.width;
+        plan.sharedHeight = preset.height;
+    }
     plan.aspectWidth = 16;
     plan.aspectHeight = 9;
     plan.uiOnly = true;

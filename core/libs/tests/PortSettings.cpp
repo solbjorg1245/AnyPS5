@@ -643,7 +643,13 @@ static void TestUpscalerSettings() {
     const auto performance = parsed("Resolution = 1280x720\nUpscaler = port\nUpscalerQuality = performance\n", true);
     const auto plan = PortSettings::PlanTierRewrite(performance);
     Require(plan.Active() && plan.uiOnly && plan.slot->mode == 5 && std::string(plan.slot->convar) == "WantsTrinity" && plan.renderWidth == 1920 && plan.renderHeight == 1080
-            && plan.Aspect() == 16.0f / 9.0f && !plan.SharedNative() && !plan.DisplayNative(), "performance: the slot-5 plan");
+            && plan.Aspect() == 16.0f / 9.0f && plan.SharedNative() && plan.sharedWidth == 1920 && plan.sharedHeight == 1080 && !plan.DisplayNative(),
+        "performance: the slot-5 plan, shared targets at the preset (TrinitySites)");
+    auto tableOnly = performance;
+    PortSettings::ApplyEnvironment(tableOnly, [](const char* name) { return std::string_view(name) == "APS5_UPSCALER_TARGETS" ? "0" : nullptr; });
+    const auto tableOnlyPlan = PortSettings::PlanTierRewrite(tableOnly);
+    Require(!tableOnly.upscalerTargets && tableOnlyPlan.Active() && tableOnlyPlan.renderWidth == 1920 && !tableOnlyPlan.SharedNative(),
+        "APS5_UPSCALER_TARGETS=0: the table alone, the shared targets keep 2688x1512");
     Require(!PortSettings::PlanResolution4kUi(performance).Active(), "no 4K UI rewrite with the upscaler");
     Require(PortSettings::GameArgs(performance) == std::vector<std::string>{"+r_Wants4K=WantsTrinity"}, "performance: one r_Wants4K");
     const auto writes = PortSettings::TierTableWrites(plan, true);

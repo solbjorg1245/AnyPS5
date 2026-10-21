@@ -169,6 +169,8 @@ struct TargetSites {
     LoadSite shared;
     LoadSite display;
     std::array<ImmediateSite, 6> immediates;
+    // Init's own load of the shared pair (va 0: none), for a title that is already in the mode at Init.
+    LoadSite init;
 };
 
 // WantsPerf (1) and WantsHigh (3); WantsSuperHigh (4) loads one pair for both (its `shared` site, the
@@ -177,9 +179,14 @@ constexpr std::array<ImmediateSite, 6> Display4kSites{{{0x14091af74, 0xbf, 3840,
     {0x14091b066, 0xbe, 2160, true}, {0x1409956d7, 0xb9, 3840, false}, {0x140995707, 0xb9, 2160, true}}};
 constexpr TargetSites PerfSites{{0x14091a663, 0x05, 0x142509230, 1600, 900}, {0x14091a65b, 0x0d, 0x142507810, 1920, 1080},
     {{{0x14091b00e, 0xba, 1920, false}, {0x14091b013, 0xb9, 1080, true}, {0x14091b0b4, 0xba, 1920, false}, {0x14091b0b9, 0xb9, 1080, true},
-      {0x1409956e8, 0xb8, 1920, false}, {0x140995718, 0xb8, 1080, true}}}};
-constexpr TargetSites HighSites{{0x14091a67f, 0x05, 0x142509550, 2560, 1440}, {0x14091a677, 0x0d, 0x142504830, 3840, 2160}, Display4kSites};
-constexpr TargetSites SuperHighSites{{0x14091a66d, 0x05, 0x142504830, 3840, 2160}, {}, Display4kSites};
+      {0x1409956e8, 0xb8, 1920, false}, {0x140995718, 0xb8, 1080, true}}}, {}};
+constexpr TargetSites HighSites{{0x14091a67f, 0x05, 0x142509550, 2560, 1440}, {0x14091a677, 0x0d, 0x142504830, 3840, 2160}, Display4kSites, {}};
+constexpr TargetSites SuperHighSites{{0x14091a66d, 0x05, 0x142504830, 3840, 2160}, {}, Display4kSites, {}};
+// WantsTrinity (5, the upscaler's mode, s64 S3b): SetMode and Init both load its shared pair 2688x1512 from
+// one constant (Init's switch on the mode at 0x14091b1be); its display pair 3840x2160 is the upscaler's
+// output and stays.
+constexpr TargetSites TrinitySites{{0x14091a691, 0x05, 0x142506470, 2688, 1512}, {0x14091a689, 0x0d, 0x142504830, 3840, 2160}, Display4kSites,
+    {0x14091b1f6, 0x05, 0x142506470, 2688, 1512}};
 
 std::uint32_t readWord(std::uintptr_t address) {
     std::uint32_t value = 0;
@@ -345,7 +352,7 @@ void NativeAspectPatch::locate() {
 // table's display entries follow it). A half with any site differing writes nothing.
 void NativeAspectPatch::patchTargets(std::intptr_t delta, bool& display) {
     const auto mode = plan.slot->mode;
-    const auto& sites = mode == 1 ? PerfSites : mode == 3 ? HighSites : SuperHighSites;
+    const auto& sites = mode == 1 ? PerfSites : mode == 3 ? HighSites : mode == 5 ? TrinitySites : SuperHighSites;
     const bool joint = mode == 4;
     const auto refuse = [&](const char* half, std::uintptr_t va) {
         std::fprintf(stderr, "[aspect] %s: the code at 0x%llx is not the expected build's: kept at the slot's 16:9 size (part 1)\n", half, static_cast<unsigned long long>(va));
@@ -353,6 +360,10 @@ void NativeAspectPatch::patchTargets(std::intptr_t delta, bool& display) {
     };
     bool shared = plan.SharedNative() && loadMatches(delta, sites.shared);
     if (plan.SharedNative() && !shared) refuse(joint ? "shared render targets and display buffer" : "shared render targets", sites.shared.va);
+    if (shared && sites.init.va != 0 && !loadMatches(delta, sites.init)) {
+        refuse("shared render targets", sites.init.va);
+        shared = false;
+    }
     bool wantDisplay = plan.DisplayNative() && (!joint || shared);
     if (wantDisplay && !joint && !loadMatches(delta, sites.display)) {
         refuse("display buffer", sites.display.va);
@@ -381,13 +392,21 @@ void NativeAspectPatch::patchTargets(std::intptr_t delta, bool& display) {
     DWORD previous = 0;
     VirtualProtect(pairs, 4 * sizeof(std::uint32_t), PAGE_READONLY, &previous);
 #endif
-    if (shared) sharedApplied = pointLoad(delta, sites.shared, pairs);
+    if (shared) sharedApplied = pointLoad(delta, sites.shared, pairs) && (sites.init.va == 0 || pointLoad(delta, sites.init, pairs));
     if (wantDisplay) {
         bool written = joint ? sharedApplied : pointLoad(delta, sites.display, pairs + 2);
         for (const auto& site : sites.immediates) written = written && setImmediate(delta, site, site.height ? plan.displayHeight : plan.displayWidth);
         displayApplied = written;
     }
     display = displayApplied;
+    if (mode == 5) {
+        std::fprintf(stderr, "[aspect] part 2 in %s (upscaler): shared render targets %ux%u (%s), display buffer %ux%u (the upscaler's output); size pair at %p\n",
+            plan.slot->convar, sharedApplied ? pairs[0] : plan.slot->renderWidth, sharedApplied ? pairs[1] : plan.slot->renderHeight,
+            sharedApplied ? "SetMode's and Init's loads patched, APS5_UPSCALER_TARGETS=0 keeps the slot's own" : "the slot's own: the code could not be written",
+            plan.slot->displayWidth, plan.slot->displayHeight, static_cast<void*>(pairs));
+        std::fflush(stderr);
+        return;
+    }
     std::fprintf(stderr, "[aspect] part 2 in %s (experimental): shared render targets %ux%u (%s), display buffer %ux%u (%s); size pairs at %p\n", plan.slot->convar,
         sharedApplied ? pairs[0] : plan.slot->renderWidth, sharedApplied ? pairs[1] : plan.slot->renderHeight, sharedApplied ? "SetMode's load patched, APS5_NATIVE_ASPECT_RENDER: post effects break, t557/t558/t560" : "the slot's own",
         displayApplied ? plan.displayWidth : plan.slot->displayWidth, displayApplied ? plan.displayHeight : plan.slot->displayHeight,
@@ -434,7 +453,12 @@ std::string NativeAspectPatch::Digest() {
         std::snprintf(text, sizeof(text), ", %s not applied (%s)", plan.slot->mode == 5 ? "upscaler render size" : plan.uiOnly ? "4K UI" : "native aspect",
             searched ? "see the [aspect] line" : "video out not opened");
     } else if (plan.uiOnly) {
-        std::snprintf(text, sizeof(text), ", %s: %ux%u in %s, display buffer %ux%u", plan.slot->mode == 5 ? "upscaler render size" : "4K UI", plan.renderWidth, plan.renderHeight, plan.slot->convar, plan.slot->displayWidth, plan.slot->displayHeight);
+        char shared[64] = "";
+        if (plan.slot->mode == 5) {
+            std::snprintf(shared, sizeof(shared), ", shared targets %ux%u", sharedApplied ? plan.sharedWidth : plan.slot->renderWidth, sharedApplied ? plan.sharedHeight : plan.slot->renderHeight);
+        }
+        std::snprintf(text, sizeof(text), ", %s: %ux%u in %s, display buffer %ux%u%s", plan.slot->mode == 5 ? "upscaler render size" : "4K UI", plan.renderWidth, plan.renderHeight, plan.slot->convar,
+            plan.slot->displayWidth, plan.slot->displayHeight, shared);
     } else {
         std::snprintf(text, sizeof(text), ", native aspect %.4f (%ux%u in %s): display mode %d, %llu/%llu flips native, %llu field writes%s; shared targets %s, display buffer %s", plan.Aspect(),
             plan.renderWidth, plan.renderHeight, plan.slot->convar, mode, static_cast<unsigned long long>(windowWideFlips), static_cast<unsigned long long>(windowFlips),
