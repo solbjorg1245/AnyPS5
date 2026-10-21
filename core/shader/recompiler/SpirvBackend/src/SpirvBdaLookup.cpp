@@ -239,15 +239,19 @@ void DefineBdaLookupState(SpirvEmitterState& state) {
 
 }
 
-// APS5_SPIRV_BDA_UNIFORM=<1-3>, default off (see SpirvBda.hpp). The value enters the shader disk cache key
-// with the other recompiler switches.
+// APS5_SPIRV_BDA_UNIFORM=<0-3>, default 2 when unset, 0 is the old lookups (see SpirvBda.hpp). A set value enters
+// the shader disk cache key with the other recompiler switches.
+std::uint32_t BdaUniformStageFromEnv(const char* value) {
+    if (value == nullptr) return 2u;
+    return static_cast<std::uint32_t>(std::min<unsigned long>(std::strtoul(value, nullptr, 10), 3ul));
+}
+
 std::uint32_t BdaUniformStage() {
     if (uniformStageForTests >= 0) return static_cast<std::uint32_t>(uniformStageForTests);
     static const std::uint32_t stage = [] {
         const char* value = std::getenv("APS5_SPIRV_BDA_UNIFORM");
-        if (value == nullptr) return 0u;
-        const auto parsed = static_cast<std::uint32_t>(std::min<unsigned long>(std::strtoul(value, nullptr, 10), 3ul));
-        std::fprintf(stderr, "[spirv] APS5_SPIRV_BDA_UNIFORM=%u: BDA lookups %s\n", parsed, parsed == 0u ? "unchanged" : parsed == 1u ? "check the table header in one branch" : parsed == 2u ? "check the header in one branch, skip the call inside the last read range" : "check the header in one branch, skip the call inside the last read range, search once per subgroup for uniform bases");
+        const auto parsed = BdaUniformStageFromEnv(value);
+        std::fprintf(stderr, "[spirv] APS5_SPIRV_BDA_UNIFORM=%u%s: BDA lookups %s\n", parsed, value == nullptr ? " (default)" : "", parsed == 0u ? "unchanged" : parsed == 1u ? "check the table header in one branch" : parsed == 2u ? "check the header in one branch, skip the call inside the last read range" : "check the header in one branch, skip the call inside the last read range, search once per subgroup for uniform bases");
         return parsed;
     }();
     return stage;

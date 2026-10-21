@@ -291,12 +291,12 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             ++it;
         }
     }
-    // APS5_BDA_TABLE_VRAM=1 (default off): the table in host-visible video memory (ReBAR or the BAR
+    // APS5_BDA_TABLE_VRAM (default on, =0 off): the table in host-visible video memory (ReBAR or the BAR
     // window), where every address-based access's lookup reads it; host memory when no such type exists.
     constexpr VkMemoryPropertyFlags videoHost = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     static const bool tableInVideoMemory = [&] {
         const char* value = std::getenv("APS5_BDA_TABLE_VRAM");
-        if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) return false;
+        if (!BdaTableVramRequested(value)) return false;
         try {
             static_cast<void>(context.MemoryType(~0u, videoHost));
         } catch (const std::runtime_error&) {

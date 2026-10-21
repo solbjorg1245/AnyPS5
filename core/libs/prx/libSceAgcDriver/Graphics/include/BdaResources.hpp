@@ -2,10 +2,16 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_BDARESOURCES_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include <cstring>
 
 namespace AgcDriver::Graphics {
 
 bool LoopGuardTripped();
+
+// APS5_BDA_TABLE_VRAM: on when unset or empty, 0 turns it off.
+inline bool BdaTableVramRequested(const char* value) {
+    return value == nullptr || *value == '\0' || std::strcmp(value, "0") != 0;
+}
 
 // Debug aid APS5_CHECK_STALE_IMPORTS=1: every page table made is kept weakly with its ranges, and an
 // import destroyed while a live table still maps its device address is reported with the table's
