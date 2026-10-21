@@ -245,6 +245,23 @@ TextureCounters& TextureCounts() {
 // Sampled elements the driver could not decode and bound as null (see decodeBoundSampled).
 std::atomic<std::uint64_t> sampledNullBound{0};
 
+// APS5_PRECOLLECT_NULL_SKIP=1 (R-STALLS): stage A's precollect hands a null image element (base
+// address 0, see NullTextureWords) to stage B undecoded instead of decoding it, which threw. Stage B
+// binds the null texture for it as before, so only the throw goes: a bindless array of mostly null
+// slots threw once per slot through the guest libc's unwinder, ~50 ms per build, and an address-based
+// dispatch runs its stage A under the GPU mutex (queue 0x50's indirect dispatches held it 4-5 s per
+// 10 s in the walk stalls). The [textures] line counts both over 10 s.
+bool PrecollectNullSkip() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_PRECOLLECT_NULL_SKIP");
+        return text != nullptr && std::strcmp(text, "1") == 0;
+    }();
+    return enabled;
+}
+
+std::atomic<std::uint64_t> precollectNullsSkipped{0};
+std::atomic<std::uint64_t> precollectThrows{0};
+
 // The storage mip runs come from the recompiler (DescriptorBinding::imageMipOffset) instead of a
 // guess from equal T#s (s62 WATER): two separate storage images with the same T# (the water sim
 // stores its normal map through two equal descriptors, the second for the red channel) both address
@@ -273,7 +290,9 @@ void reportTextureCounters() {
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
     char exactMips[112] = "";
     if (StorageMipExact()) std::snprintf(exactMips, sizeof(exactMips), "; %llu storage lookups with an equal T# kept at their own mip (APS5_STORAGE_MIP_EXACT)", static_cast<unsigned long long>(storageEqualKept.exchange(0, std::memory_order_relaxed)));
-    std::fprintf(stderr, "[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; cache %llu MiB, %llu budget evictions (%llu MiB, %llu of 64 MiB or more), %llu replaced, %llu made beside another key of the surface, %llu views of a shared image%s\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.cachedBytes) >> 20u, count(counters.budgetEvictions), count(counters.evictedBytes) >> 20u, count(counters.largeEvictions), count(counters.replaced), count(counters.sameSurface), count(counters.sharedImages), exactMips);
+    char precollect[160];
+    std::snprintf(precollect, sizeof(precollect), "; stage-A precollect (10 s): %llu decode throws, %llu null elements left to stage B (APS5_PRECOLLECT_NULL_SKIP %s)", static_cast<unsigned long long>(precollectThrows.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(precollectNullsSkipped.exchange(0, std::memory_order_relaxed)), PrecollectNullSkip() ? "on" : "off");
+    std::fprintf(stderr, "[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; cache %llu MiB, %llu budget evictions (%llu MiB, %llu of 64 MiB or more), %llu replaced, %llu made beside another key of the surface, %llu views of a shared image%s%s\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.cachedBytes) >> 20u, count(counters.budgetEvictions), count(counters.evictedBytes) >> 20u, count(counters.largeEvictions), count(counters.replaced), count(counters.sameSurface), count(counters.sharedImages), exactMips, precollect);
     // The image elements bound as null over these 10 s instead of dropping their draws (see
     // ShaderRecompiler::NullBoundImage and decodeBoundSampled); each was a thrown draw before.
     using ShaderRecompiler::NullBoundImage;
@@ -3828,6 +3847,7 @@ bool ShaderResources::precollectImages() {
     // as the predicate's rule demands (the generation the entry moves to must predate the checks).
     static const bool disabled = std::getenv("APS5_NO_PRECOLLECT") != nullptr;
     static const bool noRecords = std::getenv("APS5_NO_STAGE_A_IMAGES") != nullptr;
+    const bool nullSkip = PrecollectNullSkip();
     if (disabled || deferredImages.empty()) return false;
     imageRecords.clear();
     nextImageRecord = 0;
@@ -3839,6 +3859,12 @@ bool ShaderResources::precollectImages() {
             const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
             ImageRecord record;
             record.sampled = binding.kind == ShaderRecompiler::DescriptorKind::SampledImage;
+            if (nullSkip && NullTextureWords(words)) {
+                // Undecoded, as the throw below left it: stage B substitutes the null descriptor.
+                precollectNullsSkipped.fetch_add(1, std::memory_order_relaxed);
+                imageRecords.push_back(std::move(record));
+                continue;
+            }
             try {
                 record.resource = DecodeTextureResource(words);
                 record.guestBytes = DescribeSurface(record.resource).guestBytes;
@@ -3860,6 +3886,7 @@ bool ShaderResources::precollectImages() {
                 }
             } catch (const std::exception&) {
                 record.decoded = false;
+                precollectThrows.fetch_add(1, std::memory_order_relaxed);
             }
             imageRecords.push_back(std::move(record));
         }
