@@ -922,6 +922,7 @@ void EmitProgram(SpirvEmitterState& state) {
     if (state.pixelValidMaskVariable != 0u) {
         state.module.AddFunction(spv::OpStore, state.pixelValidMaskVariable, ConstantU32(state, 1u));
     }
+    EmitBdaLookupInit(state);
     EmitMemoryOffsets(state);
     if (program.BlockOrder().empty()) {
         if (state.pixelValidMaskVariable != 0u) {

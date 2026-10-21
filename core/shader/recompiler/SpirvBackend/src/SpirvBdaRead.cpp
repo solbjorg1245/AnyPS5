@@ -22,11 +22,38 @@ std::uint32_t BdaAccessMask(const SpirvEmitterState& state, const IrValue& inst)
     return spv::MemoryAccessAlignedMask | (index < memory.size() && memory[index].coherent ? spv::MemoryAccessVolatileMask : 0u);
 }
 
-std::uint32_t EmitBdaByte(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t instruction, std::uint32_t accessMask) {
+// The lookup functions an access calls. Under APS5_SPIRV_BDA_UNIFORM=3 an access whose address base is
+// wave-uniform takes the ones that search once per subgroup: scalar loads, global loads with an SGPR base,
+// GPU-selected V#s (their base is the V#'s), and full addresses built from wave-uniform values.
+struct BdaLookups {
+    std::uint32_t pointer = 0;
+    std::uint32_t probe = 0;
+    std::uint32_t write = 0;
+};
+
+BdaLookups LookupsFor(const SpirvValueEmitContext& ctx, const IrValue& inst) {
+    const auto& state = ctx.state;
+    const BdaLookups lanes{state.bdaPointerFunction, state.bdaProbeFunction, state.bdaWritePointerFunction};
+    if (state.bdaUniformPointerFunction == 0) return lanes;
+    const auto opcode = inst.Opcode();
+    const bool address = AddressOpcodeInfoOf(opcode).access != AddressAccess::None;
+    if (!address && BufferAccessOf(opcode) == BufferAccess::None && opcode != IrOpcode::ReadConstBuffer) return lanes;
+    const auto index = inst.Flags<MemoryFlags>().index;
+    const auto& memory = state.program.Resources().memoryInfo;
+    if (index >= memory.size()) return lanes;
+    const auto uniformValue = [&](std::size_t argument) {
+        const IrValue* value = argument < inst.ArgumentCount() && inst.Argument(argument) != nullptr ? inst.Argument(argument)->Resolve() : nullptr;
+        return value != nullptr && (value->HasImmediate() || state.bdaUniformValues.contains(value));
+    };
+    const auto& mem = memory[index];
+    const bool uniform = !address || mem.kind == ResourceKind::ScalarAddress || !mem.addressIsFull || (uniformValue(1) && uniformValue(2));
+    return uniform ? BdaLookups{state.bdaUniformPointerFunction, state.bdaUniformProbeFunction, state.bdaUniformWritePointerFunction} : lanes;
+}
+
+std::uint32_t EmitBdaByte(SpirvEmitterState& state, std::uint32_t guest, std::uint32_t instruction, std::uint32_t accessMask, std::uint32_t lookup) {
     const auto byteType = state.module.Type(spv::OpTypeInt, 8u, 0u);
     const auto bytePointer = TypePointer(state, spv::StorageClassPhysicalStorageBuffer, byteType);
-    const auto physical = state.module.AllocateId();
-    state.module.AddFunction(spv::OpFunctionCall, TypeScalarU64(state), physical, state.bdaPointerFunction, guest, ConstantU32(state, 1u), instruction);
+    const auto physical = EmitBdaLookupCall(state, lookup, guest, ConstantU32(state, 1u), instruction);
     if (state.bdaStopsInvocations) {
         StopBdaInvocationIf(state, Binary(state, spv::OpIEqual, TypeBool(state), physical, BdaConstant(state, 0u)));
         const auto pointer = state.module.AllocateId();
@@ -56,11 +83,11 @@ std::uint32_t EmitBdaByte(SpirvEmitterState& state, std::uint32_t guest, std::ui
     return value;
 }
 
-std::uint32_t EmitBdaBytes(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, std::uint32_t accessMask) {
+std::uint32_t EmitBdaBytes(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, std::uint32_t accessMask, std::uint32_t lookup) {
     auto result = ConstantU32(state, 0u);
     for (std::uint32_t byte = 0; byte < bytes; ++byte) {
         const auto guest = Binary(state, spv::OpIAdd, TypeScalarU64(state), address, BdaConstant(state, byte));
-        const auto value = EmitBdaByte(state, guest, instruction, accessMask);
+        const auto value = EmitBdaByte(state, guest, instruction, accessMask, lookup);
         result = Binary(state, spv::OpBitwiseOr, TypeU32(state), result, Binary(state, spv::OpShiftLeftLogical, TypeU32(state), value, ConstantU32(state, byte * 8u)));
     }
     return result;
@@ -136,18 +163,18 @@ std::uint32_t EmitBdaRead(SpirvValueEmitContext& ctx, const IrValue& inst, std::
     if (bits == 32u) return EmitBdaDwordReads(ctx, inst, address, 0u, 1u)[0];
     const auto instruction = ConstantU32(state, inst.Flags<MemoryFlags>().pc);
     EmitBdaOverflowCheck(state, address, bits / 8u, instruction);
-    return EmitBdaBytes(state, address, bits / 8u, instruction, BdaAccessMask(state, inst));
+    return EmitBdaBytes(state, address, bits / 8u, instruction, BdaAccessMask(state, inst), LookupsFor(ctx, inst).pointer);
 }
 
 void EmitBdaWrite(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t value) {
     auto& state = ctx.state;
     if (state.bdaWritePointerFunction == 0 || state.bdaNoteWriteFunction == 0) ctx.Fail(inst, "BDA write functions are missing");
     const auto instruction = ConstantU32(state, inst.Flags<MemoryFlags>().pc);
+    const auto writeLookup = LookupsFor(ctx, inst).write;
     const auto unaligned = Binary(state, spv::OpINotEqual, TypeBool(state), Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), address, BdaConstant(state, 3u)), BdaConstant(state, 0u));
     EmitIfCondition(state, unaligned, [&] { RecordBdaFault(state, address, ConstantU32(state, 4u), instruction, BdaAbi::FaultReason::Unaligned); });
     EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), unaligned), [&] {
-        const auto physical = state.module.AllocateId();
-        state.module.AddFunction(spv::OpFunctionCall, TypeScalarU64(state), physical, state.bdaWritePointerFunction, address, ConstantU32(state, 4u), instruction);
+        const auto physical = EmitBdaLookupCall(state, writeLookup, address, ConstantU32(state, 4u), instruction);
         EmitIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), physical, BdaConstant(state, 0u)), [&] {
             const auto pointer = state.module.AllocateId();
             state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, physical);
@@ -170,6 +197,7 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
     if (state.bdaPointerFunction == 0) ctx.Fail(inst, "BDA lookup function is missing");
     const auto u64 = TypeScalarU64(state);
     const auto instruction = ConstantU32(state, inst.Flags<MemoryFlags>().pc);
+    const auto lookups = LookupsFor(ctx, inst);
     const auto used = everyDword ? (1u << dwords) - 1u : UsedBdaDwords(inst, dwords);
     const auto isUsed = [&](std::uint32_t dword) { return (used & (1u << dword)) != 0u; };
     std::array<std::uint32_t, 4> values{};
@@ -191,16 +219,15 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
             if (!isUsed(dword)) continue;
             if (dword != first) addresses[dword] = dwordAddress(dword);
             EmitBdaOverflowCheck(state, addresses[dword], 4u, instruction);
-            into[dword] = EmitBdaBytes(state, addresses[dword], 4u, instruction, BdaAccessMask(state, inst));
+            into[dword] = EmitBdaBytes(state, addresses[dword], 4u, instruction, BdaAccessMask(state, inst), lookups.pointer);
         }
     };
     addresses[first] = dwordAddress(first);
-    if (state.bdaProbeFunction == 0) {
+    if (lookups.probe == 0) {
         readBytes(values);
         return values;
     }
-    const auto physical = state.module.AllocateId();
-    state.module.AddFunction(spv::OpFunctionCall, u64, physical, state.bdaProbeFunction, addresses[first], ConstantU32(state, (last - first + 1u) * 4u), instruction);
+    const auto physical = EmitBdaLookupCall(state, lookups.probe, addresses[first], ConstantU32(state, (last - first + 1u) * 4u), instruction);
     const auto mapped = Binary(state, spv::OpINotEqual, TypeBool(state), physical, BdaConstant(state, 0u));
     const auto aligned = Binary(state, spv::OpIEqual, TypeBool(state), Binary(state, spv::OpBitwiseAnd, u64, physical, BdaConstant(state, 3u)), BdaConstant(state, 0u));
     const auto wide = Binary(state, spv::OpLogicalAnd, TypeBool(state), mapped, aligned);

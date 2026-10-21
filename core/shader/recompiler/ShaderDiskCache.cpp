@@ -13,6 +13,7 @@
 #endif
 #include "prx/libc/include/HostThread.hpp"
 #include "ShaderCacheVersion.hpp"
+#include "SpirvBackend/SpirvBda.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -583,11 +584,15 @@ const std::vector<std::byte>& switchKey() {
         Writer writer(bytes);
         for (const auto name : Generated::RecompilerSwitches) {
             if (std::find(std::begin(NeutralSwitches), std::end(NeutralSwitches), name) != std::end(NeutralSwitches)) continue;
+            // Keyed below by the stage the emitter uses, so unset, 2 and garbage share one key.
+            if (name == "APS5_SPIRV_BDA_UNIFORM") continue;
             const char* value = std::getenv(std::string(name).c_str());
             if (value == nullptr) continue;
             writer.Text(std::string(name));
             writer.Text(value);
         }
+        writer.Text("bda-uniform-stage");
+        writer.Text(std::to_string(ShaderRecompiler::BdaUniformStageFromEnv(std::getenv("APS5_SPIRV_BDA_UNIFORM"))));
         return bytes;
     }();
     return key;

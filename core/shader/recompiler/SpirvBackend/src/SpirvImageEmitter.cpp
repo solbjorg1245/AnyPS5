@@ -1143,8 +1143,7 @@ void EmitImageBvhIntersectRay(SpirvValueEmitContext& ctx, const IrValue& inst) {
             }
             const auto pc = uint(inst.Flags<MemoryFlags>().pc);
             const auto bytes = uint(count * 4u);
-            const auto physical = state.module.AllocateId();
-            state.module.AddFunction(spv::OpFunctionCall, u64, physical, state.bdaProbeFunction, nodeAddress, bytes, pc);
+            const auto physical = EmitBdaLookupCall(state, state.bdaProbeFunction, nodeAddress, bytes, pc);
             const auto mapped = both(op(spv::OpINotEqual, boolean, physical, BdaConstant(state, 0u)), op(spv::OpIEqual, boolean, op(spv::OpBitwiseAnd, u64, physical, BdaConstant(state, 3u)), BdaConstant(state, 0u)));
             EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, mapped), [&] { RecordBdaFault(state, nodeAddress, bytes, pc, BdaAbi::FaultReason::Unmapped); });
             for (std::uint32_t first = 0; first < count; first += 4u) {
