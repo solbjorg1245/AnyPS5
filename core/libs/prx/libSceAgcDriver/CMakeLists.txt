@@ -144,6 +144,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Queues/Submission.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Queues/WorkerAffinity.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Shaders/ShaderDiagnostics.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Shaders/ShaderPrecompile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Shaders/ShaderRegistry.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/DeferredLabels.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/LabelHistory.cpp
@@ -415,6 +416,12 @@ target_link_libraries(agc_shader_disk_cache_tests PRIVATE shader_recompiler_agc_
 set_target_properties(agc_shader_disk_cache_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_disk_cache_tests)
 
+add_test_executable(agc_shader_key_list_tests EXCLUDE_FROM_ALL tests/ShaderKeyList.cpp)
+target_include_directories(agc_shader_key_list_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_shader_key_list_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_shader_key_list_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_shader_key_list_tests)
+
 add_test_executable(agc_shader_control_flow_tests EXCLUDE_FROM_ALL
         tests/ControlFlow.cpp
 )
@@ -531,6 +538,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         tests/TextureFormat.cpp
         tests/TexelStats.cpp
         tests/TextureTiling.cpp
+        tests/SubresourceAlias.cpp
         tests/ImageMemoryPool.cpp
         tests/GuestTextureResource.cpp
         tests/GuestSamplerResource.cpp

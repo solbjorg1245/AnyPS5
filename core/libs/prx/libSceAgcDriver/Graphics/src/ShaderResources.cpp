@@ -3504,6 +3504,7 @@ bool ShaderResources::RefreshData(VkCommandBuffer commands, const CompiledShader
         // A fork made before reads this object's buffers for its equal bindings: its set no longer
         // stands for its words (ForkData's Reused).
         lastFork.set = VK_NULL_HANDLE;
+        drawSetMemo.bindings.reset();
     }
     return recorded;
 }
@@ -3641,6 +3642,7 @@ ShaderResources::DataFork ShaderResources::ForkData(const CompiledShader& shader
             }
             rehashDataWords();
             lastFork.set = VK_NULL_HANDLE;
+            drawSetMemo.bindings.reset();
             fork.outcome = ForkOutcome::Adopted;
             return fork;
         }
@@ -4277,13 +4279,202 @@ bool ShaderResources::RebaseEligible(std::span<const CompiledShader> shaders, co
     return true;
 }
 
+namespace {
+
+// InPlaceBindingsForTests: -1 the environment's answer, 0 off, 1 on.
+std::atomic<int> inPlaceBindingsForTests{-1};
+
+}
+
 bool ShaderResources::InPlaceBindings() {
     static const bool inPlace = std::getenv("APS5_NO_INPLACE_BINDINGS") == nullptr && std::getenv("APS5_CAPTURE_INPUTS") == nullptr;
-    return inPlace;
+    const auto forced = inPlaceBindingsForTests.load(std::memory_order_relaxed);
+    return forced < 0 ? inPlace : forced != 0;
+}
+
+void ShaderResources::InPlaceBindingsForTests(int inPlace) {
+    inPlaceBindingsForTests.store(inPlace, std::memory_order_relaxed);
+}
+
+namespace {
+
+// APS5_SET_MEMO's counters (the [draws] set memo line): set copies bound again, kept, not kept
+// (guest snapshots, or data copies beside deferred flat slots), misses by reason, and
+// APS5_SET_MEMO_VERIFY's compares and mismatches.
+struct SetMemoCounters {
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> kept{0};
+    std::atomic<std::uint64_t> notKept{0};
+    std::atomic<std::uint64_t> otherBatch{0};
+    std::atomic<std::uint64_t> imports{0};
+    std::atomic<std::uint64_t> words{0};
+    std::atomic<std::uint64_t> deferred{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> mismatched{0};
+};
+
+SetMemoCounters& SetMemoTotals() {
+    static SetMemoCounters counters;
+    return counters;
+}
+
+bool SetMemoVerify() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_SET_MEMO_VERIFY");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+// Whether a stage fills deferred flat slots (Draw.cpp recordDeferredFlat), which writes the bytes
+// of a data copy on the CPU for the draw that binds it.
+bool FillsDeferredFlat(std::span<const CompiledShader> shaders) {
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) continue;
+        for (const auto& binding : shader.program->bindings) {
+            if (binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt && !binding.deferredWords.empty()) return true;
+        }
+    }
+    return false;
+}
+
+}
+
+bool ShaderResources::SetMemo() {
+    // On by default since s64 (t1341 verify 0 mismatches, t1397-t1405 same-binary A/B, a reload check
+    // with the verify knobs); APS5_SET_MEMO=0 is the old path.
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_SET_MEMO");
+        const bool on = value == nullptr || value[0] != '0';
+        std::fprintf(stderr, "[draws] set memo (APS5_SET_MEMO): %s\n", on ? "on" : "off (APS5_SET_MEMO=0)");
+        return on;
+    }();
+    return enabled;
+}
+
+void ShaderResources::ReportSetMemo() {
+    if (!SetMemo()) return;
+    auto& totals = SetMemoTotals();
+    const auto hits = totals.hits.exchange(0, std::memory_order_relaxed);
+    const auto kept = totals.kept.exchange(0, std::memory_order_relaxed);
+    const auto notKept = totals.notKept.exchange(0, std::memory_order_relaxed);
+    const auto otherBatch = totals.otherBatch.exchange(0, std::memory_order_relaxed);
+    const auto imports = totals.imports.exchange(0, std::memory_order_relaxed);
+    const auto words = totals.words.exchange(0, std::memory_order_relaxed);
+    const auto deferred = totals.deferred.exchange(0, std::memory_order_relaxed);
+    const auto verified = totals.verified.exchange(0, std::memory_order_relaxed);
+    const auto mismatched = totals.mismatched.load(std::memory_order_relaxed);
+    std::fprintf(stderr, "[draws] set memo (APS5_SET_MEMO, 10 s): %llu set copies bound again, %llu kept, %llu not kept (guest snapshots, or data copies with deferred flat slots); misses: %llu no memo in the open batch, %llu imports changed, %llu words differ, %llu deferred flat slots; verify %llu compared, %llu mismatched since the start\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(kept), static_cast<unsigned long long>(notKept), static_cast<unsigned long long>(otherBatch), static_cast<unsigned long long>(imports), static_cast<unsigned long long>(words), static_cast<unsigned long long>(deferred), static_cast<unsigned long long>(verified), static_cast<unsigned long long>(mismatched));
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::setMemoHit(const Recorder& recorder, std::span<const CompiledShader> shaders, std::uint64_t generation, std::uint64_t epoch) const {
+    auto& totals = SetMemoTotals();
+    const auto& memo = drawSetMemo;
+    // The set copy lives as long as its batch: the open one only (AllocateTransient).
+    auto bindings = memo.recorder == &recorder && memo.serial == recorder.Submissions() + 1 ? memo.bindings.lock() : nullptr;
+    if (bindings == nullptr) {
+        totals.otherBatch.fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
+    // No registration changed and no import retired since: each in-place element's import is the
+    // one HostImportFor finds now (HostImportMemoized's rule), and alive.
+    if (memo.generation != generation || memo.epoch != epoch) {
+        totals.imports.fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
+    std::size_t at = 0;
+    for (std::size_t index = 0; index < setMemoSources.size(); ++index) {
+        const auto words = SourceWords(shaders, setMemoSources[index].first, setMemoSources[index].second);
+        if (words.size() != memo.lengths[index] || !std::equal(words.begin(), words.end(), memo.words.begin() + static_cast<std::ptrdiff_t>(at))) {
+            totals.words.fetch_add(1, std::memory_order_relaxed);
+            return {};
+        }
+        at += words.size();
+    }
+    if (memo.dataCopies && FillsDeferredFlat(shaders)) {
+        totals.deferred.fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
+    totals.hits.fetch_add(1, std::memory_order_relaxed);
+    return bindings;
+}
+
+void ShaderResources::setMemoKeep(const Recorder& recorder, std::span<const CompiledShader> shaders, const std::shared_ptr<DrawBindings>& result, std::span<const std::size_t> selected, std::span<const VkDescriptorBufferInfo> infos, std::uint64_t generation, std::uint64_t epoch) const {
+    auto& totals = SetMemoTotals();
+    auto& memo = drawSetMemo;
+    // A snapshot holds guest bytes of its draw (ReusableDrawSnapshot decides on the write-watch);
+    // a data copy beside deferred flat slots takes its draw's slot words on the CPU.
+    if (result->snapshotsMade != 0 || result->snapshotsReused != 0 || (result->dataCopies != 0 && FillsDeferredFlat(shaders))) {
+        memo.bindings.reset();
+        totals.notKept.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (!setMemoSourcesListed) {
+        for (const auto& item : allocations) {
+            if (item.sourceShader < 0 || (!item.guest && (item.buffer == nullptr || !DataRole(item.role)))) continue;
+            const std::pair<std::int32_t, std::uint32_t> source{item.sourceShader, item.sourceBinding};
+            if (std::find(setMemoSources.begin(), setMemoSources.end(), source) == setMemoSources.end()) setMemoSources.push_back(source);
+        }
+        setMemoSourcesListed = true;
+    }
+    memo.recorder = &recorder;
+    memo.serial = recorder.Submissions() + 1;
+    memo.generation = generation;
+    memo.epoch = epoch;
+    memo.bindings = result;
+    memo.dataCopies = result->dataCopies != 0;
+    memo.words.clear();
+    memo.lengths.clear();
+    for (const auto& [shader, binding] : setMemoSources) {
+        const auto words = SourceWords(shaders, shader, binding);
+        memo.words.insert(memo.words.end(), words.begin(), words.end());
+        memo.lengths.push_back(static_cast<std::uint32_t>(words.size()));
+    }
+    if (SetMemoVerify()) {
+        memo.selected.assign(selected.begin(), selected.end());
+        memo.infos.assign(infos.begin(), infos.end());
+    }
+    totals.kept.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ShaderResources::setMemoVerify(const DrawBindings& memoBindings, const DrawBindings* fresh, std::span<const std::size_t> selected, std::span<const VkDescriptorBufferInfo> infos) const {
+    auto& totals = SetMemoTotals();
+    totals.verified.fetch_add(1, std::memory_order_relaxed);
+    const auto& memo = drawSetMemo;
+    // The same elements, each with the same descriptor, a data copy with the same bytes.
+    bool same = fresh != nullptr && selected.size() == memo.selected.size() && std::equal(selected.begin(), selected.end(), memo.selected.begin());
+    for (std::size_t i = 0; same && i < selected.size(); ++i) {
+        const auto index = selected[i];
+        const auto byAllocation = [&](const DrawBindings::Snapshot& snapshot) { return snapshot.allocation == index; };
+        const auto freshCopy = std::find_if(fresh->snapshots.begin(), fresh->snapshots.end(), byAllocation);
+        const auto memoCopy = std::find_if(memoBindings.snapshots.begin(), memoBindings.snapshots.end(), byAllocation);
+        if (freshCopy != fresh->snapshots.end() || memoCopy != memoBindings.snapshots.end()) {
+            same = freshCopy != fresh->snapshots.end() && memoCopy != memoBindings.snapshots.end() && freshCopy->buffer->Bytes().size() == memoCopy->buffer->Bytes().size() && std::memcmp(freshCopy->buffer->Bytes().data(), memoCopy->buffer->Bytes().data(), freshCopy->buffer->Bytes().size()) == 0;
+            continue;
+        }
+        same = infos[i].buffer == memo.infos[i].buffer && infos[i].offset == memo.infos[i].offset && infos[i].range == memo.infos[i].range;
+    }
+    if (same) return;
+    if (totals.mismatched.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[draws] set memo verify MISMATCH: template %p, %zu elements selected now, %zu in the memo%s\n", static_cast<const void*>(this), selected.size(), memo.selected.size(), fresh == nullptr ? " (no set copy now)" : "");
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const CompiledShader> shaders) const {
     if (_set == VK_NULL_HANDLE || usesBda) return {};
+    // APS5_SET_MEMO: the open batch's last set copy of this object, when this draw's words are its words.
+    const bool memo = SetMemo();
+    std::shared_ptr<DrawBindings> memoHit;
+    // Taken before this draw's lookups: a registry change or a retired import during them leaves
+    // the kept memo with the older values, so the next draw misses rather than trust an import
+    // the lookups may not have seen.
+    std::uint64_t memoGeneration = 0;
+    std::uint64_t memoEpoch = 0;
+    if (memo) {
+        RecordProfile::Scope memoSpan(RecordProfile::SetMemoCheck);
+        memoGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        memoEpoch = HostImportsEpoch();
+        memoHit = setMemoHit(recorder, shaders, memoGeneration, memoEpoch);
+        if (memoHit != nullptr && !SetMemoVerify()) return memoHit;
+    }
     RecordProfile::Scope selectSpan(RecordProfile::SetSelect);
     ScratchLease<InPlaceReadsScratch> scratch;
     const auto reads = guestMemory.InPlaceReads(scratch->reads);
@@ -4376,7 +4567,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         result->snapshots.push_back({begin, std::move(buffer), index});
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
-    if (selected.empty()) return {};
+    if (selected.empty()) {
+        if (memoHit != nullptr) setMemoVerify(*memoHit, nullptr, selected, infos);
+        return {};
+    }
     selectSpan.Stop();
     RecordProfile::Scope allocateSpan(RecordProfile::SetAllocate);
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
@@ -4445,6 +4639,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     writeSpan.Stop();
     RecordProfile::Scope keepSpan(RecordProfile::SetKeep);
     recorder.Keep(result);
+    if (memo) {
+        if (memoHit != nullptr) setMemoVerify(*memoHit, result.get(), selected, infos);
+        else setMemoKeep(recorder, shaders, result, selected, infos, memoGeneration, memoEpoch);
+    }
     return result;
 }
 
@@ -4697,6 +4895,7 @@ bool ShaderResources::rebaseLease(std::span<const CompiledShader> shaders, bool&
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     // A fork copied the set as it was (ForkData's Reused binds no fork made before this).
     lastFork.set = VK_NULL_HANDLE;
+    drawSetMemo.bindings.reset();
     for (const auto& move : moves) {
         auto& item = allocations[move.index];
         item.address = move.address;

@@ -471,7 +471,7 @@ void CheckFreedStores() {
 }
 
 // The calling thread's collect epoch (ThreadCollectEpoch, ResetCollectEpoch; with
-// APS5_RECORD_PIPE_EPOCH=1 the recording thread follows A's): without one every collect walks (each
+// APS5_RECORD_PIPE_EPOCH, default on, the recording thread follows A's): without one every collect walks (each
 // walk moves the generation); within one a repeated collect is the memo's (no walk); a bump walks again.
 void CheckThreadEpoch() {
     void* memory = AllocateWatched(Block);

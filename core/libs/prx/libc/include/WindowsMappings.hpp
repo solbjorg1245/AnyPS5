@@ -231,6 +231,14 @@ public:
         return made;
     }
 
+    // Whether `address` lies in a shared view page still tracked per 16 KiB (no TrackParts yet):
+    // a write anywhere in it stamps all of it (the driver's APS5_FIX_CORNER).
+    bool CoarseView(std::uintptr_t address) {
+        std::lock_guard lock(mutex);
+        const auto found = views.find(address & ~(pageBytes - 1));
+        return found != views.end() && !found->second.page->fine;
+    }
+
     bool BeginHostWrite(std::uintptr_t address, std::size_t bytes) {
         std::lock_guard lock(mutex);
         const auto first = views.lower_bound(address & ~(pageBytes - 1));

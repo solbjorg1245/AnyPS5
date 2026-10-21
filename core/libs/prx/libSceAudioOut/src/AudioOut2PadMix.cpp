@@ -11,6 +11,10 @@ AudioOut2Route AudioOut2RouteForPort(std::uint16_t type, std::uint32_t channels)
     return AudioOut2Route::Main;
 }
 
+bool AudioOut2SkipInMainMix(std::uint16_t type, std::uint32_t channels, bool hapticsMain) {
+    return !hapticsMain && AudioOut2RouteForPort(type, channels) == AudioOut2Route::PadVibration;
+}
+
 bool AudioOut2IsPadAudioDevice(const char* name) {
     if (name == nullptr) return false;
     constexpr char needle[] = "dualsense";

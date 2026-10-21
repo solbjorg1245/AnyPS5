@@ -3,6 +3,7 @@
 #include "BdaAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/FrameTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderPrecompile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentationScaler.hpp"
@@ -1358,6 +1359,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         }
         state->scaler = std::make_unique<PresentationScaler>(graphicsContext(), VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM);
     }
+    // APS5_PRECOMPILE (ShaderPrecompile.hpp): the first device fills the shader disk cache before the game's first frame.
+    DriverDetail::RunShaderPrecompile(Target());
 }
 
 VulkanDevice::~VulkanDevice() = default;

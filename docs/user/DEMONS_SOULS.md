@@ -78,7 +78,10 @@ patch (slow; for troubleshooting only). On an Intel CPU, `-ToIntel` / `--to-inte
 it is untested with this game, so use it only if the game crashes with an illegal instruction.
 
 The first launch, and every new area, compiles shaders into `shader_cache/`. This makes the first
-minutes stutter heavily. Saves are stored in `_sd/` in the install folder; back them up from there.
+minutes stutter heavily. To shorten this, the first launch of each version precompiles the shaders of the
+opening areas listed in `shader-keys.txt` (shader identifiers, no game code) from your dump: the window
+stays black for a few seconds before the first frame. `APS5_PRECOMPILE=0` turns this off.
+Saves are stored in `_sd/` in the install folder; back them up from there.
 
 ## Settings
 
@@ -198,6 +201,12 @@ such a wait after 1 s with no GPU progress and lets the compute work run without
 (long pipeline builds at a load) was not counted as progress, so these waits gave up although the graphics
 queue was still on its way to the label. The driver now counts it; `APS5_WAIT_PIPE_PROGRESS=0` restores
 the old rule (for comparison only).
+
+Particles in wind and force volumes: some of the game's particle passes pick a 3D texture per force
+volume from a table, one volume at a time (a "waterfall" loop). The driver could not tell which table
+entries they use and skipped those passes; the log said "GetImageResource dword 0 is not a valid runtime
+value". It now reads the volumes' records and binds exactly the textures they name.
+`APS5_LOOP_TABLE_RUN=0` skips the passes as before (for comparison only).
 
 ## Controls
 

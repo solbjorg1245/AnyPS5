@@ -21,6 +21,9 @@ bool AudioOut2TraceEnabled();
 // Seconds since the first AudioOut2 call, for the trace.
 double AudioOut2TraceSeconds();
 
+// APS5_PROFILE_DRAW prints an `[audio] 10s:` digest line per context (AudioOut2Context.cpp).
+bool AudioOut2DigestEnabled();
+
 #define AUDIOOUT2_TRACE(...) \
     do { \
         if (AudioOut2TraceEnabled()) std::fprintf(stderr, "[audioout2] " __VA_ARGS__); \
@@ -51,8 +54,33 @@ struct AudioOut2Port {
     bool int16 = false;
     const void* data = nullptr;
     float volume[AUDIO_OUT2_PORT_CHANNELS_MAX] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    // Attribute 8 (0x40 | ACN on ambisonic object ports) and attribute 5 (passthrough side), as set.
+    std::uint32_t ambisonic = 0;
+    std::uint32_t passthrough = 0;
     std::uint64_t dataSets = 0;
     std::uint64_t attributeTraces = 0;
+};
+
+// Signal meters of one digest window: sums of squares of the ports' samples after their volume, by
+// group (bed, object, ambisonic order, pad), and of the output after the master gain.
+struct AudioOut2Meters {
+    double bed = 0.0;
+    double object = 0.0;
+    double order[6] = {};
+    double pad = 0.0;
+    double outLeft = 0.0;
+    double outRight = 0.0;
+    double outCross = 0.0;
+    // Largest output sample before the clamp, and the samples the clamp cut.
+    float peak = 0.0f;
+    std::uint64_t over = 0;
+    std::uint64_t frames = 0;
+    // Ports of each group in the last grain; padSkipped = vibration ports left out of the main mix.
+    std::uint32_t bedPorts = 0;
+    std::uint32_t objectPorts = 0;
+    std::uint32_t ambisonicPorts = 0;
+    std::uint32_t padPorts = 0;
+    std::uint32_t padSkipped = 0;
 };
 
 struct AudioOut2Context {
@@ -86,11 +114,22 @@ struct AudioOut2Context {
     // Largest sample magnitude of the grains mixed since the last summary: the mixed signal's level.
     float summaryPeak = 0.0f;
     std::chrono::steady_clock::time_point summaryStart;
+    // Digest (APS5_PROFILE_DRAW): the window's start, its meters and the totals at its start.
+    std::uint32_t id = 0;
+    std::chrono::steady_clock::time_point digestStart;
+    AudioOut2Meters meters;
+    std::uint64_t digestPushes = 0;
+    std::uint64_t digestPrimes = 0;
+    std::uint64_t digestDropped = 0;
 };
 
 // Mixes every port of the context that carries PCM data into out (stereo float, frames frames), summing
-// onto the zeroed buffer. Returns the number of ports mixed.
-std::uint32_t AudioOut2MixPorts(const AudioOut2Context& context, float* out, float* padOut, std::uint32_t frames);
+// onto the zeroed buffer. Returns the number of ports mixed. meters (may be null) takes the ports' levels.
+std::uint32_t AudioOut2MixPorts(const AudioOut2Context& context, float* out, float* padOut, std::uint32_t frames, AudioOut2Meters* meters);
+// The ambisonic decoder's mode (APS5_AUDIO2_AMBISONICS, validated: 0 = off), and whether vibration ports
+// play in the main mix without a pad card (APS5_AUDIO2_HAPTICS_MAIN).
+std::uint32_t AudioOut2AmbisonicMode();
+bool AudioOut2HapticsMain();
 bool AudioOut2HasPadPorts(const AudioOut2Context& context);
 // Forgets the ports of a context being destroyed.
 void AudioOut2ReleasePorts(const AudioOut2Context& context);

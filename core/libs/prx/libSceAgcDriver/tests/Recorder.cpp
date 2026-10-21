@@ -3793,6 +3793,216 @@ void dataRefreshTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 }
 
+// APS5_SET_MEMO (set at the start of main): a rebased hit whose words repeat the previous set copy
+// of its template in the open batch binds that set copy again, for a data copy and for a guest
+// element bound in place; other words, another batch, a registry change, a retired import (the
+// epoch alone), a data refresh or an adoption of the template and deferred flat slots beside a
+// data copy each make a set copy of their own.
+void setMemoTests(const Device& device, Recorder& recorder) {
+    if (!ShaderResources::SetMemo()) {
+        std::cout << "APS5_SET_MEMO off: set memo not tested\n";
+        return;
+    }
+    const auto& context = device.GetContext();
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.guestDescriptor = {1, 2, 3, 4};
+    program.bindings.push_back(binding);
+    auto moved = program;
+    moved.bindings[0].guestDescriptor[2] = 0x33;
+    auto other = program;
+    other.bindings[0].guestDescriptor[2] = 0x44;
+    auto deferred = moved;
+    deferred.bindings[0].deferredWords = {{1, 0x1000}};
+    const CompiledShader built{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    const CompiledShader first{ShaderRecompiler::ShaderStage::Compute, &moved, 0};
+    const CompiledShader second{ShaderRecompiler::ShaderStage::Compute, &other, 0};
+    const CompiledShader filled{ShaderRecompiler::ShaderStage::Compute, &deferred, 0};
+    // The data copy holds the draw's words (third word: `word`).
+    const auto holds = [](const std::shared_ptr<ShaderResources::DrawBindings>& bindings, std::uint32_t word) {
+        if (bindings == nullptr || bindings->dataCopies != 1 || bindings->snapshots.size() != 1) return false;
+        std::uint32_t words[4]{};
+        std::memcpy(words, bindings->snapshots[0].buffer->Bytes().data(), sizeof(words));
+        return words[0] == 1 && words[1] == 2 && words[2] == word && words[3] == 4;
+    };
+    {
+        auto memoContext = context;
+        DescriptorCache cache(memoContext);
+        memoContext.descriptorCache = &cache;
+        Recorder memoRecorder(memoContext);
+        memoRecorder.Activate();
+        ShaderResources resources(memoContext, built);
+        const auto setsMade = [&] { return cache.TransientCounters().sets + cache.Counters().sets; };
+        const auto prepare = [&](const CompiledShader& shader) { return resources.PrepareDrawBindings(memoRecorder, std::span<const CompiledShader>(&shader, 1)); };
+        Require(prepare(built) == nullptr, "a draw with the built words made a set copy");
+        auto sets = setsMade();
+        const auto a = prepare(first);
+        Require(holds(a, 0x33) && setsMade() == sets + 1, "a rebased data buffer was not copied into a set of its own");
+        Require(prepare(first) == a && setsMade() == sets + 1, "repeated words did not bind the kept set copy");
+        const auto b = prepare(second);
+        Require(holds(b, 0x44) && b != a && b->allocation.set != a->allocation.set && setsMade() == sets + 2, "other words bound the kept set copy");
+        Require(prepare(second) == b, "the second words' set copy was not kept");
+        const auto c = prepare(first);
+        Require(holds(c, 0x33) && c != a && setsMade() == sets + 3, "the memo answered words older than its last set copy");
+        // A set copy lives in its batch's transient pool: a new batch makes its own.
+        memoRecorder.Submit();
+        const auto d = prepare(first);
+        Require(holds(d, 0x33) && d != c && setsMade() == sets + 4, "a set copy of a submitted batch was bound again");
+        Require(prepare(first) == d, "the new batch's set copy was not kept");
+        // A registry mutation (generation) may have retired an in-place element's import.
+        {
+            GuestAllocations::Mutation mutation;
+        }
+        const auto e = prepare(first);
+        Require(holds(e, 0x33) && e != d, "a set copy outlived a registry mutation");
+        Require(prepare(first) == e, "the set copy made after the mutation was not kept");
+        // A data refresh of the template drops the memo (its data words changed).
+        Require(resources.RefreshData(memoRecorder.Commands(), second, &memoRecorder), "the template refresh recorded nothing");
+        Require(prepare(second) == nullptr, "a draw with the refreshed words made a set copy");
+        const auto f = prepare(first);
+        Require(holds(f, 0x33) && f != e, "a set copy outlived a data refresh of its template");
+        // Deferred flat slots fill a data copy on the CPU for its own draw: never kept or bound again.
+        sets = setsMade();
+        const auto g = prepare(filled);
+        const auto h = prepare(filled);
+        Require(holds(g, 0x33) && holds(h, 0x33) && g != h && setsMade() == sets + 2, "a data copy with deferred flat slots was bound again");
+        Require(prepare(first) != f, "a set copy beside deferred flat slots left the old memo");
+        memoRecorder.Submit();
+        device.WaitQueue();
+        memoRecorder.Sync();
+    }
+    // An adoption (ForkData's Adopted: the CPU writes other words into the idle template's data
+    // buffer) drops the memo, as it drops ForkData's.
+    {
+        auto adoptContext = context;
+        DescriptorCache cache(adoptContext);
+        FastRing ring(adoptContext, 1u << 20u);
+        adoptContext.descriptorCache = &cache;
+        adoptContext.fastRing = &ring;
+        Recorder adoptRecorder(adoptContext);
+        adoptRecorder.Activate();
+        ShaderResources resources(adoptContext, built);
+        const auto prepare = [&](const CompiledShader& shader) { return resources.PrepareDrawBindings(adoptRecorder, std::span<const CompiledShader>(&shader, 1)); };
+        // A use in a batch that finished: the template adopts.
+        adoptRecorder.Commands();
+        resources.NoteRecorded(adoptRecorder);
+        adoptRecorder.Submit();
+        device.WaitQueue();
+        adoptRecorder.Sync();
+        const auto a = prepare(first);
+        Require(holds(a, 0x33) && prepare(first) == a, "the set copy before the adoption was not kept");
+        Require(resources.ForkData(second, adoptRecorder).outcome == ShaderResources::ForkOutcome::Adopted, "the idle template did not adopt the words");
+        const auto b = prepare(first);
+        Require(holds(b, 0x33) && b != a, "a set copy outlived an adoption by its template");
+        Require(prepare(first) == b, "the set copy made after the adoption was not kept");
+        adoptRecorder.Submit();
+        device.WaitQueue();
+        adoptRecorder.Sync();
+    }
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: in-place set memo and import epoch not tested\n";
+    } else {
+        constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+        void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+        void* block = std::aligned_alloc(65536, bytes);
+#endif
+        Require(block != nullptr, "cannot allocate the set memo block");
+        std::memset(block, 0x11, bytes);
+        const auto address = reinterpret_cast<std::uint64_t>(block);
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(block, bytes, true, true);
+        }
+        if (HostImportFor(context, address, bytes) == nullptr) {
+            std::cout << "host import of the set memo block refused: in-place set memo and import epoch not tested\n";
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+        } else {
+            // A read-only guest element of 1 KiB at `offset` into the block.
+            const auto element = [&](std::uint64_t offset) {
+                ShaderRecompiler::RecompileResult guest;
+                ShaderRecompiler::DescriptorBinding buffer;
+                buffer.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+                buffer.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+                buffer.descriptorSet = 0;
+                buffer.binding = 0;
+                buffer.count = 1;
+                const auto at = address + offset;
+                buffer.guestDescriptor = {static_cast<std::uint32_t>(at), static_cast<std::uint32_t>(at >> 32u) & 0xffffu, 1024u, 0x31000000u};
+                buffer.bufferWritten = {false};
+                guest.bindings.push_back(buffer);
+                return guest;
+            };
+            const auto builtGuest = element(4096);
+            const auto movedGuest = element(8192);
+            const auto otherGuest = element(12288);
+            const CompiledShader builtElement{ShaderRecompiler::ShaderStage::Compute, &builtGuest, 0};
+            const CompiledShader movedElement{ShaderRecompiler::ShaderStage::Compute, &movedGuest, 0};
+            const CompiledShader otherElement{ShaderRecompiler::ShaderStage::Compute, &otherGuest, 0};
+            // A moved element binds its import at the draw's offset (the snapshot tests above turned
+            // in-place bindings off through the environment).
+            ShaderResources::InPlaceBindingsForTests(1);
+            {
+                auto guestContext = context;
+                DescriptorCache cache(guestContext);
+                guestContext.descriptorCache = &cache;
+                Recorder guestRecorder(guestContext);
+                guestRecorder.Activate();
+                ShaderResources resources(guestContext, builtElement);
+                const auto prepare = [&](const CompiledShader& shader) { return resources.PrepareDrawBindings(guestRecorder, std::span<const CompiledShader>(&shader, 1)); };
+                const auto inPlace = [](const std::shared_ptr<ShaderResources::DrawBindings>& bindings) { return bindings != nullptr && bindings->boundInPlace == 1 && bindings->snapshots.empty(); };
+                Require(prepare(builtElement) == nullptr, "an unmoved in-place element made a set copy");
+                const auto a = prepare(movedElement);
+                Require(inPlace(a), "a moved element was not bound in place");
+                Require(prepare(movedElement) == a, "a moved in-place element's repeated words did not bind the kept set copy");
+                const auto b = prepare(otherElement);
+                Require(inPlace(b) && b != a, "another in-place element bound the kept set copy");
+                Require(prepare(otherElement) == b, "the other element's set copy was not kept");
+                guestRecorder.Submit();
+                device.WaitQueue();
+                guestRecorder.Sync();
+            }
+            ShaderResources::InPlaceBindingsForTests(-1);
+            // A retired import alone (the epoch; the generation moved before the memo was made):
+            // the registry drops the block now, the next reconcile retires its import.
+            {
+                auto epochContext = context;
+                DescriptorCache cache(epochContext);
+                epochContext.descriptorCache = &cache;
+                Recorder epochRecorder(epochContext);
+                epochRecorder.Activate();
+                ShaderResources resources(epochContext, built);
+                const auto prepare = [&](const CompiledShader& shader) { return resources.PrepareDrawBindings(epochRecorder, std::span<const CompiledShader>(&shader, 1)); };
+                {
+                    GuestAllocations::Mutation mutation;
+                    mutation.Remove(block);
+                }
+                const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+                const auto epoch = HostImportsEpoch();
+                const auto a = prepare(first);
+                Require(holds(a, 0x33) && prepare(first) == a && HostImportsEpoch() == epoch, "the set copy before the retire was not kept");
+                HostImportFor(context, address, bytes);
+                Require(HostImportsEpoch() != epoch && GuestAllocations::GuestAllocationsGeneration_nid_postfix() == generation, "the reconcile did not retire the block's import alone");
+                const auto b = prepare(first);
+                Require(holds(b, 0x33) && b != a, "a set copy outlived a retired import");
+                Require(prepare(first) == b, "the set copy made after the retire was not kept");
+                epochRecorder.Submit();
+                device.WaitQueue();
+                epochRecorder.Sync();
+            }
+        }
+    }
+    recorder.Activate();
+    std::cout << "set memo checked\n";
+}
+
 }
 
 class SampleProgram {
@@ -4791,7 +5001,10 @@ void sharedViewFineTrackingTests() {
     Require(collect(true) == 0, "an armed range nobody wrote reported writes");
     guest[3 * part + 5] = 1;
     Require(collect(true) == 0xf, "a store into a coarse view page did not report the whole page");
+    // CoarseWriteView (APS5_FIX_CORNER's snapshot key): a view page is coarse until TrackParts, any address in it.
+    Require(GuestArena::GuestArenaCoarseWriteView_nid_postfix(base + 2 * part + 7) && GuestArena::GuestArenaCoarseWriteView_nid_postfix(base + viewPage), "a shared view page not yet made fine was not coarse");
     Require(GuestArena::GuestArenaTrackWriteParts_nid_postfix(base, part) == 1, "the first view page was not made fine");
+    Require(!GuestArena::GuestArenaCoarseWriteView_nid_postfix(base + 3 * part) && GuestArena::GuestArenaCoarseWriteView_nid_postfix(base + viewPage), "making one view page fine did not end its coarse tracking alone");
     Require(GuestArena::GuestArenaTrackWriteParts_nid_postfix(base, viewPage) == 0, "a fine view page was made fine again");
     Require(collect(true) == 0, "making an armed, unwritten view page fine reported writes");
     guest[3 * part + 5] = 2;
@@ -7291,6 +7504,8 @@ void computeQueueTests() {
 }
 
 int main() {
+    // APS5_SET_MEMO (read once): the draw tests below run with the set memo, setMemoTests checks it.
+    _putenv_s("APS5_SET_MEMO", "1");
     try {
         computeQueueTests();
         gpuTimingDigestTests();
@@ -7345,6 +7560,7 @@ int main() {
         contentKeyIntoTests();
         resultCopyCostTests();
         dataRefreshTests(device, recorder);
+        setMemoTests(device, recorder);
         minLodTests(device, recorder);
         firstLayerViewTests(device, recorder);
         metadataPassTests(device, recorder);

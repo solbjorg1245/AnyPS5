@@ -90,6 +90,23 @@ std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWrit
 // writeBackLayers), and pending units a DCC clear -> uncompressed key flip kept as the texels
 // (Refresh).
 std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKept{0};
+// APS5_SUBALIAS_REFRESH, the [storage] subalias line (relaxed, reported only): refreshes that
+// looked for subresource aliases (StorageTexture::pendingSubAliases) and the pending images over
+// their memory: kept out of the flush, nothing pending there (idle), or rejected by state (not
+// cached, keys not uncompressed), shape (no layer pairing), units (a unit the pair cannot take) or
+// shared (a unit pending in two of them); device copies with their units and bytes, units held
+// from an earlier copy, units superseded by this image's own results, units read from memory after
+// all, and fallback stores (no direct upload, or a unit rejected after the flush).
+struct SubaliasCounters {
+    std::atomic<std::uint64_t> refreshes{0}, candidates{0}, kept{0}, idle{0}, rejectedState{0}, rejectedShape{0}, rejectedUnits{0}, rejectedShared{0}, rejectedStoredOver{0};
+    std::atomic<std::uint64_t> copies{0}, units{0}, bytes{0}, held{0}, superseded{0}, reread{0}, fallbacks{0};
+    // Shape rejections by SubresourceMismatch.
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(SubresourceMismatch::Count)> mismatches{};
+};
+SubaliasCounters& Subaliases() {
+    static SubaliasCounters counters;
+    return counters;
+}
 // Write-back edge blocks (a surface sharing its 64 KiB block) StoredOver leaves to the CPU: whole,
 // by what stored the surface's pages (PageStoreCause, counted with APS5_FIX_BOOT_STRIP), or merged
 // per page (the pages no store reached since take the GPU's results: the Bink chroma tail).
@@ -106,6 +123,20 @@ std::size_t traceEdgeFine(const char* when, const GuestTextureResource& descript
     return made;
 }
 std::array<std::atomic<std::uint64_t>, 5> edgeCauses{};
+// APS5_FIX_CORNER (default on; =0 = the old merge): an edge block's surface pages the CPU stamped
+// take the results when their view page was still tracked per 16 KiB at the layer's upload and
+// their bytes still equal the ones read then: the stamp was the view page's, from a CPU store into
+// the data next door before TrackEdgeParts made it fine (a Bink plane's first merge: the intro
+// movie's bottom-right rectangle). A CPU store of the very same bytes is taken for no store.
+bool fixCorner() {
+    static const bool on = [] {
+        const char* value = std::getenv("APS5_FIX_CORNER");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return on;
+}
+std::atomic<std::uint64_t> edgeUnchangedPages{0};
+std::atomic<std::uint64_t> edgeSnapshotsRead{0};
 // Images stored by a FlushPending after a hook skip of theirs (AccessKeptByCpu), of which by the
 // hook for the read site of the last skip; images evictStale dropped (the [hooksync] and [storage] lines).
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
@@ -354,7 +385,21 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
-    std::fprintf(stderr, "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu, edge blocks to the CPU %llu (cpu pages %llu, driver pages %llu, driver whole %llu, unknown %llu), edge blocks merged per page %llu (GPU pages %llu, view pages made fine %llu, at creation %llu)%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), take(edgeBlocksToCpu), take(edgeCauses[1]), take(edgeCauses[2]), take(edgeCauses[3]), take(edgeCauses[4]), take(edgeBlocksMerged), take(edgeGpuPages), take(edgeFinePages), take(edgeFineAtCreation), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
+    // APS5_FIX_CORNER's fields: with the switch off the line keeps its old shape.
+    char corner[96] = "";
+    if (fixCorner()) std::snprintf(corner, sizeof(corner), ", unchanged CPU-stamped pages %llu, edge snapshots %llu", take(edgeUnchangedPages), take(edgeSnapshotsRead));
+    std::fprintf(stderr, "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu, edge blocks to the CPU %llu (cpu pages %llu, driver pages %llu, driver whole %llu, unknown %llu), edge blocks merged per page %llu (GPU pages %llu, view pages made fine %llu, at creation %llu%s)%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), take(edgeBlocksToCpu), take(edgeCauses[1]), take(edgeCauses[2]), take(edgeCauses[3]), take(edgeCauses[4]), take(edgeBlocksMerged), take(edgeGpuPages), take(edgeFinePages), take(edgeFineAtCreation), corner, ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
+    if (SubaliasRefreshEnabled()) {
+        auto& s = Subaliases();
+        const auto refreshes = take(s.refreshes), candidates = take(s.candidates), kept = take(s.kept), idle = take(s.idle);
+        const auto state = take(s.rejectedState), shape = take(s.rejectedShape), units = take(s.rejectedUnits), shared = take(s.rejectedShared), storedOver = take(s.rejectedStoredOver);
+        const auto copies = take(s.copies), copied = take(s.units), bytes = take(s.bytes), held = take(s.held), superseded = take(s.superseded), reread = take(s.reread), fallbacks = take(s.fallbacks);
+        std::string reasons;
+        for (std::size_t i = 1; i < s.mismatches.size(); ++i) {
+            if (const auto count = take(s.mismatches[i]); count != 0) reasons += std::string(reasons.empty() ? "" : ", ") + SubresourceMismatchName(static_cast<SubresourceMismatch>(i)) + " " + std::to_string(count);
+        }
+        std::fprintf(stderr, "[storage] subalias (APS5_SUBALIAS_REFRESH, 10 s): %llu refreshes looked, %llu pending images over them: %llu kept, %llu idle, rejected state %llu, shape %llu, units %llu, shared %llu, stored over %llu; %llu device copies (%llu units, %.1f MiB), %llu units held, %llu superseded, %llu re-read, %llu fallback stores; shape by reason: %s\n", refreshes, candidates, kept, idle, state, shape, units, shared, storedOver, copies, copied, static_cast<double>(bytes) / 1048576.0, held, superseded, reread, fallbacks, reasons.empty() ? "-" : reasons.c_str());
+    }
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
@@ -1404,6 +1449,9 @@ bool FillClearColor(VkFormat format, std::uint32_t elementBytes, std::span<const
 // The image being validated by Refresh: its own pending results are what the next dispatch wants,
 // so the comparison with guest memory must not flush them.
 thread_local const StorageTexture* refreshing = nullptr;
+// APS5_SUBALIAS_REFRESH: the subresource aliases the flush of the Refresh running on this thread
+// leaves pending (StorageTexture::pendingSubAliases), set only around that flush.
+thread_local const std::vector<const StorageTexture*>* refreshAliases = nullptr;
 
 void FlushHook(std::uint64_t address, std::size_t bytes) {
     StorageTexture::FlushPending(address, bytes);
@@ -1543,6 +1591,16 @@ bool StorageTexture::Refresh() {
             }
         }
     }
+    // APS5_SUBALIAS_REFRESH: without a same-surface alias, the pending images over a layer range of
+    // this memory whose units here this image can take stay pending through the flush as well.
+    std::vector<SubAlias> subAliases;
+    if (alias == nullptr && SubaliasRefreshEnabled()) subAliases = pendingSubAliases();
+    std::vector<const StorageTexture*> subExempt;
+    for (const auto& sub : subAliases) subExempt.push_back(sub.texture.get());
+    struct SubExempt {
+        const std::vector<const StorageTexture*>* previous;
+        ~SubExempt() { refreshAliases = previous; }
+    } subExemptScope{std::exchange(refreshAliases, subExempt.empty() ? nullptr : &subExempt)};
     // No publish: the upload below reads the stored units from the unit shadow itself.
     const bool flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.get(), "storage refresh", PublishScope::None);
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
@@ -1594,6 +1652,7 @@ bool StorageTexture::Refresh() {
                 scanBlocks();
                 for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
                     if (stampedBlocks[unit] == 0) {
+                        carryEdgeSnapshot(unit, layerGeneration[unit], current);
                         layerGeneration[unit] = current;
                         continue;
                     }
@@ -1651,9 +1710,15 @@ bool StorageTexture::Refresh() {
                 borrowedUnits.clear();
             }
         }
+        // The kept sub-aliases stayed exempt through the compare above too (its flush hook).
+        refreshAliases = subExemptScope.previous;
+        if (!subAliases.empty()) planSubBorrows(subAliases, direct, changed, unchanged);
     }
     if (unchanged) {
         ++Profile().storageReused;
+        if ((edgeSnapshotAt[0] | edgeSnapshotAt[1]) != 0) {
+            for (const int side : {0, 1}) carryEdgeSnapshot(edgeLayer(side), layerGeneration[edgeLayer(side)], current);
+        }
         layerGeneration.assign(trackedLayers, current);
         refreshGeneration();
         RecordCensus::Touch(RecordCensus::RefreshMemo);
@@ -1750,6 +1815,17 @@ bool StorageTexture::Refresh() {
         }
         refreshGeneration();
     }
+    bool subBorrowed = false;
+    for (auto& sub : subAliases) {
+        if (!sub.any) continue;
+        uploadReason = "subalias";
+        borrowSubUnits(sub);
+        for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+            if (sub.units[unit]) layerGeneration[unit] = current;
+        }
+        subBorrowed = true;
+    }
+    if (subBorrowed) refreshGeneration();
     if (std::any_of(changed.begin(), changed.end(), [](bool selected) { return selected; })) {
         uploadReason = keysChanged ? "keys" : cpuWrote ? "cpu" : generation == 0 ? "untracked" : flushed ? "flushed" : "store";
         upload(&changed);
@@ -1809,7 +1885,14 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     // A layer selection applies to the direct path alone (the others upload everything); it names
     // array layers, which the tracked layers are when there are several.
     if (layers != nullptr && ((!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; }))) layers = nullptr;
+    // APS5_FIX_CORNER: the edge bytes of the layers this upload stamps are read before the collect
+    // below (a CPU store racing it then differs from them); a side of an unselected layer keeps its
+    // snapshot and generation (a path uploading everything anyway moves the layer past it).
+    const auto snapped = fixCorner() ? snapshotEdges(layers) : 0u;
     const auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    for (const int side : {0, 1}) {
+        if ((snapped >> side & 1u) != 0) edgeSnapshotGeneration[side] = now;
+    }
     const auto stampLayers = [&](bool selectedOnly) {
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (!selectedOnly || layers == nullptr || (*layers)[layer]) layerGeneration[layer] = now;
@@ -1830,6 +1913,8 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         originalValid = false;
         forgetBorrowed(0, trackedLayers);
         stampLayers(false);
+        edgeSnapshotAt[0] = edgeSnapshotAt[1] = 0;
+        edgeSnapshotGeneration[0] = edgeSnapshotGeneration[1] = 0;
         static const bool recordClear = std::getenv("APS5_NO_RECORDED_CLEAR") == nullptr;
         auto* recorder = recordClear ? Recorder::Active() : nullptr;
         std::unique_ptr<CommandBatch> batch;
@@ -2671,6 +2756,25 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         }
         if (superseded) source->reconcilePending();
     }
+    // Likewise the subresource aliases' units (APS5_SUBALIAS_REFRESH): the unit of theirs at the
+    // same address covers the same bytes (PlanSubresourceUnit's sameExtent).
+    if (!subBorrows.empty()) {
+        for (auto& held : subBorrows) {
+            const auto source = held.source.lock();
+            bool superseded = false;
+            for (std::uint32_t unit = first; unit < first + count && unit < held.units.size(); ++unit) {
+                if (!held.units[unit]) continue;
+                held.units[unit] = false;
+                const auto theirs = static_cast<std::int64_t>(unit) + held.unitOffset;
+                if (source == nullptr || source->version != held.version || theirs < 0 || theirs >= static_cast<std::int64_t>(source->trackedLayers) || !source->layerPending[static_cast<std::size_t>(theirs)]) continue;
+                source->layerPending[static_cast<std::size_t>(theirs)] = false;
+                Subaliases().superseded.fetch_add(1, std::memory_order_relaxed);
+                superseded = true;
+            }
+            if (superseded) source->reconcilePending();
+        }
+        std::erase_if(subBorrows, [](const SubBorrow& held) { return std::none_of(held.units.begin(), held.units.end(), [](bool unit) { return unit; }); });
+    }
     if (eager) {
         WriteBack();
         return;
@@ -2767,7 +2871,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         const auto* exempt = refreshing;
         for (auto it = pending.textures.MayOverlap(address, bytes) ? pending.textures.begin() : pending.textures.end(); it != pending.textures.end();) {
             auto* texture = *it;
-            if (texture != except && texture != exempt && texture->overlaps(address, bytes)) {
+            if (texture != except && texture != exempt && texture->overlaps(address, bytes) && (refreshAliases == nullptr || std::find(refreshAliases->begin(), refreshAliases->end(), texture) == refreshAliases->end())) {
                 if (!texture->pendingUnitInside(address, bytes)) {
                     pretestSkipped.fetch_add(1, std::memory_order_relaxed);
                     ++it;
@@ -3842,6 +3946,10 @@ void StorageTexture::advanceAdjacent(const std::vector<Adjacent>& adjacent, std:
         if (begin < beforeEnd && !GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(beforeEnd - begin), seen)) continue;
         if (afterBegin < end && !GuestMemory::UnchangedSince(afterBegin, static_cast<std::size_t>(end - afterBegin), seen)) continue;
         if (trace) std::fprintf(stderr, "[flush] adjacent pending image 0x%llx+0x%llx layer %u advanced past a write-back's stamps (generation %llu -> %llu)\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), layer, static_cast<unsigned long long>(seen), static_cast<unsigned long long>(now));
+        // APS5_FIX_CORNER: unchanged outside the shared block since `seen`, so the edge bytes read at
+        // `seen` still vouch (the byte compare catches a write inside it; the Bink luma plane's store
+        // advancing the chroma plane after it).
+        texture->carryEdgeSnapshot(layer, seen, now);
         texture->layerGeneration[layer] = now;
         texture->refreshGeneration();
     }
@@ -3880,7 +3988,252 @@ std::shared_ptr<StorageTexture> StorageTexture::pendingAlias() const {
     return nullptr;
 }
 
+void StorageTexture::forgetSubBorrowed(std::uint32_t first, std::uint32_t count) {
+    for (auto& held : subBorrows) {
+        for (auto unit = first; unit < first + count && unit < held.units.size(); ++unit) held.units[unit] = false;
+    }
+    std::erase_if(subBorrows, [](const SubBorrow& held) { return std::none_of(held.units.begin(), held.units.end(), [](bool unit) { return unit; }); });
+}
+
+SubresourceShape StorageTexture::subresourceShape() const {
+    SubresourceShape shape;
+    shape.baseAddress = descriptor.baseAddress;
+    shape.guestBytes = guestBytes;
+    shape.layerBytes = geometry.layerBytes;
+    shape.layers = geometry.layers;
+    shape.width = descriptor.width;
+    shape.height = descriptor.height;
+    shape.mipCount = descriptor.mipCount;
+    shape.elementBytes = BytesPerElement(descriptor.format);
+    shape.blockWidth = BlockWidth(descriptor.format);
+    shape.tileMode = descriptor.tileMode;
+    shape.dimension = descriptor.dimension;
+    shape.swizzleSlice = descriptor.swizzleSlice;
+    shape.dcc = descriptor.dccAddress != 0;
+    shape.flat = !geometry.thick && geometry.imageDepth == 1 && geometry.imageLayers == geometry.layers;
+    shape.blockUnits = blockUnits && trackedLayerBytes == 65536;
+    return shape;
+}
+
+void StorageTexture::subUnitPlans(const SubAlias& alias, std::vector<SubresourceUnitPlan>& plans, std::vector<SubresourceUnit>& facts) const {
+    plans.assign(trackedLayers, SubresourceUnitPlan::Leave);
+    facts.assign(trackedLayers, SubresourceUnit{});
+    const auto& source = *alias.texture;
+    const auto begin = std::max(descriptor.baseAddress, source.descriptor.baseAddress);
+    const auto end = std::min(descriptor.baseAddress + guestBytes, source.descriptor.baseAddress + source.guestBytes);
+    if (end <= begin) return;
+    // Both bases are 64 KiB aligned (block units): unit k of the overlap is one block of each.
+    const auto first = static_cast<std::uint32_t>((begin - descriptor.baseAddress) / 65536);
+    const auto sourceFirst = static_cast<std::uint32_t>((begin - source.descriptor.baseAddress) / 65536);
+    const auto count = std::min({static_cast<std::uint32_t>((end - begin + 65535) / 65536), trackedLayers - first, source.trackedLayers - sourceFirst});
+    std::vector<std::uint64_t> generations(count);
+    for (std::uint32_t k = 0; k < count; ++k) generations[k] = source.layerGeneration[sourceFirst + k];
+    std::vector<std::uint8_t> stamped(count);
+    const bool tracked = GuestMemory::ChangedBlocks(begin, static_cast<std::size_t>(std::min<std::uint64_t>(end - begin, static_cast<std::uint64_t>(count) * 65536)), generations, stamped);
+    // The units this image took from the alias at its current version.
+    const SubBorrow* lent = nullptr;
+    for (const auto& entry : subBorrows) {
+        if (entry.version == source.version && entry.units.size() == trackedLayers && entry.source.lock().get() == &source) lent = &entry;
+    }
+    for (std::uint32_t k = 0; k < count; ++k) {
+        const auto unit = first + k;
+        const auto theirs = sourceFirst + k;
+        auto& fact = facts[unit];
+        fact.readerPending = layerPending[unit];
+        fact.writerPending = source.layerPending[theirs];
+        fact.sameExtent = layerBytes(unit) == source.layerBytes(theirs);
+        fact.writerTracked = tracked && source.layerGeneration[theirs] != 0;
+        fact.writerStamped = tracked ? stamped[k] : GuestMemory::BlockMaybeWritten;
+        fact.held = lent != nullptr && lent->units[unit];
+        plans[unit] = PlanSubresourceUnit(fact);
+    }
+}
+
+std::vector<StorageTexture::SubAlias> StorageTexture::pendingSubAliases() const {
+    std::vector<SubAlias> aliases;
+    if (!blockUnits || descriptor.dccAddress != 0) return aliases;
+    std::vector<std::shared_ptr<StorageTexture>> candidates;
+    // Per candidate: pending units inside this memory (the flush stores it unless it is kept).
+    std::vector<bool> storesInside;
+    // Guest ranges of the other pending images the flush stores over this memory.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> stored;
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        if (!pending.textures.MayOverlap(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) return aliases;
+        for (auto* texture : pending.textures) {
+            if (texture == this || !texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) continue;
+            const bool inside = texture->pendingUnitInside(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+            if (!texture->blockUnits) {
+                if (inside) stored.emplace_back(texture->descriptor.baseAddress, texture->descriptor.baseAddress + texture->guestBytes);
+                continue;
+            }
+            if (auto alive = texture->weak_from_this().lock()) {
+                candidates.push_back(std::move(alive));
+                storesInside.push_back(inside);
+            }
+        }
+    }
+    if (candidates.empty()) return aliases;
+    // The device copy serves the direct path only: the others upload the whole surface from memory.
+    if (HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) == nullptr) return aliases;
+    auto& counters = Subaliases();
+    counters.refreshes.fetch_add(1, std::memory_order_relaxed);
+    counters.candidates.fetch_add(candidates.size(), std::memory_order_relaxed);
+    const auto mine = subresourceShape();
+    std::vector<SubresourceUnitPlan> plans;
+    std::vector<SubresourceUnit> facts;
+    for (const auto& candidate : candidates) {
+        if (!candidate->Cached() || candidate->uploadedKeys != DccKeys::Uncompressed) {
+            counters.rejectedState.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        const auto theirs = candidate->subresourceShape();
+        std::int64_t offset = 0;
+        if (const auto mismatch = SubresourcePairing(mine, theirs, offset); mismatch != SubresourceMismatch::None) {
+            counters.rejectedShape.fetch_add(1, std::memory_order_relaxed);
+            counters.mismatches[static_cast<std::size_t>(mismatch)].fetch_add(1, std::memory_order_relaxed);
+            // Debug aid: APS5_TRACE_SUBALIAS names the first 48 pairs rejected by shape.
+            static const bool trace = std::getenv("APS5_TRACE_SUBALIAS") != nullptr;
+            static std::atomic<int> traced{0};
+            if (trace && traced.fetch_add(1, std::memory_order_relaxed) < 48) {
+                const auto describe = [](const SubresourceShape& shape) {
+                    char text[200];
+                    std::snprintf(text, sizeof(text), "0x%llx+0x%llx %ux%u mips %u layers %u x 0x%llx bpe %u tile %d dim %d swizzle %u dcc %d flat %d units %d", static_cast<unsigned long long>(shape.baseAddress), static_cast<unsigned long long>(shape.guestBytes), shape.width, shape.height, shape.mipCount, shape.layers, static_cast<unsigned long long>(shape.layerBytes), shape.elementBytes, static_cast<int>(shape.tileMode), static_cast<int>(shape.dimension), shape.swizzleSlice, shape.dcc ? 1 : 0, shape.flat ? 1 : 0, shape.blockUnits ? 1 : 0);
+                    return std::string(text);
+                };
+                std::fprintf(stderr, "[subalias] refresh %s, pending %s: %s\n", describe(mine).c_str(), describe(theirs).c_str(), SubresourceMismatchName(mismatch));
+            }
+            continue;
+        }
+        SubAlias alias{candidate, offset, static_cast<std::int64_t>(descriptor.baseAddress / 65536) - static_cast<std::int64_t>(candidate->descriptor.baseAddress / 65536), std::vector<bool>(trackedLayers, false), std::vector<bool>(trackedLayers, false), false};
+        subUnitPlans(alias, plans, facts);
+        if (std::find(plans.begin(), plans.end(), SubresourceUnitPlan::Reject) != plans.end()) {
+            counters.rejectedUnits.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        bool any = false;
+        for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+            alias.pendingBefore[unit] = facts[unit].writerPending;
+            any = any || facts[unit].writerPending;
+        }
+        // Nothing pending here: the flush passes it by anyway.
+        if (!any) {
+            counters.idle.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        aliases.push_back(std::move(alias));
+    }
+    // A unit pending in two aliases: which results are newer is not known here, so both are stored.
+    std::vector<std::uint8_t> owners(trackedLayers, 0);
+    for (const auto& alias : aliases) {
+        for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+            if (alias.pendingBefore[unit] && owners[unit] < 2) ++owners[unit];
+        }
+    }
+    const auto shared = std::erase_if(aliases, [&](const SubAlias& alias) {
+        for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+            if (alias.pendingBefore[unit] && owners[unit] > 1) return true;
+        }
+        return false;
+    });
+    counters.rejectedShared.fetch_add(shared, std::memory_order_relaxed);
+    // An image the flush stores first over a unit a kept alias has pending would decide that unit
+    // against the pending-list order: such aliases are stored by the flush as well.
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        if (!storesInside[i]) continue;
+        const auto* texture = candidates[i].get();
+        if (std::none_of(aliases.begin(), aliases.end(), [&](const SubAlias& alias) { return alias.texture.get() == texture; })) stored.emplace_back(texture->descriptor.baseAddress, texture->descriptor.baseAddress + texture->guestBytes);
+    }
+    if (!aliases.empty() && !stored.empty()) {
+        std::vector<SubresourceLender> lenders;
+        lenders.reserve(aliases.size());
+        for (const auto& alias : aliases) lenders.push_back({alias.texture->descriptor.baseAddress, alias.texture->descriptor.baseAddress + alias.texture->guestBytes, alias.pendingBefore});
+        const auto given = SubresourceStoredOver(descriptor.baseAddress, trackedLayers, std::move(stored), lenders);
+        std::size_t index = 0;
+        const auto storedOver = std::erase_if(aliases, [&](const SubAlias&) { return given[index++]; });
+        counters.rejectedStoredOver.fetch_add(storedOver, std::memory_order_relaxed);
+    }
+    counters.kept.fetch_add(aliases.size(), std::memory_order_relaxed);
+    return aliases;
+}
+
+void StorageTexture::planSubBorrows(std::vector<SubAlias>& aliases, bool direct, std::vector<bool>& changed, bool& unchanged) {
+    auto& counters = Subaliases();
+    std::vector<std::vector<SubresourceUnitPlan>> plans(aliases.size());
+    std::vector<std::vector<SubresourceUnit>> facts(aliases.size());
+    bool fallback = !direct;
+    for (std::size_t i = 0; i < aliases.size(); ++i) {
+        subUnitPlans(aliases[i], plans[i], facts[i]);
+        if (std::find(plans[i].begin(), plans[i].end(), SubresourceUnitPlan::Reject) != plans[i].end()) fallback = true;
+    }
+    if (fallback) {
+        // Stored as the flush would have stored them (this image stays exempt as `refreshing`); the
+        // units they had pending here are read from memory.
+        counters.fallbacks.fetch_add(1, std::memory_order_relaxed);
+        FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage refresh", PublishScope::None);
+        for (auto& alias : aliases) {
+            alias.any = false;
+            for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+                if (!alias.pendingBefore[unit] || layerPending[unit]) continue;
+                changed[unit] = true;
+                unchanged = false;
+            }
+        }
+        return;
+    }
+    for (std::size_t i = 0; i < aliases.size(); ++i) {
+        auto& alias = aliases[i];
+        for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+            const auto& fact = facts[i][unit];
+            if (plans[i][unit] == SubresourceUnitPlan::Borrow) {
+                alias.units[unit] = true;
+                alias.any = true;
+                changed[unit] = false;
+                unchanged = false;
+                continue;
+            }
+            if (!alias.pendingBefore[unit] || layerPending[unit]) continue;
+            if (fact.writerPending && fact.writerStamped == GuestMemory::BlockUnchanged && fact.held) {
+                counters.held.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            // Stored meanwhile (a hook), or dead to the alias's write-back (stamped): memory has it.
+            counters.reread.fetch_add(1, std::memory_order_relaxed);
+            changed[unit] = true;
+            unchanged = false;
+        }
+    }
+}
+
+void StorageTexture::borrowSubUnits(SubAlias& alias) {
+    auto& source = *alias.texture;
+    const auto bytes = copyUnitsFrom(source, alias.units, alias.layerOffset);
+    std::uint64_t taken = 0;
+    for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+        if (!alias.units[unit]) continue;
+        forgetBorrowed(unit, 1);
+        ++taken;
+    }
+    auto entry = std::find_if(subBorrows.begin(), subBorrows.end(), [&](const SubBorrow& held) { return held.source.lock() == alias.texture; });
+    if (entry == subBorrows.end()) entry = subBorrows.insert(subBorrows.end(), SubBorrow{alias.texture, source.version, alias.unitOffset, {}});
+    // Units taken at an older version are taken again whole above (none is held across versions).
+    if (entry->version != source.version || entry->units.size() != trackedLayers) entry->units.assign(trackedLayers, false);
+    entry->version = source.version;
+    entry->unitOffset = alias.unitOffset;
+    for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+        if (alias.units[unit]) entry->units[unit] = true;
+    }
+    source.lent = true;
+    ++version;
+    auto& counters = Subaliases();
+    counters.copies.fetch_add(1, std::memory_order_relaxed);
+    counters.units.fetch_add(taken, std::memory_order_relaxed);
+    counters.bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
 void StorageTexture::forgetBorrowed(std::uint32_t first, std::uint32_t count) {
+    if (!subBorrows.empty()) forgetSubBorrowed(first, count);
     if (borrowedUnits.empty()) return;
     for (auto unit = first; unit < first + count && unit < borrowedUnits.size(); ++unit) borrowedUnits[unit] = false;
     if (std::none_of(borrowedUnits.begin(), borrowedUnits.end(), [](bool held) { return held; })) {
@@ -3890,12 +4243,38 @@ void StorageTexture::forgetBorrowed(std::uint32_t first, std::uint32_t count) {
 }
 
 std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vector<bool>& units) {
+    const auto bytes = copyUnitsFrom(source, units, 0);
+    if (!subBorrows.empty()) {
+        for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+            if (units[unit]) forgetSubBorrowed(unit, 1);
+        }
+    }
+    if (borrowedFrom.lock() != source.weak_from_this().lock() || borrowedUnits.size() != trackedLayers) {
+        borrowedUnits.assign(trackedLayers, false);
+        borrowedFrom = source.weak_from_this();
+    }
+    borrowedVersion = source.version;
+    source.lent = true;
+    for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+        if (units[unit]) borrowedUnits[unit] = true;
+    }
+    ++version;
+    return bytes;
+}
+
+std::uint64_t StorageTexture::copyUnitsFrom(StorageTexture& source, const std::vector<bool>& units, std::int64_t layerOffset) {
     const auto runs = unitRuns(units);
     const auto windows = sliceWindows(runs);
     Require(!windows.empty(), "storage image borrows no unit");
     std::vector<VkImageCopy> regions;
     for (const auto& window : windows) {
-        for (const auto& region : window.regions) regions.push_back({region.imageSubresource, region.imageOffset, region.imageSubresource, region.imageOffset, region.imageExtent});
+        for (const auto& region : window.regions) {
+            auto from = region.imageSubresource;
+            const auto layer = static_cast<std::int64_t>(from.baseArrayLayer) + layerOffset;
+            Require(layer >= 0 && layer < static_cast<std::int64_t>(source.geometry.imageLayers), "storage image borrows a layer its alias does not have");
+            from.baseArrayLayer = static_cast<std::uint32_t>(layer);
+            regions.push_back({from, region.imageOffset, region.imageSubresource, region.imageOffset, region.imageExtent});
+        }
     }
     std::uint64_t bytes = 0;
     for (const auto& [begin, end] : runs) bytes += end - begin;
@@ -3926,6 +4305,7 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
     }
+    barriers[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, source.descriptor.mipCount, 0, source.geometry.imageLayers};
     barriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     barriers[0].image = source.image;
@@ -3941,16 +4321,6 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
     if (batch) batch->SubmitAndWait();
     else recorder->EndGpuTiming(timing, bytes);
     countStorageUpload(3, bytes);
-    if (borrowedFrom.lock() != source.weak_from_this().lock() || borrowedUnits.size() != trackedLayers) {
-        borrowedUnits.assign(trackedLayers, false);
-        borrowedFrom = source.weak_from_this();
-    }
-    borrowedVersion = source.version;
-    source.lent = true;
-    for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
-        if (units[unit]) borrowedUnits[unit] = true;
-    }
-    ++version;
     return bytes;
 }
 
@@ -4024,6 +4394,86 @@ void StorageTexture::storeKeys(const char* caller, const std::vector<bool>& laye
     if (IsDccClear(filledKeys)) return;
     const auto outcome = MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, keyStoreGuard(caller, layers));
     if (outcome.stored && outcome.kept == 0) keysSeen = outcome.collected != 0 ? outcome.collected : GuestMemory::TrackerGeneration();
+}
+
+std::uint32_t StorageTexture::edgeLayer(int side) const {
+    if (side == 0 || trackedLayerBytes == 0) return 0;
+    return static_cast<std::uint32_t>(std::min<std::uint64_t>((guestBytes - 1) / trackedLayerBytes, trackedLayers - 1));
+}
+
+void StorageTexture::carryEdgeSnapshot(std::uint32_t layer, std::uint64_t from, std::uint64_t to) {
+    for (const int side : {0, 1}) {
+        if (edgeSnapshotAt[side] != 0 && edgeLayer(side) == layer && from != 0 && edgeSnapshotGeneration[side] == from) edgeSnapshotGeneration[side] = to;
+    }
+}
+
+std::uint32_t StorageTexture::snapshotEdges(const std::vector<bool>* layers, bool read) {
+    constexpr std::uint64_t viewPage = 0x4000;
+    const auto begin = descriptor.baseAddress;
+    const auto end = begin + guestBytes;
+    const std::uint64_t from[2] = {begin, std::max(end & ~(viewPage - 1), begin)};
+    const std::uint64_t to[2] = {std::min((begin + viewPage - 1) & ~(viewPage - 1), end), end};
+    // The tracked layers a side's bytes lie in that `layers` selects, of how many (a side spans
+    // several when a layer is smaller than its 16 KiB).
+    const auto selection = [&](int side) {
+        if (from[side] >= to[side] || trackedLayerBytes == 0) return std::pair<std::uint64_t, std::uint64_t>{(*layers)[edgeLayer(side)] ? 1u : 0u, 1u};
+        const auto first = std::min<std::uint64_t>(trackedLayers - 1, (from[side] - begin) / trackedLayerBytes);
+        const auto last = std::min<std::uint64_t>(trackedLayers - 1, (to[side] - 1 - begin) / trackedLayerBytes);
+        std::uint64_t selected = 0;
+        for (auto layer = first; layer <= last; ++layer) selected += (*layers)[static_cast<std::size_t>(layer)] ? 1u : 0u;
+        return std::pair<std::uint64_t, std::uint64_t>{selected, last - first + 1};
+    };
+    std::uint32_t snapped = 0;
+    for (int side = 0; side < 2; ++side) {
+        const auto [selected, spanned] = layers != nullptr ? selection(side) : std::pair<std::uint64_t, std::uint64_t>{1, 1};
+        if (selected == 0) continue;
+        edgeSnapshotAt[side] = 0;
+        edgeSnapshotGeneration[side] = 0;
+        if (!read || selected != spanned) {
+            std::vector<std::byte>().swap(edgeSnapshot[side]);
+            continue;
+        }
+        // A side on a view page boundary shares no page; a surface inside one view page has one side.
+        // Only a view page still tracked per 16 KiB stamps the surface for its neighbours' stores (a
+        // fine one, plain memory and fine tracking off read nothing: most uploads stop here).
+        if ((side == 0 ? begin : end) % viewPage == 0 || from[side] >= to[side] || (side == 1 && edgeSnapshotAt[0] != 0 && from[1] < to[0]) || !GuestMemory::CoarseViewPage(from[side])) {
+            std::vector<std::byte>().swap(edgeSnapshot[side]);
+            continue;
+        }
+        // Read in place, no flush (the refresh flushed the surface; GPU stores landing later differ),
+        // and only where every byte is readable (else nothing is vouched for).
+        const auto bytes = static_cast<std::size_t>(to[side] - from[side]);
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(from[side]), bytes)) {
+            std::vector<std::byte>().swap(edgeSnapshot[side]);
+            continue;
+        }
+        edgeSnapshot[side].resize(bytes);
+        std::memcpy(edgeSnapshot[side].data(), reinterpret_cast<const void*>(from[side]), bytes);
+        edgeSnapshotAt[side] = from[side];
+        snapped |= 1u << side;
+        edgeSnapshotsRead.fetch_add(1, std::memory_order_relaxed);
+    }
+    return snapped;
+}
+
+std::uint32_t StorageTexture::unchangedEdgePages(std::uint64_t block, std::uint32_t pages, std::uint64_t generation) const {
+    constexpr std::uint64_t page = GuestMemory::UnstoredPageBytes;
+    std::uint32_t unchanged = 0;
+    for (std::uint32_t p = 0; p < 32; ++p) {
+        if ((pages >> p & 1u) == 0) continue;
+        const auto from = std::max(block + p * page, descriptor.baseAddress);
+        const auto to = std::min(block + (p + 1) * page, descriptor.baseAddress + guestBytes);
+        if (from >= to) continue;
+        for (int side = 0; side < 2; ++side) {
+            const auto at = edgeSnapshotAt[side];
+            if (at == 0 || from < at || to > at + edgeSnapshot[side].size()) continue;
+            if (generation == 0 || edgeSnapshotGeneration[side] != generation) break;
+            // No flush: pending GPU stores into the page are this image's own results or differ.
+            if (GuestMemory::EqualsCommittedUnsynced(from, std::span<const std::byte>(edgeSnapshot[side]).subspan(static_cast<std::size_t>(from - at), static_cast<std::size_t>(to - from)))) unchanged |= 1u << p;
+            break;
+        }
+    }
+    return unchanged;
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
@@ -4105,26 +4555,33 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                 // re-upload with the layer, which keeps its generation as for a kept block).
                 auto cause = GuestMemory::PageStoreCause::None;
                 std::uint32_t cpuPages = 0, driverPages = 0;
-                const auto gpuPages = GuestMemory::PagesUnstoredSince(from, static_cast<std::size_t>(to - from), layerGeneration[layer], &cause, &cpuPages, &driverPages);
+                auto gpuPages = GuestMemory::PagesUnstoredSince(from, static_cast<std::size_t>(to - from), layerGeneration[layer], &cause, &cpuPages, &driverPages);
                 std::uint32_t surfacePages = 0;
                 for (auto p = (from - at) / GuestMemory::UnstoredPageBytes; p <= (to - 1 - at) / GuestMemory::UnstoredPageBytes; ++p) surfacePages |= 1u << p;
                 // CPU-stamped surface pages may be a 16 KiB shared-view stamp over the CPU data next
                 // door: from now on such pages are tracked per 4 KiB (TrackEdgeParts).
+                std::size_t madeFine = 0;
                 if (const auto cpuSurface = cpuPages & surfacePages; cpuSurface != 0) {
                     const auto low = static_cast<std::uint64_t>(std::countr_zero(cpuSurface));
                     const auto high = static_cast<std::uint64_t>(31 - std::countl_zero(cpuSurface));
                     const auto fineAt = at + low * GuestMemory::UnstoredPageBytes;
                     const auto fineBytes = (high - low + 1) * GuestMemory::UnstoredPageBytes;
-                    edgeFinePages.fetch_add(traceEdgeFine("after a merge", descriptor, guestBytes, fineAt, fineBytes, GuestMemory::TrackEdgeParts(fineAt, static_cast<std::size_t>(fineBytes))), std::memory_order_relaxed);
+                    madeFine = GuestMemory::TrackEdgeParts(fineAt, static_cast<std::size_t>(fineBytes));
+                    edgeFinePages.fetch_add(traceEdgeFine("after a merge", descriptor, guestBytes, fineAt, fineBytes, madeFine), std::memory_order_relaxed);
                 }
+                // APS5_FIX_CORNER: while the layer keeps the generation of the upload that read its edge
+                // bytes with their view page still per 16 KiB (whichever surface's merge made it fine
+                // since), CPU-stamped surface pages no driver store reached whose bytes still equal them
+                // take the results (see fixCorner). A later upload reads a fine page: nothing to vouch.
+                const auto vouched = fixCorner() && cause == GuestMemory::PageStoreCause::CpuPages ? unchangedEdgePages(at, cpuPages & surfacePages & ~driverPages & ~gpuPages, layerGeneration[layer]) : 0u;
                 // Debug aid: APS5_TRACE_EDGE_MERGE names the first 64 edge blocks whose surface pages
                 // a store record keeps from the results (block, surface pages, GPU pages, CPU and
-                // driver page masks, the layer's generation).
+                // driver page masks, the layer's generation, the pages APS5_FIX_CORNER vouches for and its snapshots).
                 static const bool traceEdge = std::getenv("APS5_TRACE_EDGE_MERGE") != nullptr;
                 static std::atomic<int> edgeTraced{0};
                 if (traceEdge) {
                     if (gpuPages != surfacePages && edgeTraced.fetch_add(1, std::memory_order_relaxed) < 64) {
-                        std::fprintf(stderr, "[edge-merge] image 0x%llx+0x%llx layer %u block 0x%llx surface %04x gpu %04x cpu %04x driver %04x cause %u generation %llu\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), layer, static_cast<unsigned long long>(at), surfacePages, gpuPages, cpuPages, driverPages, static_cast<unsigned>(cause), static_cast<unsigned long long>(layerGeneration[layer]));
+                        std::fprintf(stderr, "[edge-merge] image 0x%llx+0x%llx layer %u block 0x%llx surface %04x gpu %04x cpu %04x driver %04x cause %u generation %llu unchanged %04x (snapshots 0x%llx@%llu 0x%llx@%llu)\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), layer, static_cast<unsigned long long>(at), surfacePages, gpuPages, cpuPages, driverPages, static_cast<unsigned>(cause), static_cast<unsigned long long>(layerGeneration[layer]), vouched, static_cast<unsigned long long>(edgeSnapshotAt[0]), static_cast<unsigned long long>(edgeSnapshotGeneration[0]), static_cast<unsigned long long>(edgeSnapshotAt[1]), static_cast<unsigned long long>(edgeSnapshotGeneration[1]));
                     }
                     // APS5_TRACE_EDGE_DUMP=<dir> also saves the whole 64 KiB block's guest bytes for the
                     // first 32 such blocks whose surface pages the CPU stored to (what the CPU wrote).
@@ -4150,6 +4607,10 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                             }
                         }
                     }
+                }
+                if (vouched != 0) {
+                    gpuPages |= vouched;
+                    edgeUnchangedPages.fetch_add(static_cast<std::uint64_t>(std::popcount(vouched)), std::memory_order_relaxed);
                 }
                 if (gpuPages == 0) {
                     edgeBlocksToCpu.fetch_add(1, std::memory_order_relaxed);
@@ -4211,15 +4672,32 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     std::vector<ShadowedRange> shadowed;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> imported;
     const HostImport* shadowImport = nullptr;
-    const auto settle = [&](bool memoizedCollect) {
+    const auto settle = [&](bool memoizedCollect, bool landed = true) {
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (layers[layer]) layerPending[layer] = false;
         }
         const bool allKept = std::none_of(skippedLayer.begin(), skippedLayer.end(), [](bool kept) { return kept; });
         if (allKept || !adjacent.empty()) {
+            // APS5_FIX_CORNER: the re-stamped layers' edge bytes (what was just stored) are read again
+            // before the collect, as an upload reads them (a Bink plane stored whole before the first
+            // frame whose table store stamps its edge pages through the shared view page). A store
+            // into a host import lands when its batch runs: read now, the bytes would be the old ones
+            // (t1193's luma head), so those sides are dropped and vouch for nothing until an upload.
+            // A skipped layer keeps its old generation and snapshot: its edge block is BlockWritten, so the
+            // next Refresh sees the same 64 KiB stamp and re-uploads it (new generation, new snapshot)
+            // before any later merge can vouch with it.
+            std::uint32_t snapped = 0;
+            if (fixCorner()) {
+                std::vector<bool> restamped(trackedLayers, false);
+                for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) restamped[layer] = layers[layer] && !skippedLayer[layer];
+                snapped = snapshotEdges(&restamped, landed);
+            }
             const auto now = memoizedCollect ? GuestMemory::CollectWrites(firstStored, static_cast<std::size_t>(lastStored - firstStored)) : GuestMemory::CollectWritesUncached(firstStored, static_cast<std::size_t>(lastStored - firstStored));
             for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
                 if (layers[layer] && !skippedLayer[layer]) layerGeneration[layer] = now;
+            }
+            for (const int side : {0, 1}) {
+                if ((snapped >> side & 1u) != 0) edgeSnapshotGeneration[side] = now;
             }
             refreshGeneration();
             advanceAdjacent(adjacent, now, firstBlock, lastBlock);
@@ -4262,7 +4740,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             storeKeys("block write-back", layers);
             uploadedKeys = DccKeys::Uncompressed;
             for (const auto& [from, to] : keep) GuestMemory::MarkWritten(from, static_cast<std::size_t>(to - from));
-            settle(true);
+            settle(true, Recorder::Active() == nullptr);
             ++Profile().storageDirectWriteBacks;
             return;
         }
@@ -4405,7 +4883,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         // The walk covers this surface's pages only: an adjacent image's later CPU write is stamped
         // newer than this value when its own range is collected. No CPU wrote the pages here
         // (MarkWritten made the only stamps), so the memoized collect is exact.
-        settle(true);
+        settle(true, batch != nullptr);
         ++Profile().storageDirectWriteBacks;
         return;
     }

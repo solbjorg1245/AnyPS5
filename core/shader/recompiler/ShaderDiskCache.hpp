@@ -37,6 +37,14 @@ struct Counters {
 [[nodiscard]] std::uint64_t SourceVersion();
 
 void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, const ResourceSpecialization& specialization, std::vector<std::byte>& key);
+// The part of BuildKey's key the request and the specialization decide, without the format, the
+// source version, the device target, the host subgroup size and the switch set (P-PRECOMPILE): a
+// key list record rebuilt to the recording's digest asks for the key the game asks for on this
+// build and device.
+[[nodiscard]] std::uint64_t InputDigest(const RecompileRequest& request, const ResourceSpecialization& specialization);
+// The key of an empty request on this target: the format, source version, device target and switch
+// set every entry of this cache depends on.
+[[nodiscard]] std::uint64_t ContextDigest(const SpirvTarget& target);
 
 [[nodiscard]] std::string EntryName(std::span<const std::byte> key);
 
@@ -50,6 +58,8 @@ void EncodeResult(const RecompileResult& result, std::vector<std::byte>& out);
 [[nodiscard]] std::filesystem::path EntryDirectory();
 
 [[nodiscard]] bool Load(std::span<const std::byte> key, CompiledVariant& variant);
+// Whether the key's entry file exists (the precompile skips those; not counted as a hit or miss).
+[[nodiscard]] bool Present(std::span<const std::byte> key);
 void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant);
 void Flush();
 [[nodiscard]] Counters Totals();

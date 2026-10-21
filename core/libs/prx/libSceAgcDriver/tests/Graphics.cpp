@@ -2160,6 +2160,7 @@ int main() {
         RunTextureFormatTests();
         RunTexelStatsTests();
         RunTextureTilingTests();
+        RunSubresourceAliasTests();
         RunImageMemoryPoolTests();
         RunGuestTextureResourceTests();
         RunGuestSamplerResourceTests();
