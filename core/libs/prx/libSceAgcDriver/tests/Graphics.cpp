@@ -448,6 +448,21 @@ void DepthStencilTests() {
     queue.context[0x200] = 0x00200211;
     state = AgcDriver::Graphics::DecodeState(queue);
     Require(state.stencilFront.compareOp == VK_COMPARE_OP_EQUAL && state.stencilFront.reference == 2 && state.stencilFront.passOp == VK_STENCIL_OP_KEEP, "stencil content pass changed");
+    // STENCIL_TEST_VAL_EXPORT_ENABLE where the test compares against the reference: DecodeState
+    // refuses it, and the precheck rejects it too under APS5_PRECHECK_STENCIL_EXPORT; an
+    // always-pass, keep-everything test leaves both quiet.
+    queue.context[0x203] |= 2u;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "stencil test value export");
+    const bool precheckExport = [] {
+        const char* text = std::getenv("APS5_PRECHECK_STENCIL_EXPORT");
+        return text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    Require((AgcDriver::Graphics::DrawRejection(queue, false).find("stencil test value export") != std::string::npos) == precheckExport, "the precheck and DecodeState disagree on a stencil test value export");
+    queue.context[0x10b] = 0;
+    queue.context[0x200] = 0x00700711;
+    (void)AgcDriver::Graphics::DecodeState(queue);
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "the precheck rejected a stencil test value export an always-pass test ignores");
+    queue.context[0x203] &= ~2u;
     queue.context[0x10b] = 0x00030030;
     queue.context[0x10c] = 0x01ffff00;
     queue.context[0x200] = 0x00700771;

@@ -10,6 +10,7 @@
 #include <bitset>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <sstream>
 
@@ -729,6 +730,21 @@ std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue
     return pass;
 }
 
+// APS5_PRECHECK_STENCIL_EXPORT=1 (R-STALLS, default off): DrawRejection also rejects the draws
+// DecodeState throws "stencil test value export from the pixel shader is unsupported" for, so they
+// are skipped by the precheck (memoized per draw state under APS5_FAST_STATE) instead of by a
+// caught throw per draw: the [throws] census of t1516/t1517 counted 300-700 per 10 s in the later
+// explore area, about 1 ms each in the unwinder. The draw is skipped either way.
+namespace {
+bool PrecheckStencilExport() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_PRECHECK_STENCIL_EXPORT");
+        return text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return enabled;
+}
+}
+
 std::string DrawRejection(const QueueState& queue, bool indexed) {
     const auto& cx = queue.context;
     // A register a rule needs that is absent gives no verdict here: DecodeState reports it.
@@ -756,6 +772,12 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
         if (auto reason = require((word & 0xc0000008u) == 0, "depth bounds or depth-conditional color writes are unsupported"); !reason.empty()) return reason;
     }
     if (auto reason = nonzero(cx, 0x203, ShaderControlMask, "depth export, shader coverage or ordered fragment execution"); !reason.empty()) return reason;
+    if (PrecheckStencilExport() && value(cx, 0x203, word) && (word & 2u) != 0) {
+        // DecodeState's rule: the export with a stencil test (decodeDepth: a bound surface, a
+        // stencil plane and DB_DEPTH_CONTROL bit 0) whose reference value takes part.
+        std::uint32_t depthControl = 0, stencilInfo = 0, stencilOps = 0;
+        if (value(cx, 0x200, depthControl) && (depthControl & 3u) != 0 && depthSurfaceBound(cx) && value(cx, 0x011, stencilInfo) && (stencilInfo & 1u) != 0 && (depthControl & 1u) != 0 && value(cx, 0x10b, stencilOps) && stencilTestValueUsed(cx, depthControl)) return require(false, "stencil test value export from the pixel shader is unsupported");
+    }
     if (auto reason = nonzero(cx, 0x2dc, AlphaToCoverageMask, "alpha-to-coverage"); !reason.empty()) return reason;
     if (auto reason = nonzero(cx, 0x2f8, ~0u, "multisampling or coverage conversion"); !reason.empty()) return reason;
     if (auto reason = nonzero(cx, 0x292, ScanModeMask, "scan conversion mode"); !reason.empty()) return reason;
