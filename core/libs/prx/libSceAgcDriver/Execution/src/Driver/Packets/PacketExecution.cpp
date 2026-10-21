@@ -462,7 +462,11 @@ void Driver::execute(const Submission& submission) {
             dumpSampleCounters(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u));
         } else if (const auto mfsr = upscaleExec && opcode == 0x10 ? MfsrPacket::Decode(packet) : std::nullopt) {
             // The PS5 Pro upscaler's hand-over (MfsrPacket): its bilinear stand-in instead of the NOP skip.
+            // APS5_PASS_DUMP: the pass is an event of the dumped frame, its output and MainColor read back.
+            const PassDump::Serial passSerial;
+            if (PassDump::FrameActive()) PassDump::BeforeWork(device.Load().get(), submission.queue);
             tolerate("upscale", [&] { upscale(*mfsr, submission); });
+            if (PassDump::FrameActive()) PassDump::AfterDispatch(device.Load().get(), queue, submission.queue, Upscale::DumpNote(*mfsr));
         } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
             if (!wroteOnGpu) {
                 Pm4::Execute(packet, queue);

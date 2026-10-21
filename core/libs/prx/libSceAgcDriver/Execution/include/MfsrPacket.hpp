@@ -100,6 +100,11 @@ inline constexpr ImageSize DecodeImageSize(const Descriptor& words) {
     return {(((words[1] >> 30u) & 0x3u) | ((words[2] & 0xfffu) << 2u)) + 1u, ((words[2] >> 14u) & 0x3fffu) + 1u, (words[1] >> 20u) & 0x1ffu};
 }
 
+// A T#'s base address (bits 8..47).
+inline constexpr std::uint64_t DecodeImageAddress(const Descriptor& words) {
+    return (static_cast<std::uint64_t>(words[1] & 0xffu) << 40u) | (static_cast<std::uint64_t>(words[0]) << 8u);
+}
+
 }
 
 #endif

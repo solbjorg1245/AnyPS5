@@ -9,7 +9,9 @@
 // last frame's place is off screen). The result goes to the next history image and to the output (a
 // storage view of the guest's own format, written without a format qualifier). MainColor holds the
 // game's compressed colour c / (1 + luma): the history stays compressed, and with bit 2 of flags the
-// output is written expanded, c / (1 - luma), as the game's TAA pass does (APS5_UPSCALER_EXPAND).
+// output is written expanded, c / (1 - luma) (APS5_UPSCALER_EXPAND=1); with bit 3 the output (not the
+// history) is multiplied by the exposure texel, as the game's TAA pass multiplies MainColor
+// (APS5_UPSCALER_EXPOSURE).
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) uniform sampler2D color;
@@ -18,6 +20,7 @@ layout(set = 0, binding = 2) uniform sampler2D depth;
 layout(set = 0, binding = 3) uniform sampler2D history;
 layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D nextHistory;
 layout(set = 0, binding = 5) uniform writeonly image2D target;
+layout(set = 0, binding = 6) uniform sampler2D exposureTexel;
 
 layout(push_constant, std430) uniform Parameters {
     uvec2 size;
@@ -30,7 +33,7 @@ layout(push_constant, std430) uniform Parameters {
     float exposure;
     float currentWeight;
     // Bit 0: reset (the history is not read); bit 1: the nearest depth is the smallest (else reversed Z);
-    // bit 2: the output expanded.
+    // bit 2: the output expanded; bit 3: the output exposed.
     uint flags;
 };
 
@@ -130,6 +133,9 @@ void main() {
     imageStore(nextHistory, ivec2(texel), vec4(result, 1.0));
     if ((flags & 4u) != 0u) {
         result /= 1.0 - min(dot(result, vec3(0.3, 0.59, 0.11)), 0.9995);
+    }
+    if ((flags & 8u) != 0u) {
+        result *= texelFetch(exposureTexel, ivec2(0), 0).r;
     }
     imageStore(target, ivec2(texel), vec4(result, alpha));
 }

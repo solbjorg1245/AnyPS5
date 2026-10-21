@@ -90,8 +90,13 @@ void noteUpscale(const MfsrPacket::Dispatch& dispatch, std::optional<Upscale::Sk
         }
     } else {
         ++passes;
-        if (total++ == 0) std::fprintf(stderr, "[upscale] bilinear on: output %ux%u format %u, MainColor %ux%u format %u, render %ux%u\n", output.width, output.height, output.format,
-            color.width, color.height, color.format, render[0], render[1]);
+        if (total++ == 0) {
+            std::fprintf(stderr, "[upscale] bilinear on: output %ux%u format %u, MainColor %ux%u format %u, render %ux%u\n", output.width, output.height, output.format,
+                color.width, color.height, color.format, render[0], render[1]);
+            const auto& words = dispatch.descriptor;
+            std::fprintf(stderr, "[upscale] +0x28 descriptor%s: %08x %08x %08x %08x %08x %08x %08x %08x, +0x118 %g\n", (dispatch.present & 0x20u) != 0 ? "" : " (not set)", words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7],
+                static_cast<double>(dispatch.Field<float>(0x118)));
+        }
     }
     if (now - start < std::chrono::seconds(10)) return;
     if (Upscale::PluginSwitch()) {

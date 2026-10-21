@@ -5,10 +5,14 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/UpscaleBilinear_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/UpscaleTemporal_spv.h"
 #include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <span>
 
 namespace AgcDriver::Graphics {
 
@@ -43,6 +47,48 @@ void recordPass(const Context& context, VkCommandBuffer commands, VkAccessFlags 
     recorder.MarkCovered(dispatchedAccess);
 }
 
+
+// APS5_PROFILE_DRAW: where a pass's MainColor came from, whenever that changes (12 lines at most):
+// the T#'s surface, the storage image with results pending over it (FindPending, as cachedTexture
+// looks it up) and whether the texture bound is a view of that image, of another one, or a snapshot
+// of guest memory (which misses results still on the GPU).
+void noteColorSource(const char* pass, std::span<const std::uint32_t> words, const Texture& texture) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static int shown = 0, last = -1;
+    if (!profile || shown >= 12) return;
+    const auto resource = DecodeTextureResource(words);
+    const auto pending = StorageTexture::FindPending(resource.baseAddress, DescribeSurface(resource).guestBytes, resource.swizzleSlice);
+    const auto* source = texture.StorageSource();
+    const int served = source == nullptr ? 0 : source == pending.get() ? 1 : 2;
+    if (served == last) return;
+    last = served;
+    ++shown;
+    static constexpr std::array<const char*, 3> names{{"a snapshot", "the pending image", "another storage image"}};
+    char other[160] = "none";
+    if (pending != nullptr) {
+        const auto& seen = pending->Descriptor();
+        std::snprintf(other, sizeof(other), "0x%llx %ux%u format %u tile %u dcc 0x%llx, copy %s", static_cast<unsigned long long>(seen.baseAddress), seen.width, seen.height, seen.format, static_cast<unsigned>(seen.tileMode),
+                      static_cast<unsigned long long>(seen.dccAddress), Texture::CanCopyFrom(*pending, resource) ? "yes" : "no");
+    }
+    std::fprintf(stderr, "[upscale] %s MainColor 0x%llx %ux%u format %u tile %u dcc 0x%llx slice %u (T# %08x %08x %08x %08x %08x %08x %08x %08x): pending %s; served by %s\n", pass,
+                 static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<unsigned>(resource.tileMode), static_cast<unsigned long long>(resource.dccAddress), resource.swizzleSlice,
+                 words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7], other, names[served]);
+}
+
+// APS5_UPSCALER_EXPOSURE (Upscale::ExposureEnabled): the plan's 1x1 exposure texture, null when the
+// switch is off, the packet carries none or it does not resolve (the pass then keeps MainColor's scale).
+std::shared_ptr<Texture> exposureTexture(const Context& context, const Upscale::Plan& plan, bool& firstLayer) {
+    firstLayer = false;
+    if (!plan.exposure || !Upscale::ExposureEnabled()) return nullptr;
+    bool undecodable = false;
+    try {
+        return FastSampledTexture(context, plan.exposureWords, ShaderRecompiler::DescriptorImageShape::Image2D, false, firstLayer, undecodable);
+    } catch (const std::exception&) {
+        firstLayer = false;
+        return nullptr;
+    }
+}
+
 }
 
 BilinearUpscaler::BilinearUpscaler(const Context& context) : context(context) {
@@ -50,7 +96,7 @@ BilinearUpscaler::BilinearUpscaler(const Context& context) : context(context) {
     this->context.bufferPool.reset();
     // Binding 0: MainColor with the sampler; 1: the output. FastLayouts owns the layouts.
     constexpr std::uint32_t compute = VK_SHADER_STAGE_COMPUTE_BIT;
-    const std::array<std::uint32_t, 8> key{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, compute, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, compute};
+    const std::array<std::uint32_t, 12> key{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, compute, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, compute, 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, compute};
     layout = context.fastLayouts != nullptr ? context.fastLayouts->Get(key, compute) : nullptr;
     if (layout == nullptr) return;
     VkShaderModule module = VK_NULL_HANDLE;
@@ -105,28 +151,36 @@ std::optional<Upscale::Skip> BilinearUpscaler::Record(const Context& context, co
     bool firstLayer = false, undecodable = false;
     auto color = FastSampledTexture(context, plan.colorWords, ShaderRecompiler::DescriptorImageShape::Image2D, false, firstLayer, undecodable);
     if (color == nullptr) return Skip::ColorUnresolved;
+    noteColorSource("bilinear", plan.colorWords, *color);
+    bool exposureFirst = false;
+    const auto exposure = exposureTexture(context, plan, exposureFirst);
     ShaderRecompiler::DescriptorBinding target{ShaderRecompiler::DescriptorKind::StorageImage, ShaderRecompiler::DescriptorRole::GuestImages, 0, 1, 1, {plan.outputWords.begin(), plan.outputWords.end()}};
     target.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
     target.imageWritten = {true};
     const auto output = ResolveStorageImage(context, target, 0, nullptr);
-    const std::array<VkDescriptorImageInfo, 2> images{{{sampler, firstLayer ? color->FirstLayerView() : color->View(), color->Layout()},
-        {VK_NULL_HANDLE, output.firstLayer ? output.image->FirstLayerView(output.mip) : output.image->View(output.mip), VK_IMAGE_LAYOUT_GENERAL}}};
-    std::array<VkWriteDescriptorSet, 2> writes{};
+    // Without the exposure texel, MainColor is bound in its place (the shader does not read it).
+    const auto& exposed = exposure != nullptr ? exposure : color;
+    const bool exposedFirst = exposure != nullptr ? exposureFirst : firstLayer;
+    const std::array<VkDescriptorImageInfo, 3> images{{{sampler, firstLayer ? color->FirstLayerView() : color->View(), color->Layout()},
+        {VK_NULL_HANDLE, output.firstLayer ? output.image->FirstLayerView(output.mip) : output.image->View(output.mip), VK_IMAGE_LAYOUT_GENERAL},
+        {sampler, exposedFirst ? exposed->FirstLayerView() : exposed->View(), exposed->Layout()}}};
+    std::array<VkWriteDescriptorSet, 3> writes{};
     for (std::uint32_t binding = 0; binding < writes.size(); ++binding) {
-        writes[binding] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, binding, 0, 1, binding == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &images[binding], nullptr, nullptr};
+        writes[binding] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, binding, 0, 1, binding == 1 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &images[binding], nullptr, nullptr};
     }
-    // UpscaleBilinear.comp's Parameters (std430); bit 0 of flags: the output expanded.
+    // UpscaleBilinear.comp's Parameters (std430); flags bit 0: the output expanded, bit 1: exposed.
     struct Push {
         std::uint32_t width, height;
         std::array<float, 2> scale, low, high;
         std::uint32_t flags;
     };
-    const Push push{plan.output.width, plan.output.height, plan.scale, plan.low, plan.high, Upscale::ExpandEnabled() ? 1u : 0u};
+    const Push push{plan.output.width, plan.output.height, plan.scale, plan.low, plan.high, (Upscale::ExpandEnabled() ? 1u : 0u) | (exposure != nullptr ? 2u : 0u)};
     // 2. The record (recordPass, under TimingKey), then the output's mark.
     auto& recorder = *context.recorder;
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered, Recorder::CommandSite::Dispatch);
     recorder.Keep(color);
+    if (exposure != nullptr) recorder.Keep(exposure);
     recorder.Keep(output.image);
     recordPass(context, commands, covered, pipeline, *layout, writes, &push, static_cast<std::uint32_t>(sizeof(push)), plan.groups, Upscale::TimingKey);
     // As MarkGpuWrites marks a written storage image: its results pending over its surface. Nothing is
@@ -189,7 +243,7 @@ TemporalUpscaler::TemporalUpscaler(const Context& context) : context(context) {
     // Bindings 0-2: MainColor, Motion, MainDepth (fetched); 3: the last history (filtered); 4: the next
     // history; 5: the output.
     constexpr std::uint32_t compute = VK_SHADER_STAGE_COMPUTE_BIT, sampled = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, storage = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    const std::array<std::uint32_t, 24> key{0, sampled, 1, compute, 1, sampled, 1, compute, 2, sampled, 1, compute, 3, sampled, 1, compute, 4, storage, 1, compute, 5, storage, 1, compute};
+    const std::array<std::uint32_t, 28> key{0, sampled, 1, compute, 1, sampled, 1, compute, 2, sampled, 1, compute, 3, sampled, 1, compute, 4, storage, 1, compute, 5, storage, 1, compute, 6, sampled, 1, compute};
     layout = context.fastLayouts != nullptr ? context.fastLayouts->Get(key, compute) : nullptr;
     if (layout == nullptr) return;
     VkShaderModule module = VK_NULL_HANDLE;
@@ -242,6 +296,9 @@ std::optional<Upscale::Skip> TemporalUpscaler::Record(const Context& context, co
     bool colorFirst = false, motionFirst = false, depthFirst = false, undecodable = false;
     auto color = FastSampledTexture(context, plan.base.colorWords, DescriptorImageShape::Image2D, false, colorFirst, undecodable);
     if (color == nullptr) return Skip::ColorUnresolved;
+    noteColorSource("port", plan.base.colorWords, *color);
+    bool exposureFirst = false;
+    const auto exposure = exposureTexture(context, plan.base, exposureFirst);
     auto motion = FastSampledTexture(context, plan.motionWords, DescriptorImageShape::Image2D, false, motionFirst, undecodable);
     auto depth = FastSampledTexture(context, plan.depthWords, DescriptorImageShape::Image2D, false, depthFirst, undecodable);
     if (motion == nullptr || depth == nullptr) return Skip::InputUnresolved;
@@ -264,13 +321,17 @@ std::optional<Upscale::Skip> TemporalUpscaler::Record(const Context& context, co
         }
         newest = 0;
     }
-    const std::array<VkDescriptorImageInfo, 6> images{{{nearest, colorFirst ? color->FirstLayerView() : color->View(), color->Layout()},
+    // Without the exposure texel, MainColor is bound in its place (the shader does not read it).
+    const auto& exposed = exposure != nullptr ? exposure : color;
+    const bool exposedFirst = exposure != nullptr ? exposureFirst : colorFirst;
+    const std::array<VkDescriptorImageInfo, 7> images{{{nearest, colorFirst ? color->FirstLayerView() : color->View(), color->Layout()},
         {nearest, motionFirst ? motion->FirstLayerView() : motion->View(), motion->Layout()}, {nearest, depthFirst ? depth->FirstLayerView() : depth->View(), depth->Layout()},
         {linear, history[newest]->view, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, history[newest ^ 1]->view, VK_IMAGE_LAYOUT_GENERAL},
-        {VK_NULL_HANDLE, output.firstLayer ? output.image->FirstLayerView(output.mip) : output.image->View(output.mip), VK_IMAGE_LAYOUT_GENERAL}}};
-    std::array<VkWriteDescriptorSet, 6> writes{};
+        {VK_NULL_HANDLE, output.firstLayer ? output.image->FirstLayerView(output.mip) : output.image->View(output.mip), VK_IMAGE_LAYOUT_GENERAL},
+        {nearest, exposedFirst ? exposed->FirstLayerView() : exposed->View(), exposed->Layout()}}};
+    std::array<VkWriteDescriptorSet, 7> writes{};
     for (std::uint32_t binding = 0; binding < writes.size(); ++binding) {
-        writes[binding] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, binding, 0, 1, binding < 4 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &images[binding], nullptr, nullptr};
+        writes[binding] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, binding, 0, 1, binding == 4 || binding == 5 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &images[binding], nullptr, nullptr};
     }
     // UpscaleTemporal.comp's Parameters (std430); exposure 1.0 (+0x118 is 1.0 so far).
     struct Push {
@@ -279,7 +340,7 @@ std::optional<Upscale::Skip> TemporalUpscaler::Record(const Context& context, co
         float exposure, currentWeight;
         std::uint32_t flags;
     };
-    const Push push{size[0], size[1], plan.base.render[0], plan.base.render[1], plan.jitter, plan.motionScale, 1.0f, Upscale::PortCurrentWeight, (plan.reset || fresh ? 1u : 0u) | (plan.smallestNearest ? 2u : 0u) | (Upscale::ExpandEnabled() ? 4u : 0u)};
+    const Push push{size[0], size[1], plan.base.render[0], plan.base.render[1], plan.jitter, plan.motionScale, 1.0f, Upscale::PortCurrentWeight, (plan.reset || fresh ? 1u : 0u) | (plan.smallestNearest ? 2u : 0u) | (Upscale::ExpandEnabled() ? 4u : 0u) | (exposure != nullptr ? 8u : 0u)};
     // 2. The command buffer (after the lookups and the images, which may record or reclaim). On a
     // reset the history images go from undefined to GENERAL (their content is not read), where they
     // stay: the passes' global barriers order their reads and writes. Then the record (recordPass,
@@ -289,6 +350,7 @@ std::optional<Upscale::Skip> TemporalUpscaler::Record(const Context& context, co
     recorder.Keep(color);
     recorder.Keep(motion);
     recorder.Keep(depth);
+    if (exposure != nullptr) recorder.Keep(exposure);
     recorder.Keep(output.image);
     if (fresh || plan.reset) {
         std::array<VkImageMemoryBarrier, 2> barriers{};
@@ -351,6 +413,7 @@ std::optional<Upscale::Skip> PluginUpscaler::Record(const Context& context, cons
     bool colorFirst = false, motionFirst = false, depthFirst = false, undecodable = false;
     auto color = FastSampledTexture(context, plan.base.colorWords, DescriptorImageShape::Image2D, false, colorFirst, undecodable);
     if (color == nullptr) return Skip::ColorUnresolved;
+    noteColorSource("plugin", plan.base.colorWords, *color);
     auto motion = FastSampledTexture(context, plan.motionWords, DescriptorImageShape::Image2D, false, motionFirst, undecodable);
     auto depth = FastSampledTexture(context, plan.depthWords, DescriptorImageShape::Image2D, false, depthFirst, undecodable);
     if (motion == nullptr || depth == nullptr) return Skip::InputUnresolved;

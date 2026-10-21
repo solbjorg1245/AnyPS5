@@ -97,6 +97,16 @@ bool rawEnabled() {
     return raw;
 }
 
+// APS5_PASS_DUMP_RAW_FROM=<event>: only events from that index on write .raw files (the 2 GiB cap
+// otherwise fills before a frame's late passes).
+std::uint64_t rawFrom() {
+    static const std::uint64_t from = [] {
+        const char* value = std::getenv("APS5_PASS_DUMP_RAW_FROM");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+    }();
+    return from;
+}
+
 std::uint64_t atPresent() {
     static const std::uint64_t present = [] {
         const char* value = std::getenv("APS5_PASS_DUMP_AT");
@@ -237,7 +247,7 @@ void writeRow(Dump& state, const Event& event, const char* plane, int slot, std:
             if ((layer + 1ull) * layerBytes > image->bytes.size()) break;
             if (!Graphics::AccumulateTexelStats(image->format, image->bytes.subspan(layer * layerBytes, layerBytes), image->width, image->height, rowBytes, stats)) break;
         }
-        if (rawEnabled()) raw = writeRaw(state, seq, *image);
+        if (rawEnabled() && event.index >= rawFrom()) raw = writeRaw(state, seq, *image);
     }
     const auto fraction = [&](std::uint64_t count) { return stats.texels != 0 ? static_cast<double>(count) / static_cast<double>(stats.texels) : 0.0; };
     char range[64] = ",";

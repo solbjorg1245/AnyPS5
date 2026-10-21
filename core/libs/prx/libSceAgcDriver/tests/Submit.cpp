@@ -1445,7 +1445,17 @@ void testUpscalePlan() {
     check(skipOf() == Upscale::Skip::NoColor, "upscale: no MainColor T#, no pass");
     for (std::size_t skip = 0; skip < static_cast<std::size_t>(Upscale::Skip::Count); ++skip) check(Upscale::SkipName(static_cast<Upscale::Skip>(skip)) != nullptr, "upscale: every skip has its log name");
     check(!Upscale::Enabled(nullptr) && !Upscale::Enabled("") && !Upscale::Enabled("0") && Upscale::Enabled("1"), "upscale: off unless APS5_MFSR_EXEC is set and not 0");
-    check(Upscale::ExpandOn(nullptr) && Upscale::ExpandOn("") && Upscale::ExpandOn("1") && !Upscale::ExpandOn("0"), "upscale: the output is expanded unless APS5_UPSCALER_EXPAND=0");
+    check(!Upscale::ExpandOn(nullptr) && !Upscale::ExpandOn("") && Upscale::ExpandOn("1") && !Upscale::ExpandOn("0"), "upscale: the output is expanded only with APS5_UPSCALER_EXPAND=1");
+    check(Upscale::ExposureOn(nullptr) && Upscale::ExposureOn("") && Upscale::ExposureOn("1") && !Upscale::ExposureOn("0"), "upscale: the output is exposed unless APS5_UPSCALER_EXPOSURE=0");
+    // The +0x28 descriptor is the exposure texture, carried when present bit 5 is set.
+    dispatch.descriptor = image(1, 1, 22);
+    dispatch.present = 0x2f;
+    const auto exposed = Upscale::PlanBilinear(dispatch);
+    check(std::holds_alternative<Upscale::Plan>(exposed) && std::get<Upscale::Plan>(exposed).exposure && std::get<Upscale::Plan>(exposed).exposureWords == dispatch.descriptor, "upscale: the exposure T# is carried with present bit 5");
+    dispatch.present = 0x0f;
+    const auto unexposed = Upscale::PlanBilinear(dispatch);
+    check(std::holds_alternative<Upscale::Plan>(unexposed) && !std::get<Upscale::Plan>(unexposed).exposure, "upscale: no present bit 5, no exposure");
+    dispatch.present = 0x2f;
     // The game's compression c / (1 + luma) and the passes' expansion c / (1 - luma) round-trip.
     const std::array<float, 3> hdr{12.0f, 3.0f, 0.25f};
     const float luma = 0.3f * hdr[0] + 0.59f * hdr[1] + 0.11f * hdr[2];

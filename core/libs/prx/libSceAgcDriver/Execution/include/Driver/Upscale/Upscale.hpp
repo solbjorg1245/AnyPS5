@@ -6,8 +6,10 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <string_view>
 #include <variant>
 
@@ -32,8 +34,37 @@ inline constexpr std::uint32_t GroupSize = 8;
 // The pass's [gputime] program key (guest programs are keyed by address, 0x3 is the batch, 0x10.. the classes).
 inline constexpr std::uint64_t TimingKey = 0x7;
 
+// APS5_PASS_DUMP: the hand-over's note for PassDump::AfterDispatch, its output and MainColor read
+// back as the pass left them (FrameTrace's " w=" form).
+inline std::string DumpNote(const MfsrPacket::Dispatch& dispatch) {
+    std::string note;
+    for (const std::size_t index : {std::size_t{0}, std::size_t{1}}) {
+        if ((dispatch.present & (1u << index)) == 0) continue;
+        const auto size = MfsrPacket::DecodeImageSize(dispatch.images[index]);
+        char text[96];
+        std::snprintf(text, sizeof(text), " w=0x%llx/%ux%u/f%u/m0", static_cast<unsigned long long>(MfsrPacket::DecodeImageAddress(dispatch.images[index])), size.width, size.height, size.format);
+        note += text;
+    }
+    // The +0x28 descriptor read as a V# (base, stride, records), its bytes dumped as F32 (64 KiB at most).
+    if ((dispatch.present & 0x20u) != 0) {
+        const auto& words = dispatch.descriptor;
+        const auto address = static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1] & 0xffffu) << 32u);
+        const auto stride = (words[1] >> 16u) & 0x3fffu;
+        const auto bytes = std::min<std::uint64_t>(static_cast<std::uint64_t>(words[2]) * (stride != 0 ? stride : 1u), 0x10000u);
+        char text[64];
+        std::snprintf(text, sizeof(text), " wb=0x%llx+0x%llx", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
+        if (address != 0 && bytes >= 4) note += text;
+    }
+    return note;
+}
+
 struct Plan {
     MfsrPacket::Descriptor outputWords{}, colorWords{};
+    // The +0x28 descriptor: a 1x1 T# (format 22, R32_FLOAT) over the frame's exposure buffer (cs
+    // 0x2488a1200 writes it), whose first float the game's TAA pass multiplies MainColor by; `exposure`
+    // when the packet carries it (present bit 5).
+    MfsrPacket::Descriptor exposureWords{};
+    bool exposure = false;
     MfsrPacket::ImageSize output{}, color{};
     std::array<std::uint32_t, 2> render{};
     // 8x8 groups over the output.
@@ -49,6 +80,8 @@ inline std::variant<Plan, Skip> PlanBilinear(const MfsrPacket::Dispatch& dispatc
     Plan plan;
     plan.outputWords = dispatch.images[0];
     plan.colorWords = dispatch.images[1];
+    plan.exposureWords = dispatch.descriptor;
+    plan.exposure = (dispatch.present & 0x20u) != 0;
     plan.output = MfsrPacket::DecodeImageSize(plan.outputWords);
     plan.color = MfsrPacket::DecodeImageSize(plan.colorWords);
     plan.render = dispatch.Field<std::array<std::uint32_t, 2>>(MfsrPacket::RenderSizeOffset);
@@ -144,15 +177,23 @@ inline std::variant<TemporalPlan, Skip> PlanTemporal(const MfsrPacket::Dispatch&
 // APS5_UPSCALER_PORT, or the settings' upscaler as for Enabled().
 bool PortEnabled();
 
-// APS5_UPSCALER_EXPAND (default on; "0" = the passes as first written, which leave the 3D view about
-// 10x too dark): MainColor holds the game's compressed colour c / (1 + luma), luma = 0.3 r + 0.59 g +
-// 0.11 b, which its TAA pass (cs 0x24893aa00) writes expanded, c / (1 - luma), for the post chain
-// (t1449's pass dump: MainColor at most 1.0, the TAA output up to 982). The bilinear and port passes
-// write the output expanded the same way (luma held below 0.9995); the port pass's history stays
-// compressed. Expanded is the reference for the shaders.
-inline bool ExpandOn(const char* value) { return value == nullptr || std::strcmp(value, "0") != 0; }
+// APS5_UPSCALER_EXPAND=1 (default off, a dead end kept for A/B): the passes write the output expanded,
+// c / (1 - luma), luma = 0.3 r + 0.59 g + 0.11 b (held below 0.9995), the port pass's history not.
+// MainColor is linear: the game's TAA pass (cs 0x24893aa00) compresses c / (1 + luma) only for its
+// blend and expands its result back (t1454/t1455 pass dumps: MainColor's mean luma 0.0019 in both
+// modes). Expanded is the reference for the shaders.
+inline bool ExpandOn(const char* value) { return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0; }
 inline bool ExpandEnabled() {
     static const bool on = ExpandOn(std::getenv("APS5_UPSCALER_EXPAND"));
+    return on;
+}
+// APS5_UPSCALER_EXPOSURE (default on; "0" = the passes without it, which leave the 3D view about 9x too
+// dark): the passes multiply their output by the exposure texel (Plan::exposure), as the TAA pass
+// multiplies MainColor by it before its blend (t1455: TAA output mean luma 0.0170 = MainColor's 0.0019
+// x the exposure 9.21). The port pass's history stays unexposed.
+inline bool ExposureOn(const char* value) { return value == nullptr || std::strcmp(value, "0") != 0; }
+inline bool ExposureEnabled() {
+    static const bool on = ExposureOn(std::getenv("APS5_UPSCALER_EXPOSURE"));
     return on;
 }
 inline std::array<float, 3> Expanded(const std::array<float, 3>& colour) {

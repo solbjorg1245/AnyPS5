@@ -5,11 +5,13 @@
 // rectangle, clamped half a texel inside it (Upscale::Plan). The output is a storage view of the
 // guest's own format, written without a format qualifier (shaderStorageImageWriteWithoutFormat).
 // MainColor holds the game's compressed colour c / (1 + luma); bit 0 of flags writes it expanded,
-// c / (1 - luma), as the game's TAA pass does (APS5_UPSCALER_EXPAND, Upscale::ExpandEnabled).
+// c / (1 - luma) (APS5_UPSCALER_EXPAND=1, Upscale::ExpandEnabled); bit 1 multiplies it by the exposure
+// texel, as the game's TAA pass multiplies MainColor (APS5_UPSCALER_EXPOSURE, Upscale::ExposureEnabled).
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) uniform sampler2D color;
 layout(set = 0, binding = 1) uniform writeonly image2D target;
+layout(set = 0, binding = 2) uniform sampler2D exposure;
 
 layout(push_constant, std430) uniform Parameters {
     uvec2 size;
@@ -31,5 +33,11 @@ void main() {
     }
     vec2 position = clamp((vec2(texel) + 0.5) * scale, low, high);
     vec4 colour = textureLod(color, position, 0.0);
-    imageStore(target, ivec2(texel), (flags & 1u) != 0u ? expanded(colour) : colour);
+    if ((flags & 1u) != 0u) {
+        colour = expanded(colour);
+    }
+    if ((flags & 2u) != 0u) {
+        colour.rgb *= texelFetch(exposure, ivec2(0), 0).r;
+    }
+    imageStore(target, ivec2(texel), colour);
 }
